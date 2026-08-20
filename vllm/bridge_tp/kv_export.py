@@ -199,6 +199,7 @@ def _dump_request_kv(
     model_name: str,
     tp_rank: int,
     tp_world_size: int,
+    async_scheduling: bool,
 ) -> None:
     if tp_world_size != 1:
         raise NotImplementedError(
@@ -221,6 +222,12 @@ def _dump_request_kv(
 
     if num_output_tokens < config.dump_after_output_tokens:
         return
+    if async_scheduling:
+        raise NotImplementedError(
+            "BridgeTP Phase 1-3 requires synchronous scheduling so token "
+            "IDs and KV state can be captured at the same boundary; restart "
+            "vLLM with --no-async-scheduling"
+        )
     if num_computed_tokens > num_known_tokens:
         raise RuntimeError(
             "Computed-token count exceeds the known token history: "
@@ -385,12 +392,6 @@ def maybe_dump_kv_cache(
         return
 
     try:
-        if async_scheduling:
-            raise NotImplementedError(
-                "BridgeTP Phase 1-3 requires synchronous scheduling so token "
-                "IDs and KV state can be captured at the same boundary"
-            )
-
         request_id = _select_request_id(config, input_batch)
         if request_id is None or request_id in _dumped_request_ids:
             return
@@ -408,6 +409,7 @@ def maybe_dump_kv_cache(
             model_name=model_name,
             tp_rank=tp_rank,
             tp_world_size=tp_world_size,
+            async_scheduling=async_scheduling,
         )
     except Exception:
         if config.strict:

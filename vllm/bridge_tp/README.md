@@ -37,6 +37,12 @@ history can contain a newly sampled token that has not been used as model input
 yet; it is recorded under `known_not_computed_token_ids` and counted by
 `pending_known_tokens`.
 
+Start vLLM with `--no-async-scheduling` for Phase 1-3. vLLM 0.23.0 enables
+async scheduling automatically when compatible, but its worker stores a
+placeholder for the newest sampled token before the asynchronous CPU copy
+finishes. That placeholder cannot support the token/KV boundary evidence this
+diagnostic is designed to collect.
+
 Phase 1-3 intentionally rejects TP greater than one, speculative decoding,
 async scheduling, hybrid/Mamba caches, and non-uniform KV-cache groups. These
 limitations prevent unsupported layouts from being mistaken for validated
