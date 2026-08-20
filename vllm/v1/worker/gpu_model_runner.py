@@ -21,6 +21,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 import vllm.envs as envs
+from vllm.bridge_tp.kv_export import maybe_dump_kv_cache
 from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
@@ -4548,6 +4549,20 @@ class GPUModelRunner(
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
             )
+
+        maybe_dump_kv_cache(
+            kv_caches=self.kv_caches,
+            requests=self.requests,
+            input_batch=self.input_batch,
+            scheduler_output=scheduler_output,
+            kv_cache_config=self.kv_cache_config,
+            attn_groups=self.attn_groups,
+            cache_dtype=self.cache_config.cache_dtype,
+            model_name=str(self.model_config.model),
+            tp_rank=get_tp_group().rank_in_group,
+            tp_world_size=get_tp_group().world_size,
+            async_scheduling=self.use_async_scheduling,
+        )
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
