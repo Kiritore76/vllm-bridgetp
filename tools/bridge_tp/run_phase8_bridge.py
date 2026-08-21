@@ -195,7 +195,13 @@ def main() -> None:
 
     prompt_tokens = int(staging["num_prompt_tokens"])
     cutover_ids = list(staging["all_known_token_ids"])[prompt_tokens:]
-    target_ids = _token_ids(target_response)
+    # Streaming target responses are normalized by
+    # _post_streaming_completion() and expose token_ids at the top level,
+    # unlike ordinary completion responses which store them in choices[0].
+    target_token_ids = target_response.get("token_ids")
+    if not isinstance(target_token_ids, list):
+        raise ValueError("Streaming target response contains no token_ids")
+    target_ids = [int(token_id) for token_id in target_token_ids]
     source_ids = _token_ids(source_response)
     control_ids = _token_ids(control_response)
     assembled_ids = cutover_ids + target_ids
