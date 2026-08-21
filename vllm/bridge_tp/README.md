@@ -62,3 +62,5 @@ Later online-prototype stages are documented separately:
 - `PHASE7.md`: application-level atomic takeover and rollback;
 - `PHASE7_VALIDATION.md`: returned commit/rollback evidence;
 - `PHASE8.md`: background old-KV staging, new-KV mirroring, and cleanup.
+- `PHASE8_VALIDATION.md`: returned commit/cancellation evidence and the
+  provenance-preserving offline verdict reconstruction.
