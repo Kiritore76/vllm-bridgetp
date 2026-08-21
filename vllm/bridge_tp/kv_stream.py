@@ -60,6 +60,7 @@ def _env_bool(name: str, default: bool) -> bool:
 @dataclass(frozen=True)
 class BridgeTPStreamConfig:
     enabled: bool
+    takeover_enabled: bool
     migration_id: str
     run_dir: Path
     host: str
@@ -86,6 +87,7 @@ class BridgeTPStreamConfig:
             )
         config = cls(
             enabled=enabled,
+            takeover_enabled=_env_bool("BRIDGETP_TAKEOVER_ENABLED", False),
             migration_id=migration_id,
             run_dir=Path(run_dir or "/tmp/bridgetp_phase6_disabled").expanduser(),
             host=os.getenv("BRIDGETP_STREAM_HOST", "127.0.0.1"),
@@ -168,7 +170,11 @@ class _RankPublisher:
         started = time.perf_counter()
         receipt: dict[str, Any] = {
             "format_version": 1,
-            "phase": "BridgeTP D3 Phase 6",
+            "phase": (
+                "BridgeTP D3 Phase 7"
+                if self.config.takeover_enabled
+                else "BridgeTP D3 Phase 6"
+            ),
             "migration_id": self.config.migration_id,
             "target_tp_rank": self.rank,
             "status": "ERROR",
@@ -381,11 +387,18 @@ def _publish_request(
         request.get_token_id(i) for i in range(num_computed, num_known)
     ]
     all_known_token_ids = computed_token_ids + pending_token_ids
+    phase = (
+        "BridgeTP D3 Phase 7"
+        if config.takeover_enabled
+        else "BridgeTP D3 Phase 6"
+    )
     manifest = {
         "format_version": 1,
-        "phase": "BridgeTP D3 Phase 6",
+        "phase": phase,
         "scope": (
-            "live TP1 snapshot to TP4 shadow continuation; no ownership takeover"
+            "live TP1 snapshot prepared for atomic TP4 takeover"
+            if config.takeover_enabled
+            else "live TP1 snapshot to TP4 shadow continuation; no ownership takeover"
         ),
         "protocol_version": PROTOCOL_VERSION,
         "migration_id": config.migration_id,
@@ -419,10 +432,29 @@ def _publish_request(
         "ranks": rank_records,
     }
     _atomic_json_dump(manifest, config.run_dir / "session_manifest.json")
+    if config.takeover_enabled:
+        _atomic_json_dump(
+            {
+                "format_version": 1,
+                "phase": "BridgeTP D3 Phase 7",
+                "scope": (
+                    "application-level atomic handoff; "
+                    "no crash-consensus claim"
+                ),
+                "migration_id": config.migration_id,
+                "source_request_id": request_id,
+                "snapshot_num_output_tokens": num_output_tokens,
+                "state": "PREPARING",
+                "source_abort_dispatched": False,
+                "updated_unix_s": time.time(),
+            },
+            config.run_dir / "takeover_state.json",
+        )
     _published_request_ids.add(request_id)
     logger.warning(
-        "BridgeTP Phase 6 published live request %s at output=%d, "
+        "%s published live request %s at output=%d, "
         "computed=%d, pending=%d, run=%s",
+        phase,
         request_id,
         num_output_tokens,
         num_computed,
@@ -451,6 +483,8 @@ def maybe_publish_kv_stream(
     if not config.enabled or _disabled_after_error:
         return
     try:
+        if _published_request_ids:
+            return
         request_ids = input_batch.req_ids
         if len(request_ids) != 1:
             return
