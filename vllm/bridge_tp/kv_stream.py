@@ -1,0 +1,479 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+"""Live TP1 iteration-boundary publisher for BridgeTP Phase 6."""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import secrets
+import socket
+import threading
+import time
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+
+import torch
+
+from vllm.bridge_tp.kv_export import (
+    _copy_request_blocks,
+    _estimate_dump_bytes,
+    _get_block_axis,
+    _get_request_block_ids,
+    _ordered_layer_names,
+)
+from vllm.bridge_tp.kv_reshard import iter_tp_rank_shards
+from vllm.bridge_tp.stream_protocol import (
+    PROTOCOL_VERSION,
+    recv_json,
+    send_json,
+    send_payload_frames,
+    serialize_rank_payload,
+    sha256_bytes,
+)
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+_TRUE = {"1", "true", "yes", "on"}
+_published_request_ids: set[str] = set()
+_disabled_after_error = False
+_publishers: list["_RankPublisher"] = []
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in _TRUE:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} is not a boolean: {value!r}")
+
+
+@dataclass(frozen=True)
+class BridgeTPStreamConfig:
+    enabled: bool
+    migration_id: str
+    run_dir: Path
+    host: str
+    base_port: int
+    target_tp_size: int
+    head_axis: int
+    expected_kv_heads: int
+    after_output_tokens: int
+    chunk_bytes: int
+    aggregate_rate_gib_s: float
+    socket_timeout_s: float
+    pin_memory: bool
+    strict: bool
+
+    @classmethod
+    def from_env(cls) -> "BridgeTPStreamConfig":
+        migration_id = os.getenv("BRIDGETP_STREAM_MIGRATION_ID", "").strip()
+        run_dir = os.getenv("BRIDGETP_STREAM_RUN_DIR", "").strip()
+        enabled = _env_bool("BRIDGETP_STREAM_ENABLED", False)
+        if enabled and (not migration_id or not run_dir):
+            raise ValueError(
+                "Live streaming requires BRIDGETP_STREAM_MIGRATION_ID and "
+                "BRIDGETP_STREAM_RUN_DIR"
+            )
+        config = cls(
+            enabled=enabled,
+            migration_id=migration_id,
+            run_dir=Path(run_dir or "/tmp/bridgetp_phase6_disabled").expanduser(),
+            host=os.getenv("BRIDGETP_STREAM_HOST", "127.0.0.1"),
+            base_port=int(os.getenv("BRIDGETP_STREAM_BASE_PORT", "29600")),
+            target_tp_size=int(os.getenv("BRIDGETP_STREAM_TARGET_TP", "4")),
+            head_axis=int(os.getenv("BRIDGETP_STREAM_HEAD_AXIS", "3")),
+            expected_kv_heads=int(
+                os.getenv("BRIDGETP_STREAM_EXPECTED_KV_HEADS", "8")
+            ),
+            after_output_tokens=int(
+                os.getenv("BRIDGETP_STREAM_AFTER_OUTPUT_TOKENS", "128")
+            ),
+            chunk_bytes=int(
+                os.getenv("BRIDGETP_STREAM_CHUNK_BYTES", str(1024 * 1024))
+            ),
+            aggregate_rate_gib_s=float(
+                os.getenv("BRIDGETP_STREAM_RATE_GIB_S", "0")
+            ),
+            socket_timeout_s=float(
+                os.getenv("BRIDGETP_STREAM_SOCKET_TIMEOUT_S", "600")
+            ),
+            pin_memory=_env_bool("BRIDGETP_STREAM_PIN_MEMORY", True),
+            strict=_env_bool("BRIDGETP_STREAM_STRICT", True),
+        )
+        if config.target_tp_size != 4:
+            raise ValueError("BridgeTP Phase 6 currently requires target TP=4")
+        if not 0 < config.chunk_bytes <= 16 * 1024 * 1024:
+            raise ValueError("BRIDGETP_STREAM_CHUNK_BYTES must be in [1, 16 MiB]")
+        if config.aggregate_rate_gib_s < 0:
+            raise ValueError("BRIDGETP_STREAM_RATE_GIB_S cannot be negative")
+        if config.after_output_tokens <= 0:
+            raise ValueError("Snapshot output-token boundary must be positive")
+        return config
+
+
+@lru_cache(maxsize=1)
+def get_bridge_tp_stream_config() -> BridgeTPStreamConfig:
+    return BridgeTPStreamConfig.from_env()
+
+
+def _atomic_json_dump(value: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as file:
+        json.dump(value, file, ensure_ascii=False, indent=2)
+        file.write("\n")
+    os.replace(temporary, path)
+
+
+class _RankPublisher:
+    def __init__(
+        self,
+        *,
+        config: BridgeTPStreamConfig,
+        session_token: str,
+        rank: int,
+        payload: bytes,
+        header: dict[str, Any],
+    ) -> None:
+        self.config = config
+        self.session_token = session_token
+        self.rank = rank
+        self.payload = payload
+        self.header = header
+        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.listener.settimeout(config.socket_timeout_s)
+        self.listener.bind((config.host, config.base_port + rank))
+        self.listener.listen(1)
+        self.thread = threading.Thread(
+            target=self._serve,
+            name=f"bridgetp-stream-rank-{rank}",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def _serve(self) -> None:
+        started = time.perf_counter()
+        receipt: dict[str, Any] = {
+            "format_version": 1,
+            "phase": "BridgeTP D3 Phase 6",
+            "migration_id": self.config.migration_id,
+            "target_tp_rank": self.rank,
+            "status": "ERROR",
+        }
+        try:
+            connection, peer = self.listener.accept()
+            with connection:
+                connection.settimeout(self.config.socket_timeout_s)
+                hello = recv_json(connection)
+                expected = {
+                    "protocol_version": PROTOCOL_VERSION,
+                    "migration_id": self.config.migration_id,
+                    "session_token": self.session_token,
+                    "target_tp_rank": self.rank,
+                }
+                for key, value in expected.items():
+                    if hello.get(key) != value:
+                        raise ValueError(
+                            f"BridgeTP HELLO field {key} differs: "
+                            f"{hello.get(key)!r} != {value!r}"
+                        )
+                send_json(connection, self.header)
+                per_rank_rate = 0.0
+                if self.config.aggregate_rate_gib_s:
+                    per_rank_rate = (
+                        self.config.aggregate_rate_gib_s
+                        * 1024**3
+                        / self.config.target_tp_size
+                    )
+                transfer = send_payload_frames(
+                    connection,
+                    self.payload,
+                    chunk_bytes=self.config.chunk_bytes,
+                    rate_bytes_per_second=per_rank_rate,
+                )
+                acknowledgement = recv_json(connection)
+                if acknowledgement.get("status") != "READY":
+                    raise RuntimeError(
+                        f"TP rank {self.rank} did not acknowledge READY: "
+                        f"{acknowledgement}"
+                    )
+                receipt.update(
+                    {
+                        "status": "READY",
+                        "peer": list(peer),
+                        "target_request_id": acknowledgement.get(
+                            "target_request_id"
+                        ),
+                        "exact_readback": acknowledgement.get("exact_readback"),
+                        "rate_limit_aggregate_gib_s": (
+                            self.config.aggregate_rate_gib_s
+                        ),
+                        **transfer,
+                    }
+                )
+        except Exception as error:
+            receipt["error"] = f"{type(error).__name__}: {error}"
+            logger.exception("BridgeTP sender for TP rank %d failed", self.rank)
+        finally:
+            receipt["total_seconds"] = time.perf_counter() - started
+            _atomic_json_dump(
+                receipt,
+                self.config.run_dir
+                / "sender_receipts"
+                / f"tp_rank_{self.rank}.json",
+            )
+            self.listener.close()
+
+
+def _publish_request(
+    *,
+    config: BridgeTPStreamConfig,
+    request_id: str,
+    kv_caches: list[torch.Tensor],
+    requests: dict[str, Any],
+    input_batch: Any,
+    scheduler_output: Any,
+    kv_cache_config: Any,
+    attn_groups: list[list[Any]],
+    cache_dtype: str,
+    model_name: str,
+    tp_rank: int,
+    tp_world_size: int,
+    async_scheduling: bool,
+) -> None:
+    if tp_world_size != 1 or tp_rank != 0:
+        raise ValueError("BridgeTP Phase 6 source must be TP1 rank 0")
+    if async_scheduling:
+        raise ValueError("BridgeTP Phase 6 requires --no-async-scheduling")
+    if scheduler_output.scheduled_spec_decode_tokens:
+        raise ValueError("BridgeTP Phase 6 does not support speculative decoding")
+    if not kv_caches:
+        raise RuntimeError("The source has no initialized KV-cache tensors")
+
+    request_index = input_batch.req_id_to_index[request_id]
+    request = requests[request_id]
+    num_output_tokens = len(request.output_token_ids)
+    if num_output_tokens < config.after_output_tokens:
+        return
+    num_scheduled = int(scheduler_output.num_scheduled_tokens.get(request_id, 0))
+    num_computed_before = int(input_batch.num_computed_tokens_cpu[request_index])
+    num_computed = num_computed_before + num_scheduled
+    num_known = int(request.num_tokens)
+    pending = num_known - num_computed
+    if pending != 1:
+        raise ValueError(
+            "BridgeTP Phase 6 currently requires exactly one pending known token; "
+            f"observed {pending}"
+        )
+
+    block_ids, block_size = _get_request_block_ids(
+        input_batch, request_index, num_computed
+    )
+    block_axis = _get_block_axis(attn_groups, cache_dtype, block_size)
+    layer_names = _ordered_layer_names(kv_cache_config)
+    raw_source_bytes = _estimate_dump_bytes(
+        kv_caches, block_axis, len(block_ids)
+    )
+    snapshot_started = time.perf_counter()
+    source_layers, layer_records, d2h_ms = _copy_request_blocks(
+        kv_caches, layer_names, block_ids, block_axis
+    )
+
+    session_token = secrets.token_hex(32)
+    config.run_dir.mkdir(parents=True, exist_ok=True)
+    if (config.run_dir / "session_manifest.json").exists():
+        raise FileExistsError(
+            f"Phase 6 run directory was already used: {config.run_dir}"
+        )
+    rank_records: list[dict[str, Any]] = []
+    publishers: list[_RankPublisher] = []
+    total_raw_rank_bytes = 0
+    for rank, rank_layers_unpinned in iter_tp_rank_shards(
+        source_layers,
+        head_axis=config.head_axis,
+        target_tp_size=config.target_tp_size,
+        expected_source_kv_heads=config.expected_kv_heads,
+    ):
+        rank_layers = rank_layers_unpinned
+        pinned = False
+        if config.pin_memory and torch.cuda.is_available():
+            rank_layers = {
+                name: tensor.pin_memory() for name, tensor in rank_layers.items()
+            }
+            pinned = True
+        raw_rank_bytes = sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in rank_layers.values()
+        )
+        total_raw_rank_bytes += raw_rank_bytes
+        payload = serialize_rank_payload(
+            {
+                "format_version": 1,
+                "migration_id": config.migration_id,
+                "source_request_id": request_id,
+                "target_tp_size": config.target_tp_size,
+                "target_tp_rank": rank,
+                "block_axis": block_axis,
+                "block_size": block_size,
+                "num_computed_tokens": num_computed,
+                "layers": rank_layers,
+            }
+        )
+        payload_hash = sha256_bytes(payload)
+        num_frames = math.ceil(len(payload) / config.chunk_bytes)
+        header = {
+            "protocol_version": PROTOCOL_VERSION,
+            "migration_id": config.migration_id,
+            "source_request_id": request_id,
+            "target_tp_size": config.target_tp_size,
+            "target_tp_rank": rank,
+            "num_computed_tokens": num_computed,
+            "pending_known_tokens": pending,
+            "block_size": block_size,
+            "block_axis": block_axis,
+            "num_layers": len(rank_layers),
+            "raw_tensor_bytes": raw_rank_bytes,
+            "payload_bytes": len(payload),
+            "payload_sha256": payload_hash,
+            "num_frames": num_frames,
+            "chunk_bytes": config.chunk_bytes,
+        }
+        publisher = _RankPublisher(
+            config=config,
+            session_token=session_token,
+            rank=rank,
+            payload=payload,
+            header=header,
+        )
+        publishers.append(publisher)
+        rank_records.append(
+            {
+                "target_tp_rank": rank,
+                "host": config.host,
+                "port": config.base_port + rank,
+                "raw_tensor_bytes": raw_rank_bytes,
+                "payload_bytes": len(payload),
+                "payload_sha256": payload_hash,
+                "num_frames": num_frames,
+                "pinned_cpu": pinned,
+            }
+        )
+
+    for publisher in publishers:
+        publisher.start()
+    _publishers.extend(publishers)
+
+    computed_token_ids = [request.get_token_id(i) for i in range(num_computed)]
+    pending_token_ids = [
+        request.get_token_id(i) for i in range(num_computed, num_known)
+    ]
+    all_known_token_ids = computed_token_ids + pending_token_ids
+    manifest = {
+        "format_version": 1,
+        "phase": "BridgeTP D3 Phase 6",
+        "scope": (
+            "live TP1 snapshot to TP4 shadow continuation; no ownership takeover"
+        ),
+        "protocol_version": PROTOCOL_VERSION,
+        "migration_id": config.migration_id,
+        "session_token": session_token,
+        "model": model_name,
+        "source_request_id": request_id,
+        "source_tp_size": 1,
+        "target_tp_size": config.target_tp_size,
+        "cache_dtype": cache_dtype,
+        "block_size": block_size,
+        "block_axis": block_axis,
+        "head_axis": config.head_axis,
+        "expected_source_kv_heads": config.expected_kv_heads,
+        "physical_block_ids": block_ids,
+        "num_blocks": len(block_ids),
+        "num_layers": len(source_layers),
+        "num_prompt_tokens": int(request.num_prompt_tokens),
+        "snapshot_num_output_tokens": num_output_tokens,
+        "num_computed_tokens": num_computed,
+        "pending_known_tokens": pending,
+        "computed_token_ids": computed_token_ids,
+        "pending_token_ids": pending_token_ids,
+        "all_known_token_ids": all_known_token_ids,
+        "raw_source_tensor_bytes": raw_source_bytes,
+        "raw_rank_tensor_bytes_total": total_raw_rank_bytes,
+        "d2h_snapshot_ms": d2h_ms,
+        "snapshot_prepare_ms": (time.perf_counter() - snapshot_started) * 1000,
+        "chunk_bytes": config.chunk_bytes,
+        "aggregate_rate_limit_gib_s": config.aggregate_rate_gib_s,
+        "layers": layer_records,
+        "ranks": rank_records,
+    }
+    _atomic_json_dump(manifest, config.run_dir / "session_manifest.json")
+    _published_request_ids.add(request_id)
+    logger.warning(
+        "BridgeTP Phase 6 published live request %s at output=%d, "
+        "computed=%d, pending=%d, run=%s",
+        request_id,
+        num_output_tokens,
+        num_computed,
+        pending,
+        config.run_dir,
+    )
+
+
+def maybe_publish_kv_stream(
+    *,
+    kv_caches: list[torch.Tensor],
+    requests: dict[str, Any],
+    input_batch: Any,
+    scheduler_output: Any,
+    kv_cache_config: Any,
+    attn_groups: list[list[Any]],
+    cache_dtype: str,
+    model_name: str,
+    tp_rank: int,
+    tp_world_size: int,
+    async_scheduling: bool,
+) -> None:
+    """Publish one live TP1 request once it reaches the configured boundary."""
+    global _disabled_after_error
+    config = get_bridge_tp_stream_config()
+    if not config.enabled or _disabled_after_error:
+        return
+    try:
+        request_ids = input_batch.req_ids
+        if len(request_ids) != 1:
+            return
+        request_id = request_ids[0]
+        if request_id in _published_request_ids:
+            return
+        _publish_request(
+            config=config,
+            request_id=request_id,
+            kv_caches=kv_caches,
+            requests=requests,
+            input_batch=input_batch,
+            scheduler_output=scheduler_output,
+            kv_cache_config=kv_cache_config,
+            attn_groups=attn_groups,
+            cache_dtype=cache_dtype,
+            model_name=model_name,
+            tp_rank=tp_rank,
+            tp_world_size=tp_world_size,
+            async_scheduling=async_scheduling,
+        )
+    except Exception:
+        if config.strict:
+            raise
+        _disabled_after_error = True
+        logger.exception("BridgeTP Phase 6 publisher failed and was disabled")
