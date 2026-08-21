@@ -73,6 +73,14 @@ def _atomic_json_dump(value: dict[str, Any], path: Path) -> None:
     os.replace(temporary, path)
 
 
+def _load_json(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as file:
+        value = json.load(file)
+    if not isinstance(value, dict):
+        raise TypeError(f"Expected a JSON object: {path}")
+    return value
+
+
 class BridgeTPStreamingConnector(KVConnectorBase_V1):
     """Receive a live TP1 snapshot into scheduler-owned TP4 blocks."""
 
@@ -102,6 +110,19 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 "bridgetp_stream_socket_timeout_s", 600
             )
         )
+        takeover_control_path = self._kv_transfer_config.get_from_extra_config(
+            "bridgetp_takeover_control_path", None
+        )
+        self.takeover_control_path = (
+            Path(takeover_control_path).resolve()
+            if takeover_control_path
+            else None
+        )
+        self.takeover_control_timeout_s = float(
+            self._kv_transfer_config.get_from_extra_config(
+                "bridgetp_takeover_control_timeout_s", 600
+            )
+        )
         parallel = vllm_config.parallel_config
         if parallel.tensor_parallel_size != 4:
             raise ValueError("BridgeTP Phase 6 requires tensor_parallel_size=4")
@@ -125,7 +146,6 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         with self.manifest_path.open(encoding="utf-8") as file:
             manifest = json.load(file)
         required = {
-            "phase": "BridgeTP D3 Phase 6",
             "protocol_version": PROTOCOL_VERSION,
             "source_tp_size": 1,
             "target_tp_size": 4,
@@ -137,6 +157,16 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     f"Phase 6 manifest field {key} differs: "
                     f"{manifest.get(key)!r} != {value!r}"
                 )
+        expected_phase = (
+            "BridgeTP D3 Phase 7"
+            if self.takeover_control_path is not None
+            else "BridgeTP D3 Phase 6"
+        )
+        if manifest.get("phase") != expected_phase:
+            raise ValueError(
+                "Stream manifest phase differs: "
+                f"{manifest.get('phase')!r} != {expected_phase!r}"
+            )
         if str(manifest["model"]) != self._target_model:
             raise ValueError("Phase 6 source and target model paths differ")
         if int(manifest["block_size"]) != self._target_block_size:
@@ -349,6 +379,43 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             inject_ms = (time.perf_counter() - inject_started) * 1000
+            receipt_path = (
+                self.receipt_dir
+                / _safe_name(request.target_request_id)
+                / f"tp_rank_{tp_rank}.json"
+            )
+            phase7 = self.takeover_control_path is not None
+            receipt = {
+                "format_version": 1,
+                "phase": (
+                    "BridgeTP D3 Phase 7" if phase7 else "BridgeTP D3 Phase 6"
+                ),
+                "scope": (
+                    "target-ready barrier before ownership commit"
+                    if phase7
+                    else (
+                        "live stream restore and exact readback; "
+                        "no ownership takeover"
+                    )
+                ),
+                "status": "TARGET_READY" if phase7 else "READY",
+                "migration_id": request.migration_id,
+                "source_request_id": request.source_request_id,
+                "target_request_id": request.target_request_id,
+                "tp_rank": tp_rank,
+                "target_block_ids": request.target_block_ids,
+                "num_computed_tokens": request.num_computed_tokens,
+                "pending_tokens_to_compute": 1,
+                "receive_ms": receive_ms,
+                "deserialize_ms": deserialize_ms,
+                "inject_and_readback_ms": inject_ms,
+                "target_ready_total_ms": (time.perf_counter() - started) * 1000,
+                "total_ms": (time.perf_counter() - started) * 1000,
+                "target_ready_unix_s": time.time(),
+                **transfer,
+                **validation,
+            }
+            _atomic_json_dump(receipt, receipt_path)
             send_json(
                 connection,
                 {
@@ -358,38 +425,76 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 },
             )
 
-        receipt = {
-            "format_version": 1,
-            "phase": "BridgeTP D3 Phase 6",
-            "scope": "live stream restore and exact readback; no ownership takeover",
-            "status": "READY",
-            "migration_id": request.migration_id,
-            "source_request_id": request.source_request_id,
-            "target_request_id": request.target_request_id,
-            "tp_rank": tp_rank,
-            "target_block_ids": request.target_block_ids,
-            "num_computed_tokens": request.num_computed_tokens,
-            "pending_tokens_to_compute": 1,
-            "receive_ms": receive_ms,
-            "deserialize_ms": deserialize_ms,
-            "inject_and_readback_ms": inject_ms,
-            "total_ms": (time.perf_counter() - started) * 1000,
-            **transfer,
-            **validation,
-        }
-        receipt_path = (
-            self.receipt_dir
-            / _safe_name(request.target_request_id)
-            / f"tp_rank_{tp_rank}.json"
-        )
-        _atomic_json_dump(receipt, receipt_path)
+        if phase7:
+            assert self.takeover_control_path is not None
+            wait_started = time.perf_counter()
+            deadline = wait_started + self.takeover_control_timeout_s
+            while True:
+                if self.takeover_control_path.exists():
+                    state = _load_json(self.takeover_control_path)
+                    if state.get("migration_id") != request.migration_id:
+                        raise ValueError("Takeover state migration ID differs")
+                    decision = state.get("state")
+                    if decision == "COMMITTED":
+                        if not state.get("source_abort_dispatched"):
+                            raise ValueError(
+                                "COMMITTED state has no source-abort evidence"
+                            )
+                        receipt.update(
+                            {
+                                "status": "OWNERSHIP_COMMITTED",
+                                "control_wait_ms": (
+                                    time.perf_counter() - wait_started
+                                )
+                                * 1000,
+                                "source_abort_dispatched": True,
+                                "takeover_state": decision,
+                                "ownership_ready_total_ms": (
+                                    time.perf_counter() - started
+                                )
+                                * 1000,
+                            }
+                        )
+                        _atomic_json_dump(receipt, receipt_path)
+                        get_tp_group().barrier()
+                        break
+                    if decision == "ROLLED_BACK":
+                        receipt.update(
+                            {
+                                "status": "ROLLED_BACK",
+                                "control_wait_ms": (
+                                    time.perf_counter() - wait_started
+                                )
+                                * 1000,
+                                "source_abort_dispatched": False,
+                                "takeover_state": decision,
+                                "rollback_total_ms": (
+                                    time.perf_counter() - started
+                                )
+                                * 1000,
+                            }
+                        )
+                        _atomic_json_dump(receipt, receipt_path)
+                        get_tp_group().barrier()
+                        raise RuntimeError(
+                            "BridgeTP Phase 7 target was rolled back before commit"
+                        )
+                if time.perf_counter() >= deadline:
+                    receipt["status"] = "CONTROL_TIMEOUT"
+                    receipt["control_wait_ms"] = (
+                        time.perf_counter() - wait_started
+                    ) * 1000
+                    _atomic_json_dump(receipt, receipt_path)
+                    raise TimeoutError("Timed out waiting for Phase 7 commit decision")
+                time.sleep(0.01)
+
         logger.warning(
-            "BridgeTP Phase 6 received request %s on rank %d; "
-            "readback=%s total_ms=%.3f",
+            "%s received request %s on rank %d; readback=%s status=%s",
+            receipt["phase"],
             request.target_request_id,
             tp_rank,
             validation["exact_readback"],
-            receipt["total_ms"],
+            receipt["status"],
         )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
