@@ -58,6 +58,8 @@ Validate a completed dump with the Bridge development environment:
 
 Later online-prototype stages are documented separately:
 
+- `PHASE1_9_OVERVIEW.md`: Phase 1–8 responsibilities, the combined proof,
+  and the Phase 9 controller specification;
 - `PHASE6.md`: live four-stream TP1 snapshot transfer;
 - `PHASE7.md`: application-level atomic takeover and rollback;
 - `PHASE7_VALIDATION.md`: returned commit/rollback evidence;
