@@ -1,5 +1,8 @@
 # BridgeTP D3 Phase 5: TP4 file restore MVP
 
+Status: passed on 2026-08-21. See `PHASE5_VALIDATION.md` for the recorded
+restore receipts, exact continuation tokens, and evidence boundary.
+
 Phase 5 uses vLLM's KV Connector lifecycle to let the target scheduler allocate
 real TP4 KV blocks before each worker loads its authenticated Phase 4 shard.
 Every worker immediately reads the target blocks back and requires exact tensor
