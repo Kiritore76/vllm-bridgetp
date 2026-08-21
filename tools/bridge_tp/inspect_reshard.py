@@ -64,6 +64,10 @@ def main() -> None:
         payload = torch.load(rank_path, map_location="cpu", weights_only=True)
         if payload["target_tp_size"] != 4:
             raise ValueError(f"Shard target TP size mismatch: {rank_path}")
+        if payload["block_axis"] != manifest["source_dump"]["block_axis"]:
+            raise ValueError(f"Shard block axis mismatch: {rank_path}")
+        if payload["block_size"] != manifest["source_dump"]["block_size"]:
+            raise ValueError(f"Shard block size mismatch: {rank_path}")
         if payload["target_tp_rank"] != record["target_tp_rank"]:
             raise ValueError(f"Shard rank mismatch: {rank_path}")
         if payload["request_id"] != manifest["request_id"]:
