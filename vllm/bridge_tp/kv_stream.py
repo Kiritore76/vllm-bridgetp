@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Live TP1 iteration-boundary publisher for BridgeTP Phase 6."""
+"""Live TP1 iteration-boundary publisher for BridgeTP Phases 6-8."""
 
 from __future__ import annotations
 
@@ -61,6 +61,7 @@ def _env_bool(name: str, default: bool) -> bool:
 class BridgeTPStreamConfig:
     enabled: bool
     takeover_enabled: bool
+    phase8_enabled: bool
     migration_id: str
     run_dir: Path
     host: str
@@ -69,6 +70,9 @@ class BridgeTPStreamConfig:
     head_axis: int
     expected_kv_heads: int
     after_output_tokens: int
+    phase8_cutover_output_tokens: int
+    phase8_delta_host: str
+    phase8_delta_base_port: int
     chunk_bytes: int
     aggregate_rate_gib_s: float
     socket_timeout_s: float
@@ -88,6 +92,7 @@ class BridgeTPStreamConfig:
         config = cls(
             enabled=enabled,
             takeover_enabled=_env_bool("BRIDGETP_TAKEOVER_ENABLED", False),
+            phase8_enabled=_env_bool("BRIDGETP_PHASE8_ENABLED", False),
             migration_id=migration_id,
             run_dir=Path(run_dir or "/tmp/bridgetp_phase6_disabled").expanduser(),
             host=os.getenv("BRIDGETP_STREAM_HOST", "127.0.0.1"),
@@ -99,6 +104,15 @@ class BridgeTPStreamConfig:
             ),
             after_output_tokens=int(
                 os.getenv("BRIDGETP_STREAM_AFTER_OUTPUT_TOKENS", "128")
+            ),
+            phase8_cutover_output_tokens=int(
+                os.getenv("BRIDGETP_PHASE8_CUTOVER_OUTPUT_TOKENS", "160")
+            ),
+            phase8_delta_host=os.getenv(
+                "BRIDGETP_PHASE8_DELTA_HOST", "127.0.0.1"
+            ),
+            phase8_delta_base_port=int(
+                os.getenv("BRIDGETP_PHASE8_DELTA_BASE_PORT", "29900")
             ),
             chunk_bytes=int(
                 os.getenv("BRIDGETP_STREAM_CHUNK_BYTES", str(1024 * 1024))
@@ -120,7 +134,22 @@ class BridgeTPStreamConfig:
             raise ValueError("BRIDGETP_STREAM_RATE_GIB_S cannot be negative")
         if config.after_output_tokens <= 0:
             raise ValueError("Snapshot output-token boundary must be positive")
+        if config.phase8_enabled:
+            if not config.takeover_enabled:
+                raise ValueError("BridgeTP Phase 8 requires takeover to be enabled")
+            if config.phase8_cutover_output_tokens <= config.after_output_tokens:
+                raise ValueError(
+                    "Phase 8 cutover boundary must follow the old-KV boundary"
+                )
         return config
+
+
+def _phase_name(config: BridgeTPStreamConfig) -> str:
+    if config.phase8_enabled:
+        return "BridgeTP D3 Phase 8"
+    if config.takeover_enabled:
+        return "BridgeTP D3 Phase 7"
+    return "BridgeTP D3 Phase 6"
 
 
 @lru_cache(maxsize=1)
@@ -170,11 +199,7 @@ class _RankPublisher:
         started = time.perf_counter()
         receipt: dict[str, Any] = {
             "format_version": 1,
-            "phase": (
-                "BridgeTP D3 Phase 7"
-                if self.config.takeover_enabled
-                else "BridgeTP D3 Phase 6"
-            ),
+            "phase": _phase_name(self.config),
             "migration_id": self.config.migration_id,
             "target_tp_rank": self.rank,
             "status": "ERROR",
@@ -235,6 +260,7 @@ class _RankPublisher:
             logger.exception("BridgeTP sender for TP rank %d failed", self.rank)
         finally:
             receipt["total_seconds"] = time.perf_counter() - started
+            receipt["completed_unix_s"] = time.time()
             _atomic_json_dump(
                 receipt,
                 self.config.run_dir
@@ -242,6 +268,9 @@ class _RankPublisher:
                 / f"tp_rank_{self.rank}.json",
             )
             self.listener.close()
+            # The Phase 8 old-KV path must release its serialized source copy
+            # after the CPU stager acknowledges it.
+            self.payload = b""
 
 
 def _publish_request(
@@ -387,16 +416,14 @@ def _publish_request(
         request.get_token_id(i) for i in range(num_computed, num_known)
     ]
     all_known_token_ids = computed_token_ids + pending_token_ids
-    phase = (
-        "BridgeTP D3 Phase 7"
-        if config.takeover_enabled
-        else "BridgeTP D3 Phase 6"
-    )
+    phase = _phase_name(config)
     manifest = {
         "format_version": 1,
         "phase": phase,
         "scope": (
-            "live TP1 snapshot prepared for atomic TP4 takeover"
+            "old-KV background snapshot prepared for delta-staged takeover"
+            if config.phase8_enabled
+            else "live TP1 snapshot prepared for atomic TP4 takeover"
             if config.takeover_enabled
             else "live TP1 snapshot to TP4 shadow continuation; no ownership takeover"
         ),
@@ -436,7 +463,7 @@ def _publish_request(
         _atomic_json_dump(
             {
                 "format_version": 1,
-                "phase": "BridgeTP D3 Phase 7",
+                "phase": phase,
                 "scope": (
                     "application-level atomic handoff; "
                     "no crash-consensus claim"
@@ -451,6 +478,18 @@ def _publish_request(
             config.run_dir / "takeover_state.json",
         )
     _published_request_ids.add(request_id)
+    if config.phase8_enabled:
+        from vllm.bridge_tp.phase8_source import start_phase8_source
+
+        start_phase8_source(
+            config=config,
+            request_id=request_id,
+            session_token=session_token,
+            initial_num_computed_tokens=num_computed,
+            block_size=block_size,
+            block_axis=block_axis,
+            layer_names=layer_names,
+        )
     logger.warning(
         "%s published live request %s at output=%d, "
         "computed=%d, pending=%d, run=%s",
@@ -483,13 +522,28 @@ def maybe_publish_kv_stream(
     if not config.enabled or _disabled_after_error:
         return
     try:
-        if _published_request_ids:
-            return
         request_ids = input_batch.req_ids
         if len(request_ids) != 1:
             return
         request_id = request_ids[0]
+        if _published_request_ids and request_id not in _published_request_ids:
+            # A dedicated validation server owns one migration session.  Later
+            # clean-control requests must not reuse its ports or run directory.
+            return
         if request_id in _published_request_ids:
+            if config.phase8_enabled:
+                from vllm.bridge_tp.phase8_source import maybe_publish_phase8_delta
+
+                maybe_publish_phase8_delta(
+                    config=config,
+                    request_id=request_id,
+                    kv_caches=kv_caches,
+                    requests=requests,
+                    input_batch=input_batch,
+                    scheduler_output=scheduler_output,
+                    cache_dtype=cache_dtype,
+                    attn_groups=attn_groups,
+                )
             return
         _publish_request(
             config=config,
@@ -510,4 +564,4 @@ def maybe_publish_kv_stream(
         if config.strict:
             raise
         _disabled_after_error = True
-        logger.exception("BridgeTP Phase 6 publisher failed and was disabled")
+        logger.exception("BridgeTP live publisher failed and was disabled")

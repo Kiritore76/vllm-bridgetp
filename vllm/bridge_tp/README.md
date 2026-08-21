@@ -55,3 +55,10 @@ Validate a completed dump with the Bridge development environment:
   tools/bridge_tp/inspect_dump.py \
   /root/autodl-tmp/bridgetp/bridge_dumps/<request-id>/tp_rank_0
 ```
+
+Later online-prototype stages are documented separately:
+
+- `PHASE6.md`: live four-stream TP1 snapshot transfer;
+- `PHASE7.md`: application-level atomic takeover and rollback;
+- `PHASE7_VALIDATION.md`: returned commit/rollback evidence;
+- `PHASE8.md`: background old-KV staging, new-KV mirroring, and cleanup.
