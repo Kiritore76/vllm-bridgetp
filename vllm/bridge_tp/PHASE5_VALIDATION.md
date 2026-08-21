@@ -2,17 +2,18 @@
 
 ## Result
 
-Phase 5 passed on 2026-08-21. A real TP4 target allocated scheduler-owned KV
-blocks, all four workers restored their authenticated rank shards, every worker
-passed an exact device readback, and the restored TP4 request produced the same
-32 greedy continuation token IDs as a clean TP1 control.
+Phase 5 passed on 2026-08-21 across two successful invocations. A real TP4
+target allocated scheduler-owned KV blocks, all four workers restored their
+authenticated rank shards, every worker passed an exact device readback, and a
+restored TP4 request produced the same 32 greedy continuation token IDs as a
+clean TP1 control. The two invocations are recorded separately below and their
+timings must not be combined.
 
 ```text
 vLLM source branch: bridgetp/d3-phase5-tp4-file-restore
 vLLM source commit: 25e4151a7237eb4ca90a9c500a03feda42a893ae
 model: Qwen2.5-14B-Instruct
 source request: cmpl-bff96b5ee84f93ec-0-bf80dd23
-target request: cmpl-b1e5ce73880bc9e9-0-83e5a0ae
 source topology: TP1
 target topology: TP4
 computed tokens restored: 137
@@ -26,7 +27,11 @@ were nevertheless allocated by the target scheduler and were not imported as
 source ownership metadata. All TP ranks correctly received the same logical
 block table and applied it to their own GPU-local KV pools.
 
-## Restore receipts
+## Invocation A: archived restore receipts
+
+```text
+target request: cmpl-b1e5ce73880bc9e9-0-83e5a0ae
+```
 
 ```text
 TP rank 0: 236.2813614308834 ms
@@ -41,7 +46,22 @@ include synchronous file loading, CPU-to-GPU copy, synchronization, and exact
 GPU readback. They are one debug run, not optimized online migration latency or
 a formal performance distribution.
 
-## Exact continuation check
+## Invocation B: server log and exact continuation
+
+The archived TP4 response ID is `cmpl-add60f533fead701`. The server log records
+the corresponding internal target request
+`cmpl-add60f533fead701-0-90eb9e46`, with exact readback on all ranks:
+
+```text
+TP rank 0: 171.014 ms
+TP rank 1: 183.836 ms
+TP rank 2: 179.394 ms
+TP rank 3: 105.398 ms
+```
+
+The archived TP1 control response ID is `cmpl-931eac258fd24ab5`. Both archived
+responses finished by the requested 32-token length and returned the following
+identical token IDs:
 
 The TP1 control and restored TP4 request both returned:
 
@@ -78,10 +98,20 @@ Phase 5 does not prove:
 - source cancellation, rollback, or iteration-boundary atomic takeover;
 - handoff stall or steady-state online migration performance.
 
-## Raw artifacts to archive
+## Raw artifact archive
 
-The server-side validation record is not complete until these files are copied
-into the project result archive:
+The downloaded archive is stored at:
+
+```text
+D:\work\bridgetp\vllm\phase5_validation_20260821.tar.gz
+D:\work\bridgetp\vllm\phase5_results\phase5_validation_20260821
+```
+
+All 17 entries listed in `SHA256SUMS` passed local verification. The environment
+snapshot records vLLM 0.23.0, PyTorch 2.11.0+cu130, and four
+NVIDIA A100-PCIE-40GB GPUs with driver 595.71.05.
+
+The archive contains:
 
 ```text
 phase5_receipts/<target-request-id>/tp_rank_0.json
@@ -94,3 +124,10 @@ phase5_receipts/<target-request-id>/tp_rank_3.json
 phase5_tp4_server.log
 git/environment/GPU identity snapshot
 ```
+
+The receipt JSON files belong to invocation A, while the server log and TP4
+response belong to invocation B. This happened because the archive command
+selected the first receipt directory after a repeat run. The records still
+provide two independent successful correctness observations, but they are not
+a single-run timing bundle. Phase 6 tooling must use unique run directories and
+must never select a receipt directory with an unqualified `find | head`.
