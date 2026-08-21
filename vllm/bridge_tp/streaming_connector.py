@@ -123,6 +123,14 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 "bridgetp_takeover_control_timeout_s", 600
             )
         )
+        configured_phase = self._kv_transfer_config.get_from_extra_config(
+            "bridgetp_stream_expected_phase", None
+        )
+        self.expected_phase = str(configured_phase) if configured_phase else (
+            "BridgeTP D3 Phase 7"
+            if self.takeover_control_path is not None
+            else "BridgeTP D3 Phase 6"
+        )
         parallel = vllm_config.parallel_config
         if parallel.tensor_parallel_size != 4:
             raise ValueError("BridgeTP Phase 6 requires tensor_parallel_size=4")
@@ -157,15 +165,10 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     f"Phase 6 manifest field {key} differs: "
                     f"{manifest.get(key)!r} != {value!r}"
                 )
-        expected_phase = (
-            "BridgeTP D3 Phase 7"
-            if self.takeover_control_path is not None
-            else "BridgeTP D3 Phase 6"
-        )
-        if manifest.get("phase") != expected_phase:
+        if manifest.get("phase") != self.expected_phase:
             raise ValueError(
                 "Stream manifest phase differs: "
-                f"{manifest.get('phase')!r} != {expected_phase!r}"
+                f"{manifest.get('phase')!r} != {self.expected_phase!r}"
             )
         if str(manifest["model"]) != self._target_model:
             raise ValueError("Phase 6 source and target model paths differ")
@@ -387,9 +390,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             phase7 = self.takeover_control_path is not None
             receipt = {
                 "format_version": 1,
-                "phase": (
-                    "BridgeTP D3 Phase 7" if phase7 else "BridgeTP D3 Phase 6"
-                ),
+                "phase": self.expected_phase,
                 "scope": (
                     "target-ready barrier before ownership commit"
                     if phase7

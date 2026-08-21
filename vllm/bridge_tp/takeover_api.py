@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Phase 7 control-plane API for commit, source abort, and rollback."""
+"""Phase 7/8 control-plane API for commit, source abort, and rollback."""
 
 from __future__ import annotations
 
@@ -53,11 +53,13 @@ def _configured_session() -> tuple[Path, str]:
 def _validate_body(
     body: dict[str, Any], run_dir: Path, migration_id: str
 ) -> dict[str, Any]:
-    manifest = _load_json(run_dir / "session_manifest.json")
+    session = _load_json(run_dir / "session_manifest.json")
+    staging_path = run_dir / "staging_manifest.json"
+    manifest = _load_json(staging_path) if staging_path.exists() else session
     expected = {
         "migration_id": migration_id,
-        "session_token": manifest["session_token"],
-        "source_request_id": manifest["source_request_id"],
+        "session_token": session["session_token"],
+        "source_request_id": session["source_request_id"],
     }
     for key, value in expected.items():
         if body.get(key) != value:
@@ -71,8 +73,14 @@ def _validate_body(
 def _validate_target_ready(
     run_dir: Path, migration_id: str
 ) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+    phase8 = (run_dir / "staging_manifest.json").exists()
+    sender_dir = (
+        run_dir / "stage_delivery_receipts"
+        if phase8
+        else run_dir / "sender_receipts"
+    )
     senders = [
-        _load_json(run_dir / "sender_receipts" / f"tp_rank_{rank}.json")
+        _load_json(sender_dir / f"tp_rank_{rank}.json")
         for rank in range(4)
     ]
     receiver_root = run_dir / "receiver_receipts"
@@ -104,6 +112,70 @@ def _validate_target_ready(
         if int(sender["payload_bytes"]) != int(receiver["payload_bytes"]):
             raise ValueError(f"TP rank {rank} payload byte count differs")
     return target_request_id, senders, receivers
+
+
+def _external_request_id(source_request_id: str) -> str:
+    if "-" not in source_request_id:
+        raise HTTPException(
+            status_code=HTTPStatus.CONFLICT,
+            detail="Source internal request ID cannot be mapped to external ID",
+        )
+    return source_request_id.rsplit("-", 1)[0]
+
+
+@router.post("/bridge_tp/v1/cleanup")
+async def cleanup(raw_request: Request) -> dict[str, Any]:
+    """Cancel a pre-cutover source and release Phase 8 staging resources."""
+    try:
+        body = await raw_request.json()
+    except json.JSONDecodeError as error:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail=f"JSON decode error: {error}",
+        ) from error
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="Request body must be a JSON object",
+        )
+    run_dir, migration_id = _configured_session()
+    manifest = _validate_body(body, run_dir, migration_id)
+    if manifest.get("phase") != "BridgeTP D3 Phase 8":
+        raise HTTPException(
+            status_code=HTTPStatus.CONFLICT,
+            detail="The cleanup endpoint is restricted to BridgeTP Phase 8",
+        )
+    async with _takeover_lock:
+        state_path = run_dir / "takeover_state.json"
+        state = _load_json(state_path)
+        if state.get("state") != "PREPARING":
+            raise HTTPException(
+                status_code=HTTPStatus.CONFLICT,
+                detail=f"Cannot clean up takeover state {state.get('state')}",
+            )
+        cleanup_request = {
+            "format_version": 1,
+            "phase": "BridgeTP D3 Phase 8",
+            "migration_id": migration_id,
+            "source_request_id": manifest["source_request_id"],
+            "reason": str(body.get("reason", "controller cancelled before cutover")),
+            "requested_unix_s": time.time(),
+        }
+        _atomic_json_dump(cleanup_request, run_dir / "cleanup_request.json")
+        source_external_request_id = _external_request_id(
+            str(manifest["source_request_id"])
+        )
+        await raw_request.app.state.engine_client.abort(source_external_request_id)
+        cancelled = {
+            **state,
+            "state": "CANCELLED",
+            "source_external_request_id": source_external_request_id,
+            "source_abort_dispatched": True,
+            "reason": cleanup_request["reason"],
+            "updated_unix_s": time.time(),
+        }
+        _atomic_json_dump(cancelled, state_path)
+        return cancelled
 
 
 @router.post("/bridge_tp/v1/takeover")
@@ -148,7 +220,7 @@ async def takeover(raw_request: Request) -> dict[str, Any]:
 
         base_state = {
             "format_version": 1,
-            "phase": "BridgeTP D3 Phase 7",
+        "phase": str(manifest.get("phase", "BridgeTP D3 Phase 7")),
             "scope": (
                 "application-level atomic handoff; no crash-consensus claim"
             ),
@@ -167,7 +239,7 @@ async def takeover(raw_request: Request) -> dict[str, Any]:
             }
             _atomic_json_dump(state, state_path)
             logger.warning(
-                "BridgeTP Phase 7 rolled back migration %s; source remains owner",
+                "BridgeTP takeover rolled back migration %s; source remains owner",
                 migration_id,
             )
             return state
@@ -183,12 +255,7 @@ async def takeover(raw_request: Request) -> dict[str, Any]:
             ) from error
 
         source_request_id = str(manifest["source_request_id"])
-        if "-" not in source_request_id:
-            raise HTTPException(
-                status_code=HTTPStatus.CONFLICT,
-                detail="Source internal request ID cannot be mapped to external ID",
-            )
-        source_external_request_id = source_request_id.rsplit("-", 1)[0]
+        source_external_request_id = _external_request_id(source_request_id)
         committing = {
             **base_state,
             "state": "COMMITTING",
@@ -209,7 +276,7 @@ async def takeover(raw_request: Request) -> dict[str, Any]:
         }
         _atomic_json_dump(committed, state_path)
         logger.warning(
-            "BridgeTP Phase 7 committed migration %s and aborted source %s",
+            "BridgeTP takeover committed migration %s and aborted source %s",
             migration_id,
             source_external_request_id,
         )
