@@ -59,7 +59,8 @@ raw shard bytes: 28,311,552
 exact roundtrip: true
 ```
 
-The final reshard artifact reported about 124.0 ms on this Windows CPU run.
+The Phase5-compatible reshard artifact reported about 133.8 ms on this Windows
+CPU run.
 That number includes Python tensor slicing, four `torch.save` operations,
 hashing, and an in-memory reconstruction check. It is not an A100 transfer
 measurement, an optimized migration result, or a formal performance sample.
