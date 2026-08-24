@@ -18,6 +18,7 @@ from typing import Any
 
 import torch
 
+from vllm.bridge_tp.runtime_control import RuntimeControl
 from vllm.bridge_tp.stream_protocol import (
     PROTOCOL_VERSION,
     deserialize_rank_payload,
@@ -353,10 +354,14 @@ class _DeliveryPublisher:
                     if hello.get(key) != value:
                         raise ValueError(f"delivery HELLO field {key} differs")
                 send_json(connection, self.header)
+                rate_provider = None
+                if RuntimeControl.path(self.run_dir).exists():
+                    rate_provider = self._current_per_rank_rate_bytes_s
                 transfer = send_payload_frames(
                     connection,
                     self.payload,
                     chunk_bytes=int(self.header["chunk_bytes"]),
+                    rate_provider=rate_provider,
                 )
                 acknowledgement = recv_json(connection)
                 if acknowledgement.get("status") != "READY":
@@ -384,6 +389,17 @@ class _DeliveryPublisher:
             )
             self.payload = b""
             self.listener.close()
+
+    def _current_per_rank_rate_bytes_s(self) -> float:
+        control = RuntimeControl.load(self.run_dir)
+        aggregate_rate = float(
+            self.manifest.get("aggregate_rate_limit_gib_s", 0.0)
+        )
+        if control is not None and control.rate_gib_s is not None:
+            aggregate_rate = control.rate_gib_s
+        if not aggregate_rate:
+            return 0.0
+        return aggregate_rate * 1024**3 / 4
 
 
 def _cleanup(run_dir: Path, reason: str, staged_ranks: int, deltas: int) -> None:

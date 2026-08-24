@@ -12,7 +12,7 @@ import secrets
 import socket
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -27,6 +27,11 @@ from vllm.bridge_tp.kv_export import (
     _ordered_layer_names,
 )
 from vllm.bridge_tp.kv_reshard import iter_tp_rank_shards
+from vllm.bridge_tp.runtime_control import (
+    ControlCache,
+    RuntimeControl,
+    mark_control_honored,
+)
 from vllm.bridge_tp.stream_protocol import (
     PROTOCOL_VERSION,
     recv_json,
@@ -42,7 +47,7 @@ logger = init_logger(__name__)
 _TRUE = {"1", "true", "yes", "on"}
 _published_request_ids: set[str] = set()
 _disabled_after_error = False
-_publishers: list["_RankPublisher"] = []
+_publishers: list[_RankPublisher] = []
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -78,9 +83,13 @@ class BridgeTPStreamConfig:
     socket_timeout_s: float
     pin_memory: bool
     strict: bool
+    # False only when a Phase 9 controller has published a control block that
+    # has not armed this migration yet.  Absent a control block this stays True,
+    # so Phase 6/7/8 runs behave exactly as before.
+    armed: bool = True
 
     @classmethod
-    def from_env(cls) -> "BridgeTPStreamConfig":
+    def from_env(cls) -> BridgeTPStreamConfig:
         migration_id = os.getenv("BRIDGETP_STREAM_MIGRATION_ID", "").strip()
         run_dir = os.getenv("BRIDGETP_STREAM_RUN_DIR", "").strip()
         enabled = _env_bool("BRIDGETP_STREAM_ENABLED", False)
@@ -130,18 +139,27 @@ class BridgeTPStreamConfig:
             raise ValueError("BridgeTP Phase 6 currently requires target TP=4")
         if not 0 < config.chunk_bytes <= 16 * 1024 * 1024:
             raise ValueError("BRIDGETP_STREAM_CHUNK_BYTES must be in [1, 16 MiB]")
-        if config.aggregate_rate_gib_s < 0:
+        config.validate_boundaries()
+        return config
+
+    def validate_boundaries(self) -> None:
+        """Checks that must hold for env values AND for controller overrides.
+
+        Phase 9 rewrites the rate and the two boundaries at runtime, so these
+        cannot live inside ``from_env`` alone or a bad control block would slip
+        through unvalidated.
+        """
+        if self.aggregate_rate_gib_s < 0:
             raise ValueError("BRIDGETP_STREAM_RATE_GIB_S cannot be negative")
-        if config.after_output_tokens <= 0:
+        if self.after_output_tokens <= 0:
             raise ValueError("Snapshot output-token boundary must be positive")
-        if config.phase8_enabled:
-            if not config.takeover_enabled:
+        if self.phase8_enabled:
+            if not self.takeover_enabled:
                 raise ValueError("BridgeTP Phase 8 requires takeover to be enabled")
-            if config.phase8_cutover_output_tokens <= config.after_output_tokens:
+            if self.phase8_cutover_output_tokens <= self.after_output_tokens:
                 raise ValueError(
                     "Phase 8 cutover boundary must follow the old-KV boundary"
                 )
-        return config
 
 
 def _phase_name(config: BridgeTPStreamConfig) -> str:
@@ -153,8 +171,57 @@ def _phase_name(config: BridgeTPStreamConfig) -> str:
 
 
 @lru_cache(maxsize=1)
-def get_bridge_tp_stream_config() -> BridgeTPStreamConfig:
+def get_bridge_tp_stream_env_config() -> BridgeTPStreamConfig:
+    """Environment baseline.  Immutable for the lifetime of the process."""
     return BridgeTPStreamConfig.from_env()
+
+
+@lru_cache(maxsize=1)
+def _control_cache(run_dir: str) -> ControlCache:
+    return ControlCache(run_dir)
+
+
+def get_bridge_tp_stream_config() -> BridgeTPStreamConfig:
+    """Environment baseline overlaid with the live Phase 9 control block.
+
+    Phase 6/7/8 froze the trigger boundary, the cutover boundary and the
+    migration rate at process start, which is correct when a human fixes them
+    before launching a run.  A Phase 9 controller has to change them while the
+    request is decoding, so this reads a control block from the run directory
+    on every call.  The cost is one ``stat`` per decode iteration; the JSON is
+    re-parsed only when the controller has actually published a new block.
+
+    When no control block exists the environment wins outright and ``armed`` is
+    True, so every existing Phase 6/7/8 run script keeps working unchanged.
+    """
+    base = get_bridge_tp_stream_env_config()
+    if not base.enabled:
+        return base
+    control = _control_cache(str(base.run_dir)).get()
+    if control is None:
+        return base
+    overlaid = replace(
+        base,
+        armed=bool(control.armed),
+        after_output_tokens=(
+            control.trigger_output_tokens
+            if control.trigger_output_tokens is not None
+            else base.after_output_tokens
+        ),
+        phase8_cutover_output_tokens=(
+            control.cutover_output_tokens
+            if control.cutover_output_tokens is not None
+            else base.phase8_cutover_output_tokens
+        ),
+        aggregate_rate_gib_s=(
+            control.rate_gib_s
+            if control.rate_gib_s is not None
+            else base.aggregate_rate_gib_s
+        ),
+    )
+    overlaid.validate_boundaries()
+    mark_control_honored(base.run_dir, control.generation)
+    return overlaid
 
 
 def _atomic_json_dump(value: dict[str, Any], path: Path) -> None:
@@ -222,18 +289,16 @@ class _RankPublisher:
                             f"{hello.get(key)!r} != {value!r}"
                         )
                 send_json(connection, self.header)
-                per_rank_rate = 0.0
-                if self.config.aggregate_rate_gib_s:
-                    per_rank_rate = (
-                        self.config.aggregate_rate_gib_s
-                        * 1024**3
-                        / self.config.target_tp_size
-                    )
+                per_rank_rate = self._current_per_rank_rate_bytes_s()
+                rate_provider = None
+                if RuntimeControl.path(self.config.run_dir).exists():
+                    rate_provider = self._current_per_rank_rate_bytes_s
                 transfer = send_payload_frames(
                     connection,
                     self.payload,
                     chunk_bytes=self.config.chunk_bytes,
                     rate_bytes_per_second=per_rank_rate,
+                    rate_provider=rate_provider,
                 )
                 acknowledgement = recv_json(connection)
                 if acknowledgement.get("status") != "READY":
@@ -271,6 +336,16 @@ class _RankPublisher:
             # The Phase 8 old-KV path must release its serialized source copy
             # after the CPU stager acknowledges it.
             self.payload = b""
+
+    def _current_per_rank_rate_bytes_s(self) -> float:
+        config = get_bridge_tp_stream_config()
+        if not config.aggregate_rate_gib_s:
+            return 0.0
+        return (
+            config.aggregate_rate_gib_s
+            * 1024**3
+            / config.target_tp_size
+        )
 
 
 def _publish_request(
@@ -502,6 +577,42 @@ def _publish_request(
     )
 
 
+def _publish_source_progress(
+    *,
+    config: BridgeTPStreamConfig,
+    request_id: str,
+    requests: dict[str, Any],
+    input_batch: Any,
+    scheduler_output: Any,
+) -> None:
+    """Publish the scheduler boundary observed by the Phase 9 controller."""
+    request_index = input_batch.req_id_to_index[request_id]
+    request = requests[request_id]
+    num_scheduled = int(scheduler_output.num_scheduled_tokens.get(request_id, 0))
+    num_computed = (
+        int(input_batch.num_computed_tokens_cpu[request_index]) + num_scheduled
+    )
+    num_known = int(request.num_tokens)
+    now = time.time()
+    arrival = getattr(request, "arrival_time", None)
+    if not isinstance(arrival, (int, float)):
+        arrival = now
+    _atomic_json_dump(
+        {
+            "format_version": 1,
+            "phase": "BridgeTP D3 Phase 9",
+            "source_request_id": request_id,
+            "num_prompt_tokens": int(request.num_prompt_tokens),
+            "num_output_tokens": len(request.output_token_ids),
+            "num_computed_tokens": num_computed,
+            "num_pending_tokens": num_known - num_computed,
+            "arrival_unix_s": float(arrival),
+            "updated_unix_s": now,
+        },
+        config.run_dir / "source_progress.json",
+    )
+
+
 def maybe_publish_kv_stream(
     *,
     kv_caches: list[torch.Tensor],
@@ -527,8 +638,19 @@ def maybe_publish_kv_stream(
             return
         request_id = request_ids[0]
         if _published_request_ids and request_id not in _published_request_ids:
-            # A dedicated validation server owns one migration session.  Later
-            # clean-control requests must not reuse its ports or run directory.
+            # A dedicated validation server owns one migration session. Later
+            # clean-control requests must not overwrite its progress evidence
+            # or reuse its ports and run directory.
+            return
+        if RuntimeControl.path(config.run_dir).exists():
+            _publish_source_progress(
+                config=config,
+                request_id=request_id,
+                requests=requests,
+                input_batch=input_batch,
+                scheduler_output=scheduler_output,
+            )
+        if not config.armed:
             return
         if request_id in _published_request_ids:
             if config.phase8_enabled:

@@ -25,6 +25,7 @@ from typing import Any
 import torch
 
 from vllm.bridge_tp.kv_export import _get_request_block_ids
+from vllm.bridge_tp.runtime_control import RuntimeControl
 from vllm.bridge_tp.stream_protocol import (
     PROTOCOL_VERSION,
     recv_json,
@@ -124,19 +125,23 @@ class _Phase8SourceState:
                     ),
                     timeout=min(5.0, self.config.socket_timeout_s),
                 )
-            except OSError:
+            except OSError as error:
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
                         f"timed out connecting to Phase 8 stager rank {rank}"
-                    )
+                    ) from error
                 time.sleep(0.02)
         with connection:
             connection.settimeout(self.config.socket_timeout_s)
             send_json(connection, work.header)
+            rate_provider = None
+            if RuntimeControl.path(self.config.run_dir).exists():
+                rate_provider = self._current_per_rank_rate_bytes_s
             transfer = send_payload_frames(
                 connection,
                 work.payload,
                 chunk_bytes=self.config.chunk_bytes,
+                rate_provider=rate_provider,
             )
             acknowledgement = recv_json(connection)
             if acknowledgement.get("status") != "STAGED":
@@ -160,6 +165,15 @@ class _Phase8SourceState:
             / "delta_sender_receipts"
             / f"tp_rank_{rank}_{work.start_token}_{work.end_token}.json",
         )
+
+    def _current_per_rank_rate_bytes_s(self) -> float:
+        control = RuntimeControl.load(self.config.run_dir)
+        aggregate_rate = self.config.aggregate_rate_gib_s
+        if control is not None and control.rate_gib_s is not None:
+            aggregate_rate = control.rate_gib_s
+        if not aggregate_rate:
+            return 0.0
+        return aggregate_rate * 1024**3 / self.config.target_tp_size
 
     def enqueue(
         self,
