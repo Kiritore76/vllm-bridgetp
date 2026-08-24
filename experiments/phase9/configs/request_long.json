@@ -1,0 +1,9 @@
+{
+  "model": "bridgetp-model",
+  "prompt": "Write a detailed technical explanation of tensor parallelism in large language model inference, covering KV cache sharding, collective communication patterns, and the tradeoffs between parallelism degree and aggregate throughput.",
+  "max_tokens": 512,
+  "temperature": 0.0,
+  "stream": true,
+  "bridgetp_group_id": null,
+  "bridgetp_group_longest": false
+}

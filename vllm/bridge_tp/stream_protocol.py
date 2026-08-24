@@ -11,7 +11,7 @@ import json
 import socket
 import struct
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
@@ -79,14 +79,22 @@ def send_payload_frames(
     *,
     chunk_bytes: int,
     rate_bytes_per_second: float = 0.0,
+    rate_provider: Callable[[], float] | None = None,
 ) -> dict[str, int | float | str]:
-    """Send an ordered, independently hashed sequence of payload frames."""
+    """Send an ordered, independently hashed sequence of payload frames.
+
+    ``rate_provider`` is evaluated once per frame and takes precedence over
+    ``rate_bytes_per_second``. This lets the Phase 9 controller adjust an
+    in-flight transfer without rebuilding the sender. A returned value of zero
+    preserves the existing unlimited-rate convention.
+    """
     if chunk_bytes <= 0 or chunk_bytes > _MAX_FRAME_BYTES:
         raise ValueError("chunk_bytes must be in [1, 16 MiB]")
     if rate_bytes_per_second < 0:
         raise ValueError("rate_bytes_per_second cannot be negative")
 
     started = time.perf_counter()
+    last_frame_completed = started
     frame_count = 0
     for sequence, offset in enumerate(range(0, len(payload), chunk_bytes)):
         chunk = payload[offset : offset + chunk_bytes]
@@ -94,7 +102,21 @@ def send_payload_frames(
         connection.sendall(_FRAME_HEADER.pack(sequence, len(chunk), digest))
         connection.sendall(chunk)
         frame_count += 1
-        if rate_bytes_per_second:
+        current_rate = (
+            float(rate_provider())
+            if rate_provider is not None
+            else rate_bytes_per_second
+        )
+        if current_rate < 0:
+            raise ValueError("dynamic rate_bytes_per_second cannot be negative")
+        if rate_provider is not None and current_rate:
+            target_frame_seconds = len(chunk) / current_rate
+            frame_elapsed = time.perf_counter() - last_frame_completed
+            delay = target_frame_seconds - frame_elapsed
+            if delay > 0:
+                time.sleep(delay)
+            last_frame_completed = time.perf_counter()
+        elif current_rate:
             target_elapsed = (offset + len(chunk)) / rate_bytes_per_second
             delay = target_elapsed - (time.perf_counter() - started)
             if delay > 0:

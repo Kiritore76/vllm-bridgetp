@@ -1,0 +1,54 @@
+{
+  "source_url": "http://127.0.0.1:8001",
+  "target_url": "http://127.0.0.1:8200",
+  "run_dir": "./runs/e1_holdback_seed0",
+  "block_size": 16,
+  "tp1_total_kv_blocks": 0,
+  "tp4_total_kv_blocks": 0,
+  "tick_s": 0.2,
+  "handoff_output_tokens": 32,
+  "proxy_mode": "HOLD_BACK",
+  "survival_table_path": "./calibration/survival_table.json",
+  "platform_note": "FILL IN: 5x A100-PCIe-40GB, single node, CPU-staged TCP",
+  "tpot_tp1": {
+    "base_s": 0.030,
+    "per_running_s": 0.0015,
+    "calibration_source": "FILL IN: P1-B run id + date"
+  },
+  "tpot_tp4": {
+    "base_s": 0.021,
+    "per_running_s": 0.0011,
+    "calibration_source": "FILL IN: P1-B run id + date"
+  },
+  "interference": {
+    "s_per_gib_at_ref": 1.25,
+    "ref_load_frac": 0.5,
+    "load_exponent": 2.0,
+    "calibration_source": "FILL IN: P2-D sweep run id + date"
+  },
+  "policy": {
+    "kv_bytes_per_token": 196608,
+    "theta_0": 0.60,
+    "theta_min": 0.15,
+    "alpha": 0.45,
+    "p_oom_force": 0.85,
+    "min_output_tokens_before_eligible": 32,
+    "max_concurrent_migrations": 1
+  },
+  "rate": {
+    "b_min_bytes_s": 429496729.6,
+    "b_max_bytes_s": 1288490188.8,
+    "b_start_bytes_s": 536870912.0,
+    "slo_p99_tpot_s": 0.080,
+    "control_period_s": 0.2
+  },
+  "slow": {
+    "ewma_alpha": 0.08,
+    "high_threshold": 0.65,
+    "low_threshold": 0.45,
+    "persistent_windows": 150,
+    "recovery_windows": 60,
+    "minimum_hold_s": 120.0,
+    "physical_reconfiguration": false
+  }
+}
