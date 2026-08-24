@@ -21,6 +21,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from vllm.bridge_tp.controller.audit import read_audit  # noqa: E402
+from vllm.bridge_tp.controller.token_equivalence import (  # noqa: E402
+    classify_token_equivalence,
+    first_divergence,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,6 +43,12 @@ def parse_args() -> argparse.Namespace:
         help="expected terminal path; commit is the strict E-1 default",
     )
     parser.add_argument("--json", action="store_true", help="emit machine-readable")
+    parser.add_argument(
+        "--tie-epsilon",
+        type=float,
+        default=1e-6,
+        help="maximum logprob distance from the maximum for a certified tie",
+    )
     return parser.parse_args()
 
 
@@ -228,15 +238,72 @@ def main() -> None:
             control = json.loads(args.control_tokens.read_text(encoding="utf-8"))
             emitted = token_ids if isinstance(token_ids, list) else []
             match = list(emitted) == list(control)
-            first_diff = next(
-                (i for i, (a, b) in enumerate(zip(emitted, control)) if a != b),
-                None,
-            )
-            report.add(
-                "correctness gate: token-identical to greedy control",
-                match,
-                "exact" if match else f"first divergence at index {first_diff}",
-            )
+            first_diff = first_divergence(list(emitted), list(control))
+            if match:
+                report.add(
+                    "correctness gate: exact or certified equal-logit tie",
+                    True,
+                    "EXACT: token-identical to greedy TP1 control",
+                )
+            else:
+                required_paths = {
+                    "target_response": run / "target_response.json",
+                    "control_response": run / "control_response.json",
+                    "token_text_map": run / "token_text_map.json",
+                    "probe_request": run / "topology_probe_request.json",
+                    "tp1_probe": run / "topology_probe_tp1.json",
+                    "tp4_probe": run / "topology_probe_tp4.json",
+                    "classification": run / "token_equivalence.json",
+                    "staging": run / "staging_manifest.json",
+                }
+                missing = [
+                    name for name, path in required_paths.items() if not path.exists()
+                ]
+                if missing:
+                    report.add(
+                        "correctness gate: exact or certified equal-logit tie",
+                        False,
+                        f"first divergence at {first_diff}; missing {missing}",
+                    )
+                else:
+                    raw = {
+                        name: json.loads(path.read_text(encoding="utf-8"))
+                        for name, path in required_paths.items()
+                    }
+                    staging = raw["staging"]
+                    num_prompt = int(staging["num_prompt_tokens"])
+                    known = [
+                        int(value) for value in staging["all_known_token_ids"]
+                    ]
+                    expected_prompt = (
+                        known[:num_prompt] + list(control)[: int(first_diff)]
+                    )
+                    classification = classify_token_equivalence(
+                        emitted=[int(value) for value in emitted],
+                        control=[int(value) for value in control],
+                        emitted_rows=list(stats.get("emitted") or []),
+                        cutover_index=int(stats["cutover_index"]),
+                        target_response=raw["target_response"],
+                        control_response=raw["control_response"],
+                        token_text_map=raw["token_text_map"],
+                        probe_request=raw["probe_request"],
+                        tp1_probe=raw["tp1_probe"],
+                        tp4_probe=raw["tp4_probe"],
+                        expected_probe_prompt=expected_prompt,
+                        tie_epsilon=args.tie_epsilon,
+                    )
+                    saved_matches = raw["classification"] == classification
+                    report.add(
+                        "correctness gate: tie classification reproducible",
+                        saved_matches,
+                        classification["classification"],
+                    )
+                    report.add(
+                        "correctness gate: exact or certified equal-logit tie",
+                        bool(classification["acceptable"]),
+                        f"{classification['classification']}: "
+                        f"{classification['reason']}",
+                    )
         else:
             report.add(
                 "correctness gate: clean TP1 control tokens supplied",
