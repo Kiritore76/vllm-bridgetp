@@ -193,6 +193,8 @@ def build_target_request(
             MIGRATION_PARAM: staging["migration_id"],
         },
     }
+    if "logprobs" in source_request:
+        target["logprobs"] = int(source_request["logprobs"])
     return target, cutover
 
 

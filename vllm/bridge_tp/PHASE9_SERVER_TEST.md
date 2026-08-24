@@ -20,12 +20,13 @@ python -m py_compile \
   vllm/bridge_tp/stream_protocol.py \
   vllm/bridge_tp/controller/*.py \
   tools/bridge_tp/run_phase9_controller.py \
+  tools/bridge_tp/probe_token_divergence.py \
   tools/bridge_tp/inspect_phase9_run.py
 
 python -m unittest discover -s tests -t . -p 'test_phase9_*.py'
 ```
 
-预期：86 项测试全部通过。
+预期：90 项测试全部通过。
 
 本分支只修改 Python，不修改 C++/CUDA 扩展。editable 安装下无需重新编译 vLLM，
 但所有 source、target、stager 进程都必须重启，才能加载新 Python 代码。
@@ -42,7 +43,25 @@ python -m unittest discover -s tests -t . -p 'test_phase9_*.py'
 - `COMMITTED` 和 source abort；
 - 组装输出与干净 TP1 control 逐 token 一致。
 
-任意一项失败都停止 Phase 9，不进入下面的 smoke。
+逐 token 对照若失败，不能只看总 `FAIL`：若增量覆盖、四 rank exact readback、
+`COMMITTED` 与 source abort 均通过，应保留该轮并检查首次分叉。只有双方 topology
+probe 都证明两个候选是并列最大 logprob，才归类为
+`TIE_EQUIVALENT_DIVERGENCE`；不得通过反复重跑挑选碰巧全等的运行。非并列分叉仍然
+停止 Phase 9。
+
+对保留下来的 Phase 8 回归目录运行：
+
+```bash
+python tools/bridge_tp/probe_token_divergence.py \
+  --run-dir "$PHASE8_DIR" \
+  --source-url http://127.0.0.1:8001 \
+  --target-url http://127.0.0.1:8200 \
+  --tokenizer "$PHASE8_MODEL" \
+  | tee "$PHASE8_DIR/token_equivalence_output.txt"
+```
+
+原 `inspection.json` 保持 `FAIL`，不覆盖；派生的 `token_equivalence.json` 单独记录
+该失败能否由双方并列最大 logprob 解释。
 
 ## 3. 创建 Phase 9 工程 smoke session
 
@@ -281,7 +300,27 @@ print('control tokens:', len(tokens))
 PY
 ```
 
-## 10. 严格验收
+## 10. 生成 exact/tie token 等价证据
+
+若 unified response 与 control 完全一致，本工具直接记录 `EXACT`。若不一致，工具在
+首个共同前缀上分别向 TP1、TP4 发起一个无迁移、单 token、greedy、带 top-20
+logprob 的 topology probe。只有 control token 和 target token 在两边都处于并列最大
+logprob，才签发 `TIE_EQUIVALENT_DIVERGENCE`；缺失 logprob 或普通分叉直接失败。
+
+```bash
+python tools/bridge_tp/probe_token_divergence.py \
+  --run-dir "$PHASE9_DIR" \
+  --source-url http://127.0.0.1:8001 \
+  --target-url http://127.0.0.1:8200 \
+  --tokenizer "$PHASE9_MODEL" \
+  | tee "$PHASE9_DIR/token_equivalence_output.txt"
+```
+
+正式 source/target 请求不启用 logprobs，避免改变 handoff/TPOT 测量开销。只有发生
+分叉后才运行上述两个单 token probe。原始 probe request/response、tokenizer映射与
+复算结果都会保存在运行目录，不能只保留最终分类。
+
+## 11. 严格验收
 
 ```bash
 source /root/autodl-tmp/bridgetp/phase9_session.env
@@ -301,10 +340,14 @@ python tools/bridge_tp/inspect_phase9_run.py \
 - source 和 target 都贡献客户端可见 token；
 - `unified_response.jsonl` 是实时追加的客户端可见流，并与最终 proxy 状态一致；
 - 全局 token index 无缺口、无重复；
-- 与干净 TP1 control 逐 token 完全相同；
+- 与干净 TP1 control 逐 token完全相同，或者首分叉具有可复算的双方并列最大
+  logprob证书；
 - audit 终态为 `TAKEOVER`，无 invariant violation。
 
-## 11. smoke 通过后再开始正式标定
+`EXACT` 和 `TIE_EQUIVALENT_DIVERGENCE` 必须分开统计。后者只解除“KV损坏”的误报，
+不能写成与TP1 counterfactual逐token完全一致。
+
+## 12. smoke 通过后再开始正式标定
 
 工程 smoke 只回答在线闭环能否工作，不能写论文。正式顺序是：
 

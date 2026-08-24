@@ -27,6 +27,10 @@ from vllm.bridge_tp.controller.online_io import (
 from vllm.bridge_tp.controller.policy import InterferenceModel, TpotModel
 from vllm.bridge_tp.controller.response_proxy import ProxyMode
 from vllm.bridge_tp.controller.state_machine import MigrationStateMachine
+from vllm.bridge_tp.controller.token_equivalence import (
+    classify_token_equivalence,
+    first_divergence,
+)
 
 
 class TestProxyRecorder(unittest.TestCase):
@@ -73,7 +77,7 @@ class TestProxyRecorder(unittest.TestCase):
 
 class TestOnlineArtifacts(unittest.TestCase):
     def test_target_request_uses_staging_boundary(self) -> None:
-        source = {"model": "m", "max_tokens": 100}
+        source = {"model": "m", "max_tokens": 100, "logprobs": 20}
         staging = {
             "snapshot_num_output_tokens": 40,
             "all_known_token_ids": [1, 2, 3],
@@ -82,6 +86,7 @@ class TestOnlineArtifacts(unittest.TestCase):
         request, cutover = build_target_request(source, staging, "run")
         self.assertEqual(cutover, 40)
         self.assertEqual(request["max_tokens"], 60)
+        self.assertEqual(request["logprobs"], 20)
         self.assertEqual(
             request["kv_transfer_params"]["bridgetp_migration_id"],
             "migration",
@@ -95,6 +100,143 @@ class TestOnlineArtifacts(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(honored_generation(path), 7)
+
+
+class TestTokenEquivalence(unittest.TestCase):
+    @staticmethod
+    def completion(
+        token_ids: list[int],
+        texts: list[str],
+        tops: list[dict[str, float]],
+    ) -> dict:
+        return {
+            "choices": [
+                {
+                    "token_ids": token_ids,
+                    "logprobs": {
+                        "tokens": texts,
+                        "top_logprobs": tops,
+                    },
+                }
+            ]
+        }
+
+    def test_exact_match_needs_no_tie_evidence(self) -> None:
+        result = classify_token_equivalence(
+            emitted=[1, 2],
+            control=[1, 2],
+            emitted_rows=[],
+            cutover_index=1,
+            target_response=None,
+            control_response=None,
+            token_text_map=None,
+            probe_request=None,
+            tp1_probe=None,
+            tp4_probe=None,
+            expected_probe_prompt=None,
+        )
+        self.assertEqual(result["classification"], "EXACT")
+        self.assertTrue(result["acceptable"])
+
+    def test_equal_maximum_is_certified_on_both_topologies(self) -> None:
+        tied = {" necessary": -1.0, " essential": -1.0, " other": -3.0}
+        control = self.completion(
+            [10, 20, 40],
+            [" a", " b", " necessary"],
+            [{" a": 0.0}, {" b": 0.0}, tied],
+        )
+        target = {
+            "token_ids": [30],
+            "chunks": [
+                {
+                    "choices": [
+                        {
+                            "token_ids": [30],
+                            "logprobs": {
+                                "tokens": [" essential"],
+                                "top_logprobs": [tied],
+                            },
+                        }
+                    ]
+                }
+            ]
+        }
+        probe = self.completion([40], [" necessary"], [tied])
+        prompt = [101, 102, 10, 20]
+        result = classify_token_equivalence(
+            emitted=[10, 20, 30],
+            control=[10, 20, 40],
+            emitted_rows=[
+                {"index": 0, "origin": "source"},
+                {"index": 1, "origin": "source"},
+                {"index": 2, "origin": "target"},
+            ],
+            cutover_index=2,
+            target_response=target,
+            control_response=control,
+            token_text_map={
+                "control_token_id": 40,
+                "target_token_id": 30,
+                "tokens": {"40": " necessary", "30": " essential"},
+            },
+            probe_request={
+                "prompt": prompt,
+                "max_tokens": 1,
+                "temperature": 0,
+            },
+            tp1_probe=probe,
+            tp4_probe=probe,
+            expected_probe_prompt=prompt,
+        )
+        self.assertEqual(
+            result["classification"],
+            "TIE_EQUIVALENT_DIVERGENCE",
+        )
+        self.assertTrue(result["tie_certified"])
+        self.assertTrue(result["acceptable"])
+
+    def test_non_tied_divergence_fails_closed(self) -> None:
+        tied = {" necessary": -1.0, " essential": -1.1}
+        control = self.completion([40], [" necessary"], [tied])
+        target = {
+            "token_ids": [30],
+            "chunks": [
+                {
+                    "choices": [
+                        {
+                            "token_ids": [30],
+                            "logprobs": {
+                                "tokens": [" essential"],
+                                "top_logprobs": [tied],
+                            },
+                        }
+                    ]
+                }
+            ]
+        }
+        probe = self.completion([40], [" necessary"], [tied])
+        result = classify_token_equivalence(
+            emitted=[30],
+            control=[40],
+            emitted_rows=[{"index": 0, "origin": "target"}],
+            cutover_index=0,
+            target_response=target,
+            control_response=control,
+            token_text_map={
+                "control_token_id": 40,
+                "target_token_id": 30,
+                "tokens": {"40": " necessary", "30": " essential"},
+            },
+            probe_request={"prompt": [9], "max_tokens": 1, "temperature": 0},
+            tp1_probe=probe,
+            tp4_probe=probe,
+            expected_probe_prompt=[9],
+        )
+        self.assertEqual(result["classification"], "UNPROVEN_DIVERGENCE")
+        self.assertFalse(result["acceptable"])
+
+    def test_first_divergence_includes_length_only_mismatch(self) -> None:
+        self.assertEqual(first_divergence([1], [1, 2]), 1)
 
 
 class TestDynamicRateProvider(unittest.TestCase):
