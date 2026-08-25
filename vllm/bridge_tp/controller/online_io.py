@@ -14,6 +14,10 @@ from pathlib import Path
 from typing import Any
 
 from .response_proxy import EmittedToken, ProxyMode, ResponseProxy
+from .sampling_contract import (
+    freeze_strict_greedy_sampling,
+    strict_greedy_sampling_errors,
+)
 
 TokenSink = Callable[[int, int, float], None]
 MIGRATION_PARAM = "bridgetp_migration_id"
@@ -176,23 +180,30 @@ def build_target_request(
     staging: dict[str, Any],
     run_name: str,
 ) -> tuple[dict[str, Any], int]:
+    source_errors = strict_greedy_sampling_errors(source_request)
+    if source_errors:
+        raise ValueError(
+            "source request does not carry the Phase 9 sampling contract: "
+            + "; ".join(source_errors)
+        )
     cutover = int(staging["snapshot_num_output_tokens"])
     remaining = int(source_request["max_tokens"]) - cutover
     if remaining <= 0:
         raise ValueError("source max_tokens leaves no post-cutover target tokens")
-    target = {
-        "model": source_request["model"],
-        "request_id": f"bridgetp-phase9-target-{run_name}",
-        "prompt": staging["all_known_token_ids"],
-        "max_tokens": remaining,
-        "temperature": 0,
-        "ignore_eos": bool(source_request.get("ignore_eos", False)),
-        "stream": True,
-        "return_token_ids": True,
-        "kv_transfer_params": {
-            MIGRATION_PARAM: staging["migration_id"],
-        },
-    }
+    target = freeze_strict_greedy_sampling(
+        {
+            "model": source_request["model"],
+            "request_id": f"bridgetp-phase9-target-{run_name}",
+            "prompt": staging["all_known_token_ids"],
+            "max_tokens": remaining,
+            "ignore_eos": bool(source_request.get("ignore_eos", False)),
+            "stream": True,
+            "return_token_ids": True,
+            "kv_transfer_params": {
+                MIGRATION_PARAM: staging["migration_id"],
+            },
+        }
+    )
     if "logprobs" in source_request:
         target["logprobs"] = int(source_request["logprobs"])
     return target, cutover

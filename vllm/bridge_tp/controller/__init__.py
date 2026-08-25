@@ -31,6 +31,11 @@ from .policy import (
 from .predictor import SurvivalTable
 from .rate_controller import RateConfig, RateController
 from .response_proxy import ProxyMode, ResponseProxy, StreamViolation
+from .sampling_contract import (
+    STRICT_GREEDY_SAMPLING_CONTRACT,
+    freeze_strict_greedy_sampling,
+    strict_greedy_sampling_errors,
+)
 from .state_machine import IllegalTransition, MigrationStateMachine
 
 __all__ = [
@@ -50,8 +55,11 @@ __all__ = [
     "ResponseProxy",
     "RiskTracker",
     "SourceRequestView",
+    "STRICT_GREEDY_SAMPLING_CONTRACT",
     "StreamViolation",
     "SurvivalTable",
     "TpotModel",
+    "freeze_strict_greedy_sampling",
     "read_audit",
+    "strict_greedy_sampling_errors",
 ]

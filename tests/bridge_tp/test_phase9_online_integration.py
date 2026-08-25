@@ -11,7 +11,11 @@ import types
 import unittest
 from pathlib import Path
 
-from tools.bridge_tp.run_phase9_controller import step_handoff, step_local
+from tools.bridge_tp.run_phase9_controller import (
+    _prepare_source_request,
+    step_handoff,
+    step_local,
+)
 from vllm.bridge_tp.controller.action_adapter import ActionAdapter
 from vllm.bridge_tp.controller.config import ControllerConfig
 from vllm.bridge_tp.controller.events import (
@@ -26,6 +30,11 @@ from vllm.bridge_tp.controller.online_io import (
 )
 from vllm.bridge_tp.controller.policy import InterferenceModel, TpotModel
 from vllm.bridge_tp.controller.response_proxy import ProxyMode
+from vllm.bridge_tp.controller.sampling_contract import (
+    STRICT_GREEDY_SAMPLING_CONTRACT,
+    freeze_strict_greedy_sampling,
+    strict_greedy_sampling_errors,
+)
 from vllm.bridge_tp.controller.state_machine import MigrationStateMachine
 from vllm.bridge_tp.controller.token_equivalence import (
     classify_token_equivalence,
@@ -77,7 +86,9 @@ class TestProxyRecorder(unittest.TestCase):
 
 class TestOnlineArtifacts(unittest.TestCase):
     def test_target_request_uses_staging_boundary(self) -> None:
-        source = {"model": "m", "max_tokens": 100, "logprobs": 20}
+        source = freeze_strict_greedy_sampling(
+            {"model": "m", "max_tokens": 100, "logprobs": 20}
+        )
         staging = {
             "snapshot_num_output_tokens": 40,
             "all_known_token_ids": [1, 2, 3],
@@ -91,6 +102,29 @@ class TestOnlineArtifacts(unittest.TestCase):
             request["kv_transfer_params"]["bridgetp_migration_id"],
             "migration",
         )
+        self.assertFalse(strict_greedy_sampling_errors(request))
+
+    def test_source_request_freezes_model_sampling_defaults(self) -> None:
+        source = {
+            "model": "m",
+            "prompt": "p",
+            "max_tokens": 100,
+            "temperature": 0.0,
+        }
+        request = _prepare_source_request(source, Path("run"))
+        for key, expected in STRICT_GREEDY_SAMPLING_CONTRACT.items():
+            self.assertEqual(request[key], expected)
+        self.assertFalse(strict_greedy_sampling_errors(request))
+
+    def test_source_request_rejects_explicit_repetition_penalty(self) -> None:
+        source = {
+            "model": "m",
+            "prompt": "p",
+            "max_tokens": 100,
+            "repetition_penalty": 1.05,
+        }
+        with self.assertRaisesRegex(ValueError, "repetition_penalty"):
+            _prepare_source_request(source, Path("run"))
 
     def test_honored_marker_is_generation_specific(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -120,6 +154,12 @@ class TestTokenEquivalence(unittest.TestCase):
                 }
             ]
         }
+
+    @staticmethod
+    def probe_request(prompt: list[int]) -> dict:
+        return freeze_strict_greedy_sampling(
+            {"prompt": prompt, "max_tokens": 1}
+        )
 
     def test_exact_match_needs_no_tie_evidence(self) -> None:
         result = classify_token_equivalence(
@@ -179,14 +219,11 @@ class TestTokenEquivalence(unittest.TestCase):
                 "target_token_id": 30,
                 "tokens": {"40": " necessary", "30": " essential"},
             },
-            probe_request={
-                "prompt": prompt,
-                "max_tokens": 1,
-                "temperature": 0,
-            },
+            probe_request=self.probe_request(prompt),
             tp1_probe=probe,
             tp4_probe=probe,
             expected_probe_prompt=prompt,
+            require_strict_sampling_contract=True,
         )
         self.assertEqual(
             result["classification"],
@@ -227,13 +264,103 @@ class TestTokenEquivalence(unittest.TestCase):
                 "target_token_id": 30,
                 "tokens": {"40": " necessary", "30": " essential"},
             },
-            probe_request={"prompt": [9], "max_tokens": 1, "temperature": 0},
+            probe_request=self.probe_request([9]),
+            tp1_probe=probe,
+            tp4_probe=probe,
+            expected_probe_prompt=[9],
+            require_strict_sampling_contract=True,
+        )
+        self.assertEqual(result["classification"], "UNPROVEN_DIVERGENCE")
+        self.assertFalse(result["acceptable"])
+
+    def test_probe_with_inherited_penalty_fails_closed(self) -> None:
+        tied = {" necessary": -1.0, " essential": -1.0}
+        control = self.completion([40], [" necessary"], [tied])
+        target = {
+            "token_ids": [30],
+            "chunks": [
+                {
+                    "choices": [
+                        {
+                            "token_ids": [30],
+                            "logprobs": {
+                                "tokens": [" essential"],
+                                "top_logprobs": [tied],
+                            },
+                        }
+                    ]
+                }
+            ],
+        }
+        probe = self.completion([40], [" necessary"], [tied])
+        contaminated = self.probe_request([9])
+        contaminated["repetition_penalty"] = 1.05
+        result = classify_token_equivalence(
+            emitted=[30],
+            control=[40],
+            emitted_rows=[{"index": 0, "origin": "target"}],
+            cutover_index=0,
+            target_response=target,
+            control_response=control,
+            token_text_map={
+                "control_token_id": 40,
+                "target_token_id": 30,
+                "tokens": {"40": " necessary", "30": " essential"},
+            },
+            probe_request=contaminated,
+            tp1_probe=probe,
+            tp4_probe=probe,
+            expected_probe_prompt=[9],
+            require_strict_sampling_contract=True,
+        )
+        self.assertEqual(result["classification"], "UNPROVEN_DIVERGENCE")
+        self.assertIn("sampling contract differs", result["reason"])
+
+    def test_phase8_classifier_keeps_legacy_probe_boundary(self) -> None:
+        tied = {" necessary": -1.0, " essential": -1.0}
+        control = self.completion([40], [" necessary"], [tied])
+        target = {
+            "token_ids": [30],
+            "chunks": [
+                {
+                    "choices": [
+                        {
+                            "token_ids": [30],
+                            "logprobs": {
+                                "tokens": [" essential"],
+                                "top_logprobs": [tied],
+                            },
+                        }
+                    ]
+                }
+            ],
+        }
+        probe = self.completion([40], [" necessary"], [tied])
+        result = classify_token_equivalence(
+            emitted=[30],
+            control=[40],
+            emitted_rows=[{"index": 0, "origin": "target"}],
+            cutover_index=0,
+            target_response=target,
+            control_response=control,
+            token_text_map={
+                "control_token_id": 40,
+                "target_token_id": 30,
+                "tokens": {"40": " necessary", "30": " essential"},
+            },
+            probe_request={
+                "prompt": [9],
+                "max_tokens": 1,
+                "temperature": 0.0,
+            },
             tp1_probe=probe,
             tp4_probe=probe,
             expected_probe_prompt=[9],
         )
-        self.assertEqual(result["classification"], "UNPROVEN_DIVERGENCE")
-        self.assertFalse(result["acceptable"])
+        self.assertEqual(
+            result["classification"],
+            "TIE_EQUIVALENT_DIVERGENCE",
+        )
 
     def test_first_divergence_includes_length_only_mismatch(self) -> None:
         self.assertEqual(first_divergence([1], [1, 2]), 1)

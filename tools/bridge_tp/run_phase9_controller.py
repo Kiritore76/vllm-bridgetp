@@ -44,6 +44,9 @@ from vllm.bridge_tp.controller.policy import FastPolicy, RiskTracker  # noqa: E4
 from vllm.bridge_tp.controller.predictor import SurvivalTable  # noqa: E402
 from vllm.bridge_tp.controller.rate_controller import RateController  # noqa: E402
 from vllm.bridge_tp.controller.response_proxy import ProxyMode  # noqa: E402
+from vllm.bridge_tp.controller.sampling_contract import (  # noqa: E402
+    freeze_strict_greedy_sampling,
+)
 from vllm.bridge_tp.controller.state_machine import (  # noqa: E402
     IllegalTransition,
     MigrationRecord,
@@ -86,11 +89,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def _prepare_source_request(source: dict[str, Any], run_dir: Path) -> dict[str, Any]:
-    request = dict(source)
+    request = freeze_strict_greedy_sampling(source)
     request.update(
         {
             "request_id": f"bridgetp-phase9-{run_dir.name}",
-            "temperature": 0,
             "stream": True,
             "return_token_ids": True,
         }

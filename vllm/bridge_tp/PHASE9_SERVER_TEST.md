@@ -10,14 +10,15 @@ cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 
 git fetch origin
-git switch bridgetp/d3-phase9-online-controller
-git pull --ff-only origin bridgetp/d3-phase9-online-controller
+git switch bridgetp/d3-phase9-greedy-contract
+git pull --ff-only origin bridgetp/d3-phase9-greedy-contract
 
 python -m py_compile \
   vllm/bridge_tp/runtime_control.py \
   vllm/bridge_tp/kv_stream.py \
   vllm/bridge_tp/phase8_source.py \
   vllm/bridge_tp/stream_protocol.py \
+  vllm/bridge_tp/controller/sampling_contract.py \
   vllm/bridge_tp/controller/*.py \
   tools/bridge_tp/run_phase9_controller.py \
   tools/bridge_tp/probe_token_divergence.py \
@@ -26,7 +27,12 @@ python -m py_compile \
 python -m unittest discover -s tests -t . -p 'test_phase9_*.py'
 ```
 
-预期：90 项测试全部通过。
+预期：Phase 9 测试全部通过。
+
+Phase 9 不得只依赖 `temperature=0`。Qwen 的 `generation_config.json` 含有
+`repetition_penalty=1.05`，而 vLLM 默认返回 penalty 之前的 raw logprobs。
+Controller 会为 source 和 target 显式冻结无 penalty 的 strict-greedy
+contract；inspector 会拒绝缺字段或继承模型 sampling default 的运行。
 
 本分支只修改 Python，不修改 C++/CUDA 扩展。editable 安装下无需重新编译 vLLM，
 但所有 source、target、stager 进程都必须重启，才能加载新 Python 代码。
@@ -285,6 +291,9 @@ run = Path(sys.argv[1])
 payload = json.loads((run / 'source_request.json').read_text())
 payload.pop('request_id', None)
 payload['stream'] = False
+(run / 'control_request.json').write_text(
+    json.dumps(payload, indent=2) + '\n'
+)
 request = urllib.request.Request(
     'http://127.0.0.1:8001/v1/completions',
     data=json.dumps(payload).encode(),
@@ -334,6 +343,8 @@ python tools/bridge_tp/inspect_phase9_run.py \
 
 关键证据缺失会直接 FAIL，不再以 SKIP 算通过。必须同时满足：
 
+- source、target、control（发生分叉时还包括 probe）都携带完整的无
+  penalty strict-greedy sampling contract；
 - controller 决策输入、benefit、cost、动作齐全；
 - 四 rank exact readback；
 - `COMMITTED` 且 source abort；

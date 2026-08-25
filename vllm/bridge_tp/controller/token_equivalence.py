@@ -2,15 +2,19 @@
 """Classify greedy counterfactual token divergence without hiding failures.
 
 An exact TP1-control match remains the strongest result.  A mismatch can only
-be classified as an equal-logit tie when raw TP1 and TP4 topology probes both
-place the two emitted token strings at the maximum logprob.  Missing evidence
-is a failure, never an implicit tie.
+be classified as an equal-logit tie when TP1 and TP4 topology probes both place
+the two emitted token strings at the maximum logprob.  Phase 9 callers require
+the strict greedy contract, which disables penalties so vLLM raw logprobs are
+also the logits used for argmax.  Missing or contaminated evidence is a
+failure.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+
+from .sampling_contract import strict_greedy_sampling_errors
 
 
 @dataclass(frozen=True)
@@ -74,6 +78,7 @@ def classify_token_equivalence(
     tp4_probe: dict[str, Any] | None,
     expected_probe_prompt: list[int] | None,
     tie_epsilon: float = 1e-6,
+    require_strict_sampling_contract: bool = False,
 ) -> dict[str, Any]:
     """Return an auditable exact/tie/failure classification.
 
@@ -166,10 +171,16 @@ def classify_token_equivalence(
         expected_probe_prompt or []
     ):
         return _unproven(base, "topology probe prompt is not the common prefix")
-    if int(request.get("max_tokens", 0)) != 1 or float(
-        request.get("temperature", -1)
-    ) != 0.0:
+    if int(request.get("max_tokens", 0)) != 1:
         return _unproven(base, "topology probe is not one-token greedy decode")
+    if require_strict_sampling_contract:
+        contract_errors = strict_greedy_sampling_errors(request)
+        if contract_errors:
+            return _unproven(
+                base,
+                "topology probe sampling contract differs: "
+                + "; ".join(contract_errors),
+            )
 
     tie_details = []
     for name, probe in (("tp1", tp1_records[0]), ("tp4", tp4_records[0])):
