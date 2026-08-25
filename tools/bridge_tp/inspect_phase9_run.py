@@ -21,6 +21,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from vllm.bridge_tp.controller.audit import read_audit  # noqa: E402
+from vllm.bridge_tp.controller.sampling_contract import (  # noqa: E402
+    strict_greedy_sampling_detail,
+    strict_greedy_sampling_errors,
+)
 from vllm.bridge_tp.controller.token_equivalence import (  # noqa: E402
     classify_token_equivalence,
     first_divergence,
@@ -94,6 +98,32 @@ def main() -> None:
         raise SystemExit(1)
     records = list(read_audit(audit_path))
     report.add("audit log present", True, f"{len(records)} records")
+
+    # Sampling defaults from a model generation_config are not acceptable
+    # evidence. In particular, a repetition penalty makes vLLM's default raw
+    # logprobs differ from the logits used by greedy sampling.
+    request_paths = [("source", run / "source_request.json", True)]
+    request_paths.append(
+        ("target", run / "target_request.json", args.expect == "commit")
+    )
+    if args.control_tokens is not None:
+        request_paths.append(("control", run / "control_request.json", True))
+    for role, path, required_path in request_paths:
+        if not path.exists():
+            if required_path:
+                report.add(
+                    f"sampling contract: {role} request",
+                    False,
+                    f"{path.name} missing",
+                )
+            continue
+        request_value = json.loads(path.read_text(encoding="utf-8"))
+        errors = strict_greedy_sampling_errors(request_value)
+        report.add(
+            f"sampling contract: {role} request",
+            not errors,
+            strict_greedy_sampling_detail(request_value),
+        )
 
     kinds = [r.get("kind") for r in records]
     decisions = [r for r in records if r.get("kind") == "decision"]
@@ -291,6 +321,7 @@ def main() -> None:
                         tp4_probe=raw["tp4_probe"],
                         expected_probe_prompt=expected_prompt,
                         tie_epsilon=args.tie_epsilon,
+                        require_strict_sampling_contract=True,
                     )
                     saved_matches = raw["classification"] == classification
                     report.add(

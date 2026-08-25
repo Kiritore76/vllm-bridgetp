@@ -18,6 +18,10 @@ from vllm.bridge_tp.controller.online_io import (  # noqa: E402
     atomic_json_dump,
     load_json,
 )
+from vllm.bridge_tp.controller.sampling_contract import (  # noqa: E402
+    freeze_strict_greedy_sampling,
+    strict_greedy_sampling_errors,
+)
 from vllm.bridge_tp.controller.token_equivalence import (  # noqa: E402
     classify_token_equivalence,
     first_divergence,
@@ -70,7 +74,14 @@ def main() -> None:
     staging = load_json(run / "staging_manifest.json")
     proxy_path = run / "response_proxy_stats.json"
     phase8_path = run / "phase8_result.json"
-    if proxy_path.exists():
+    is_phase9 = proxy_path.exists()
+    if is_phase9:
+        source_errors = strict_greedy_sampling_errors(source_request)
+        if source_errors:
+            raise ValueError(
+                "source request does not carry the Phase 9 sampling "
+                "contract: " + "; ".join(source_errors)
+            )
         stats = load_json(proxy_path)
         emitted = [int(value) for value in stats.get("token_ids") or []]
         emitted_rows = list(stats.get("emitted") or [])
@@ -133,16 +144,21 @@ def main() -> None:
         num_prompt = int(staging["num_prompt_tokens"])
         known = [int(value) for value in staging["all_known_token_ids"]]
         expected_prompt = known[:num_prompt] + control[:divergence]
-        probe_request = {
+        probe_base = {
             "model": source_request["model"],
             "prompt": expected_prompt,
             "max_tokens": 1,
-            "temperature": 0,
+            "temperature": 0.0,
             "ignore_eos": True,
             "stream": False,
             "return_token_ids": True,
             "logprobs": args.logprobs,
         }
+        probe_request = (
+            freeze_strict_greedy_sampling(probe_base)
+            if is_phase9
+            else probe_base
+        )
         tp1_probe = _post(args.source_url, probe_request, args.timeout_s)
         tp4_probe = _post(args.target_url, probe_request, args.timeout_s)
         atomic_json_dump(probe_request, run / "topology_probe_request.json")
@@ -163,6 +179,7 @@ def main() -> None:
         tp4_probe=tp4_probe,
         expected_probe_prompt=expected_prompt,
         tie_epsilon=args.tie_epsilon,
+        require_strict_sampling_contract=is_phase9,
     )
     atomic_json_dump(classification, run / "token_equivalence.json")
     print(json.dumps(classification, ensure_ascii=False, indent=2))
