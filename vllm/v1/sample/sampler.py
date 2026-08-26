@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A layer that samples the next tokens from the model's outputs."""
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 
@@ -75,8 +77,11 @@ class Sampler(nn.Module):
         sampling_metadata: SamplingMetadata,
         predict_bonus_token: bool = False,
         logprobs_mode_override: LogprobsMode | None = None,
+        bridgetp_logit_observer: Any | None = None,
     ) -> SamplerOutput:
         logprobs_mode = logprobs_mode_override or self.logprobs_mode
+        if bridgetp_logit_observer is not None:
+            bridgetp_logit_observer.capture("raw", logits)
         # NOTE(woosuk): Use the original logits (before any penalties or
         # temperature scaling) for the top-k logprobs.
         # This is different from the V0 sampler, which uses the logits that
@@ -98,6 +103,8 @@ class Sampler(nn.Module):
         logits = self.apply_logits_processors(
             logits, sampling_metadata, predict_bonus_token
         )
+        if bridgetp_logit_observer is not None:
+            bridgetp_logit_observer.capture("processed", logits)
         # Sample the next token.
         sampled, processed_logprobs = self.sample(logits, sampling_metadata)
         if processed_logprobs is not None:
@@ -107,6 +114,8 @@ class Sampler(nn.Module):
         # This conversion is necessary because FlashInfer sampling operations
         # return int32 (while PyTorch argmax and topk return int64).
         sampled = sampled.long()
+        if bridgetp_logit_observer is not None:
+            bridgetp_logit_observer.finalize(sampled)
 
         # Handle logprob_token_ids if specified (more efficient than full vocab)
         # This is used by generative_scoring API to get logprobs for specific tokens

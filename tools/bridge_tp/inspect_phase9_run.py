@@ -59,6 +59,7 @@ def parse_args() -> argparse.Namespace:
 class Report:
     def __init__(self) -> None:
         self.checks: list[tuple[str, bool, str]] = []
+        self.tiered_evidence: dict = {}
 
     def add(self, name: str, ok: bool, detail: str = "") -> None:
         self.checks.append((name, ok, detail))
@@ -74,6 +75,11 @@ class Report:
             lines.append(f"[{mark}] {name}" + (f" -- {detail}" if detail else ""))
         lines.append("")
         lines.append("RESULT: " + ("PASS" if self.passed else "FAIL"))
+        if self.tiered_evidence:
+            lines.append("")
+            lines.append("TIERED EVIDENCE (does not rewrite the legacy result):")
+            for name, value in self.tiered_evidence.items():
+                lines.append(f"  {name}: {value.get('status')}")
         return "\n".join(lines)
 
     def to_json(self) -> dict:
@@ -83,6 +89,7 @@ class Report:
                 {"name": n, "status": ("pass" if o else "fail"), "detail": d}
                 for n, o, d in self.checks
             ],
+            "tiered_evidence": self.tiered_evidence,
         }
 
 
@@ -302,9 +309,7 @@ def main() -> None:
                     }
                     staging = raw["staging"]
                     num_prompt = int(staging["num_prompt_tokens"])
-                    known = [
-                        int(value) for value in staging["all_known_token_ids"]
-                    ]
+                    known = [int(value) for value in staging["all_known_token_ids"]]
                     expected_prompt = (
                         known[:num_prompt] + list(control)[: int(first_diff)]
                     )
@@ -370,6 +375,55 @@ def main() -> None:
         report.add("no invariant violations logged", False, "see audit log")
     else:
         report.add("no invariant violations logged", True)
+
+    mechanical_prefixes = (
+        "expected takeover state",
+        "safety gate:",
+        "four-rank exact readback",
+        "correctness gate: unified stream has no gap or duplicate",
+        "correctness gate: emitted JSONL matches proxy state",
+        "correctness gate: source and target both contributed",
+        "no invariant violations logged",
+    )
+    mechanical = [
+        (name, ok, detail)
+        for name, ok, detail in report.checks
+        if name.startswith(mechanical_prefixes)
+    ]
+    numerical_files = {
+        "D-0": run / "logit_ulp_analysis.json",
+        "D-1": run / "kv_provenance.json",
+        "D-3": run / "agreement_summary.json",
+    }
+    report.tiered_evidence = {
+        "tier1_mechanical_correctness": {
+            "status": (
+                "pass"
+                if mechanical and all(ok for _name, ok, _detail in mechanical)
+                else "fail"
+            ),
+            "checks": [name for name, _ok, _detail in mechanical],
+        },
+        "tier2_numerical_fidelity": {
+            "status": (
+                "measured"
+                if any(path.is_file() for path in numerical_files.values())
+                else "not_measured"
+            ),
+            "artifacts": {
+                name: str(path) if path.is_file() else None
+                for name, path in numerical_files.items()
+            },
+            "note": (
+                "Numerical artifacts are quantitative evidence and do not "
+                "silently relax the legacy exact/tie correctness gate."
+            ),
+        },
+        "tier3_semantic_equivalence": {
+            "status": "not_measured",
+            "note": "Task-specific semantic evaluation is a separate experiment.",
+        },
+    }
 
     if args.json:
         print(json.dumps(report.to_json(), indent=2))

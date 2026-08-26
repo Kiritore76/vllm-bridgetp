@@ -70,6 +70,10 @@ RUN_FILES = (
     "topology_probe_tp4.json",
     "token_text_map.json",
     "token_equivalence.json",
+    "logit_ulp_analysis.json",
+    "kv_provenance.json",
+    "agreement_summary.json",
+    "precision_sweep.json",
     "cleanup_request.json",
     "inspect.json",
 )
@@ -79,6 +83,8 @@ RUN_DIRS = (
     "delta_sender_receipts",
     "stage_delivery_receipts",
     "receiver_receipts",
+    "logit_captures",
+    "agreement_records",
 )
 # Anything matching these is refused outright: the bundle must stay reviewable.
 FORBIDDEN_SUFFIXES = (".pt", ".pth", ".bin", ".safetensors", ".npy", ".npz")

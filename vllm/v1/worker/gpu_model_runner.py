@@ -23,6 +23,10 @@ from tqdm import tqdm
 import vllm.envs as envs
 from vllm.bridge_tp.kv_export import maybe_dump_kv_cache
 from vllm.bridge_tp.kv_stream import maybe_publish_kv_stream
+from vllm.bridge_tp.logit_capture import (
+    get_logit_capture_config,
+    maybe_make_logit_observer,
+)
 from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
@@ -3541,9 +3545,21 @@ class GPUModelRunner(
         # if async scheduling and required by current sampling params.
         self.input_batch.update_async_output_token_ids()
         if spec_decode_metadata is None:
+            bridgetp_logit_observer = maybe_make_logit_observer(
+                req_ids=list(self.input_batch.req_ids),
+                requests=self.requests,
+                tp_rank=get_tp_group().rank_in_group,
+            )
             return self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
+                bridgetp_logit_observer=bridgetp_logit_observer,
+            )
+
+        if get_logit_capture_config().enabled:
+            raise RuntimeError(
+                "BridgeTP D-0 raw-logit capture does not support speculative "
+                "decoding; restart without speculative decoding"
             )
 
         # Update spec_token_ids with real draft tokens from pre step only when

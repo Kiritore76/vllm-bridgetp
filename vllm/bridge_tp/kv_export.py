@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -21,6 +22,11 @@ logger = init_logger(__name__)
 _dumped_request_ids: set[str] = set()
 _disabled_after_error = False
 _warned_multi_request = False
+
+
+def _token_ids_sha256(token_ids: list[int]) -> str:
+    payload = json.dumps(token_ids, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _safe_request_id(request_id: str) -> str:
@@ -87,6 +93,25 @@ def _get_block_axis(
     if block_axis not in (0, 1):
         raise ValueError(f"Unexpected KV-cache block axis: {block_axis}")
     return block_axis
+
+
+def _get_cache_layout(
+    attn_groups: list[list[Any]],
+    cache_dtype: str,
+    block_size: int,
+) -> dict[str, int]:
+    """Return the standard-attention cache-axis contract for this rank."""
+    block_axis = _get_block_axis(attn_groups, cache_dtype, block_size)
+    spec = attn_groups[0][0].kv_cache_spec
+    return {
+        "block_axis": block_axis,
+        "kv_axis": 1 if block_axis == 0 else 0,
+        "token_axis": 2,
+        "head_axis": 3,
+        "head_size_axis": 4,
+        "local_num_kv_heads": int(spec.num_kv_heads),
+        "head_size": int(spec.head_size),
+    }
 
 
 def _ordered_layer_names(kv_cache_config: Any) -> list[str]:
@@ -201,9 +226,11 @@ def _dump_request_kv(
     tp_world_size: int,
     async_scheduling: bool,
 ) -> None:
-    if tp_world_size != 1:
+    if tp_world_size not in config.allowed_tp_world_sizes:
         raise NotImplementedError(
-            "BridgeTP Phase 1-3 dump must first be validated with TP1"
+            f"BridgeTP KV dump does not allow TP{tp_world_size}; configured "
+            f"sizes are {config.allowed_tp_world_sizes}. Phase 9 TP4 provenance "
+            "runs must set BRIDGETP_DUMP_TP_WORLD_SIZES=1,4."
         )
     if scheduler_output.scheduled_spec_decode_tokens:
         raise NotImplementedError(
@@ -237,7 +264,8 @@ def _dump_request_kv(
     block_ids, block_size = _get_request_block_ids(
         input_batch, request_index, num_computed_tokens
     )
-    block_axis = _get_block_axis(attn_groups, cache_dtype, block_size)
+    cache_layout = _get_cache_layout(attn_groups, cache_dtype, block_size)
+    block_axis = cache_layout["block_axis"]
     layer_names = _ordered_layer_names(kv_cache_config)
     if len(kv_caches) != len(layer_names):
         raise RuntimeError(
@@ -286,7 +314,9 @@ def _dump_request_kv(
                 "format_version": 1,
                 "request_id": request_id,
                 "tp_rank": tp_rank,
+                "tp_world_size": tp_world_size,
                 "physical_block_ids": block_ids,
+                "cache_layout": cache_layout,
                 "layers": tensors,
             },
             temporary_path,
@@ -297,6 +327,7 @@ def _dump_request_kv(
     computed_token_ids = [
         request.get_token_id(index) for index in range(num_computed_tokens)
     ]
+    computed_token_ids_hash = _token_ids_sha256(computed_token_ids)
     known_not_computed_token_ids = [
         request.get_token_id(index)
         for index in range(num_computed_tokens, num_known_tokens)
@@ -311,6 +342,7 @@ def _dump_request_kv(
         "num_output_tokens": num_output_tokens,
         "num_known_tokens": num_known_tokens,
         "num_computed_tokens": num_computed_tokens,
+        "computed_token_ids_sha256": computed_token_ids_hash,
         "pending_known_tokens": num_known_tokens - num_computed_tokens,
     }
     _atomic_json_dump(tokens, output_dir / "generated_tokens.json")
@@ -321,8 +353,10 @@ def _dump_request_kv(
         last_block_valid_tokens = block_size
     manifest = {
         "format_version": 1,
-        "phase": "BridgeTP D3 Phase 1-3",
-        "scope": "TP1 request-scoped KV-cache dump; no takeover",
+        "phase": (
+            "BridgeTP D3 Phase 1-3" if tp_world_size == 1 else "BridgeTP D3 Phase 9 D-1"
+        ),
+        "scope": "request-scoped KV-cache dump; no ownership change",
         "model": model_name,
         "request_id": request_id,
         "tp_rank": tp_rank,
@@ -331,6 +365,7 @@ def _dump_request_kv(
         "num_layers": len(kv_caches),
         "block_size": block_size,
         "block_axis": block_axis,
+        "cache_layout": cache_layout,
         "physical_block_ids": block_ids,
         "num_physical_blocks": len(block_ids),
         "last_block_valid_tokens": last_block_valid_tokens,
@@ -340,6 +375,7 @@ def _dump_request_kv(
         "num_computed_tokens_before_iteration": num_computed_before,
         "num_scheduled_tokens_this_iteration": num_scheduled_tokens,
         "num_computed_tokens": num_computed_tokens,
+        "computed_token_ids_sha256": computed_token_ids_hash,
         "pending_known_tokens": num_known_tokens - num_computed_tokens,
         "estimated_tensor_bytes": estimated_bytes,
         "tensor_file_bytes": tensor_path.stat().st_size if tensor_path else 0,
@@ -379,11 +415,11 @@ def maybe_dump_kv_cache(
     tp_world_size: int,
     async_scheduling: bool,
 ) -> None:
-    """Dump one request's real TP1 KV blocks after sampling bookkeeping.
+    """Dump one request's real rank-local KV blocks after bookkeeping.
 
     This hook is a deliberately narrow diagnostic. It is disabled by default,
     only supports one standard-attention KV-cache group, and never changes KV
-    ownership or scheduler state.
+    ownership or scheduler state. TP4 export is opt-in for Phase 9 D-1.
     """
     global _disabled_after_error
 
