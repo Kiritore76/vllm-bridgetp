@@ -84,8 +84,33 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument(
+        "--diagnostic-trigger-output-tokens",
+        type=int,
+        help=(
+            "diagnostic-only fixed trigger boundary; must be supplied with "
+            "--diagnostic-cutover-output-tokens"
+        ),
+    )
+    parser.add_argument(
+        "--diagnostic-cutover-output-tokens",
+        type=int,
+        help=(
+            "diagnostic-only fixed cutover boundary; must be supplied with "
+            "--diagnostic-trigger-output-tokens"
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    trigger = args.diagnostic_trigger_output_tokens
+    cutover = args.diagnostic_cutover_output_tokens
+    if (trigger is None) != (cutover is None):
+        parser.error(
+            "diagnostic trigger and cutover boundaries must be supplied together"
+        )
+    if trigger is not None and (trigger < 0 or cutover <= trigger):
+        parser.error("diagnostic boundaries require 0 <= trigger < cutover")
+    return args
 
 
 def _prepare_source_request(source: dict[str, Any], run_dir: Path) -> dict[str, Any]:
@@ -226,6 +251,8 @@ def step_local(
     config: ControllerConfig,
     recorder: ProxyRecorder,
     max_tokens: int,
+    diagnostic_trigger_output_tokens: int | None = None,
+    diagnostic_cutover_output_tokens: int | None = None,
 ) -> None:
     decision = policy.evaluate(
         request,
@@ -238,10 +265,40 @@ def step_local(
         active_migrations=0,
     )
     audit.write({"kind": "decision", **decision.to_json()})
-    if decision.action is not Action.START_SHADOW or dry_run:
+    diagnostic_boundary = diagnostic_trigger_output_tokens is not None
+    if dry_run or (
+        not diagnostic_boundary and decision.action is not Action.START_SHADOW
+    ):
         return
-    trigger = request.output_tokens + 1
-    cutover = trigger + config.handoff_output_tokens
+    if diagnostic_trigger_output_tokens is None:
+        trigger = request.output_tokens + 1
+        cutover = trigger + config.handoff_output_tokens
+    else:
+        if diagnostic_cutover_output_tokens is None:
+            raise RuntimeError("diagnostic cutover boundary is missing")
+        trigger = diagnostic_trigger_output_tokens
+        cutover = diagnostic_cutover_output_tokens
+        if request.output_tokens >= trigger:
+            audit.write(
+                {
+                    "kind": "diagnostic_boundary_missed",
+                    "observed_output_tokens": request.output_tokens,
+                    "trigger_output_tokens": trigger,
+                    "cutover_output_tokens": cutover,
+                }
+            )
+            raise RuntimeError(
+                "source reached diagnostic trigger before the controller armed it: "
+                f"observed={request.output_tokens}, trigger={trigger}"
+            )
+        audit.write(
+            {
+                "kind": "diagnostic_boundary_forced",
+                "observed_output_tokens": request.output_tokens,
+                "trigger_output_tokens": trigger,
+                "cutover_output_tokens": cutover,
+            }
+        )
     if cutover >= max_tokens:
         audit.write(
             {
@@ -257,7 +314,7 @@ def step_local(
         trigger,
         rate.rate_gib_s,
         cutover_output_tokens=cutover,
-        note=decision.reason,
+        note=("diagnostic fixed boundary" if diagnostic_boundary else decision.reason),
     )
     record.trigger_output_tokens = trigger
     record.cutover_output_tokens = cutover
@@ -266,7 +323,7 @@ def step_local(
         record.migration_id,
         MigrationState.SHADOW,
         now,
-        decision.reason,
+        "diagnostic fixed boundary" if diagnostic_boundary else decision.reason,
     )
 
 
@@ -438,6 +495,16 @@ def main() -> None:
         )
 
     config = ControllerConfig.load(args.config)
+    diagnostic_trigger = args.diagnostic_trigger_output_tokens
+    diagnostic_cutover = args.diagnostic_cutover_output_tokens
+    if diagnostic_trigger is not None:
+        diagnostic_gap = diagnostic_cutover - diagnostic_trigger
+        if diagnostic_gap != config.handoff_output_tokens:
+            raise SystemExit(
+                "diagnostic cutover minus trigger must equal "
+                f"handoff_output_tokens ({config.handoff_output_tokens}), got "
+                f"{diagnostic_gap}"
+            )
     run_dir = args.run_dir.resolve()
     config.run_dir = str(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -512,6 +579,14 @@ def main() -> None:
                 "dry_run": args.dry_run,
                 "platform_note": config.platform_note,
                 "runtime_control_generation": probe.generation,
+                "diagnostic_fixed_boundary": (
+                    {
+                        "trigger_output_tokens": diagnostic_trigger,
+                        "cutover_output_tokens": diagnostic_cutover,
+                    }
+                    if diagnostic_trigger is not None
+                    else None
+                ),
             },
         )
         machine = MigrationStateMachine(audit_sink=audit.write)
@@ -591,6 +666,8 @@ def main() -> None:
                         config,
                         recorder,
                         int(source_request["max_tokens"]),
+                        diagnostic_trigger,
+                        diagnostic_cutover,
                     )
                 elif record.state is MigrationState.SHADOW:
                     previous_target = target_future
