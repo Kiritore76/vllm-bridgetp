@@ -50,6 +50,95 @@ Use the same server flags for every condition. Start TP1 on GPU 0 / port 8001
 and TP4 on GPUs 1--4 / port 8200. Record `nvidia-smi -L`, topology, git commit,
 server logs, model path, dtype, and KV block counts.
 
+Create the shared environment in every terminal:
+
+```bash
+cd /root/autodl-tmp/bridgetp/vllm_bridge
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+
+export BRIDGE_PY=/root/autodl-tmp/bridgetp/.venv_bridge/bin/python
+export CAL_ROOT=/root/autodl-tmp/bridgetp/results/phase9_bridge_calibration
+export CAL_MODEL=/root/autodl-tmp/models/models/Qwen--Qwen2.5-14B-Instruct/snapshots/master
+mkdir -p "$CAL_ROOT/server_logs"
+```
+
+### Terminal TP1: start the TP1 server for Section 7.1
+
+```bash
+cd /root/autodl-tmp/bridgetp/vllm_bridge
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+export BRIDGE_PY=/root/autodl-tmp/bridgetp/.venv_bridge/bin/python
+export CAL_ROOT=/root/autodl-tmp/bridgetp/results/phase9_bridge_calibration
+export CAL_MODEL=/root/autodl-tmp/models/models/Qwen--Qwen2.5-14B-Instruct/snapshots/master
+mkdir -p "$CAL_ROOT/server_logs"
+
+CUDA_VISIBLE_DEVICES=0 "$BRIDGE_PY" \
+  -m vllm.entrypoints.openai.api_server \
+  --model "$CAL_MODEL" \
+  --served-model-name bridgetp-model \
+  --tensor-parallel-size 1 \
+  --dtype bfloat16 \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.88 \
+  --port 8001 \
+  --no-enable-prefix-caching \
+  --disable-hybrid-kv-cache-manager \
+  --no-async-scheduling \
+  2>&1 | tee "$CAL_ROOT/server_logs/tp1_port8001.log"
+```
+
+### Terminal TP4: start the TP4 server for Sections 7.1 and 7.2
+
+```bash
+cd /root/autodl-tmp/bridgetp/vllm_bridge
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+export BRIDGE_PY=/root/autodl-tmp/bridgetp/.venv_bridge/bin/python
+export CAL_ROOT=/root/autodl-tmp/bridgetp/results/phase9_bridge_calibration
+export CAL_MODEL=/root/autodl-tmp/models/models/Qwen--Qwen2.5-14B-Instruct/snapshots/master
+mkdir -p "$CAL_ROOT/server_logs"
+
+CUDA_VISIBLE_DEVICES=1,2,3,4 "$BRIDGE_PY" \
+  -m vllm.entrypoints.openai.api_server \
+  --model "$CAL_MODEL" \
+  --served-model-name bridgetp-model \
+  --tensor-parallel-size 4 \
+  --dtype bfloat16 \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.88 \
+  --port 8200 \
+  --no-enable-prefix-caching \
+  --disable-hybrid-kv-cache-manager \
+  --no-async-scheduling \
+  2>&1 | tee "$CAL_ROOT/server_logs/tp4_port8200.log"
+```
+
+Do not run a benchmark until these checks pass from a third terminal:
+
+```bash
+curl -fsS http://127.0.0.1:8001/v1/models
+curl -fsS http://127.0.0.1:8200/v1/models
+
+grep -Ei 'GPU KV cache size|GPU blocks|num_gpu_blocks' \
+  "$CAL_ROOT/server_logs/tp1_port8001.log" \
+  "$CAL_ROOT/server_logs/tp4_port8200.log" | tail -20
+```
+
+Section 7.1 may measure TP1 and TP4 while both servers are available, but only
+one benchmark client should run at a time. Before Section 7.2 P2P-copy
+conditions, stop the TP1 server with `Ctrl-C` and verify that GPU 0 is free:
+
+```bash
+if pgrep -af 'vllm.entrypoints.openai.api_server.*--port 8001'; then
+  echo 'STOP: TP1 port 8001 is still running; stop its terminal before 7.2'
+else
+  echo 'PASS: GPU 0 source is not occupied by the TP1 calibration server'
+fi
+```
+
+The TP4 server on port 8200 must remain running throughout Section 7.2. The
+copy-load tool uses physical GPU 0 as source and physical GPU 1 (TP4 rank 0) as
+destination, matching the A100 PCIe P2-D calibration topology.
+
 For the previously validated configuration, the observed per-rank block counts
 were TP1=1968 and TP4=35739. Reuse them only if the new server logs reproduce
 31,488 and 571,824 KV tokens respectively with block size 16.
