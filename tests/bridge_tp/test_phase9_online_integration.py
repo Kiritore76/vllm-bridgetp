@@ -157,9 +157,7 @@ class TestTokenEquivalence(unittest.TestCase):
 
     @staticmethod
     def probe_request(prompt: list[int]) -> dict:
-        return freeze_strict_greedy_sampling(
-            {"prompt": prompt, "max_tokens": 1}
-        )
+        return freeze_strict_greedy_sampling({"prompt": prompt, "max_tokens": 1})
 
     def test_exact_match_needs_no_tie_evidence(self) -> None:
         result = classify_token_equivalence(
@@ -199,7 +197,7 @@ class TestTokenEquivalence(unittest.TestCase):
                         }
                     ]
                 }
-            ]
+            ],
         }
         probe = self.completion([40], [" necessary"], [tied])
         prompt = [101, 102, 10, 20]
@@ -249,7 +247,7 @@ class TestTokenEquivalence(unittest.TestCase):
                         }
                     ]
                 }
-            ]
+            ],
         }
         probe = self.completion([40], [" necessary"], [tied])
         result = classify_token_equivalence(
@@ -536,6 +534,147 @@ class TestRunnerTransitions(unittest.TestCase):
         self.assertEqual(record.state, MigrationState.TAKEOVER)
         self.assertEqual(record.ranks_ready, {0, 1, 2, 3})
         self.assertEqual(recorder.stats()["target_origin_tokens"], 1)
+
+    def test_step_local_uses_fixed_diagnostic_boundary(self) -> None:
+        class Decision:
+            action = Action.STAY
+            reason = "diagnostic"
+
+            @staticmethod
+            def to_json() -> dict:
+                return {"action": Action.STAY.value, "reason": "test"}
+
+        class Policy:
+            @staticmethod
+            def evaluate(*_args, **_kwargs) -> Decision:
+                return Decision()
+
+        class Audit:
+            def __init__(self) -> None:
+                self.records: list[dict] = []
+
+            def write(self, value: dict) -> None:
+                self.records.append(value)
+
+        class Adapter:
+            def __init__(self) -> None:
+                self.armed: tuple[int, float, int] | None = None
+
+            def arm_shadow(
+                self,
+                trigger: int,
+                rate: float,
+                cutover_output_tokens: int,
+                note: str,
+            ) -> None:
+                del note
+                self.armed = (trigger, rate, cutover_output_tokens)
+
+        class Rate:
+            rate_bytes_s = 1024.0
+            rate_gib_s = 0.5
+
+        audit = Audit()
+        machine = MigrationStateMachine(audit_sink=audit.write)
+        record = machine.create("migration", "request")
+        adapter = Adapter()
+        recorder = ProxyRecorder("external", ProxyMode.HOLD_BACK)
+        request = SourceRequestView(
+            request_id="request",
+            prompt_tokens=8,
+            output_tokens=19,
+            computed_tokens=26,
+            pending_tokens=1,
+            arrival_unix_s=0.0,
+            last_token_unix_s=1.0,
+        )
+
+        step_local(
+            Policy(),
+            machine,
+            adapter,
+            audit,
+            record,
+            request,
+            object(),
+            object(),
+            0.1,
+            Rate(),
+            10.0,
+            False,
+            ControllerConfig(handoff_output_tokens=32),
+            recorder,
+            100,
+            diagnostic_trigger_output_tokens=21,
+            diagnostic_cutover_output_tokens=53,
+        )
+
+        self.assertEqual(adapter.armed, (21, 0.5, 53))
+        self.assertEqual(record.cutover_output_tokens, 53)
+        self.assertTrue(
+            any(r["kind"] == "diagnostic_boundary_forced" for r in audit.records)
+        )
+
+    def test_step_local_rejects_missed_diagnostic_trigger(self) -> None:
+        class Decision:
+            action = Action.STAY
+            reason = "diagnostic"
+
+            @staticmethod
+            def to_json() -> dict:
+                return {"action": Action.STAY.value, "reason": "test"}
+
+        class Policy:
+            @staticmethod
+            def evaluate(*_args, **_kwargs) -> Decision:
+                return Decision()
+
+        class Audit:
+            def write(self, _value: dict) -> None:
+                return None
+
+        class Adapter:
+            @staticmethod
+            def arm_shadow(*_args, **_kwargs) -> None:
+                raise AssertionError("missed diagnostic trigger must not arm")
+
+        class Rate:
+            rate_bytes_s = 1024.0
+            rate_gib_s = 0.5
+
+        audit = Audit()
+        machine = MigrationStateMachine(audit_sink=audit.write)
+        record = machine.create("migration", "request")
+        request = SourceRequestView(
+            request_id="request",
+            prompt_tokens=8,
+            output_tokens=21,
+            computed_tokens=28,
+            pending_tokens=1,
+            arrival_unix_s=0.0,
+            last_token_unix_s=1.0,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "reached diagnostic trigger"):
+            step_local(
+                Policy(),
+                machine,
+                Adapter(),
+                audit,
+                record,
+                request,
+                object(),
+                object(),
+                0.1,
+                Rate(),
+                10.0,
+                False,
+                ControllerConfig(handoff_output_tokens=32),
+                ProxyRecorder("external", ProxyMode.HOLD_BACK),
+                100,
+                diagnostic_trigger_output_tokens=21,
+                diagnostic_cutover_output_tokens=53,
+            )
 
 
 if __name__ == "__main__":
