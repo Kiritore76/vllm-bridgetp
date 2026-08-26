@@ -43,10 +43,11 @@ placeholder for the newest sampled token before the asynchronous CPU copy
 finishes. That placeholder cannot support the token/KV boundary evidence this
 diagnostic is designed to collect.
 
-Phase 1-3 intentionally rejects TP greater than one, speculative decoding,
-async scheduling, hybrid/Mamba caches, and non-uniform KV-cache groups. These
-limitations prevent unsupported layouts from being mistaken for validated
-BridgeTP evidence.
+Phase 1-3 still rejects TP greater than one by default, as well as speculative
+decoding, async scheduling, hybrid/Mamba caches, and non-uniform KV-cache
+groups. Phase 9 D-1 may explicitly enable rank-local TP4 export with
+`BRIDGETP_DUMP_TP_WORLD_SIZES=1,4`; that opt-in is numerical-provenance
+instrumentation and does not retroactively change the Phase 1-3 validation.
 
 Validate a completed dump with the Bridge development environment:
 
@@ -66,3 +67,5 @@ Later online-prototype stages are documented separately:
 - `PHASE8.md`: background old-KV staging, new-KV mirroring, and cleanup.
 - `PHASE8_VALIDATION.md`: returned commit/cancellation evidence and the
   provenance-preserving offline verdict reconstruction.
+- `PHASE9_NUMERICAL_FIDELITY_RUNBOOK.md`: actual-vLLM D-0 logits, fixed-prefix
+  D-1 KV provenance, D-2 precision exploration, and paired A/B/C/D statistics.

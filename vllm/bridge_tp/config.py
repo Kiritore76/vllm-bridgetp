@@ -32,9 +32,25 @@ def _read_nonnegative_int(name: str, default: int) -> int:
     return value
 
 
+def _read_positive_int_tuple(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    values = tuple(int(item.strip()) for item in raw.split(",") if item.strip())
+    if not values or any(value <= 0 for value in values):
+        raise ValueError(f"{name} must contain positive comma-separated integers")
+    if len(set(values)) != len(values):
+        raise ValueError(f"{name} must not contain duplicate TP sizes")
+    return values
+
+
 @dataclass(frozen=True)
 class BridgeTPDumpConfig:
-    """Configuration for the Phase 1-3 TP1 KV-cache snapshot."""
+    """Configuration for request-scoped KV-cache snapshots.
+
+    TP1 remains the default so the validated Phase 1-3 behavior is unchanged.
+    Phase 9 D-1 explicitly opts into TP4 export.
+    """
 
     enabled: bool
     output_dir: Path
@@ -43,6 +59,7 @@ class BridgeTPDumpConfig:
     include_tensors: bool
     strict: bool
     max_bytes: int
+    allowed_tp_world_sizes: tuple[int, ...]
 
     @classmethod
     def from_env(cls) -> "BridgeTPDumpConfig":
@@ -63,6 +80,9 @@ class BridgeTPDumpConfig:
             include_tensors=_read_bool("BRIDGETP_DUMP_TENSORS", True),
             strict=_read_bool("BRIDGETP_DUMP_STRICT", True),
             max_bytes=_read_nonnegative_int("BRIDGETP_DUMP_MAX_BYTES", 2 * 1024**3),
+            allowed_tp_world_sizes=_read_positive_int_tuple(
+                "BRIDGETP_DUMP_TP_WORLD_SIZES", (1,)
+            ),
         )
 
 
