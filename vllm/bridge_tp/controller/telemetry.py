@@ -24,6 +24,7 @@ import math
 import time
 import urllib.request
 from dataclasses import dataclass
+from typing import Iterable
 
 from .events import PoolTelemetry
 
@@ -100,11 +101,27 @@ def first_value(samples: list[Sample], name: str, default: float = 0.0) -> float
     return default
 
 
+def first_value_for_names(
+    samples: list[Sample], names: Iterable[str], default: float = 0.0
+) -> float:
+    """Return the first available metric among ordered aliases."""
+    available = {sample.name for sample in samples}
+    for name in names:
+        if name in available:
+            return first_value(samples, name, default)
+    return default
+
+
+def has_metric(samples: list[Sample], name: str) -> bool:
+    """Return whether a scrape contains at least one sample with ``name``."""
+    return any(sample.name == name for sample in samples)
+
+
 def histogram_quantile(samples: list[Sample], metric: str, q: float) -> float:
     """Linear-interpolated quantile from ``<metric>_bucket`` samples."""
     if not 0.0 < q < 1.0:
         raise ValueError("q must be in (0,1)")
-    buckets: list[tuple[float, float]] = []
+    totals_by_bound: dict[float, float] = {}
     for sample in samples:
         if sample.name != f"{metric}_bucket":
             continue
@@ -112,10 +129,10 @@ def histogram_quantile(samples: list[Sample], metric: str, q: float) -> float:
         if le is None:
             continue
         bound = math.inf if le in ("+Inf", "Inf") else float(le)
-        buckets.append((bound, sample.value))
+        totals_by_bound[bound] = totals_by_bound.get(bound, 0.0) + sample.value
+    buckets = sorted(totals_by_bound.items())
     if not buckets:
         return 0.0
-    buckets.sort(key=lambda item: item[0])
     total = buckets[-1][1]
     if total <= 0:
         return 0.0
@@ -134,6 +151,74 @@ def histogram_quantile(samples: list[Sample], metric: str, q: float) -> float:
     return previous_bound
 
 
+def _counter_delta(current: float, previous: float) -> float:
+    """Return a non-negative Prometheus counter delta, tolerating resets."""
+    if current >= previous:
+        return current - previous
+    return max(0.0, current)
+
+
+def histogram_delta_samples(
+    previous: list[Sample], current: list[Sample], metric: str
+) -> list[Sample]:
+    """Build an interval histogram from two cumulative scrapes.
+
+    Histogram buckets are matched by all labels. Counter resets are handled by
+    treating the current value as the new interval count. The returned samples
+    can be passed to :func:`histogram_quantile`.
+    """
+
+    def key(sample: Sample) -> tuple[tuple[str, str], ...]:
+        return tuple(sorted(sample.labels.items()))
+
+    bucket_name = f"{metric}_bucket"
+    previous_buckets = {
+        key(sample): sample.value
+        for sample in previous
+        if sample.name == bucket_name
+    }
+    out: list[Sample] = []
+    for sample in current:
+        if sample.name != bucket_name:
+            continue
+        before = previous_buckets.get(key(sample), 0.0)
+        out.append(
+            Sample(
+                name=bucket_name,
+                labels=sample.labels,
+                value=_counter_delta(sample.value, before),
+            )
+        )
+    return out
+
+
+def interval_histogram_stats(
+    previous: list[Sample],
+    current: list[Sample],
+    metric: str,
+    q: float = 0.99,
+) -> tuple[int, float, float]:
+    """Return ``(count, mean, quantile)`` for one scrape interval."""
+    current_count = sum(
+        sample.value for sample in current if sample.name == f"{metric}_count"
+    )
+    previous_count = sum(
+        sample.value for sample in previous if sample.name == f"{metric}_count"
+    )
+    current_sum = sum(
+        sample.value for sample in current if sample.name == f"{metric}_sum"
+    )
+    previous_sum = sum(
+        sample.value for sample in previous if sample.name == f"{metric}_sum"
+    )
+    count = _counter_delta(current_count, previous_count)
+    total = _counter_delta(current_sum, previous_sum)
+    delta_samples = histogram_delta_samples(previous, current, metric)
+    quantile = histogram_quantile(delta_samples, metric, q) if count > 0 else 0.0
+    mean = total / count if count > 0 else 0.0
+    return int(round(count)), mean, quantile
+
+
 def pool_from_samples(
     samples: list[Sample],
     block_size: int,
@@ -145,7 +230,17 @@ def pool_from_samples(
     Metric names follow vLLM V1. If a deployment renames them, override here
     rather than scattering string literals through the policy.
     """
-    kv_usage = first_value(samples, "vllm:gpu_cache_usage_perc", 0.0)
+    # V1 renamed this metric in newer releases. Prefer the name observed on
+    # current Phase 9 servers, while retaining compatibility with older P1/P2
+    # environments.
+    kv_usage = first_value_for_names(
+        samples,
+        (
+            "vllm:kv_cache_usage_perc",
+            "vllm:gpu_cache_usage_perc",
+        ),
+        0.0,
+    )
     if kv_usage > 1.0:  # some builds export percent, others fraction
         kv_usage /= 100.0
     kv_usage = max(0.0, min(1.0, kv_usage))
@@ -165,6 +260,47 @@ def pool_from_samples(
         free_kv_blocks=free_blocks,
         block_size=block_size,
         sampled_unix_s=now_unix_s if now_unix_s is not None else time.time(),
+    )
+
+
+def interval_pool_from_samples(
+    previous: list[Sample],
+    current: list[Sample],
+    block_size: int,
+    total_kv_blocks: int,
+    now_unix_s: float | None = None,
+) -> tuple[PoolTelemetry, int]:
+    """Build pool telemetry whose TPOT fields cover one scrape interval.
+
+    Gauges and monotone counters come from the current scrape. TPOT mean and
+    P99 are computed from deltas between cumulative Prometheus histograms.
+    The second return value is the number of TPOT observations in the interval.
+    """
+    pool = pool_from_samples(
+        current,
+        block_size=block_size,
+        total_kv_blocks=total_kv_blocks,
+        now_unix_s=now_unix_s,
+    )
+    count, mean, p99 = interval_histogram_stats(
+        previous,
+        current,
+        "vllm:time_per_output_token_seconds",
+        0.99,
+    )
+    return (
+        PoolTelemetry(
+            num_running=pool.num_running,
+            num_waiting=pool.num_waiting,
+            kv_usage_frac=pool.kv_usage_frac,
+            preemptions_total=pool.preemptions_total,
+            p99_tpot_s=p99,
+            mean_tpot_s=mean,
+            free_kv_blocks=pool.free_kv_blocks,
+            block_size=pool.block_size,
+            sampled_unix_s=pool.sampled_unix_s,
+        ),
+        count,
     )
 
 
