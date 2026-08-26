@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tools.bridge_tp.measure_agreement import load_token_ids
-from tools.bridge_tp.probe_logit_ulp import analyze_side
+from tools.bridge_tp.probe_logit_ulp import analyze_side, token_value
 from tools.bridge_tp.run_fixed_prefix_continuation import request_payload
 from tools.bridge_tp.summarize_agreement import validate_pairs
 from vllm.bridge_tp.config import BridgeTPDumpConfig
@@ -121,6 +121,21 @@ class TestEvidenceTools(unittest.TestCase):
             result["processed"]["descriptive_band"],
             "WITHIN_ONE_RECORDED_DTYPE_ULP",
         )
+
+    def test_logit_probe_falls_back_to_saved_tensor(self):
+        stage = {
+            "candidate_values": {},
+            "top_token_ids": [1],
+            "top_values": [20.0],
+            "tensor_file": "raw_logits.pt",
+        }
+        with patch(
+            "tools.bridge_tp.probe_logit_ulp._tensor_token_value",
+            return_value=19.75,
+        ) as loader:
+            value = token_value(stage, 2, "control/raw", Path("capture"))
+        self.assertEqual(value, 19.75)
+        loader.assert_called_once_with(stage, 2, "control/raw", Path("capture"))
 
     def test_fixed_prefix_request_freezes_strict_greedy_contract(self):
         payload = request_payload(
