@@ -38,10 +38,44 @@ def load_capture(path: Path) -> dict:
         raise SystemExit(f"unsupported capture format: {candidate}")
     if set(payload.get("stages", {})) != {"raw", "processed"}:
         raise SystemExit(f"raw and processed stages are required: {candidate}")
+    payload["_capture_dir"] = str(candidate.parent)
     return payload
 
 
-def token_value(stage: dict, token_id: int, label: str) -> float:
+def _tensor_token_value(
+    stage: dict,
+    token_id: int,
+    label: str,
+    capture_dir: Path,
+) -> float:
+    tensor_file = stage.get("tensor_file")
+    if not tensor_file:
+        raise SystemExit(
+            f"{label} does not include token {token_id} and has no tensor file"
+        )
+    path = capture_dir / str(tensor_file)
+    if not path.is_file():
+        raise SystemExit(f"{label} tensor file not found: {path}")
+    try:
+        import torch
+
+        tensor = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception as error:
+        raise SystemExit(f"failed to load {label} tensor {path}: {error}") from error
+    row = tensor.reshape(-1)
+    if token_id < 0 or token_id >= row.numel():
+        raise SystemExit(
+            f"{label} token {token_id} is outside tensor size {row.numel()}"
+        )
+    return float(row[token_id].float().item())
+
+
+def token_value(
+    stage: dict,
+    token_id: int,
+    label: str,
+    capture_dir: Path | None = None,
+) -> float:
     values = stage.get("candidate_values", {})
     key = str(token_id)
     if key in values:
@@ -49,18 +83,36 @@ def token_value(stage: dict, token_id: int, label: str) -> float:
     top_ids = [int(value) for value in stage.get("top_token_ids", [])]
     if token_id in top_ids:
         return float(stage["top_values"][top_ids.index(token_id)])
+    if capture_dir is not None:
+        return _tensor_token_value(stage, token_id, label, capture_dir)
     raise SystemExit(
         f"{label} does not include token {token_id}; re-run capture with "
-        "BRIDGETP_LOGIT_CAPTURE_CANDIDATE_TOKEN_IDS containing both tokens"
+        "BRIDGETP_LOGIT_CAPTURE_CANDIDATE_TOKEN_IDS containing both tokens, "
+        "or enable BRIDGETP_LOGIT_CAPTURE_TENSORS"
     )
 
 
 def analyze_side(label: str, capture: dict, token_ids: list[int]) -> dict:
     result: dict[str, object] = {}
+    capture_dir = (
+        Path(capture["_capture_dir"])
+        if capture.get("_capture_dir") is not None
+        else None
+    )
     for stage_name in ("raw", "processed"):
         stage = capture["stages"][stage_name]
-        first = token_value(stage, token_ids[0], f"{label}/{stage_name}")
-        second = token_value(stage, token_ids[1], f"{label}/{stage_name}")
+        first = token_value(
+            stage,
+            token_ids[0],
+            f"{label}/{stage_name}",
+            capture_dir,
+        )
+        second = token_value(
+            stage,
+            token_ids[1],
+            f"{label}/{stage_name}",
+            capture_dir,
+        )
         result[stage_name] = analyze_candidate_gap(
             stage=stage_name,
             dtype=stage["dtype"],
