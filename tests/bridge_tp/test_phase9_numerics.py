@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -22,7 +24,11 @@ from vllm.bridge_tp.controller.numerics import (
     summarize_samples,
     ulp_at,
 )
-from vllm.bridge_tp.logit_capture import LogitCaptureConfig, token_ids_sha256
+from vllm.bridge_tp.logit_capture import (
+    LogitCaptureConfig,
+    _resolve_target_request_id,
+    token_ids_sha256,
+)
 
 
 class TestRecordedDtypeUlp(unittest.TestCase):
@@ -185,6 +191,53 @@ class TestOptInConfiguration(unittest.TestCase):
     def test_prefix_hash_is_stable_and_order_sensitive(self):
         self.assertEqual(token_ids_sha256([1, 2, 3]), token_ids_sha256([1, 2, 3]))
         self.assertNotEqual(token_ids_sha256([1, 2, 3]), token_ids_sha256([3, 2, 1]))
+
+    def test_logit_filter_accepts_public_completion_request_id(self):
+        self.assertEqual(
+            _resolve_target_request_id("control", ["cmpl-control-0-deadbeef"]),
+            "cmpl-control-0-deadbeef",
+        )
+        self.assertIsNone(
+            _resolve_target_request_id("control", ["cmpl-different-0"])
+        )
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "requires torch")
+    def test_streaming_connector_refuses_unmarked_target_recompute(self):
+        from vllm.bridge_tp.streaming_connector import BridgeTPStreamingConnector
+
+        connector = object.__new__(BridgeTPStreamingConnector)
+        connector._manifest = {
+            "migration_id": "migration",
+            "all_known_token_ids": [1, 2, 3],
+            "num_computed_tokens": 2,
+        }
+        request = types.SimpleNamespace(
+            request_id="cmpl-bridgetp-phase9-target-run-0",
+            kv_transfer_params=None,
+            prompt_token_ids=[1, 2, 3],
+            num_tokens=3,
+        )
+        with self.assertRaisesRegex(ValueError, "refusing local recomputation"):
+            connector._request_matches(request)
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "requires torch")
+    def test_streaming_connector_rejects_wrong_migration_id(self):
+        from vllm.bridge_tp.streaming_connector import BridgeTPStreamingConnector
+
+        connector = object.__new__(BridgeTPStreamingConnector)
+        connector._manifest = {
+            "migration_id": "migration",
+            "all_known_token_ids": [1, 2, 3],
+            "num_computed_tokens": 2,
+        }
+        request = types.SimpleNamespace(
+            request_id="cmpl-bridgetp-phase9-target-run-0",
+            kv_transfer_params={"bridgetp_migration_id": "wrong"},
+            prompt_token_ids=[1, 2, 3],
+            num_tokens=3,
+        )
+        with self.assertRaisesRegex(ValueError, "migration id differs"):
+            connector._request_matches(request)
 
 
 if __name__ == "__main__":

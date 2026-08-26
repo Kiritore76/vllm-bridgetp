@@ -192,10 +192,27 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
     def _request_matches(self, request: Request) -> bool:
         params = request.kv_transfer_params or {}
         manifest = self._load_manifest()
-        if params.get(MIGRATION_PARAM) != manifest["migration_id"]:
-            return False
+        migration_id = params.get(MIGRATION_PARAM)
         prompt = request.prompt_token_ids
-        if prompt is None or list(prompt) != list(manifest["all_known_token_ids"]):
+        prompt_matches = prompt is not None and list(prompt) == list(
+            manifest["all_known_token_ids"]
+        )
+        if migration_id is None:
+            if (
+                "bridgetp-phase" in request.request_id
+                and "target" in request.request_id
+            ):
+                raise ValueError(
+                    "BridgeTP target request is missing migration marker "
+                    f"{MIGRATION_PARAM!r}; refusing local recomputation"
+                )
+            return False
+        if migration_id != manifest["migration_id"]:
+            raise ValueError(
+                "BridgeTP target migration id differs from the active manifest: "
+                f"{migration_id!r} != {manifest['migration_id']!r}"
+            )
+        if not prompt_matches:
             raise ValueError(
                 "Phase 6 target prompt must exactly equal the live snapshot token "
                 "history"
