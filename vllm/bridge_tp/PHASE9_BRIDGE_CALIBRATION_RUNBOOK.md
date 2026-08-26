@@ -1,0 +1,221 @@
+# Phase 9 conditional bridge calibration runbook
+
+This runbook implements Section 7 of the Phase 9 next-experiments plan. It is
+an A100 PCIe calibration experiment. It does not repeat Phase 1--8, does not
+establish D-group migration fidelity, and does not make a cross-platform claim.
+
+## 1. Added executable support
+
+- `record_phase9_calibration.py`: records current vLLM gauges and interval
+  (not server-lifetime) TPOT histograms.
+- `run_phase9_copy_load.py`: records an equal-duration rate-zero window or
+  generates measured P2-D-style sustained P2P traffic.
+- `analyze_phase9_calibration.py`: aligns telemetry, copy window, and detailed
+  benchmark ITLs; rejects conditions outside their actual KV band or rate.
+- `fit_phase9_tick_tpot.py`: fits TP1/TP4 TPOT against instantaneous
+  `num_requests_running`.
+- `summarize_phase9_calibration.py`: requires exactly 36 accepted interference
+  conditions (`3 bands x 4 rates x 3 reps`).
+
+The production telemetry parser accepts both
+`vllm:kv_cache_usage_perc` and the older
+`vllm:gpu_cache_usage_perc` name.
+
+## 2. Frozen scope
+
+TPOT mapping:
+
+```text
+I128/O512
+QPS 1, 2, 4
+TP1 and TP4
+3 repetitions
+```
+
+Interference mapping:
+
+```text
+platform: NVIDIA A100 PCIe
+actual KV bands: 0.15-0.25, 0.45-0.55, 0.75-0.85
+copy rates: 0, 0.4, 0.7, 1.2 GiB/s
+3 repetitions per cell
+```
+
+The QPS used to hold each KV band must be selected by a rate-zero pilot and
+then frozen. Offered QPS is not a substitute for measured KV occupancy.
+
+## 3. Server preflight
+
+Use the same server flags for every condition. Start TP1 on GPU 0 / port 8001
+and TP4 on GPUs 1--4 / port 8200. Record `nvidia-smi -L`, topology, git commit,
+server logs, model path, dtype, and KV block counts.
+
+For the previously validated configuration, the observed per-rank block counts
+were TP1=1968 and TP4=35739. Reuse them only if the new server logs reproduce
+31,488 and 571,824 KV tokens respectively with block size 16.
+
+Before a run, verify the metrics actually used by the recorder:
+
+```bash
+curl -fsS http://127.0.0.1:8200/metrics | grep -E \
+  'vllm:(kv_cache_usage_perc|gpu_cache_usage_perc|num_requests_running|num_requests_waiting|time_per_output_token_seconds_(bucket|sum|count))' \
+  | head -40
+```
+
+## 4. One condition, split across terminals
+
+Create a unique condition directory and export the same values in every
+terminal:
+
+```bash
+cd /root/autodl-tmp/bridgetp/vllm_bridge
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+export BRIDGE_PY=/root/autodl-tmp/bridgetp/.venv_bridge/bin/python
+export CAL_ROOT=/root/autodl-tmp/bridgetp/results/phase9_bridge_calibration
+export CONDITION_ID=medium_rate0.7_r1
+export CONDITION_DIR="$CAL_ROOT/$CONDITION_ID"
+mkdir -p "$CONDITION_DIR"
+```
+
+### Terminal A: interval telemetry
+
+```bash
+"$BRIDGE_PY" tools/bridge_tp/record_phase9_calibration.py \
+  --base-url http://127.0.0.1:8200 \
+  --out "$CONDITION_DIR/telemetry.csv" \
+  --interval-s 1 \
+  --max-seconds 900 \
+  --block-size 16 \
+  --total-kv-blocks 35739 \
+  --condition-id "$CONDITION_ID" \
+  --load-band medium \
+  --target-rate-gib-s 0.7 \
+  --rep 1 \
+  --stop-file "$CONDITION_DIR/telemetry.stop" \
+  2>&1 | tee "$CONDITION_DIR/telemetry.log"
+```
+
+### Terminal B: TP4 detailed benchmark
+
+Use the QPS frozen by the rate-zero pilot for the requested band. The example
+variable is deliberately checked rather than silently defaulted:
+
+```bash
+: "${MEDIUM_QPS:?export MEDIUM_QPS from the accepted rate-zero pilot}"
+
+vllm bench serve \
+  --backend vllm \
+  --base-url http://127.0.0.1:8200 \
+  --endpoint /v1/completions \
+  --model bridgetp-model \
+  --tokenizer /root/autodl-tmp/models/models/Qwen--Qwen2.5-14B-Instruct/snapshots/master \
+  --dataset-name random \
+  --input-len 256 \
+  --output-len 2048 \
+  --request-rate "$MEDIUM_QPS" \
+  --num-prompts 400 \
+  --num-warmups 10 \
+  --seed 1 \
+  --ignore-eos \
+  --percentile-metrics ttft,tpot,itl,e2el \
+  --metric-percentiles 50,95,99 \
+  --save-result --save-detailed \
+  --result-dir "$CONDITION_DIR" \
+  --result-filename benchmark.json \
+  --label "$CONDITION_ID" \
+  2>&1 | tee "$CONDITION_DIR/benchmark.log"
+```
+
+### Terminal C: copy or rate-zero window
+
+Start this after the benchmark has been issuing requests for 20 seconds. Rate
+zero uses the same command and records a no-copy baseline window.
+
+```bash
+"$BRIDGE_PY" tools/bridge_tp/run_phase9_copy_load.py \
+  --src 0 \
+  --dst 1 \
+  --chunk-mib 16 \
+  --target-gib-s 0.7 \
+  --seconds 300 \
+  --out "$CONDITION_DIR/copy_window.json" \
+  2>&1 | tee "$CONDITION_DIR/copy_window.log"
+
+touch "$CONDITION_DIR/telemetry.stop"
+```
+
+For the baseline cell, change both `--target-rate-gib-s` and
+`--target-gib-s` to `0`. Do not run a different-duration baseline.
+
+## 5. Analyze one completed condition
+
+For the medium band example:
+
+```bash
+"$BRIDGE_PY" tools/bridge_tp/analyze_phase9_calibration.py \
+  --telemetry "$CONDITION_DIR/telemetry.csv" \
+  --benchmark-json "$CONDITION_DIR/benchmark.json" \
+  --copy-json "$CONDITION_DIR/copy_window.json" \
+  --target-rate-gib-s 0.7 \
+  --load-min 0.45 \
+  --load-max 0.55 \
+  --min-band-fraction 0.80 \
+  --rate-relative-tolerance 0.05 \
+  --out "$CONDITION_DIR/condition_result.json" \
+  2>&1 | tee "$CONDITION_DIR/analysis.log"
+```
+
+Only `status=ACCEPTED` is eligible for the 36-cell summary. A rejected run must
+remain in the archive; adjust the QPS in a new condition ID rather than
+overwriting or deleting it.
+
+## 6. TPOT tick fit
+
+After all 18 I128/O512 TPOT conditions finish:
+
+```bash
+"$BRIDGE_PY" tools/bridge_tp/fit_phase9_tick_tpot.py \
+  --tp1 "$CAL_ROOT"/tpot_tp1_*/telemetry.csv \
+  --tp4 "$CAL_ROOT"/tpot_tp4_*/telemetry.csv \
+  --input-len 128 \
+  --output-len 512 \
+  --out "$CAL_ROOT/tick_tpot_candidate.json"
+```
+
+This candidate replaces the run-level max-concurrency proxy only after its
+input list, environment, and hashes are frozen.
+
+## 7. Complete interference grid
+
+After exactly one accepted result exists for every band/rate/rep cell:
+
+```bash
+"$BRIDGE_PY" tools/bridge_tp/summarize_phase9_calibration.py \
+  --inputs "$CAL_ROOT"/*/condition_result.json \
+  --out "$CAL_ROOT/bridge_calibration_summary.json" \
+  2>&1 | tee "$CAL_ROOT/bridge_calibration_summary.log"
+```
+
+Expected output:
+
+```text
+status: COMPLETE
+expected_conditions: 36
+missing: []
+unexpected: []
+duplicates: []
+rejected: []
+```
+
+Finally hash all accepted evidence:
+
+```bash
+find "$CAL_ROOT" -type f \
+  \( -name '*.json' -o -name '*.csv' -o -name '*.log' \) \
+  -print0 | sort -z | xargs -0 sha256sum \
+  > "$CAL_ROOT/SHA256SUMS"
+```
+
+Completion of this grid does not authorize formal D-3. The next steps are to
+fit and implement the rate-aware interference model, rerun policy replay, and
+then freeze the Section 8 preregistration.

@@ -102,6 +102,73 @@ class TestPrometheusParsing(unittest.TestCase):
         )
         self.assertAlmostEqual(p.kv_usage_frac, 0.63, places=9)
 
+    def test_new_kv_cache_metric_name_is_preferred(self):
+        samples = tel.parse_prometheus(
+            "vllm:gpu_cache_usage_perc 0.25\n"
+            "vllm:kv_cache_usage_perc 0.75\n"
+        )
+        pool = tel.pool_from_samples(samples, block_size=16, total_kv_blocks=100)
+        self.assertAlmostEqual(pool.kv_usage_frac, 0.75, places=9)
+
+    def test_interval_histogram_uses_counter_deltas(self):
+        previous = tel.parse_prometheus(
+            """
+vllm:time_per_output_token_seconds_bucket{le="0.01"} 10
+vllm:time_per_output_token_seconds_bucket{le="0.02"} 20
+vllm:time_per_output_token_seconds_bucket{le="0.04"} 30
+vllm:time_per_output_token_seconds_bucket{le="+Inf"} 30
+vllm:time_per_output_token_seconds_sum 0.60
+vllm:time_per_output_token_seconds_count 30
+"""
+        )
+        current = tel.parse_prometheus(
+            """
+vllm:time_per_output_token_seconds_bucket{le="0.01"} 10
+vllm:time_per_output_token_seconds_bucket{le="0.02"} 25
+vllm:time_per_output_token_seconds_bucket{le="0.04"} 40
+vllm:time_per_output_token_seconds_bucket{le="+Inf"} 40
+vllm:time_per_output_token_seconds_sum 0.90
+vllm:time_per_output_token_seconds_count 40
+"""
+        )
+        count, mean, p99 = tel.interval_histogram_stats(
+            previous,
+            current,
+            "vllm:time_per_output_token_seconds",
+        )
+        self.assertEqual(count, 10)
+        self.assertAlmostEqual(mean, 0.03, places=9)
+        self.assertGreater(p99, 0.02)
+        self.assertLessEqual(p99, 0.04)
+
+    def test_interval_pool_retains_current_gauges(self):
+        previous = tel.parse_prometheus(SCRAPE)
+        current = tel.parse_prometheus(
+            SCRAPE.replace(
+                'vllm:num_requests_running{model_name="qwen"} 7.0',
+                'vllm:num_requests_running{model_name="qwen"} 9.0',
+            ).replace(
+                'vllm:time_per_output_token_seconds_count 100.0',
+                'vllm:time_per_output_token_seconds_count 110.0',
+            ).replace(
+                'vllm:time_per_output_token_seconds_sum 2.4',
+                'vllm:time_per_output_token_seconds_sum 2.7',
+            ).replace(
+                'vllm:time_per_output_token_seconds_bucket{le="+Inf"} 100.0',
+                'vllm:time_per_output_token_seconds_bucket{le="+Inf"} 110.0',
+            )
+        )
+        pool, count = tel.interval_pool_from_samples(
+            previous,
+            current,
+            block_size=16,
+            total_kv_blocks=1000,
+        )
+        self.assertEqual(pool.num_running, 9)
+        self.assertAlmostEqual(pool.kv_usage_frac, 0.63, places=9)
+        self.assertEqual(count, 10)
+        self.assertAlmostEqual(pool.mean_tpot_s, 0.03, places=9)
+
 
 class TestRuntimeControl(unittest.TestCase):
     def setUp(self) -> None:
