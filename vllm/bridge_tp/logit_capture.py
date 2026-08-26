@@ -56,6 +56,36 @@ def _safe_request_id(request_id: str) -> str:
     return safe[:160] or "request"
 
 
+def _resolve_target_request_id(
+    configured: str,
+    request_ids: list[str],
+) -> str | None:
+    """Resolve a public completion id to vLLM's internal request id."""
+    bases = [configured]
+    if not configured.startswith("cmpl-"):
+        bases.append(f"cmpl-{configured}-0")
+
+    def matches_filter(request_id: str) -> bool:
+        for base in bases:
+            if request_id == base:
+                return True
+            randomized = re.fullmatch(
+                rf"{re.escape(base)}-[0-9A-Fa-f]{{8}}",
+                request_id,
+            )
+            if randomized is not None:
+                return True
+        return False
+
+    matches = [request_id for request_id in request_ids if matches_filter(request_id)]
+    if len(matches) > 1:
+        raise RuntimeError(
+            "BridgeTP logit capture request filter is ambiguous: "
+            f"configured={configured!r}, matches={matches!r}"
+        )
+    return matches[0] if matches else None
+
+
 def token_ids_sha256(token_ids: list[int]) -> str:
     payload = json.dumps(token_ids, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
@@ -222,9 +252,13 @@ def maybe_make_logit_observer(
         return None
     try:
         if config.target_request_id is not None:
-            if config.target_request_id not in req_ids:
+            resolved_request_id = _resolve_target_request_id(
+                config.target_request_id,
+                req_ids,
+            )
+            if resolved_request_id is None:
                 return None
-            request_id = config.target_request_id
+            request_id = resolved_request_id
         else:
             if len(req_ids) != 1:
                 return None
