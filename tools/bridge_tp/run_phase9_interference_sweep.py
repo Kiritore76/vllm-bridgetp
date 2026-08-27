@@ -52,8 +52,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-mib", type=float, default=16.0)
     parser.add_argument("--input-len", type=int, default=256)
     parser.add_argument("--output-len", type=int, default=2048)
-    parser.add_argument("--num-warmups", type=int, default=10)
+    parser.add_argument("--num-warmups", type=int, default=0)
     parser.add_argument("--copy-delay-s", type=float, default=60.0)
+    parser.add_argument("--load-settle-timeout-s", type=float, default=300.0)
+    parser.add_argument("--stability-window-s", type=float, default=60.0)
+    parser.add_argument("--stability-poll-s", type=float, default=5.0)
+    parser.add_argument("--min-band-fraction", type=float, default=0.80)
     parser.add_argument("--copy-seconds", type=float, default=300.0)
     parser.add_argument("--drain-margin-s", type=float, default=60.0)
     parser.add_argument("--telemetry-interval-s", type=float, default=1.0)
@@ -73,6 +77,22 @@ def parse_args() -> argparse.Namespace:
         parser.error("source and target GPUs must differ")
     if any(qps <= 0 for qps in args.candidate_qps):
         parser.error("candidate QPS values must be positive")
+    if args.num_warmups < 0:
+        parser.error("num-warmups cannot be negative")
+    if not 0 <= args.copy_delay_s < args.load_settle_timeout_s:
+        parser.error(
+            "copy-delay-s must be non-negative and below "
+            "load-settle-timeout-s"
+        )
+    if not 0 < args.stability_window_s < args.load_settle_timeout_s:
+        parser.error(
+            "stability-window-s must be positive and below "
+            "load-settle-timeout-s"
+        )
+    if args.stability_poll_s <= 0:
+        parser.error("stability-poll-s must be positive")
+    if not 0 < args.min_band_fraction <= 1:
+        parser.error("min-band-fraction must be in (0,1]")
     if args.mode == "formal" and args.pilot_summary is None:
         parser.error("formal mode requires --pilot-summary")
     return args
@@ -85,7 +105,11 @@ def benchmark_command(
     condition_id: str,
     condition_dir: Path,
 ) -> list[str]:
-    duration = args.copy_delay_s + args.copy_seconds + args.drain_margin_s
+    duration = (
+        args.load_settle_timeout_s
+        + args.copy_seconds
+        + args.drain_margin_s
+    )
     prompts = max(1, math.ceil(qps * duration))
     return [
         args.vllm_bin,
@@ -221,6 +245,110 @@ def window_load_summary(condition_dir: Path) -> dict[str, object]:
     }
 
 
+def recent_load_summary(
+    telemetry: Path,
+    window_s: float,
+    interval_s: float,
+) -> dict[str, object] | None:
+    """Summarize the most recent complete telemetry window."""
+    if not telemetry.is_file():
+        return None
+    try:
+        with telemetry.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+    except (OSError, csv.Error):
+        return None
+    parsed = []
+    for row in rows:
+        try:
+            parsed.append(
+                (
+                    float(row["monotonic_s"]),
+                    float(row["kv_usage_frac"]),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not parsed:
+        return None
+    end = parsed[-1][0]
+    values = [value for timestamp, value in parsed if timestamp >= end - window_s]
+    if len(values) < 2:
+        return None
+    coverage_s = parsed[-1][0] - next(
+        timestamp for timestamp, _ in parsed if timestamp >= end - window_s
+    )
+    # Allow two scrape intervals of scheduling jitter before declaring the
+    # rolling window incomplete.
+    if coverage_s < max(0.0, window_s - 2.0 * interval_s):
+        return None
+    mean = sum(values) / len(values)
+    fractions = {
+        band: sum(low <= value <= high for value in values) / len(values)
+        for band, (low, high) in BANDS.items()
+    }
+    return {
+        "samples": len(values),
+        "window_s": window_s,
+        "coverage_s": coverage_s,
+        "kv_usage_mean": mean,
+        "kv_usage_min": min(values),
+        "kv_usage_max": max(values),
+        "band_fractions": fractions,
+    }
+
+
+def matching_stable_band(
+    summary: dict[str, object] | None,
+    requested_band: str | None,
+    min_fraction: float,
+) -> str | None:
+    """Return the band whose rolling window satisfies the frozen rule."""
+    if summary is None:
+        return None
+    mean = float(summary["kv_usage_mean"])
+    fractions = summary["band_fractions"]
+    names = (requested_band,) if requested_band is not None else tuple(BANDS)
+    for name in names:
+        low, high = BANDS[name]
+        if low <= mean <= high and float(fractions[name]) >= min_fraction:
+            return name
+    return None
+
+
+def wait_for_stable_load(
+    args: argparse.Namespace,
+    telemetry: Path,
+    benchmark: subprocess.Popen,
+    requested_band: str | None,
+) -> tuple[str | None, dict[str, object] | None, float]:
+    """Wait for a measured rolling load window before starting copy."""
+    started = time.monotonic()
+    not_before = started + args.copy_delay_s
+    deadline = started + args.load_settle_timeout_s
+    latest = None
+    while True:
+        now = time.monotonic()
+        if benchmark.poll() is not None:
+            raise RuntimeError("benchmark ended before load became stable")
+        if now >= not_before:
+            latest = recent_load_summary(
+                telemetry,
+                args.stability_window_s,
+                args.telemetry_interval_s,
+            )
+            matched = matching_stable_band(
+                latest,
+                requested_band,
+                args.min_band_fraction,
+            )
+            if matched is not None:
+                return matched, latest, now - started
+        if now >= deadline:
+            return None, latest, now - started
+        time.sleep(min(args.stability_poll_s, max(0.0, deadline - now)))
+
+
 def run_condition(
     args: argparse.Namespace,
     prefix: str,
@@ -250,6 +378,14 @@ def run_condition(
         "qps": qps,
         "target_rate_gib_s": rate,
         "rep": rep,
+        "load_stability": {
+            "requested_band": band,
+            "minimum_delay_s": args.copy_delay_s,
+            "timeout_s": args.load_settle_timeout_s,
+            "window_s": args.stability_window_s,
+            "poll_s": args.stability_poll_s,
+            "min_band_fraction": args.min_band_fraction,
+        },
         "recorder_command": recorder_cmd,
         "benchmark_command": benchmark_cmd,
         "copy_command": copy_cmd,
@@ -274,6 +410,9 @@ def run_condition(
         text=True,
     )
     benchmark = None
+    stability = None
+    stable_band = None
+    settle_elapsed_s = None
     try:
         time.sleep(max(2.0, 2 * args.telemetry_interval_s))
         if recorder.poll() is not None:
@@ -284,15 +423,45 @@ def run_condition(
             stderr=subprocess.STDOUT,
             text=True,
         )
-        time.sleep(args.copy_delay_s)
-        if benchmark.poll() is not None:
-            raise RuntimeError("benchmark ended before the copy window")
-        copy_return = stream_command(
-            copy_cmd,
-            condition_dir / "copy_window.log",
+        stable_band, stability, settle_elapsed_s = wait_for_stable_load(
+            args,
+            condition_dir / "telemetry.csv",
+            benchmark,
+            band,
         )
-        if copy_return != 0:
-            raise RuntimeError(f"copy window failed with exit code {copy_return}")
+        stability_payload = {
+            "format_version": 1,
+            "status": "STABLE" if stable_band is not None else "TIMEOUT",
+            "requested_band": band,
+            "matched_band": stable_band,
+            "settle_elapsed_s": settle_elapsed_s,
+            "minimum_delay_s": args.copy_delay_s,
+            "timeout_s": args.load_settle_timeout_s,
+            "window_s": args.stability_window_s,
+            "min_band_fraction": args.min_band_fraction,
+            "observed": stability,
+        }
+        (condition_dir / "load_stability.json").write_text(
+            json.dumps(stability_payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        if stable_band is None:
+            if band is not None:
+                raise RuntimeError(
+                    f"load did not stabilize in {band} band before timeout"
+                )
+            # A pilot miss is evidence about this candidate, not a reason to
+            # discard the other preregistered candidates.
+            return_code = None
+        else:
+            return_code = stream_command(
+                copy_cmd,
+                condition_dir / "copy_window.log",
+            )
+            if return_code != 0:
+                raise RuntimeError(
+                    f"copy window failed with exit code {return_code}"
+                )
     finally:
         failed = sys.exc_info()[0] is not None
         (condition_dir / "telemetry.stop").touch()
@@ -302,7 +471,7 @@ def run_condition(
             recorder.terminate()
             recorder.wait(timeout=10.0)
         telemetry_log.close()
-        if failed:
+        if failed or stable_band is None:
             if benchmark is not None and benchmark.poll() is None:
                 benchmark.terminate()
                 try:
@@ -316,6 +485,37 @@ def run_condition(
         raise RuntimeError(f"telemetry recorder failed: {recorder.returncode}")
     if benchmark is None:
         raise RuntimeError("benchmark was not started")
+    if stable_band is None:
+        latest = stability or {
+            "samples": 0,
+            "window_s": args.stability_window_s,
+            "coverage_s": 0.0,
+            "kv_usage_mean": 0.0,
+            "kv_usage_min": 0.0,
+            "kv_usage_max": 0.0,
+            "band_fractions": {name: 0.0 for name in BANDS},
+        }
+        summary = {
+            **latest,
+            "stability_status": "TIMEOUT",
+            "matched_band": None,
+            "settle_elapsed_s": settle_elapsed_s,
+        }
+        (condition_dir / "load_summary.json").write_text(
+            json.dumps(summary, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        write_hashes(
+            condition_dir,
+            [
+                condition_dir / "telemetry.csv",
+                condition_dir / "telemetry.manifest.json",
+                manifest_path,
+                condition_dir / "load_stability.json",
+                condition_dir / "load_summary.json",
+            ],
+        )
+        return condition_dir, summary
     try:
         benchmark_return = benchmark.wait(timeout=args.condition_timeout_s)
     except subprocess.TimeoutExpired:
@@ -332,12 +532,21 @@ def run_condition(
         condition_dir / "telemetry.manifest.json",
         condition_dir / "benchmark.json",
         condition_dir / "copy_window.json",
+        condition_dir / "load_stability.json",
         manifest_path,
     ]
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         raise RuntimeError(f"condition artifacts are missing: {missing}")
     load_summary = window_load_summary(condition_dir)
+    load_summary.update(
+        {
+            "stability_status": "STABLE",
+            "matched_band": stable_band,
+            "settle_elapsed_s": settle_elapsed_s,
+            "pre_copy_stability": stability,
+        }
+    )
     (condition_dir / "load_summary.json").write_text(
         json.dumps(load_summary, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -349,15 +558,19 @@ def run_condition(
     return condition_dir, load_summary
 
 
-def choose_band_qps(conditions: list[dict]) -> dict[str, dict | None]:
+def choose_band_qps(
+    conditions: list[dict],
+    min_band_fraction: float = 0.80,
+) -> dict[str, dict | None]:
     selected = {}
     for band, (low, high) in BANDS.items():
         midpoint = (low + high) / 2
         candidates = [
             item
             for item in conditions
-            if low <= item["kv_usage_mean"] <= high
-            and item["band_fractions"][band] >= 0.80
+            if item.get("stability_status", "STABLE") == "STABLE"
+            and low <= item["kv_usage_mean"] <= high
+            and item["band_fractions"][band] >= min_band_fraction
         ]
         candidates.sort(
             key=lambda item: (abs(item["kv_usage_mean"] - midpoint), item["qps"])
@@ -384,7 +597,7 @@ def run_pilot(args: argparse.Namespace) -> None:
                 **summary,
             }
         )
-    selected = choose_band_qps(conditions)
+    selected = choose_band_qps(conditions, args.min_band_fraction)
     payload = {
         "format_version": 1,
         "phase": "BridgeTP Phase 9 Section 7.2 load pilot",
@@ -396,8 +609,10 @@ def run_pilot(args: argparse.Namespace) -> None:
         "conditions": conditions,
         "selected": selected,
         "selection_rule": (
-            "Require mean inside band and at least 80% of interval samples "
-            "inside band; choose the mean nearest the band midpoint."
+            "Start the measurement only after a rolling stable-load window; "
+            "then require the full rate-zero measurement mean inside the "
+            "band and at least 80% of its samples inside the band; choose "
+            "the mean nearest the band midpoint."
         ),
         "formal_model_conclusion": None,
     }
@@ -436,7 +651,7 @@ def analyze_formal_condition(
         "--load-max",
         str(high),
         "--min-band-fraction",
-        "0.80",
+        str(args.min_band_fraction),
         "--rate-relative-tolerance",
         "0.05",
         "--out",

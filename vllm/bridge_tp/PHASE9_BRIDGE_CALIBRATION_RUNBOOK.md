@@ -235,10 +235,14 @@ export CAL_PILOT_ROOT="$CAL_ROOT/load_pilot_$(date +%Y%m%dT%H%M%S)"
   --block-size 16 \
   --source-gpu 0 \
   --target-gpu 1 \
-  --candidate-qps 0.2 0.4 0.53 0.7 1.0 1.5 \
+  --candidate-qps 0.7 1.25 1.3 1.35 1.9 2.0 2.1 \
   --input-len 256 \
   --output-len 2048 \
+  --num-warmups 0 \
   --copy-delay-s 60 \
+  --load-settle-timeout-s 300 \
+  --stability-window-s 60 \
+  --min-band-fraction 0.80 \
   --copy-seconds 300 \
   2>&1 | tee "$CAL_ROOT/load_pilot_driver.log"
 ```
@@ -253,6 +257,8 @@ Inspect, do not silently accept, the selected values:
 The summary must report `status=READY` and non-null selections for all three
 bands. If it reports `MORE_QPS_CANDIDATES_REQUIRED`, preserve that pilot and
 rerun a new pilot root with an expanded preregistered candidate list.
+Candidates that never satisfy the rolling stability gate are preserved with
+`stability_status=TIMEOUT`; the automatic pilot continues to the next QPS.
 
 ### Automatic Section 7.2 formal 36-cell sweep
 
@@ -281,7 +287,11 @@ export CAL_FORMAL_ROOT="$CAL_ROOT/interference_formal_$(date +%Y%m%dT%H%M%S)"
   --target-gpu 1 \
   --input-len 256 \
   --output-len 2048 \
+  --num-warmups 0 \
   --copy-delay-s 60 \
+  --load-settle-timeout-s 300 \
+  --stability-window-s 60 \
+  --min-band-fraction 0.80 \
   --copy-seconds 300 \
   2>&1 | tee "$CAL_ROOT/interference_formal_driver.log"
 ```

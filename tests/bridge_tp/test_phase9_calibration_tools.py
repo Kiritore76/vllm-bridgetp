@@ -56,6 +56,80 @@ class TestCalibrationAnalysis(unittest.TestCase):
         self.assertEqual(selected["medium"]["qps"], 0.4)
         self.assertEqual(selected["high"]["qps"], 0.8)
 
+    def test_load_pilot_ignores_stability_timeout(self):
+        conditions = [
+            {
+                "qps": 0.7,
+                "kv_usage_mean": 0.20,
+                "band_fractions": {"low": 1.0, "medium": 0.0, "high": 0.0},
+                "stability_status": "TIMEOUT",
+            },
+            {
+                "qps": 0.75,
+                "kv_usage_mean": 0.21,
+                "band_fractions": {"low": 0.9, "medium": 0.0, "high": 0.0},
+                "stability_status": "STABLE",
+            },
+        ]
+        selected = run_interference.choose_band_qps(conditions)
+        self.assertEqual(selected["low"]["qps"], 0.75)
+
+    def test_load_pilot_honors_configured_band_fraction(self):
+        conditions = [
+            {
+                "qps": 0.7,
+                "kv_usage_mean": 0.20,
+                "band_fractions": {"low": 0.85, "medium": 0.0, "high": 0.0},
+                "stability_status": "STABLE",
+            }
+        ]
+        self.assertIsNotNone(
+            run_interference.choose_band_qps(conditions, 0.80)["low"]
+        )
+        self.assertIsNone(
+            run_interference.choose_band_qps(conditions, 0.90)["low"]
+        )
+
+    def test_matching_stable_band_requires_mean_and_fraction(self):
+        summary = {
+            "kv_usage_mean": 0.50,
+            "band_fractions": {"low": 0.0, "medium": 0.85, "high": 0.0},
+        }
+        self.assertEqual(
+            run_interference.matching_stable_band(summary, None, 0.80),
+            "medium",
+        )
+        self.assertIsNone(
+            run_interference.matching_stable_band(summary, "low", 0.80)
+        )
+
+    def test_recent_load_summary_rejects_incomplete_window(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "telemetry.csv"
+            path.write_text(
+                "monotonic_s,kv_usage_frac\n100,0.18\n110,0.20\n",
+                encoding="utf-8",
+            )
+            self.assertIsNone(
+                run_interference.recent_load_summary(path, 60.0, 1.0)
+            )
+
+    def test_recent_load_summary_accepts_complete_stable_window(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "telemetry.csv"
+            rows = ["monotonic_s,kv_usage_frac"]
+            rows.extend(
+                f"{second},{0.18 + (second % 2) * 0.01}"
+                for second in range(61)
+            )
+            path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+            summary = run_interference.recent_load_summary(path, 60.0, 1.0)
+            self.assertIsNotNone(summary)
+            self.assertEqual(
+                run_interference.matching_stable_band(summary, "low", 0.80),
+                "low",
+            )
+
     def test_tpot_sweep_matrix_has_eighteen_conditions(self):
         args = type(
             "Args",
