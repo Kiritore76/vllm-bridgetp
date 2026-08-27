@@ -28,9 +28,52 @@ analyze = load_tool("analyze_phase9_calibration")
 record = load_tool("record_phase9_calibration")
 summarize = load_tool("summarize_phase9_calibration")
 fit_tpot = load_tool("fit_phase9_tick_tpot")
+run_tpot = load_tool("run_phase9_tpot_sweep")
+run_interference = load_tool("run_phase9_interference_sweep")
 
 
 class TestCalibrationAnalysis(unittest.TestCase):
+    def test_load_pilot_selection_is_band_scoped(self):
+        conditions = [
+            {
+                "qps": 0.2,
+                "kv_usage_mean": 0.20,
+                "band_fractions": {"low": 0.9, "medium": 0.0, "high": 0.0},
+            },
+            {
+                "qps": 0.4,
+                "kv_usage_mean": 0.50,
+                "band_fractions": {"low": 0.0, "medium": 0.9, "high": 0.0},
+            },
+            {
+                "qps": 0.8,
+                "kv_usage_mean": 0.80,
+                "band_fractions": {"low": 0.0, "medium": 0.0, "high": 0.9},
+            },
+        ]
+        selected = run_interference.choose_band_qps(conditions)
+        self.assertEqual(selected["low"]["qps"], 0.2)
+        self.assertEqual(selected["medium"]["qps"], 0.4)
+        self.assertEqual(selected["high"]["qps"], 0.8)
+
+    def test_tpot_sweep_matrix_has_eighteen_conditions(self):
+        args = type(
+            "Args",
+            (),
+            {
+                "tp1_url": "http://127.0.0.1:8001",
+                "tp4_url": "http://127.0.0.1:8200",
+                "tp1_blocks": 1968,
+                "tp4_blocks": 35739,
+                "qps": (1.0, 2.0, 4.0),
+                "reps": (1, 2, 3),
+            },
+        )()
+        matrix = list(run_tpot.condition_matrix(args))
+        self.assertEqual(len(matrix), 18)
+        self.assertEqual(matrix[0], ("tp1", args.tp1_url, 1968, 1.0, 1))
+        self.assertEqual(matrix[-1], ("tp4", args.tp4_url, 35739, 4.0, 3))
+
     def test_weighted_tpot_fit_recovers_linear_model(self):
         rows = [
             {
