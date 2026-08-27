@@ -29,6 +29,17 @@ from typing import Iterable
 from .events import PoolTelemetry
 
 
+# vLLM V1 currently exports request-level TPOT under the first name.  Older
+# Phase 9 environments used the second name.  Do not substitute the
+# inter-token-latency histogram here: it has one observation per token gap,
+# whereas the controller model and calibration response are request-level
+# TPOT.
+REQUEST_TPOT_METRICS = (
+    "vllm:request_time_per_output_token_seconds",
+    "vllm:time_per_output_token_seconds",
+)
+
+
 class TelemetryError(RuntimeError):
     pass
 
@@ -115,6 +126,14 @@ def first_value_for_names(
 def has_metric(samples: list[Sample], name: str) -> bool:
     """Return whether a scrape contains at least one sample with ``name``."""
     return any(sample.name == name for sample in samples)
+
+
+def request_tpot_metric(samples: list[Sample]) -> str | None:
+    """Return the request-level TPOT histogram exported by this server."""
+    for metric in REQUEST_TPOT_METRICS:
+        if has_metric(samples, f"{metric}_bucket"):
+            return metric
+    return None
 
 
 def histogram_quantile(samples: list[Sample], metric: str, q: float) -> float:
@@ -224,6 +243,7 @@ def pool_from_samples(
     block_size: int,
     total_kv_blocks: int,
     now_unix_s: float | None = None,
+    tpot_metric: str | None = None,
 ) -> PoolTelemetry:
     """Build a :class:`PoolTelemetry` from one scrape.
 
@@ -245,17 +265,24 @@ def pool_from_samples(
         kv_usage /= 100.0
     kv_usage = max(0.0, min(1.0, kv_usage))
     free_blocks = int(round(total_kv_blocks * (1.0 - kv_usage)))
+    selected_tpot_metric = tpot_metric or request_tpot_metric(samples)
     return PoolTelemetry(
         num_running=int(first_value(samples, "vllm:num_requests_running", 0.0)),
         num_waiting=int(first_value(samples, "vllm:num_requests_waiting", 0.0)),
         kv_usage_frac=kv_usage,
         preemptions_total=int(first_value(samples, "vllm:num_preemptions_total", 0.0)),
-        p99_tpot_s=histogram_quantile(
-            samples, "vllm:time_per_output_token_seconds", 0.99
+        p99_tpot_s=(
+            histogram_quantile(samples, selected_tpot_metric, 0.99)
+            if selected_tpot_metric is not None
+            else 0.0
         ),
-        mean_tpot_s=_safe_mean(
-            first_value(samples, "vllm:time_per_output_token_seconds_sum", 0.0),
-            first_value(samples, "vllm:time_per_output_token_seconds_count", 0.0),
+        mean_tpot_s=(
+            _safe_mean(
+                first_value(samples, f"{selected_tpot_metric}_sum", 0.0),
+                first_value(samples, f"{selected_tpot_metric}_count", 0.0),
+            )
+            if selected_tpot_metric is not None
+            else 0.0
         ),
         free_kv_blocks=free_blocks,
         block_size=block_size,
@@ -269,6 +296,7 @@ def interval_pool_from_samples(
     block_size: int,
     total_kv_blocks: int,
     now_unix_s: float | None = None,
+    tpot_metric: str | None = None,
 ) -> tuple[PoolTelemetry, int]:
     """Build pool telemetry whose TPOT fields cover one scrape interval.
 
@@ -276,18 +304,27 @@ def interval_pool_from_samples(
     P99 are computed from deltas between cumulative Prometheus histograms.
     The second return value is the number of TPOT observations in the interval.
     """
+    selected_tpot_metric = (
+        tpot_metric
+        or request_tpot_metric(current)
+        or request_tpot_metric(previous)
+    )
     pool = pool_from_samples(
         current,
         block_size=block_size,
         total_kv_blocks=total_kv_blocks,
         now_unix_s=now_unix_s,
+        tpot_metric=selected_tpot_metric,
     )
-    count, mean, p99 = interval_histogram_stats(
-        previous,
-        current,
-        "vllm:time_per_output_token_seconds",
-        0.99,
-    )
+    if selected_tpot_metric is None:
+        count, mean, p99 = 0, 0.0, 0.0
+    else:
+        count, mean, p99 = interval_histogram_stats(
+            previous,
+            current,
+            selected_tpot_metric,
+            0.99,
+        )
     return (
         PoolTelemetry(
             num_running=pool.num_running,

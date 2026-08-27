@@ -94,6 +94,37 @@ class TestPrometheusParsing(unittest.TestCase):
         self.assertAlmostEqual(p.mean_tpot_s, 0.024, places=9)
         self.assertGreater(p.p99_tpot_s, p.mean_tpot_s)
 
+    def test_current_request_tpot_metric_is_preferred(self):
+        current = tel.parse_prometheus(
+            "vllm:request_time_per_output_token_seconds_bucket{le=\"0.04\"} 8\n"
+            "vllm:request_time_per_output_token_seconds_bucket{le=\"+Inf\"} 10\n"
+            "vllm:request_time_per_output_token_seconds_sum 0.3\n"
+            "vllm:request_time_per_output_token_seconds_count 10\n"
+            "vllm:time_per_output_token_seconds_bucket{le=\"+Inf\"} 99\n"
+        )
+        self.assertEqual(
+            tel.request_tpot_metric(current),
+            "vllm:request_time_per_output_token_seconds",
+        )
+        pool = tel.pool_from_samples(current, block_size=16, total_kv_blocks=100)
+        self.assertAlmostEqual(pool.mean_tpot_s, 0.03, places=9)
+
+    def test_interval_pool_accepts_lazily_created_current_metric(self):
+        current = tel.parse_prometheus(
+            "vllm:num_requests_running 2\n"
+            "vllm:num_requests_waiting 0\n"
+            "vllm:kv_cache_usage_perc 0.1\n"
+            "vllm:request_time_per_output_token_seconds_bucket{le=\"0.04\"} 3\n"
+            "vllm:request_time_per_output_token_seconds_bucket{le=\"+Inf\"} 4\n"
+            "vllm:request_time_per_output_token_seconds_sum 0.12\n"
+            "vllm:request_time_per_output_token_seconds_count 4\n"
+        )
+        pool, count = tel.interval_pool_from_samples(
+            [], current, block_size=16, total_kv_blocks=100
+        )
+        self.assertEqual(count, 4)
+        self.assertAlmostEqual(pool.mean_tpot_s, 0.03, places=9)
+
     def test_percent_style_cache_usage_is_normalized(self):
         p = tel.pool_from_samples(
             tel.parse_prometheus("vllm:gpu_cache_usage_perc 63.0\n"),

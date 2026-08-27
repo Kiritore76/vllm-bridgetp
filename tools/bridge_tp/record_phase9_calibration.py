@@ -25,9 +25,9 @@ from vllm.bridge_tp.controller.telemetry import (  # noqa: E402
     histogram_delta_samples,
     interval_pool_from_samples,
     parse_prometheus,
+    request_tpot_metric,
 )
 
-TPOT_METRIC = "vllm:time_per_output_token_seconds"
 KV_METRICS = (
     "vllm:kv_cache_usage_perc",
     "vllm:gpu_cache_usage_perc",
@@ -74,9 +74,12 @@ def fetch_samples(url: str, timeout_s: float):
     return parse_prometheus(text)
 
 
-def histogram_delta_json(previous, current) -> str:
+def histogram_delta_json(previous, current, metric: str | None = None) -> str:
+    metric = metric or request_tpot_metric(current) or request_tpot_metric(previous)
+    if metric is None:
+        return "{}"
     buckets = {}
-    for sample in histogram_delta_samples(previous, current, TPOT_METRIC):
+    for sample in histogram_delta_samples(previous, current, metric):
         bound = sample.labels.get("le")
         if bound is not None:
             buckets[bound] = buckets.get(bound, 0.0) + sample.value
@@ -92,6 +95,7 @@ def main() -> None:
     manifest_path = args.out.with_suffix(".manifest.json")
 
     previous = fetch_samples(metrics_url, args.timeout_s)
+    tpot_metric = request_tpot_metric(previous)
     kv_metric = next((name for name in KV_METRICS if has_metric(previous, name)), None)
     if kv_metric is None:
         raise RuntimeError(
@@ -101,9 +105,6 @@ def main() -> None:
     required = (
         "vllm:num_requests_running",
         "vllm:num_requests_waiting",
-        f"{TPOT_METRIC}_bucket",
-        f"{TPOT_METRIC}_sum",
-        f"{TPOT_METRIC}_count",
     )
     missing = [name for name in required if not has_metric(previous, name)]
     if missing:
@@ -146,12 +147,18 @@ def main() -> None:
             current_monotonic = time.perf_counter()
             current_unix = time.time()
             current = fetch_samples(metrics_url, args.timeout_s)
+            if tpot_metric is None:
+                # Request-level histograms may be registered lazily.  The
+                # first scrape containing one is still a valid delta from an
+                # empty baseline because no earlier scrape exposed samples.
+                tpot_metric = request_tpot_metric(current)
             pool, count = interval_pool_from_samples(
                 previous,
                 current,
                 block_size=args.block_size,
                 total_kv_blocks=args.total_kv_blocks,
                 now_unix_s=current_unix,
+                tpot_metric=tpot_metric,
             )
             writer.writerow(
                 {
@@ -170,7 +177,7 @@ def main() -> None:
                     "interval_mean_tpot_s": pool.mean_tpot_s,
                     "interval_p99_tpot_s": pool.p99_tpot_s,
                     "tpot_histogram_delta_json": histogram_delta_json(
-                        previous, current
+                        previous, current, tpot_metric
                     ),
                 }
             )
@@ -179,6 +186,13 @@ def main() -> None:
             previous = current
             last_monotonic = current_monotonic
 
+    if tpot_metric is None:
+        raise RuntimeError(
+            "request-level TPOT histogram never appeared; expected "
+            "vllm:request_time_per_output_token_seconds or the legacy "
+            "vllm:time_per_output_token_seconds"
+        )
+
     manifest = {
         "format_version": 1,
         "phase": "BridgeTP Phase 9 conditional bridge calibration",
@@ -186,7 +200,7 @@ def main() -> None:
         "base_url": args.base_url,
         "metrics_url": metrics_url,
         "kv_metric": kv_metric,
-        "tpot_metric": TPOT_METRIC,
+        "tpot_metric": tpot_metric,
         "load_band": args.load_band,
         "target_rate_gib_s": args.target_rate_gib_s,
         "rep": args.rep,

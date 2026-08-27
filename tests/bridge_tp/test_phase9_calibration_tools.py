@@ -136,6 +136,20 @@ class TestCalibrationAnalysis(unittest.TestCase):
             {"+Inf": 4.0, "0.02": 3.0},
         )
 
+    def test_current_request_tpot_histogram_delta_is_serialized(self):
+        previous = record.parse_prometheus(
+            'vllm:request_time_per_output_token_seconds_bucket{le="0.04"} 2\n'
+            'vllm:request_time_per_output_token_seconds_bucket{le="+Inf"} 3\n'
+        )
+        current = record.parse_prometheus(
+            'vllm:request_time_per_output_token_seconds_bucket{le="0.04"} 5\n'
+            'vllm:request_time_per_output_token_seconds_bucket{le="+Inf"} 7\n'
+        )
+        self.assertEqual(
+            json.loads(record.histogram_delta_json(previous, current)),
+            {"+Inf": 4.0, "0.04": 3.0},
+        )
+
     def test_complete_grid_summary(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

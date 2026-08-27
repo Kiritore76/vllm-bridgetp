@@ -147,7 +147,7 @@ Before a run, verify the metrics actually used by the recorder:
 
 ```bash
 curl -fsS http://127.0.0.1:8200/metrics | grep -E \
-  'vllm:(kv_cache_usage_perc|gpu_cache_usage_perc|num_requests_running|num_requests_waiting|time_per_output_token_seconds_(bucket|sum|count))' \
+  'vllm:(kv_cache_usage_perc|gpu_cache_usage_perc|num_requests_running|num_requests_waiting|request_time_per_output_token_seconds_(bucket|sum|count))' \
   | head -40
 ```
 
