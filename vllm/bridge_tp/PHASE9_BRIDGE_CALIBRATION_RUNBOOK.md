@@ -36,7 +36,7 @@ Interference mapping:
 
 ```text
 platform: NVIDIA A100 PCIe
-attainable KV bands: low 0.10-0.25, medium 0.30-0.45, high 0.55-0.65
+attainable KV bands: low 0.10-0.25, medium 0.30-0.45, high 0.50-0.65
 copy rates: 0, 0.4, 0.7, 1.2 GiB/s
 3 repetitions per cell
 ```
@@ -49,6 +49,14 @@ while waiting continued to increase; the original 0.15-0.25, 0.45-0.55, and
 highest attainable steady regime in this workload scope, not 75-85% KV usage.
 The failed pilots and reachability diagnostic remain diagnostic evidence and
 must not be mixed into the formal fit.
+
+The high lower bound was frozen by deterministic offline reclassification of
+the isolated rate-zero supplemental telemetry. Bounds 0.54 and 0.52 failed the
+unchanged 120-second stability plus separate 300-second measurement rule. At
+QPS 1.15, bound 0.50 was the narrowest passing value: pre-window mean 0.5397
+with fraction 0.800, followed by measurement mean 0.5759 with fraction 1.000
+and range 0.5290-0.6134. The 0.80 fraction threshold and both window durations
+were not relaxed.
 
 The QPS used to hold each KV band must be selected by a rate-zero pilot and
 then frozen. Offered QPS is not a substitute for measured KV occupancy.

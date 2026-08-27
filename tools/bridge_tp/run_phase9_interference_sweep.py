@@ -32,14 +32,18 @@ SUMMARIZER = TOOLS_DIR / "summarize_phase9_calibration.py"
 BANDS = {
     "low": (0.10, 0.25),
     "medium": (0.30, 0.45),
-    "high": (0.55, 0.65),
+    "high": (0.50, 0.65),
 }
 PROTOCOL_AMENDMENT = (
     "A100 PCIe TP4 I256/O2048 attainable-load amendment made before any "
     "nonzero-copy formal condition: two rate-zero pilots and an isolated "
     "QPS 3.0/3.5/4.0 reachability diagnostic showed running saturated near "
     "256 while waiting increased, so the original 0.15-0.25/0.45-0.55/"
-    "0.75-0.85 bands were not jointly sustainable."
+    "0.75-0.85 bands were not jointly sustainable. Offline reclassification "
+    "of isolated rate-zero telemetry then froze 0.50-0.65 as the narrowest "
+    "high band passing a 120-second stability window followed by a separate "
+    "300-second measurement window at the 0.80 fraction threshold; lower "
+    "bounds 0.54 and 0.52 failed."
 )
 RATES = (0.0, 0.4, 0.7, 1.2)
 REPS = (1, 2, 3)

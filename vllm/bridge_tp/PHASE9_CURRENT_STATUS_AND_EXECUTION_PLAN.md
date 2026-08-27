@@ -141,9 +141,14 @@ fail closed。
 均值约为 0.698/0.717/0.736，但 `num_running` 均约为 256，waiting 均值继续增长到
 1083/1300/1522，且窗口 drift 为正；原 0.75-0.85 high 只被爬升过程穿过，未形成
 稳态。由于尚未运行任何 nonzero-copy formal condition，Section 7.2 在正式数据前冻结
-工作负载可达档位：low 0.10-0.25、medium 0.30-0.45、high 0.55-0.65。这里 high
+工作负载可达档位：low 0.10-0.25、medium 0.30-0.45、high 0.50-0.65。这里 high
 只表示当前 A100 PCIe TP4 I256/O2048 配置的最高可达稳态，不表示 75-85% KV 占用。
 旧 pilot 与 reachability 数据只作为该协议修订的诊断依据，不进入正式拟合。
+
+high 下限使用补充 rate-zero telemetry 离线冻结：0.54 与 0.52 均不能满足未改变的
+120 秒预稳定加独立 300 秒测量门；QPS 1.15 在下限 0.50 时预窗口 mean=0.5397、
+fraction=0.800，随后测量窗口 mean=0.5759、fraction=1.000、范围 0.5290-0.6134。
+因此只修订可达区间，不降低 0.80 fraction 门，也不缩短两个时间窗口。
 
 ### 4.3 C-3 的完成条件
 
