@@ -30,12 +30,33 @@ COPY_LOAD = TOOLS_DIR / "run_phase9_copy_load.py"
 ANALYZER = TOOLS_DIR / "analyze_phase9_calibration.py"
 SUMMARIZER = TOOLS_DIR / "summarize_phase9_calibration.py"
 BANDS = {
-    "low": (0.15, 0.25),
-    "medium": (0.45, 0.55),
-    "high": (0.75, 0.85),
+    "low": (0.10, 0.25),
+    "medium": (0.30, 0.45),
+    "high": (0.55, 0.65),
 }
+PROTOCOL_AMENDMENT = (
+    "A100 PCIe TP4 I256/O2048 attainable-load amendment made before any "
+    "nonzero-copy formal condition: two rate-zero pilots and an isolated "
+    "QPS 3.0/3.5/4.0 reachability diagnostic showed running saturated near "
+    "256 while waiting increased, so the original 0.15-0.25/0.45-0.55/"
+    "0.75-0.85 bands were not jointly sustainable."
+)
 RATES = (0.0, 0.4, 0.7, 1.2)
 REPS = (1, 2, 3)
+
+
+def serialized_bands() -> dict[str, list[float]]:
+    return {name: [low, high] for name, (low, high) in BANDS.items()}
+
+
+def validate_pilot_for_formal(pilot: dict[str, object]) -> None:
+    if pilot.get("status") != "READY":
+        raise RuntimeError("pilot summary is not READY")
+    if pilot.get("load_bands") != serialized_bands():
+        raise RuntimeError(
+            "pilot load bands do not match this runner; rerun the "
+            "rate-zero pilot with the current protocol"
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -385,6 +406,8 @@ def run_condition(
             "window_s": args.stability_window_s,
             "poll_s": args.stability_poll_s,
             "min_band_fraction": args.min_band_fraction,
+            "load_bands": serialized_bands(),
+            "protocol_amendment": PROTOCOL_AMENDMENT,
         },
         "recorder_command": recorder_cmd,
         "benchmark_command": benchmark_cmd,
@@ -606,6 +629,9 @@ def run_pilot(args: argparse.Namespace) -> None:
             else "MORE_QPS_CANDIDATES_REQUIRED"
         ),
         "platform_scope": "NVIDIA A100 PCIe only",
+        "workload_scope": "TP4 I256/O2048",
+        "load_bands": serialized_bands(),
+        "protocol_amendment": PROTOCOL_AMENDMENT,
         "conditions": conditions,
         "selected": selected,
         "selection_rule": (
@@ -676,8 +702,7 @@ def analyze_formal_condition(
 
 def run_formal(args: argparse.Namespace) -> None:
     pilot = json.loads(args.pilot_summary.read_text(encoding="utf-8"))
-    if pilot.get("status") != "READY":
-        raise RuntimeError("pilot summary is not READY")
+    validate_pilot_for_formal(pilot)
     qps_by_band = {
         band: float(pilot["selected"][band]["qps"]) for band in BANDS
     }

@@ -42,7 +42,7 @@ platform: 5 x NVIDIA A100-PCIE-40GB
 | D-2 precision sensitivity | 未开始，探索项 | 无正式 sweep | 不阻塞正式 D-3 停止门 |
 | D-3 smoke | 工程链路通过 | A=256、B=98、C=98、D=94 | 必须排除该 RID |
 | 更新版 C-1 / Section 7.1 | 进行中 | 自动 18 条件 runner；TPOT metric 修复至 `e8b3e5d` | 完整 fit、hash、支持范围审计 |
-| 更新版 C-2 / Section 7.2 | 首轮 pilot 未通过，稳态重跑待开始 | 首轮全部 selected=null；stable-window runner 已实现 | 新 pilot READY；formal 36 条件 COMPLETE |
+| 更新版 C-2 / Section 7.2 | 两轮原始 band pilot 未通过，可达 band 已冻结 | 高 QPS 隔离诊断显示 running 约 256 饱和而 waiting 增长 | 新 attainable-band pilot READY；formal 36 条件 COMPLETE |
 | C-3 survival table | 已使用但待冻结 | 服务器已有 discovery survival table | 审计 trace/split/source 并哈希 |
 | P9-2 / Section 6 replay | 工程 replay 通过 | engineering anchor 下同时有 migrate/stay | 新模型实现后必须重跑 |
 | 正式 policy-driven D-3 | 阻塞 | 尚无 preregistered 50-RID 结果 | 满足第 7 节全部停止门 |
@@ -136,6 +136,14 @@ medium，但原窗口主要记录负载爬升，且没有候选覆盖 high。该
 诊断，不进入正式拟合。后续 runner 先验证 rolling stable-load window，再开始 300 秒
 rate-zero/copy window；pilot timeout 会保留证据并继续下一候选，formal timeout 则
 fail closed。
+
+随后隔离重启 TP4 的 QPS 3.0/3.5/4.0 reachability 诊断中，最后 120 秒 KV
+均值约为 0.698/0.717/0.736，但 `num_running` 均约为 256，waiting 均值继续增长到
+1083/1300/1522，且窗口 drift 为正；原 0.75-0.85 high 只被爬升过程穿过，未形成
+稳态。由于尚未运行任何 nonzero-copy formal condition，Section 7.2 在正式数据前冻结
+工作负载可达档位：low 0.10-0.25、medium 0.30-0.45、high 0.55-0.65。这里 high
+只表示当前 A100 PCIe TP4 I256/O2048 配置的最高可达稳态，不表示 75-85% KV 占用。
+旧 pilot 与 reachability 数据只作为该协议修订的诊断依据，不进入正式拟合。
 
 ### 4.3 C-3 的完成条件
 
