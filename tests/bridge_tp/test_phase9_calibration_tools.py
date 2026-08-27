@@ -30,9 +30,32 @@ summarize = load_tool("summarize_phase9_calibration")
 fit_tpot = load_tool("fit_phase9_tick_tpot")
 run_tpot = load_tool("run_phase9_tpot_sweep")
 run_interference = load_tool("run_phase9_interference_sweep")
+reclassify_pilot = load_tool("reclassify_phase9_load_pilot")
 
 
 class TestCalibrationAnalysis(unittest.TestCase):
+    def test_attainable_load_bands_are_frozen(self):
+        self.assertEqual(
+            run_interference.serialized_bands(),
+            {
+                "low": [0.10, 0.25],
+                "medium": [0.30, 0.45],
+                "high": [0.55, 0.65],
+            },
+        )
+
+    def test_formal_rejects_legacy_or_missing_band_definition(self):
+        with self.assertRaisesRegex(RuntimeError, "do not match"):
+            run_interference.validate_pilot_for_formal({"status": "READY"})
+
+    def test_formal_accepts_current_ready_pilot(self):
+        run_interference.validate_pilot_for_formal(
+            {
+                "status": "READY",
+                "load_bands": run_interference.serialized_bands(),
+            }
+        )
+
     def test_load_pilot_selection_is_band_scoped(self):
         conditions = [
             {
@@ -42,12 +65,12 @@ class TestCalibrationAnalysis(unittest.TestCase):
             },
             {
                 "qps": 0.4,
-                "kv_usage_mean": 0.50,
+                "kv_usage_mean": 0.375,
                 "band_fractions": {"low": 0.0, "medium": 0.9, "high": 0.0},
             },
             {
                 "qps": 0.8,
-                "kv_usage_mean": 0.80,
+                "kv_usage_mean": 0.60,
                 "band_fractions": {"low": 0.0, "medium": 0.0, "high": 0.9},
             },
         ]
@@ -92,7 +115,7 @@ class TestCalibrationAnalysis(unittest.TestCase):
 
     def test_matching_stable_band_requires_mean_and_fraction(self):
         summary = {
-            "kv_usage_mean": 0.50,
+            "kv_usage_mean": 0.375,
             "band_fractions": {"low": 0.0, "medium": 0.85, "high": 0.0},
         }
         self.assertEqual(
@@ -129,6 +152,33 @@ class TestCalibrationAnalysis(unittest.TestCase):
                 run_interference.matching_stable_band(summary, "low", 0.80),
                 "low",
             )
+
+    def test_reclassification_requires_stable_then_measurement_window(self):
+        rows = [(float(second), 0.37) for second in range(421)]
+        result = reclassify_pilot.find_qualifying_window(
+            rows,
+            "medium",
+            stability_window_s=120.0,
+            measurement_window_s=300.0,
+            min_band_fraction=0.80,
+        )
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result["measurement"]["kv_usage_mean"], 0.37)
+
+    def test_reclassification_rejects_a_ramp_through_band(self):
+        rows = [
+            (float(second), min(0.9, second / 500.0))
+            for second in range(601)
+        ]
+        self.assertIsNone(
+            reclassify_pilot.find_qualifying_window(
+                rows,
+                "medium",
+                stability_window_s=120.0,
+                measurement_window_s=300.0,
+                min_band_fraction=0.80,
+            )
+        )
 
     def test_tpot_sweep_matrix_has_eighteen_conditions(self):
         args = type(

@@ -36,10 +36,19 @@ Interference mapping:
 
 ```text
 platform: NVIDIA A100 PCIe
-actual KV bands: 0.15-0.25, 0.45-0.55, 0.75-0.85
+attainable KV bands: low 0.10-0.25, medium 0.30-0.45, high 0.55-0.65
 copy rates: 0, 0.4, 0.7, 1.2 GiB/s
 3 repetitions per cell
 ```
+
+These A100 PCIe TP4 I256/O2048 bands are a protocol amendment frozen before
+any nonzero-copy formal condition. Two rate-zero pilots and an isolated QPS
+3.0/3.5/4.0 reachability diagnostic showed approximately 256 running requests
+while waiting continued to increase; the original 0.15-0.25, 0.45-0.55, and
+0.75-0.85 bands were therefore not jointly sustainable. Here `high` means the
+highest attainable steady regime in this workload scope, not 75-85% KV usage.
+The failed pilots and reachability diagnostic remain diagnostic evidence and
+must not be mixed into the formal fit.
 
 The QPS used to hold each KV band must be selected by a rate-zero pilot and
 then frozen. Offered QPS is not a substitute for measured KV occupancy.
@@ -235,7 +244,7 @@ export CAL_PILOT_ROOT="$CAL_ROOT/load_pilot_$(date +%Y%m%dT%H%M%S)"
   --block-size 16 \
   --source-gpu 0 \
   --target-gpu 1 \
-  --candidate-qps 0.7 1.25 1.3 1.35 1.9 2.0 2.1 \
+  --candidate-qps 0.7 0.8 0.9 0.95 1.0 1.05 1.1 1.15 1.2 \
   --input-len 256 \
   --output-len 2048 \
   --num-warmups 0 \
@@ -259,6 +268,35 @@ bands. If it reports `MORE_QPS_CANDIDATES_REQUIRED`, preserve that pilot and
 rerun a new pilot root with an expanded preregistered candidate list.
 Candidates that never satisfy the rolling stability gate are preserved with
 `stability_status=TIMEOUT`; the automatic pilot continues to the next QPS.
+
+### Reclassify existing pre-formal rate-zero pilots after the attainable-band amendment
+
+Do not repeat already collected rate-zero conditions merely because the load
+bands were amended. The reclassifier accepts a historical condition only when
+the same telemetry contains a compliant 120-second stability window followed
+by a separate compliant 300-second measurement window. It rejects a trace that
+only ramps through a band. Pass every relevant rate-zero pilot root and write a
+new immutable summary; do not include the isolated QPS 3.0/3.5/4.0 reachability
+root because it has only a 300-second diagnostic window.
+
+```bash
+export CAL_RECLASS_ROOT="$CAL_ROOT/load_pilot_attainable_reclassified_$(date +%Y%m%dT%H%M%S)"
+mkdir -p "$CAL_RECLASS_ROOT"
+
+"$BRIDGE_PY" tools/bridge_tp/reclassify_phase9_load_pilot.py \
+  --pilot-roots \
+    "$CAL_FIRST_STABLE_PILOT_ROOT" \
+    "$CAL_SECOND_STABLE_PILOT_ROOT" \
+  --stability-window-s 120 \
+  --measurement-window-s 300 \
+  --min-band-fraction 0.80 \
+  --out "$CAL_RECLASS_ROOT/load_pilot_summary.json"
+```
+
+If the result is `READY`, use this reclassified summary as `CAL_PILOT_ROOT`
+for the formal sweep. If it reports `MISSING_ATTAINABLE_BAND_EVIDENCE`, run
+only the missing band/QPS neighborhood and re-run the deterministic
+reclassification over the old and supplemental roots.
 
 ### Automatic Section 7.2 formal 36-cell sweep
 
@@ -401,8 +439,8 @@ For the medium band example:
   --benchmark-json "$CONDITION_DIR/benchmark.json" \
   --copy-json "$CONDITION_DIR/copy_window.json" \
   --target-rate-gib-s 0.7 \
-  --load-min 0.45 \
-  --load-max 0.55 \
+  --load-min 0.30 \
+  --load-max 0.45 \
   --min-band-fraction 0.80 \
   --rate-relative-tolerance 0.05 \
   --out "$CONDITION_DIR/condition_result.json" \
