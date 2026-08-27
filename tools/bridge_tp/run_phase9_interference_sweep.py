@@ -95,6 +95,28 @@ def parse_args() -> argparse.Namespace:
         default=(0.2, 0.4, 0.53, 0.7, 1.0, 1.5),
     )
     parser.add_argument("--pilot-summary", type=Path)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "reuse ACCEPTED formal condition results already present under "
+            "--out-root"
+        ),
+    )
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=2,
+        help="maximum new attempts per missing formal condition (default: 2)",
+    )
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help=(
+            "after exhausting retries for one formal condition, continue "
+            "with the rest of the grid"
+        ),
+    )
     args = parser.parse_args()
     if args.tp4_blocks <= 0 or args.block_size <= 0:
         parser.error("KV geometry must be positive")
@@ -118,6 +140,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("stability-poll-s must be positive")
     if not 0 < args.min_band_fraction <= 1:
         parser.error("min-band-fraction must be in (0,1]")
+    if args.max_attempts <= 0:
+        parser.error("max-attempts must be positive")
     if args.mode == "formal" and args.pilot_summary is None:
         parser.error("formal mode requires --pilot-summary")
     return args
@@ -704,35 +728,191 @@ def analyze_formal_condition(
     return out
 
 
+FormalKey = tuple[str, float, int]
+
+
+def formal_result_key(payload: dict[str, object]) -> FormalKey:
+    inputs = payload.get("inputs")
+    if not isinstance(inputs, dict):
+        raise ValueError("formal result lacks inputs")
+    return (
+        str(payload.get("load_band", "")),
+        float(inputs["target_rate_gib_s"]),
+        int(payload.get("rep", 0)),
+    )
+
+
+def accepted_formal_results(out_root: Path) -> dict[FormalKey, Path]:
+    """Find one reusable ACCEPTED result for each formal grid key."""
+    expected = {
+        (band, rate, rep)
+        for band in BANDS
+        for rate in RATES
+        for rep in REPS
+    }
+    accepted: dict[FormalKey, Path] = {}
+    for path in sorted(out_root.glob("*/condition_result.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            key = formal_result_key(payload)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            print(f"ignoring unreadable formal result {path}: {error}")
+            continue
+        if payload.get("status") == "ACCEPTED" and key in expected:
+            accepted.setdefault(key, path)
+    return accepted
+
+
+def existing_formal_attempt_counts(out_root: Path) -> dict[FormalKey, int]:
+    """Count prior formal condition directories for each grid key."""
+    expected = {
+        (band, rate, rep)
+        for band in BANDS
+        for rate in RATES
+        for rep in REPS
+    }
+    counts: dict[FormalKey, int] = {}
+    for path in sorted(out_root.glob("*/condition_manifest.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            key = (
+                str(payload.get("load_band", "")),
+                float(payload["target_rate_gib_s"]),
+                int(payload.get("rep", 0)),
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            print(f"ignoring unreadable formal manifest {path}: {error}")
+            continue
+        is_formal = str(payload.get("mode", "")).startswith("formal_")
+        if is_formal and key in expected:
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def write_formal_progress(
+    out_root: Path,
+    results: dict[FormalKey, Path],
+    failures: dict[FormalKey, str] | None = None,
+) -> Path:
+    expected = [
+        (band, rate, rep)
+        for band in BANDS
+        for rate in RATES
+        for rep in REPS
+    ]
+    missing = [key for key in expected if key not in results]
+    payload = {
+        "format_version": 1,
+        "phase": "BridgeTP Phase 9 conditional bridge calibration",
+        "status": "COMPLETE" if not missing else "INCOMPLETE",
+        "accepted_conditions": len(results),
+        "expected_conditions": len(expected),
+        "accepted_results": [
+            str(results[key]) for key in expected if key in results
+        ],
+        "missing_conditions": [
+            {"load_band": band, "target_rate_gib_s": rate, "rep": rep}
+            for band, rate, rep in missing
+        ],
+        "failed_conditions": [
+            {
+                "load_band": band,
+                "target_rate_gib_s": rate,
+                "rep": rep,
+                "last_error": error,
+            }
+            for (band, rate, rep), error in sorted((failures or {}).items())
+        ],
+    }
+    out = out_root / "formal_progress.json"
+    out.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return out
+
+
 def run_formal(args: argparse.Namespace) -> None:
     pilot = json.loads(args.pilot_summary.read_text(encoding="utf-8"))
     validate_pilot_for_formal(pilot)
     qps_by_band = {
         band: float(pilot["selected"][band]["qps"]) for band in BANDS
     }
-    results = []
+    results = accepted_formal_results(args.out_root) if args.resume else {}
+    prior_attempts = (
+        existing_formal_attempt_counts(args.out_root) if args.resume else {}
+    )
+    if results:
+        print(f"resuming with {len(results)} ACCEPTED formal conditions")
+    failures: dict[FormalKey, str] = {}
     for band in BANDS:
         for rate in RATES:
             for rep in REPS:
-                condition_dir, _ = run_condition(
-                    args,
-                    prefix=f"formal_{band}",
-                    qps=qps_by_band[band],
-                    rate=rate,
-                    rep=rep,
-                    band=band,
-                )
-                results.append(
-                    analyze_formal_condition(
-                        args, condition_dir, band, rate
+                key = (band, rate, rep)
+                if key in results:
+                    print(f"reusing ACCEPTED condition {key}: {results[key]}")
+                    continue
+                attempts_used = prior_attempts.get(key, 0)
+                if attempts_used >= args.max_attempts:
+                    failures[key] = (
+                        f"{attempts_used} existing attempts lack an "
+                        "ACCEPTED result"
                     )
-                )
+                for attempt in range(attempts_used + 1, args.max_attempts + 1):
+                    try:
+                        condition_dir, _ = run_condition(
+                            args,
+                            prefix=f"formal_{band}",
+                            qps=qps_by_band[band],
+                            rate=rate,
+                            rep=rep,
+                            band=band,
+                        )
+                        results[key] = analyze_formal_condition(
+                            args, condition_dir, band, rate
+                        )
+                        failures.pop(key, None)
+                        write_formal_progress(args.out_root, results, failures)
+                        break
+                    except Exception as error:
+                        failures[key] = str(error)
+                        print(
+                            f"formal condition {key} attempt "
+                            f"{attempt}/{args.max_attempts} failed: {error}",
+                            file=sys.stderr,
+                        )
+                        if attempt < args.max_attempts:
+                            print(f"retrying formal condition {key}")
+                if key not in results and not args.continue_on_error:
+                    raise RuntimeError(
+                        f"formal condition {key} exhausted retries: "
+                        f"{failures[key]}"
+                    )
+                if key not in results:
+                    print(
+                        f"continuing after failed formal condition {key}",
+                        file=sys.stderr,
+                    )
+                    write_formal_progress(args.out_root, results, failures)
+    progress_out = write_formal_progress(args.out_root, results, failures)
+    if len(results) != len(BANDS) * len(RATES) * len(REPS):
+        if args.continue_on_error:
+            print(
+                "completed the formal grid traversal with failed conditions; "
+                f"saved incomplete progress to {progress_out}",
+                file=sys.stderr,
+            )
+            return
+        raise RuntimeError(
+            "formal interference grid remains incomplete after attempting "
+            f"all conditions; resume with the same --out-root: {progress_out}"
+        )
     summary_out = args.out_root / "bridge_calibration_summary.json"
     command = [
         sys.executable,
         str(SUMMARIZER),
         "--inputs",
-        *(str(path) for path in results),
+        *(str(path) for path in results.values()),
         "--out",
         str(summary_out),
     ]

@@ -56,6 +56,137 @@ class TestCalibrationAnalysis(unittest.TestCase):
             }
         )
 
+    def test_resume_reuses_only_accepted_formal_results(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            accepted_dir = root / "accepted"
+            rejected_dir = root / "rejected"
+            accepted_dir.mkdir()
+            rejected_dir.mkdir()
+            base = {
+                "load_band": "low",
+                "rep": 1,
+                "inputs": {"target_rate_gib_s": 0.4},
+            }
+            accepted_path = accepted_dir / "condition_result.json"
+            accepted_path.write_text(
+                json.dumps({**base, "status": "ACCEPTED"}),
+                encoding="utf-8",
+            )
+            (rejected_dir / "condition_result.json").write_text(
+                json.dumps({**base, "status": "REJECTED", "rep": 2}),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                run_interference.accepted_formal_results(root),
+                {("low", 0.4, 1): accepted_path},
+            )
+
+    def test_formal_progress_lists_missing_conditions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = root / "condition_result.json"
+            result.touch()
+            out = run_interference.write_formal_progress(
+                root,
+                {("low", 0.0, 1): result},
+                {("low", 0.4, 2): "condition rejected"},
+            )
+            payload = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(payload["status"], "INCOMPLETE")
+            self.assertEqual(payload["accepted_conditions"], 1)
+            self.assertEqual(len(payload["missing_conditions"]), 35)
+            self.assertEqual(
+                payload["failed_conditions"],
+                [
+                    {
+                        "load_band": "low",
+                        "target_rate_gib_s": 0.4,
+                        "rep": 2,
+                        "last_error": "condition rejected",
+                    }
+                ],
+            )
+
+    def test_formal_counts_prior_failure_then_retries_once_and_continues(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prior_failure = root / "formal_low_prior_failure"
+            prior_failure.mkdir()
+            (prior_failure / "condition_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "mode": "formal_low",
+                        "load_band": "low",
+                        "target_rate_gib_s": 0.0,
+                        "rep": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            pilot_summary = root / "load_pilot_summary.json"
+            pilot_summary.write_text(
+                json.dumps(
+                    {
+                        "status": "READY",
+                        "load_bands": run_interference.serialized_bands(),
+                        "selected": {
+                            band: {"qps": 0.7}
+                            for band in run_interference.BANDS
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = type(
+                "Args",
+                (),
+                {
+                    "pilot_summary": pilot_summary,
+                    "out_root": root,
+                    "resume": True,
+                    "max_attempts": 2,
+                    "continue_on_error": True,
+                },
+            )()
+            failed_key = ("low", 0.0, 1)
+            attempts = 0
+
+            def fake_run_condition(_args, *, band, rate, rep, **_kwargs):
+                nonlocal attempts
+                key = (band, rate, rep)
+                if key == failed_key:
+                    attempts += 1
+                    raise RuntimeError("unstable load")
+                return root / f"{band}_{rate}_{rep}", {}
+
+            with (
+                mock.patch.object(
+                    run_interference,
+                    "run_condition",
+                    side_effect=fake_run_condition,
+                ) as run_mock,
+                mock.patch.object(
+                    run_interference,
+                    "analyze_formal_condition",
+                    side_effect=lambda _args, path, _band, _rate: path
+                    / "condition_result.json",
+                ) as analyze_mock,
+            ):
+                run_interference.run_formal(args)
+
+            self.assertEqual(attempts, 1)
+            self.assertEqual(run_mock.call_count, 36)
+            self.assertEqual(analyze_mock.call_count, 35)
+            progress = json.loads(
+                (root / "formal_progress.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(progress["accepted_conditions"], 35)
+            self.assertEqual(
+                progress["failed_conditions"][0]["last_error"],
+                "unstable load",
+            )
+
     def test_load_pilot_selection_is_band_scoped(self):
         conditions = [
             {
