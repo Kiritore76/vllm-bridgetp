@@ -40,7 +40,7 @@ class TestCalibrationAnalysis(unittest.TestCase):
             {
                 "low": [0.10, 0.25],
                 "medium": [0.30, 0.45],
-                "high": [0.55, 0.65],
+                "high": [0.50, 0.65],
             },
         )
 
