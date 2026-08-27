@@ -153,6 +153,151 @@ curl -fsS http://127.0.0.1:8200/metrics | grep -E \
 
 ## 4. One condition, split across terminals
 
+Section 7.1 should normally use the automatic sequential sweep below. The
+manual Terminal A/B/C template later in this section is for Section 7.2.
+
+### Automatic Section 7.1 TPOT sweep
+
+Keep both TP1 port 8001 and TP4 port 8200 servers running. From one additional
+terminal run:
+
+```bash
+cd /root/autodl-tmp/bridgetp/vllm_bridge
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+
+export BRIDGE_PY=/root/autodl-tmp/bridgetp/.venv_bridge/bin/python
+export CAL_ROOT=/root/autodl-tmp/bridgetp/results/phase9_bridge_calibration
+export CAL_MODEL=/root/autodl-tmp/models/models/Qwen--Qwen2.5-14B-Instruct/snapshots/master
+export CAL_TPOT_ROOT="$CAL_ROOT/tpot_sweep_$(date +%Y%m%dT%H%M%S)"
+
+"$BRIDGE_PY" tools/bridge_tp/run_phase9_tpot_sweep.py \
+  --out-root "$CAL_TPOT_ROOT" \
+  --model "$CAL_MODEL" \
+  --served-model-name bridgetp-model \
+  --tp1-url http://127.0.0.1:8001 \
+  --tp4-url http://127.0.0.1:8200 \
+  --tp1-blocks 1968 \
+  --tp4-blocks 35739 \
+  --block-size 16 \
+  --qps 1 2 4 \
+  --reps 1 2 3 \
+  --input-len 128 \
+  --output-len 512 \
+  --num-prompts 100 \
+  --num-warmups 10 \
+  2>&1 | tee "$CAL_ROOT/tpot_sweep_driver.log"
+```
+
+The tool runs all 18 conditions sequentially, starts and stops one telemetry
+recorder per condition, hashes each condition, and writes:
+
+```text
+$CAL_TPOT_ROOT/tick_tpot_candidate.json
+$CAL_TPOT_ROOT/SHA256SUMS
+```
+
+Verify completion before stopping TP1:
+
+```bash
+find "$CAL_TPOT_ROOT" -mindepth 1 -maxdepth 1 \
+  -type d -name 'tpot_*' | wc -l
+
+"$BRIDGE_PY" -m json.tool \
+  "$CAL_TPOT_ROOT/tick_tpot_candidate.json"
+```
+
+The directory count must be 18. After this check, stop the TP1 server with
+`Ctrl-C`, verify port 8001 is gone, and keep TP4 port 8200 running for Section
+7.2.
+
+### Automatic Section 7.2 load-band pilot
+
+TP1 must be stopped, GPU 0 must be free, and TP4 port 8200 must remain running.
+The pilot runs rate-zero conditions sequentially and recommends QPS values only
+when the measured mean KV occupancy is inside a band and at least 80% of the
+300-second window samples are inside that band.
+
+```bash
+cd /root/autodl-tmp/bridgetp/vllm_bridge
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+
+export BRIDGE_PY=/root/autodl-tmp/bridgetp/.venv_bridge/bin/python
+export CAL_ROOT=/root/autodl-tmp/bridgetp/results/phase9_bridge_calibration
+export CAL_MODEL=/root/autodl-tmp/models/models/Qwen--Qwen2.5-14B-Instruct/snapshots/master
+export CAL_PILOT_ROOT="$CAL_ROOT/load_pilot_$(date +%Y%m%dT%H%M%S)"
+
+"$BRIDGE_PY" tools/bridge_tp/run_phase9_interference_sweep.py pilot \
+  --out-root "$CAL_PILOT_ROOT" \
+  --model "$CAL_MODEL" \
+  --served-model-name bridgetp-model \
+  --tp4-url http://127.0.0.1:8200 \
+  --tp4-blocks 35739 \
+  --block-size 16 \
+  --source-gpu 0 \
+  --target-gpu 1 \
+  --candidate-qps 0.2 0.4 0.53 0.7 1.0 1.5 \
+  --input-len 256 \
+  --output-len 2048 \
+  --copy-delay-s 60 \
+  --copy-seconds 300 \
+  2>&1 | tee "$CAL_ROOT/load_pilot_driver.log"
+```
+
+Inspect, do not silently accept, the selected values:
+
+```bash
+"$BRIDGE_PY" -m json.tool \
+  "$CAL_PILOT_ROOT/load_pilot_summary.json"
+```
+
+The summary must report `status=READY` and non-null selections for all three
+bands. If it reports `MORE_QPS_CANDIDATES_REQUIRED`, preserve that pilot and
+rerun a new pilot root with an expanded preregistered candidate list.
+
+### Automatic Section 7.2 formal 36-cell sweep
+
+Running this command is the explicit acceptance of the QPS selections recorded
+in the pilot summary. It runs one condition at a time; it does not overlap two
+benchmarks or two copy windows.
+
+```bash
+cd /root/autodl-tmp/bridgetp/vllm_bridge
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+
+export BRIDGE_PY=/root/autodl-tmp/bridgetp/.venv_bridge/bin/python
+export CAL_ROOT=/root/autodl-tmp/bridgetp/results/phase9_bridge_calibration
+export CAL_MODEL=/root/autodl-tmp/models/models/Qwen--Qwen2.5-14B-Instruct/snapshots/master
+export CAL_FORMAL_ROOT="$CAL_ROOT/interference_formal_$(date +%Y%m%dT%H%M%S)"
+
+"$BRIDGE_PY" tools/bridge_tp/run_phase9_interference_sweep.py formal \
+  --out-root "$CAL_FORMAL_ROOT" \
+  --pilot-summary "$CAL_PILOT_ROOT/load_pilot_summary.json" \
+  --model "$CAL_MODEL" \
+  --served-model-name bridgetp-model \
+  --tp4-url http://127.0.0.1:8200 \
+  --tp4-blocks 35739 \
+  --block-size 16 \
+  --source-gpu 0 \
+  --target-gpu 1 \
+  --input-len 256 \
+  --output-len 2048 \
+  --copy-delay-s 60 \
+  --copy-seconds 300 \
+  2>&1 | tee "$CAL_ROOT/interference_formal_driver.log"
+```
+
+Successful completion writes:
+
+```text
+$CAL_FORMAL_ROOT/bridge_calibration_summary.json
+$CAL_FORMAL_ROOT/SHA256SUMS
+```
+
+Verify `status=COMPLETE`, 36 expected conditions, and empty
+`missing/unexpected/duplicates/rejected` lists. A rejected condition stops the
+automatic sweep and remains on disk; it must not be overwritten or silently
+excluded.
+
 Create a unique condition directory and export the same values in every
 terminal:
 
