@@ -43,6 +43,12 @@ class TpotModel:
     per_running_s: float = 0.0
     # Free-text provenance, e.g. "P1-B, Qwen2.5-14B, A100-PCIe, 2026-09-12".
     calibration_source: str = ""
+    num_running_min: int = 0
+    num_running_max: int = 1_000_000_000
+
+    def in_support(self, num_running: int) -> bool:
+        """Whether the instantaneous running count was calibrated."""
+        return self.num_running_min <= num_running <= self.num_running_max
 
     def tpot_s(self, num_running: int) -> float:
         return max(1e-6, self.base_s + self.per_running_s * max(0, num_running))
@@ -301,6 +307,10 @@ class FastPolicy:
         gain_per_token = tau1 - tau4
         breakdown = self.cost_breakdown(req, tp4, rate_bytes_s, tp1)
         cost = sum(v for k, v in breakdown.items() if not k.startswith("_"))
+        if not self.tpot_tp1.in_support(
+            tp1.num_running
+        ) or not self.tpot_tp4.in_support(tp4.num_running):
+            return math.inf, cost, breakdown
         if gain_per_token <= 0:
             return math.inf, cost, breakdown
         denom = self.w_group(req) * gain_per_token
@@ -426,6 +436,16 @@ class FastPolicy:
                 MigrationState.LOCAL,
                 f"target unavailable: kv={tp4.kv_usage_frac:.2f} "
                 f"waiting={tp4.num_waiting}",
+                **common,
+            )
+        if not self.tpot_tp1.in_support(
+            tp1.num_running
+        ) or not self.tpot_tp4.in_support(tp4.num_running):
+            return mk(
+                Action.STAY,
+                MigrationState.LOCAL,
+                "TPOT model outside calibrated num_running support: "
+                f"tp1={tp1.num_running}, tp4={tp4.num_running}",
                 **common,
             )
         if math.isinf(n_star):

@@ -41,10 +41,10 @@ platform: 5 x NVIDIA A100-PCIE-40GB
 | D-1 KV provenance | 单 RID 测量完成 | 固定 prefix、K=53、TP1/native TP4/migrated TP4 逐层逐 rank 报告 | `formal_causal_conclusion` 仍为空 |
 | D-2 precision sensitivity | 未开始，探索项 | 无正式 sweep | 不阻塞正式 D-3 停止门 |
 | D-3 smoke | 工程链路通过 | A=256、B=98、C=98、D=94 | 必须排除该 RID |
-| 更新版 C-1 / Section 7.1 | 产物尚未带回 | 自动 18 条件 runner；TPOT metric 修复至 `e8b3e5d` | 带回 candidate、fit log、hash 和原始 telemetry 后审计 |
+| 更新版 C-1 / Section 7.1 | 18 条件完整，线性候选未通过 replay 适用性门 | 原始 telemetry、candidate 和 hash 全部复算一致 | 不能调阈值；先补齐 TP4 低负载收益区与 interference 支持重叠 |
 | 更新版 C-2 / Section 7.2 | 完成 | attainable-band pilot READY；observed-safe formal 36/36 COMPLETE | 保留完整原始条件目录；不重跑 |
-| C-3 survival table | 已使用但产物尚未带回 | 服务器曾有 discovery survival table | 带回并审计 trace/split/source、支持范围和 hash |
-| P9-2 / Section 6 replay | rate-aware 接口已实现，正式 replay 阻塞 | C-2 候选拟合及逻辑测试通过 | 取得 C-1 和 C-3 后运行正式格点 |
+| C-3 survival table | 表体通过，来源冻结未通过 | selected 30141-request 表结构、raw hash、支持范围通过 | 找到原始 `qwen_traceA_e1.csv`，记录 hash 并从相同 split 重建核对 |
+| P9-2 / Section 6 replay | FAILED，已保留 | calibrated pre-formal grid 90/90 STAY，0 finite N* | 不得反向调参；修复证据支持重叠后重跑 |
 | 正式 policy-driven D-3 | 阻塞 | 尚无 preregistered 50-RID 结果 | 满足第 7 节全部停止门 |
 | E-1 至 E-8 | 未开始正式运行 | 部分机制/工具已有 | D-3 后冻结 E-1 口径 |
 | R-1 至 R-4 | 延后 | 无 | E 主实验和参数冻结后再跑 |
@@ -120,6 +120,23 @@ boundary，必须从正式统计中排除。
 - 拟合有足够非空 interval、合理的 weighted R²/RMSE；
 - 记录 `num_running_min/max`，后续不在未测范围内无声明外推。
 
+2026-08-28 带回并审计 `tpot_sweep_20260827T105852`：18 个条件键完整，所有
+condition 和顶层 SHA256 均通过；从原始 telemetry 独立复算与候选逐位一致：
+
+```text
+TP1: base=0.02685154 s, per_running=0.000119109 s, support=1..74,
+     weighted R²=0.5452, RMSE=0.002062 s
+TP4: base=0.02690606 s, per_running=0.000356066 s, support=1..96,
+     weighted R²=0.5560, RMSE=0.007467 s
+```
+
+数据完整不等于模型适用。该线性候选在全部正 `num_running` 上预测 TP4 不快于 TP1，
+因此 calibrated replay 没有有限边界。原始 benchmark 同时显示 QPS=1 时 TP4 mean
+TPOT 为 25.60 ms、TP1 为 27.17 ms，说明低负载存在窄收益区，但单一
+`num_running` 线性模型没有可靠刻画它。TP4 sweep 的 KV 支持仅约 0.00028-0.0660，
+而 interference formal 从 0.10 开始；两个标定的支持范围没有覆盖同一个“TP4 更快且
+干扰已测”的区域。不能为了生成 migrate 行而修改阈值或事后选择系数。
+
 ### 4.2 Section 7.2 的完成条件
 
 1. TP1 停止并释放 GPU 0，TP4 在 GPU 1-4、端口 8200 常驻；
@@ -180,11 +197,19 @@ interaction；不能把正交互明显的 P99 ITL 偷换成 TPOT。P99 ITL 拟�
 - 超出支持范围不外推；
 - survival table 和来源 manifest 已哈希。
 
+带回的 selected 表满足 12 个严格递增 bucket、各 remaining row 已排序、30141 个训练
+请求、`max_observed_length=8000`，raw SHA256 为
+`0a1b6cc79dfdb9aebcee2cdd4329af35a93ae835477278905ace80733451f733`。
+但其 source manifest 状态为 `SELECTED_PENDING_SOURCE_TRACE_HASH`，并明确记录
+`source_trace_status=NOT_FOUND_ON_SERVER`、`source_trace_sha256=UNAVAILABLE`。
+因此表可以用于诊断 replay，尚不能通过 C-3 正式冻结门。
+
 ## 5. Section 7 完成后的开发任务
 
 Section 7 的完成本身不授权正式 D-3。当前各项状态如下：
 
-1. **阻塞**：从 7.1 读取 TP1/TP4 的 `base_s`、`per_running_s` 和支持范围；
+1. **完成但未通过适用性门**：已读取并复算 7.1 的 TP1/TP4 `base_s`、
+   `per_running_s` 和支持范围；线性候选导致全部 `tau4 >= tau1`；
 2. **完成**：从 7.2 拟合可审计的 rate-aware interference model：
 
    ```text
@@ -195,9 +220,10 @@ Section 7 的完成本身不授权正式 D-3。当前各项状态如下：
 4. **完成**：更新 `InterferenceModel`、`ControllerConfig` 和 config serialization；
 5. **完成**：更新 `replay_policy.py`，使其接收 TPOT slope 和 rate-aware model，而不是常数 TPOT
    加单一 `s_per_gib_at_ref`；
-6. **部分完成**：拟合脚本记录 inventory、summary、脚本和代码 revision；正式 config
-   只能在 C-1/C-3 到齐后冻结并哈希；
-7. **部分完成**：rate-aware 模型逻辑测试通过；正式 replay 等待 C-1/C-3。
+6. **部分完成**：拟合和 replay 审计记录输入 hash 与代码 revision；正式 config
+   只能在 C-3 来源和 very-low overlap 到齐后冻结；
+7. **FAILED 并保留**：rate-aware 模型逻辑测试通过，但首次 calibrated replay 无
+   migrate 区和有限边界。
 
 现有 P2-D 45 runs 仍可作为敏感性证据，但不能与新的 7.2 格点混合拟合后伪装成同一
 实验协议。
@@ -224,11 +250,34 @@ copy rate:       正式模型支持范围内的低/中/高档
 旧 engineering replay 的 `START_SHADOW=243/STAY=27` 只能证明工具和基本边界存在，
 不能替代此门。
 
+2026-08-28 使用已带回 C-1/C-3 和 36-cell interference candidate 运行 90-row
+pre-formal grid，结果：
+
+```text
+status: FAILED
+rows: 90
+supported rows: 54
+actions: STAY=90, START_SHADOW=0
+finite N*: 0
+reason: tau4 >= tau1
+survival source frozen: false
+```
+
+该失败结果必须保留。下一次 replay 前只允许完成两个事先声明的证据修复：
+
+1. 找回并哈希原始 `qwen_traceA_e1.csv`，按 time-ordered 70% 的 30141 条重建 C-3；
+2. 在任何新 interference 结果产生前预注册一个 TP4 very-low 重叠 pilot。建议候选
+   band 为 0.01-0.06，候选 QPS 为 0.10/0.15/0.20/0.25/0.30，保持原 120 秒稳定门、
+   独立 300 秒测量窗、0.80 fraction、observed-safe p95 上限和两次失败后跳过规则。
+
+pilot 只有在同时落入现有 TP4 C-1 KV 支持和稳定负载窗时才允许扩成
+`4 rates × 3 reps = 12` 条附加 formal cells。原 low/medium/high 36 条不得删除或重跑。
+
 ## 7. 正式 50-RID D-3 停止门
 
 以下条件全部满足前，不运行正式 policy-driven D-3：
 
-- [ ] Section 7.1 candidate fit 已生成、检查并哈希；
+- [x] Section 7.1 candidate fit 已生成、检查并哈希；
 - [x] Section 7.2 pilot 为 READY；
 - [x] Section 7.2 formal 为 COMPLETE；
 - [x] rate-aware interference model 已实现并测试；
@@ -311,12 +360,13 @@ R 不阻塞当前 C、正式 D-3 或 E-1。它应在 E 主实验和参数冻结�
 ## 11. 推荐执行顺序
 
 ```text
-现在（7.2 和 interference candidate 已完成）
-  └─ 从服务器带回并审计 7.1 candidate/raw/hash
-       └─ 带回并审计 C-3 survival table/source manifest/hash
-            └─ 冻结包含 C-1/C-2/C-3 的正式 controller config
+现在（7.1/7.2 已审计；首次 calibrated replay 已 FAILED 并保留）
+  ├─ 找回 qwen_traceA_e1.csv，重建并冻结 C-3 source hash
+  └─ 在新数据前冻结 very-low overlap pilot 协议
+       └─ pilot READY → 只新增 very-low 12 cells；原 36 cells 不变
+            └─ 重新拟合支持范围并冻结正式 controller config
                  └─ 新模型正式 replay
-                      ├─ 门失败 → 修正模型/支持范围，保留原 replay
+                      ├─ 门失败 → 停止 policy-driven D-3，报告无可用边界
                       └─ 门通过 → 冻结 D-3 preregistration
                            └─ 正式 30-50 RID D-3
                                 └─ 冻结 E-1 Tier 1/2/3
