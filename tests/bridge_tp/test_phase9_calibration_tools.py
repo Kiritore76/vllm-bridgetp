@@ -31,9 +31,35 @@ fit_tpot = load_tool("fit_phase9_tick_tpot")
 run_tpot = load_tool("run_phase9_tpot_sweep")
 run_interference = load_tool("run_phase9_interference_sweep")
 reclassify_pilot = load_tool("reclassify_phase9_load_pilot")
+collect_interference = load_tool("collect_phase9_interference_grid")
 
 
 class TestCalibrationAnalysis(unittest.TestCase):
+    def test_collection_prefers_complete_low_error_result(self):
+        base = {
+            "observed": {
+                "telemetry_samples": 299,
+                "rate_relative_error": 0.01,
+            }
+        }
+        more_complete = (
+            Path("more_complete.json"),
+            {
+                "observed": {
+                    "telemetry_samples": 300,
+                    "rate_relative_error": 0.02,
+                }
+            },
+        )
+        lower_error = (Path("lower_error.json"), base)
+        self.assertEqual(
+            min(
+                [lower_error, more_complete],
+                key=collect_interference.selection_score,
+            ),
+            more_complete,
+        )
+
     def test_observed_safe_policy_accepts_shifted_but_safe_load(self):
         args = type(
             "Args",
