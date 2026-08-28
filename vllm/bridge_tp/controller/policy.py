@@ -53,7 +53,9 @@ class InterferenceModel:
     """Target-side penalty attributable to migration traffic.
 
     ``penalty_s`` returns the expected added foreground time over the whole
-    drain, so it is directly comparable with the benefit term.
+    drain, so it is directly comparable with the benefit term. Formal Phase 9
+    uses a paired request-level TPOT response over measured load/rate support;
+    ``legacy_power`` remains only for old engineering configurations.
 
     CALIBRATE THIS. The default below is an order-of-magnitude anchor derived
     from the M3 measurement, not a substitute for the P2-D sweep on your
@@ -79,9 +81,65 @@ class InterferenceModel:
     # ControllerConfig.validate() refuses to start a run while this is empty.
     calibration_source: str = ""
 
-    def penalty_s(self, bytes_to_move: int, target_load_frac: float) -> float:
+    # ``legacy_power`` preserves old engineering configs.  Formal Phase 9
+    # configs use ``rate_aware_tpot`` and the paired request-level TPOT fit.
+    model_kind: str = "legacy_power"
+    tpot_rate_coef_s2_per_gib: float = 0.0
+    tpot_rate_load_coef_s2_per_gib: float = 0.0
+    min_load_frac: float = 0.0
+    max_load_frac: float = 1.0
+    min_rate_gib_s: float = 0.0
+    # A large finite default keeps legacy configs strict-JSON serializable.
+    max_rate_gib_s: float = 1.0e30
+
+    def in_support(self, target_load_frac: float, copy_rate_gib_s: float) -> bool:
+        """Whether a rate-aware prediction stays inside calibration support."""
+        if self.model_kind == "legacy_power":
+            return True
+        return (
+            self.min_load_frac <= target_load_frac <= self.max_load_frac
+            and self.min_rate_gib_s <= copy_rate_gib_s <= self.max_rate_gib_s
+        )
+
+    def incremental_tpot_s(
+        self, target_load_frac: float, copy_rate_gib_s: float
+    ) -> float:
+        """Predict request-level native TPOT increase during copy traffic."""
+        if self.model_kind != "rate_aware_tpot":
+            raise ValueError("incremental_tpot_s requires rate_aware_tpot")
+        if not self.in_support(target_load_frac, copy_rate_gib_s):
+            return math.inf
+        coefficient = (
+            self.tpot_rate_coef_s2_per_gib
+            + self.tpot_rate_load_coef_s2_per_gib * target_load_frac
+        )
+        return max(0.0, copy_rate_gib_s * coefficient)
+
+    def penalty_s(
+        self,
+        bytes_to_move: int,
+        target_load_frac: float,
+        copy_rate_bytes_s: float | None = None,
+        native_tpot_s: float | None = None,
+    ) -> float:
         gib = max(0.0, bytes_to_move) / (1024.0**3)
         load = max(0.0, min(1.0, target_load_frac))
+        if self.model_kind == "rate_aware_tpot":
+            if gib == 0:
+                return 0.0
+            if copy_rate_bytes_s is None or native_tpot_s is None:
+                raise ValueError(
+                    "rate_aware_tpot requires copy_rate_bytes_s and native_tpot_s"
+                )
+            rate_gib_s = copy_rate_bytes_s / (1024.0**3)
+            delta_tpot_s = self.incremental_tpot_s(load, rate_gib_s)
+            if math.isinf(delta_tpot_s) or copy_rate_bytes_s <= 0:
+                return math.inf
+            drain_s = bytes_to_move / copy_rate_bytes_s
+            native_tokens_during_drain = drain_s / max(1e-6, native_tpot_s)
+            return delta_tpot_s * native_tokens_during_drain
+        if self.model_kind != "legacy_power":
+            raise ValueError(f"unknown interference model_kind {self.model_kind!r}")
         scale = ((load + 1e-6) / max(1e-6, self.ref_load_frac)) ** self.load_exponent
         return self.s_per_gib_at_ref * gib * scale
 
@@ -214,13 +272,17 @@ class FastPolicy:
         move_bytes = self.migration_bytes(req)
         drain_s = move_bytes / max(1.0, rate_bytes_s)
         tau1 = self.tpot_tp1.tpot_s(tp1.num_running)
+        tau4 = self.tpot_tp4.tpot_s(tp4.num_running)
         # tokens the source produces during handoff that will be discarded
         dup_tokens = self.cfg.t_restore_commit_s / tau1
         return {
             "t_stall_s": self.cfg.t_stall_s,
             "t_dup_s": dup_tokens * tau1,
             "t_interference_s": self.interference.penalty_s(
-                move_bytes, tp4.kv_usage_frac
+                move_bytes,
+                tp4.kv_usage_frac,
+                copy_rate_bytes_s=rate_bytes_s,
+                native_tpot_s=tau4,
             ),
             "t_margin_s": self.cfg.t_margin_s,
             "_drain_s": drain_s,

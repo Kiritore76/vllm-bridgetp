@@ -1,6 +1,6 @@
 # BridgeTP Phase 9 当前状态与执行计划
 
-更新时间：2026-08-27
+更新时间：2026-08-28
 
 适用源码：
 
@@ -41,10 +41,10 @@ platform: 5 x NVIDIA A100-PCIE-40GB
 | D-1 KV provenance | 单 RID 测量完成 | 固定 prefix、K=53、TP1/native TP4/migrated TP4 逐层逐 rank 报告 | `formal_causal_conclusion` 仍为空 |
 | D-2 precision sensitivity | 未开始，探索项 | 无正式 sweep | 不阻塞正式 D-3 停止门 |
 | D-3 smoke | 工程链路通过 | A=256、B=98、C=98、D=94 | 必须排除该 RID |
-| 更新版 C-1 / Section 7.1 | 进行中 | 自动 18 条件 runner；TPOT metric 修复至 `e8b3e5d` | 完整 fit、hash、支持范围审计 |
-| 更新版 C-2 / Section 7.2 | 两轮原始 band pilot 未通过，可达 band 已冻结 | 高 QPS 隔离诊断显示 running 约 256 饱和而 waiting 增长 | 新 attainable-band pilot READY；formal 36 条件 COMPLETE |
-| C-3 survival table | 已使用但待冻结 | 服务器已有 discovery survival table | 审计 trace/split/source 并哈希 |
-| P9-2 / Section 6 replay | 工程 replay 通过 | engineering anchor 下同时有 migrate/stay | 新模型实现后必须重跑 |
+| 更新版 C-1 / Section 7.1 | 产物尚未带回 | 自动 18 条件 runner；TPOT metric 修复至 `e8b3e5d` | 带回 candidate、fit log、hash 和原始 telemetry 后审计 |
+| 更新版 C-2 / Section 7.2 | 完成 | attainable-band pilot READY；observed-safe formal 36/36 COMPLETE | 保留完整原始条件目录；不重跑 |
+| C-3 survival table | 已使用但产物尚未带回 | 服务器曾有 discovery survival table | 带回并审计 trace/split/source、支持范围和 hash |
+| P9-2 / Section 6 replay | rate-aware 接口已实现，正式 replay 阻塞 | C-2 候选拟合及逻辑测试通过 | 取得 C-1 和 C-3 后运行正式格点 |
 | 正式 policy-driven D-3 | 阻塞 | 尚无 preregistered 50-RID 结果 | 满足第 7 节全部停止门 |
 | E-1 至 E-8 | 未开始正式运行 | 部分机制/工具已有 | D-3 后冻结 E-1 口径 |
 | R-1 至 R-4 | 延后 | 无 | E 主实验和参数冻结后再跑 |
@@ -150,6 +150,27 @@ high 下限使用补充 rate-zero telemetry 离线冻结：0.54 与 0.52 均不�
 fraction=0.800，随后测量窗口 mean=0.5759、fraction=1.000、范围 0.5290-0.6134。
 因此只修订可达区间，不降低 0.80 fraction 门，也不缩短两个时间窗口。
 
+2026-08-28 合并归档通过完整性门：36/36 accepted，low/medium/high 各 12 条，
+`missing/unexpected/duplicates/rejected` 均为空，所有条件各有 299 个 telemetry samples，
+copy-rate relative error 最大值低于 `4e-7`。low 使用旧 formal 的成功条件，medium/high
+使用 `observed_safe` 修订后的新 formal；失败尝试不进入拟合，但原始失败证据不得删除。
+
+主干扰响应按同 band、同 rep 的 rate-zero 条件配对，使用 request-level mean TPOT：
+
+```text
+delta_tpot_s = rate_gib_s * (a + b * kv_usage_mean)
+a = 0.0161100702 s^2/GiB
+b = 0（约束 b >= 0；非约束估计为 -0.0048866326）
+R^2 through zero = 0.984397
+RMSE = 0.001693 s
+support: load 0.10-0.65, rate 0.40-1.20 GiB/s
+```
+
+负载约束落在零边界，表示当前 request-level mean TPOT 数据没有识别出正的 load
+interaction；不能把正交互明显的 P99 ITL 偷换成 TPOT。P99 ITL 拟合只保留为尾延迟
+诊断。控制器在模型支持范围外 fail closed，正式 replay 不得把 0.70/0.85 load 当作
+有标定支持的正常决策点。
+
 ### 4.3 C-3 的完成条件
 
 - 与论文 M1 使用同一 trace；
@@ -161,21 +182,22 @@ fraction=0.800，随后测量窗口 mean=0.5759、fraction=1.000、范围 0.5290
 
 ## 5. Section 7 完成后的开发任务
 
-Section 7 的完成本身不授权正式 D-3。必须先完成以下代码和分析工作：
+Section 7 的完成本身不授权正式 D-3。当前各项状态如下：
 
-1. 从 7.1 读取 TP1/TP4 的 `base_s`、`per_running_s` 和支持范围；
-2. 从 7.2 拟合或选择可审计的 rate-aware interference model：
+1. **阻塞**：从 7.1 读取 TP1/TP4 的 `base_s`、`per_running_s` 和支持范围；
+2. **完成**：从 7.2 拟合可审计的 rate-aware interference model：
 
    ```text
    T_interference = f(kv_usage_frac, copy_rate_gib_s)
    ```
 
-3. 不把 `inter_token_latency_seconds` 偷换为 request-level TPOT；
-4. 更新 `InterferenceModel`、`ControllerConfig` 和 config serialization；
-5. 更新 `replay_policy.py`，使其接收 TPOT slope 和 rate-aware model，而不是常数 TPOT
+3. **完成**：主拟合使用 request-level mean TPOT，ITL 仅作诊断；
+4. **完成**：更新 `InterferenceModel`、`ControllerConfig` 和 config serialization；
+5. **完成**：更新 `replay_policy.py`，使其接收 TPOT slope 和 rate-aware model，而不是常数 TPOT
    加单一 `s_per_gib_at_ref`；
-6. 为拟合结果、输入 summary、正式 config 和代码 commit 计算 SHA256；
-7. 运行逻辑测试和离线 replay，确认边界方向与支持范围。
+6. **部分完成**：拟合脚本记录 inventory、summary、脚本和代码 revision；正式 config
+   只能在 C-1/C-3 到齐后冻结并哈希；
+7. **部分完成**：rate-aware 模型逻辑测试通过；正式 replay 等待 C-1/C-3。
 
 现有 P2-D 45 runs 仍可作为敏感性证据，但不能与新的 7.2 格点混合拟合后伪装成同一
 实验协议。
@@ -207,9 +229,9 @@ copy rate:       正式模型支持范围内的低/中/高档
 以下条件全部满足前，不运行正式 policy-driven D-3：
 
 - [ ] Section 7.1 candidate fit 已生成、检查并哈希；
-- [ ] Section 7.2 pilot 为 READY；
-- [ ] Section 7.2 formal 为 COMPLETE；
-- [ ] rate-aware interference model 已实现并测试；
+- [x] Section 7.2 pilot 为 READY；
+- [x] Section 7.2 formal 为 COMPLETE；
+- [x] rate-aware interference model 已实现并测试；
 - [ ] 正式 replay 同时存在 migrate/stay，且单调方向合理；
 - [ ] survival table 来源已冻结并哈希；
 - [ ] 50 个不同 prompt/RID 的 manifest 已冻结；
@@ -289,23 +311,21 @@ R 不阻塞当前 C、正式 D-3 或 E-1。它应在 E 主实验和参数冻结�
 ## 11. 推荐执行顺序
 
 ```text
-现在
-  └─ 完成 Section 7.1
-       └─ 停 TP1，完成 Section 7.2 pilot
-            ├─ pilot 非 READY → 扩展预注册 QPS，保留原 pilot
-            └─ pilot READY → 完成 36-cell formal
-                 └─ 带回并审计 7.1/7.2/C-3 产物
-                      └─ 开发并拟合 rate-aware model
-                           └─ 新模型正式 replay
-                                └─ 冻结 D-3 preregistration
-                                     └─ 正式 30-50 RID D-3
-                                          └─ 冻结 E-1 Tier 1/2/3
-                                               └─ E-1 → E-2/E-3/E-4/E-5
-                                                    └─ E-6/E-7
-                                                         └─ E-8
-                                                              └─ R-1/R-2
-                                                                   └─ 可用时 R-3
-                                                                        └─ 可选 R-4
+现在（7.2 和 interference candidate 已完成）
+  └─ 从服务器带回并审计 7.1 candidate/raw/hash
+       └─ 带回并审计 C-3 survival table/source manifest/hash
+            └─ 冻结包含 C-1/C-2/C-3 的正式 controller config
+                 └─ 新模型正式 replay
+                      ├─ 门失败 → 修正模型/支持范围，保留原 replay
+                      └─ 门通过 → 冻结 D-3 preregistration
+                           └─ 正式 30-50 RID D-3
+                                └─ 冻结 E-1 Tier 1/2/3
+                                     └─ E-1 → E-2/E-3/E-4/E-5
+                                          └─ E-6/E-7
+                                               └─ E-8
+                                                    └─ R-1/R-2
+                                                         └─ 可用时 R-3
+                                                              └─ 可选 R-4
 ```
 
 ## 12. 最近一次交付检查点
