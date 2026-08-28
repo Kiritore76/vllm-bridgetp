@@ -94,6 +94,8 @@ def load_tpot_models(args: argparse.Namespace) -> tuple[TpotModel, TpotModel]:
             calibration_source=(
                 f"{args.tpot_model}: {payload.get('status', 'candidate')}"
             ),
+            num_running_min=int(raw.get("num_running_min", 0)),
+            num_running_max=int(raw.get("num_running_max", 1_000_000_000)),
         )
 
     return build("tpot_tp1"), build("tpot_tp4")
@@ -169,6 +171,10 @@ def main() -> None:
                         "rate_gib_s": rate,
                         "survival_in_support": table.in_support(produced),
                         "interference_in_support": interference.in_support(load, rate),
+                        "tpot_in_support": (
+                            tpot_tp1.in_support(tp1.num_running)
+                            and tpot_tp4.in_support(tp4.num_running)
+                        ),
                         "break_even_tokens": round(decision.break_even_tokens, 1),
                         "p_worth": round(decision.p_worth, 4),
                         "theta_esc": round(decision.theta_esc, 4),

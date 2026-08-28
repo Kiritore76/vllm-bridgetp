@@ -229,6 +229,35 @@ class TestFastPolicy(unittest.TestCase):
         )
         self.assertTrue(math.isinf(model.incremental_tpot_s(0.70, 0.70)))
 
+    def test_tpot_model_fails_closed_outside_running_support(self):
+        policy = FastPolicy(
+            config=PolicyConfig(),
+            table=self.table,
+            tpot_tp1=TpotModel(
+                0.030,
+                0.0,
+                num_running_min=1,
+                num_running_max=8,
+            ),
+            tpot_tp4=TpotModel(
+                0.020,
+                0.0,
+                num_running_min=1,
+                num_running_max=4,
+            ),
+            interference=InterferenceModel(s_per_gib_at_ref=0.35),
+        )
+        decision = policy.evaluate(
+            request_view(),
+            MigrationState.LOCAL,
+            pool(running=2),
+            pool(running=5),
+            0.1,
+            0.5 * GIB,
+        )
+        self.assertIs(decision.action, Action.STAY)
+        self.assertIn("outside calibrated num_running support", decision.reason)
+
     def test_too_early_requests_are_not_eligible(self):
         decision = self.policy.evaluate(
             request_view(output=8, computed=8),
