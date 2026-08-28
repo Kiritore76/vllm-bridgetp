@@ -38,6 +38,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trace", type=Path, required=True)
     parser.add_argument("--output-field", default="output_tokens")
     parser.add_argument(
+        "--time-field",
+        default=None,
+        help="sort records chronologically by this field before splitting",
+    )
+    parser.add_argument(
         "--train-frac",
         type=float,
         default=0.7,
@@ -51,29 +56,38 @@ def parse_args() -> argparse.Namespace:
         help="progress checkpoints in output tokens",
     )
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--expected-total-rows", type=int)
+    parser.add_argument("--expected-train-rows", type=int)
     return parser.parse_args()
 
 
-def load_lengths(path: Path, field: str) -> list[int]:
+def load_lengths(path: Path, field: str, time_field: str | None = None) -> list[int]:
     text = path.read_text(encoding="utf-8")
-    lengths: list[int] = []
+    rows: list[dict[str, object]]
     if path.suffix.lower() in (".jsonl", ".ndjson"):
+        rows = []
         for line in text.splitlines():
             line = line.strip()
             if not line:
                 continue
-            row = json.loads(line)
-            if field not in row:
-                raise KeyError(f"field {field!r} missing from {path}")
-            lengths.append(int(row[field]))
+            rows.append(json.loads(line))
     elif path.suffix.lower() == ".json":
         rows = json.loads(text)
-        lengths = [int(row[field]) for row in rows]
     else:
         reader = csv.DictReader(text.splitlines())
-        if reader.fieldnames is None or field not in reader.fieldnames:
-            raise KeyError(f"field {field!r} missing from {path}")
-        lengths = [int(row[field]) for row in reader]
+        rows = list(reader)
+    if not rows:
+        raise ValueError(f"no rows read from {path}")
+    required = [field] + ([time_field] if time_field else [])
+    for required_field in required:
+        if required_field not in rows[0]:
+            raise KeyError(f"field {required_field!r} missing from {path}")
+    if time_field:
+        try:
+            rows.sort(key=lambda row: float(row[time_field]))
+        except (TypeError, ValueError):
+            rows.sort(key=lambda row: str(row[time_field]))
+    lengths = [int(row[field]) for row in rows]
     if not lengths:
         raise ValueError(f"no rows read from {path}")
     return lengths
@@ -84,8 +98,17 @@ def main() -> None:
     if not 0.0 < args.train_frac <= 1.0:
         raise SystemExit("--train-frac must be in (0,1]")
 
-    lengths = load_lengths(args.trace, args.output_field)
+    lengths = load_lengths(args.trace, args.output_field, args.time_field)
+    if (
+        args.expected_total_rows is not None
+        and len(lengths) != args.expected_total_rows
+    ):
+        raise SystemExit(
+            f"expected {args.expected_total_rows} total rows, got {len(lengths)}"
+        )
     cut = int(len(lengths) * args.train_frac)
+    if args.expected_train_rows is not None and cut != args.expected_train_rows:
+        raise SystemExit(f"expected {args.expected_train_rows} train rows, got {cut}")
     train = lengths[:cut]
     if len(train) < 100:
         raise SystemExit(
@@ -96,7 +119,13 @@ def main() -> None:
     table = SurvivalTable.from_output_lengths(
         train,
         bucket_edges=tuple(args.bucket_edges),
-        source=f"{args.trace.name} first {args.train_frac:.0%} ({len(train)} requests)",
+        source=(
+            f"{args.trace.name} chronological first {args.train_frac:.0%} "
+            f"({len(train)} requests)"
+            if args.time_field
+            else f"{args.trace.name} first {args.train_frac:.0%} "
+            f"({len(train)} requests)"
+        ),
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     table.save(args.out)

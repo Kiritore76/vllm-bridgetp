@@ -10,6 +10,7 @@ import json
 import math
 import unittest
 
+from tools.bridge_tp.build_survival_table import load_lengths
 from vllm.bridge_tp.controller.events import (
     Action,
     MigrationState,
@@ -132,6 +133,21 @@ class TestSurvivalTable(unittest.TestCase):
             self.assertEqual(back.bucket_edges, self.table.bucket_edges)
             self.assertEqual(
                 back.p_remaining_gt(64, 192), self.table.p_remaining_gt(64, 192)
+            )
+
+    def test_trace_loader_sorts_before_time_split(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trace.csv"
+            path.write_text(
+                "timestamp,output_len\n3,30\n1,10\n2,20\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                load_lengths(path, "output_len", "timestamp"),
+                [10, 20, 30],
             )
 
     def test_rejects_unsorted_rows(self):
