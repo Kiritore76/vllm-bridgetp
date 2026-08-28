@@ -127,6 +127,10 @@ def main() -> None:
     source_frozen = source.get("source_trace_status") == "FOUND" and source.get(
         "source_trace_sha256"
     ) not in {None, "", "UNAVAILABLE"}
+    valid_requests = int(source.get("valid_requests", "0"))
+    expected_train_rows = int(valid_requests * 0.70)
+    selected_train_rows = int(source.get("train_requests", "-1"))
+    split_matches = selected_train_rows == expected_train_rows
     gate_checks = {
         "expected_90_rows": len(rows) == 90,
         "has_migrate_and_stay_in_supported_region": (
@@ -135,6 +139,7 @@ def main() -> None:
         ),
         "has_finite_boundary_in_supported_region": bool(finite),
         "survival_source_frozen": source_frozen,
+        "survival_split_matches_floor_70pct": split_matches,
     }
     payload = {
         "format_version": 1,
@@ -145,6 +150,11 @@ def main() -> None:
         "finite_boundary_rows": len(finite),
         "action_counts": dict(action_counts),
         "supported_action_counts": dict(supported_action_counts),
+        "survival_split": {
+            "valid_requests": valid_requests,
+            "expected_floor_70pct_train_rows": expected_train_rows,
+            "selected_train_rows": selected_train_rows,
+        },
         "reason_counts": dict(Counter(row["reason"] for row in rows)),
         "load_monotonicity": monotonic_load(rows),
         "inputs": {

@@ -43,7 +43,7 @@ platform: 5 x NVIDIA A100-PCIE-40GB
 | D-3 smoke | 工程链路通过 | A=256、B=98、C=98、D=94 | 必须排除该 RID |
 | 更新版 C-1 / Section 7.1 | 18 条件完整，线性候选未通过 replay 适用性门 | 原始 telemetry、candidate 和 hash 全部复算一致 | 不能调阈值；先补齐 TP4 低负载收益区与 interference 支持重叠 |
 | 更新版 C-2 / Section 7.2 | 完成 | attainable-band pilot READY；observed-safe formal 36/36 COMPLETE | 保留完整原始条件目录；不重跑 |
-| C-3 survival table | 表体通过，来源冻结未通过 | selected 30141-request 表结构、raw hash、支持范围通过 | 找到原始 `qwen_traceA_e1.csv`，记录 hash 并从相同 split 重建核对 |
+| C-3 survival table | 表体通过，来源与 split 冻结未通过 | 30141 selected 与 30140 alternative 均已保留 | 找到原始 `qwen_traceA_e1.csv`，按 M1 的 floor(0.70N) 重建并哈希 |
 | P9-2 / Section 6 replay | FAILED，已保留 | calibrated pre-formal grid 90/90 STAY，0 finite N* | 不得反向调参；修复证据支持重叠后重跑 |
 | 正式 policy-driven D-3 | 阻塞 | 尚无 preregistered 50-RID 结果 | 满足第 7 节全部停止门 |
 | E-1 至 E-8 | 未开始正式运行 | 部分机制/工具已有 | D-3 后冻结 E-1 口径 |
@@ -204,6 +204,11 @@ interaction；不能把正交互明显的 P99 ITL 偷换成 TPOT。P99 ITL 拟�
 `source_trace_status=NOT_FOUND_ON_SERVER`、`source_trace_sha256=UNAVAILABLE`。
 因此表可以用于诊断 replay，尚不能通过 C-3 正式冻结门。
 
+此外，当前 `build_survival_table.py` 与 M1 runbook 的训练边界均为
+`int(43058 * 0.70) = 30140`；archive 却把 30141 条版本标为 selected，并把 30140 条
+版本标为 excluded alternative。正式 C-3 必须以原始 trace 按 timestamp 排序后重建，
+在此之前不能把任一现有版本提升为正式输入。
+
 ## 5. Section 7 完成后的开发任务
 
 Section 7 的完成本身不授权正式 D-3。当前各项状态如下：
@@ -261,11 +266,13 @@ actions: STAY=90, START_SHADOW=0
 finite N*: 0
 reason: tau4 >= tau1
 survival source frozen: false
+survival floor(70%) split matched: false (30141 selected vs 30140 expected)
 ```
 
 该失败结果必须保留。下一次 replay 前只允许完成两个事先声明的证据修复：
 
-1. 找回并哈希原始 `qwen_traceA_e1.csv`，按 time-ordered 70% 的 30141 条重建 C-3；
+1. 找回并哈希原始 `qwen_traceA_e1.csv`，按 timestamp 排序后用
+   `int(0.70 * 43058)=30140` 条重建 C-3，并与 archive 中的 30140 alternative 核对；
 2. 在任何新 interference 结果产生前预注册一个 TP4 very-low 重叠 pilot。建议候选
    band 为 0.01-0.06，候选 QPS 为 0.10/0.15/0.20/0.25/0.30，保持原 120 秒稳定门、
    独立 300 秒测量窗、0.80 fraction、observed-safe p95 上限和两次失败后跳过规则。
