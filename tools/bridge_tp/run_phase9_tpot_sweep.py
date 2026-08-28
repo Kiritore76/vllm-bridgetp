@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 import urllib.request
 import uuid
 from pathlib import Path
@@ -45,6 +46,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--condition-timeout-s", type=float, default=1800.0)
     parser.add_argument("--vllm-bin", default="vllm")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="reuse complete successful conditions already under --out-root",
+    )
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=1,
+        help="maximum new attempts per missing condition (default: 1)",
+    )
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="after retries are exhausted, save the failure and continue",
+    )
     args = parser.parse_args()
     if args.tp1_blocks <= 0 or args.tp4_blocks <= 0 or args.block_size <= 0:
         parser.error("KV geometry must be positive")
@@ -54,6 +71,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("repetitions must be positive")
     if args.num_prompts <= 0 or args.num_warmups < 0:
         parser.error("prompt counts are invalid")
+    if args.max_attempts <= 0:
+        parser.error("--max-attempts must be positive")
     return args
 
 
@@ -171,6 +190,130 @@ def write_hashes(condition_dir: Path, paths: list[Path]) -> None:
         "\n".join(lines) + "\n",
         encoding="utf-8",
     )
+
+
+def condition_key(side: str, qps: float, rep: int) -> tuple[str, float, int]:
+    return side, float(qps), int(rep)
+
+
+def hashes_match(condition_dir: Path) -> bool:
+    hashes = condition_dir / "SHA256SUMS"
+    if not hashes.is_file():
+        return False
+    for line in hashes.read_text(encoding="utf-8").splitlines():
+        expected, filename = line.split(maxsplit=1)
+        path = condition_dir / filename.strip()
+        if not path.is_file() or sha256_file(path) != expected:
+            return False
+    return True
+
+
+def accepted_conditions(
+    out_root: Path,
+    *,
+    input_len: int,
+    output_len: int,
+    num_prompts: int,
+) -> dict[tuple[str, float, int], Path]:
+    accepted: dict[tuple[str, float, int], Path] = {}
+    for directory in sorted(out_root.glob("tpot_*")):
+        manifest_path = directory / "condition_manifest.json"
+        benchmark_path = directory / "benchmark.json"
+        telemetry_path = directory / "telemetry.csv"
+        if not all(
+            path.is_file()
+            for path in (manifest_path, benchmark_path, telemetry_path)
+        ):
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            benchmark = json.loads(benchmark_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if (
+            int(manifest.get("input_len", -1)) != input_len
+            or int(manifest.get("output_len", -1)) != output_len
+            or int(manifest.get("num_prompts", -1)) != num_prompts
+            or int(benchmark.get("completed", -1)) != num_prompts
+            or int(benchmark.get("failed", -1)) != 0
+            or not hashes_match(directory)
+        ):
+            continue
+        key = condition_key(
+            str(manifest["side"]),
+            float(manifest["qps"]),
+            int(manifest["rep"]),
+        )
+        accepted[key] = telemetry_path
+    return accepted
+
+
+def write_failure_record(
+    condition_dir: Path,
+    *,
+    attempt: int,
+    error: BaseException,
+) -> None:
+    path = condition_dir / "condition_failure.json"
+    path.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "status": "FAILED_ATTEMPT",
+                "attempt": attempt,
+                "error_type": type(error).__name__,
+                "error": str(error),
+                "traceback": traceback.format_exc(),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    artifacts = [path]
+    for name in (
+        "condition_manifest.json",
+        "benchmark.json",
+        "telemetry.csv",
+        "telemetry.manifest.json",
+        "benchmark.log",
+        "telemetry.log",
+    ):
+        candidate = condition_dir / name
+        if candidate.is_file():
+            artifacts.append(candidate)
+    write_hashes(condition_dir, artifacts)
+
+
+def write_progress(
+    args: argparse.Namespace,
+    expected: list[tuple[str, float, int]],
+    accepted: dict[tuple[str, float, int], Path],
+    failures: list[dict[str, object]],
+) -> Path:
+    missing = [key for key in expected if key not in accepted]
+    path = args.out_root / "tpot_progress.json"
+    path.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "status": "COMPLETE" if not missing else "INCOMPLETE",
+                "expected_conditions": len(expected),
+                "accepted_conditions": len(expected) - len(missing),
+                "missing_conditions": [
+                    {"side": side, "qps": qps, "rep": rep}
+                    for side, qps, rep in missing
+                ],
+                "failed_attempts": failures,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
 
 
 def run_condition(
@@ -301,14 +444,76 @@ def main() -> None:
     if not args.dry_run and shutil.which(args.vllm_bin) is None:
         raise RuntimeError(f"vLLM executable not found: {args.vllm_bin}")
     args.out_root.mkdir(parents=True, exist_ok=True)
-    tp1_paths = []
-    tp4_paths = []
-    for side, base_url, blocks, qps, rep in condition_matrix(args):
-        path = run_condition(args, side, base_url, blocks, qps, rep)
-        (tp1_paths if side == "tp1" else tp4_paths).append(path)
+    matrix = list(condition_matrix(args))
+    expected = [
+        condition_key(side, qps, rep)
+        for side, _base_url, _blocks, qps, rep in matrix
+    ]
+    accepted = (
+        accepted_conditions(
+            args.out_root,
+            input_len=args.input_len,
+            output_len=args.output_len,
+            num_prompts=args.num_prompts,
+        )
+        if args.resume
+        else {}
+    )
+    failures: list[dict[str, object]] = []
+    for side, base_url, blocks, qps, rep in matrix:
+        key = condition_key(side, qps, rep)
+        if key in accepted:
+            print(f"reusing accepted condition: {side} qps={qps:g} rep={rep}")
+            continue
+        for attempt in range(1, args.max_attempts + 1):
+            before = set(args.out_root.glob("tpot_*"))
+            try:
+                accepted[key] = run_condition(
+                    args, side, base_url, blocks, qps, rep
+                )
+                break
+            except Exception as error:
+                created = list(set(args.out_root.glob("tpot_*")) - before)
+                condition_dir = created[0] if len(created) == 1 else None
+                if condition_dir is not None:
+                    write_failure_record(
+                        condition_dir,
+                        attempt=attempt,
+                        error=error,
+                    )
+                failures.append(
+                    {
+                        "side": side,
+                        "qps": qps,
+                        "rep": rep,
+                        "attempt": attempt,
+                        "condition_dir": str(condition_dir or "UNKNOWN"),
+                        "error": str(error),
+                    }
+                )
+                print(
+                    f"condition failed: {side} qps={qps:g} rep={rep} "
+                    f"attempt={attempt}/{args.max_attempts}: {error}",
+                    file=sys.stderr,
+                )
+                if attempt == args.max_attempts and not args.continue_on_error:
+                    write_progress(args, expected, accepted, failures)
+                    raise
     if args.dry_run:
-        print(f"dry run complete: {len(tp1_paths) + len(tp4_paths)} conditions")
+        print(f"dry run complete: {len(accepted)} conditions")
         return
+
+    progress = write_progress(args, expected, accepted, failures)
+    missing = [key for key in expected if key not in accepted]
+    if missing:
+        print(
+            f"sweep incomplete after retries: accepted={len(accepted)}/"
+            f"{len(expected)}; wrote {progress}"
+        )
+        return
+
+    tp1_paths = [accepted[key] for key in expected if key[0] == "tp1"]
+    tp4_paths = [accepted[key] for key in expected if key[0] == "tp4"]
 
     fit_out = args.out_root / "tick_tpot_candidate.json"
     fit_command = [
@@ -335,7 +540,7 @@ def main() -> None:
         args.out_root,
         [fit_out, args.out_root / "tick_tpot_fit.log"],
     )
-    print(f"completed 18 conditions; fitted model: {fit_out}")
+    print(f"completed {len(expected)} conditions; fitted model: {fit_out}")
 
 
 if __name__ == "__main__":
