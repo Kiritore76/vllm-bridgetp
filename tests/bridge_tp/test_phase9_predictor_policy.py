@@ -191,6 +191,44 @@ class TestFastPolicy(unittest.TestCase):
         busy = self.policy.break_even_tokens(req, pool(), pool(kv=0.70), 0.5 * GIB)[0]
         self.assertGreater(busy, idle)
 
+    def test_rate_aware_interference_uses_request_tpot_fit(self):
+        model = InterferenceModel(
+            calibration_source="unit test",
+            model_kind="rate_aware_tpot",
+            tpot_rate_coef_s2_per_gib=0.016,
+            tpot_rate_load_coef_s2_per_gib=0.004,
+            min_load_frac=0.10,
+            max_load_frac=0.65,
+            min_rate_gib_s=0.40,
+            max_rate_gib_s=1.20,
+        )
+        self.assertAlmostEqual(model.incremental_tpot_s(0.50, 0.70), 0.0126)
+        low = model.penalty_s(
+            1 * int(GIB),
+            0.20,
+            copy_rate_bytes_s=0.70 * GIB,
+            native_tpot_s=0.10,
+        )
+        high = model.penalty_s(
+            1 * int(GIB),
+            0.60,
+            copy_rate_bytes_s=0.70 * GIB,
+            native_tpot_s=0.10,
+        )
+        self.assertGreater(high, low)
+
+    def test_rate_aware_interference_fails_closed_outside_support(self):
+        model = InterferenceModel(
+            calibration_source="unit test",
+            model_kind="rate_aware_tpot",
+            tpot_rate_coef_s2_per_gib=0.016,
+            min_load_frac=0.10,
+            max_load_frac=0.65,
+            min_rate_gib_s=0.40,
+            max_rate_gib_s=1.20,
+        )
+        self.assertTrue(math.isinf(model.incremental_tpot_s(0.70, 0.70)))
+
     def test_too_early_requests_are_not_eligible(self):
         decision = self.policy.evaluate(
             request_view(output=8, computed=8),

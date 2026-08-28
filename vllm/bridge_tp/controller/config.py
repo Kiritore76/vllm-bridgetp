@@ -133,6 +133,22 @@ class ControllerConfig:
             raise ValueError("slow low_threshold must be below high_threshold")
         if self.policy.theta_min > self.policy.theta_0:
             raise ValueError("theta_min must not exceed theta_0")
+        if self.interference.model_kind not in {
+            "legacy_power",
+            "rate_aware_tpot",
+        }:
+            raise ValueError(
+                f"unknown interference model_kind {self.interference.model_kind!r}"
+            )
+        if self.interference.model_kind == "rate_aware_tpot":
+            if self.interference.tpot_rate_coef_s2_per_gib < 0:
+                raise ValueError("interference TPOT rate coefficient must be >= 0")
+            if self.interference.tpot_rate_load_coef_s2_per_gib < 0:
+                raise ValueError("interference TPOT load coefficient must be >= 0")
+            if self.interference.min_load_frac >= self.interference.max_load_frac:
+                raise ValueError("interference load support is empty")
+            if self.interference.min_rate_gib_s >= self.interference.max_rate_gib_s:
+                raise ValueError("interference rate support is empty")
 
         # The three cost/benefit inputs set the break-even remaining length N*.
         # Shipping plausible-looking defaults into a measurement run is how a
