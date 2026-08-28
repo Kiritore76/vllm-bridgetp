@@ -34,6 +34,42 @@ reclassify_pilot = load_tool("reclassify_phase9_load_pilot")
 
 
 class TestCalibrationAnalysis(unittest.TestCase):
+    def test_observed_safe_policy_accepts_shifted_but_safe_load(self):
+        args = type(
+            "Args",
+            (),
+            {
+                "measurement_load_policy": "observed_safe",
+                "measurement_max_kv_p95": 0.85,
+                "load_min": 0.50,
+                "load_max": 0.65,
+                "min_band_fraction": 0.80,
+            },
+        )()
+        name, passed, p95 = analyze.measurement_load_check(
+            [0.40, 0.42, 0.44, 0.46], args
+        )
+        self.assertEqual(name, "measurement_load_safe")
+        self.assertTrue(passed)
+        self.assertLess(p95, 0.85)
+
+    def test_observed_safe_policy_rejects_unsafe_p95(self):
+        args = type(
+            "Args",
+            (),
+            {
+                "measurement_load_policy": "observed_safe",
+                "measurement_max_kv_p95": 0.85,
+                "load_min": 0.50,
+                "load_max": 0.65,
+                "min_band_fraction": 0.80,
+            },
+        )()
+        _, passed, _ = analyze.measurement_load_check(
+            [0.80, 0.86, 0.90], args
+        )
+        self.assertFalse(passed)
+
     def test_attainable_load_bands_are_frozen(self):
         self.assertEqual(
             run_interference.serialized_bands(),
@@ -108,6 +144,21 @@ class TestCalibrationAnalysis(unittest.TestCase):
                 ],
             )
 
+    def test_formal_subset_keys_are_explicit(self):
+        args = type(
+            "Args",
+            (),
+            {
+                "formal_bands": ("medium", "high"),
+                "formal_rates": (0.7,),
+                "formal_reps": (1,),
+            },
+        )()
+        self.assertEqual(
+            run_interference.formal_expected_keys(args),
+            [("medium", 0.7, 1), ("high", 0.7, 1)],
+        )
+
     def test_formal_counts_prior_failure_then_retries_once_and_continues(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -147,6 +198,9 @@ class TestCalibrationAnalysis(unittest.TestCase):
                     "resume": True,
                     "max_attempts": 2,
                     "continue_on_error": True,
+                    "formal_bands": tuple(run_interference.BANDS),
+                    "formal_rates": run_interference.RATES,
+                    "formal_reps": run_interference.REPS,
                 },
             )()
             failed_key = ("low", 0.0, 1)

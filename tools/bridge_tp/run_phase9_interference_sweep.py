@@ -83,6 +83,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stability-window-s", type=float, default=60.0)
     parser.add_argument("--stability-poll-s", type=float, default=5.0)
     parser.add_argument("--min-band-fraction", type=float, default=0.80)
+    parser.add_argument(
+        "--measurement-load-policy",
+        choices=("strict_band", "observed_safe"),
+        default="strict_band",
+    )
+    parser.add_argument("--measurement-max-kv-p95", type=float, default=0.85)
+    parser.add_argument("--min-measurement-samples", type=int, default=290)
     parser.add_argument("--copy-seconds", type=float, default=300.0)
     parser.add_argument("--drain-margin-s", type=float, default=60.0)
     parser.add_argument("--telemetry-interval-s", type=float, default=1.0)
@@ -95,6 +102,14 @@ def parse_args() -> argparse.Namespace:
         default=(0.2, 0.4, 0.53, 0.7, 1.0, 1.5),
     )
     parser.add_argument("--pilot-summary", type=Path)
+    parser.add_argument(
+        "--formal-bands",
+        nargs="+",
+        choices=tuple(BANDS),
+        default=tuple(BANDS),
+    )
+    parser.add_argument("--formal-rates", nargs="+", type=float, default=RATES)
+    parser.add_argument("--formal-reps", nargs="+", type=int, default=REPS)
     parser.add_argument(
         "--resume",
         action="store_true",
@@ -140,6 +155,17 @@ def parse_args() -> argparse.Namespace:
         parser.error("stability-poll-s must be positive")
     if not 0 < args.min_band_fraction <= 1:
         parser.error("min-band-fraction must be in (0,1]")
+    if not 0 < args.measurement_max_kv_p95 <= 1:
+        parser.error("measurement-max-kv-p95 must be in (0,1]")
+    if args.min_measurement_samples <= 0:
+        parser.error("min-measurement-samples must be positive")
+    if any(rate not in RATES for rate in args.formal_rates):
+        parser.error(f"formal-rates must be selected from {RATES}")
+    if any(rep not in REPS for rep in args.formal_reps):
+        parser.error(f"formal-reps must be selected from {REPS}")
+    args.formal_bands = tuple(dict.fromkeys(args.formal_bands))
+    args.formal_rates = tuple(dict.fromkeys(args.formal_rates))
+    args.formal_reps = tuple(dict.fromkeys(args.formal_reps))
     if args.max_attempts <= 0:
         parser.error("max-attempts must be positive")
     if args.mode == "formal" and args.pilot_summary is None:
@@ -706,6 +732,12 @@ def analyze_formal_condition(
         str(high),
         "--min-band-fraction",
         str(args.min_band_fraction),
+        "--measurement-load-policy",
+        args.measurement_load_policy,
+        "--measurement-max-kv-p95",
+        str(args.measurement_max_kv_p95),
+        "--min-measurement-samples",
+        str(args.min_measurement_samples),
         "--rate-relative-tolerance",
         "0.05",
         "--out",
@@ -729,6 +761,15 @@ def analyze_formal_condition(
 
 
 FormalKey = tuple[str, float, int]
+
+
+def formal_expected_keys(args: argparse.Namespace) -> list[FormalKey]:
+    return [
+        (band, rate, rep)
+        for band in args.formal_bands
+        for rate in args.formal_rates
+        for rep in args.formal_reps
+    ]
 
 
 def formal_result_key(payload: dict[str, object]) -> FormalKey:
@@ -793,13 +834,15 @@ def write_formal_progress(
     out_root: Path,
     results: dict[FormalKey, Path],
     failures: dict[FormalKey, str] | None = None,
+    expected: list[FormalKey] | None = None,
 ) -> Path:
-    expected = [
-        (band, rate, rep)
-        for band in BANDS
-        for rate in RATES
-        for rep in REPS
-    ]
+    if expected is None:
+        expected = [
+            (band, rate, rep)
+            for band in BANDS
+            for rate in RATES
+            for rep in REPS
+        ]
     missing = [key for key in expected if key not in results]
     payload = {
         "format_version": 1,
@@ -838,16 +881,19 @@ def run_formal(args: argparse.Namespace) -> None:
     qps_by_band = {
         band: float(pilot["selected"][band]["qps"]) for band in BANDS
     }
+    expected = formal_expected_keys(args)
+    expected_set = set(expected)
     results = accepted_formal_results(args.out_root) if args.resume else {}
+    results = {key: path for key, path in results.items() if key in expected_set}
     prior_attempts = (
         existing_formal_attempt_counts(args.out_root) if args.resume else {}
     )
     if results:
         print(f"resuming with {len(results)} ACCEPTED formal conditions")
     failures: dict[FormalKey, str] = {}
-    for band in BANDS:
-        for rate in RATES:
-            for rep in REPS:
+    for band in args.formal_bands:
+        for rate in args.formal_rates:
+            for rep in args.formal_reps:
                 key = (band, rate, rep)
                 if key in results:
                     print(f"reusing ACCEPTED condition {key}: {results[key]}")
@@ -872,7 +918,9 @@ def run_formal(args: argparse.Namespace) -> None:
                             args, condition_dir, band, rate
                         )
                         failures.pop(key, None)
-                        write_formal_progress(args.out_root, results, failures)
+                        write_formal_progress(
+                            args.out_root, results, failures, expected
+                        )
                         break
                     except Exception as error:
                         failures[key] = str(error)
@@ -893,9 +941,13 @@ def run_formal(args: argparse.Namespace) -> None:
                         f"continuing after failed formal condition {key}",
                         file=sys.stderr,
                     )
-                    write_formal_progress(args.out_root, results, failures)
-    progress_out = write_formal_progress(args.out_root, results, failures)
-    if len(results) != len(BANDS) * len(RATES) * len(REPS):
+                    write_formal_progress(
+                        args.out_root, results, failures, expected
+                    )
+    progress_out = write_formal_progress(
+        args.out_root, results, failures, expected
+    )
+    if len(results) != len(expected):
         if args.continue_on_error:
             print(
                 "completed the formal grid traversal with failed conditions; "
@@ -907,6 +959,13 @@ def run_formal(args: argparse.Namespace) -> None:
             "formal interference grid remains incomplete after attempting "
             f"all conditions; resume with the same --out-root: {progress_out}"
         )
+    full_grid = len(expected) == len(BANDS) * len(RATES) * len(REPS)
+    if not full_grid:
+        print(
+            f"completed {len(expected)} selected formal conditions: "
+            f"{progress_out}"
+        )
+        return
     summary_out = args.out_root / "bridge_calibration_summary.json"
     command = [
         sys.executable,
