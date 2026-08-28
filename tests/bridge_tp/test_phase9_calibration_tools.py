@@ -409,6 +409,52 @@ class TestCalibrationAnalysis(unittest.TestCase):
         self.assertEqual(matrix[0], ("tp1", args.tp1_url, 1968, 1.0, 1))
         self.assertEqual(matrix[-1], ("tp4", args.tp4_url, 35739, 4.0, 3))
 
+    def test_tpot_resume_reuses_only_complete_hashed_condition(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            condition = root / "tpot_tp1_qps0.1_r2_test"
+            condition.mkdir()
+            manifest = condition / "condition_manifest.json"
+            benchmark = condition / "benchmark.json"
+            telemetry = condition / "telemetry.csv"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "side": "tp1",
+                        "qps": 0.1,
+                        "rep": 2,
+                        "input_len": 256,
+                        "output_len": 2048,
+                        "num_prompts": 40,
+                    }
+                )
+            )
+            benchmark.write_text(json.dumps({"completed": 40, "failed": 0}))
+            telemetry.write_text("num_running\n1\n")
+            run_tpot.write_hashes(condition, [manifest, benchmark, telemetry])
+
+            accepted = run_tpot.accepted_conditions(
+                root,
+                input_len=256,
+                output_len=2048,
+                num_prompts=40,
+            )
+            self.assertEqual(
+                accepted[("tp1", 0.1, 2)],
+                telemetry,
+            )
+
+            telemetry.write_text("num_running\n2\n")
+            self.assertEqual(
+                run_tpot.accepted_conditions(
+                    root,
+                    input_len=256,
+                    output_len=2048,
+                    num_prompts=40,
+                ),
+                {},
+            )
+
     def test_weighted_tpot_fit_recovers_linear_model(self):
         rows = [
             {
