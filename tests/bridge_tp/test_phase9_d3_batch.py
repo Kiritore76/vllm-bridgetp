@@ -85,60 +85,23 @@ class TestPhase9D3Batch(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "validated design"):
                 batch.load_manifest(path)
 
-    def test_controller_config_uses_calibrated_c_models(self) -> None:
+    def test_controller_config_is_self_contained_diagnostic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            tpot_path = root / "tpot.json"
-            interference_path = root / "interference.json"
-            tpot_path.write_text(
-                json.dumps(
-                    {
-                        "tpot_tp1": {
-                            "base_s": 0.03,
-                            "per_running_s": 0.001,
-                            "conditions": 21,
-                        },
-                        "tpot_tp4": {
-                            "base_s": 0.02,
-                            "per_running_s": 0.001,
-                            "conditions": 30,
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
-            interference_path.write_text(
-                json.dumps(
-                    {
-                        "controller_model": {
-                            "model_kind": "rate_aware_tpot",
-                            "calibration_source": "frozen C2",
-                            "tpot_rate_coef_s2_per_gib": 0.01,
-                            "tpot_rate_load_coef_s2_per_gib": 0.01,
-                            "min_load_frac": 0.01,
-                            "max_load_frac": 0.65,
-                            "min_rate_gib_s": 0.4,
-                            "max_rate_gib_s": 1.2,
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
             args = types.SimpleNamespace(
                 controller_config_template=None,
-                tpot_model=tpot_path,
-                interference_model=interference_path,
                 tp1_url="http://127.0.0.1:8001",
                 tp4_url="http://127.0.0.1:8200",
                 tp1_blocks=100,
                 tp4_blocks=200,
-                survival_table=root / "survival.json",
+                max_tokens=416,
             )
             path = batch.controller_config(args, root / "run")
             config = ControllerConfig.load(path)
-            self.assertEqual(config.tpot_tp1.calibration_source[:8], "Phase 9 ")
-            self.assertEqual(config.interference.model_kind, "rate_aware_tpot")
+            self.assertIn("diagnostic only", config.tpot_tp1.calibration_source)
+            self.assertEqual(config.interference.model_kind, "legacy_power")
             self.assertEqual(config.tp4_total_kv_blocks, 200)
+            self.assertTrue(Path(config.survival_table_path).exists())
 
 
 if __name__ == "__main__":
