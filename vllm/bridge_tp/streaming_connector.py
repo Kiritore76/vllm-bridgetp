@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm.bridge_tp.block_layout import snapshot_target_block_ids
 from vllm.bridge_tp.kv_restore import inject_rank_shard
 from vllm.bridge_tp.stream_protocol import (
     MIGRATION_PARAM,
@@ -253,10 +254,37 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         if num_external_tokens != int(manifest["num_computed_tokens"]):
             raise ValueError("Target external-token count differs from snapshot")
         block_ids = blocks.get_block_ids()
-        if len(block_ids) != 1 or len(block_ids[0]) != int(manifest["num_blocks"]):
-            raise ValueError("Target block allocation differs from live snapshot")
+        self._snapshot_target_block_ids(
+            request,
+            block_ids,
+            "Target block allocation differs from live snapshot",
+        )
         self._claimed_target_request_id = request.request_id
         self._pending_requests[request.request_id] = request
+
+    def _snapshot_target_block_ids(
+        self,
+        request: Request,
+        block_ids: tuple[list[int], ...],
+        error_message: str,
+    ) -> list[int]:
+        """Validate an allocation and return blocks covered by streamed KV.
+
+        The request contains one pending token beyond ``num_computed_tokens``.
+        When the computed prefix exactly fills its final block, the scheduler
+        legitimately allocates one additional tail block for that pending
+        token.  The streamed snapshot must be restored only into the prefix
+        blocks; the scheduler-owned tail block remains untouched for local
+        decode.
+        """
+        manifest = self._load_manifest()
+        return snapshot_target_block_ids(
+            block_ids,
+            request_num_tokens=request.num_tokens,
+            block_size=int(manifest["block_size"]),
+            snapshot_blocks=int(manifest["num_blocks"]),
+            error_message=error_message,
+        )
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -273,17 +301,17 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 manifest["num_computed_tokens"]
             ):
                 raise ValueError("Worker token boundary differs from snapshot")
-            block_ids = new_request.block_ids
-            if len(block_ids) != 1 or len(block_ids[0]) != int(
-                manifest["num_blocks"]
-            ):
-                raise ValueError("Worker block table differs from allocation")
+            snapshot_block_ids = self._snapshot_target_block_ids(
+                request,
+                new_request.block_ids,
+                "Worker block table differs from allocation",
+            )
             metadata.requests.append(
                 BridgeTPStreamRequest(
                     migration_id=str(manifest["migration_id"]),
                     source_request_id=str(manifest["source_request_id"]),
                     target_request_id=request.request_id,
-                    target_block_ids=list(block_ids[0]),
+                    target_block_ids=snapshot_block_ids,
                     num_computed_tokens=int(manifest["num_computed_tokens"]),
                 )
             )

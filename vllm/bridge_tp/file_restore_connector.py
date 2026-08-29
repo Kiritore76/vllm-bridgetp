@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm.bridge_tp.block_layout import snapshot_target_block_ids
 from vllm.bridge_tp.kv_restore import (
     RESTORE_PARAM,
     RestoreArtifact,
@@ -179,12 +180,15 @@ class BridgeTPFileRestoreConnector(KVConnectorBase_V1):
         if num_external_tokens != self.artifact.num_computed_tokens:
             raise ValueError("Scheduler external-token count differs from artifact")
         block_ids = blocks.get_block_ids()
-        if len(block_ids) != 1:
-            raise ValueError("BridgeTP Phase 5 requires one target block table")
-        if len(block_ids[0]) != self.artifact.num_blocks:
-            raise ValueError(
+        snapshot_target_block_ids(
+            block_ids,
+            request_num_tokens=request.num_tokens,
+            block_size=self.artifact.block_size,
+            snapshot_blocks=self.artifact.num_blocks,
+            error_message=(
                 "Allocated target block count differs from source request blocks"
-            )
+            ),
+        )
         self._claimed_target_request_id = request.request_id
         self._pending_requests[request.request_id] = request
 
@@ -198,14 +202,18 @@ class BridgeTPFileRestoreConnector(KVConnectorBase_V1):
                 continue
             if new_request.num_computed_tokens != self.artifact.num_computed_tokens:
                 raise ValueError("Worker request boundary differs from artifact")
-            block_ids = new_request.block_ids
-            if len(block_ids) != 1 or len(block_ids[0]) != self.artifact.num_blocks:
-                raise ValueError("Worker target block table differs from allocation")
+            snapshot_block_ids = snapshot_target_block_ids(
+                new_request.block_ids,
+                request_num_tokens=request.num_tokens,
+                block_size=self.artifact.block_size,
+                snapshot_blocks=self.artifact.num_blocks,
+                error_message="Worker target block table differs from allocation",
+            )
             metadata.requests.append(
                 BridgeTPRestoreRequest(
                     target_request_id=request.request_id,
                     source_request_id=self.artifact.source_request_id,
-                    target_block_ids=list(block_ids[0]),
+                    target_block_ids=snapshot_block_ids,
                     num_computed_tokens=self.artifact.num_computed_tokens,
                 )
             )
