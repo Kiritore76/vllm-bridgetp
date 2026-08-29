@@ -16,6 +16,7 @@ from tools.bridge_tp.measure_agreement import load_token_ids
 from tools.bridge_tp.probe_logit_ulp import analyze_side, token_value
 from tools.bridge_tp.run_fixed_prefix_continuation import request_payload
 from tools.bridge_tp.summarize_agreement import validate_pairs
+from vllm.bridge_tp.block_layout import snapshot_target_block_ids
 from vllm.bridge_tp.config import BridgeTPDumpConfig
 from vllm.bridge_tp.controller.numerics import (
     agreement_length,
@@ -105,6 +106,35 @@ class TestAgreementStatistics(unittest.TestCase):
 
 
 class TestEvidenceTools(unittest.TestCase):
+    def test_pending_tail_block_is_excluded_from_snapshot_restore(self):
+        selected = snapshot_target_block_ids(
+            (list(range(100, 113)),),
+            request_num_tokens=193,
+            block_size=16,
+            snapshot_blocks=12,
+            error_message="bad allocation",
+        )
+        self.assertEqual(selected, list(range(100, 112)))
+        self.assertNotIn(112, selected)
+
+    def test_unexpected_extra_tail_block_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "bad allocation"):
+            snapshot_target_block_ids(
+                (list(range(14)),),
+                request_num_tokens=193,
+                block_size=16,
+                snapshot_blocks=12,
+                error_message="bad allocation",
+            )
+        with self.assertRaisesRegex(ValueError, "bad allocation"):
+            snapshot_target_block_ids(
+                (list(range(13)),),
+                request_num_tokens=193,
+                block_size=16,
+                snapshot_blocks=10,
+                error_message="bad allocation",
+            )
+
     def test_measurement_reads_fixed_prefix_provenance_object(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "fixed_prefix.json"
@@ -238,6 +268,68 @@ class TestOptInConfiguration(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "migration id differs"):
             connector._request_matches(request)
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "requires torch")
+    def test_streaming_connector_keeps_pending_tail_block_out_of_restore(self):
+        from vllm.bridge_tp.stream_protocol import MIGRATION_PARAM
+        from vllm.bridge_tp.streaming_connector import BridgeTPStreamingConnector
+
+        connector = object.__new__(BridgeTPStreamingConnector)
+        connector._manifest = {
+            "migration_id": "migration",
+            "source_request_id": "source",
+            "all_known_token_ids": list(range(193)),
+            "num_computed_tokens": 192,
+            "num_blocks": 12,
+            "block_size": 16,
+        }
+        connector._pending_requests = {}
+        connector._claimed_target_request_id = None
+        request = types.SimpleNamespace(
+            request_id="target",
+            kv_transfer_params={MIGRATION_PARAM: "migration"},
+            prompt_token_ids=list(range(193)),
+            num_tokens=193,
+        )
+        allocated = (list(range(100, 113)),)
+        blocks = types.SimpleNamespace(get_block_ids=lambda: allocated)
+
+        connector.update_state_after_alloc(request, blocks, 192)
+        scheduler_output = types.SimpleNamespace(
+            scheduled_new_reqs=[
+                types.SimpleNamespace(
+                    req_id="target",
+                    num_computed_tokens=192,
+                    block_ids=allocated,
+                )
+            ]
+        )
+        metadata = connector.build_connector_meta(scheduler_output)
+
+        self.assertEqual(len(metadata.requests), 1)
+        self.assertEqual(
+            metadata.requests[0].target_block_ids,
+            list(range(100, 112)),
+        )
+        self.assertNotIn(112, metadata.requests[0].target_block_ids)
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "requires torch")
+    def test_streaming_connector_rejects_unexpected_extra_tail_blocks(self):
+        from vllm.bridge_tp.streaming_connector import BridgeTPStreamingConnector
+
+        connector = object.__new__(BridgeTPStreamingConnector)
+        connector._manifest = {
+            "num_blocks": 12,
+            "block_size": 16,
+        }
+        request = types.SimpleNamespace(num_tokens=193)
+
+        with self.assertRaisesRegex(ValueError, "differs from live snapshot"):
+            connector._snapshot_target_block_ids(
+                request,
+                (list(range(14)),),
+                "Target block allocation differs from live snapshot",
+            )
 
 
 if __name__ == "__main__":
