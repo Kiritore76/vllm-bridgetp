@@ -20,9 +20,20 @@ import argparse
 import csv
 import json
 import sys
+import types
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
+
+# This is an offline controller replay and must not require the vLLM runtime
+# (notably torch) merely to import the small bridge_tp package.  Register the
+# repository's vllm directory as a namespace package so importing the
+# controller does not execute vllm/__init__.py.
+if "vllm" not in sys.modules:
+    vllm_package = types.ModuleType("vllm")
+    vllm_package.__path__ = [str(REPO_ROOT / "vllm")]
+    sys.modules["vllm"] = vllm_package
 
 from vllm.bridge_tp.controller.events import (  # noqa: E402
     MigrationState,
@@ -96,6 +107,13 @@ def load_tpot_models(args: argparse.Namespace) -> tuple[TpotModel, TpotModel]:
             ),
             num_running_min=int(raw.get("num_running_min", 0)),
             num_running_max=int(raw.get("num_running_max", 1_000_000_000)),
+            model_kind=str(raw.get("model_kind", "running_linear")),
+            load_knots=tuple(float(value) for value in raw.get("load_knots", ())),
+            tpot_knots_s=tuple(
+                float(value) for value in raw.get("tpot_knots_s", ())
+            ),
+            min_load_frac=float(raw.get("min_load_frac", 0.0)),
+            max_load_frac=float(raw.get("max_load_frac", 1.0)),
         )
 
     return build("tpot_tp1"), build("tpot_tp4")
@@ -126,8 +144,7 @@ def main() -> None:
     print(
         f"# survival table: {table.source or args.survival_table} "
         f"(calibrated to {table.max_observed_length} tokens)\n"
-        f"# TP1=({tpot_tp1.base_s:.6f} + {tpot_tp1.per_running_s:.6f}*running)s "
-        f"TP4=({tpot_tp4.base_s:.6f} + {tpot_tp4.per_running_s:.6f}*running)s\n"
+        f"# TP1={tpot_tp1.model_kind} TP4={tpot_tp4.model_kind}\n"
         f"# interference={interference.model_kind} "
         f"rates={','.join(str(rate) for rate in args.rate_gib_s)} GiB/s"
     )
@@ -172,8 +189,12 @@ def main() -> None:
                         "survival_in_support": table.in_support(produced),
                         "interference_in_support": interference.in_support(load, rate),
                         "tpot_in_support": (
-                            tpot_tp1.in_support(tp1.num_running)
-                            and tpot_tp4.in_support(tp4.num_running)
+                            tpot_tp1.in_support(
+                                tp1.num_running, tp1.kv_usage_frac
+                            )
+                            and tpot_tp4.in_support(
+                                tp4.num_running, tp4.kv_usage_frac
+                            )
                         ),
                         "break_even_tokens": round(decision.break_even_tokens, 1),
                         "p_worth": round(decision.p_worth, 4),

@@ -274,6 +274,19 @@ class TestFastPolicy(unittest.TestCase):
         self.assertIs(decision.action, Action.STAY)
         self.assertIn("outside calibrated num_running support", decision.reason)
 
+    def test_load_piecewise_tpot_interpolates_and_fails_closed(self):
+        model = TpotModel(
+            0.020,
+            model_kind="load_piecewise_monotone",
+            load_knots=(0.10, 0.30, 0.50),
+            tpot_knots_s=(0.020, 0.040, 0.080),
+            min_load_frac=0.10,
+            max_load_frac=0.50,
+        )
+        self.assertAlmostEqual(model.tpot_s(99, 0.20), 0.030)
+        self.assertTrue(model.in_support(99, 0.20))
+        self.assertFalse(model.in_support(99, 0.60))
+
     def test_too_early_requests_are_not_eligible(self):
         decision = self.policy.evaluate(
             request_view(output=8, computed=8),

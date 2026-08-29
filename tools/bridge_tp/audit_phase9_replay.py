@@ -45,8 +45,19 @@ def git_revision() -> str:
 
 
 def read_source_manifest(path: Path) -> dict[str, str]:
+    text = path.read_text(encoding="utf-8")
+    if path.suffix.lower() == ".json" or text.lstrip().startswith("{"):
+        payload = json.loads(text)
+        frozen = payload.get("status") == "FROZEN"
+        source_hash = payload.get("source_trace_sha256")
+        return {
+            "source_trace_status": "FOUND" if frozen and source_hash else "MISSING",
+            "source_trace_sha256": str(source_hash or "UNAVAILABLE"),
+            "valid_requests": str(payload.get("total_requests", 0)),
+            "train_requests": str(payload.get("train_requests", -1)),
+        }
     result = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         if "=" in line:
             key, value = line.split("=", 1)
             result[key] = value

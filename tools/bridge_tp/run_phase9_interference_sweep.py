@@ -29,11 +29,17 @@ RECORDER = TOOLS_DIR / "record_phase9_calibration.py"
 COPY_LOAD = TOOLS_DIR / "run_phase9_copy_load.py"
 ANALYZER = TOOLS_DIR / "analyze_phase9_calibration.py"
 SUMMARIZER = TOOLS_DIR / "summarize_phase9_calibration.py"
-BANDS = {
-    "low": (0.10, 0.25),
-    "medium": (0.30, 0.45),
-    "high": (0.50, 0.65),
+BAND_PROFILES = {
+    "standard": {
+        "low": (0.10, 0.25),
+        "medium": (0.30, 0.45),
+        "high": (0.50, 0.65),
+    },
+    "very_low": {
+        "very_low": (0.01, 0.06),
+    },
 }
+BANDS = dict(BAND_PROFILES["standard"])
 PROTOCOL_AMENDMENT = (
     "A100 PCIe TP4 I256/O2048 attainable-load amendment made before any "
     "nonzero-copy formal condition: two rate-zero pilots and an isolated "
@@ -64,6 +70,7 @@ def validate_pilot_for_formal(pilot: dict[str, object]) -> None:
 
 
 def parse_args() -> argparse.Namespace:
+    global BANDS
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("pilot", "formal"))
     parser.add_argument("--out-root", type=Path, required=True)
@@ -71,6 +78,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--served-model-name", default="bridgetp-model")
     parser.add_argument("--tp4-url", default="http://127.0.0.1:8200")
     parser.add_argument("--tp4-blocks", type=int, required=True)
+    parser.add_argument(
+        "--band-profile",
+        choices=tuple(BAND_PROFILES),
+        default="standard",
+        help="isolated preregistered load-band profile (default: standard)",
+    )
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--source-gpu", type=int, default=0)
     parser.add_argument("--target-gpu", type=int, default=1)
@@ -105,8 +118,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--formal-bands",
         nargs="+",
-        choices=tuple(BANDS),
-        default=tuple(BANDS),
+        choices=tuple(
+            dict.fromkeys(
+                band for profile in BAND_PROFILES.values() for band in profile
+            )
+        ),
+        default=None,
     )
     parser.add_argument("--formal-rates", nargs="+", type=float, default=RATES)
     parser.add_argument("--formal-reps", nargs="+", type=int, default=REPS)
@@ -133,6 +150,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     args = parser.parse_args()
+    BANDS = dict(BAND_PROFILES[args.band_profile])
     if args.tp4_blocks <= 0 or args.block_size <= 0:
         parser.error("KV geometry must be positive")
     if args.source_gpu == args.target_gpu:
@@ -163,6 +181,13 @@ def parse_args() -> argparse.Namespace:
         parser.error(f"formal-rates must be selected from {RATES}")
     if any(rep not in REPS for rep in args.formal_reps):
         parser.error(f"formal-reps must be selected from {REPS}")
+    if args.formal_bands is None:
+        args.formal_bands = tuple(BANDS)
+    elif any(band not in BANDS for band in args.formal_bands):
+        parser.error(
+            f"formal-bands must come from profile {args.band_profile}: "
+            f"{tuple(BANDS)}"
+        )
     args.formal_bands = tuple(dict.fromkeys(args.formal_bands))
     args.formal_rates = tuple(dict.fromkeys(args.formal_rates))
     args.formal_reps = tuple(dict.fromkeys(args.formal_reps))
@@ -686,6 +711,7 @@ def run_pilot(args: argparse.Namespace) -> None:
         "workload_scope": "TP4 I256/O2048",
         "load_bands": serialized_bands(),
         "protocol_amendment": PROTOCOL_AMENDMENT,
+        "band_profile": args.band_profile,
         "conditions": conditions,
         "selected": selected,
         "selection_rule": (
@@ -974,6 +1000,12 @@ def run_formal(args: argparse.Namespace) -> None:
         *(str(path) for path in results.values()),
         "--out",
         str(summary_out),
+        "--expected-bands",
+        *BANDS,
+        "--expected-rates",
+        *(str(rate) for rate in args.formal_rates),
+        "--expected-reps",
+        *(str(rep) for rep in args.formal_reps),
     ]
     return_code = stream_command(
         command,
@@ -989,7 +1021,7 @@ def run_formal(args: argparse.Namespace) -> None:
             args.out_root / "bridge_calibration_summary.log",
         ],
     )
-    print(f"completed 36 formal conditions: {summary_out}")
+    print(f"completed {len(expected)} formal conditions: {summary_out}")
 
 
 def main() -> None:

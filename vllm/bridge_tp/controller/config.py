@@ -133,6 +133,31 @@ class ControllerConfig:
             raise ValueError("slow low_threshold must be below high_threshold")
         if self.policy.theta_min > self.policy.theta_0:
             raise ValueError("theta_min must not exceed theta_0")
+        for name, model in (
+            ("tpot_tp1", self.tpot_tp1),
+            ("tpot_tp4", self.tpot_tp4),
+        ):
+            if model.model_kind not in {"running_linear", "load_piecewise_monotone"}:
+                raise ValueError(f"unknown {name} model_kind {model.model_kind!r}")
+            if model.model_kind == "load_piecewise_monotone":
+                if len(model.load_knots) < 2 or len(model.load_knots) != len(
+                    model.tpot_knots_s
+                ):
+                    raise ValueError(f"{name} load/TPOT knots are invalid")
+                if any(
+                    right <= left
+                    for left, right in zip(model.load_knots, model.load_knots[1:])
+                ):
+                    raise ValueError(f"{name} load knots must be strictly increasing")
+                if any(
+                    right < left
+                    for left, right in zip(
+                        model.tpot_knots_s, model.tpot_knots_s[1:]
+                    )
+                ):
+                    raise ValueError(f"{name} TPOT knots must be nondecreasing")
+                if model.min_load_frac >= model.max_load_frac:
+                    raise ValueError(f"{name} load support is empty")
         if self.interference.model_kind not in {
             "legacy_power",
             "rate_aware_tpot",
