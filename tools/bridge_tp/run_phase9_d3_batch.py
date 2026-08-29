@@ -847,8 +847,29 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def validate_stage_inputs(args: argparse.Namespace) -> None:
+    paths = {
+        "manifest": args.manifest,
+    }
+    if args.stage == "migrate":
+        paths.update(
+            {
+                "model": args.model_path,
+                "TPOT model": args.tpot_model,
+                "interference model": args.interference_model,
+                "survival table": args.survival_table,
+            }
+        )
+        if args.controller_config_template is not None:
+            paths["controller config template"] = args.controller_config_template
+    missing = [f"{name}: {path}" for name, path in paths.items() if not path.exists()]
+    if missing:
+        raise FileNotFoundError("missing required inputs:\n" + "\n".join(missing))
+
+
 def main() -> None:
     args = parse_args()
+    validate_stage_inputs(args)
     manifest = load_manifest(args.manifest)
     prompts = selected_prompts(manifest, args.mode, args.limit)
     args.out_root.mkdir(parents=True, exist_ok=True)
