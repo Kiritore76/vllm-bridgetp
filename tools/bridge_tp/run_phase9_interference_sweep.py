@@ -419,6 +419,7 @@ def matching_stable_band(
 def wait_for_stable_load(
     args: argparse.Namespace,
     telemetry: Path,
+    recorder: subprocess.Popen,
     benchmark: subprocess.Popen,
     requested_band: str | None,
 ) -> tuple[str | None, dict[str, object] | None, float]:
@@ -429,6 +430,12 @@ def wait_for_stable_load(
     latest = None
     while True:
         now = time.monotonic()
+        recorder_return = recorder.poll()
+        if recorder_return is not None:
+            raise RuntimeError(
+                "telemetry recorder exited before load became stable "
+                f"with code {recorder_return}"
+            )
         if benchmark.poll() is not None:
             raise RuntimeError("benchmark ended before load became stable")
         if now >= not_before:
@@ -528,6 +535,7 @@ def run_condition(
         stable_band, stability, settle_elapsed_s = wait_for_stable_load(
             args,
             condition_dir / "telemetry.csv",
+            recorder,
             benchmark,
             band,
         )
