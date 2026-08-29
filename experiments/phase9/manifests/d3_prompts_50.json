@@ -1,0 +1,280 @@
+{
+  "format_version": 1,
+  "status": "FROZEN",
+  "phase": "BridgeTP Phase 9 D-3 formal numerical fidelity",
+  "frozen_on": "2026-08-29",
+  "population": "50 new deterministic greedy-completion prompts",
+  "excluded_prior_smoke_request_ids": [
+    "78fc430a-c0c1-47ff-8a54-27b8b0ab357f"
+  ],
+  "design": {
+    "trigger_output_tokens": 128,
+    "cutover_output_tokens": 160,
+    "target_local_budget_tokens": 256,
+    "source_max_tokens": 416,
+    "sampling": "strict greedy; ignore_eos=true",
+    "groups": {
+      "A": "native TP1 versus independent native TP1 rerun",
+      "B": "native TP1 versus native TP4 batch size 1",
+      "C": "native TP4 batch size 1 versus native TP4 batch size 8",
+      "D": "migrated stream versus native TP1 control"
+    }
+  },
+  "notes": [
+    "Every B/C/D comparison begins after the same exact fixed token prefix.",
+    "Prompt order and wording are frozen before formal execution.",
+    "The prior single-request smoke RID is excluded from the formal sample."
+  ],
+  "prompts": [
+    {
+      "request_id": "d3-formal-001",
+      "domain": "distributed-systems",
+      "prompt": "Explain how a distributed key-value store can preserve linearizability during leader replacement. Include assumptions, message ordering, failure cases, and a concrete execution trace."
+    },
+    {
+      "request_id": "d3-formal-002",
+      "domain": "machine-learning",
+      "prompt": "Write a technical comparison of tensor parallelism and pipeline parallelism for transformer inference. Discuss memory layout, communication, latency, throughput, and operational tradeoffs."
+    },
+    {
+      "request_id": "d3-formal-003",
+      "domain": "databases",
+      "prompt": "Describe how snapshot isolation is implemented in a multiversion database, then analyze write skew with a step-by-step example and possible prevention mechanisms."
+    },
+    {
+      "request_id": "d3-formal-004",
+      "domain": "networks",
+      "prompt": "Explain congestion control in a modern datacenter network. Cover queue buildup, explicit congestion notification, feedback delay, fairness, and incast behavior."
+    },
+    {
+      "request_id": "d3-formal-005",
+      "domain": "operating-systems",
+      "prompt": "Give a detailed account of virtual memory address translation, including page tables, TLB behavior, huge pages, page faults, and NUMA effects."
+    },
+    {
+      "request_id": "d3-formal-006",
+      "domain": "compilers",
+      "prompt": "Explain static single assignment form and show how dominance frontiers guide phi-node insertion. Include a small control-flow example and optimization implications."
+    },
+    {
+      "request_id": "d3-formal-007",
+      "domain": "security",
+      "prompt": "Analyze a capability-based security model for a multi-tenant service. Explain delegation, revocation, confinement, auditing, and confused-deputy risks."
+    },
+    {
+      "request_id": "d3-formal-008",
+      "domain": "storage",
+      "prompt": "Describe the write path of a log-structured merge tree from client request to durable storage, including compaction, amplification, bloom filters, and recovery."
+    },
+    {
+      "request_id": "d3-formal-009",
+      "domain": "algorithms",
+      "prompt": "Develop an intuitive and formal explanation of amortized analysis using dynamic arrays, binary counters, and a potential function. State the limits of each argument."
+    },
+    {
+      "request_id": "d3-formal-010",
+      "domain": "reliability",
+      "prompt": "Design a fault-injection plan for a replicated online service. Define hypotheses, observability, safety limits, rollback criteria, and how to interpret ambiguous results."
+    },
+    {
+      "request_id": "d3-formal-011",
+      "domain": "physics",
+      "prompt": "Explain the thermodynamic meaning of entropy using both macroscopic and statistical descriptions, and reconcile reversible equations with irreversible processes."
+    },
+    {
+      "request_id": "d3-formal-012",
+      "domain": "biology",
+      "prompt": "Describe how cells regulate gene expression from chromatin accessibility through transcription and RNA processing, emphasizing feedback and measurement limitations."
+    },
+    {
+      "request_id": "d3-formal-013",
+      "domain": "chemistry",
+      "prompt": "Explain chemical equilibrium from kinetic and thermodynamic viewpoints. Derive the role of free energy and discuss temperature, pressure, and catalyst effects."
+    },
+    {
+      "request_id": "d3-formal-014",
+      "domain": "astronomy",
+      "prompt": "Give a rigorous but accessible explanation of how astronomers infer exoplanet properties from transit and radial-velocity measurements, including major degeneracies."
+    },
+    {
+      "request_id": "d3-formal-015",
+      "domain": "climate-science",
+      "prompt": "Explain Earth energy balance, radiative forcing, feedbacks, ocean heat uptake, and why equilibrium and transient climate responses differ."
+    },
+    {
+      "request_id": "d3-formal-016",
+      "domain": "mathematics",
+      "prompt": "Introduce eigenvalues and eigenvectors through linear transformations, then connect diagonalization to differential equations, Markov chains, and numerical conditioning."
+    },
+    {
+      "request_id": "d3-formal-017",
+      "domain": "statistics",
+      "prompt": "Compare frequentist confidence intervals and Bayesian credible intervals using one worked binomial example, with assumptions and common interpretation errors."
+    },
+    {
+      "request_id": "d3-formal-018",
+      "domain": "economics",
+      "prompt": "Analyze how a central bank interest-rate change can propagate through credit, exchange rates, expectations, investment, employment, and inflation."
+    },
+    {
+      "request_id": "d3-formal-019",
+      "domain": "control-theory",
+      "prompt": "Explain feedback stability with poles, phase margin, gain margin, and time delay. Use a practical temperature-control example and discuss model uncertainty."
+    },
+    {
+      "request_id": "d3-formal-020",
+      "domain": "signal-processing",
+      "prompt": "Describe sampling, aliasing, windowing, spectral leakage, and reconstruction in digital signal processing, with equations and an illustrative numerical example."
+    },
+    {
+      "request_id": "d3-formal-021",
+      "domain": "software-engineering",
+      "prompt": "Propose an incremental migration from a monolith to services while preserving correctness. Cover boundaries, data ownership, observability, testing, and rollback."
+    },
+    {
+      "request_id": "d3-formal-022",
+      "domain": "concurrency",
+      "prompt": "Explain the ABA problem in lock-free algorithms, demonstrate it with a stack execution, and compare tagged pointers, hazard pointers, and epoch reclamation."
+    },
+    {
+      "request_id": "d3-formal-023",
+      "domain": "cloud-computing",
+      "prompt": "Design an autoscaling policy for a latency-sensitive inference service. Discuss signals, delays, hysteresis, cold starts, overload, and validation methodology."
+    },
+    {
+      "request_id": "d3-formal-024",
+      "domain": "gpu-computing",
+      "prompt": "Explain GPU occupancy and performance without treating occupancy as the only objective. Include registers, shared memory, memory latency, divergence, and roofline reasoning."
+    },
+    {
+      "request_id": "d3-formal-025",
+      "domain": "llm-inference",
+      "prompt": "Trace one autoregressive decoding step through a transformer inference engine, including batching, attention, KV cache access, sampling, and scheduling."
+    },
+    {
+      "request_id": "d3-formal-026",
+      "domain": "distributed-systems",
+      "prompt": "Compare Raft and primary-backup replication under partitions, leader failure, membership change, and stale reads. Identify what each protocol does and does not guarantee."
+    },
+    {
+      "request_id": "d3-formal-027",
+      "domain": "machine-learning",
+      "prompt": "Explain calibration of probabilistic classifiers, including reliability diagrams, proper scoring rules, temperature scaling, dataset shift, and decision consequences."
+    },
+    {
+      "request_id": "d3-formal-028",
+      "domain": "databases",
+      "prompt": "Design indexes for a mixed analytical and transactional workload. Discuss selectivity, covering indexes, write costs, statistics, partitioning, and plan instability."
+    },
+    {
+      "request_id": "d3-formal-029",
+      "domain": "networks",
+      "prompt": "Explain how DNS resolution works from an application call to an authoritative answer, including caching, negative responses, DNSSEC, and operational failure modes."
+    },
+    {
+      "request_id": "d3-formal-030",
+      "domain": "operating-systems",
+      "prompt": "Analyze process scheduling for interactive and batch workloads. Compare fairness, priorities, preemption, multicore load balancing, and tail-latency effects."
+    },
+    {
+      "request_id": "d3-formal-031",
+      "domain": "compilers",
+      "prompt": "Explain register allocation by graph coloring, including liveness, interference construction, spilling, coalescing, and why practical allocators use heuristics."
+    },
+    {
+      "request_id": "d3-formal-032",
+      "domain": "security",
+      "prompt": "Construct a threat model for a model-serving API. Cover assets, trust boundaries, authentication, prompt abuse, data leakage, denial of service, and mitigations."
+    },
+    {
+      "request_id": "d3-formal-033",
+      "domain": "storage",
+      "prompt": "Compare RAID, erasure coding, and replication for durable storage. Analyze correlated failure, rebuild traffic, latency, capacity efficiency, and repair policy."
+    },
+    {
+      "request_id": "d3-formal-034",
+      "domain": "algorithms",
+      "prompt": "Explain maximum flow and minimum cut, derive the relationship, walk through an augmenting-path example, and describe two real modeling applications."
+    },
+    {
+      "request_id": "d3-formal-035",
+      "domain": "reliability",
+      "prompt": "Develop service-level objectives for a user-facing API. Connect indicators, error budgets, burn rates, alerting windows, dependencies, and release decisions."
+    },
+    {
+      "request_id": "d3-formal-036",
+      "domain": "physics",
+      "prompt": "Explain special relativity from invariance of light speed through Lorentz transformations, time dilation, length contraction, and relativistic energy."
+    },
+    {
+      "request_id": "d3-formal-037",
+      "domain": "biology",
+      "prompt": "Describe adaptive immune response from antigen presentation to memory formation, and explain how diversity, selection, tolerance, and vaccination interact."
+    },
+    {
+      "request_id": "d3-formal-038",
+      "domain": "chemistry",
+      "prompt": "Explain electrochemical cells using half reactions, electrode potentials, the Nernst equation, transport, overpotential, and energy-efficiency losses."
+    },
+    {
+      "request_id": "d3-formal-039",
+      "domain": "astronomy",
+      "prompt": "Describe stellar evolution for low- and high-mass stars, connecting hydrostatic balance, fusion stages, nucleosynthesis, mass loss, and final remnants."
+    },
+    {
+      "request_id": "d3-formal-040",
+      "domain": "climate-science",
+      "prompt": "Analyze attribution of an extreme weather event. Explain counterfactual ensembles, probability ratios, uncertainty, observational constraints, and communication limits."
+    },
+    {
+      "request_id": "d3-formal-041",
+      "domain": "mathematics",
+      "prompt": "Explain the central limit theorem, distinguish it from the law of large numbers, give a standardized-sum example, and discuss important failure modes."
+    },
+    {
+      "request_id": "d3-formal-042",
+      "domain": "statistics",
+      "prompt": "Design a sequential experiment with repeated looks at the data. Explain stopping bias, alpha spending, power, practical significance, and reporting requirements."
+    },
+    {
+      "request_id": "d3-formal-043",
+      "domain": "economics",
+      "prompt": "Explain adverse selection and moral hazard with separate insurance examples, then compare screening, signaling, contracts, monitoring, and regulation."
+    },
+    {
+      "request_id": "d3-formal-044",
+      "domain": "control-theory",
+      "prompt": "Describe model predictive control from state estimation through constrained optimization and receding-horizon action, including computational and robustness concerns."
+    },
+    {
+      "request_id": "d3-formal-045",
+      "domain": "signal-processing",
+      "prompt": "Explain Kalman filtering by deriving prediction and update intuition, then discuss covariance assumptions, observability, tuning, and nonlinear extensions."
+    },
+    {
+      "request_id": "d3-formal-046",
+      "domain": "software-engineering",
+      "prompt": "Design a compatibility strategy for evolving a public API. Cover schema changes, versioning, capability negotiation, deprecation, telemetry, and client migration."
+    },
+    {
+      "request_id": "d3-formal-047",
+      "domain": "concurrency",
+      "prompt": "Compare mutexes, semaphores, condition variables, and channels by solving one bounded-buffer problem and analyzing safety, liveness, and cancellation."
+    },
+    {
+      "request_id": "d3-formal-048",
+      "domain": "cloud-computing",
+      "prompt": "Explain multi-region failover for a stateful application, including replication lag, routing, split brain, recovery objectives, testing, and failback."
+    },
+    {
+      "request_id": "d3-formal-049",
+      "domain": "gpu-computing",
+      "prompt": "Analyze collective communication for tensor-parallel inference. Compare ring and tree all-reduce, topology awareness, message size, overlap, and failure behavior."
+    },
+    {
+      "request_id": "d3-formal-050",
+      "domain": "llm-inference",
+      "prompt": "Design a safe live migration protocol for an autoregressive request between different tensor-parallel topologies. Specify state, boundaries, validation, rollback, and evidence."
+    }
+  ]
+}
