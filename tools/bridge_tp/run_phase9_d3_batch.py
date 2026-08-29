@@ -69,12 +69,20 @@ def load_manifest(path: Path) -> dict[str, Any]:
     prompts = raw.get("prompts")
     if not isinstance(prompts, list) or len(prompts) != 50:
         raise ValueError("formal D3 manifest must contain exactly 50 prompts")
+    smoke_prompts = raw.get("smoke_prompts")
+    if not isinstance(smoke_prompts, list) or len(smoke_prompts) != 2:
+        raise ValueError("D3 manifest must contain exactly two smoke prompts")
     ids = [str(item.get("request_id", "")) for item in prompts]
     if any(not value for value in ids) or len(set(ids)) != len(ids):
         raise ValueError("manifest request IDs must be nonempty and unique")
     for item in prompts:
         if not isinstance(item.get("prompt"), str) or not item["prompt"].strip():
             raise ValueError(f"{item.get('request_id')}: prompt is empty")
+    smoke_ids = [str(item.get("request_id", "")) for item in smoke_prompts]
+    if any(not value for value in smoke_ids) or len(set(smoke_ids)) != 2:
+        raise ValueError("smoke request IDs must be nonempty and unique")
+    if set(ids) & set(smoke_ids):
+        raise ValueError("formal and smoke request IDs must be disjoint")
     design = raw.get("design") or {}
     expected = {
         "trigger_output_tokens": 128,
@@ -91,9 +99,9 @@ def load_manifest(path: Path) -> dict[str, Any]:
 def selected_prompts(
     manifest: dict[str, Any], mode: str, limit: int | None
 ) -> list[dict[str, Any]]:
-    prompts = list(manifest["prompts"])
-    if mode == "smoke":
-        prompts = prompts[:2]
+    prompts = list(
+        manifest["smoke_prompts"] if mode == "smoke" else manifest["prompts"]
+    )
     if limit is not None:
         prompts = prompts[:limit]
     return prompts

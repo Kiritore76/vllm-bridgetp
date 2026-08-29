@@ -34,6 +34,13 @@ class TestPhase9D3Batch(unittest.TestCase):
             )],
             ["d3-formal-001", "d3-formal-002"],
         )
+        formal_ids = {
+            item["request_id"]
+            for item in batch.selected_prompts(manifest, "formal", None)
+        }
+        self.assertEqual(len(formal_ids), 50)
+        self.assertNotIn("d3-formal-001", formal_ids)
+        self.assertNotIn("d3-formal-002", formal_ids)
 
     def test_extracts_fixed_prefix_and_migration_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
