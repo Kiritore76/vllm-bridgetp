@@ -19,6 +19,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inputs", type=Path, nargs="+", required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--expected-bands", nargs="+", default=EXPECTED_BANDS)
+    parser.add_argument(
+        "--expected-rates", type=float, nargs="+", default=EXPECTED_RATES
+    )
+    parser.add_argument("--expected-reps", type=int, nargs="+", default=EXPECTED_REPS)
     return parser.parse_args()
 
 
@@ -32,6 +37,9 @@ def key(payload: dict) -> tuple[str, float, int]:
 
 def main() -> None:
     args = parse_args()
+    expected_bands = tuple(dict.fromkeys(args.expected_bands))
+    expected_rates = tuple(dict.fromkeys(args.expected_rates))
+    expected_reps = tuple(dict.fromkeys(args.expected_reps))
     payloads = [
         json.loads(path.read_text(encoding="utf-8")) for path in args.inputs
     ]
@@ -41,9 +49,9 @@ def main() -> None:
 
     expected = {
         (band, rate, rep)
-        for band in EXPECTED_BANDS
-        for rate in EXPECTED_RATES
-        for rep in EXPECTED_REPS
+        for band in expected_bands
+        for rate in expected_rates
+        for rep in expected_reps
     }
     observed = set(by_key)
     missing = sorted(expected - observed)
@@ -57,27 +65,27 @@ def main() -> None:
 
     cells = []
     paired_monotonic_failures = []
-    for band in EXPECTED_BANDS:
+    for band in expected_bands:
         baselines = {
             rep: by_key[(band, 0.0, rep)][0]
-            for rep in EXPECTED_REPS
+            for rep in expected_reps
             if len(by_key.get((band, 0.0, rep), [])) == 1
         }
         previous_delta = None
         previous_rate = None
-        for rate in EXPECTED_RATES:
+        for rate in expected_rates:
             values = [
                 by_key[(band, rate, rep)][0]
-                for rep in EXPECTED_REPS
+                for rep in expected_reps
                 if len(by_key.get((band, rate, rep), [])) == 1
             ]
-            if len(values) != len(EXPECTED_REPS):
+            if len(values) != len(expected_reps):
                 continue
             observed_rows = [value["observed"] for value in values]
             deltas = [
                 value["observed"]["p99_tpot_s"]
                 - baselines[rep]["observed"]["p99_tpot_s"]
-                for rep, value in zip(EXPECTED_REPS, values)
+                for rep, value in zip(expected_reps, values)
                 if rep in baselines
             ]
             mean_delta = statistics.mean(deltas) if deltas else None

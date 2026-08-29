@@ -35,6 +35,83 @@ collect_interference = load_tool("collect_phase9_interference_grid")
 
 
 class TestCalibrationAnalysis(unittest.TestCase):
+    def test_very_low_profile_builds_twelve_formal_cells(self):
+        original_bands = dict(run_interference.BANDS)
+        try:
+            with mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "run_phase9_interference_sweep.py",
+                    "pilot",
+                    "--out-root",
+                    "out",
+                    "--model",
+                    "model",
+                    "--tp4-blocks",
+                    "35739",
+                    "--band-profile",
+                    "very_low",
+                ],
+            ):
+                args = run_interference.parse_args()
+            self.assertEqual(args.formal_bands, ("very_low",))
+            args.formal_rates = (0.0, 0.4, 0.7, 1.2)
+            args.formal_reps = (1, 2, 3)
+            self.assertEqual(len(run_interference.formal_expected_keys(args)), 12)
+        finally:
+            run_interference.BANDS = original_bands
+
+    def test_summarizer_accepts_complete_very_low_grid(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            inputs = []
+            for rate in (0.0, 0.4, 0.7, 1.2):
+                for rep in (1, 2, 3):
+                    path = root / f"rate{rate}_rep{rep}.json"
+                    path.write_text(
+                        json.dumps(
+                            {
+                                "status": "ACCEPTED",
+                                "load_band": "very_low",
+                                "rep": rep,
+                                "inputs": {"target_rate_gib_s": rate},
+                                "observed": {
+                                    "kv_usage_mean": 0.03,
+                                    "effective_rate_gib_s": rate,
+                                    "p99_tpot_s": 0.02 + rate * 0.01,
+                                    "p99_itl_s": 0.03 + rate * 0.01,
+                                },
+                            }
+                        )
+                    )
+                    inputs.append(str(path))
+            out = root / "summary.json"
+            with mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "summarize_phase9_calibration.py",
+                    "--inputs",
+                    *inputs,
+                    "--out",
+                    str(out),
+                    "--expected-bands",
+                    "very_low",
+                    "--expected-rates",
+                    "0",
+                    "0.4",
+                    "0.7",
+                    "1.2",
+                    "--expected-reps",
+                    "1",
+                    "2",
+                    "3",
+                ],
+            ):
+                summarize.main()
+            self.assertEqual(json.loads(out.read_text())["status"], "COMPLETE")
+
     def test_collection_prefers_complete_low_error_result(self):
         base = {
             "observed": {
@@ -468,6 +545,17 @@ class TestCalibrationAnalysis(unittest.TestCase):
         self.assertAlmostEqual(result["base_s"], 0.01, places=12)
         self.assertAlmostEqual(result["per_running_s"], 0.002, places=12)
         self.assertAlmostEqual(result["weighted_r_squared"], 1.0, places=12)
+
+    def test_monotone_load_fit_pools_reversed_observations(self):
+        result = fit_tpot.monotone_load_fit(
+            [
+                {"load": 0.1, "tpot_s": 0.02, "source": "a"},
+                {"load": 0.2, "tpot_s": 0.04, "source": "b"},
+                {"load": 0.3, "tpot_s": 0.03, "source": "c"},
+            ]
+        )
+        self.assertEqual(result["model_kind"], "load_piecewise_monotone")
+        self.assertEqual(result["tpot_knots_s"], [0.02, 0.035, 0.035])
 
     def test_aggregate_interval_histograms(self):
         rows = [

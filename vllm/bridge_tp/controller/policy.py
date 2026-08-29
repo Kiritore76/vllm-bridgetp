@@ -17,6 +17,7 @@ or unconditionally when near-term source OOM risk exceeds the safety level.
 from __future__ import annotations
 
 import math
+from bisect import bisect_right
 from dataclasses import dataclass, field, replace
 
 from .events import (
@@ -45,12 +46,42 @@ class TpotModel:
     calibration_source: str = ""
     num_running_min: int = 0
     num_running_max: int = 1_000_000_000
+    model_kind: str = "running_linear"
+    load_knots: tuple[float, ...] = ()
+    tpot_knots_s: tuple[float, ...] = ()
+    min_load_frac: float = 0.0
+    max_load_frac: float = 1.0
 
-    def in_support(self, num_running: int) -> bool:
-        """Whether the instantaneous running count was calibrated."""
+    def in_support(
+        self, num_running: int, kv_usage_frac: float | None = None
+    ) -> bool:
+        """Whether the runtime predictor lies inside calibration support."""
+        if self.model_kind == "load_piecewise_monotone":
+            return (
+                kv_usage_frac is not None
+                and len(self.load_knots) == len(self.tpot_knots_s)
+                and len(self.load_knots) >= 2
+                and self.min_load_frac <= kv_usage_frac <= self.max_load_frac
+            )
+        if self.model_kind != "running_linear":
+            return False
         return self.num_running_min <= num_running <= self.num_running_max
 
-    def tpot_s(self, num_running: int) -> float:
+    def tpot_s(self, num_running: int, kv_usage_frac: float | None = None) -> float:
+        if self.model_kind == "load_piecewise_monotone":
+            if kv_usage_frac is None or not self.load_knots:
+                return math.inf
+            x = float(kv_usage_frac)
+            if x <= self.load_knots[0]:
+                return max(1e-6, float(self.tpot_knots_s[0]))
+            if x >= self.load_knots[-1]:
+                return max(1e-6, float(self.tpot_knots_s[-1]))
+            right = bisect_right(self.load_knots, x)
+            left = right - 1
+            x0, x1 = self.load_knots[left], self.load_knots[right]
+            y0, y1 = self.tpot_knots_s[left], self.tpot_knots_s[right]
+            fraction = (x - x0) / max(1e-12, x1 - x0)
+            return max(1e-6, float(y0 + fraction * (y1 - y0)))
         return max(1e-6, self.base_s + self.per_running_s * max(0, num_running))
 
 
@@ -277,8 +308,8 @@ class FastPolicy:
     ) -> dict[str, float]:
         move_bytes = self.migration_bytes(req)
         drain_s = move_bytes / max(1.0, rate_bytes_s)
-        tau1 = self.tpot_tp1.tpot_s(tp1.num_running)
-        tau4 = self.tpot_tp4.tpot_s(tp4.num_running)
+        tau1 = self.tpot_tp1.tpot_s(tp1.num_running, tp1.kv_usage_frac)
+        tau4 = self.tpot_tp4.tpot_s(tp4.num_running, tp4.kv_usage_frac)
         # tokens the source produces during handoff that will be discarded
         dup_tokens = self.cfg.t_restore_commit_s / tau1
         return {
@@ -302,14 +333,14 @@ class FastPolicy:
         rate_bytes_s: float,
     ) -> tuple[float, float, dict[str, float]]:
         """Return (N*, cost_s, cost_breakdown)."""
-        tau1 = self.tpot_tp1.tpot_s(tp1.num_running)
-        tau4 = self.tpot_tp4.tpot_s(tp4.num_running)
+        tau1 = self.tpot_tp1.tpot_s(tp1.num_running, tp1.kv_usage_frac)
+        tau4 = self.tpot_tp4.tpot_s(tp4.num_running, tp4.kv_usage_frac)
         gain_per_token = tau1 - tau4
         breakdown = self.cost_breakdown(req, tp4, rate_bytes_s, tp1)
         cost = sum(v for k, v in breakdown.items() if not k.startswith("_"))
         if not self.tpot_tp1.in_support(
-            tp1.num_running
-        ) or not self.tpot_tp4.in_support(tp4.num_running):
+            tp1.num_running, tp1.kv_usage_frac
+        ) or not self.tpot_tp4.in_support(tp4.num_running, tp4.kv_usage_frac):
             return math.inf, cost, breakdown
         if gain_per_token <= 0:
             return math.inf, cost, breakdown
@@ -360,8 +391,8 @@ class FastPolicy:
         e_remain = self.table.expected_remaining(req.output_tokens)
         p_oom = self.p_oom(req, tp1, others_expected_tokens)
         theta = self.theta_esc(risk_tp1)
-        tau1 = self.tpot_tp1.tpot_s(tp1.num_running)
-        tau4 = self.tpot_tp4.tpot_s(tp4.num_running)
+        tau1 = self.tpot_tp1.tpot_s(tp1.num_running, tp1.kv_usage_frac)
+        tau4 = self.tpot_tp4.tpot_s(tp4.num_running, tp4.kv_usage_frac)
         benefit = self.w_group(req) * e_remain * max(0.0, tau1 - tau4)
 
         common = dict(
@@ -439,13 +470,14 @@ class FastPolicy:
                 **common,
             )
         if not self.tpot_tp1.in_support(
-            tp1.num_running
-        ) or not self.tpot_tp4.in_support(tp4.num_running):
+            tp1.num_running, tp1.kv_usage_frac
+        ) or not self.tpot_tp4.in_support(tp4.num_running, tp4.kv_usage_frac):
             return mk(
                 Action.STAY,
                 MigrationState.LOCAL,
-                "TPOT model outside calibrated num_running support: "
-                f"tp1={tp1.num_running}, tp4={tp4.num_running}",
+                "TPOT model outside calibrated num_running support/runtime support: "
+                f"tp1_running={tp1.num_running}, tp1_kv={tp1.kv_usage_frac:.3f}, "
+                f"tp4_running={tp4.num_running}, tp4_kv={tp4.kv_usage_frac:.3f}",
                 **common,
             )
         if math.isinf(n_star):
@@ -497,8 +529,8 @@ class FastPolicy:
             if math.isinf(n_star):
                 continue
             e_remain = self.table.expected_remaining(req.output_tokens)
-            tau1 = self.tpot_tp1.tpot_s(tp1.num_running)
-            tau4 = self.tpot_tp4.tpot_s(tp4.num_running)
+            tau1 = self.tpot_tp1.tpot_s(tp1.num_running, tp1.kv_usage_frac)
+            tau4 = self.tpot_tp4.tpot_s(tp4.num_running, tp4.kv_usage_frac)
             benefit = self.w_group(req) * e_remain * max(0.0, tau1 - tau4)
             net = benefit - cost
             move_bytes = max(1, self.migration_bytes(req))
