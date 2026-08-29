@@ -32,6 +32,7 @@ KV_METRICS = (
     "vllm:kv_cache_usage_perc",
     "vllm:gpu_cache_usage_perc",
 )
+LOAD_BANDS = ("very_low", "low", "medium", "high")
 _STOP = False
 
 
@@ -50,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--block-size", type=int, required=True)
     parser.add_argument("--total-kv-blocks", type=int, required=True)
     parser.add_argument("--condition-id", required=True)
-    parser.add_argument("--load-band", choices=("low", "medium", "high"))
+    parser.add_argument("--load-band", choices=LOAD_BANDS)
     parser.add_argument("--target-rate-gib-s", type=float, required=True)
     parser.add_argument("--rep", type=int, required=True)
     parser.add_argument(

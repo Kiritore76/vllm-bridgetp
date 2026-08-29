@@ -35,6 +35,60 @@ collect_interference = load_tool("collect_phase9_interference_grid")
 
 
 class TestCalibrationAnalysis(unittest.TestCase):
+    def test_recorder_accepts_very_low_band(self):
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "record_phase9_calibration.py",
+                "--out",
+                "telemetry.csv",
+                "--block-size",
+                "16",
+                "--total-kv-blocks",
+                "35739",
+                "--condition-id",
+                "smoke",
+                "--load-band",
+                "very_low",
+                "--target-rate-gib-s",
+                "0",
+                "--rep",
+                "1",
+            ],
+        ):
+            args = record.parse_args()
+        self.assertEqual(args.load_band, "very_low")
+
+    def test_stability_wait_fails_when_recorder_exits(self):
+        args = type(
+            "Args",
+            (),
+            {
+                "copy_delay_s": 0.0,
+                "load_settle_timeout_s": 600.0,
+                "stability_window_s": 120.0,
+                "telemetry_interval_s": 1.0,
+                "min_band_fraction": 0.80,
+                "stability_poll_s": 5.0,
+            },
+        )()
+        recorder = mock.Mock()
+        recorder.poll.return_value = 2
+        benchmark = mock.Mock()
+        benchmark.poll.return_value = None
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "telemetry recorder exited.*code 2",
+        ):
+            run_interference.wait_for_stable_load(
+                args,
+                Path("missing.csv"),
+                recorder,
+                benchmark,
+                "very_low",
+            )
+
     def test_very_low_profile_builds_twelve_formal_cells(self):
         original_bands = dict(run_interference.BANDS)
         try:
