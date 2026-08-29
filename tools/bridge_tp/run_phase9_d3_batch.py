@@ -38,18 +38,6 @@ MEASURE = REPO / "tools" / "bridge_tp" / "measure_agreement.py"
 SUMMARIZE = REPO / "tools" / "bridge_tp" / "summarize_agreement.py"
 GROUPS = "ABCD"
 DEFAULT_CONFIG = REPO / "experiments" / "phase9" / "configs" / "e1_correctness.json"
-TPOT_FIELDS = {
-    "base_s",
-    "per_running_s",
-    "calibration_source",
-    "num_running_min",
-    "num_running_max",
-    "model_kind",
-    "load_knots",
-    "tpot_knots_s",
-    "min_load_frac",
-    "max_load_frac",
-}
 
 
 def read_json(path: Path) -> Any:
@@ -306,26 +294,39 @@ def migration_env(
 def controller_config(args: argparse.Namespace, run: Path) -> Path:
     template = args.controller_config_template or DEFAULT_CONFIG
     config = read_json(template)
-    tpot = read_json(args.tpot_model)
-    interference = read_json(args.interference_model)
-    for name in ("tpot_tp1", "tpot_tp4"):
-        model = {
-            key: value
-            for key, value in tpot[name].items()
-            if key in TPOT_FIELDS
-        }
-        model["calibration_source"] = (
-            "Phase 9 C1 frozen TPOT model; sha256="
-            + sha256_file(args.tpot_model)
-        )
-        config[name] = model
-    config["interference"] = interference["controller_model"]
+    diagnostic_note = "D3 fixed-boundary diagnostic only; value not used for action"
+    config["tpot_tp1"] = {
+        "base_s": 0.03,
+        "per_running_s": 0.0,
+        "calibration_source": diagnostic_note,
+    }
+    config["tpot_tp4"] = {
+        "base_s": 0.02,
+        "per_running_s": 0.0,
+        "calibration_source": diagnostic_note,
+    }
+    config["interference"] = {
+        "s_per_gib_at_ref": 0.0,
+        "calibration_source": diagnostic_note,
+        "model_kind": "legacy_power",
+    }
     config["source_url"] = args.tp1_url
     config["target_url"] = args.tp4_url
     config["run_dir"] = str(run)
     config["tp1_total_kv_blocks"] = args.tp1_blocks
     config["tp4_total_kv_blocks"] = args.tp4_blocks
-    config["survival_table_path"] = str(args.survival_table)
+    survival_path = run / "diagnostic_survival_table.json"
+    write_json(
+        survival_path,
+        {
+            "format_version": 1,
+            "source": diagnostic_note,
+            "bucket_edges": [0],
+            "remaining": [[args.max_tokens]],
+            "max_observed_length": args.max_tokens,
+        },
+    )
+    config["survival_table_path"] = str(survival_path)
     path = run / "controller_config.json"
     write_json(path, config)
     return path
@@ -787,9 +788,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", type=Path)
     parser.add_argument("--served-model-name", default="bridgetp-model")
     parser.add_argument("--controller-config-template", type=Path)
-    parser.add_argument("--tpot-model", type=Path)
-    parser.add_argument("--interference-model", type=Path)
-    parser.add_argument("--survival-table", type=Path)
     parser.add_argument("--tp1-blocks", type=int)
     parser.add_argument("--tp4-blocks", type=int)
     parser.add_argument("--tp1-gpu", default="0")
@@ -833,9 +831,6 @@ def parse_args() -> argparse.Namespace:
         parser.error(f"{args.stage} requires --model-path")
     if args.stage == "migrate":
         required = {
-            "--tpot-model": args.tpot_model,
-            "--interference-model": args.interference_model,
-            "--survival-table": args.survival_table,
             "--tp1-blocks": args.tp1_blocks,
             "--tp4-blocks": args.tp4_blocks,
         }
@@ -855,9 +850,6 @@ def validate_stage_inputs(args: argparse.Namespace) -> None:
         paths.update(
             {
                 "model": args.model_path,
-                "TPOT model": args.tpot_model,
-                "interference model": args.interference_model,
-                "survival table": args.survival_table,
             }
         )
         if args.controller_config_template is not None:
