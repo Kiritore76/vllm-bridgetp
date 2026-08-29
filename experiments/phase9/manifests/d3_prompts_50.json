@@ -3,7 +3,7 @@
   "status": "FROZEN",
   "phase": "BridgeTP Phase 9 D-3 formal numerical fidelity",
   "frozen_on": "2026-08-29",
-  "population": "50 new deterministic greedy-completion prompts",
+  "population": "2 excluded smoke prompts plus 50 new formal prompts",
   "excluded_prior_smoke_request_ids": [
     "78fc430a-c0c1-47ff-8a54-27b8b0ab357f"
   ],
@@ -25,7 +25,7 @@
     "Prompt order and wording are frozen before formal execution.",
     "The prior single-request smoke RID is excluded from the formal sample."
   ],
-  "prompts": [
+  "smoke_prompts": [
     {
       "request_id": "d3-formal-001",
       "domain": "distributed-systems",
@@ -35,7 +35,9 @@
       "request_id": "d3-formal-002",
       "domain": "machine-learning",
       "prompt": "Write a technical comparison of tensor parallelism and pipeline parallelism for transformer inference. Discuss memory layout, communication, latency, throughput, and operational tradeoffs."
-    },
+    }
+  ],
+  "prompts": [
     {
       "request_id": "d3-formal-003",
       "domain": "databases",
@@ -275,6 +277,16 @@
       "request_id": "d3-formal-050",
       "domain": "llm-inference",
       "prompt": "Design a safe live migration protocol for an autoregressive request between different tensor-parallel topologies. Specify state, boundaries, validation, rollback, and evidence."
+    },
+    {
+      "request_id": "d3-formal-051",
+      "domain": "numerical-computing",
+      "prompt": "Explain how floating-point reduction order can change a deterministic machine-learning inference result. Include rounding, parallel topology, tie cases, reproducibility, and suitable validation metrics."
+    },
+    {
+      "request_id": "d3-formal-052",
+      "domain": "systems-evaluation",
+      "prompt": "Design a paired experiment that separates a system intervention from hardware-topology and batching effects. Define controls, provenance, stopping rules, uncertainty, and defensible conclusions."
     }
   ]
 }
