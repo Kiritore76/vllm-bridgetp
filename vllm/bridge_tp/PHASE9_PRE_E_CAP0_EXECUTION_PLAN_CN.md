@@ -531,7 +531,8 @@ git -C "$BRIDGE_BASE" ls-files --others --exclude-standard \
 
 ```bash
 test ! -e "$BRIDGE_REPO"
-git -C "$BRIDGE_BASE" fetch origin bridgetp/phase9-cap0-pilot
+git -C "$BRIDGE_BASE" fetch origin \
+  refs/heads/bridgetp/phase9-cap0-pilot:refs/remotes/origin/bridgetp/phase9-cap0-pilot
 git -C "$BRIDGE_BASE" worktree add --detach \
   "$BRIDGE_REPO" origin/bridgetp/phase9-cap0-pilot
 ```
@@ -548,7 +549,8 @@ git -C "$BRIDGE_REPO" remote -v
 
 ```bash
 test -z "$(git -C "$BRIDGE_REPO" status --porcelain)"
-git -C "$BRIDGE_REPO" fetch origin bridgetp/phase9-cap0-pilot
+git -C "$BRIDGE_REPO" fetch origin \
+  refs/heads/bridgetp/phase9-cap0-pilot:refs/remotes/origin/bridgetp/phase9-cap0-pilot
 git -C "$BRIDGE_REPO" checkout --detach origin/bridgetp/phase9-cap0-pilot
 ```
 
