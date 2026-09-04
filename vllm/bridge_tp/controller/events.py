@@ -104,6 +104,15 @@ class Action(str, Enum):
     CANCEL = "CANCEL"
 
 
+class TriggerPath(str, Enum):
+    """Why a migration entered Shadow; persisted in every run artifact."""
+
+    PERFORMANCE_OPPORTUNITY = "PERFORMANCE_OPPORTUNITY"
+    POLICY_OOM_RISK = "POLICY_OOM_RISK"
+    CAPACITY_PILOT = "CAPACITY_PILOT"
+    DIAGNOSTIC_FIXED_BOUNDARY = "DIAGNOSTIC_FIXED_BOUNDARY"
+
+
 @dataclass(frozen=True)
 class SourceRequestView:
     """What the controller knows about one live TP1 request."""
@@ -155,6 +164,7 @@ class Decision:
     action: Action
     from_state: MigrationState
     to_state: MigrationState
+    trigger_path: TriggerPath | None = None
 
     # inputs
     output_tokens: int = 0
@@ -181,4 +191,7 @@ class Decision:
         out["action"] = self.action.value
         out["from_state"] = self.from_state.value
         out["to_state"] = self.to_state.value
+        out["trigger_path"] = (
+            self.trigger_path.value if self.trigger_path is not None else None
+        )
         return out

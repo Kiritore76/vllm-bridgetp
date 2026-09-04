@@ -1,0 +1,39 @@
+{
+  "format_version": 1,
+  "note": "Pilot template only. Tune counts/lengths with a no-migration baseline; this schedule is never passed to the controller.",
+  "jobs": [
+    {
+      "job_id": "target_guard_01",
+      "pool": "target",
+      "start_after_s": 0.0,
+      "request": {
+        "model": "Qwen/Qwen2.5-14B-Instruct",
+        "prompt": "Explain queueing delay in a distributed inference service.",
+        "max_tokens": 512,
+        "ignore_eos": true
+      }
+    },
+    {
+      "job_id": "source_burst_01",
+      "pool": "source",
+      "start_after_s": 8.0,
+      "request": {
+        "model": "Qwen/Qwen2.5-14B-Instruct",
+        "prompt": "Write a detailed systems design review for a capacity-limited scheduler.",
+        "max_tokens": 1024,
+        "ignore_eos": true
+      }
+    },
+    {
+      "job_id": "source_burst_02",
+      "pool": "source",
+      "start_after_s": 8.2,
+      "request": {
+        "model": "Qwen/Qwen2.5-14B-Instruct",
+        "prompt": "Describe failure recovery for a replicated state machine in detail.",
+        "max_tokens": 1024,
+        "ignore_eos": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,66 @@
+{
+  "source_url": "http://127.0.0.1:8001",
+  "target_url": "http://127.0.0.1:8200",
+  "run_dir": "./runs/cap0",
+  "block_size": 16,
+  "tp1_total_kv_blocks": 0,
+  "tp4_total_kv_blocks": 0,
+  "tick_s": 0.2,
+  "handoff_output_tokens": 32,
+  "proxy_mode": "HOLD_BACK",
+  "survival_table_path": "./calibration/survival_table.json",
+  "platform_note": "CAP-0 ENGINEERING PILOT ONLY; replace with measured server provenance",
+  "capacity_pilot": {
+    "enabled": true,
+    "exclusive_trigger_path": true,
+    "guard_free_kv_tokens": 0,
+    "trigger_time_to_guard_s": 8.0,
+    "clear_time_to_guard_s": 20.0,
+    "ewma_alpha": 0.35,
+    "minimum_samples": 4,
+    "minimum_decline_tokens_s": 1.0,
+    "maximum_observation_gap_s": 2.0
+  },
+  "tpot_tp1": {
+    "base_s": 0.03,
+    "per_running_s": 0.0,
+    "calibration_source": "CAP-0 placeholder; performance trigger is disabled"
+  },
+  "tpot_tp4": {
+    "base_s": 0.02,
+    "per_running_s": 0.0,
+    "calibration_source": "CAP-0 placeholder; performance trigger is disabled"
+  },
+  "interference": {
+    "s_per_gib_at_ref": 1.0,
+    "calibration_source": "CAP-0 placeholder; replace with Phase 9 C2 before formal runs"
+  },
+  "policy": {
+    "kv_bytes_per_token": 196608,
+    "theta_0": 0.6,
+    "theta_min": 0.15,
+    "alpha": 0.45,
+    "p_oom_force": 0.85,
+    "min_output_tokens_before_eligible": 32,
+    "max_target_kv_usage_frac": 0.85,
+    "max_target_waiting": 4,
+    "max_concurrent_migrations": 1
+  },
+  "rate": {
+    "b_min_bytes_s": 429496729.6,
+    "b_max_bytes_s": 1288490188.8,
+    "b_start_bytes_s": 536870912.0,
+    "b_hard_max_bytes_s": 2147483648.0,
+    "slo_p99_tpot_s": 0.08,
+    "control_period_s": 0.2
+  },
+  "slow": {
+    "ewma_alpha": 0.08,
+    "high_threshold": 0.65,
+    "low_threshold": 0.45,
+    "persistent_windows": 150,
+    "recovery_windows": 60,
+    "minimum_hold_s": 120.0,
+    "physical_reconfiguration": false
+  }
+}

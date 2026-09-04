@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .capacity_signal import CapacityPilotConfig
 from .policy import InterferenceModel, PolicyConfig, TpotModel
 from .rate_controller import RateConfig
 from .response_proxy import ProxyMode
@@ -61,6 +62,7 @@ class ControllerConfig:
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     rate: RateConfig = field(default_factory=RateConfig)
     slow: SlowConfig = field(default_factory=SlowConfig)
+    capacity_pilot: CapacityPilotConfig = field(default_factory=CapacityPilotConfig)
     tpot_tp1: TpotModel = field(default_factory=lambda: TpotModel(0.030, 0.0015))
     tpot_tp4: TpotModel = field(default_factory=lambda: TpotModel(0.021, 0.0011))
     interference: InterferenceModel = field(
@@ -99,6 +101,7 @@ class ControllerConfig:
             "policy": PolicyConfig,
             "rate": RateConfig,
             "slow": SlowConfig,
+            "capacity_pilot": CapacityPilotConfig,
             "tpot_tp1": TpotModel,
             "tpot_tp4": TpotModel,
             "interference": InterferenceModel,
@@ -131,6 +134,7 @@ class ControllerConfig:
             raise ValueError("rate b_min exceeds b_max")
         if self.slow.low_threshold >= self.slow.high_threshold:
             raise ValueError("slow low_threshold must be below high_threshold")
+        self.capacity_pilot.validate()
         if self.policy.theta_min > self.policy.theta_0:
             raise ValueError("theta_min must not exceed theta_0")
         for name, model in (

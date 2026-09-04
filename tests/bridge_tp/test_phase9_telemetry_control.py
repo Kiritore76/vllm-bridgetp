@@ -94,6 +94,14 @@ class TestPrometheusParsing(unittest.TestCase):
         self.assertAlmostEqual(p.mean_tpot_s, 0.024, places=9)
         self.assertGreater(p.p99_tpot_s, p.mean_tpot_s)
 
+    def test_current_preemption_counter_name_is_supported(self):
+        samples = tel.parse_prometheus(
+            'vllm:num_preemptions{model_name="qwen"} 7\n'
+            'vllm:kv_cache_usage_perc{model_name="qwen"} 0.5\n'
+        )
+        pool = tel.pool_from_samples(samples, block_size=16, total_kv_blocks=100)
+        self.assertEqual(pool.preemptions_total, 7)
+
     def test_current_request_tpot_metric_is_preferred(self):
         current = tel.parse_prometheus(
             "vllm:request_time_per_output_token_seconds_bucket{le=\"0.04\"} 8\n"

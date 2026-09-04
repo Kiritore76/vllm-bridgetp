@@ -9,7 +9,7 @@ correctness evidence instead of re-earning it.
 Endpoints (from ``vllm/bridge_tp/takeover_api.py``):
 
     POST {source}/bridge_tp/v1/takeover  {"action": "commit"|"rollback", ...}
-    POST {source}/bridge_tp/v1/cleanup   {"reason": ...}
+    POST {source}/bridge_tp/v1/cleanup   {"reason": ..., "abort_source": bool}
 
 Both require the session-binding triple, which the server cross-checks against
 ``session_manifest.json`` and refuses with 403 if it does not match:
@@ -291,11 +291,16 @@ class ActionAdapter:
             self.binding.body(action="rollback", reason=reason),
         )
 
-    def cancel(self, reason: str) -> dict[str, Any]:
-        """Phase 8 pre-cutover cancellation: abort source, drain staging."""
+    def cancel(self, reason: str, *, abort_source: bool = True) -> dict[str, Any]:
+        """Drain pre-cutover staging and optionally abort the TP1 request.
+
+        The default preserves the Phase 8 cancellation experiment.  Phase 9
+        policy abandonment passes ``abort_source=False`` because ownership has
+        not moved and the user's request must continue on TP1.
+        """
         return _post(
             f"{self.source_url}/bridge_tp/v1/cleanup",
-            self.binding.body(reason=reason),
+            self.binding.body(reason=reason, abort_source=abort_source),
         )
 
     def read_takeover_state(self) -> dict[str, Any] | None:

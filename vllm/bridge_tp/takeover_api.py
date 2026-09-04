@@ -125,7 +125,12 @@ def _external_request_id(source_request_id: str) -> str:
 
 @router.post("/bridge_tp/v1/cleanup")
 async def cleanup(raw_request: Request) -> dict[str, Any]:
-    """Cancel a pre-cutover source and release Phase 8 staging resources."""
+    """Cancel pre-cutover staging, optionally aborting the source request.
+
+    ``abort_source`` defaults to ``True`` for compatibility with the Phase 8
+    cancellation experiment.  An online controller abandoning only the
+    migration must send ``False`` so TP1 remains the sole response owner.
+    """
     try:
         body = await raw_request.json()
     except json.JSONDecodeError as error:
@@ -137,6 +142,12 @@ async def cleanup(raw_request: Request) -> dict[str, Any]:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST,
             detail="Request body must be a JSON object",
+        )
+    abort_source = body.get("abort_source", True)
+    if not isinstance(abort_source, bool):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="abort_source must be a JSON boolean",
         )
     run_dir, migration_id = _configured_session()
     manifest = _validate_body(body, run_dir, migration_id)
@@ -159,18 +170,22 @@ async def cleanup(raw_request: Request) -> dict[str, Any]:
             "migration_id": migration_id,
             "source_request_id": manifest["source_request_id"],
             "reason": str(body.get("reason", "controller cancelled before cutover")),
+            "abort_source": abort_source,
             "requested_unix_s": time.time(),
         }
         _atomic_json_dump(cleanup_request, run_dir / "cleanup_request.json")
-        source_external_request_id = _external_request_id(
-            str(manifest["source_request_id"])
-        )
-        await raw_request.app.state.engine_client.abort(source_external_request_id)
+        source_external_request_id: str | None = None
+        if cleanup_request["abort_source"]:
+            source_external_request_id = _external_request_id(
+                str(manifest["source_request_id"])
+            )
+            await raw_request.app.state.engine_client.abort(source_external_request_id)
         cancelled = {
             **state,
             "state": "CANCELLED",
             "source_external_request_id": source_external_request_id,
-            "source_abort_dispatched": True,
+            "source_abort_dispatched": cleanup_request["abort_source"],
+            "source_continues_on_tp1": not cleanup_request["abort_source"],
             "reason": cleanup_request["reason"],
             "updated_unix_s": time.time(),
         }
