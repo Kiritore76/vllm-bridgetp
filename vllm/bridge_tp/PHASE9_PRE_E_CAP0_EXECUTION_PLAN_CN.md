@@ -439,3 +439,769 @@ terminal/drain 竞态修复。它不证明 post-commit rollback，也不覆盖�
 10. artifact inspector 和 paired summary。
 
 这些正式 controller 项不属于本文实验计划，也不能用 CAP-0 结果冒充完成。
+
+## 14. 当前机制冻结：这些实验为何可以在 Shadow/Bridge 方案未定时先跑
+
+本轮服务器命令验证的是现有实现 `M0_FULL_RESTORE`，不是尚未确定的论文最终机制：
+
+```text
+mechanism = M0_FULL_RESTORE
+shadow    = HISTORY_PRECOPY_PLUS_DELTA
+bridge    = NOT_IMPLEMENTED
+handoff   = FULL_KV_BEFORE_TARGET_EXECUTION
+```
+
+这里的 Shadow 会先复制 anchor 截止边界以前的历史 KV，再传边界后的增量；TP4 在完整 restore、
+四 rank ready 和 takeover commit 前不为该 anchor 执行远程 attention，也不存在“TP4 计算端 +
+TP1 远程 attention”的 Bridge 中间态。因此，E0、052、guard 标定和 CAP-0 三场景可以继续，
+因为它们回答的是现有 M0 的边界修复、因果触发、可达性和安全放弃。它们不会替未来的
+Shadow 历史复制方向或 Bridge remote-attention 方案作结论。
+
+正式 E 仍需等两件事冻结后再规划：论文最终状态机（是否以及如何引入 Bridge）和对应的数据
+传输/ownership contract。若未来实现改为 newest-first、boundary-outward 或 remote-attention
+Bridge，需要使用新 mechanism 名、新 commit 和新结果目录重新做机制相关门；本轮 M0 结果
+仍可保留为 full-restore baseline 和工程回归。
+
+## 15. 服务器命令的使用约定
+
+以下命令面向 Linux 服务器，仓库和环境默认是：
+
+```text
+原 checkout： /root/autodl-tmp/bridgetp/vllm_bridge
+CAP-0 checkout：/root/autodl-tmp/bridgetp/vllm_bridge_cap0
+venv：          /root/autodl-tmp/bridgetp/.venv_bridge
+model：         /root/autodl-tmp/models/models/Qwen--Qwen2.5-14B-Instruct/snapshots/master
+GPU：           GPU0=TP1，GPU1--4=TP4
+端口：          TP1=8001，TP4=8200，snapshot=29800，delta=29900，delivery=30000
+```
+
+如果服务器实际路径不同，只改本节导出的路径变量，不改实验语义。所有命令都应保存退出码；
+出现非零退出码时保留目录并停止向后推进，不在原目录覆盖重跑。
+
+远端分支在本文本地提交时尚未推送。服务器部署必须等
+`origin/bridgetp/phase9-cap0-pilot` 可见后进行。CAP-0 代码锚点是：
+
+```text
+73b03bbe61c0398704dc77548e615d0c92c05c0a  Add BridgeTP Phase 9 CAP-0 pilot
+```
+
+文档提交可位于该锚点之后，因此服务器验证规则是“该提交必须是 HEAD 的祖先”，而不是要求
+HEAD 永远等于 `73b03bb`。
+
+## 16. S0：安全部署、E0 盘点和 CPU 回归的完整命令
+
+### 16.1 原 checkout 只读取证，不切分支
+
+```bash
+set -euo pipefail
+
+export BRIDGE_BASE=/root/autodl-tmp/bridgetp/vllm_bridge
+export BRIDGE_REPO=/root/autodl-tmp/bridgetp/vllm_bridge_cap0
+export BRIDGE_PY=/root/autodl-tmp/bridgetp/.venv_bridge/bin/python
+export BRIDGE_MODEL=/root/autodl-tmp/models/models/Qwen--Qwen2.5-14B-Instruct/snapshots/master
+export CAP0_RESULTS=/root/autodl-tmp/bridgetp/results/phase9_cap0
+export E0_ID="e0_$(date -u +%Y%m%dT%H%M%SZ)"
+export E0_DIR="$CAP0_RESULTS/e0/$E0_ID"
+mkdir -p "$E0_DIR"
+
+printf '%s\n' \
+  "export BRIDGE_BASE=$BRIDGE_BASE" \
+  "export BRIDGE_REPO=$BRIDGE_REPO" \
+  "export BRIDGE_PY=$BRIDGE_PY" \
+  "export BRIDGE_MODEL=$BRIDGE_MODEL" \
+  "export CAP0_RESULTS=$CAP0_RESULTS" \
+  > /root/autodl-tmp/bridgetp/phase9_cap0_common.env
+
+git -C "$BRIDGE_BASE" status --short --branch | tee "$E0_DIR/base_git_status.txt"
+git -C "$BRIDGE_BASE" branch --show-current | tee "$E0_DIR/base_git_branch.txt"
+git -C "$BRIDGE_BASE" rev-parse HEAD | tee "$E0_DIR/base_git_head.txt"
+git -C "$BRIDGE_BASE" log -5 --oneline | tee "$E0_DIR/base_git_log.txt"
+git -C "$BRIDGE_BASE" remote -v | tee "$E0_DIR/base_git_remote.txt"
+git -C "$BRIDGE_BASE" diff --binary > "$E0_DIR/base_dirty.patch"
+git -C "$BRIDGE_BASE" ls-files --others --exclude-standard \
+  | tee "$E0_DIR/base_untracked_files.txt"
+```
+
+这里不运行 `reset`、`clean`、`checkout --` 或覆盖性复制。`base_dirty.patch` 只记录已跟踪
+改动；未跟踪文件只列名，不擅自打包或移动。
+
+### 16.2 获取远端分支并建立独立 worktree
+
+仅在 `$BRIDGE_REPO` 尚不存在时运行：
+
+```bash
+test ! -e "$BRIDGE_REPO"
+git -C "$BRIDGE_BASE" fetch origin bridgetp/phase9-cap0-pilot
+git -C "$BRIDGE_BASE" worktree add --detach \
+  "$BRIDGE_REPO" origin/bridgetp/phase9-cap0-pilot
+```
+
+如果目录已经存在，不删除它，先做只读核验：
+
+```bash
+git -C "$BRIDGE_REPO" status --short --branch
+git -C "$BRIDGE_REPO" rev-parse HEAD
+git -C "$BRIDGE_REPO" remote -v
+```
+
+只有确认这是以前创建的干净 CAP-0 worktree 后，才允许快进到远端：
+
+```bash
+test -z "$(git -C "$BRIDGE_REPO" status --porcelain)"
+git -C "$BRIDGE_REPO" fetch origin bridgetp/phase9-cap0-pilot
+git -C "$BRIDGE_REPO" checkout --detach origin/bridgetp/phase9-cap0-pilot
+```
+
+核验代码锚点和干净状态：
+
+```bash
+cd "$BRIDGE_REPO"
+test -z "$(git status --porcelain)"
+git merge-base --is-ancestor 73b03bbe61c0398704dc77548e615d0c92c05c0a HEAD
+git status --short --branch | tee "$E0_DIR/cap0_git_status.txt"
+git rev-parse HEAD | tee "$E0_DIR/cap0_git_head.txt"
+git log -5 --oneline | tee "$E0_DIR/cap0_git_log.txt"
+git remote -v | tee "$E0_DIR/cap0_git_remote.txt"
+```
+
+### 16.3 环境和 GPU 取证
+
+```bash
+cd "$BRIDGE_REPO"
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+
+"$BRIDGE_PY" -c 'import sys,torch,vllm; print("python",sys.version); print("torch",torch.__version__); print("torch_cuda",torch.version.cuda); print("vllm",vllm.__version__); print("vllm_path",vllm.__file__)' \
+  | tee "$E0_DIR/environment.txt"
+nvidia-smi --query-gpu=index,name,uuid,driver_version,memory.total \
+  --format=csv,noheader | tee "$E0_DIR/gpu_inventory.txt"
+nvidia-smi topo -m | tee "$E0_DIR/gpu_topology.txt"
+sha256sum "$BRIDGE_MODEL/config.json" "$BRIDGE_MODEL/generation_config.json" \
+  | tee "$E0_DIR/model_config_SHA256SUMS"
+```
+
+### 16.4 CPU 回归
+
+```bash
+cd "$BRIDGE_REPO"
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+
+"$BRIDGE_PY" -m py_compile \
+  tools/bridge_tp/run_phase9_capacity_background.py \
+  tools/bridge_tp/run_phase9_controller.py \
+  vllm/bridge_tp/controller/action_adapter.py \
+  vllm/bridge_tp/controller/anchor_selector.py \
+  vllm/bridge_tp/controller/capacity_signal.py \
+  vllm/bridge_tp/controller/config.py \
+  vllm/bridge_tp/controller/events.py \
+  vllm/bridge_tp/controller/policy.py \
+  vllm/bridge_tp/controller/state_machine.py \
+  vllm/bridge_tp/controller/telemetry.py \
+  vllm/bridge_tp/kv_stream.py \
+  vllm/bridge_tp/phase8_source.py \
+  vllm/bridge_tp/takeover_api.py \
+  2>&1 | tee "$E0_DIR/py_compile.txt"
+
+"$BRIDGE_PY" -m unittest \
+  tests.bridge_tp.test_phase9_capacity_pilot \
+  tests.bridge_tp.test_phase9_predictor_policy \
+  tests.bridge_tp.test_phase9_state_and_proxy \
+  tests.bridge_tp.test_phase9_online_integration \
+  tests.bridge_tp.test_phase9_d3_batch \
+  tests.bridge_tp.test_phase9_telemetry_control \
+  2>&1 | tee "$E0_DIR/cap0_targeted_tests.txt"
+
+"$BRIDGE_PY" -m unittest discover -s tests -t . -p 'test_phase9_*.py' \
+  2>&1 | tee "$E0_DIR/all_phase9_tests.txt"
+
+git diff --check | tee "$E0_DIR/git_diff_check.txt"
+test -z "$(git status --porcelain)"
+```
+
+预期基线是 targeted 121 tests 通过、全部 `test_phase9_*.py` 为 174 tests 通过且 4 skipped；
+若服务器依赖版本导致计数变化，必须解释新增/缺失测试，不能只记录“PASS”。
+
+## 17. 读取真实 TP1/TP4 KV block 数
+
+先确认 8001/8200 未被旧进程占用；若有占用，人工确认其归属并正常停止，不用 `pkill -f`：
+
+```bash
+ss -ltnp | grep -E ':(8001|8200)\b' || true
+```
+
+启动一次与后续相同参数的 clean geometry probe：
+
+```bash
+export GEOM_DIR="$E0_DIR/geometry_probe"
+mkdir -p "$GEOM_DIR"
+
+CUDA_VISIBLE_DEVICES=1,2,3,4 nohup "$BRIDGE_PY" \
+  -m vllm.entrypoints.openai.api_server \
+  --model "$BRIDGE_MODEL" --served-model-name bridgetp-model \
+  --tensor-parallel-size 4 --dtype bfloat16 --max-model-len 8192 \
+  --gpu-memory-utilization 0.88 --port 8200 \
+  --no-enable-prefix-caching --disable-hybrid-kv-cache-manager \
+  --no-async-scheduling > "$GEOM_DIR/target_tp4.log" 2>&1 &
+echo $! > "$GEOM_DIR/target.pid"
+
+CUDA_VISIBLE_DEVICES=0 nohup "$BRIDGE_PY" \
+  -m vllm.entrypoints.openai.api_server \
+  --model "$BRIDGE_MODEL" --served-model-name bridgetp-model \
+  --tensor-parallel-size 1 --dtype bfloat16 --max-model-len 8192 \
+  --gpu-memory-utilization 0.88 --port 8001 \
+  --no-enable-prefix-caching --disable-hybrid-kv-cache-manager \
+  --no-async-scheduling > "$GEOM_DIR/source_tp1.log" 2>&1 &
+echo $! > "$GEOM_DIR/source.pid"
+
+for url in http://127.0.0.1:8001/health http://127.0.0.1:8200/health; do
+  for attempt in $(seq 1 450); do
+    curl -fsS "$url" >/dev/null && break
+    test "$attempt" -lt 450
+    sleep 2
+  done
+done
+
+grep -Ei 'GPU KV cache size|GPU blocks|num_gpu_blocks' \
+  "$GEOM_DIR/source_tp1.log" "$GEOM_DIR/target_tp4.log" \
+  | tee "$GEOM_DIR/kv_block_lines.txt"
+```
+
+把日志中各 server 报告的 per-rank 数写入环境文件。TP4 的值不要乘 4：
+
+```bash
+export TP1_BLOCKS=替换为TP1日志实际值
+export TP4_BLOCKS=替换为TP4日志实际值
+test "$TP1_BLOCKS" -gt 0
+test "$TP4_BLOCKS" -gt 0
+printf 'export TP1_BLOCKS=%s\nexport TP4_BLOCKS=%s\n' \
+  "$TP1_BLOCKS" "$TP4_BLOCKS" \
+  | tee /root/autodl-tmp/bridgetp/phase9_cap0_geometry.env
+
+kill "$(cat "$GEOM_DIR/source.pid")" "$(cat "$GEOM_DIR/target.pid")"
+wait "$(cat "$GEOM_DIR/source.pid")" || true
+wait "$(cat "$GEOM_DIR/target.pid")" || true
+```
+
+## 18. S1：`d3-formal-052` post-fix 工程回归完整命令
+
+052 必须在 CAP-0 进程全部停止、8001/8200 空闲时运行。批处理器不支持在 formal 模式选择
+单条，因此生成一个保持原 50 条 frozen prompts 不变的工程 manifest，只把 052 的 prompt
+复制到第一个 smoke slot，并使用不与 formal ID 重叠的新 ID。
+
+```bash
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
+source /root/autodl-tmp/bridgetp/phase9_cap0_geometry.env
+cd "$BRIDGE_REPO"
+unset BRIDGETP_STREAM_SOURCE_REQUEST_ID_PREFIX
+
+export POSTFIX_COMMIT="$(git rev-parse --short=12 HEAD)"
+export POSTFIX_ID="d3-formal-052-postfix_${POSTFIX_COMMIT}"
+export D3_ROOT="/root/autodl-tmp/bridgetp/results/phase9_d3_postfix_052/${POSTFIX_ID}"
+export D3_MANIFEST="$D3_ROOT/d3_052_engineering_manifest.json"
+mkdir -p "$D3_ROOT"
+
+"$BRIDGE_PY" - \
+  experiments/phase9/manifests/d3_prompts_50.json \
+  "$D3_MANIFEST" "$POSTFIX_ID" <<'PY'
+import json, sys
+from pathlib import Path
+
+source, target, request_id = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+data = json.loads(source.read_text(encoding='utf-8'))
+prompt = next(x for x in data['prompts'] if x['request_id'] == 'd3-formal-052')
+data['smoke_prompts'][0] = {**prompt, 'request_id': request_id}
+target.write_text(json.dumps(data, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+PY
+
+sha256sum experiments/phase9/manifests/d3_prompts_50.json "$D3_MANIFEST" \
+  | tee "$D3_ROOT/manifest_SHA256SUMS"
+
+"$BRIDGE_PY" tools/bridge_tp/run_phase9_d3_batch.py validate \
+  --manifest "$D3_MANIFEST" --out-root "$D3_ROOT" --mode smoke
+
+"$BRIDGE_PY" tools/bridge_tp/run_phase9_d3_batch.py migrate \
+  --manifest "$D3_MANIFEST" --out-root "$D3_ROOT" --mode smoke --limit 1 \
+  --python-bin "$BRIDGE_PY" --model-path "$BRIDGE_MODEL" \
+  --tp1-blocks "$TP1_BLOCKS" --tp4-blocks "$TP4_BLOCKS" \
+  --dtype bfloat16 --max-attempts 2 \
+  2>&1 | tee "$D3_ROOT/migrate_console.txt"
+
+"$BRIDGE_PY" tools/bridge_tp/run_phase9_d3_batch.py controls \
+  --manifest "$D3_MANIFEST" --out-root "$D3_ROOT" --mode smoke --limit 1 \
+  --python-bin "$BRIDGE_PY" --model-path "$BRIDGE_MODEL" \
+  --dtype bfloat16 --vllm-commit "$(git rev-parse HEAD)" \
+  2>&1 | tee "$D3_ROOT/controls_console.txt"
+
+"$BRIDGE_PY" tools/bridge_tp/run_phase9_d3_batch.py status \
+  --manifest "$D3_MANIFEST" --out-root "$D3_ROOT" --mode smoke --limit 1 \
+  2>&1 | tee "$D3_ROOT/status_console.txt"
+```
+
+工程验收：`batch_progress.json` 中该 ID 的 migration/control 均为 `COMPLETE`；成功 attempt
+中 `pending_known_tokens=1`，四 rank receipt 全部 exact readback，`takeover_state.json` 为
+`COMMITTED`，日志不再出现 `Target block allocation differs from live snapshot`。不要运行
+formal summarize，也不要把该目录合并进旧 49 条 D 结果。
+
+## 19. 生成 no-migration/CAP-0 workload manifest
+
+先建立独立 manifest 目录。manifest 永远传给 workload generator，不传给 controller，也不
+放进 controller 的 run directory：
+
+```bash
+source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
+export CAP0_MANIFEST_ROOT=/root/autodl-tmp/bridgetp/phase9_cap0_manifests
+mkdir -p "$CAP0_MANIFEST_ROOT/working" "$CAP0_MANIFEST_ROOT/frozen"
+```
+
+以下生成器用于 bring-up。通过环境变量调节并发数、长度和到达时刻；它会把所有 model alias
+冻结为 server 实际暴露的 `bridgetp-model`：
+
+```bash
+export LOAD_NAME=calibration_working
+export TARGET_JOBS=1
+export TARGET_TOKENS=512
+export TARGET_START_S=0.0
+export SOURCE_JOBS=2
+export SOURCE_TOKENS=1024
+export SOURCE_START_S=8.0
+
+"$BRIDGE_PY" - "$CAP0_MANIFEST_ROOT/working/$LOAD_NAME.json" <<'PY'
+import json, os, sys
+from pathlib import Path
+
+jobs = []
+for i in range(int(os.environ['TARGET_JOBS'])):
+    jobs.append({
+        'job_id': f'target_{i:03d}', 'pool': 'target',
+        'start_after_s': float(os.environ['TARGET_START_S']) + i * 0.2,
+        'request': {'model': 'bridgetp-model',
+                    'prompt': 'Explain queueing delay in a distributed inference service.',
+                    'max_tokens': int(os.environ['TARGET_TOKENS']),
+                    'ignore_eos': True}})
+for i in range(int(os.environ['SOURCE_JOBS'])):
+    jobs.append({
+        'job_id': f'source_{i:03d}', 'pool': 'source',
+        'start_after_s': float(os.environ['SOURCE_START_S']) + i * 0.2,
+        'request': {'model': 'bridgetp-model',
+                    'prompt': 'Write a detailed systems design review for a capacity-limited scheduler.',
+                    'max_tokens': int(os.environ['SOURCE_TOKENS']),
+                    'ignore_eos': True}})
+out = Path(sys.argv[1])
+payload = {'format_version': 1,
+           'note': 'workload-generator input only; never controller input',
+           'jobs': jobs}
+out.write_text(json.dumps(payload, indent=2) + '\n', encoding='utf-8')
+print(out)
+PY
+
+"$BRIDGE_PY" tools/bridge_tp/run_phase9_capacity_background.py \
+  --manifest "$CAP0_MANIFEST_ROOT/working/$LOAD_NAME.json" \
+  --out-dir "/tmp/${LOAD_NAME}_validate" --validate-only
+```
+
+只允许在 bring-up 阶段改上述六个 workload 参数。场景达到预期状态后冻结并记录 hash：
+
+```bash
+export FROZEN_NAME=calibration_v1
+cp "$CAP0_MANIFEST_ROOT/working/$LOAD_NAME.json" \
+  "$CAP0_MANIFEST_ROOT/frozen/$FROZEN_NAME.json"
+sha256sum "$CAP0_MANIFEST_ROOT/frozen/$FROZEN_NAME.json" \
+  | tee "$CAP0_MANIFEST_ROOT/frozen/$FROZEN_NAME.sha256"
+```
+
+`calibration_v1`、`noop_v1`、`rescue_v1` 和 `abandon_v1` 分别冻结。三个报告重复不能再改
+对应 manifest；若必须改，版本号递增并重新做 bring-up，旧失败目录保留。
+
+## 20. 每一轮通用的目录、config 和服务启动命令
+
+### 20.1 创建全新运行身份
+
+每轮先设置 `CAP0_CLASS`、`CAP0_REP`、manifest 和 guard：
+
+```bash
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
+source /root/autodl-tmp/bridgetp/phase9_cap0_geometry.env
+cd "$BRIDGE_REPO"
+
+export CAP0_CLASS=calibration
+export CAP0_REP=01
+export CAP0_ID="cap0-${CAP0_CLASS}-r${CAP0_REP}-$(date -u +%Y%m%dT%H%M%SZ)"
+export CAP0_CONTROLLER_ROOT="$CAP0_RESULTS/controller_runs"
+export CAP0_BACKGROUND_ROOT="$CAP0_RESULTS/background_runs"
+export CAP0_PROVENANCE_ROOT="$CAP0_RESULTS/provenance"
+export CAP0_DIR="$CAP0_CONTROLLER_ROOT/$CAP0_ID"
+export CAP0_BG_DIR="$CAP0_BACKGROUND_ROOT/$CAP0_ID"
+export CAP0_PROV_DIR="$CAP0_PROVENANCE_ROOT/$CAP0_ID"
+export CAP0_CONFIG="$CAP0_PROV_DIR/controller_config.json"
+export CAP0_BG_MANIFEST="$CAP0_MANIFEST_ROOT/frozen/calibration_v1.json"
+export CAP0_CAPACITY_ENABLED=0
+export CAP0_GUARD=0
+
+test ! -e "$CAP0_DIR"
+test ! -e "$CAP0_BG_DIR"
+test ! -e "$CAP0_PROV_DIR"
+mkdir -p "$CAP0_DIR" "$CAP0_BG_DIR" "$CAP0_PROV_DIR"
+
+printf '%s\n' \
+  "export BRIDGE_REPO=$BRIDGE_REPO" \
+  "export BRIDGE_PY=$BRIDGE_PY" \
+  "export BRIDGE_MODEL=$BRIDGE_MODEL" \
+  "export TP1_BLOCKS=$TP1_BLOCKS" \
+  "export TP4_BLOCKS=$TP4_BLOCKS" \
+  "export CAP0_ID=$CAP0_ID" \
+  "export CAP0_DIR=$CAP0_DIR" \
+  "export CAP0_BG_DIR=$CAP0_BG_DIR" \
+  "export CAP0_PROV_DIR=$CAP0_PROV_DIR" \
+  "export CAP0_CONFIG=$CAP0_CONFIG" \
+  "export CAP0_BG_MANIFEST=$CAP0_BG_MANIFEST" \
+  > "/root/autodl-tmp/bridgetp/cap0_${CAP0_ID}.env"
+
+git rev-parse HEAD > "$CAP0_PROV_DIR/git_revision.txt"
+git status --short --branch > "$CAP0_PROV_DIR/git_status.txt"
+sha256sum "$CAP0_BG_MANIFEST" > "$CAP0_PROV_DIR/background_manifest.sha256"
+```
+
+为 calibration 设置 `CAP0_CAPACITY_ENABLED=0`、`CAP0_GUARD=0` 并配合 `--dry-run`；
+三个 held-out 场景设置 `CAP0_CAPACITY_ENABLED=1` 和已冻结的正 guard：
+
+```bash
+"$BRIDGE_PY" - \
+  experiments/phase9/configs/cap0_controller.template.json \
+  "$CAP0_CONFIG" <<'PY'
+import json, os, sys
+from pathlib import Path
+
+src, dst = Path(sys.argv[1]), Path(sys.argv[2])
+cfg = json.loads(src.read_text(encoding='utf-8'))
+cfg['run_dir'] = os.environ['CAP0_DIR']
+cfg['tp1_total_kv_blocks'] = int(os.environ['TP1_BLOCKS'])
+cfg['tp4_total_kv_blocks'] = int(os.environ['TP4_BLOCKS'])
+cfg['survival_table_path'] = '/root/autodl-tmp/bridgetp/calibration/survival_table.json'
+cfg['platform_note'] = 'CAP-0 ENGINEERING PILOT; 5x A100 PCIe; exact provenance in run'
+cfg['capacity_pilot']['enabled'] = bool(int(os.environ['CAP0_CAPACITY_ENABLED']))
+cfg['capacity_pilot']['guard_free_kv_tokens'] = int(os.environ['CAP0_GUARD'])
+dst.write_text(json.dumps(cfg, indent=2) + '\n', encoding='utf-8')
+PY
+
+"$BRIDGE_PY" -c 'from vllm.bridge_tp.controller.config import ControllerConfig; import sys; ControllerConfig.load(sys.argv[1]); print("VALID",sys.argv[1])' "$CAP0_CONFIG"
+```
+
+### 20.2 启动 TP4、TP1 和 stager
+
+```bash
+export PHASE9_STAGING_MANIFEST="$CAP0_DIR/staging_manifest.json"
+export PHASE9_RECEIPTS="$CAP0_DIR/receiver_receipts"
+export PHASE9_CONTROL="$CAP0_DIR/takeover_state.json"
+
+CUDA_VISIBLE_DEVICES=1,2,3,4 nohup "$BRIDGE_PY" \
+  -m vllm.entrypoints.openai.api_server \
+  --model "$BRIDGE_MODEL" --served-model-name bridgetp-model \
+  --tensor-parallel-size 4 --dtype bfloat16 --max-model-len 8192 \
+  --gpu-memory-utilization 0.88 --port 8200 \
+  --no-enable-prefix-caching --disable-hybrid-kv-cache-manager \
+  --no-async-scheduling \
+  --kv-transfer-config "$("$BRIDGE_PY" -c 'import json,os; print(json.dumps({
+    "kv_connector":"BridgeTPStreamingConnector",
+    "kv_connector_module_path":"vllm.bridge_tp.streaming_connector",
+    "kv_role":"kv_consumer","kv_load_failure_policy":"fail",
+    "kv_connector_extra_config":{
+      "bridgetp_stream_manifest":os.environ["PHASE9_STAGING_MANIFEST"],
+      "bridgetp_stream_receipt_dir":os.environ["PHASE9_RECEIPTS"],
+      "bridgetp_stream_socket_timeout_s":600,
+      "bridgetp_stream_expected_phase":"BridgeTP D3 Phase 8",
+      "bridgetp_takeover_control_path":os.environ["PHASE9_CONTROL"],
+      "bridgetp_takeover_control_timeout_s":600}}))')" \
+  > "$CAP0_DIR/target_tp4.log" 2>&1 &
+echo $! > "$CAP0_PROV_DIR/target.pid"
+
+export BRIDGETP_DUMP_ENABLED=0
+export BRIDGETP_STREAM_ENABLED=1
+export BRIDGETP_STREAM_MIGRATION_ID="$CAP0_ID"
+export BRIDGETP_STREAM_RUN_DIR="$CAP0_DIR"
+export BRIDGETP_STREAM_HOST=127.0.0.1
+export BRIDGETP_STREAM_BASE_PORT=29800
+export BRIDGETP_STREAM_TARGET_TP=4
+export BRIDGETP_STREAM_HEAD_AXIS=3
+export BRIDGETP_STREAM_EXPECTED_KV_HEADS=8
+export BRIDGETP_STREAM_AFTER_OUTPUT_TOKENS=128
+export BRIDGETP_STREAM_CHUNK_BYTES=1048576
+export BRIDGETP_STREAM_RATE_GIB_S=0.50
+export BRIDGETP_STREAM_SOCKET_TIMEOUT_S=600
+export BRIDGETP_STREAM_PIN_MEMORY=1
+export BRIDGETP_STREAM_STRICT=1
+export BRIDGETP_STREAM_SOURCE_REQUEST_ID_PREFIX="bridgetp-phase9-$CAP0_ID"
+export BRIDGETP_PHASE8_ENABLED=1
+export BRIDGETP_PHASE8_CUTOVER_OUTPUT_TOKENS=160
+export BRIDGETP_PHASE8_DELTA_HOST=127.0.0.1
+export BRIDGETP_PHASE8_DELTA_BASE_PORT=29900
+export BRIDGETP_TAKEOVER_ENABLED=1
+export BRIDGETP_TAKEOVER_MIGRATION_ID="$CAP0_ID"
+export BRIDGETP_TAKEOVER_RUN_DIR="$CAP0_DIR"
+
+CUDA_VISIBLE_DEVICES=0 nohup "$BRIDGE_PY" \
+  -m vllm.entrypoints.openai.api_server \
+  --model "$BRIDGE_MODEL" --served-model-name bridgetp-model \
+  --tensor-parallel-size 1 --dtype bfloat16 --max-model-len 8192 \
+  --gpu-memory-utilization 0.88 --port 8001 \
+  --no-enable-prefix-caching --disable-hybrid-kv-cache-manager \
+  --no-async-scheduling > "$CAP0_DIR/source_tp1.log" 2>&1 &
+echo $! > "$CAP0_PROV_DIR/source.pid"
+
+for url in http://127.0.0.1:8001/health http://127.0.0.1:8200/health; do
+  for attempt in $(seq 1 450); do
+    curl -fsS "$url" >/dev/null && break
+    test "$attempt" -lt 450
+    sleep 2
+  done
+done
+
+nohup "$BRIDGE_PY" tools/bridge_tp/phase8_stager.py \
+  --run-dir "$CAP0_DIR" --delta-host 127.0.0.1 --delta-base-port 29900 \
+  --delivery-host 127.0.0.1 --delivery-base-port 30000 --timeout-s 600 \
+  > "$CAP0_DIR/stager.log" 2>&1 &
+echo $! > "$CAP0_PROV_DIR/stager.pid"
+
+ps -fp "$(paste -d, \
+  "$CAP0_PROV_DIR/target.pid" \
+  "$CAP0_PROV_DIR/source.pid" \
+  "$CAP0_PROV_DIR/stager.pid")" \
+  > "$CAP0_PROV_DIR/processes.txt"
+```
+
+每轮都重新核对日志 block 数与冻结值一致：
+
+```bash
+grep -Ei 'GPU KV cache size|GPU blocks|num_gpu_blocks' \
+  "$CAP0_DIR/source_tp1.log" "$CAP0_DIR/target_tp4.log" \
+  | tee "$CAP0_PROV_DIR/kv_block_lines.txt"
+```
+
+### 20.3 启动独立 background，再启动 controller
+
+```bash
+"$BRIDGE_PY" tools/bridge_tp/run_phase9_capacity_background.py \
+  --manifest "$CAP0_BG_MANIFEST" \
+  --out-dir "$CAP0_BG_DIR" --validate-only
+
+nohup "$BRIDGE_PY" tools/bridge_tp/run_phase9_capacity_background.py \
+  --manifest "$CAP0_BG_MANIFEST" \
+  --source-url http://127.0.0.1:8001 \
+  --target-url http://127.0.0.1:8200 \
+  --out-dir "$CAP0_BG_DIR" \
+  > "$CAP0_BG_DIR/background.log" 2>&1 &
+echo $! > "$CAP0_PROV_DIR/background.pid"
+```
+
+calibration/no-migration 使用：
+
+```bash
+"$BRIDGE_PY" tools/bridge_tp/run_phase9_controller.py \
+  --config "$CAP0_CONFIG" --run-dir "$CAP0_DIR" \
+  --source-request experiments/phase9/configs/request_long.json \
+  --migration-id "$CAP0_ID" --dry-run \
+  2>&1 | tee "$CAP0_PROV_DIR/controller_console.txt"
+```
+
+No-op、Rescue、Safe abandon 使用相同命令但去掉 `--dry-run`：
+
+```bash
+"$BRIDGE_PY" tools/bridge_tp/run_phase9_controller.py \
+  --config "$CAP0_CONFIG" --run-dir "$CAP0_DIR" \
+  --source-request experiments/phase9/configs/request_long.json \
+  --migration-id "$CAP0_ID" \
+  2>&1 | tee "$CAP0_PROV_DIR/controller_console.txt"
+```
+
+等待 background 并逐个正常停止本轮服务；PID 文件精确限定目标，禁止模糊 `pkill`：
+
+```bash
+wait "$(cat "$CAP0_PROV_DIR/background.pid")" || true
+for name in stager source target; do
+  pid="$(cat "$CAP0_PROV_DIR/${name}.pid")"
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+done
+```
+
+## 21. C0/C1：三次 no-migration 标定、分析和 guard 冻结
+
+先用同一 `calibration_v1.json`、`CAP0_CAPACITY_ENABLED=0`、`CAP0_GUARD=0` 和 `--dry-run`
+按第 20 节完整执行 `r01`、`r02`、`r03`。每轮必须重启 TP1、TP4 和 stager。disabled
+tracker 仍记录 raw free-KV、EWMA decline、running、waiting 和 preemption；`--dry-run` 保证
+即使 legacy performance decision 出现也不会执行 actuator。
+
+三轮完成后输出可审计摘要：
+
+```bash
+export CAL_GLOB="$CAP0_RESULTS/controller_runs/cap0-calibration-r*"
+"$BRIDGE_PY" - $CAL_GLOB <<'PY'
+import json, sys
+from pathlib import Path
+
+for run_s in sys.argv[1:]:
+    run = Path(run_s)
+    rows = [json.loads(x) for x in (run/'phase9_audit.jsonl').read_text().splitlines()]
+    tel = [x for x in rows if x.get('kind') == 'telemetry']
+    if not tel:
+        raise SystemExit(f'no telemetry: {run}')
+    initial = int(tel[0]['tp1']['preemptions_total'])
+    first = next((x for x in tel if int(x['tp1']['preemptions_total']) > initial), None)
+    free = [int(x['capacity_signal']['free_kv_tokens']) for x in tel]
+    decline = [float(x['capacity_signal']['decline_rate_tokens_s']) for x in tel]
+    print(json.dumps({
+        'run': run.name,
+        'samples': len(tel),
+        'minimum_free_kv_tokens': min(free),
+        'first_preemption_free_kv_tokens': (
+            int(first['capacity_signal']['free_kv_tokens']) if first else None),
+        'maximum_ewma_decline_tokens_s': max(decline),
+        'final_state': next(x for x in reversed(rows) if x.get('kind') == 'run_end')['final_state'],
+    }, sort_keys=True))
+PY
+```
+
+在查看 held-out 三场景前冻结以下事前规则：令每轮 `F_i` 为第一次 preemption 时的 free KV；
+若该轮无 preemption，则使用 closest approach（minimum free KV）并标记为 censored。令
+`D_max` 为三轮最大 EWMA decline，`T_enter=8s`。工程 guard 为：
+
+```text
+ceil_to_block(max_i(F_i) + D_max * T_enter)
+```
+
+并裁剪到 `[block_size, TP1_total_tokens - block_size]`。该规则宁可提前触发；它只是 CAP-0
+guard，不是 OOM 概率。把最终整数写入并冻结：
+
+```bash
+export FROZEN_GUARD=替换为按上述规则计算出的正整数
+export TP1_TOTAL_TOKENS=$((TP1_BLOCKS * 16))
+test "$FROZEN_GUARD" -gt 0
+test "$FROZEN_GUARD" -lt "$TP1_TOTAL_TOKENS"
+printf '%s\n' "$FROZEN_GUARD" \
+  | tee "$CAP0_MANIFEST_ROOT/frozen/guard_free_kv_tokens.txt"
+printf '%s  %s\n' \
+  "$(sha256sum "$CAP0_MANIFEST_ROOT/frozen/calibration_v1.json" | awk '{print $1}')" \
+  calibration_v1.json \
+  > "$CAP0_MANIFEST_ROOT/frozen/calibration_and_guard_provenance.txt"
+```
+
+## 22. P0/P1/P2：三个 held-out 场景的执行矩阵
+
+三个场景均先做不计入重复的 bring-up，冻结 manifest 后做 `r01`、`r02`、`r03`。每轮在
+第 20.1 节设置：
+
+| 场景 | `CAP0_CLASS` | manifest | controller | 必须出现 |
+|---|---|---|---|---|
+| No-op | `noop` | `noop_v1.json` | 非 dry-run | active signal + target guard fail + `STAY` |
+| Rescue | `rescue` | `rescue_v1.json` | 非 dry-run | `CAPACITY_PILOT` + 4 ranks + `TAKEOVER` |
+| Safe abandon | `abandon` | `abandon_v1.json` | 非 dry-run | `SHADOW` 后 `CLEAR` + `CANCELLED` |
+
+三者共同设置：
+
+```bash
+export CAP0_CAPACITY_ENABLED=1
+export CAP0_GUARD="$(cat "$CAP0_MANIFEST_ROOT/frozen/guard_free_kv_tokens.txt")"
+```
+
+bring-up 时只通过第 19 节 workload 参数形成条件：
+
+- No-op：增加/延长 target jobs，确保 source signal active 时 TP4 持续超过
+  `max_target_kv_usage_frac=0.85` 或 `max_target_waiting=4`，直到 anchor 完成；
+- Rescue：target 初始忙，随后自然结束；TP4 变得 admissible 时 source signal 仍 active；
+- Safe abandon：让 source burst 在历史复制完成前自然结束，使 signal `CLEAR`；必要时调整
+  workload 时序或长度，不改 frozen guard，不注入 controller future information。
+
+如果只靠当前 load generator 无法稳定形成某场景，停止并记录 `NO-GO`，不要用 sleep、手工
+取消请求或观察结果后改 guard 把场景“做出来”。这意味着需要补 workload orchestrator，
+而不是 CAP-0 已通过。
+
+## 23. 单轮自动验收命令
+
+运行下面的只读 checker，`EXPECTED` 取 `calibration`、`noop`、`rescue` 或 `abandon`：
+
+```bash
+export EXPECTED=替换为场景名
+"$BRIDGE_PY" - "$CAP0_DIR" "$EXPECTED" <<'PY'
+import json, sys
+from pathlib import Path
+
+run, expected = Path(sys.argv[1]), sys.argv[2]
+rows = [json.loads(x) for x in (run/'phase9_audit.jsonl').read_text().splitlines()]
+end = next(x for x in reversed(rows) if x.get('kind') == 'run_end')
+transitions = [x.get('to') for x in rows if x.get('kind') == 'transition']
+cap = [x for x in rows if x.get('kind') == 'capacity_pilot_decision']
+
+if expected == 'calibration':
+    assert end['final_state'] == 'COMPLETED_ON_TP1'
+    assert 'SHADOW' not in transitions
+elif expected == 'noop':
+    assert any(x.get('action') == 'STAY' and x.get('signal', {}).get('active') for x in cap)
+    assert 'SHADOW' not in transitions
+    assert not (run/'staging_manifest.json').exists()
+elif expected == 'rescue':
+    assert any(x.get('action') == 'START_SHADOW' for x in cap)
+    assert end.get('trigger_path') == 'CAPACITY_PILOT'
+    assert transitions[-1] == 'TAKEOVER'
+    state = json.loads((run/'takeover_state.json').read_text())
+    assert state['state'] == 'COMMITTED'
+    assert state['source_abort_dispatched'] is True
+    receipts = list((run/'receiver_receipts').glob('*/tp_rank_*.json'))
+    assert len(receipts) == 4
+    assert all(json.loads(x.read_text()).get('exact_readback') is True for x in receipts)
+elif expected == 'abandon':
+    assert 'SHADOW' in transitions and transitions[-1] == 'CANCELLED'
+    assert any(x.get('kind') == 'abandon' and 'headroom recovered' in x.get('reason','') for x in rows)
+    cleanup = json.loads((run/'cleanup_request.json').read_text())
+    state = json.loads((run/'takeover_state.json').read_text())
+    assert cleanup['abort_source'] is False
+    assert state['state'] == 'CANCELLED'
+    assert state['source_abort_dispatched'] is False
+    assert state['source_continues_on_tp1'] is True
+else:
+    raise SystemExit(f'unknown EXPECTED={expected}')
+print('PASS', expected, run, end['final_state'])
+PY
+```
+
+checker 只做必要条件检查，不能代替人工检查 source/target/stager 日志、request-ID 串号、
+client stream 完整性和 background summary。
+
+## 24. 每轮封存和 SHA-256
+
+```bash
+git -C "$BRIDGE_REPO" rev-parse HEAD > "$CAP0_PROV_DIR/git_revision_after.txt"
+git -C "$BRIDGE_REPO" status --short --branch > "$CAP0_PROV_DIR/git_status_after.txt"
+cp "$CAP0_CONFIG" "$CAP0_PROV_DIR/controller_config.frozen.json"
+cp "$CAP0_BG_MANIFEST" "$CAP0_PROV_DIR/background_manifest.frozen.json"
+
+find "$CAP0_DIR" "$CAP0_BG_DIR" "$CAP0_PROV_DIR" \
+  -type f ! -name SHA256SUMS -print0 \
+  | sort -z \
+  | xargs -0 sha256sum \
+  > "$CAP0_PROV_DIR/SHA256SUMS"
+sha256sum -c "$CAP0_PROV_DIR/SHA256SUMS"
+```
+
+失败轮同样封存。不得在生成 `SHA256SUMS` 后编辑被覆盖文件；如需增加分析文件，生成新的
+`SHA256SUMS.v2` 并保留旧文件。
+
+## 25. 最终执行顺序和停止点
+
+```text
+1. 等远端分支可见；独立 worktree 部署，不触碰服务器旧 checkout 的 dirty changes。
+2. S0/E0 盘点 + CPU 回归。
+3. 用相同 server args 测真实 TP1/TP4 KV blocks。
+4. S1 单独运行 052 post-fix migrate + controls；通过后封存，绝不并入旧49条。
+5. C0 bring-up，冻结 calibration_v1 workload。
+6. C1 no-migration r01/r02/r03；按事前规则计算并冻结 guard。
+7. P0 No-op bring-up，冻结 noop_v1，再跑 r01/r02/r03。
+8. P1 Rescue bring-up，冻结 rescue_v1，再跑 r01/r02/r03。
+9. P2 Safe abandon bring-up，冻结 abandon_v1，再跑 r01/r02/r03。
+10. 逐轮 checker、人工审计、SHA-256 和跨轮 go/no-go。
+11. 到此停止；不启动 formal E。
+```
+
+本轮做完应证明：M0 full-restore 的 052 尾块修复成立；单 anchor 在 contention 下能被因果
+KV headroom 信号安全地“不迁移、迁移完成、迁移前安全放弃”。本轮不能证明：哪种历史 KV
+复制顺序最好、是否应有 Bridge remote attention、正式 capacity controller 已完成，或系统
+goodput/SLO 优于 baseline。
