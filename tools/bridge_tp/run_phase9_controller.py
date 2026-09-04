@@ -26,11 +26,16 @@ from vllm.bridge_tp.controller.action_adapter import (  # noqa: E402
     ActionError,
 )
 from vllm.bridge_tp.controller.audit import AuditLog  # noqa: E402
+from vllm.bridge_tp.controller.capacity_signal import (  # noqa: E402
+    CapacityHeadroomTracker,
+    CapacitySignal,
+)
 from vllm.bridge_tp.controller.config import ControllerConfig  # noqa: E402
 from vllm.bridge_tp.controller.events import (  # noqa: E402
     Action,
     MigrationState,
     SourceRequestView,
+    TriggerPath,
 )
 from vllm.bridge_tp.controller.online_io import (  # noqa: E402
     ProxyRecorder,
@@ -253,6 +258,7 @@ def step_local(
     max_tokens: int,
     diagnostic_trigger_output_tokens: int | None = None,
     diagnostic_cutover_output_tokens: int | None = None,
+    capacity_signal: CapacitySignal | None = None,
 ) -> None:
     decision = policy.evaluate(
         request,
@@ -266,9 +272,39 @@ def step_local(
     )
     audit.write({"kind": "decision", **decision.to_json()})
     diagnostic_boundary = diagnostic_trigger_output_tokens is not None
-    if dry_run or (
-        not diagnostic_boundary and decision.action is not Action.START_SHADOW
-    ):
+    capacity_requested = bool(capacity_signal is not None and capacity_signal.active)
+    capacity_allowed = False
+    if capacity_requested:
+        target_unavailable = (
+            pool4.kv_usage_frac > config.policy.max_target_kv_usage_frac
+            or pool4.num_waiting > config.policy.max_target_waiting
+        )
+        capacity_allowed = not target_unavailable
+        audit.write(
+            {
+                "kind": "capacity_pilot_decision",
+                "action": "START_SHADOW" if capacity_allowed else "STAY",
+                "reason": (
+                    "measured headroom trigger and target passes current guard"
+                    if capacity_allowed
+                    else "measured headroom trigger but target fails current guard"
+                ),
+                "signal": capacity_signal.to_json(),
+                "target_kv_usage_frac": pool4.kv_usage_frac,
+                "target_waiting": pool4.num_waiting,
+                "target_reservation_proven": False,
+            }
+        )
+    performance_allowed = not (
+        config.capacity_pilot.enabled
+        and config.capacity_pilot.exclusive_trigger_path
+    )
+    should_start = (
+        diagnostic_boundary
+        or capacity_allowed
+        or (performance_allowed and decision.action is Action.START_SHADOW)
+    )
+    if dry_run or not should_start:
         return
     if diagnostic_trigger_output_tokens is None:
         trigger = request.output_tokens + 1
@@ -310,20 +346,34 @@ def step_local(
         )
         return
     recorder.set_cutover(cutover, now)
+    if diagnostic_boundary:
+        trigger_path = TriggerPath.DIAGNOSTIC_FIXED_BOUNDARY
+        trigger_reason = "diagnostic fixed boundary"
+    elif capacity_allowed:
+        trigger_path = TriggerPath.CAPACITY_PILOT
+        trigger_reason = "CAP-0 measured source headroom trigger"
+    else:
+        trigger_path = getattr(
+            decision,
+            "trigger_path",
+            None,
+        ) or TriggerPath.PERFORMANCE_OPPORTUNITY
+        trigger_reason = decision.reason
     adapter.arm_shadow(
         trigger,
         rate.rate_gib_s,
         cutover_output_tokens=cutover,
-        note=("diagnostic fixed boundary" if diagnostic_boundary else decision.reason),
+        note=trigger_reason,
     )
     record.trigger_output_tokens = trigger
     record.cutover_output_tokens = cutover
     record.t_decision = now
+    record.trigger_path = trigger_path
     machine.transition(
         record.migration_id,
         MigrationState.SHADOW,
         now,
-        "diagnostic fixed boundary" if diagnostic_boundary else decision.reason,
+        trigger_reason,
     )
 
 
@@ -341,6 +391,7 @@ def step_shadow(
     now: float,
     dry_run: bool,
     recorder: ProxyRecorder,
+    capacity_signal: CapacitySignal | None = None,
 ) -> None:
     remaining = policy.migration_bytes(request)
     new_rate = rate.step(
@@ -360,13 +411,35 @@ def step_shadow(
     if not dry_run:
         adapter.set_rate(rate.rate_gib_s, note=rate.last_reason)
 
-    abandon, reason = policy.should_abandon(
-        request,
-        pool1,
-        pool4,
-        rate.rate_bytes_s,
-        risk_value,
-    )
+    safety_path = record.trigger_path in {
+        TriggerPath.CAPACITY_PILOT,
+        TriggerPath.POLICY_OOM_RISK,
+    }
+    if safety_path:
+        abandon = (
+            pool4.kv_usage_frac > policy.cfg.max_target_kv_usage_frac + 0.10
+        )
+        reason = (
+            f"target risk too high: kv={pool4.kv_usage_frac:.2f}"
+            if abandon
+            else ""
+        )
+        if (
+            not abandon
+            and record.trigger_path is TriggerPath.CAPACITY_PILOT
+            and capacity_signal is not None
+            and capacity_signal.transition == "CLEAR"
+        ):
+            abandon = True
+            reason = "CAP-0 source headroom recovered before cutover"
+    else:
+        abandon, reason = policy.should_abandon(
+            request,
+            pool1,
+            pool4,
+            rate.rate_bytes_s,
+            risk_value,
+        )
     if abandon:
         audit.write({"kind": "abandon", "reason": reason})
         if not dry_run:
@@ -375,7 +448,7 @@ def step_shadow(
                 adapter.disarm(reason)
             else:
                 try:
-                    adapter.cancel(reason)
+                    adapter.cancel(reason, abort_source=False)
                 except ActionError as error:
                     audit.write({"kind": "action_error", "detail": str(error)})
         recorder.on_rollback(now, reason)
@@ -462,7 +535,10 @@ def _finish_source_without_commit(
         binding = adapter.refresh_binding()
         if binding is not None:
             try:
-                adapter.cancel("source reached EOS before target ready")
+                adapter.cancel(
+                    "source reached EOS before target ready",
+                    abort_source=False,
+                )
             except ActionError as error:
                 audit.write({"kind": "action_error", "detail": str(error)})
         recorder.on_rollback(now, "source reached EOS")
@@ -567,6 +643,7 @@ def main() -> None:
         )
         rate = RateController(config.rate)
         risk = RiskTracker(alpha=config.slow.ewma_alpha)
+        capacity = CapacityHeadroomTracker(config.capacity_pilot)
         audit = AuditLog(
             run_dir / "phase9_audit.jsonl",
             run_metadata={
@@ -632,6 +709,10 @@ def main() -> None:
                     time.sleep(config.tick_s)
                     continue
                 risk_value = risk.update(pool1)
+                capacity_signal = capacity.update(
+                    pool1.free_kv_tokens,
+                    pool1.sampled_unix_s or now,
+                )
                 request = read_source_progress(run_dir, source_request, now)
                 if request is None:
                     time.sleep(config.tick_s)
@@ -646,6 +727,7 @@ def main() -> None:
                         "tp1": pool1.__dict__,
                         "tp4": pool4.__dict__,
                         "rate_bytes_s": rate.rate_bytes_s,
+                        "capacity_signal": capacity_signal.to_json(),
                     }
                 )
 
@@ -668,6 +750,7 @@ def main() -> None:
                         int(source_request["max_tokens"]),
                         diagnostic_trigger,
                         diagnostic_cutover,
+                        capacity_signal,
                     )
                 elif record.state is MigrationState.SHADOW:
                     previous_target = target_future
@@ -703,6 +786,7 @@ def main() -> None:
                             now,
                             args.dry_run,
                             recorder,
+                            capacity_signal,
                         )
                 elif record.state is MigrationState.HANDOFF:
                     step_handoff(
@@ -726,6 +810,11 @@ def main() -> None:
                     "t_cutover": record.t_cutover,
                     "t_committed": record.t_committed,
                     "stopped_by_signal": _STOP,
+                    "trigger_path": (
+                        record.trigger_path.value
+                        if record.trigger_path is not None
+                        else None
+                    ),
                 }
             )
             audit.close()

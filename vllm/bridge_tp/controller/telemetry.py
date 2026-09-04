@@ -39,6 +39,14 @@ REQUEST_TPOT_METRICS = (
     "vllm:time_per_output_token_seconds",
 )
 
+# Prometheus clients append ``_total`` to some Counter exposition formats,
+# while current vLLM names this metric ``vllm:num_preemptions``.  Accept both,
+# preferring the current spelling.
+PREEMPTION_METRICS = (
+    "vllm:num_preemptions",
+    "vllm:num_preemptions_total",
+)
+
 
 class TelemetryError(RuntimeError):
     pass
@@ -270,7 +278,9 @@ def pool_from_samples(
         num_running=int(first_value(samples, "vllm:num_requests_running", 0.0)),
         num_waiting=int(first_value(samples, "vllm:num_requests_waiting", 0.0)),
         kv_usage_frac=kv_usage,
-        preemptions_total=int(first_value(samples, "vllm:num_preemptions_total", 0.0)),
+        preemptions_total=int(
+            first_value_for_names(samples, PREEMPTION_METRICS, 0.0)
+        ),
         p99_tpot_s=(
             histogram_quantile(samples, selected_tpot_metric, 0.99)
             if selected_tpot_metric is not None

@@ -74,6 +74,10 @@ class _Phase8SourceState:
     d2h_ms: float = 0.0
     finalized: bool = False
     stopped: bool = False
+    lifecycle_lock: threading.RLock = field(
+        default_factory=threading.RLock,
+        repr=False,
+    )
 
     def start(self) -> None:
         for rank in range(self.config.target_tp_size):
@@ -181,40 +185,44 @@ class _Phase8SourceState:
         start_token: int,
         end_token: int,
         rank_payloads: list[dict[str, torch.Tensor]],
-    ) -> None:
-        for rank, layers in enumerate(rank_payloads):
-            payload = serialize_rank_payload(
-                {
-                    "format_version": 1,
+    ) -> bool:
+        with self.lifecycle_lock:
+            if self.finalized or self.stopped:
+                return False
+            for rank, layers in enumerate(rank_payloads):
+                payload = serialize_rank_payload(
+                    {
+                        "format_version": 1,
+                        "phase": "BridgeTP D3 Phase 8",
+                        "migration_id": self.config.migration_id,
+                        "source_request_id": self.request_id,
+                        "target_tp_rank": rank,
+                        "start_token": start_token,
+                        "end_token": end_token,
+                        "layers": layers,
+                    }
+                )
+                header = {
+                    "protocol_version": PROTOCOL_VERSION,
                     "phase": "BridgeTP D3 Phase 8",
                     "migration_id": self.config.migration_id,
+                    "session_token": self.session_token,
                     "source_request_id": self.request_id,
                     "target_tp_rank": rank,
                     "start_token": start_token,
                     "end_token": end_token,
-                    "layers": layers,
+                    "payload_bytes": len(payload),
+                    "payload_sha256": sha256_bytes(payload),
+                    "num_frames": math.ceil(len(payload) / self.config.chunk_bytes),
+                    "chunk_bytes": self.config.chunk_bytes,
                 }
-            )
-            header = {
-                "protocol_version": PROTOCOL_VERSION,
-                "phase": "BridgeTP D3 Phase 8",
-                "migration_id": self.config.migration_id,
-                "session_token": self.session_token,
-                "source_request_id": self.request_id,
-                "target_tp_rank": rank,
-                "start_token": start_token,
-                "end_token": end_token,
-                "payload_bytes": len(payload),
-                "payload_sha256": sha256_bytes(payload),
-                "num_frames": math.ceil(len(payload) / self.config.chunk_bytes),
-                "chunk_bytes": self.config.chunk_bytes,
-            }
-            self.delta_payload_bytes += len(payload)
-            self.queues[rank].put(
-                _DeltaWork(start_token, end_token, header, payload)
-            )
-        self.delta_batches += 1
-        self.delta_tokens += end_token - start_token
+                self.delta_payload_bytes += len(payload)
+                self.queues[rank].put(
+                    _DeltaWork(start_token, end_token, header, payload)
+                )
+            self.delta_batches += 1
+            self.delta_tokens += end_token - start_token
+            return True
 
     def wait_for_acks(self) -> None:
         for work_queue in self.queues:
@@ -236,6 +244,12 @@ class _Phase8SourceState:
         if not cleanup_path.exists() or self.finalized:
             return
         try:
+            # Prevent later decode iterations from enqueueing deltas after the
+            # worker queues have been drained.  This matters when Phase 9
+            # abandons only the migration and deliberately leaves TP1 serving
+            # the request.
+            with self.lifecycle_lock:
+                self.finalized = True
             self.wait_for_acks()
             self.stop_workers()
             request = json.loads(cleanup_path.read_text(encoding="utf-8"))
@@ -391,11 +405,13 @@ def maybe_publish_phase8_delta(
         end_token=num_computed,
     )
     state.d2h_ms += d2h_ms
-    state.enqueue(
+    enqueued = state.enqueue(
         start_token=start_token,
         end_token=num_computed,
         rank_payloads=rank_payloads,
     )
+    if not enqueued:
+        return
     state.last_computed_token = num_computed
     if output_tokens != config.phase8_cutover_output_tokens:
         return

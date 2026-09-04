@@ -26,6 +26,7 @@ from .events import (
     MigrationState,
     PoolTelemetry,
     SourceRequestView,
+    TriggerPath,
 )
 from .predictor import SurvivalTable
 
@@ -431,6 +432,7 @@ class FastPolicy:
                     MigrationState.SHADOW,
                     f"forced escalation: p_oom={p_oom:.3f} >= {self.cfg.p_oom_force}",
                     **common,
+                    trigger_path=TriggerPath.POLICY_OOM_RISK,
                 ),
                 forced=True,
             )
@@ -493,6 +495,7 @@ class FastPolicy:
                 MigrationState.SHADOW,
                 f"p_worth={p_worth:.3f} >= theta={theta:.3f} (N*={n_star:.0f})",
                 **common,
+                trigger_path=TriggerPath.PERFORMANCE_OPPORTUNITY,
             )
         return mk(
             Action.STAY,

@@ -20,6 +20,7 @@ from .events import (
     MigrationState,
     PoolTelemetry,
     SourceRequestView,
+    TriggerPath,
 )
 from .policy import (
     FastPolicy,
@@ -59,6 +60,7 @@ __all__ = [
     "StreamViolation",
     "SurvivalTable",
     "TpotModel",
+    "TriggerPath",
     "freeze_strict_greedy_sampling",
     "read_audit",
     "strict_greedy_sampling_errors",

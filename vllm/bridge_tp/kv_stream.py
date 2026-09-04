@@ -19,6 +19,7 @@ from typing import Any
 
 import torch
 
+from vllm.bridge_tp.controller.anchor_selector import select_source_request_id
 from vllm.bridge_tp.kv_export import (
     _copy_request_blocks,
     _estimate_dump_bytes,
@@ -83,6 +84,10 @@ class BridgeTPStreamConfig:
     socket_timeout_s: float
     pin_memory: bool
     strict: bool
+    # Optional external request-ID prefix used by the capacity pilot to pick
+    # one anchor from a real multi-request scheduler batch.  Empty preserves
+    # the Phase 6-8 single-request-only behaviour exactly.
+    source_request_id_prefix: str = ""
     # False only when a Phase 9 controller has published a control block that
     # has not armed this migration yet.  Absent a control block this stays True,
     # so Phase 6/7/8 runs behave exactly as before.
@@ -134,6 +139,9 @@ class BridgeTPStreamConfig:
             ),
             pin_memory=_env_bool("BRIDGETP_STREAM_PIN_MEMORY", True),
             strict=_env_bool("BRIDGETP_STREAM_STRICT", True),
+            source_request_id_prefix=os.getenv(
+                "BRIDGETP_STREAM_SOURCE_REQUEST_ID_PREFIX", ""
+            ).strip(),
         )
         if config.target_tp_size != 4:
             raise ValueError("BridgeTP Phase 6 currently requires target TP=4")
@@ -634,9 +642,12 @@ def maybe_publish_kv_stream(
         return
     try:
         request_ids = input_batch.req_ids
-        if len(request_ids) != 1:
+        request_id = select_source_request_id(
+            request_ids,
+            config.source_request_id_prefix,
+        )
+        if request_id is None:
             return
-        request_id = request_ids[0]
         if _published_request_ids and request_id not in _published_request_ids:
             # A dedicated validation server owns one migration session. Later
             # clean-control requests must not overwrite its progress evidence

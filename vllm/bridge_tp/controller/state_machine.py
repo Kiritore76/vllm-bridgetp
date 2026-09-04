@@ -18,7 +18,12 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from .events import LEGAL_TRANSITIONS, TERMINAL_STATES, MigrationState
+from .events import (
+    LEGAL_TRANSITIONS,
+    TERMINAL_STATES,
+    MigrationState,
+    TriggerPath,
+)
 
 
 class IllegalTransition(RuntimeError):
@@ -39,6 +44,7 @@ class MigrationRecord:
     # boundaries
     trigger_output_tokens: int | None = None
     cutover_output_tokens: int | None = None
+    trigger_path: TriggerPath | None = None
 
     # timings, unix seconds
     t_decision: float | None = None
@@ -145,6 +151,11 @@ class MigrationStateMachine:
                     "to": to.value,
                     "reason": reason,
                     "ranks_ready": sorted(record.ranks_ready),
+                    "trigger_path": (
+                        record.trigger_path.value
+                        if record.trigger_path is not None
+                        else None
+                    ),
                 }
             )
             return record
