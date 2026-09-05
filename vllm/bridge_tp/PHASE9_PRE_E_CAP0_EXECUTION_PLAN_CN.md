@@ -830,13 +830,19 @@ test -f "$CAP0_TRACE"
 mkdir -p "$CAP0_INPUT_ROOT"
 
 "$BRIDGE_PY" tools/bridge_tp/build_survival_table.py \
-  --trace "$CAP0_TRACE" --output-field output_tokens --train-frac 0.7 \
+  --trace "$CAP0_TRACE" --output-field output_len --time-field timestamp \
+  --train-frac 0.7 --expected-total-rows 43058 \
+  --expected-train-rows 30140 \
   --out "$CAP0_SURVIVAL_TABLE"
 
 "$BRIDGE_PY" -c 'from vllm.bridge_tp.controller.predictor import SurvivalTable; import sys; t=SurvivalTable.load(sys.argv[1]); print("VALID",sys.argv[1],"max_observed_length",t.max_observed_length)' \
   "$CAP0_SURVIVAL_TABLE"
 sha256sum "$CAP0_TRACE" "$CAP0_SURVIVAL_TABLE" \
   | tee "$CAP0_INPUT_ROOT/predictor_inputs.sha256"
+test "$(sha256sum "$CAP0_TRACE" | awk '{print $1}')" = \
+  443ad43e5264ba9c48e984e999f723ab3e73dcec53a46d7a2e1240514d393314
+test "$(sha256sum "$CAP0_SURVIVAL_TABLE" | awk '{print $1}')" = \
+  031b06b0e7d663d5a4ad9cf71f2a640123b84d8e85eb4c94d94f44baa20aaa4a
 printf 'export CAP0_TRACE=%s\nexport CAP0_INPUT_ROOT=%s\nexport CAP0_SURVIVAL_TABLE=%s\n' \
   "$CAP0_TRACE" "$CAP0_INPUT_ROOT" "$CAP0_SURVIVAL_TABLE" \
   > /root/autodl-tmp/bridgetp/phase9_cap0_predictor.env
