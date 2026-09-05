@@ -69,8 +69,9 @@ def validate_abandon_pressure(
     tp1_total_tokens: int,
     tp4_total_tokens: int,
     max_model_len: int,
+    expected_scenario: str = "CAP-0 Safe abandon bring-up",
 ) -> dict[str, Any]:
-    if manifest.get("scenario") != "CAP-0 Safe abandon bring-up":
+    if manifest.get("scenario") != expected_scenario:
         raise ValueError("manifest is not labeled CAP-0 Safe abandon")
     jobs = manifest.get("jobs")
     if not isinstance(jobs, list) or not jobs:
@@ -332,7 +333,11 @@ def accept_abandon(
     }
 
 
-def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]:
+def validate_inputs(
+    args: argparse.Namespace,
+    *,
+    expected_scenario: str = "CAP-0 Safe abandon bring-up",
+) -> tuple[str, int, dict[str, Any]]:
     if os.name == "nt":
         raise RuntimeError("CAP-0 Safe-abandon runner requires Linux")
     for path in (
@@ -373,6 +378,7 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         tp1_total_tokens=args.tp1_blocks * 16,
         tp4_total_tokens=args.tp4_blocks * 16,
         max_model_len=args.max_model_len,
+        expected_scenario=expected_scenario,
     )
     if args.out_root.exists():
         raise FileExistsError(f"refusing to reuse output root {args.out_root}")
