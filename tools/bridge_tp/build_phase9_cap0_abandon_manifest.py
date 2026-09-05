@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-start-interval-s", type=float, default=0.01)
     parser.add_argument("--target-prompt-token-id", type=int, default=100)
     parser.add_argument("--source-copies", type=int, default=4)
-    parser.add_argument("--source-output-tokens", type=int, default=4200)
+    parser.add_argument("--source-output-tokens", type=int, default=4300)
     parser.add_argument("--source-start-after-s", type=float, default=2.0)
     parser.add_argument("--source-start-interval-s", type=float, default=0.2)
     parser.add_argument("--max-model-len", type=int, default=8192)
@@ -46,7 +46,7 @@ def build_manifest(**overrides: Any) -> dict[str, Any]:
         "target_start_interval_s": 0.01,
         "target_prompt_token_id": 100,
         "source_copies": 4,
-        "source_output_tokens": 4200,
+        "source_output_tokens": 4300,
         "source_start_after_s": 2.0,
         "source_start_interval_s": 0.2,
         "max_model_len": 8192,

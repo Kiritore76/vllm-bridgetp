@@ -1887,7 +1887,7 @@ cutover 前安全取消迁移，并保持 TP1 对请求及客户端输出的唯�
 默认 working manifest 包含 4 个轻量 TP4 target jobs 和 4 个有限 TP1 source-pressure jobs，
 共 8 个 background jobs。TP4 context demand 为 32400 tokens，仅占实测容量约 5.7%，用于
 确保 active signal 出现时 target 可立即接纳 Shadow；TP1 的 background output demand 为
-16800 tokens，加 8000-token anchor 后为 24800 tokens，约占实测 TP1 容量 78.8%。该有限
+17200 tokens，加 8000-token anchor 后为 25200 tokens，约占实测 TP1 容量 80.0%。该有限
 burst 应先压低 headroom 触发一次 `START_SHADOW`，再在历史复制完成前自然结束并恢复
 headroom。上述时序只是 bring-up 候选，实际结果必须由 audit 和 cleanup receipts 证明。
 
