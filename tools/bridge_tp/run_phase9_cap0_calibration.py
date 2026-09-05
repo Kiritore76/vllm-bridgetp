@@ -469,14 +469,54 @@ def calibration_metrics(controller_dir: Path) -> dict[str, Any]:
     rows = load_audit(controller_dir / "phase9_audit.jsonl")
     telemetry = [row for row in rows if row.get("kind") == "telemetry"]
     initial = int(telemetry[0]["tp1"]["preemptions_total"])
-    first = next(
+    first_index = next(
         (
-            row
-            for row in telemetry
+            index
+            for index, row in enumerate(telemetry)
             if int(row["tp1"]["preemptions_total"]) > initial
         ),
         None,
     )
+    first = telemetry[first_index] if first_index is not None else None
+    before_first = (
+        telemetry[:first_index] if first_index is not None else telemetry
+    )
+
+    # Admission, completion and recompute can allocate or release thousands of
+    # KV tokens between two scrapes.  Those discrete scheduler events are not a
+    # token-generation slope and must not be extrapolated for T_enter seconds.
+    # Use unchanged scheduler-state intervals and a robust p95 instead.  The
+    # maximum p95 across formal repetitions remains deliberately conservative.
+    steady_declines: list[float] = []
+    for previous, current in zip(before_first, before_first[1:]):
+        previous_tp1 = previous["tp1"]
+        current_tp1 = current["tp1"]
+        scheduler_fields = (
+            "num_running",
+            "num_waiting",
+            "preemptions_total",
+        )
+        if any(
+            int(previous_tp1[field]) != int(current_tp1[field])
+            for field in scheduler_fields
+        ):
+            continue
+        previous_time = float(previous_tp1["sampled_unix_s"])
+        current_time = float(current_tp1["sampled_unix_s"])
+        elapsed = current_time - previous_time
+        if elapsed <= 0 or elapsed > 2.0:
+            continue
+        previous_free = int(previous["capacity_signal"]["free_kv_tokens"])
+        current_free = int(current["capacity_signal"]["free_kv_tokens"])
+        consumed = previous_free - current_free
+        if consumed > 0:
+            steady_declines.append(consumed / elapsed)
+    if not steady_declines:
+        raise RuntimeError("no steady TP1 KV-decline samples before preemption")
+    ordered_declines = sorted(steady_declines)
+    p95_index = max(0, math.ceil(0.95 * len(ordered_declines)) - 1)
+    steady_p95 = ordered_declines[p95_index]
+
     free = [int(row["capacity_signal"]["free_kv_tokens"]) for row in telemetry]
     decline = [
         float(row["capacity_signal"]["decline_rate_tokens_s"])
@@ -488,13 +528,20 @@ def calibration_metrics(controller_dir: Path) -> dict[str, Any]:
     return {
         "samples": len(telemetry),
         "minimum_free_kv_tokens": min(free),
-        "first_preemption_free_kv_tokens": (
+        "pre_preemption_free_kv_tokens": (
+            int(telemetry[first_index - 1]["capacity_signal"]["free_kv_tokens"])
+            if first_index is not None and first_index > 0
+            else None
+        ),
+        "post_preemption_free_kv_tokens": (
             int(first["capacity_signal"]["free_kv_tokens"])
             if first is not None
             else None
         ),
         "censored": first is None,
-        "maximum_ewma_decline_tokens_s": max(decline),
+        "steady_decline_sample_count": len(steady_declines),
+        "steady_decline_p95_tokens_s": steady_p95,
+        "maximum_observed_ewma_decline_tokens_s": max(decline),
         "peak_tp1_kv_usage_frac": max(kv_usage),
         "maximum_tp1_waiting": max(waiting),
         "preemption_delta": max(preemptions) - initial,
@@ -510,13 +557,13 @@ def calculate_guard_candidate(
     if not metrics:
         raise ValueError("at least one calibration metric is required")
     f_values = [
-        int(item["first_preemption_free_kv_tokens"])
-        if item["first_preemption_free_kv_tokens"] is not None
+        int(item["pre_preemption_free_kv_tokens"])
+        if item["pre_preemption_free_kv_tokens"] is not None
         else int(item["minimum_free_kv_tokens"])
         for item in metrics
     ]
     maximum_decline = max(
-        float(item["maximum_ewma_decline_tokens_s"]) for item in metrics
+        float(item["steady_decline_p95_tokens_s"]) for item in metrics
     )
     raw = max(f_values) + maximum_decline * enter_seconds
     rounded = math.ceil(raw / block_size) * block_size
@@ -525,7 +572,7 @@ def calculate_guard_candidate(
         "format_version": 1,
         "status": "CANDIDATE_NOT_FROZEN",
         "f_values": f_values,
-        "maximum_ewma_decline_tokens_s": maximum_decline,
+        "maximum_steady_decline_p95_tokens_s": maximum_decline,
         "enter_seconds": enter_seconds,
         "raw_guard_tokens": raw,
         "block_size": block_size,
