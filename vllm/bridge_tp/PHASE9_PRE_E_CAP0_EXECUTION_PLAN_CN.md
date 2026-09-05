@@ -1229,6 +1229,63 @@ T1 按 `Ctrl+C`，依次正常停止 stager、TP1、TP4。不要使用 `pkill -f
 tracker 仍记录 raw free-KV、EWMA decline、running、waiting 和 preemption；`--dry-run` 保证
 即使 legacy performance decision 出现也不会执行 actuator。
 
+### 21.1 推荐：一个前台终端从 r01 自动跑到 r03
+
+`run_phase9_cap0_calibration.py` 把第 20 节的五个进程封装成一个前台父进程。它每轮依次
+启动 TP4、TP1、stager、dry-run controller 和三任务 workload，健康检查后才进入下一步，
+并在轮次间正常停止全部子进程。任一轮失败就停止，不继续消耗后续轮次；失败日志仍完整
+保留。这个批次会从全新的 `r01` 开始，不复用此前手工运行。
+
+只需要一个终端执行：
+
+```bash
+cd /root/autodl-tmp/bridgetp/vllm_bridge
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
+source /root/autodl-tmp/bridgetp/phase9_cap0_geometry.env
+source /root/autodl-tmp/bridgetp/phase9_cap0_predictor.env
+
+export OMP_NUM_THREADS=1
+export CAP0_CODE_REVISION="$(git rev-parse HEAD)"
+export CAL_BATCH_ID="cap0-calibration-batch-$(date -u +%Y%m%dT%H%M%SZ)"
+export CAL_BATCH_PARENT="$CAP0_RESULTS/calibration_batches"
+export CAL_BATCH_DIR="$CAL_BATCH_PARENT/$CAL_BATCH_ID"
+mkdir -p "$CAL_BATCH_PARENT"
+set -o pipefail
+
+"$BRIDGE_PY" tools/bridge_tp/run_phase9_cap0_calibration.py \
+  --model-path "$BRIDGE_MODEL" \
+  --manifest "$CAP0_MANIFEST_ROOT/frozen/calibration_v1.json" \
+  --survival-table "$CAP0_SURVIVAL_TABLE" \
+  --out-root "$CAL_BATCH_DIR" \
+  --expected-revision "$CAP0_CODE_REVISION" \
+  --expected-manifest-sha256 \
+    843d8725914b794e31268dffc1c980a4321b68bad68723c07a1611863c3758e3 \
+  --expected-survival-sha256 \
+    031b06b0e7d663d5a4ad9cf71f2a640123b84d8e85eb4c94d94f44baa20aaa4a \
+  --tp1-blocks "$TP1_BLOCKS" \
+  --tp4-blocks "$TP4_BLOCKS" \
+  --repetitions 3 \
+  2>&1 | tee "$CAL_BATCH_PARENT/${CAL_BATCH_ID}.console.txt"
+```
+
+不要预先创建 `$CAL_BATCH_DIR`；脚本用“目录必须不存在”防止覆盖旧结果。输出布局固定为：
+
+```text
+calibration_batches/<batch-id>/
+  batch_status.json
+  guard_candidate.json
+  r01/{controller,background,provenance,status.json}
+  r02/{controller,background,provenance,status.json}
+  r03/{controller,background,provenance,status.json}
+```
+
+成功条件是终端出现 `COMPLETE`，且 `batch_status.json` 的 `status` 为 `COMPLETE`、三轮均为
+`PASS`。`guard_candidate.json` 只是按事前公式自动计算的候选值，脚本不会自动冻结 guard；
+必须先人工审阅三轮曲线和删失情况。按 `Ctrl+C` 会触发父进程清理它创建的服务，不要再用
+`pkill -f`。No-op、Rescue、Safe abandon 尚未冻结各自 bring-up 与 manifest，因此不在这个
+循环中。
+
 三轮完成后输出可审计摘要：
 
 ```bash
