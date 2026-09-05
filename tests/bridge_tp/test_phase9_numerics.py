@@ -251,6 +251,23 @@ class TestOptInConfiguration(unittest.TestCase):
             connector._request_matches(request)
 
     @unittest.skipUnless(importlib.util.find_spec("torch"), "requires torch")
+    def test_streaming_connector_allows_unmarked_background_before_manifest(
+        self,
+    ) -> None:
+        from vllm.bridge_tp.streaming_connector import BridgeTPStreamingConnector
+
+        connector = object.__new__(BridgeTPStreamingConnector)
+        connector._manifest = None
+        connector.manifest_path = Path("missing-staging-manifest.json")
+        request = types.SimpleNamespace(
+            request_id="cmpl-bridgetp-cap0-load-target_000",
+            kv_transfer_params=None,
+            prompt_token_ids=[1, 2, 3],
+            num_tokens=3,
+        )
+        self.assertFalse(connector._request_matches(request))
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "requires torch")
     def test_streaming_connector_rejects_wrong_migration_id(self):
         from vllm.bridge_tp.streaming_connector import BridgeTPStreamingConnector
 

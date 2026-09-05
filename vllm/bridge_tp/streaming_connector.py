@@ -192,12 +192,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
 
     def _request_matches(self, request: Request) -> bool:
         params = request.kv_transfer_params or {}
-        manifest = self._load_manifest()
         migration_id = params.get(MIGRATION_PARAM)
-        prompt = request.prompt_token_ids
-        prompt_matches = prompt is not None and list(prompt) == list(
-            manifest["all_known_token_ids"]
-        )
         if migration_id is None:
             if (
                 "bridgetp-phase" in request.request_id
@@ -208,6 +203,11 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     f"{MIGRATION_PARAM!r}; refusing local recomputation"
                 )
             return False
+        manifest = self._load_manifest()
+        prompt = request.prompt_token_ids
+        prompt_matches = prompt is not None and list(prompt) == list(
+            manifest["all_known_token_ids"]
+        )
         if migration_id != manifest["migration_id"]:
             raise ValueError(
                 "BridgeTP target migration id differs from the active manifest: "
