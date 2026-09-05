@@ -501,7 +501,10 @@ HEAD 永远等于 `73b03bb`。
 cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 
-set -euo pipefail
+# 交互终端不要继承此前脚本留下的 errexit/nounset/pipefail；失败由每步退出码显式判断。
+set +e
+set +u
+set +o pipefail
 
 export BRIDGE_BASE=/root/autodl-tmp/bridgetp/vllm_bridge
 export BRIDGE_REPO=/root/autodl-tmp/bridgetp/vllm_bridge
@@ -621,7 +624,11 @@ source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
   2>&1 | tee "$E0_DIR/all_phase9_tests.txt"
 
 git diff --check | tee "$E0_DIR/git_diff_check.txt"
-test -z "$(git status --porcelain)"
+echo "git_diff_check_rc=${PIPESTATUS[0]}" | tee -a "$E0_DIR/git_diff_check.txt"
+git status --short --branch | tee "$E0_DIR/post_test_git_status.txt"
+
+# 不再断言整个工作树为空：切换前已存在且不与 CAP-0 冲突的用户文件允许保留。
+# 只要上面的 CAP-0 commit 祖先核验、Python 编译和测试通过，就不会因这些用户文件退出终端。
 ```
 
 预期基线是 targeted 121 tests 通过、全部 `test_phase9_*.py` 为 174 tests 通过且 4 skipped；
