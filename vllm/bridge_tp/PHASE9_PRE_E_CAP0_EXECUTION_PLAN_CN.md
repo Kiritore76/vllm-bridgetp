@@ -1996,6 +1996,143 @@ state，调用 `abort_source=false` cleanup 后才进入 CANCELLED；最终验�
 stager cleanup receipts。等待对象只来自本次已触发 snapshot 的当前状态，不读取未来负载。
 必须使用修订后的明确 commit 和全新 ID 再跑一次 bring-up。
 
+### 22.6 冻结 P2 Safe abandon workload 并运行正式重复
+
+`cap0-abandon-bringup-20260905T140558Z` 已在 revision
+`b0817a23fa8f13c360ebbcd5f241ddd89de9dc13` 完成标准 bring-up：8/8 background jobs
+成功，恰好一次 ENTER/START_SHADOW、Shadow 内一次 CLEAR，状态严格为
+`SHADOW -> CANCELLED`；cleanup 为 `abort_source=false`，takeover state 为 CANCELLED，
+source/stager receipt 均为 CLEANED，8000 tokens 全由 TP1 输出，且没有任何 cutover、target
+或 receiver 工件。origin/expanded manifest SHA-256 为
+`959c5a12424d2aa4b4755899a28127d0c2522fc02fad9b6bf23294fdeea53385`。
+
+拉取包含 Safe-abandon freezer/formal runner 的明确 revision 后，先冻结 bring-up 实际执行的
+exact jobs。冻结器交叉核验 working/expanded/inputs/acceptance/status 及其哈希，不根据当前
+builder 重新生成 workload：
+
+```bash
+cd /root/autodl-tmp/bridgetp/vllm_bridge
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
+
+set +e
+set +u
+set +o pipefail
+
+export BRINGUP_ID=cap0-abandon-bringup-20260905T140558Z
+export BRINGUP_REVISION=b0817a23fa8f13c360ebbcd5f241ddd89de9dc13
+export BRINGUP_ROOT="$CAP0_RESULTS/abandon_bringup/$BRINGUP_ID"
+export ORIGIN_ABANDON="$CAP0_MANIFEST_ROOT/working/${BRINGUP_ID}.json"
+export ORIGIN_ABANDON_SHA=959c5a12424d2aa4b4755899a28127d0c2522fc02fad9b6bf23294fdeea53385
+export CAP0_SURVIVAL_SHA=031b06b0e7d663d5a4ad9cf71f2a640123b84d8e85eb4c94d94f44baa20aaa4a
+export CAP0_GUARD_FILE="$CAP0_MANIFEST_ROOT/frozen/guard_free_kv_tokens.txt"
+export CAP0_GUARD_SHA=0e86c353044f9610be1b5511ff21e870823b7f259c40ccde24188d84164b545b
+export FROZEN_ABANDON="$CAP0_MANIFEST_ROOT/frozen/abandon_v1.json"
+
+test "$(sha256sum "$ORIGIN_ABANDON" | awk '{print $1}')" = "$ORIGIN_ABANDON_SHA"
+test "$(sha256sum "$BRINGUP_ROOT/background/background_manifest.json" | awk '{print $1}')" = "$ORIGIN_ABANDON_SHA"
+
+"$BRIDGE_PY" tools/bridge_tp/freeze_phase9_cap0_abandon.py \
+  --bringup-root "$BRINGUP_ROOT" \
+  --working-manifest "$ORIGIN_ABANDON" \
+  --out "$FROZEN_ABANDON" \
+  --expected-bringup-revision "$BRINGUP_REVISION" \
+  --expected-working-sha256 "$ORIGIN_ABANDON_SHA" \
+  --expected-survival-sha256 "$CAP0_SURVIVAL_SHA" \
+  --expected-guard-sha256 "$CAP0_GUARD_SHA" \
+  --expected-guard 8448 \
+  --tp1-blocks "$TP1_BLOCKS" --tp4-blocks "$TP4_BLOCKS"
+export FREEZE_RC=$?
+
+export FROZEN_ABANDON_PROVENANCE="$CAP0_MANIFEST_ROOT/frozen/abandon_v1.provenance.json"
+export FROZEN_ABANDON_SHA="$(awk '{print $1}' "$CAP0_MANIFEST_ROOT/frozen/abandon_v1.sha256")"
+
+echo "FREEZE_RC=$FREEZE_RC"
+echo "FROZEN_ABANDON_SHA=$FROZEN_ABANDON_SHA"
+test "$FREEZE_RC" -eq 0
+test "$(sha256sum "$FROZEN_ABANDON" | awk '{print $1}')" = "$FROZEN_ABANDON_SHA"
+```
+
+冻结成功后，在同一前台终端先静态核验 formal contract，再连续运行 r01--r03。每轮由父
+runner 重新启动 TP4、TP1、stager、controller 和 background workload；任一轮失败即停止并
+保留现场：
+
+```bash
+cd /root/autodl-tmp/bridgetp/vllm_bridge
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
+
+set +e
+set +u
+set +o pipefail
+
+export CAP0_CODE_REVISION="$(git rev-parse HEAD)"
+export BRINGUP_ID=cap0-abandon-bringup-20260905T140558Z
+export BRINGUP_ROOT="$CAP0_RESULTS/abandon_bringup/$BRINGUP_ID"
+export CAP0_SURVIVAL_SHA=031b06b0e7d663d5a4ad9cf71f2a640123b84d8e85eb4c94d94f44baa20aaa4a
+export CAP0_GUARD_FILE="$CAP0_MANIFEST_ROOT/frozen/guard_free_kv_tokens.txt"
+export CAP0_GUARD_SHA=0e86c353044f9610be1b5511ff21e870823b7f259c40ccde24188d84164b545b
+export FROZEN_ABANDON="$CAP0_MANIFEST_ROOT/frozen/abandon_v1.json"
+export FROZEN_ABANDON_PROVENANCE="$CAP0_MANIFEST_ROOT/frozen/abandon_v1.provenance.json"
+export FROZEN_ABANDON_SHA="$(awk '{print $1}' "$CAP0_MANIFEST_ROOT/frozen/abandon_v1.sha256")"
+export ABANDON_BATCH_ID="cap0-abandon-formal-$(date -u +%Y%m%dT%H%M%SZ)"
+export ABANDON_BATCH_ROOT="$CAP0_RESULTS/abandon_batches/$ABANDON_BATCH_ID"
+mkdir -p "$CAP0_RESULTS/abandon_batches"
+
+"$BRIDGE_PY" tools/bridge_tp/run_phase9_cap0_abandon_formal.py \
+  --validate-only \
+  --model-path "$BRIDGE_MODEL" \
+  --manifest "$FROZEN_ABANDON" \
+  --manifest-provenance "$FROZEN_ABANDON_PROVENANCE" \
+  --bringup-root "$BRINGUP_ROOT" \
+  --survival-table "$CAP0_SURVIVAL_TABLE" \
+  --guard-file "$CAP0_GUARD_FILE" \
+  --out-root "$ABANDON_BATCH_ROOT" \
+  --expected-revision "$CAP0_CODE_REVISION" \
+  --expected-manifest-sha256 "$FROZEN_ABANDON_SHA" \
+  --expected-survival-sha256 "$CAP0_SURVIVAL_SHA" \
+  --expected-guard-sha256 "$CAP0_GUARD_SHA" \
+  --expected-guard 8448 \
+  --tp1-blocks "$TP1_BLOCKS" --tp4-blocks "$TP4_BLOCKS" \
+  --repetitions 3
+export VALIDATE_RC=$?
+
+if [ "$VALIDATE_RC" -eq 0 ]; then
+  set -o pipefail
+  "$BRIDGE_PY" tools/bridge_tp/run_phase9_cap0_abandon_formal.py \
+    --model-path "$BRIDGE_MODEL" \
+    --manifest "$FROZEN_ABANDON" \
+    --manifest-provenance "$FROZEN_ABANDON_PROVENANCE" \
+    --bringup-root "$BRINGUP_ROOT" \
+    --survival-table "$CAP0_SURVIVAL_TABLE" \
+    --guard-file "$CAP0_GUARD_FILE" \
+    --out-root "$ABANDON_BATCH_ROOT" \
+    --expected-revision "$CAP0_CODE_REVISION" \
+    --expected-manifest-sha256 "$FROZEN_ABANDON_SHA" \
+    --expected-survival-sha256 "$CAP0_SURVIVAL_SHA" \
+    --expected-guard-sha256 "$CAP0_GUARD_SHA" \
+    --expected-guard 8448 \
+    --tp1-blocks "$TP1_BLOCKS" --tp4-blocks "$TP4_BLOCKS" \
+    --repetitions 3 \
+    2>&1 | tee "$CAP0_RESULTS/abandon_batches/${ABANDON_BATCH_ID}.console.txt"
+  export ABANDON_FORMAL_RC=${PIPESTATUS[0]}
+  set +o pipefail
+else
+  export ABANDON_FORMAL_RC=98
+fi
+
+echo "VALIDATE_RC=$VALIDATE_RC"
+echo "ABANDON_FORMAL_RC=$ABANDON_FORMAL_RC"
+echo "ABANDON_BATCH_ROOT=$ABANDON_BATCH_ROOT"
+test "$VALIDATE_RC" -eq 0
+test "$ABANDON_FORMAL_RC" -eq 0
+```
+
+成功标志为 `ABANDON_FORMAL_COMPLETE`；`batch_status.json` 必须为 `FORMAL_COMPLETE`，
+`formal_acceptance.json` 必须为 3/3 PASS。每轮仍必须有一次因果 CLEAR、non-destructive
+cleanup、纯 TP1 8000-token 输出和零 cutover/receiver 工件。该批次只关闭 CAP-0 P2 工程
+门，不是正式 E 性能结果。
+
 三者共同设置：
 
 ```bash
