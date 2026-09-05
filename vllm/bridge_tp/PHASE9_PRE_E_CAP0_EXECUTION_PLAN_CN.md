@@ -812,6 +812,38 @@ formal summarize，也不要把该目录合并进旧 49 条 D 结果。
 
 ## 19. 生成 no-migration/CAP-0 workload manifest
 
+### 19.1 冻结 controller predictor 输入
+
+controller 即使在 capacity disabled 和 `--dry-run` 下也会初始化 `SurvivalTable`。先从既有
+M1 trace 确定性生成 CAP-0 predictor 输入，并保存 trace/table hash；这不是重跑 C，也不能
+替代正式 E 的 predictor provenance：
+
+```bash
+cd /root/autodl-tmp/bridgetp/vllm_bridge
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
+
+export CAP0_TRACE=/root/autodl-tmp/bridgetp/experiments4/data/traces/qwen_traceA_e1.csv
+export CAP0_INPUT_ROOT=/root/autodl-tmp/bridgetp/phase9_cap0_inputs
+export CAP0_SURVIVAL_TABLE="$CAP0_INPUT_ROOT/survival_table_m1_v1.json"
+test -f "$CAP0_TRACE"
+mkdir -p "$CAP0_INPUT_ROOT"
+
+"$BRIDGE_PY" tools/bridge_tp/build_survival_table.py \
+  --trace "$CAP0_TRACE" --output-field output_tokens --train-frac 0.7 \
+  --out "$CAP0_SURVIVAL_TABLE"
+
+"$BRIDGE_PY" -c 'from vllm.bridge_tp.controller.predictor import SurvivalTable; import sys; t=SurvivalTable.load(sys.argv[1]); print("VALID",sys.argv[1],"max_observed_length",t.max_observed_length)' \
+  "$CAP0_SURVIVAL_TABLE"
+sha256sum "$CAP0_TRACE" "$CAP0_SURVIVAL_TABLE" \
+  | tee "$CAP0_INPUT_ROOT/predictor_inputs.sha256"
+printf 'export CAP0_TRACE=%s\nexport CAP0_INPUT_ROOT=%s\nexport CAP0_SURVIVAL_TABLE=%s\n' \
+  "$CAP0_TRACE" "$CAP0_INPUT_ROOT" "$CAP0_SURVIVAL_TABLE" \
+  > /root/autodl-tmp/bridgetp/phase9_cap0_predictor.env
+```
+
+### 19.2 生成并冻结 workload manifest
+
 先建立独立 manifest 目录。manifest 永远传给 workload generator，不传给 controller，也不
 放进 controller 的 run directory：
 
@@ -904,6 +936,7 @@ source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 
 source /root/autodl-tmp/bridgetp/phase9_cap0_geometry.env
+source /root/autodl-tmp/bridgetp/phase9_cap0_predictor.env
 
 export CAP0_CLASS=calibration
 export CAP0_REP=01
@@ -930,6 +963,7 @@ printf '%s\n' \
   "export BRIDGE_MODEL=$BRIDGE_MODEL" \
   "export TP1_BLOCKS=$TP1_BLOCKS" \
   "export TP4_BLOCKS=$TP4_BLOCKS" \
+  "export CAP0_SURVIVAL_TABLE=$CAP0_SURVIVAL_TABLE" \
   "export CAP0_ID=$CAP0_ID" \
   "export CAP0_DIR=$CAP0_DIR" \
   "export CAP0_BG_DIR=$CAP0_BG_DIR" \
@@ -968,7 +1002,7 @@ cfg = json.loads(src.read_text(encoding='utf-8'))
 cfg['run_dir'] = os.environ['CAP0_DIR']
 cfg['tp1_total_kv_blocks'] = int(os.environ['TP1_BLOCKS'])
 cfg['tp4_total_kv_blocks'] = int(os.environ['TP4_BLOCKS'])
-cfg['survival_table_path'] = '/root/autodl-tmp/bridgetp/calibration/survival_table.json'
+cfg['survival_table_path'] = os.environ['CAP0_SURVIVAL_TABLE']
 cfg['platform_note'] = 'CAP-0 ENGINEERING PILOT; 5x A100 PCIe; exact provenance in run'
 cfg['capacity_pilot']['enabled'] = bool(int(os.environ['CAP0_CAPACITY_ENABLED']))
 cfg['capacity_pilot']['guard_free_kv_tokens'] = int(os.environ['CAP0_GUARD'])
