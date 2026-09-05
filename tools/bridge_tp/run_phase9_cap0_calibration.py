@@ -435,7 +435,10 @@ def accept_calibration(
     ):
         errors.append("background timing is missing")
     else:
-        if audit_end is None or float(audit_end) < float(background_end):
+        if (
+            audit_end is None
+            or float(audit_end) + coverage_slack_s < float(background_end)
+        ):
             errors.append("controller ended before the background workload")
         if (
             last_telemetry is None

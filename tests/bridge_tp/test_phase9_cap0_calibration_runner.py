@@ -320,6 +320,63 @@ class TestCalibrationAcceptance(unittest.TestCase):
             self.assertEqual(result["status"], "PASS")
             self.assertEqual(result["migration_transitions"], 0)
 
+    def test_accepts_controller_end_within_coverage_slack(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            controller = root / "controller"
+            background = root / "background"
+            controller.mkdir()
+            background.mkdir()
+            # The controller run_end is 0.4 s before the background end and
+            # the final telemetry is 0.5 s before it.  Both are inside the
+            # same explicitly configured 1.0 s observation tolerance.
+            self.write_run(
+                controller,
+                background,
+                background_end=20.0,
+                telemetry_end=19.5,
+            )
+            result = MODULE.accept_calibration(
+                controller,
+                background,
+                expected_jobs=5,
+                minimum_peak_kv_usage_frac=0.90,
+                require_preemption=True,
+                coverage_slack_s=1.0,
+            )
+            self.assertEqual(result["status"], "PASS")
+            self.assertNotIn(
+                "controller ended before the background workload",
+                result["errors"],
+            )
+
+    def test_rejects_controller_end_beyond_coverage_slack(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            controller = root / "controller"
+            background = root / "background"
+            controller.mkdir()
+            background.mkdir()
+            self.write_run(
+                controller,
+                background,
+                background_end=20.0,
+                telemetry_end=18.5,
+            )
+            result = MODULE.accept_calibration(
+                controller,
+                background,
+                expected_jobs=5,
+                minimum_peak_kv_usage_frac=0.90,
+                require_preemption=True,
+                coverage_slack_s=1.0,
+            )
+            self.assertEqual(result["status"], "FAIL")
+            self.assertIn(
+                "controller ended before the background workload",
+                result["errors"],
+            )
+
     def test_rejects_migration_transition(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

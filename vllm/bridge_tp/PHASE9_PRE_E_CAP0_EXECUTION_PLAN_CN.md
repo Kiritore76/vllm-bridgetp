@@ -1260,6 +1260,9 @@ smoke 只运行一次且不计入 r01--r03。它必须同时证明：五个 back
 生命周期、最终留在 TP1 且没有任何迁移转换。任一条件不满足都不生成 PASS contract。
 70% 是采样下限而非容量阈值：一次 preemption 可瞬时释放最大约 25% TP1 cache，因此不要求
 0.2 秒 telemetry 必须恰好捕获释放前的 100%；preemption 单调计数才是确证容量触顶的主门。
+controller `run_end` 和最后一条 telemetry 对 background `run_end` 使用同一个显式
+`coverage_slack_s=1.0`；容差内的进程完成顺序抖动不判失败，超过容差仍拒绝。该 slack 只处理
+采样和进程回收边界，不放宽五个 job 全部完成、preemption、峰值压力及 no-migration 门。
 
 一个终端执行 smoke：
 
