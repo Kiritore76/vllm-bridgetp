@@ -1985,6 +1985,17 @@ test "$ABANDON_RC" -eq 0
 的时长/到达间隔，不能修改 frozen guard，也不能人工取消请求或向 controller 注入未来信息。
 只有单轮 bring-up 完整通过并人工核验后，才实现冻结器和至少三轮正式重复 runner。
 
+第二个 working 候选 `cap0-abandon-bringup-20260905T135001Z` 已证明 workload 时序正确：
+一次 `ENTER`、一次 `START_SHADOW`、Shadow 内一次 `CLEAR`，状态为
+`SHADOW -> CANCELLED`。但该轮暴露出 cleanup binding 发布竞态：controller 在 CLEAR 时
+立即检查 binding，而 TP1 正在执行同步 D2H 历史快照；约 4.56 秒后才发布
+`session_manifest.json` 和 `PREPARING` takeover state。旧逻辑因当时 binding 不存在而只
+disarm，之后 source/stager 仍完成初始快照且没有收到 cleanup request。该轮顶层 FAIL 正确，
+不能冻结。修订后的 controller 先 disarm，再有界等待 matching session binding 与 PREPARING
+state，调用 `abort_source=false` cleanup 后才进入 CANCELLED；最终验收另有界等待 source 和
+stager cleanup receipts。等待对象只来自本次已触发 snapshot 的当前状态，不读取未来负载。
+必须使用修订后的明确 commit 和全新 ID 再跑一次 bring-up。
+
 三者共同设置：
 
 ```bash
