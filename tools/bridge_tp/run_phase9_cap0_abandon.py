@@ -133,6 +133,13 @@ def accept_abandon(
     starts = [row for row in capacity if row.get("action") == "START_SHADOW"]
     transitions = [row for row in rows if row.get("kind") == "transition"]
     states = [str(row.get("to")) for row in transitions]
+    shadow_clears = [
+        row
+        for row in rows
+        if row.get("kind") == "telemetry"
+        and row.get("state") == "SHADOW"
+        and row.get("capacity_signal", {}).get("transition") == "CLEAR"
+    ]
     abandons = [row for row in rows if row.get("kind") == "abandon"]
     ends = [row for row in rows if row.get("kind") == "run_end"]
     commits = [row for row in rows if row.get("kind") == "commit"]
@@ -172,6 +179,8 @@ def accept_abandon(
             errors.append("START_SHADOW exceeded the target waiting guard")
     if states != ["SHADOW", "CANCELLED"]:
         errors.append(f"unexpected abandon migration path: {states!r}")
+    if not shadow_clears:
+        errors.append("no causal capacity CLEAR was observed during SHADOW")
     if len(abandons) != 1 or "headroom recovered" not in str(
         abandons[0].get("reason", "") if abandons else ""
     ):
@@ -269,6 +278,7 @@ def accept_abandon(
             starts[0].get("target_waiting") if starts else None
         ),
         "transition_states": states,
+        "shadow_capacity_clear_samples": len(shadow_clears),
         "abandon_reason": abandons[0].get("reason") if len(abandons) == 1 else None,
         "trigger_path": ends[0].get("trigger_path") if len(ends) == 1 else None,
         "final_state": ends[0].get("final_state") if len(ends) == 1 else None,
