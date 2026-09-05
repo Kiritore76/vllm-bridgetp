@@ -1129,8 +1129,8 @@ source /root/autodl-tmp/bridgetp/phase9_cap0_active.env
   --out-dir "$CAP0_BG_DIR" --validate-only
 ```
 
-终端 T4：前台运行 workload generator。它虽然在代码和文件名中叫 background，但这里不以
-shell 后台进程启动：
+终端 T4：先准备好下面的 workload generator 命令，但暂时不要执行。它虽然在代码和文件名中
+叫 background，但这里不以 shell 后台进程启动：
 
 ```bash
 cd /root/autodl-tmp/bridgetp/vllm_bridge
@@ -1146,8 +1146,9 @@ source /root/autodl-tmp/bridgetp/phase9_cap0_active.env
   2>&1 | tee "$CAP0_BG_DIR/background.log"
 ```
 
-启动 T4 后立即切到终端 T5 启动 controller，避免人工延迟跨过 manifest 中的 source burst
-时刻。calibration/no-migration 在 T5 使用：
+先在终端 T5 启动 controller；看到进程开始运行后立即切到 T4 执行上面的 workload 命令。
+这样 controller 的显式 anchor 会先进入 TP1，避免人工切换终端跨过 manifest 中的 source
+burst 时刻。calibration/no-migration 在 T5 使用：
 
 ```bash
 cd /root/autodl-tmp/bridgetp/vllm_bridge

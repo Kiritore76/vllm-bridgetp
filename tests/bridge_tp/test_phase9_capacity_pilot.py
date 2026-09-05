@@ -54,6 +54,13 @@ class TestAnchorSelection(unittest.TestCase):
         )
         self.assertEqual(selected, "cap0-anchor-17")
 
+    def test_explicit_prefix_accepts_completion_frontend_wrapper(self) -> None:
+        selected = select_source_request_id(
+            ["cmpl-background-0", "cmpl-cap0-anchor-17"],
+            "cap0-anchor",
+        )
+        self.assertEqual(selected, "cmpl-cap0-anchor-17")
+
     def test_ambiguous_prefix_fails_closed(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "ambiguous"):
             select_source_request_id(

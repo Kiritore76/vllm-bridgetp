@@ -17,12 +17,22 @@ def select_source_request_id(
     """
     if not configured_prefix:
         return request_ids[0] if len(request_ids) == 1 else None
-    matches = [
-        request_id
-        for request_id in request_ids
-        if request_id == configured_prefix
-        or request_id.startswith(configured_prefix + "-")
-    ]
+    def matches_prefix(request_id: str) -> bool:
+        # The OpenAI completions frontend exposes an external request ID such
+        # as ``bridgetp-phase9-...`` to the client but the engine may wrap it
+        # as ``cmpl-bridgetp-phase9-...``.  Match the configured external
+        # prefix against either representation while retaining the suffix
+        # allowance used by other frontends.
+        candidates = [request_id]
+        if request_id.startswith("cmpl-"):
+            candidates.append(request_id.removeprefix("cmpl-"))
+        return any(
+            candidate == configured_prefix
+            or candidate.startswith(configured_prefix + "-")
+            for candidate in candidates
+        )
+
+    matches = [request_id for request_id in request_ids if matches_prefix(request_id)]
     if len(matches) > 1:
         raise RuntimeError(
             "BRIDGETP_STREAM_SOURCE_REQUEST_ID_PREFIX is ambiguous: "
