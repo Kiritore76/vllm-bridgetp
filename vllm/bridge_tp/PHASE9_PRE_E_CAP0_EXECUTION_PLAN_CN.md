@@ -1455,6 +1455,83 @@ printf '%s  %s\n' \
 | Rescue | `rescue` | `rescue_v1.json` | 非 dry-run | `CAPACITY_PILOT` + 4 ranks + `TAKEOVER` |
 | Safe abandon | `abandon` | `abandon_v1.json` | 非 dry-run | `SHADOW` 后 `CLEAR` + `CANCELLED` |
 
+### 22.1 P0 No-op 自动 bring-up
+
+P0 不再手工协调五个终端。`build_phase9_cap0_noop_manifest.py` 生成仅供独立 workload
+进程读取的 working manifest；默认使用 72 个 TP4 请求，每个请求由 7000 个确定性 token-ID
+prompt 和 1100 个输出 token 构成，总 target context demand 为 583200 tokens，高于实测 TP4
+容量 571824 tokens。72 个 target 请求在 1 秒内形成 burst，并早于四个 TP1 source-pressure
+请求；TP1 仍使用与 calibration 相同的 4x7000 output shape 和独立 8000-token anchor。
+
+`run_phase9_cap0_noop.py` 是前台父进程，拥有并清理 TP4、TP1、stager、controller 和
+workload。它启用 frozen guard、关闭 performance trigger 的竞争路径，并使用非 dry-run
+controller。bring-up 只有同时满足以下条件才 PASS：
+
+- source capacity signal 至少一次 active；
+- active 时 TP4 `kv_usage_frac>0.85` 或 `num_waiting>4`，并记录明确 `STAY`；
+- 从未记录 `START_SHADOW`，也没有 Shadow/Handoff/Takeover transition；
+- 不存在 staging、takeover 或 cleanup 工件；
+- 8000-token anchor 全部由 TP1 发出，五类进程和全部 background jobs 正常结束；
+- 输出状态只能是 `BRINGUP_COMPLETE`，不得自动冻结 manifest 或启动正式重复。
+
+默认 target shape 只是预注册的首次 bring-up 候选，不是成功保证。如果它没有在 source
+signal active 的同时形成 target guard failure，保留失败目录并只修改下一版本 working
+manifest；不得降低 frozen source guard、读取 controller 未来状态或人工取消请求。
+
+生成器与 runner 的服务器命令在代码提交后以该提交对应的命令块为准。bring-up 输出至少包括
+`status.json`、`provenance/noop_acceptance.json`、输入哈希、完整 controller/background 日志和
+实际展开后的 background manifest。人工审阅 PASS 后才允许把确切 jobs 冻结为
+`noop_v1.json` 并开发正式重复入口。
+
+代码提交并在服务器切换到明确 revision 后，首次 bring-up 使用一个前台终端：
+
+```bash
+cd /root/autodl-tmp/bridgetp/vllm_bridge
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
+source /root/autodl-tmp/bridgetp/phase9_cap0_geometry.env
+source /root/autodl-tmp/bridgetp/phase9_cap0_predictor.env
+
+export OMP_NUM_THREADS=1
+export CAP0_CODE_REVISION="$(git rev-parse HEAD)"
+export CAP0_GUARD_FILE="$CAP0_MANIFEST_ROOT/frozen/guard_free_kv_tokens.txt"
+export CAP0_GUARD_SHA=0e86c353044f9610be1b5511ff21e870823b7f259c40ccde24188d84164b545b
+export NOOP_ID="cap0-noop-bringup-$(date -u +%Y%m%dT%H%M%SZ)"
+export NOOP_MANIFEST="$CAP0_MANIFEST_ROOT/working/${NOOP_ID}.json"
+export NOOP_ROOT="$CAP0_RESULTS/noop_bringup/$NOOP_ID"
+
+mkdir -p "$CAP0_MANIFEST_ROOT/working" "$CAP0_RESULTS/noop_bringup"
+
+"$BRIDGE_PY" tools/bridge_tp/build_phase9_cap0_noop_manifest.py \
+  --out "$NOOP_MANIFEST"
+export NOOP_MANIFEST_SHA="$(sha256sum "$NOOP_MANIFEST" | awk '{print $1}')"
+
+"$BRIDGE_PY" tools/bridge_tp/run_phase9_cap0_noop.py \
+  --validate-only \
+  --model-path "$BRIDGE_MODEL" --manifest "$NOOP_MANIFEST" \
+  --survival-table "$CAP0_SURVIVAL_TABLE" --guard-file "$CAP0_GUARD_FILE" \
+  --out-root "$NOOP_ROOT" --expected-revision "$CAP0_CODE_REVISION" \
+  --expected-manifest-sha256 "$NOOP_MANIFEST_SHA" \
+  --expected-survival-sha256 \
+    031b06b0e7d663d5a4ad9cf71f2a640123b84d8e85eb4c94d94f44baa20aaa4a \
+  --expected-guard 8448 --expected-guard-sha256 "$CAP0_GUARD_SHA" \
+  --tp1-blocks "$TP1_BLOCKS" --tp4-blocks "$TP4_BLOCKS"
+
+set -o pipefail
+"$BRIDGE_PY" tools/bridge_tp/run_phase9_cap0_noop.py \
+  --model-path "$BRIDGE_MODEL" --manifest "$NOOP_MANIFEST" \
+  --survival-table "$CAP0_SURVIVAL_TABLE" --guard-file "$CAP0_GUARD_FILE" \
+  --out-root "$NOOP_ROOT" --expected-revision "$CAP0_CODE_REVISION" \
+  --expected-manifest-sha256 "$NOOP_MANIFEST_SHA" \
+  --expected-survival-sha256 \
+    031b06b0e7d663d5a4ad9cf71f2a640123b84d8e85eb4c94d94f44baa20aaa4a \
+  --expected-guard 8448 --expected-guard-sha256 "$CAP0_GUARD_SHA" \
+  --tp1-blocks "$TP1_BLOCKS" --tp4-blocks "$TP4_BLOCKS" \
+  2>&1 | tee "$CAP0_RESULTS/noop_bringup/${NOOP_ID}.console.txt"
+echo "NOOP_RC=${PIPESTATUS[0]}"
+echo "NOOP_ROOT=$NOOP_ROOT"
+```
+
 三者共同设置：
 
 ```bash
