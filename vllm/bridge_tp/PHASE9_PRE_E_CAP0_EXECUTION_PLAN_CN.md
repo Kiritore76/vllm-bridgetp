@@ -1870,6 +1870,121 @@ test "$RESCUE_FORMAL_RC" -eq 0
 Rescue reachability 的重复工程门，不把 13 秒级 handoff stall 或其他延迟写成正式 E 性能
 结论。
 
+P1 已于 2026-09-05 在 revision
+`15a5fda6b9836b645db03f67a93682410b3363d3` 完成三轮正式重复；三轮均为 PASS，且每轮都
+先由 target guard 阻挡，随后仅一次 `START_SHADOW`，严格经过
+`SHADOW -> HANDOFF -> TAKEOVER`。三轮 source/target 输出切分分别为 5829/2171、
+5830/2170、5809/2191，四 rank exact readback、commit、source abort、8000-token unified
+stream 和 52/52 background jobs 全部通过。该结果关闭 P1 工程门，但不构成性能结论。
+
+### 22.5 P2 Safe abandon 自动 bring-up
+
+P2 先只运行一次不计数 bring-up；通过并人工核验之前，不冻结 `abandon_v1.json`，也不写
+正式重复 runner。它要证明的不是“迁移失败后回滚”，而是 controller 已因真实 TP1 压力
+进入 `SHADOW` 后，压力作业自然结束令 frozen capacity signal 转为 `CLEAR`，系统能在
+cutover 前安全取消迁移，并保持 TP1 对请求及客户端输出的唯一 ownership。
+
+默认 working manifest 包含 4 个轻量 TP4 target jobs 和 4 个有限 TP1 source-pressure jobs，
+共 8 个 background jobs。TP4 context demand 为 32400 tokens，仅占实测容量约 5.7%，用于
+确保 active signal 出现时 target 可立即接纳 Shadow；TP1 的 background output demand 为
+16800 tokens，加 8000-token anchor 后为 24800 tokens，约占实测 TP1 容量 78.8%。该有限
+burst 应先压低 headroom 触发一次 `START_SHADOW`，再在历史复制完成前自然结束并恢复
+headroom。上述时序只是 bring-up 候选，实际结果必须由 audit 和 cleanup receipts 证明。
+
+bring-up 必须同时证明：
+
+- active capacity signal 下恰好出现一次满足 TP4 KV/waiting guard 的 `START_SHADOW`；
+- 状态严格为 `SHADOW -> CANCELLED`，abandon 原因是 source headroom recovered，且触发
+  路径仍为 `CAPACITY_PILOT`；
+- 不出现 `HANDOFF`、`TAKEOVER` 或 commit，不生成 staging/cutover/target-response/receiver
+  receipt 等 cutover 后工件；
+- cleanup 明确为 `abort_source=false`，takeover state 为 `CANCELLED`，并记录
+  `source_continues_on_tp1=true`；source mirror 与 stager cleanup receipt 均为 `CLEANED`；
+- 8000-token unified stream 全部来自 TP1，index 连续、JSONL 与 token IDs 一致，且
+  response proxy 从未 committed；
+- 8/8 background jobs 全部成功，anchor request 不与 background request 串号。
+
+服务器拉取包含 Safe-abandon bring-up 的分支最新 revision 后，在一个前台终端执行。父进程
+会依次启动并拥有 TP4、TP1、stager、controller 和 background workload；不要预启动服务，
+不要使用 `nohup`：
+
+```bash
+cd /root/autodl-tmp/bridgetp/vllm_bridge
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
+
+set +e
+set +u
+set +o pipefail
+
+export CAP0_CODE_REVISION="$(git rev-parse HEAD)"
+export CAP0_SURVIVAL_SHA=031b06b0e7d663d5a4ad9cf71f2a640123b84d8e85eb4c94d94f44baa20aaa4a
+export CAP0_GUARD_FILE="$CAP0_MANIFEST_ROOT/frozen/guard_free_kv_tokens.txt"
+export CAP0_GUARD_SHA=0e86c353044f9610be1b5511ff21e870823b7f259c40ccde24188d84164b545b
+
+test "$(sha256sum "$CAP0_SURVIVAL_TABLE" | awk '{print $1}')" = "$CAP0_SURVIVAL_SHA"
+test "$(sha256sum "$CAP0_GUARD_FILE" | awk '{print $1}')" = "$CAP0_GUARD_SHA"
+test "$(cat "$CAP0_GUARD_FILE")" = 8448
+
+export ABANDON_ID="cap0-abandon-bringup-$(date -u +%Y%m%dT%H%M%SZ)"
+export ABANDON_MANIFEST="$CAP0_MANIFEST_ROOT/working/${ABANDON_ID}.json"
+export ABANDON_ROOT="$CAP0_RESULTS/abandon_bringup/$ABANDON_ID"
+mkdir -p "$CAP0_MANIFEST_ROOT/working" "$CAP0_RESULTS/abandon_bringup"
+
+"$BRIDGE_PY" tools/bridge_tp/build_phase9_cap0_abandon_manifest.py \
+  --out "$ABANDON_MANIFEST"
+export ABANDON_MANIFEST_SHA="$(sha256sum "$ABANDON_MANIFEST" | awk '{print $1}')"
+
+"$BRIDGE_PY" tools/bridge_tp/run_phase9_cap0_abandon.py \
+  --validate-only \
+  --model-path "$BRIDGE_MODEL" \
+  --manifest "$ABANDON_MANIFEST" \
+  --survival-table "$CAP0_SURVIVAL_TABLE" \
+  --guard-file "$CAP0_GUARD_FILE" \
+  --out-root "$ABANDON_ROOT" \
+  --expected-revision "$CAP0_CODE_REVISION" \
+  --expected-manifest-sha256 "$ABANDON_MANIFEST_SHA" \
+  --expected-survival-sha256 "$CAP0_SURVIVAL_SHA" \
+  --expected-guard-sha256 "$CAP0_GUARD_SHA" \
+  --expected-guard 8448 \
+  --tp1-blocks "$TP1_BLOCKS" --tp4-blocks "$TP4_BLOCKS"
+export VALIDATE_RC=$?
+
+if [ "$VALIDATE_RC" -eq 0 ]; then
+  set -o pipefail
+  "$BRIDGE_PY" tools/bridge_tp/run_phase9_cap0_abandon.py \
+    --model-path "$BRIDGE_MODEL" \
+    --manifest "$ABANDON_MANIFEST" \
+    --survival-table "$CAP0_SURVIVAL_TABLE" \
+    --guard-file "$CAP0_GUARD_FILE" \
+    --out-root "$ABANDON_ROOT" \
+    --expected-revision "$CAP0_CODE_REVISION" \
+    --expected-manifest-sha256 "$ABANDON_MANIFEST_SHA" \
+    --expected-survival-sha256 "$CAP0_SURVIVAL_SHA" \
+    --expected-guard-sha256 "$CAP0_GUARD_SHA" \
+    --expected-guard 8448 \
+    --tp1-blocks "$TP1_BLOCKS" --tp4-blocks "$TP4_BLOCKS" \
+    2>&1 | tee "$CAP0_RESULTS/abandon_bringup/${ABANDON_ID}.console.txt"
+  export ABANDON_RC=${PIPESTATUS[0]}
+else
+  export ABANDON_RC=98
+fi
+set +o pipefail
+
+echo "VALIDATE_RC=$VALIDATE_RC"
+echo "ABANDON_RC=$ABANDON_RC"
+echo "ABANDON_ROOT=$ABANDON_ROOT"
+echo "ABANDON_MANIFEST=$ABANDON_MANIFEST"
+test "$VALIDATE_RC" -eq 0
+test "$ABANDON_RC" -eq 0
+```
+
+成功标志为 `ABANDON_BRINGUP_COMPLETE`，机器验收文件是
+`$ABANDON_ROOT/provenance/abandon_acceptance.json`。若时序没有进入 Shadow、来不及 CLEAR，
+或已越过 cutover 才结束，都保留完整结果并停止；只能根据真实时间线调整 working workload
+的时长/到达间隔，不能修改 frozen guard，也不能人工取消请求或向 controller 注入未来信息。
+只有单轮 bring-up 完整通过并人工核验后，才实现冻结器和至少三轮正式重复 runner。
+
 三者共同设置：
 
 ```bash
