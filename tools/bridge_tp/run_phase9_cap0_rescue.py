@@ -71,9 +71,10 @@ def validate_rescue_pressure(
     tp4_total_tokens: int,
     max_model_len: int,
     max_target_waiting: int = 4,
+    expected_scenario: str = "CAP-0 Rescue reachability bring-up",
 ) -> dict[str, Any]:
-    if manifest.get("scenario") != "CAP-0 Rescue reachability bring-up":
-        raise ValueError("manifest is not labeled CAP-0 Rescue reachability")
+    if manifest.get("scenario") != expected_scenario:
+        raise ValueError(f"manifest scenario differs from {expected_scenario!r}")
     jobs = manifest.get("jobs")
     if not isinstance(jobs, list) or not jobs:
         raise ValueError("Rescue manifest requires jobs")
@@ -365,7 +366,11 @@ def accept_rescue(
     }
 
 
-def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]:
+def validate_inputs(
+    args: argparse.Namespace,
+    *,
+    expected_scenario: str = "CAP-0 Rescue reachability bring-up",
+) -> tuple[str, int, dict[str, Any]]:
     if os.name == "nt":
         raise RuntimeError("CAP-0 Rescue runner requires Linux")
     for path in (
@@ -408,6 +413,7 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         tp1_total_tokens=args.tp1_blocks * 16,
         tp4_total_tokens=args.tp4_blocks * 16,
         max_model_len=args.max_model_len,
+        expected_scenario=expected_scenario,
     )
     if args.out_root.exists():
         raise FileExistsError(f"refusing to reuse output root {args.out_root}")

@@ -1735,6 +1735,141 @@ test "$RESCUE_RC" -eq 0
 bring-up 完整通过并人工确认工件后，下一步才是把该 exact jobs manifest 冻结成
 `rescue_v1.json`，再实现和运行至少三轮正式重复。
 
+### 22.4 冻结 P1 Rescue workload 并运行正式重复
+
+`cap0-rescue-bringup-20260905T102948Z` 已在 revision `2c2fe7f` 完成标准 bring-up：
+52/52 background jobs 成功，170 次 guarded `STAY` 后仅一次 `START_SHADOW`，四 rank
+readback、commit、source abort 和 8000-token unified stream 全部通过。其 working/expanded
+manifest SHA-256 均为
+`5199f9502e3ffdde889823ea798d399ce05159472064a414ca25e25f81d59a27`。
+
+先拉取包含 Rescue freezer/formal runner 的明确 revision。以下命令冻结 bring-up 实际执行的
+exact jobs；冻结器同时要求原 working manifest、运行目录 expanded manifest 和 provenance
+三方哈希相同，不会依据当前代码重新生成 workload：
+
+```bash
+cd /root/autodl-tmp/bridgetp/vllm_bridge
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
+
+set +e
+set +u
+set +o pipefail
+
+export BRINGUP_ID=cap0-rescue-bringup-20260905T102948Z
+export BRINGUP_REVISION=2c2fe7f981db511eb911a08b902c48aeedb74606
+export BRINGUP_ROOT="$CAP0_RESULTS/rescue_bringup/$BRINGUP_ID"
+export ORIGIN_RESCUE="$CAP0_MANIFEST_ROOT/working/${BRINGUP_ID}.json"
+export ORIGIN_RESCUE_SHA=5199f9502e3ffdde889823ea798d399ce05159472064a414ca25e25f81d59a27
+export CAP0_SURVIVAL_SHA=031b06b0e7d663d5a4ad9cf71f2a640123b84d8e85eb4c94d94f44baa20aaa4a
+export CAP0_GUARD_FILE="$CAP0_MANIFEST_ROOT/frozen/guard_free_kv_tokens.txt"
+export CAP0_GUARD_SHA=0e86c353044f9610be1b5511ff21e870823b7f259c40ccde24188d84164b545b
+export FROZEN_RESCUE="$CAP0_MANIFEST_ROOT/frozen/rescue_v1.json"
+
+test "$(sha256sum "$ORIGIN_RESCUE" | awk '{print $1}')" = "$ORIGIN_RESCUE_SHA"
+test "$(sha256sum "$BRINGUP_ROOT/background/background_manifest.json" | awk '{print $1}')" = "$ORIGIN_RESCUE_SHA"
+
+"$BRIDGE_PY" tools/bridge_tp/freeze_phase9_cap0_rescue.py \
+  --bringup-root "$BRINGUP_ROOT" \
+  --working-manifest "$ORIGIN_RESCUE" \
+  --out "$FROZEN_RESCUE" \
+  --expected-bringup-revision "$BRINGUP_REVISION" \
+  --expected-working-sha256 "$ORIGIN_RESCUE_SHA" \
+  --expected-survival-sha256 "$CAP0_SURVIVAL_SHA" \
+  --expected-guard-sha256 "$CAP0_GUARD_SHA" \
+  --expected-guard 8448 \
+  --tp1-blocks "$TP1_BLOCKS" --tp4-blocks "$TP4_BLOCKS"
+export FREEZE_RC=$?
+
+export FROZEN_RESCUE_PROVENANCE="$CAP0_MANIFEST_ROOT/frozen/rescue_v1.provenance.json"
+export FROZEN_RESCUE_SHA="$(awk '{print $1}' "$CAP0_MANIFEST_ROOT/frozen/rescue_v1.sha256")"
+
+echo "FREEZE_RC=$FREEZE_RC"
+echo "FROZEN_RESCUE_SHA=$FROZEN_RESCUE_SHA"
+test "$FREEZE_RC" -eq 0
+test "$(sha256sum "$FROZEN_RESCUE" | awk '{print $1}')" = "$FROZEN_RESCUE_SHA"
+```
+
+冻结成功后，在同一前台终端先做 formal contract 静态核验，再连续运行 r01--r03。每轮由父
+runner 重新启动 TP4、TP1、stager、controller 和 background workload，使用独立目录；
+任一轮失败会停止批次并保留现场：
+
+```bash
+cd /root/autodl-tmp/bridgetp/vllm_bridge
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
+
+set +e
+set +u
+set +o pipefail
+
+export CAP0_CODE_REVISION="$(git rev-parse HEAD)"
+export BRINGUP_ID=cap0-rescue-bringup-20260905T102948Z
+export BRINGUP_ROOT="$CAP0_RESULTS/rescue_bringup/$BRINGUP_ID"
+export CAP0_SURVIVAL_SHA=031b06b0e7d663d5a4ad9cf71f2a640123b84d8e85eb4c94d94f44baa20aaa4a
+export CAP0_GUARD_FILE="$CAP0_MANIFEST_ROOT/frozen/guard_free_kv_tokens.txt"
+export CAP0_GUARD_SHA=0e86c353044f9610be1b5511ff21e870823b7f259c40ccde24188d84164b545b
+export FROZEN_RESCUE="$CAP0_MANIFEST_ROOT/frozen/rescue_v1.json"
+export FROZEN_RESCUE_PROVENANCE="$CAP0_MANIFEST_ROOT/frozen/rescue_v1.provenance.json"
+export FROZEN_RESCUE_SHA="$(awk '{print $1}' "$CAP0_MANIFEST_ROOT/frozen/rescue_v1.sha256")"
+export RESCUE_BATCH_ID="cap0-rescue-formal-$(date -u +%Y%m%dT%H%M%SZ)"
+export RESCUE_BATCH_ROOT="$CAP0_RESULTS/rescue_batches/$RESCUE_BATCH_ID"
+mkdir -p "$CAP0_RESULTS/rescue_batches"
+
+"$BRIDGE_PY" tools/bridge_tp/run_phase9_cap0_rescue_formal.py \
+  --validate-only \
+  --model-path "$BRIDGE_MODEL" \
+  --manifest "$FROZEN_RESCUE" \
+  --manifest-provenance "$FROZEN_RESCUE_PROVENANCE" \
+  --bringup-root "$BRINGUP_ROOT" \
+  --survival-table "$CAP0_SURVIVAL_TABLE" \
+  --guard-file "$CAP0_GUARD_FILE" \
+  --out-root "$RESCUE_BATCH_ROOT" \
+  --expected-revision "$CAP0_CODE_REVISION" \
+  --expected-manifest-sha256 "$FROZEN_RESCUE_SHA" \
+  --expected-survival-sha256 "$CAP0_SURVIVAL_SHA" \
+  --expected-guard-sha256 "$CAP0_GUARD_SHA" \
+  --expected-guard 8448 \
+  --tp1-blocks "$TP1_BLOCKS" --tp4-blocks "$TP4_BLOCKS" \
+  --repetitions 3
+export VALIDATE_RC=$?
+
+if [ "$VALIDATE_RC" -eq 0 ]; then
+  set -o pipefail
+  "$BRIDGE_PY" tools/bridge_tp/run_phase9_cap0_rescue_formal.py \
+    --model-path "$BRIDGE_MODEL" \
+    --manifest "$FROZEN_RESCUE" \
+    --manifest-provenance "$FROZEN_RESCUE_PROVENANCE" \
+    --bringup-root "$BRINGUP_ROOT" \
+    --survival-table "$CAP0_SURVIVAL_TABLE" \
+    --guard-file "$CAP0_GUARD_FILE" \
+    --out-root "$RESCUE_BATCH_ROOT" \
+    --expected-revision "$CAP0_CODE_REVISION" \
+    --expected-manifest-sha256 "$FROZEN_RESCUE_SHA" \
+    --expected-survival-sha256 "$CAP0_SURVIVAL_SHA" \
+    --expected-guard-sha256 "$CAP0_GUARD_SHA" \
+    --expected-guard 8448 \
+    --tp1-blocks "$TP1_BLOCKS" --tp4-blocks "$TP4_BLOCKS" \
+    --repetitions 3 \
+    2>&1 | tee "$CAP0_RESULTS/rescue_batches/${RESCUE_BATCH_ID}.console.txt"
+  export RESCUE_FORMAL_RC=${PIPESTATUS[0]}
+  set +o pipefail
+else
+  export RESCUE_FORMAL_RC=98
+fi
+
+echo "VALIDATE_RC=$VALIDATE_RC"
+echo "RESCUE_FORMAL_RC=$RESCUE_FORMAL_RC"
+echo "RESCUE_BATCH_ROOT=$RESCUE_BATCH_ROOT"
+test "$VALIDATE_RC" -eq 0
+test "$RESCUE_FORMAL_RC" -eq 0
+```
+
+成功标志为 `RESCUE_FORMAL_COMPLETE`，且 `batch_status.json` 必须为
+`FORMAL_COMPLETE`、`formal_acceptance.json` 必须为 3/3 PASS。正式轮仍只证明 CAP-0
+Rescue reachability 的重复工程门，不把 13 秒级 handoff stall 或其他延迟写成正式 E 性能
+结论。
+
 三者共同设置：
 
 ```bash
