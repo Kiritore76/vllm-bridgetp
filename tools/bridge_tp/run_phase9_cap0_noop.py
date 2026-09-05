@@ -18,7 +18,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
@@ -133,13 +133,14 @@ def make_config(
     provenance_dir: Path,
     guard: int,
     phase: str = "bringup",
+    platform_note: str | None = None,
 ) -> Path:
     config = common.read_json(common.CONFIG_TEMPLATE)
     config["run_dir"] = str(controller_dir)
     config["tp1_total_kv_blocks"] = args.tp1_blocks
     config["tp4_total_kv_blocks"] = args.tp4_blocks
     config["survival_table_path"] = str(args.survival_table.resolve())
-    config["platform_note"] = {
+    config["platform_note"] = platform_note or {
         "bringup": (
             "CAP-0 NO-OP BRING-UP; automated 5x A100 PCIe; not reportable"
         ),
@@ -338,6 +339,13 @@ def run(
     phase: str = "bringup",
     repetition: int | None = None,
     run_id: str | None = None,
+    scenario: str = "noop",
+    scenario_title: str | None = None,
+    provenance_status: str | None = None,
+    platform_note: str | None = None,
+    success_status: str | None = None,
+    success_marker: str | None = None,
+    acceptance_fn: Callable[[Path, Path, int, int], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if phase not in {"bringup", "formal"}:
         raise ValueError(f"unsupported No-op phase {phase!r}")
@@ -355,18 +363,21 @@ def run(
         provenance_dir,
         guard,
         phase=phase,
+        platform_note=platform_note,
     )
     source_request = common.make_source_request(args, provenance_dir)
     common.write_json(
         provenance_dir / "inputs.json",
         {
             "format_version": 1,
-            "scenario": (
+            "scenario": scenario_title
+            or (
                 "CAP-0 No-op bring-up"
                 if phase == "bringup"
                 else "CAP-0 No-op formal"
             ),
-            "status": (
+            "status": provenance_status
+            or (
                 "BRINGUP_NOT_REPORTABLE"
                 if phase == "bringup"
                 else "FORMAL_REPETITION"
@@ -399,7 +410,7 @@ def run(
     status: dict[str, Any] = {
         "format_version": 1,
         "status": "RUNNING",
-        "scenario": "noop",
+        "scenario": scenario,
         "phase": phase,
         "repetition": repetition,
         "run_id": run_id,
@@ -517,16 +528,29 @@ def run(
                     f"{service.process.returncode}; see {service.log_path}"
                 )
 
-        acceptance = accept_noop(
-            controller_dir,
-            background_dir,
-            expected_jobs=len(manifest["jobs"]),
-            expected_anchor_tokens=args.anchor_max_tokens,
+        if acceptance_fn is None:
+            acceptance = accept_noop(
+                controller_dir,
+                background_dir,
+                expected_jobs=len(manifest["jobs"]),
+                expected_anchor_tokens=args.anchor_max_tokens,
+            )
+        else:
+            acceptance = acceptance_fn(
+                controller_dir,
+                background_dir,
+                len(manifest["jobs"]),
+                args.anchor_max_tokens,
+            )
+        common.write_json(
+            provenance_dir / f"{scenario}_acceptance.json",
+            acceptance,
         )
-        common.write_json(provenance_dir / "noop_acceptance.json", acceptance)
         if acceptance["status"] != "PASS":
             raise RuntimeError("; ".join(acceptance["errors"]))
-        final_status = "BRINGUP_COMPLETE" if phase == "bringup" else "PASS"
+        final_status = success_status or (
+            "BRINGUP_COMPLETE" if phase == "bringup" else "PASS"
+        )
         status.update(
             {
                 "status": final_status,
@@ -535,7 +559,9 @@ def run(
             }
         )
         common.write_json(out_root / "status.json", status)
-        marker = "NOOP_BRINGUP_COMPLETE" if phase == "bringup" else "PASS"
+        marker = success_marker or (
+            "NOOP_BRINGUP_COMPLETE" if phase == "bringup" else "PASS"
+        )
         print(f"{marker}: {out_root}", flush=True)
         return status
     except Exception as error:
