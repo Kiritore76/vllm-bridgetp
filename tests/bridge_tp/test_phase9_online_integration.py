@@ -7,6 +7,7 @@ import importlib.util
 import json
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -15,13 +16,16 @@ from tools.bridge_tp.run_phase9_controller import (
     _prepare_source_request,
     step_handoff,
     step_local,
+    step_shadow,
 )
+from vllm.bridge_tp.controller.capacity_signal import CapacitySignal
 from vllm.bridge_tp.controller.action_adapter import ActionAdapter
 from vllm.bridge_tp.controller.config import ControllerConfig
 from vllm.bridge_tp.controller.events import (
     Action,
     MigrationState,
     SourceRequestView,
+    TriggerPath,
 )
 from vllm.bridge_tp.controller.online_io import (
     ProxyRecorder,
@@ -418,6 +422,70 @@ class TestLazyActionBinding(unittest.TestCase):
             )
             self.assertEqual(adapter.refresh_binding().migration_id, "m")
 
+    def test_waits_for_manifest_and_preparing_takeover_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            adapter = ActionAdapter(
+                "http://source",
+                run_dir,
+                expected_migration_id="m",
+            )
+
+            def publish() -> None:
+                (run_dir / "session_manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "migration_id": "m",
+                            "session_token": "s",
+                            "source_request_id": "r",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (run_dir / "takeover_state.json").write_text(
+                    json.dumps(
+                        {
+                            "migration_id": "m",
+                            "source_request_id": "r",
+                            "state": "PREPARING",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            timer = threading.Timer(0.02, publish)
+            timer.start()
+            try:
+                binding = adapter.wait_for_preparing_binding(
+                    timeout_s=1.0,
+                    poll_interval_s=0.005,
+                )
+            finally:
+                timer.join()
+            self.assertIsNotNone(binding)
+            self.assertEqual(binding.migration_id, "m")
+
+    def test_session_manifest_alone_is_not_cleanup_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            (run_dir / "session_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "migration_id": "m",
+                        "session_token": "s",
+                        "source_request_id": "r",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            adapter = ActionAdapter("http://source", run_dir)
+            self.assertIsNone(
+                adapter.wait_for_preparing_binding(
+                    timeout_s=0.01,
+                    poll_interval_s=0.005,
+                )
+            )
+
 
 class TestConfigFailClosed(unittest.TestCase):
     def test_fill_in_calibration_is_rejected(self) -> None:
@@ -433,6 +501,102 @@ class TestConfigFailClosed(unittest.TestCase):
 
 
 class TestRunnerTransitions(unittest.TestCase):
+    def test_capacity_clear_waits_for_cleanup_binding_before_cancel(self) -> None:
+        class Policy:
+            cfg = types.SimpleNamespace(max_target_kv_usage_frac=0.85)
+
+            @staticmethod
+            def migration_bytes(_request) -> int:
+                return 1024
+
+        class Audit:
+            def __init__(self) -> None:
+                self.records: list[dict] = []
+
+            def write(self, value: dict) -> None:
+                self.records.append(value)
+
+        class Adapter:
+            def __init__(self) -> None:
+                self.actions: list[str] = []
+
+            def set_rate(self, _rate: float, note: str) -> None:
+                del note
+
+            def disarm(self, _reason: str) -> None:
+                self.actions.append("disarm")
+
+            def wait_for_preparing_binding(self):
+                self.actions.append("wait")
+                return object()
+
+            def cancel(self, _reason: str, *, abort_source: bool):
+                self.actions.append("cancel")
+                self.abort_source = abort_source
+                return {
+                    "state": "CANCELLED",
+                    "source_abort_dispatched": abort_source,
+                }
+
+        class Rate:
+            rate_bytes_s = 1024.0
+            rate_gib_s = 0.5
+            last_reason = "test"
+
+            @staticmethod
+            def step(*_args, **_kwargs) -> float:
+                return 1024.0
+
+        audit = Audit()
+        machine = MigrationStateMachine(audit_sink=audit.write)
+        record = machine.create("migration", "request")
+        record.trigger_path = TriggerPath.CAPACITY_PILOT
+        machine.transition("migration", MigrationState.SHADOW, 1.0, "test")
+        adapter = Adapter()
+        recorder = ProxyRecorder("external", ProxyMode.HOLD_BACK)
+        request = SourceRequestView(
+            request_id="request",
+            prompt_tokens=8,
+            output_tokens=40,
+            computed_tokens=47,
+            pending_tokens=1,
+            arrival_unix_s=0.0,
+            last_token_unix_s=1.0,
+        )
+        signal = CapacitySignal(
+            sampled_unix_s=2.0,
+            free_kv_tokens=200,
+            guard_free_kv_tokens=100,
+            decline_rate_tokens_s=0.0,
+            time_to_guard_s=None,
+            active=False,
+            transition="CLEAR",
+            samples=4,
+            reason="recovered",
+        )
+        step_shadow(
+            Policy(),
+            machine,
+            adapter,
+            audit,
+            record,
+            request,
+            object(),
+            types.SimpleNamespace(kv_usage_frac=0.0, p99_tpot_s=0.02),
+            0.0,
+            Rate(),
+            2.0,
+            False,
+            recorder,
+            signal,
+        )
+        self.assertEqual(adapter.actions, ["disarm", "wait", "cancel"])
+        self.assertFalse(adapter.abort_source)
+        self.assertEqual(record.state, MigrationState.CANCELLED)
+        self.assertTrue(
+            any(row.get("kind") == "cleanup_complete" for row in audit.records)
+        )
+
     def test_local_arm_and_four_rank_commit(self) -> None:
         class Decision:
             action = Action.START_SHADOW

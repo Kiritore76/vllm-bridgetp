@@ -117,6 +117,11 @@ class TestAbandonAcceptance(unittest.TestCase):
                 "capacity_signal": {"active": False, "transition": "CLEAR"},
             },
             {"kind": "abandon", "reason": reason},
+            {
+                "kind": "cleanup_complete",
+                "state": "CANCELLED",
+                "source_abort_dispatched": abort_source,
+            },
             {"kind": "transition", "to": "CANCELLED"},
             {
                 "kind": "run_end",

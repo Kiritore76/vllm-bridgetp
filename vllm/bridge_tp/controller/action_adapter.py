@@ -27,6 +27,7 @@ server will reject.
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -133,6 +134,37 @@ class ActionAdapter:
                 f"{actual} != {self.expected_migration_id}"
             )
         return self._binding
+
+    def wait_for_preparing_binding(
+        self,
+        timeout_s: float = 30.0,
+        poll_interval_s: float = 0.02,
+    ) -> SessionBinding | None:
+        """Wait until a dynamically armed snapshot can accept cleanup.
+
+        Snapshot preparation is synchronous inside the source engine.  A
+        capacity CLEAR can therefore arrive after the trigger was honored but
+        before ``session_manifest.json`` and the PREPARING takeover state are
+        published.  Cleanup is safe only after both files describe the same
+        migration.
+        """
+        if timeout_s < 0 or poll_interval_s <= 0:
+            raise ValueError("binding wait durations must be positive")
+        deadline = time.monotonic() + timeout_s
+        while True:
+            binding = self.refresh_binding()
+            takeover = self.read_takeover_state()
+            if (
+                binding is not None
+                and takeover is not None
+                and takeover.get("state") == "PREPARING"
+                and takeover.get("migration_id") == binding.migration_id
+                and takeover.get("source_request_id") == binding.source_request_id
+            ):
+                return binding
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(poll_interval_s)
 
     # ---- actuation via the runtime control block -----------------------
     def arm_shadow(

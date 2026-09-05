@@ -443,19 +443,38 @@ def step_shadow(
     if abandon:
         audit.write({"kind": "abandon", "reason": reason})
         if not dry_run:
-            binding = adapter.refresh_binding()
+            adapter.disarm(reason)
+            binding = adapter.wait_for_preparing_binding()
             if binding is None:
-                adapter.disarm(reason)
+                audit.write(
+                    {
+                        "kind": "action_error",
+                        "detail": (
+                            "timed out waiting for the dynamically armed "
+                            "snapshot to publish a PREPARING cleanup binding"
+                        ),
+                    }
+                )
             else:
                 try:
-                    adapter.cancel(reason, abort_source=False)
+                    cleanup = adapter.cancel(reason, abort_source=False)
+                    audit.write(
+                        {
+                            "kind": "cleanup_complete",
+                            "state": cleanup.get("state"),
+                            "source_abort_dispatched": cleanup.get(
+                                "source_abort_dispatched"
+                            ),
+                        }
+                    )
                 except ActionError as error:
                     audit.write({"kind": "action_error", "detail": str(error)})
-        recorder.on_rollback(now, reason)
+        terminal_now = time.time()
+        recorder.on_rollback(terminal_now, reason)
         machine.transition(
             record.migration_id,
             MigrationState.CANCELLED,
-            now,
+            terminal_now,
             reason,
         )
         return

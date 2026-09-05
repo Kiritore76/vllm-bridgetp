@@ -9,6 +9,8 @@ import json
 import os
 import subprocess
 import sys
+import time
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -124,8 +126,21 @@ def accept_abandon(
     expected_anchor_tokens: int,
     max_target_kv_usage_frac: float = 0.85,
     max_target_waiting: int = 4,
+    cleanup_wait_timeout_s: float = 0.0,
 ) -> dict[str, Any]:
     errors: list[str] = []
+    cleanup_names = (
+        "cleanup_request.json",
+        "source_cleanup_receipt.json",
+        "stager_cleanup_receipt.json",
+    )
+    deadline = time.monotonic() + cleanup_wait_timeout_s
+    while cleanup_wait_timeout_s > 0 and any(
+        not (controller_dir / name).is_file() for name in cleanup_names
+    ):
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
 
     def required_json(name: str) -> dict[str, Any]:
         path = controller_dir / name
@@ -154,6 +169,9 @@ def accept_abandon(
         and row.get("capacity_signal", {}).get("transition") == "CLEAR"
     ]
     abandons = [row for row in rows if row.get("kind") == "abandon"]
+    cleanup_events = [
+        row for row in rows if row.get("kind") == "cleanup_complete"
+    ]
     ends = [row for row in rows if row.get("kind") == "run_end"]
     commits = [row for row in rows if row.get("kind") == "commit"]
     fatal_kinds = {
@@ -193,6 +211,15 @@ def accept_abandon(
         abandons[0].get("reason", "") if abandons else ""
     ):
         errors.append("missing capacity-headroom abandon event")
+    if len(cleanup_events) != 1:
+        errors.append(
+            f"expected one completed cleanup action, got {len(cleanup_events)}"
+        )
+    elif (
+        cleanup_events[0].get("state") != "CANCELLED"
+        or cleanup_events[0].get("source_abort_dispatched") is not False
+    ):
+        errors.append("completed cleanup action was not non-destructive")
     if len(ends) != 1 or ends[0].get("final_state") != "CANCELLED":
         errors.append(f"unexpected run_end records: {ends!r}")
     elif ends[0].get("trigger_path") != "CAPACITY_PILOT":
@@ -287,6 +314,7 @@ def accept_abandon(
         ),
         "transition_states": states,
         "shadow_capacity_clear_samples": len(shadow_clears),
+        "cleanup_complete_events": len(cleanup_events),
         "abandon_reason": abandons[0].get("reason") if len(abandons) == 1 else None,
         "trigger_path": ends[0].get("trigger_path") if len(ends) == 1 else None,
         "final_state": ends[0].get("final_state") if len(ends) == 1 else None,
@@ -385,7 +413,10 @@ def main() -> None:
         ),
         success_status="BRINGUP_COMPLETE",
         success_marker="ABANDON_BRINGUP_COMPLETE",
-        acceptance_fn=accept_abandon,
+        acceptance_fn=partial(
+            accept_abandon,
+            cleanup_wait_timeout_s=30.0,
+        ),
         allow_clean_stager_exit=True,
     )
 
