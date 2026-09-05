@@ -78,8 +78,11 @@ def validate_noop_pressure(
     max_model_len: int,
     max_target_waiting: int = 4,
 ) -> dict[str, Any]:
-    if manifest.get("scenario") != "CAP-0 No-op bring-up":
-        raise ValueError("manifest is not labeled CAP-0 No-op bring-up")
+    if manifest.get("scenario") not in {
+        "CAP-0 No-op bring-up",
+        "CAP-0 No-op formal",
+    }:
+        raise ValueError("manifest is not labeled as a CAP-0 No-op workload")
     jobs = manifest["jobs"]
     source = [job for job in jobs if job["pool"] == "source"]
     target = [job for job in jobs if job["pool"] == "target"]
@@ -129,15 +132,19 @@ def make_config(
     controller_dir: Path,
     provenance_dir: Path,
     guard: int,
+    phase: str = "bringup",
 ) -> Path:
     config = common.read_json(common.CONFIG_TEMPLATE)
     config["run_dir"] = str(controller_dir)
     config["tp1_total_kv_blocks"] = args.tp1_blocks
     config["tp4_total_kv_blocks"] = args.tp4_blocks
     config["survival_table_path"] = str(args.survival_table.resolve())
-    config["platform_note"] = (
-        "CAP-0 NO-OP BRING-UP; automated 5x A100 PCIe; not reportable"
-    )
+    config["platform_note"] = {
+        "bringup": (
+            "CAP-0 NO-OP BRING-UP; automated 5x A100 PCIe; not reportable"
+        ),
+        "formal": "CAP-0 NO-OP FORMAL REPETITION; automated 5x A100 PCIe",
+    }[phase]
     config["capacity_pilot"]["enabled"] = True
     config["capacity_pilot"]["guard_free_kv_tokens"] = guard
     path = provenance_dir / "controller_config.json"
@@ -222,6 +229,10 @@ def accept_noop(
         errors.append("source capacity signal never became active")
     if not blocked:
         errors.append("no active capacity decision was blocked by the target guard")
+    if active and len(blocked) != len(active):
+        errors.append(
+            "not every active capacity decision was a target-guarded STAY"
+        )
     if start_shadow:
         errors.append(f"observed {len(start_shadow)} START_SHADOW decisions")
     if migration_transitions:
@@ -323,23 +334,45 @@ def run(
     revision: str,
     guard: int,
     pressure: dict[str, Any],
-) -> None:
+    *,
+    phase: str = "bringup",
+    repetition: int | None = None,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    if phase not in {"bringup", "formal"}:
+        raise ValueError(f"unsupported No-op phase {phase!r}")
     out_root = args.out_root.resolve()
     controller_dir = out_root / "controller"
     background_dir = out_root / "background"
     provenance_dir = out_root / "provenance"
     for path in (controller_dir, background_dir, provenance_dir):
         path.mkdir(parents=True, exist_ok=False)
-    run_id = out_root.name
+    run_id = run_id or out_root.name
     manifest = load_manifest(args.manifest)
-    config_path = make_config(args, controller_dir, provenance_dir, guard)
+    config_path = make_config(
+        args,
+        controller_dir,
+        provenance_dir,
+        guard,
+        phase=phase,
+    )
     source_request = common.make_source_request(args, provenance_dir)
     common.write_json(
         provenance_dir / "inputs.json",
         {
             "format_version": 1,
-            "scenario": "CAP-0 No-op bring-up",
-            "status": "BRINGUP_NOT_REPORTABLE",
+            "scenario": (
+                "CAP-0 No-op bring-up"
+                if phase == "bringup"
+                else "CAP-0 No-op formal"
+            ),
+            "status": (
+                "BRINGUP_NOT_REPORTABLE"
+                if phase == "bringup"
+                else "FORMAL_REPETITION"
+            ),
+            "phase": phase,
+            "repetition": repetition,
             "run_id": run_id,
             "revision": revision,
             "manifest": str(args.manifest.resolve()),
@@ -367,6 +400,8 @@ def run(
         "format_version": 1,
         "status": "RUNNING",
         "scenario": "noop",
+        "phase": phase,
+        "repetition": repetition,
         "run_id": run_id,
         "revision": revision,
         "started_unix_s": time.time(),
@@ -491,15 +526,18 @@ def run(
         common.write_json(provenance_dir / "noop_acceptance.json", acceptance)
         if acceptance["status"] != "PASS":
             raise RuntimeError("; ".join(acceptance["errors"]))
+        final_status = "BRINGUP_COMPLETE" if phase == "bringup" else "PASS"
         status.update(
             {
-                "status": "BRINGUP_COMPLETE",
+                "status": final_status,
                 "ended_unix_s": time.time(),
                 "acceptance": acceptance,
             }
         )
         common.write_json(out_root / "status.json", status)
-        print(f"NOOP_BRINGUP_COMPLETE: {out_root}", flush=True)
+        marker = "NOOP_BRINGUP_COMPLETE" if phase == "bringup" else "PASS"
+        print(f"{marker}: {out_root}", flush=True)
+        return status
     except Exception as error:
         status.update(
             {
@@ -533,7 +571,7 @@ def main() -> None:
             )
         )
         return
-    run(args, revision, guard, pressure)
+    run(args, revision, guard, pressure, phase="bringup")
 
 
 if __name__ == "__main__":
