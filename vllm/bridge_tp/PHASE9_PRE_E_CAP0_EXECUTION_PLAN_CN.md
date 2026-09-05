@@ -1624,6 +1624,117 @@ blocked_stay_decisions > 0`、`START_SHADOW=0`、migration transition 为 0、An
 TP1 发出、76/76 background jobs 完成。三轮全部通过时，批次状态为 `FORMAL_COMPLETE`，
 控制台打印 `NOOP_FORMAL_COMPLETE`；任一轮失败则保留现场并停止，不得覆盖后重跑。
 
+P0 已于 2026-09-05 在 revision
+`2861cfefd7f7fc552f647f0462715099b0ce7b40` 完成三轮正式重复；三轮均为 PASS，且
+`START_SHADOW=0`、migration transition 为 0、76/76 background jobs 完成。该结果只关闭
+No-op 门，不代替下面的 Rescue。
+
+### 22.3 P1 Rescue reachability 自动 bring-up
+
+P1 先只跑一次不计数 bring-up，不立即冻结 `rescue_v1`，也不运行正式重复。其目标不是比较
+性能，而是证明同一个因果信号能从“因 TP4 当前 guard 不满足而保持 TP1”走到“TP4 自然
+恢复后允许迁移”，并真实贯通数据面。
+
+默认 working manifest 包含 48 个 TP4 target jobs 和 4 个 TP1 source-pressure jobs，共 52
+个 background jobs。每个 target job 使用 7000 个显式 token IDs 加 1100 output tokens，
+target 总 context demand 为 388800 tokens：高于 50% contention floor，但低于实测 TP4
+571824-token KV 容量。这样 target burst 应在 signal active 时先令 `waiting > 4`，随后有限
+作业自然完成并降至 `waiting <= 4`；这只是事前候选，不能把一次通过当作参数已冻结。
+
+bring-up 必须同时证明：
+
+- active capacity signal 下先出现至少一次由 TP4 guard 阻挡的 `STAY`；
+- 后续仅出现一次满足当前 KV/waiting guard 的 `START_SHADOW`，触发路径为
+  `CAPACITY_PILOT`；
+- 状态严格经过 `SHADOW -> HANDOFF -> TAKEOVER`，且只有四个 rank 全部 ready 才 commit；
+- 四份 sender/receiver receipt 的 migration/request ID、payload bytes、SHA-256 一致，四个
+  receiver 均为 `OWNERSHIP_COMMITTED` 且 `exact_readback=true`；
+- commit 后 source abort 已下发、target 成为唯一 owner，统一输出恰好 8000 tokens，source
+  prefix 与 target suffix 都非空，index 连续且 JSONL/token IDs 完全一致；
+- 52/52 background jobs 全部成功，且 anchor 的 source/target request ID 不与 background
+  request 串号。
+
+服务器拉取含 Rescue bring-up 的 revision 后，在一个前台终端执行。父进程会依次启动并拥有
+TP4、TP1、stager、controller 和 background workload；结束或 `Ctrl+C` 时由父进程清理，
+不要另开终端预启动服务，也不要使用 `nohup`：
+
+```bash
+cd /root/autodl-tmp/bridgetp/vllm_bridge
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
+
+set +e
+set +u
+set +o pipefail
+
+export CAP0_CODE_REVISION="$(git rev-parse HEAD)"
+export CAP0_SURVIVAL_SHA=031b06b0e7d663d5a4ad9cf71f2a640123b84d8e85eb4c94d94f44baa20aaa4a
+export CAP0_GUARD_FILE="$CAP0_MANIFEST_ROOT/frozen/guard_free_kv_tokens.txt"
+export CAP0_GUARD_SHA=0e86c353044f9610be1b5511ff21e870823b7f259c40ccde24188d84164b545b
+
+test "$(sha256sum "$CAP0_SURVIVAL_TABLE" | awk '{print $1}')" = "$CAP0_SURVIVAL_SHA"
+test "$(sha256sum "$CAP0_GUARD_FILE" | awk '{print $1}')" = "$CAP0_GUARD_SHA"
+test "$(cat "$CAP0_GUARD_FILE")" = 8448
+
+export RESCUE_ID="cap0-rescue-bringup-$(date -u +%Y%m%dT%H%M%SZ)"
+export RESCUE_MANIFEST="$CAP0_MANIFEST_ROOT/working/${RESCUE_ID}.json"
+export RESCUE_ROOT="$CAP0_RESULTS/rescue_bringup/$RESCUE_ID"
+mkdir -p "$CAP0_MANIFEST_ROOT/working" "$CAP0_RESULTS/rescue_bringup"
+
+"$BRIDGE_PY" tools/bridge_tp/build_phase9_cap0_rescue_manifest.py \
+  --out "$RESCUE_MANIFEST"
+export RESCUE_MANIFEST_SHA="$(sha256sum "$RESCUE_MANIFEST" | awk '{print $1}')"
+
+"$BRIDGE_PY" tools/bridge_tp/run_phase9_cap0_rescue.py \
+  --validate-only \
+  --model-path "$BRIDGE_MODEL" \
+  --manifest "$RESCUE_MANIFEST" \
+  --survival-table "$CAP0_SURVIVAL_TABLE" \
+  --guard-file "$CAP0_GUARD_FILE" \
+  --out-root "$RESCUE_ROOT" \
+  --expected-revision "$CAP0_CODE_REVISION" \
+  --expected-manifest-sha256 "$RESCUE_MANIFEST_SHA" \
+  --expected-survival-sha256 "$CAP0_SURVIVAL_SHA" \
+  --expected-guard-sha256 "$CAP0_GUARD_SHA" \
+  --expected-guard 8448 \
+  --tp1-blocks "$TP1_BLOCKS" --tp4-blocks "$TP4_BLOCKS"
+export VALIDATE_RC=$?
+
+if [ "$VALIDATE_RC" -eq 0 ]; then
+  set -o pipefail
+  "$BRIDGE_PY" tools/bridge_tp/run_phase9_cap0_rescue.py \
+    --model-path "$BRIDGE_MODEL" \
+    --manifest "$RESCUE_MANIFEST" \
+    --survival-table "$CAP0_SURVIVAL_TABLE" \
+    --guard-file "$CAP0_GUARD_FILE" \
+    --out-root "$RESCUE_ROOT" \
+    --expected-revision "$CAP0_CODE_REVISION" \
+    --expected-manifest-sha256 "$RESCUE_MANIFEST_SHA" \
+    --expected-survival-sha256 "$CAP0_SURVIVAL_SHA" \
+    --expected-guard-sha256 "$CAP0_GUARD_SHA" \
+    --expected-guard 8448 \
+    --tp1-blocks "$TP1_BLOCKS" --tp4-blocks "$TP4_BLOCKS" \
+    2>&1 | tee "$CAP0_RESULTS/rescue_bringup/${RESCUE_ID}.console.txt"
+  export RESCUE_RC=${PIPESTATUS[0]}
+else
+  export RESCUE_RC=98
+fi
+set +o pipefail
+
+echo "VALIDATE_RC=$VALIDATE_RC"
+echo "RESCUE_RC=$RESCUE_RC"
+echo "RESCUE_ROOT=$RESCUE_ROOT"
+echo "RESCUE_MANIFEST=$RESCUE_MANIFEST"
+test "$VALIDATE_RC" -eq 0
+test "$RESCUE_RC" -eq 0
+```
+
+成功标志为 `RESCUE_BRINGUP_COMPLETE`，机器验收文件是
+`$RESCUE_ROOT/provenance/rescue_acceptance.json`。失败时保留整个目录并停止；先分析
+`capacity_pilot_decision` 的 waiting/KV 时间序列和五类日志，不能事后改 guard。只有一次
+bring-up 完整通过并人工确认工件后，下一步才是把该 exact jobs manifest 冻结成
+`rescue_v1.json`，再实现和运行至少三轮正式重复。
+
 三者共同设置：
 
 ```bash
