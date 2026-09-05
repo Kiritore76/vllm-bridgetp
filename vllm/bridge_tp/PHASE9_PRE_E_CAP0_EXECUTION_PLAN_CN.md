@@ -226,14 +226,18 @@ telemetry 中得到的可解释工程阈值，而不是未来信息、错误容�
 
 - 每 tick free KV tokens、KV usage、running、waiting；
 - preemptions/recompute counter；
-- free-token EWMA decline rate；
+- free-token EWMA decline rate（仅作运行时诊断）；
+- 抢占前、`running/waiting/preemptions` 均不变的相邻样本瞬时下降率及其 p95；
 - 距候选 guard 的 time-to-guard；
 - 请求到达、结束和自然容量释放时间；
 - 是否出现不可恢复 overload。
 
-标定规则必须在查看 held-out CAP-0 场景前写下。优先选择首次 preemption 之前、留有工程
-反应时间的保守 free-token 水位；若三次均无 preemption，则使用最近点和最坏下降率形成
-保守 guard，并记录这是 closest-approach 标定而非 preemption-boundary 标定。
+标定规则必须在查看 held-out CAP-0 场景前写下。`F_i` 取 preemption counter 首次上升前的
+最后一个 telemetry 样本，而不是抢占释放 KV 后的样本。请求入场、退出或 recompute 可能在
+单次 scrape 间隔内离散分配/释放数千 KV token；不得把这种阶跃当作持续生成速率外推。
+每轮只在首次抢占前、相邻样本的 `num_running`、`num_waiting` 和
+`preemptions_total` 均不变时计算正向瞬时下降率，取其 nearest-rank p95 为 `D_i`；正式三轮
+再取 `max_i(D_i)`。v2 默认协议要求每轮都有 preemption，不使用 closest approach。
 
 ### 8.4 通过标准
 
@@ -1370,25 +1374,48 @@ for run_s in sys.argv[1:]:
     if not tel:
         raise SystemExit(f'no telemetry: {run}')
     initial = int(tel[0]['tp1']['preemptions_total'])
-    first = next((x for x in tel if int(x['tp1']['preemptions_total']) > initial), None)
+    first_index = next((i for i, x in enumerate(tel)
+                        if int(x['tp1']['preemptions_total']) > initial), None)
+    first = tel[first_index] if first_index is not None else None
+    before = tel[:first_index] if first_index is not None else tel
     free = [int(x['capacity_signal']['free_kv_tokens']) for x in tel]
     decline = [float(x['capacity_signal']['decline_rate_tokens_s']) for x in tel]
+    steady = []
+    for previous, current in zip(before, before[1:]):
+        fields = ('num_running', 'num_waiting', 'preemptions_total')
+        if any(int(previous['tp1'][k]) != int(current['tp1'][k]) for k in fields):
+            continue
+        dt = float(current['tp1']['sampled_unix_s']) - float(previous['tp1']['sampled_unix_s'])
+        consumed = (int(previous['capacity_signal']['free_kv_tokens'])
+                    - int(current['capacity_signal']['free_kv_tokens']))
+        if 0 < dt <= 2.0 and consumed > 0:
+            steady.append(consumed / dt)
+    steady.sort()
+    p95 = steady[max(0, __import__('math').ceil(0.95 * len(steady)) - 1)]
     print(json.dumps({
         'run': run.name,
         'samples': len(tel),
         'minimum_free_kv_tokens': min(free),
-        'first_preemption_free_kv_tokens': (
+        'pre_preemption_free_kv_tokens': (
+            int(tel[first_index - 1]['capacity_signal']['free_kv_tokens'])
+            if first_index is not None and first_index > 0 else None),
+        'post_preemption_free_kv_tokens': (
             int(first['capacity_signal']['free_kv_tokens']) if first else None),
-        'maximum_ewma_decline_tokens_s': max(decline),
+        'steady_decline_sample_count': len(steady),
+        'steady_decline_p95_tokens_s': p95,
+        'maximum_observed_ewma_decline_tokens_s': max(decline),
         'final_state': next(x for x in reversed(rows) if x.get('kind') == 'run_end')['final_state'],
     }, sort_keys=True))
 PY
 ```
 
-在查看 held-out 三场景前冻结以下事前规则：令每轮 `F_i` 为第一次 preemption 时的 free KV。
+在查看 held-out 三场景前冻结以下事前规则：令每轮 `F_i` 为第一次 preemption counter 上升
+之前最后一个 telemetry 样本的 free KV。
 v2 默认协议要求 smoke 和三个 formal repetition 都观察到 preemption；任一轮无 preemption
 直接失败，不能用 closest approach 代替。`--allow-censored` 只保留给未来显式修订协议，当前
-不得使用。令 `D_max` 为三轮最大 EWMA decline，`T_enter=8s`。工程 guard 为：
+不得使用。令每轮 `D_i` 为首次抢占前、调度状态不变相邻样本正向瞬时下降率的 nearest-rank
+p95，`D_max=max_i(D_i)`，`T_enter=8s`。全程最大 EWMA 只保留为诊断量，不能进入 guard
+公式，因为请求入场/恢复的离散 KV 分配会污染它。工程 guard 为：
 
 ```text
 ceil_to_block(max_i(F_i) + D_max * T_enter)

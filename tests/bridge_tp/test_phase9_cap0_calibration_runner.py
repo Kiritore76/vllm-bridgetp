@@ -27,14 +27,14 @@ class TestGuardCandidate(unittest.TestCase):
         result = MODULE.calculate_guard_candidate(
             [
                 {
-                    "first_preemption_free_kv_tokens": 100,
+                    "pre_preemption_free_kv_tokens": 100,
                     "minimum_free_kv_tokens": 80,
-                    "maximum_ewma_decline_tokens_s": 10.0,
+                    "steady_decline_p95_tokens_s": 10.0,
                 },
                 {
-                    "first_preemption_free_kv_tokens": None,
+                    "pre_preemption_free_kv_tokens": None,
                     "minimum_free_kv_tokens": 120,
-                    "maximum_ewma_decline_tokens_s": 5.0,
+                    "steady_decline_p95_tokens_s": 5.0,
                 },
             ],
             block_size=16,
@@ -49,15 +49,77 @@ class TestGuardCandidate(unittest.TestCase):
         result = MODULE.calculate_guard_candidate(
             [
                 {
-                    "first_preemption_free_kv_tokens": 990,
+                    "pre_preemption_free_kv_tokens": 990,
                     "minimum_free_kv_tokens": 900,
-                    "maximum_ewma_decline_tokens_s": 100.0,
+                    "steady_decline_p95_tokens_s": 100.0,
                 }
             ],
             block_size=16,
             tp1_total_tokens=1000,
         )
         self.assertEqual(result["guard_candidate_tokens"], 984)
+
+
+class TestCalibrationMetrics(unittest.TestCase):
+    def test_uses_pre_preemption_boundary_and_robust_steady_p95(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = Path(temporary)
+            records = []
+            free = 5000
+            # Twenty ordinary steady intervals followed by one same-state
+            # allocation shock.  P95 must not turn that single shock into an
+            # eight-second continuous generation rate.
+            for index in range(22):
+                records.append(
+                    {
+                        "kind": "telemetry",
+                        "tp1": {
+                            "preemptions_total": 0,
+                            "kv_usage_frac": 1.0 - free / 6000,
+                            "num_running": 2,
+                            "num_waiting": 0,
+                            "sampled_unix_s": float(index),
+                        },
+                        "capacity_signal": {
+                            "free_kv_tokens": free,
+                            "decline_rate_tokens_s": 1000.0 if index == 21 else 10.0,
+                        },
+                    }
+                )
+                free -= 1000 if index == 20 else 10
+            boundary_free = records[-1]["capacity_signal"]["free_kv_tokens"]
+            records.append(
+                {
+                    "kind": "telemetry",
+                    "tp1": {
+                        "preemptions_total": 1,
+                        "kv_usage_frac": 0.5,
+                        "num_running": 1,
+                        "num_waiting": 0,
+                        "sampled_unix_s": 22.0,
+                    },
+                    "capacity_signal": {
+                        "free_kv_tokens": 3000,
+                        "decline_rate_tokens_s": 500.0,
+                    },
+                }
+            )
+            (controller / "phase9_audit.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in records),
+                encoding="utf-8",
+            )
+
+            result = MODULE.calibration_metrics(controller)
+
+            self.assertEqual(
+                result["pre_preemption_free_kv_tokens"], boundary_free
+            )
+            self.assertEqual(result["post_preemption_free_kv_tokens"], 3000)
+            self.assertEqual(result["steady_decline_sample_count"], 21)
+            self.assertEqual(result["steady_decline_p95_tokens_s"], 10.0)
+            self.assertEqual(
+                result["maximum_observed_ewma_decline_tokens_s"], 1000.0
+            )
 
 
 class TestManifestPressure(unittest.TestCase):
