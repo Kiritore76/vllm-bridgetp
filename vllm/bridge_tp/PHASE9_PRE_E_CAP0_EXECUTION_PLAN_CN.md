@@ -1532,6 +1532,98 @@ echo "NOOP_RC=${PIPESTATUS[0]}"
 echo "NOOP_ROOT=$NOOP_ROOT"
 ```
 
+### 22.2 冻结 P0 No-op workload 并运行正式重复
+
+只有 22.1 的 bring-up 输出 `NOOP_BRINGUP_COMPLETE`，且人工核验每一个 active
+capacity decision 都是 target-guarded `STAY` 后，才允许冻结。冻结器读取实际展开后的
+`background_manifest.json`，逐项核对 bring-up status、acceptance、inputs、代码 revision、
+survival table、guard 和原始 manifest 哈希，然后生成不可覆盖的 `noop_v1.json`、checksum
+和 provenance。不能手工编辑冻结文件，也不能把重新调用 builder 生成的近似 workload 当作
+已验证 workload。
+
+以下命令中的 bring-up ID 和原始哈希对应首次通过的 P0 bring-up。正式代码 revision 必须在
+服务器拉取正式 runner 提交后固定：
+
+```bash
+cd /root/autodl-tmp/bridgetp/vllm_bridge
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
+source /root/autodl-tmp/bridgetp/phase9_cap0_geometry.env
+source /root/autodl-tmp/bridgetp/phase9_cap0_predictor.env
+
+export OMP_NUM_THREADS=1
+export CAP0_CODE_REVISION="$(git rev-parse HEAD)"
+export BRINGUP_REVISION=613daee714e2632b3b225765badcaa72fab44c61
+export BRINGUP_ID=cap0-noop-bringup-20260905T071651Z
+export BRINGUP_ROOT="$CAP0_RESULTS/noop_bringup/$BRINGUP_ID"
+export EXECUTED_MANIFEST="$BRINGUP_ROOT/background/background_manifest.json"
+export ORIGIN_MANIFEST_SHA=e3310a97b3ae7d524d681ddfbd26f114f0563684575b245dd85e1cfd572140b8
+export CAP0_GUARD_FILE="$CAP0_MANIFEST_ROOT/frozen/guard_free_kv_tokens.txt"
+export CAP0_GUARD_SHA=0e86c353044f9610be1b5511ff21e870823b7f259c40ccde24188d84164b545b
+export CAP0_SURVIVAL_SHA=031b06b0e7d663d5a4ad9cf71f2a640123b84d8e85eb4c94d94f44baa20aaa4a
+export FROZEN_NOOP="$CAP0_MANIFEST_ROOT/frozen/noop_v1.json"
+
+"$BRIDGE_PY" tools/bridge_tp/freeze_phase9_cap0_noop.py \
+  --bringup-root "$BRINGUP_ROOT" \
+  --working-manifest "$EXECUTED_MANIFEST" \
+  --out "$FROZEN_NOOP" \
+  --expected-bringup-revision "$BRINGUP_REVISION" \
+  --expected-working-sha256 "$ORIGIN_MANIFEST_SHA" \
+  --expected-survival-sha256 "$CAP0_SURVIVAL_SHA" \
+  --expected-guard-sha256 "$CAP0_GUARD_SHA" \
+  --expected-guard 8448 \
+  --tp1-blocks "$TP1_BLOCKS" --tp4-blocks "$TP4_BLOCKS"
+
+export FROZEN_NOOP_PROVENANCE="$CAP0_MANIFEST_ROOT/frozen/noop_v1.provenance.json"
+export FROZEN_NOOP_SHA="$(awk '{print $1}' "$CAP0_MANIFEST_ROOT/frozen/noop_v1.sha256")"
+test "$(sha256sum "$FROZEN_NOOP" | awk '{print $1}')" = "$FROZEN_NOOP_SHA"
+
+export NOOP_BATCH_ID="cap0-noop-formal-$(date -u +%Y%m%dT%H%M%SZ)"
+export NOOP_BATCH_ROOT="$CAP0_RESULTS/noop_batches/$NOOP_BATCH_ID"
+
+"$BRIDGE_PY" tools/bridge_tp/run_phase9_cap0_noop_formal.py \
+  --validate-only \
+  --model-path "$BRIDGE_MODEL" \
+  --manifest "$FROZEN_NOOP" \
+  --manifest-provenance "$FROZEN_NOOP_PROVENANCE" \
+  --bringup-root "$BRINGUP_ROOT" \
+  --survival-table "$CAP0_SURVIVAL_TABLE" \
+  --guard-file "$CAP0_GUARD_FILE" \
+  --out-root "$NOOP_BATCH_ROOT" \
+  --expected-revision "$CAP0_CODE_REVISION" \
+  --expected-manifest-sha256 "$FROZEN_NOOP_SHA" \
+  --expected-survival-sha256 "$CAP0_SURVIVAL_SHA" \
+  --expected-guard-sha256 "$CAP0_GUARD_SHA" \
+  --expected-guard 8448 \
+  --tp1-blocks "$TP1_BLOCKS" --tp4-blocks "$TP4_BLOCKS" \
+  --repetitions 3
+
+set -o pipefail
+"$BRIDGE_PY" tools/bridge_tp/run_phase9_cap0_noop_formal.py \
+  --model-path "$BRIDGE_MODEL" \
+  --manifest "$FROZEN_NOOP" \
+  --manifest-provenance "$FROZEN_NOOP_PROVENANCE" \
+  --bringup-root "$BRINGUP_ROOT" \
+  --survival-table "$CAP0_SURVIVAL_TABLE" \
+  --guard-file "$CAP0_GUARD_FILE" \
+  --out-root "$NOOP_BATCH_ROOT" \
+  --expected-revision "$CAP0_CODE_REVISION" \
+  --expected-manifest-sha256 "$FROZEN_NOOP_SHA" \
+  --expected-survival-sha256 "$CAP0_SURVIVAL_SHA" \
+  --expected-guard-sha256 "$CAP0_GUARD_SHA" \
+  --expected-guard 8448 \
+  --tp1-blocks "$TP1_BLOCKS" --tp4-blocks "$TP4_BLOCKS" \
+  --repetitions 3 \
+  2>&1 | tee "$CAP0_RESULTS/noop_batches/${NOOP_BATCH_ID}.console.txt"
+echo "NOOP_FORMAL_RC=${PIPESTATUS[0]}"
+echo "NOOP_BATCH_ROOT=$NOOP_BATCH_ROOT"
+```
+
+每轮必须独立重启五类进程、使用新目录，并满足 `active_capacity_decisions ==
+blocked_stay_decisions > 0`、`START_SHADOW=0`、migration transition 为 0、Anchor 完整由
+TP1 发出、76/76 background jobs 完成。三轮全部通过时，批次状态为 `FORMAL_COMPLETE`，
+控制台打印 `NOOP_FORMAL_COMPLETE`；任一轮失败则保留现场并停止，不得覆盖后重跑。
+
 三者共同设置：
 
 ```bash
