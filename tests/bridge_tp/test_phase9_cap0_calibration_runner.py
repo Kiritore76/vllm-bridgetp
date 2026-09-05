@@ -156,6 +156,24 @@ class TestSmokeContract(unittest.TestCase):
                 MODULE.validate_smoke_acceptance(args, "revision")
 
 
+class TestSourceSelectionContract(unittest.TestCase):
+    def test_nested_controller_directory_drives_anchor_prefix(self) -> None:
+        args = SimpleNamespace(
+            tp1_gpu="0",
+            snapshot_port=29800,
+            delta_port=29900,
+        )
+        environment = MODULE.source_environment(
+            args,
+            "cap0-calibration-smoke-example",
+            Path("batch") / "smoke" / "controller",
+        )
+        self.assertEqual(
+            environment["BRIDGETP_STREAM_SOURCE_REQUEST_ID_PREFIX"],
+            "bridgetp-phase9-controller",
+        )
+
+
 class TestCalibrationAcceptance(unittest.TestCase):
     @staticmethod
     def write_run(
