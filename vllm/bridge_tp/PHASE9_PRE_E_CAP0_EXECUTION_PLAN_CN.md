@@ -717,7 +717,9 @@ grep -Ei 'GPU KV cache size|GPU blocks|num_gpu_blocks' \
   | tee "$GEOM_DIR/kv_block_lines.txt"
 ```
 
-把日志中各 server 报告的 per-rank 数写入环境文件。TP4 的值不要乘 4：
+日志中的 `GPU KV cache size` 单位是 token，而后续参数单位是 KV block。当前配置的
+`block_size=16 tokens`，必须先验证能够整除 16，再换算成 block 数。TP4 日志值已经对应
+该 TP4 实例的 per-rank 容量，换算后不要再乘 4：
 
 ```bash
 cd /root/autodl-tmp/bridgetp/vllm_bridge
@@ -725,13 +727,22 @@ source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 
 export GEOM_DIR="$E0_DIR/geometry_probe"
-export TP1_BLOCKS=替换为TP1日志实际值
-export TP4_BLOCKS=替换为TP4日志实际值
+export KV_BLOCK_SIZE=16
+export TP1_KV_TOKENS=31488
+export TP4_KV_TOKENS=571824
+test $((TP1_KV_TOKENS % KV_BLOCK_SIZE)) -eq 0
+test $((TP4_KV_TOKENS % KV_BLOCK_SIZE)) -eq 0
+export TP1_BLOCKS=$((TP1_KV_TOKENS / KV_BLOCK_SIZE))
+export TP4_BLOCKS=$((TP4_KV_TOKENS / KV_BLOCK_SIZE))
 test "$TP1_BLOCKS" -gt 0
 test "$TP4_BLOCKS" -gt 0
-printf 'export TP1_BLOCKS=%s\nexport TP4_BLOCKS=%s\n' \
+printf 'export KV_BLOCK_SIZE=%s\nexport TP1_KV_TOKENS=%s\nexport TP4_KV_TOKENS=%s\nexport TP1_BLOCKS=%s\nexport TP4_BLOCKS=%s\n' \
+  "$KV_BLOCK_SIZE" "$TP1_KV_TOKENS" "$TP4_KV_TOKENS" \
   "$TP1_BLOCKS" "$TP4_BLOCKS" \
   | tee /root/autodl-tmp/bridgetp/phase9_cap0_geometry.env
+
+test "$TP1_BLOCKS" -eq 1968
+test "$TP4_BLOCKS" -eq 35739
 ```
 
 环境文件写好后，分别回到 G2、G1 按 `Ctrl+C` 正常停止 TP1、TP4。确认 8001/8200 已释放后
