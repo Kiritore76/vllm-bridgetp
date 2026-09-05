@@ -125,6 +125,19 @@ def accept_abandon(
     max_target_kv_usage_frac: float = 0.85,
     max_target_waiting: int = 4,
 ) -> dict[str, Any]:
+    errors: list[str] = []
+
+    def required_json(name: str) -> dict[str, Any]:
+        path = controller_dir / name
+        if not path.is_file():
+            errors.append(f"missing required abandon artifact: {name}")
+            return {}
+        try:
+            return common.read_json(path)
+        except (OSError, json.JSONDecodeError) as error:
+            errors.append(f"invalid abandon artifact {name}: {error}")
+            return {}
+
     background = common.read_json(background_dir / "background_summary.json")
     rows = load_audit(controller_dir / "phase9_audit.jsonl")
     capacity = [
@@ -150,17 +163,12 @@ def accept_abandon(
         "rollback_failed",
     }
     fatal = [row for row in rows if row.get("kind") in fatal_kinds]
-    proxy = common.read_json(controller_dir / "response_proxy_stats.json")
-    cleanup = common.read_json(controller_dir / "cleanup_request.json")
-    takeover = common.read_json(controller_dir / "takeover_state.json")
-    source_cleanup = common.read_json(
-        controller_dir / "source_cleanup_receipt.json"
-    )
-    stager_cleanup = common.read_json(
-        controller_dir / "stager_cleanup_receipt.json"
-    )
+    proxy = required_json("response_proxy_stats.json")
+    cleanup = required_json("cleanup_request.json")
+    takeover = required_json("takeover_state.json")
+    source_cleanup = required_json("source_cleanup_receipt.json")
+    stager_cleanup = required_json("stager_cleanup_receipt.json")
 
-    errors: list[str] = []
     if background.get("jobs") != expected_jobs:
         errors.append("background job count differs from the manifest")
     if background.get("completed") != expected_jobs or background.get("failed") != 0:
@@ -258,7 +266,7 @@ def accept_abandon(
     if receiver_receipts:
         errors.append("receiver receipts exist despite pre-cutover abandon")
 
-    session = common.read_json(controller_dir / "session_manifest.json")
+    session = required_json("session_manifest.json")
     background_ids = {
         result.get("response_id") for result in background.get("results", [])
     }

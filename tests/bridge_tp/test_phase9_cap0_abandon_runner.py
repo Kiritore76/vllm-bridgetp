@@ -43,6 +43,7 @@ class TestAbandonManifest(unittest.TestCase):
         self.assertEqual(len(manifest["jobs"]), 8)
         self.assertEqual(pressure["source_jobs"], 4)
         self.assertEqual(pressure["target_jobs"], 4)
+        self.assertEqual(manifest["parameters"]["source_output_tokens"], 4300)
         self.assertGreaterEqual(pressure["source_to_capacity_frac"], 0.75)
         self.assertLessEqual(pressure["source_to_capacity_frac"], 0.90)
         self.assertLess(pressure["target_to_capacity_frac"], 0.10)
@@ -229,6 +230,22 @@ class TestAbandonAcceptance(unittest.TestCase):
             self.assertEqual(result["status"], "FAIL")
             self.assertTrue(
                 any("source abort" in error for error in result["errors"])
+            )
+
+    def test_missing_cleanup_is_a_structured_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.write_case(root)
+            (root / "controller" / "cleanup_request.json").unlink()
+            result = RUNNER.accept_abandon(
+                root / "controller",
+                root / "background",
+                expected_jobs=8,
+                expected_anchor_tokens=4,
+            )
+            self.assertEqual(result["status"], "FAIL")
+            self.assertTrue(
+                any("cleanup_request.json" in error for error in result["errors"])
             )
 
 
