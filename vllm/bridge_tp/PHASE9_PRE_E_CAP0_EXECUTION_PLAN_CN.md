@@ -663,7 +663,10 @@ source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 ss -ltnp | grep -E ':(8001|8200)\b' || true
 ```
 
-启动一次与后续相同参数的 clean geometry probe：
+启动一次与后续相同参数的 clean geometry probe。两个 server 都以前台方式运行，分别占用
+一个终端；不要关闭终端，也不要在命令末尾添加 `&`。
+
+终端 G1：TP4，监听 8200：
 
 ```bash
 cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
@@ -673,28 +676,55 @@ source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 export GEOM_DIR="$E0_DIR/geometry_probe"
 mkdir -p "$GEOM_DIR"
 
-CUDA_VISIBLE_DEVICES=1,2,3,4 nohup "$BRIDGE_PY" \
+CUDA_VISIBLE_DEVICES=1,2,3,4 "$BRIDGE_PY" \
   -m vllm.entrypoints.openai.api_server \
   --model "$BRIDGE_MODEL" --served-model-name bridgetp-model \
   --tensor-parallel-size 4 --dtype bfloat16 --max-model-len 8192 \
   --gpu-memory-utilization 0.88 --port 8200 \
   --no-enable-prefix-caching --disable-hybrid-kv-cache-manager \
-  --no-async-scheduling > "$GEOM_DIR/target_tp4.log" 2>&1 &
-echo $! > "$GEOM_DIR/target.pid"
+  --no-async-scheduling \
+  2>&1 | tee "$GEOM_DIR/target_tp4.log"
+```
 
-CUDA_VISIBLE_DEVICES=0 nohup "$BRIDGE_PY" \
+终端 G2：TP1，监听 8001：
+
+```bash
+cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
+
+export GEOM_DIR="$E0_DIR/geometry_probe"
+mkdir -p "$GEOM_DIR"
+
+CUDA_VISIBLE_DEVICES=0 "$BRIDGE_PY" \
   -m vllm.entrypoints.openai.api_server \
   --model "$BRIDGE_MODEL" --served-model-name bridgetp-model \
   --tensor-parallel-size 1 --dtype bfloat16 --max-model-len 8192 \
   --gpu-memory-utilization 0.88 --port 8001 \
   --no-enable-prefix-caching --disable-hybrid-kv-cache-manager \
-  --no-async-scheduling > "$GEOM_DIR/source_tp1.log" 2>&1 &
-echo $! > "$GEOM_DIR/source.pid"
+  --no-async-scheduling \
+  2>&1 | tee "$GEOM_DIR/source_tp1.log"
+```
+
+终端 G3：等待健康并读取日志：
+
+```bash
+cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
+
+export GEOM_DIR="$E0_DIR/geometry_probe"
 
 for url in http://127.0.0.1:8001/health http://127.0.0.1:8200/health; do
   for attempt in $(seq 1 450); do
-    curl -fsS "$url" >/dev/null && break
-    test "$attempt" -lt 450
+    if curl -fsS "$url" >/dev/null 2>&1; then
+      echo "READY: $url"
+      break
+    fi
+    if [ "$attempt" -eq 450 ]; then
+      echo "TIMEOUT: $url"
+      exit 1
+    fi
     sleep 2
   done
 done
@@ -719,11 +749,10 @@ test "$TP4_BLOCKS" -gt 0
 printf 'export TP1_BLOCKS=%s\nexport TP4_BLOCKS=%s\n' \
   "$TP1_BLOCKS" "$TP4_BLOCKS" \
   | tee /root/autodl-tmp/bridgetp/phase9_cap0_geometry.env
-
-kill "$(cat "$GEOM_DIR/source.pid")" "$(cat "$GEOM_DIR/target.pid")"
-wait "$(cat "$GEOM_DIR/source.pid")" || true
-wait "$(cat "$GEOM_DIR/target.pid")" || true
 ```
+
+环境文件写好后，分别回到 G2、G1 按 `Ctrl+C` 正常停止 TP1、TP4。确认 8001/8200 已释放后
+再运行 052。若任一 server 失败，traceback 会直接显示在对应前台终端并同时保存在日志中。
 
 ## 18. S1：`d3-formal-052` post-fix 工程回归完整命令
 
@@ -955,7 +984,12 @@ PY
 "$BRIDGE_PY" -c 'from vllm.bridge_tp.controller.config import ControllerConfig; import sys; ControllerConfig.load(sys.argv[1]); print("VALID",sys.argv[1])' "$CAP0_CONFIG"
 ```
 
-### 20.2 启动 TP4、TP1 和 stager
+### 20.2 前台启动 TP4、TP1 和 stager
+
+每个进程使用独立终端前台运行。不要使用 `nohup`、命令末尾的 `&` 或 PID 文件。这样任何
+CUDA、模型加载、端口和 connector 异常都会立即显示，同时由 `tee` 保存。
+
+终端 T1：TP4 target，GPU1--4，HTTP 端口 8200：
 
 ```bash
 cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
@@ -967,7 +1001,7 @@ export PHASE9_STAGING_MANIFEST="$CAP0_DIR/staging_manifest.json"
 export PHASE9_RECEIPTS="$CAP0_DIR/receiver_receipts"
 export PHASE9_CONTROL="$CAP0_DIR/takeover_state.json"
 
-CUDA_VISIBLE_DEVICES=1,2,3,4 nohup "$BRIDGE_PY" \
+CUDA_VISIBLE_DEVICES=1,2,3,4 "$BRIDGE_PY" \
   -m vllm.entrypoints.openai.api_server \
   --model "$BRIDGE_MODEL" --served-model-name bridgetp-model \
   --tensor-parallel-size 4 --dtype bfloat16 --max-model-len 8192 \
@@ -985,8 +1019,16 @@ CUDA_VISIBLE_DEVICES=1,2,3,4 nohup "$BRIDGE_PY" \
       "bridgetp_stream_expected_phase":"BridgeTP D3 Phase 8",
       "bridgetp_takeover_control_path":os.environ["PHASE9_CONTROL"],
       "bridgetp_takeover_control_timeout_s":600}}))')" \
-  > "$CAP0_DIR/target_tp4.log" 2>&1 &
-echo $! > "$CAP0_PROV_DIR/target.pid"
+  2>&1 | tee "$CAP0_DIR/target_tp4.log"
+```
+
+终端 T2：TP1 source，GPU0，HTTP 端口 8001：
+
+```bash
+cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
+source /root/autodl-tmp/bridgetp/phase9_cap0_active.env
 
 export BRIDGETP_DUMP_ENABLED=0
 export BRIDGETP_STREAM_ENABLED=1
@@ -1012,34 +1054,57 @@ export BRIDGETP_TAKEOVER_ENABLED=1
 export BRIDGETP_TAKEOVER_MIGRATION_ID="$CAP0_ID"
 export BRIDGETP_TAKEOVER_RUN_DIR="$CAP0_DIR"
 
-CUDA_VISIBLE_DEVICES=0 nohup "$BRIDGE_PY" \
+CUDA_VISIBLE_DEVICES=0 "$BRIDGE_PY" \
   -m vllm.entrypoints.openai.api_server \
   --model "$BRIDGE_MODEL" --served-model-name bridgetp-model \
   --tensor-parallel-size 1 --dtype bfloat16 --max-model-len 8192 \
   --gpu-memory-utilization 0.88 --port 8001 \
   --no-enable-prefix-caching --disable-hybrid-kv-cache-manager \
-  --no-async-scheduling > "$CAP0_DIR/source_tp1.log" 2>&1 &
-echo $! > "$CAP0_PROV_DIR/source.pid"
+  --no-async-scheduling \
+  2>&1 | tee "$CAP0_DIR/source_tp1.log"
+```
+
+终端 T6：等待两个 HTTP 服务健康，并保存进程信息：
+
+```bash
+cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
+source /root/autodl-tmp/bridgetp/phase9_cap0_active.env
 
 for url in http://127.0.0.1:8001/health http://127.0.0.1:8200/health; do
   for attempt in $(seq 1 450); do
-    curl -fsS "$url" >/dev/null && break
-    test "$attempt" -lt 450
+    if curl -fsS "$url" >/dev/null 2>&1; then
+      echo "READY: $url"
+      break
+    fi
+    if [ "$attempt" -eq 450 ]; then
+      echo "TIMEOUT: $url"
+      exit 1
+    fi
     sleep 2
   done
 done
 
-nohup "$BRIDGE_PY" tools/bridge_tp/phase8_stager.py \
+ps -eo pid,ppid,lstart,args \
+  | grep -E 'vllm.entrypoints.openai.api_server.*--port (8001|8200)' \
+  | grep -v grep \
+  | tee "$CAP0_PROV_DIR/processes.txt"
+```
+
+只有 T6 报告两个 URL 均 `READY` 后，才打开终端 T3 启动 stager。T3 使用 delta 端口
+29900 和 delivery 端口 30000--30003：
+
+```bash
+cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
+source /root/autodl-tmp/bridgetp/phase9_cap0_active.env
+
+"$BRIDGE_PY" tools/bridge_tp/phase8_stager.py \
   --run-dir "$CAP0_DIR" --delta-host 127.0.0.1 --delta-base-port 29900 \
   --delivery-host 127.0.0.1 --delivery-base-port 30000 --timeout-s 600 \
-  > "$CAP0_DIR/stager.log" 2>&1 &
-echo $! > "$CAP0_PROV_DIR/stager.pid"
-
-ps -fp "$(paste -d, \
-  "$CAP0_PROV_DIR/target.pid" \
-  "$CAP0_PROV_DIR/source.pid" \
-  "$CAP0_PROV_DIR/stager.pid")" \
-  > "$CAP0_PROV_DIR/processes.txt"
+  2>&1 | tee "$CAP0_DIR/stager.log"
 ```
 
 每轮都重新核对日志 block 数与冻结值一致：
@@ -1055,7 +1120,9 @@ grep -Ei 'GPU KV cache size|GPU blocks|num_gpu_blocks' \
   | tee "$CAP0_PROV_DIR/kv_block_lines.txt"
 ```
 
-### 20.3 启动独立 background，再启动 controller
+### 20.3 前台启动独立 workload generator 和 controller
+
+先单独验证 manifest：
 
 ```bash
 cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
@@ -1066,17 +1133,27 @@ source /root/autodl-tmp/bridgetp/phase9_cap0_active.env
 "$BRIDGE_PY" tools/bridge_tp/run_phase9_capacity_background.py \
   --manifest "$CAP0_BG_MANIFEST" \
   --out-dir "$CAP0_BG_DIR" --validate-only
+```
 
-nohup "$BRIDGE_PY" tools/bridge_tp/run_phase9_capacity_background.py \
+终端 T4：前台运行 workload generator。它虽然在代码和文件名中叫 background，但这里不以
+shell 后台进程启动：
+
+```bash
+cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
+source /root/autodl-tmp/bridgetp/phase9_cap0_active.env
+
+"$BRIDGE_PY" tools/bridge_tp/run_phase9_capacity_background.py \
   --manifest "$CAP0_BG_MANIFEST" \
   --source-url http://127.0.0.1:8001 \
   --target-url http://127.0.0.1:8200 \
   --out-dir "$CAP0_BG_DIR" \
-  > "$CAP0_BG_DIR/background.log" 2>&1 &
-echo $! > "$CAP0_PROV_DIR/background.pid"
+  2>&1 | tee "$CAP0_BG_DIR/background.log"
 ```
 
-calibration/no-migration 使用：
+启动 T4 后立即切到终端 T5 启动 controller，避免人工延迟跨过 manifest 中的 source burst
+时刻。calibration/no-migration 在 T5 使用：
 
 ```bash
 cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
@@ -1091,7 +1168,7 @@ source /root/autodl-tmp/bridgetp/phase9_cap0_active.env
   2>&1 | tee "$CAP0_PROV_DIR/controller_console.txt"
 ```
 
-No-op、Rescue、Safe abandon 使用相同命令但去掉 `--dry-run`：
+No-op、Rescue、Safe abandon 在 T5 使用相同命令但去掉 `--dry-run`：
 
 ```bash
 cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
@@ -1106,21 +1183,9 @@ source /root/autodl-tmp/bridgetp/phase9_cap0_active.env
   2>&1 | tee "$CAP0_PROV_DIR/controller_console.txt"
 ```
 
-等待 background 并逐个正常停止本轮服务；PID 文件精确限定目标，禁止模糊 `pkill`：
-
-```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
-source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
-source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
-source /root/autodl-tmp/bridgetp/phase9_cap0_active.env
-
-wait "$(cat "$CAP0_PROV_DIR/background.pid")" || true
-for name in stager source target; do
-  pid="$(cat "$CAP0_PROV_DIR/${name}.pid")"
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
-done
-```
+等待 T4 workload generator 和 T5 controller 都自然结束并保存输出。然后分别回到 T3、T2、
+T1 按 `Ctrl+C`，依次正常停止 stager、TP1、TP4。不要使用 `pkill -f`。下一轮必须重新打开
+五个前台进程，并使用新的 run ID 和目录。
 
 ## 21. C0/C1：三次 no-migration 标定、分析和 guard 冻结
 
