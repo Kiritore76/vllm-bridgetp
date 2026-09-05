@@ -912,7 +912,8 @@ PY
   --out-dir "/tmp/${LOAD_NAME}_validate" --validate-only
 ```
 
-只允许在 bring-up 阶段改上述六个 workload 参数。场景达到预期状态后冻结并记录 hash：
+只允许在 bring-up 阶段改上述六个 workload 参数。下面是旧的 v1 冻结记录；它现在仅用于
+说明版本化流程，不得重新作为有效 calibration 输入：
 
 ```bash
 cd /root/autodl-tmp/bridgetp/vllm_bridge
@@ -927,10 +928,20 @@ sha256sum "$CAP0_MANIFEST_ROOT/frozen/$FROZEN_NAME.json" \
   | tee "$CAP0_MANIFEST_ROOT/frozen/$FROZEN_NAME.sha256"
 ```
 
-`calibration_v1`、`noop_v1`、`rescue_v1` 和 `abandon_v1` 分别冻结。三个报告重复不能再改
+`calibration_v1`、`noop_v1`、`rescue_v1` 和 `abandon_v1` 分别版本化。三个报告重复不能再改
 对应 manifest；若必须改，版本号递增并重新做 bring-up，旧失败目录保留。
 
+2026-09-05 的 `calibration_v1` 首次运行虽然工程验收通过，但只达到 2.44% TP1 KV usage，
+controller 的 12.9 秒观测窗口也没有覆盖 33.6 秒 background 生命周期。因此 v1 被保留为
+无效 bring-up 证据，禁止用于 guard。替代输入是仓库内冻结的
+`experiments/phase9/manifests/cap0_calibration_v2.json`；smoke 和 formal 必须使用它的同一
+SHA-256，不能在两阶段之间调参。
+
 ## 20. 每一轮通用的目录、config 和服务启动命令
+
+本节保留给 held-out 场景和人工诊断。calibration v2 不得直接照搬本节的 512-token
+`request_long.json`；它必须使用第 21 节 runner 生成的 8000-token anchor，否则 controller
+会再次早于 background 结束。
 
 ### 20.1 创建全新运行身份
 
@@ -954,7 +965,7 @@ export CAP0_DIR="$CAP0_CONTROLLER_ROOT/$CAP0_ID"
 export CAP0_BG_DIR="$CAP0_BACKGROUND_ROOT/$CAP0_ID"
 export CAP0_PROV_DIR="$CAP0_PROVENANCE_ROOT/$CAP0_ID"
 export CAP0_CONFIG="$CAP0_PROV_DIR/controller_config.json"
-export CAP0_BG_MANIFEST="$CAP0_MANIFEST_ROOT/frozen/calibration_v1.json"
+export CAP0_BG_MANIFEST="$BRIDGE_REPO/experiments/phase9/manifests/cap0_calibration_v2.json"
 export CAP0_CAPACITY_ENABLED=0
 export CAP0_GUARD=0
 
@@ -1224,19 +1235,23 @@ T1 按 `Ctrl+C`，依次正常停止 stager、TP1、TP4。不要使用 `pkill -f
 
 ## 21. C0/C1：三次 no-migration 标定、分析和 guard 冻结
 
-先用同一 `calibration_v1.json`、`CAP0_CAPACITY_ENABLED=0`、`CAP0_GUARD=0` 和 `--dry-run`
-按第 20 节完整执行 `r01`、`r02`、`r03`。每轮必须重启 TP1、TP4 和 stager。disabled
+先用同一 `cap0_calibration_v2.json`、`CAP0_CAPACITY_ENABLED=0`、`CAP0_GUARD=0` 和
+`--dry-run` 跑一次不计数 smoke。人工确认 smoke 后，才按同一冻结 contract 执行 `r01`、
+`r02`、`r03`。每轮必须重启 TP1、TP4 和 stager。disabled
 tracker 仍记录 raw free-KV、EWMA decline、running、waiting 和 preemption；`--dry-run` 保证
 即使 legacy performance decision 出现也不会执行 actuator。
 
-### 21.1 推荐：一个前台终端从 r01 自动跑到 r03
+### 21.1 第一步：只跑不计数 smoke
 
 `run_phase9_cap0_calibration.py` 把第 20 节的五个进程封装成一个前台父进程。它每轮依次
-启动 TP4、TP1、stager、dry-run controller 和三任务 workload，健康检查后才进入下一步，
-并在轮次间正常停止全部子进程。任一轮失败就停止，不继续消耗后续轮次；失败日志仍完整
-保留。这个批次会从全新的 `r01` 开始，不复用此前手工运行。
+启动 TP4、TP1、stager、dry-run controller 和冻结 workload，健康检查后才进入下一步。
+smoke 只运行一次且不计入 r01--r03。它必须同时证明：五个 background jobs 全部完成、
+采样到的 TP1 peak KV usage 至少 70%、至少观察到一次 preemption、telemetry 覆盖完整 background
+生命周期、最终留在 TP1 且没有任何迁移转换。任一条件不满足都不生成 PASS contract。
+70% 是采样下限而非容量阈值：一次 preemption 可瞬时释放最大约 25% TP1 cache，因此不要求
+0.2 秒 telemetry 必须恰好捕获释放前的 100%；preemption 单调计数才是确证容量触顶的主门。
 
-只需要一个终端执行：
+一个终端执行 smoke：
 
 ```bash
 cd /root/autodl-tmp/bridgetp/vllm_bridge
@@ -1247,44 +1262,87 @@ source /root/autodl-tmp/bridgetp/phase9_cap0_predictor.env
 
 export OMP_NUM_THREADS=1
 export CAP0_CODE_REVISION="$(git rev-parse HEAD)"
-export CAL_BATCH_ID="cap0-calibration-batch-$(date -u +%Y%m%dT%H%M%SZ)"
+export CAP0_CAL_MANIFEST="$BRIDGE_REPO/experiments/phase9/manifests/cap0_calibration_v2.json"
+export CAP0_CAL_MANIFEST_SHA=7bd5b2f6581610bef15460beb678026c687e84486da9af2ac6c1146f1eced2bf
+export SMOKE_ID="cap0-calibration-smoke-$(date -u +%Y%m%dT%H%M%SZ)"
+export SMOKE_PARENT="$CAP0_RESULTS/calibration_smoke"
+export SMOKE_DIR="$SMOKE_PARENT/$SMOKE_ID"
+mkdir -p "$SMOKE_PARENT"
+set -o pipefail
+
+"$BRIDGE_PY" tools/bridge_tp/run_phase9_cap0_calibration.py \
+  --mode smoke \
+  --model-path "$BRIDGE_MODEL" \
+  --manifest "$CAP0_CAL_MANIFEST" \
+  --survival-table "$CAP0_SURVIVAL_TABLE" \
+  --out-root "$SMOKE_DIR" \
+  --expected-revision "$CAP0_CODE_REVISION" \
+  --expected-manifest-sha256 "$CAP0_CAL_MANIFEST_SHA" \
+  --expected-survival-sha256 \
+    031b06b0e7d663d5a4ad9cf71f2a640123b84d8e85eb4c94d94f44baa20aaa4a \
+  --tp1-blocks "$TP1_BLOCKS" \
+  --tp4-blocks "$TP4_BLOCKS" \
+  --anchor-max-tokens 8000 \
+  --minimum-peak-kv-usage-frac 0.70 \
+  2>&1 | tee "$SMOKE_PARENT/${SMOKE_ID}.console.txt"
+```
+
+成功时终端只出现 `SMOKE_COMPLETE`，不会继续跑 r01。将下面三个文件取回并人工审阅：
+
+```text
+calibration_smoke/<smoke-id>/
+  batch_status.json
+  smoke_acceptance.json
+  smoke/{controller,background,provenance,status.json}
+```
+
+### 21.2 第二步：人工批准 smoke 后跑正式 r01--r03
+
+formal 模式必须显式传入上一步的 `smoke_acceptance.json`。脚本逐字段核对 smoke 与 formal
+使用相同 commit、manifest hash、survival hash、TP1/TP4 blocks、anchor 长度和压力门槛；
+不一致时在启动 GPU 服务前拒绝运行。
+
+```bash
+cd /root/autodl-tmp/bridgetp/vllm_bridge
+source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
+source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
+source /root/autodl-tmp/bridgetp/phase9_cap0_geometry.env
+source /root/autodl-tmp/bridgetp/phase9_cap0_predictor.env
+
+export OMP_NUM_THREADS=1
+export CAP0_CODE_REVISION="$(git rev-parse HEAD)"
+export CAP0_CAL_MANIFEST="$BRIDGE_REPO/experiments/phase9/manifests/cap0_calibration_v2.json"
+export CAP0_CAL_MANIFEST_SHA=7bd5b2f6581610bef15460beb678026c687e84486da9af2ac6c1146f1eced2bf
+export SMOKE_ACCEPTANCE=替换为已人工批准的smoke_acceptance.json绝对路径
+export CAL_BATCH_ID="cap0-calibration-formal-$(date -u +%Y%m%dT%H%M%SZ)"
 export CAL_BATCH_PARENT="$CAP0_RESULTS/calibration_batches"
 export CAL_BATCH_DIR="$CAL_BATCH_PARENT/$CAL_BATCH_ID"
 mkdir -p "$CAL_BATCH_PARENT"
 set -o pipefail
 
 "$BRIDGE_PY" tools/bridge_tp/run_phase9_cap0_calibration.py \
+  --mode formal \
+  --smoke-acceptance "$SMOKE_ACCEPTANCE" \
   --model-path "$BRIDGE_MODEL" \
-  --manifest "$CAP0_MANIFEST_ROOT/frozen/calibration_v1.json" \
+  --manifest "$CAP0_CAL_MANIFEST" \
   --survival-table "$CAP0_SURVIVAL_TABLE" \
   --out-root "$CAL_BATCH_DIR" \
   --expected-revision "$CAP0_CODE_REVISION" \
-  --expected-manifest-sha256 \
-    843d8725914b794e31268dffc1c980a4321b68bad68723c07a1611863c3758e3 \
+  --expected-manifest-sha256 "$CAP0_CAL_MANIFEST_SHA" \
   --expected-survival-sha256 \
     031b06b0e7d663d5a4ad9cf71f2a640123b84d8e85eb4c94d94f44baa20aaa4a \
   --tp1-blocks "$TP1_BLOCKS" \
   --tp4-blocks "$TP4_BLOCKS" \
+  --anchor-max-tokens 8000 \
+  --minimum-peak-kv-usage-frac 0.70 \
   --repetitions 3 \
   2>&1 | tee "$CAL_BATCH_PARENT/${CAL_BATCH_ID}.console.txt"
 ```
 
-不要预先创建 `$CAL_BATCH_DIR`；脚本用“目录必须不存在”防止覆盖旧结果。输出布局固定为：
-
-```text
-calibration_batches/<batch-id>/
-  batch_status.json
-  guard_candidate.json
-  r01/{controller,background,provenance,status.json}
-  r02/{controller,background,provenance,status.json}
-  r03/{controller,background,provenance,status.json}
-```
-
-成功条件是终端出现 `COMPLETE`，且 `batch_status.json` 的 `status` 为 `COMPLETE`、三轮均为
-`PASS`。`guard_candidate.json` 只是按事前公式自动计算的候选值，脚本不会自动冻结 guard；
-必须先人工审阅三轮曲线和删失情况。按 `Ctrl+C` 会触发父进程清理它创建的服务，不要再用
-`pkill -f`。No-op、Rescue、Safe abandon 尚未冻结各自 bring-up 与 manifest，因此不在这个
-循环中。
+不要预先创建 `$SMOKE_DIR` 或 `$CAL_BATCH_DIR`。正式模式中任一轮失败会立即停止并保留全部
+日志；三轮通过后才生成 `guard_candidate.json`，仍需人工审阅，脚本不会冻结 guard。按
+`Ctrl+C` 会清理该父进程创建的服务，不要用 `pkill -f`。No-op、Rescue、Safe abandon 不在
+此循环中。
 
 三轮完成后输出可审计摘要：
 
@@ -1293,7 +1351,8 @@ cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 
-export CAL_GLOB="$CAP0_RESULTS/controller_runs/cap0-calibration-r*"
+export CAL_BATCH_DIR=替换为正式三轮批次的绝对路径
+export CAL_GLOB="$CAL_BATCH_DIR/r*/controller"
 "$BRIDGE_PY" - $CAL_GLOB <<'PY'
 import json, sys
 from pathlib import Path
@@ -1320,9 +1379,10 @@ for run_s in sys.argv[1:]:
 PY
 ```
 
-在查看 held-out 三场景前冻结以下事前规则：令每轮 `F_i` 为第一次 preemption 时的 free KV；
-若该轮无 preemption，则使用 closest approach（minimum free KV）并标记为 censored。令
-`D_max` 为三轮最大 EWMA decline，`T_enter=8s`。工程 guard 为：
+在查看 held-out 三场景前冻结以下事前规则：令每轮 `F_i` 为第一次 preemption 时的 free KV。
+v2 默认协议要求 smoke 和三个 formal repetition 都观察到 preemption；任一轮无 preemption
+直接失败，不能用 closest approach 代替。`--allow-censored` 只保留给未来显式修订协议，当前
+不得使用。令 `D_max` 为三轮最大 EWMA decline，`T_enter=8s`。工程 guard 为：
 
 ```text
 ceil_to_block(max_i(F_i) + D_max * T_enter)
@@ -1343,8 +1403,8 @@ test "$FROZEN_GUARD" -lt "$TP1_TOTAL_TOKENS"
 printf '%s\n' "$FROZEN_GUARD" \
   | tee "$CAP0_MANIFEST_ROOT/frozen/guard_free_kv_tokens.txt"
 printf '%s  %s\n' \
-  "$(sha256sum "$CAP0_MANIFEST_ROOT/frozen/calibration_v1.json" | awk '{print $1}')" \
-  calibration_v1.json \
+  "$(sha256sum "$BRIDGE_REPO/experiments/phase9/manifests/cap0_calibration_v2.json" | awk '{print $1}')" \
+  cap0_calibration_v2.json \
   > "$CAP0_MANIFEST_ROOT/frozen/calibration_and_guard_provenance.txt"
 ```
 
@@ -1469,7 +1529,7 @@ sha256sum -c "$CAP0_PROV_DIR/SHA256SUMS"
 2. S0/E0 盘点 + CPU 回归。
 3. 用相同 server args 测真实 TP1/TP4 KV blocks。
 4. S1 单独运行 052 post-fix migrate + controls；通过后封存，绝不并入旧49条。
-5. C0 bring-up，冻结 calibration_v1 workload。
+5. C0 smoke，验证并冻结 calibration_v2 workload contract。
 6. C1 no-migration r01/r02/r03；按事前规则计算并冻结 guard。
 7. P0 No-op bring-up，冻结 noop_v1，再跑 r01/r02/r03。
 8. P1 Rescue bring-up，冻结 rescue_v1，再跑 r01/r02/r03。

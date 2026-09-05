@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Run the three CAP-0 no-migration calibration repetitions sequentially.
+"""Gate and run CAP-0 no-migration calibration repetitions.
 
-The orchestrator itself stays in the foreground.  It owns the TP4 server, TP1
-server, stager, dry-run controller, and background workload for one repetition
-at a time, preserves every log, and tears all children down before advancing.
-It stops at the first failed repetition and never freezes the resulting guard;
-the final output is an auditable guard candidate for human review.
+Smoke and formal modes are deliberately separate.  Smoke runs once and emits a
+machine-readable acceptance contract.  Formal mode requires that exact contract
+before it can run r01-r03.  The orchestrator stays in the foreground, owns all
+child services, fails closed on insufficient pressure or incomplete observation,
+and never freezes the resulting guard candidate.
 """
 
 from __future__ import annotations
@@ -44,6 +44,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--survival-table", type=Path, required=True)
     parser.add_argument("--out-root", type=Path, required=True)
+    parser.add_argument("--mode", choices=("smoke", "formal"), required=True)
+    parser.add_argument(
+        "--smoke-acceptance",
+        type=Path,
+        help="required in formal mode; PASS artifact from smoke mode",
+    )
     parser.add_argument("--expected-revision", required=True)
     parser.add_argument("--expected-manifest-sha256")
     parser.add_argument("--expected-survival-sha256")
@@ -51,6 +57,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tp1-blocks", type=int, required=True)
     parser.add_argument("--tp4-blocks", type=int, required=True)
     parser.add_argument("--repetitions", type=int, default=3)
+    parser.add_argument("--anchor-max-tokens", type=int, default=8000)
+    parser.add_argument("--minimum-peak-kv-usage-frac", type=float, default=0.70)
+    parser.add_argument(
+        "--allow-censored",
+        action="store_true",
+        help="allow a run with no observed preemption (not recommended)",
+    )
+    parser.add_argument("--coverage-slack-s", type=float, default=1.0)
     parser.add_argument("--tp1-gpu", default="0")
     parser.add_argument("--tp4-gpus", default="1,2,3,4")
     parser.add_argument("--tp1-port", type=int, default=8001)
@@ -264,6 +278,17 @@ def make_config(
     return path
 
 
+def make_source_request(
+    args: argparse.Namespace,
+    provenance_dir: Path,
+) -> Path:
+    request = read_json(SOURCE_REQUEST)
+    request["max_tokens"] = args.anchor_max_tokens
+    path = provenance_dir / "anchor_request.json"
+    write_json(path, request)
+    return path
+
+
 def target_connector(controller_dir: Path) -> str:
     return json.dumps(
         {
@@ -339,6 +364,10 @@ def load_audit(path: Path) -> list[dict[str, Any]]:
 def accept_calibration(
     controller_dir: Path,
     background_dir: Path,
+    expected_jobs: int,
+    minimum_peak_kv_usage_frac: float,
+    require_preemption: bool,
+    coverage_slack_s: float,
 ) -> dict[str, Any]:
     background = read_json(background_dir / "background_summary.json")
     rows = load_audit(controller_dir / "phase9_audit.jsonl")
@@ -351,12 +380,33 @@ def accept_calibration(
         for row in transitions
         if row.get("to") in {"SHADOW", "HANDOFF", "TAKEOVER"}
     ]
+    telemetry_times = [
+        float(row["tp1"]["sampled_unix_s"])
+        for row in telemetry
+        if isinstance(row.get("tp1", {}).get("sampled_unix_s"), (int, float))
+    ]
+    kv_usage = [float(row["tp1"]["kv_usage_frac"]) for row in telemetry]
+    preemptions = [int(row["tp1"]["preemptions_total"]) for row in telemetry]
+    peak_kv_usage = max(kv_usage) if kv_usage else None
+    initial_preemptions = preemptions[0] if preemptions else None
+    maximum_preemptions = max(preemptions) if preemptions else None
+    preemption_delta = (
+        maximum_preemptions - initial_preemptions
+        if maximum_preemptions is not None and initial_preemptions is not None
+        else None
+    )
+    background_start = background.get("start_unix_s")
+    background_end = background.get("end_unix_s")
+    audit_end = ends[0].get("unix_s") if len(ends) == 1 else None
+    last_telemetry = max(telemetry_times) if telemetry_times else None
     errors: list[str] = []
-    if background.get("jobs") != 3:
-        errors.append(f"background jobs={background.get('jobs')!r}, expected 3")
-    if background.get("completed") != 3 or background.get("failed") != 0:
+    if background.get("jobs") != expected_jobs:
         errors.append(
-            "background did not complete 3/3: "
+            f"background jobs={background.get('jobs')!r}, expected {expected_jobs}"
+        )
+    if background.get("completed") != expected_jobs or background.get("failed") != 0:
+        errors.append(
+            f"background did not complete {expected_jobs}/{expected_jobs}: "
             f"completed={background.get('completed')!r}, "
             f"failed={background.get('failed')!r}"
         )
@@ -368,6 +418,25 @@ def accept_calibration(
         errors.append(f"unexpected run_end records: {ends!r}")
     if migration_transitions:
         errors.append(f"observed {len(migration_transitions)} migration transitions")
+    if peak_kv_usage is None or peak_kv_usage < minimum_peak_kv_usage_frac:
+        errors.append(
+            f"peak TP1 KV usage {peak_kv_usage!r} is below required "
+            f"{minimum_peak_kv_usage_frac:.3f}"
+        )
+    if require_preemption and not preemption_delta:
+        errors.append("no TP1 preemption observed under calibration pressure")
+    if not isinstance(background_start, (int, float)) or not isinstance(
+        background_end, (int, float)
+    ):
+        errors.append("background timing is missing")
+    else:
+        if audit_end is None or float(audit_end) < float(background_end):
+            errors.append("controller ended before the background workload")
+        if (
+            last_telemetry is None
+            or last_telemetry + coverage_slack_s < float(background_end)
+        ):
+            errors.append("telemetry did not cover the background workload end")
     result = {
         "format_version": 1,
         "status": "PASS" if not errors else "FAIL",
@@ -376,6 +445,15 @@ def accept_calibration(
         "telemetry_samples": len(telemetry),
         "decision_records": len(decisions),
         "migration_transitions": len(migration_transitions),
+        "peak_tp1_kv_usage_frac": peak_kv_usage,
+        "minimum_peak_kv_usage_frac": minimum_peak_kv_usage_frac,
+        "preemption_delta": preemption_delta,
+        "require_preemption": require_preemption,
+        "background_start_unix_s": background_start,
+        "background_end_unix_s": background_end,
+        "last_telemetry_unix_s": last_telemetry,
+        "controller_end_unix_s": audit_end,
+        "coverage_slack_s": coverage_slack_s,
         "final_state": ends[0].get("final_state") if len(ends) == 1 else None,
         "errors": errors,
     }
@@ -399,6 +477,9 @@ def calibration_metrics(controller_dir: Path) -> dict[str, Any]:
         float(row["capacity_signal"]["decline_rate_tokens_s"])
         for row in telemetry
     ]
+    kv_usage = [float(row["tp1"]["kv_usage_frac"]) for row in telemetry]
+    waiting = [int(row["tp1"]["num_waiting"]) for row in telemetry]
+    preemptions = [int(row["tp1"]["preemptions_total"]) for row in telemetry]
     return {
         "samples": len(telemetry),
         "minimum_free_kv_tokens": min(free),
@@ -409,6 +490,9 @@ def calibration_metrics(controller_dir: Path) -> dict[str, Any]:
         ),
         "censored": first is None,
         "maximum_ewma_decline_tokens_s": max(decline),
+        "peak_tp1_kv_usage_frac": max(kv_usage),
+        "maximum_tp1_waiting": max(waiting),
+        "preemption_delta": max(preemptions) - initial,
     }
 
 
@@ -445,20 +529,125 @@ def calculate_guard_candidate(
     }
 
 
+def experiment_contract(args: argparse.Namespace, revision: str) -> dict[str, Any]:
+    return {
+        "format_version": 1,
+        "revision": revision,
+        "model_path": str(args.model_path.resolve()),
+        "manifest_sha256": sha256(args.manifest),
+        "survival_table_sha256": sha256(args.survival_table),
+        "dtype": args.dtype,
+        "max_model_len": args.max_model_len,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "tp1_gpu": args.tp1_gpu,
+        "tp4_gpus": args.tp4_gpus,
+        "tp1_blocks": args.tp1_blocks,
+        "tp4_blocks": args.tp4_blocks,
+        "anchor_max_tokens": args.anchor_max_tokens,
+        "minimum_peak_kv_usage_frac": args.minimum_peak_kv_usage_frac,
+        "require_preemption": not args.allow_censored,
+        "coverage_slack_s": args.coverage_slack_s,
+    }
+
+
+def validate_smoke_acceptance(
+    args: argparse.Namespace,
+    revision: str,
+) -> dict[str, Any]:
+    if args.smoke_acceptance is None:
+        raise ValueError("--smoke-acceptance is required in formal mode")
+    if not args.smoke_acceptance.is_file():
+        raise FileNotFoundError(args.smoke_acceptance)
+    smoke = read_json(args.smoke_acceptance)
+    if smoke.get("status") != "PASS":
+        raise RuntimeError("smoke acceptance status is not PASS")
+    expected = experiment_contract(args, revision)
+    if smoke.get("contract") != expected:
+        raise RuntimeError(
+            "smoke contract differs from the requested formal experiment"
+        )
+    run = smoke.get("run")
+    metrics = run.get("metrics") if isinstance(run, dict) else None
+    if not isinstance(metrics, dict) or run.get("status") != "PASS":
+        raise RuntimeError("smoke acceptance has no passing run metrics")
+    if float(metrics.get("peak_tp1_kv_usage_frac", 0.0)) < (
+        args.minimum_peak_kv_usage_frac
+    ):
+        raise RuntimeError("smoke run metrics do not satisfy the KV pressure gate")
+    if not args.allow_censored and int(metrics.get("preemption_delta", 0)) <= 0:
+        raise RuntimeError("smoke run metrics do not contain a preemption")
+    return smoke
+
+
+def validate_manifest_pressure(
+    manifest: Any,
+    *,
+    tp1_blocks: int,
+    anchor_max_tokens: int,
+    max_model_len: int,
+) -> int:
+    if not isinstance(manifest, dict) or manifest.get("format_version") != 1:
+        raise ValueError("calibration manifest requires format_version=1")
+    jobs = manifest.get("jobs")
+    if not isinstance(jobs, list) or not jobs:
+        raise ValueError("calibration manifest requires a non-empty jobs list")
+    identifiers: set[str] = set()
+    for index, job in enumerate(jobs):
+        if not isinstance(job, dict):
+            raise ValueError(f"manifest job {index} must be an object")
+        job_id = str(job.get("job_id", "")).strip()
+        if not job_id or job_id in identifiers:
+            raise ValueError(f"manifest job {index} has an invalid job_id")
+        identifiers.add(job_id)
+        if job.get("pool") not in {"source", "target"}:
+            raise ValueError(f"manifest job {job_id} has an invalid pool")
+        request = job.get("request")
+        if not isinstance(request, dict):
+            raise ValueError(f"manifest job {job_id} has no request")
+        maximum = int(request.get("max_tokens", 0))
+        if maximum <= 0 or maximum > max_model_len - 128:
+            raise ValueError(
+                f"manifest job {job_id} max_tokens must be in "
+                f"[1, {max_model_len - 128}]"
+            )
+        if float(job.get("start_after_s", -1)) < 0:
+            raise ValueError(f"manifest job {job_id} has an invalid start time")
+    source_jobs = [job for job in jobs if job["pool"] == "source"]
+    target_jobs = [job for job in jobs if job["pool"] == "target"]
+    if len(source_jobs) < 4 or not target_jobs:
+        raise ValueError(
+            "calibration requires at least four source jobs and one target job"
+        )
+    planned_source_tokens = anchor_max_tokens + sum(
+        int(job["request"]["max_tokens"]) for job in source_jobs
+    )
+    required_planned_tokens = math.ceil(tp1_blocks * 16 * 1.10)
+    if planned_source_tokens < required_planned_tokens:
+        raise ValueError(
+            f"planned source tokens {planned_source_tokens} are below the "
+            f"110% capacity floor {required_planned_tokens}"
+        )
+    if min(float(job["start_after_s"]) for job in source_jobs) > 5:
+        raise ValueError("source pressure must begin within five seconds")
+    return len(jobs)
+
+
 def run_one(
     args: argparse.Namespace,
     batch_root: Path,
-    repetition: int,
+    label: str,
+    repetition: int | None,
 ) -> dict[str, Any]:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    run_id = f"cap0-calibration-r{repetition:02d}-{stamp}"
-    rep_root = batch_root / f"r{repetition:02d}"
+    run_id = f"cap0-calibration-{label}-{stamp}"
+    rep_root = batch_root / label
     controller_dir = rep_root / "controller"
     background_dir = rep_root / "background"
     provenance_dir = rep_root / "provenance"
     for path in (controller_dir, background_dir, provenance_dir):
         path.mkdir(parents=True, exist_ok=False)
     config_path = make_config(args, controller_dir, provenance_dir)
+    source_request_path = make_source_request(args, provenance_dir)
     (provenance_dir / "git_revision.txt").write_text(
         git("rev-parse", "HEAD") + "\n", encoding="utf-8"
     )
@@ -476,6 +665,10 @@ def run_one(
             "model_path": str(args.model_path.resolve()),
             "tp1_blocks": args.tp1_blocks,
             "tp4_blocks": args.tp4_blocks,
+            "anchor_max_tokens": args.anchor_max_tokens,
+            "minimum_peak_kv_usage_frac": args.minimum_peak_kv_usage_frac,
+            "require_preemption": not args.allow_censored,
+            "coverage_slack_s": args.coverage_slack_s,
         },
     )
 
@@ -553,7 +746,7 @@ def run_one(
                 "--run-dir",
                 str(controller_dir),
                 "--source-request",
-                str(SOURCE_REQUEST),
+                str(source_request_path),
                 "--migration-id",
                 run_id,
                 "--dry-run",
@@ -565,7 +758,10 @@ def run_one(
         wait_for_file_or_exit(
             controller_dir / "source_progress.json", controller, timeout_s=120
         )
-        print(f"[{run_id}] source anchor is live; starting 3-job load", flush=True)
+        print(
+            f"[{run_id}] source anchor is live; starting frozen load",
+            flush=True,
+        )
 
         background = start_process(
             "background workload",
@@ -593,13 +789,22 @@ def run_one(
                     f"{service.process.returncode}; see {service.log_path}"
                 )
 
-        acceptance = accept_calibration(controller_dir, background_dir)
+        manifest = read_json(args.manifest)
+        acceptance = accept_calibration(
+            controller_dir,
+            background_dir,
+            expected_jobs=len(manifest["jobs"]),
+            minimum_peak_kv_usage_frac=args.minimum_peak_kv_usage_frac,
+            require_preemption=not args.allow_censored,
+            coverage_slack_s=args.coverage_slack_s,
+        )
         write_json(provenance_dir / "calibration_acceptance.json", acceptance)
         if acceptance["status"] != "PASS":
             raise RuntimeError("; ".join(acceptance["errors"]))
         metrics = calibration_metrics(controller_dir)
         write_json(provenance_dir / "calibration_metrics.json", metrics)
         result = {
+            "phase": args.mode,
             "repetition": repetition,
             "run_id": run_id,
             "status": "PASS",
@@ -610,6 +815,7 @@ def run_one(
         return result
     except Exception as error:
         result = {
+            "phase": args.mode,
             "repetition": repetition,
             "run_id": run_id,
             "status": "FAIL",
@@ -627,6 +833,16 @@ def validate_inputs(args: argparse.Namespace) -> str:
         raise RuntimeError("CAP-0 calibration runner requires Linux")
     if args.repetitions <= 0:
         raise ValueError("--repetitions must be positive")
+    if args.anchor_max_tokens <= 0:
+        raise ValueError("--anchor-max-tokens must be positive")
+    if args.anchor_max_tokens > args.max_model_len - 128:
+        raise ValueError(
+            "--anchor-max-tokens must leave at least 128 tokens for the prompt"
+        )
+    if not 0 < args.minimum_peak_kv_usage_frac <= 1:
+        raise ValueError("--minimum-peak-kv-usage-frac must be in (0, 1]")
+    if args.coverage_slack_s < 0:
+        raise ValueError("--coverage-slack-s cannot be negative")
     if args.tp1_blocks <= 0 or args.tp4_blocks <= 0:
         raise ValueError("KV block counts must be positive")
     for path in (
@@ -665,9 +881,16 @@ def validate_inputs(args: argparse.Namespace) -> str:
                 f"survival SHA-256 {actual} differs from expected "
                 f"{args.expected_survival_sha256}"
             )
-    manifest = read_json(args.manifest)
-    if len(manifest.get("jobs", [])) != 3:
-        raise ValueError("calibration manifest must contain exactly 3 jobs")
+    validate_manifest_pressure(
+        read_json(args.manifest),
+        tp1_blocks=args.tp1_blocks,
+        anchor_max_tokens=args.anchor_max_tokens,
+        max_model_len=args.max_model_len,
+    )
+    if args.mode == "formal":
+        validate_smoke_acceptance(args, revision)
+    elif args.smoke_acceptance is not None:
+        raise ValueError("--smoke-acceptance is only valid in formal mode")
     return revision
 
 
@@ -681,15 +904,39 @@ def main() -> None:
         "format_version": 1,
         "status": "RUNNING",
         "revision": revision,
+        "mode": args.mode,
         "started_unix_s": time.time(),
-        "repetitions_expected": args.repetitions,
+        "repetitions_expected": 1 if args.mode == "smoke" else args.repetitions,
         "runs": [],
     }
+    if args.mode == "formal" and args.smoke_acceptance is not None:
+        batch["smoke_acceptance"] = str(args.smoke_acceptance.resolve())
+        batch["smoke_acceptance_sha256"] = sha256(args.smoke_acceptance)
     write_json(status_path, batch)
     try:
+        if args.mode == "smoke":
+            label = "smoke"
+            print("[smoke] starting non-counted calibration gate", flush=True)
+            result = run_one(args, args.out_root, label, repetition=None)
+            batch["runs"].append(result)
+            smoke_acceptance = {
+                "format_version": 1,
+                "status": "PASS",
+                "contract": experiment_contract(args, revision),
+                "run": result,
+            }
+            write_json(args.out_root / "smoke_acceptance.json", smoke_acceptance)
+            batch["status"] = "SMOKE_COMPLETE"
+            batch["ended_unix_s"] = time.time()
+            write_json(status_path, batch)
+            print(f"SMOKE_COMPLETE: {args.out_root}", flush=True)
+            print("Review smoke_acceptance.json before formal mode.", flush=True)
+            return
+
         for repetition in range(1, args.repetitions + 1):
+            label = f"r{repetition:02d}"
             print(f"[{repetition}/{args.repetitions}] starting calibration", flush=True)
-            result = run_one(args, args.out_root, repetition)
+            result = run_one(args, args.out_root, label, repetition)
             batch["runs"].append(result)
             write_json(status_path, batch)
             print(
@@ -714,13 +961,13 @@ def main() -> None:
         )
     except BaseException as error:
         failed_status = (
-            args.out_root / f"r{repetition:02d}" / "status.json"
-            if "repetition" in locals()
-            else None
+            args.out_root / label / "status.json" if "label" in locals() else None
         )
         if failed_status is not None and failed_status.is_file():
             failed_result = read_json(failed_status)
-            if not batch["runs"] or batch["runs"][-1].get("repetition") != repetition:
+            if not batch["runs"] or batch["runs"][-1].get("run_id") != (
+                failed_result.get("run_id")
+            ):
                 batch["runs"].append(failed_result)
         batch["status"] = "FAILED"
         batch["ended_unix_s"] = time.time()

@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 SCRIPT = (
@@ -59,35 +60,183 @@ class TestGuardCandidate(unittest.TestCase):
         self.assertEqual(result["guard_candidate_tokens"], 984)
 
 
+class TestManifestPressure(unittest.TestCase):
+    def test_v2_manifest_exceeds_capacity_floor(self) -> None:
+        manifest_path = (
+            Path(__file__).resolve().parents[2]
+            / "experiments"
+            / "phase9"
+            / "manifests"
+            / "cap0_calibration_v2.json"
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        count = MODULE.validate_manifest_pressure(
+            manifest,
+            tp1_blocks=1968,
+            anchor_max_tokens=8000,
+            max_model_len=8192,
+        )
+        self.assertEqual(count, 5)
+
+    def test_rejects_old_light_manifest(self) -> None:
+        jobs = [
+            {
+                "job_id": "target_000",
+                "pool": "target",
+                "start_after_s": 0.0,
+                "request": {"max_tokens": 512},
+            }
+        ]
+        jobs.extend(
+            {
+                "job_id": f"source_{index:03d}",
+                "pool": "source",
+                "start_after_s": 2.0 + index * 0.2,
+                "request": {"max_tokens": 1024},
+            }
+            for index in range(4)
+        )
+        with self.assertRaisesRegex(ValueError, "110% capacity floor"):
+            MODULE.validate_manifest_pressure(
+                {"format_version": 1, "jobs": jobs},
+                tp1_blocks=1968,
+                anchor_max_tokens=8000,
+                max_model_len=8192,
+            )
+
+
+class TestSmokeContract(unittest.TestCase):
+    def test_formal_requires_exact_passing_smoke_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = root / "model"
+            model.mkdir()
+            manifest = root / "manifest.json"
+            survival = root / "survival.json"
+            manifest.write_text("{}", encoding="utf-8")
+            survival.write_text("{}", encoding="utf-8")
+            acceptance = root / "smoke_acceptance.json"
+            args = SimpleNamespace(
+                model_path=model,
+                manifest=manifest,
+                survival_table=survival,
+                dtype="bfloat16",
+                max_model_len=8192,
+                gpu_memory_utilization=0.88,
+                tp1_gpu="0",
+                tp4_gpus="1,2,3,4",
+                tp1_blocks=1968,
+                tp4_blocks=35739,
+                anchor_max_tokens=8000,
+                minimum_peak_kv_usage_frac=0.90,
+                allow_censored=False,
+                coverage_slack_s=1.0,
+                smoke_acceptance=acceptance,
+            )
+            contract = MODULE.experiment_contract(args, "revision")
+            acceptance.write_text(
+                json.dumps(
+                    {
+                        "status": "PASS",
+                        "contract": contract,
+                        "run": {
+                            "status": "PASS",
+                            "metrics": {
+                                "peak_tp1_kv_usage_frac": 0.95,
+                                "preemption_delta": 1,
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            MODULE.validate_smoke_acceptance(args, "revision")
+            args.anchor_max_tokens = 7999
+            with self.assertRaisesRegex(RuntimeError, "smoke contract differs"):
+                MODULE.validate_smoke_acceptance(args, "revision")
+
+
 class TestCalibrationAcceptance(unittest.TestCase):
-    def test_accepts_three_jobs_completed_locally(self) -> None:
+    @staticmethod
+    def write_run(
+        controller: Path,
+        background: Path,
+        *,
+        peak_usage: float = 0.95,
+        preemptions: int = 1,
+        background_end: float = 20.0,
+        telemetry_end: float = 20.0,
+        transition: str | None = None,
+    ) -> None:
+        (background / "background_summary.json").write_text(
+            json.dumps(
+                {
+                    "jobs": 5,
+                    "completed": 5,
+                    "failed": 0,
+                    "start_unix_s": 10.0,
+                    "end_unix_s": background_end,
+                }
+            ),
+            encoding="utf-8",
+        )
+        records = [
+            {
+                "kind": "telemetry",
+                "tp1": {
+                    "preemptions_total": 0,
+                    "kv_usage_frac": 0.1,
+                    "sampled_unix_s": 9.9,
+                },
+                "capacity_signal": {
+                    "free_kv_tokens": 100,
+                    "decline_rate_tokens_s": 2.0,
+                },
+            },
+            {"kind": "decision"},
+            {
+                "kind": "telemetry",
+                "tp1": {
+                    "preemptions_total": preemptions,
+                    "kv_usage_frac": peak_usage,
+                    "sampled_unix_s": telemetry_end,
+                },
+                "capacity_signal": {
+                    "free_kv_tokens": 10,
+                    "decline_rate_tokens_s": 20.0,
+                },
+            },
+        ]
+        if transition is not None:
+            records.append({"kind": "transition", "to": transition})
+        records.append(
+            {
+                "kind": "run_end",
+                "final_state": "COMPLETED_ON_TP1",
+                "unix_s": telemetry_end + 0.1,
+            }
+        )
+        (controller / "phase9_audit.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in records),
+            encoding="utf-8",
+        )
+
+    def test_accepts_complete_pressured_run(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             controller = root / "controller"
             background = root / "background"
             controller.mkdir()
             background.mkdir()
-            (background / "background_summary.json").write_text(
-                json.dumps({"jobs": 3, "completed": 3, "failed": 0}),
-                encoding="utf-8",
+            self.write_run(controller, background)
+            result = MODULE.accept_calibration(
+                controller,
+                background,
+                expected_jobs=5,
+                minimum_peak_kv_usage_frac=0.90,
+                require_preemption=True,
+                coverage_slack_s=1.0,
             )
-            records = [
-                {
-                    "kind": "telemetry",
-                    "tp1": {"preemptions_total": 0},
-                    "capacity_signal": {
-                        "free_kv_tokens": 100,
-                        "decline_rate_tokens_s": 2.0,
-                    },
-                },
-                {"kind": "decision"},
-                {"kind": "run_end", "final_state": "COMPLETED_ON_TP1"},
-            ]
-            (controller / "phase9_audit.jsonl").write_text(
-                "".join(json.dumps(row) + "\n" for row in records),
-                encoding="utf-8",
-            )
-            result = MODULE.accept_calibration(controller, background)
             self.assertEqual(result["status"], "PASS")
             self.assertEqual(result["migration_transitions"], 0)
 
@@ -98,23 +247,50 @@ class TestCalibrationAcceptance(unittest.TestCase):
             background = root / "background"
             controller.mkdir()
             background.mkdir()
-            (background / "background_summary.json").write_text(
-                json.dumps({"jobs": 3, "completed": 3, "failed": 0}),
-                encoding="utf-8",
+            self.write_run(controller, background, transition="SHADOW")
+            result = MODULE.accept_calibration(
+                controller,
+                background,
+                expected_jobs=5,
+                minimum_peak_kv_usage_frac=0.90,
+                require_preemption=True,
+                coverage_slack_s=1.0,
             )
-            records = [
-                {"kind": "telemetry"},
-                {"kind": "decision"},
-                {"kind": "transition", "to": "SHADOW"},
-                {"kind": "run_end", "final_state": "COMPLETED_ON_TP1"},
-            ]
-            (controller / "phase9_audit.jsonl").write_text(
-                "".join(json.dumps(row) + "\n" for row in records),
-                encoding="utf-8",
-            )
-            result = MODULE.accept_calibration(controller, background)
             self.assertEqual(result["status"], "FAIL")
             self.assertEqual(result["migration_transitions"], 1)
+
+    def test_rejects_weak_pressure_and_short_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            controller = root / "controller"
+            background = root / "background"
+            controller.mkdir()
+            background.mkdir()
+            self.write_run(
+                controller,
+                background,
+                peak_usage=0.0244,
+                preemptions=0,
+                background_end=30.0,
+                telemetry_end=12.0,
+            )
+            result = MODULE.accept_calibration(
+                controller,
+                background,
+                expected_jobs=5,
+                minimum_peak_kv_usage_frac=0.90,
+                require_preemption=True,
+                coverage_slack_s=1.0,
+            )
+            self.assertEqual(result["status"], "FAIL")
+            self.assertIn(
+                "no TP1 preemption observed under calibration pressure",
+                result["errors"],
+            )
+            self.assertIn(
+                "telemetry did not cover the background workload end",
+                result["errors"],
+            )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,61 @@
+{
+  "format_version": 1,
+  "note": "CAP-0 calibration v2; smoke and formal runs use this exact manifest",
+  "jobs": [
+    {
+      "job_id": "target_000",
+      "pool": "target",
+      "start_after_s": 0.0,
+      "request": {
+        "model": "bridgetp-model",
+        "prompt": "Explain queueing delay in a distributed inference service.",
+        "max_tokens": 2048,
+        "ignore_eos": true
+      }
+    },
+    {
+      "job_id": "source_000",
+      "pool": "source",
+      "start_after_s": 2.0,
+      "request": {
+        "model": "bridgetp-model",
+        "prompt": "Write a detailed systems design review for a capacity-limited scheduler.",
+        "max_tokens": 7000,
+        "ignore_eos": true
+      }
+    },
+    {
+      "job_id": "source_001",
+      "pool": "source",
+      "start_after_s": 2.2,
+      "request": {
+        "model": "bridgetp-model",
+        "prompt": "Write a detailed systems design review for a capacity-limited scheduler.",
+        "max_tokens": 7000,
+        "ignore_eos": true
+      }
+    },
+    {
+      "job_id": "source_002",
+      "pool": "source",
+      "start_after_s": 2.4,
+      "request": {
+        "model": "bridgetp-model",
+        "prompt": "Write a detailed systems design review for a capacity-limited scheduler.",
+        "max_tokens": 7000,
+        "ignore_eos": true
+      }
+    },
+    {
+      "job_id": "source_003",
+      "pool": "source",
+      "start_after_s": 2.6,
+      "request": {
+        "model": "bridgetp-model",
+        "prompt": "Write a detailed systems design review for a capacity-limited scheduler.",
+        "max_tokens": 7000,
+        "ignore_eos": true
+      }
+    }
+  ]
+}
