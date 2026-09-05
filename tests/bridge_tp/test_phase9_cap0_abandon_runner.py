@@ -110,6 +110,11 @@ class TestAbandonAcceptance(unittest.TestCase):
                 "target_waiting": 0,
             },
             {"kind": "transition", "to": "SHADOW"},
+            {
+                "kind": "telemetry",
+                "state": "SHADOW",
+                "capacity_signal": {"active": False, "transition": "CLEAR"},
+            },
             {"kind": "abandon", "reason": reason},
             {"kind": "transition", "to": "CANCELLED"},
             {
@@ -183,6 +188,33 @@ class TestAbandonAcceptance(unittest.TestCase):
                 "CANCELLED",
             ])
             self.assertTrue(result["source_continues_on_tp1"])
+            self.assertEqual(result["shadow_capacity_clear_samples"], 1)
+
+    def test_rejects_abandon_without_shadow_capacity_clear(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.write_case(root)
+            audit_path = root / "controller" / "phase9_audit.jsonl"
+            records = [
+                json.loads(line)
+                for line in audit_path.read_text(encoding="utf-8").splitlines()
+            ]
+            audit_path.write_text(
+                "".join(
+                    json.dumps(record) + "\n"
+                    for record in records
+                    if record.get("kind") != "telemetry"
+                ),
+                encoding="utf-8",
+            )
+            result = RUNNER.accept_abandon(
+                root / "controller",
+                root / "background",
+                expected_jobs=8,
+                expected_anchor_tokens=4,
+            )
+            self.assertEqual(result["status"], "FAIL")
+            self.assertTrue(any("capacity CLEAR" in e for e in result["errors"]))
 
     def test_rejects_source_abort(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
