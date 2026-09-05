@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -31,6 +32,22 @@ RUNNER = load_script(
 
 
 class TestRescueManifest(unittest.TestCase):
+    def test_cli_writes_manifest_without_forwarding_output_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "rescue.json"
+            with mock.patch.object(
+                sys,
+                "argv",
+                ["build_phase9_cap0_rescue_manifest.py", "--out", str(output)],
+            ):
+                BUILDER.main()
+            manifest = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(
+                manifest["scenario"],
+                "CAP-0 Rescue reachability bring-up",
+            )
+            self.assertEqual(len(manifest["jobs"]), 52)
+
     def test_default_manifest_creates_finite_rescue_window(self) -> None:
         manifest = BUILDER.build_manifest()
         pressure = RUNNER.validate_rescue_pressure(

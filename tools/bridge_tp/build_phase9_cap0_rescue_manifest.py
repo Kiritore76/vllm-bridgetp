@@ -64,15 +64,17 @@ def build_manifest(**overrides: Any) -> dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
-    manifest = build_manifest(**vars(args))
-    write_json(args.out, manifest)
+    values = vars(args).copy()
+    out = values.pop("out")
+    manifest = build_manifest(**values)
+    write_json(out, manifest)
     parameters = manifest["parameters"]
     target_tokens = int(parameters["target_copies"]) * (
         int(parameters["target_prompt_tokens"])
         + int(parameters["target_output_tokens"])
     )
     print(
-        f"wrote CAP-0 Rescue working manifest: {args.out.resolve()} "
+        f"wrote CAP-0 Rescue working manifest: {out.resolve()} "
         f"({len(manifest['jobs'])} jobs, "
         f"target demand={target_tokens} tokens)"
     )
