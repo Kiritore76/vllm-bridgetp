@@ -346,6 +346,7 @@ def run(
     success_status: str | None = None,
     success_marker: str | None = None,
     acceptance_fn: Callable[[Path, Path, int, int], dict[str, Any]] | None = None,
+    allow_clean_stager_exit: bool = False,
 ) -> dict[str, Any]:
     if phase not in {"bringup", "formal"}:
         raise ValueError(f"unsupported No-op phase {phase!r}")
@@ -521,12 +522,20 @@ def run(
         )
         processes.append(background)
         common.wait_pair(controller, background, args.run_timeout_s)
-        for service in (target, source, stager):
+        for service in (target, source):
             if service.process.poll() is not None:
                 raise RuntimeError(
                     f"{service.name} exited early with code "
                     f"{service.process.returncode}; see {service.log_path}"
                 )
+        stager_rc = stager.process.poll()
+        if stager_rc is not None and not (
+            allow_clean_stager_exit and stager_rc == 0
+        ):
+            raise RuntimeError(
+                f"{stager.name} exited early with code {stager_rc}; "
+                f"see {stager.log_path}"
+            )
 
         if acceptance_fn is None:
             acceptance = accept_noop(
