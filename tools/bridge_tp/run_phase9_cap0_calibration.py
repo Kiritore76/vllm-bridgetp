@@ -320,6 +320,11 @@ def source_environment(
     run_id: str,
     controller_dir: Path,
 ) -> dict[str, str]:
+    # run_phase9_controller derives the external anchor request ID from
+    # run_dir.name.  Keep the scheduler selector tied to that exact derivation;
+    # the surrounding batch/run ID is not part of the request ID when the
+    # orchestrator uses the nested <label>/controller layout.
+    source_request_id_prefix = f"bridgetp-phase9-{controller_dir.name}"
     env = os.environ.copy()
     env.update(
         {
@@ -340,7 +345,7 @@ def source_environment(
             "BRIDGETP_STREAM_SOCKET_TIMEOUT_S": "600",
             "BRIDGETP_STREAM_PIN_MEMORY": "1",
             "BRIDGETP_STREAM_STRICT": "1",
-            "BRIDGETP_STREAM_SOURCE_REQUEST_ID_PREFIX": f"bridgetp-phase9-{run_id}",
+            "BRIDGETP_STREAM_SOURCE_REQUEST_ID_PREFIX": source_request_id_prefix,
             "BRIDGETP_PHASE8_ENABLED": "1",
             "BRIDGETP_PHASE8_CUTOVER_OUTPUT_TOKENS": "160",
             "BRIDGETP_PHASE8_DELTA_HOST": "127.0.0.1",
@@ -669,6 +674,9 @@ def run_one(
             "minimum_peak_kv_usage_frac": args.minimum_peak_kv_usage_frac,
             "require_preemption": not args.allow_censored,
             "coverage_slack_s": args.coverage_slack_s,
+            "source_request_id_prefix": (
+                f"bridgetp-phase9-{controller_dir.name}"
+            ),
         },
     )
 
@@ -749,6 +757,8 @@ def run_one(
                 str(source_request_path),
                 "--migration-id",
                 run_id,
+                "--preflight-timeout-s",
+                "120",
                 "--dry-run",
             ],
             base_env,
@@ -756,7 +766,7 @@ def run_one(
         )
         processes.append(controller)
         wait_for_file_or_exit(
-            controller_dir / "source_progress.json", controller, timeout_s=120
+            controller_dir / "source_progress.json", controller, timeout_s=150
         )
         print(
             f"[{run_id}] source anchor is live; starting frozen load",

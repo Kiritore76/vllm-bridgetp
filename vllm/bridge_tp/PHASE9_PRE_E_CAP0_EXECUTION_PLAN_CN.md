@@ -1243,6 +1243,12 @@ tracker 仍记录 raw free-KV、EWMA decline、running、waiting 和 preemption�
 
 ### 21.1 第一步：只跑不计数 smoke
 
+首次 v2 smoke `cap0-calibration-smoke-20260905T033220Z` 在 background 启动前失败：嵌套
+`smoke/controller` 布局令 controller 生成 `bridgetp-phase9-controller` 请求 ID，而 TP1 selector
+错误地使用了包含完整 run ID 的旧前缀。anchor 本身已在 TP1 正常生成，但无法写出
+`source_progress.json`。该轮只作失败诊断，不计数；修复后的 runner 从 `controller` 目录名
+推导同一请求前缀，并为这个契约增加单测。重跑必须使用新的 smoke ID 和目录。
+
 `run_phase9_cap0_calibration.py` 把第 20 节的五个进程封装成一个前台父进程。它每轮依次
 启动 TP4、TP1、stager、dry-run controller 和冻结 workload，健康检查后才进入下一步。
 smoke 只运行一次且不计入 r01--r03。它必须同时证明：五个 background jobs 全部完成、
