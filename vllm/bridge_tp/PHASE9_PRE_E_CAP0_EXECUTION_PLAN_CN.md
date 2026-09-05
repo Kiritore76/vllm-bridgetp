@@ -467,8 +467,7 @@ Bridge，需要使用新 mechanism 名、新 commit 和新结果目录重新做�
 以下命令面向 Linux 服务器，仓库和环境默认是：
 
 ```text
-原 checkout： /root/autodl-tmp/bridgetp/vllm_bridge
-CAP-0 checkout：/root/autodl-tmp/bridgetp/vllm_bridge_cap0
+统一 checkout：/root/autodl-tmp/bridgetp/vllm_bridge
 venv：          /root/autodl-tmp/bridgetp/.venv_bridge
 model：         /root/autodl-tmp/models/models/Qwen--Qwen2.5-14B-Instruct/snapshots/master
 GPU：           GPU0=TP1，GPU1--4=TP4
@@ -483,8 +482,9 @@ GPU：           GPU0=TP1，GPU1--4=TP4
 `phase9_cap0_common.env`、`phase9_cap0_geometry.env` 或
 `phase9_cap0_active.env` 加载；`cd` 本身不再依赖导出的 `$BRIDGE_REPO`。
 
-远端分支在本文本地提交时尚未推送。服务器部署必须等
-`origin/bridgetp/phase9-cap0-pilot` 可见后进行。CAP-0 代码锚点是：
+远端 `origin/bridgetp/phase9-cap0-pilot` 已包含 CAP-0。服务器在现有
+`vllm_bridge` checkout 内取证、获取该分支并安全切换，不再创建第二个 worktree；这样会继续
+使用该 checkout 里与当前 vLLM 构建匹配的本地 CUDA 扩展。CAP-0 代码锚点是：
 
 ```text
 73b03bbe61c0398704dc77548e615d0c92c05c0a  Add BridgeTP Phase 9 CAP-0 pilot
@@ -495,7 +495,7 @@ HEAD 永远等于 `73b03bb`。
 
 ## 16. S0：安全部署、E0 盘点和 CPU 回归的完整命令
 
-### 16.1 原 checkout 只读取证，不切分支
+### 16.1 现有 checkout 切换前取证
 
 ```bash
 cd /root/autodl-tmp/bridgetp/vllm_bridge
@@ -504,9 +504,10 @@ source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 set -euo pipefail
 
 export BRIDGE_BASE=/root/autodl-tmp/bridgetp/vllm_bridge
-export BRIDGE_REPO=/root/autodl-tmp/bridgetp/vllm_bridge_cap0
+export BRIDGE_REPO=/root/autodl-tmp/bridgetp/vllm_bridge
 export BRIDGE_PY=/root/autodl-tmp/bridgetp/.venv_bridge/bin/python
 export BRIDGE_MODEL=/root/autodl-tmp/models/models/Qwen--Qwen2.5-14B-Instruct/snapshots/master
+export OMP_NUM_THREADS=1
 export CAP0_RESULTS=/root/autodl-tmp/bridgetp/results/phase9_cap0
 export CAP0_MANIFEST_ROOT=/root/autodl-tmp/bridgetp/phase9_cap0_manifests
 export E0_ID="e0_$(date -u +%Y%m%dT%H%M%SZ)"
@@ -518,6 +519,7 @@ printf '%s\n' \
   "export BRIDGE_REPO=$BRIDGE_REPO" \
   "export BRIDGE_PY=$BRIDGE_PY" \
   "export BRIDGE_MODEL=$BRIDGE_MODEL" \
+  "export OMP_NUM_THREADS=$OMP_NUM_THREADS" \
   "export CAP0_RESULTS=$CAP0_RESULTS" \
   "export CAP0_MANIFEST_ROOT=$CAP0_MANIFEST_ROOT" \
   "export E0_ID=$E0_ID" \
@@ -537,55 +539,29 @@ git -C "$BRIDGE_BASE" ls-files --others --exclude-standard \
 这里不运行 `reset`、`clean`、`checkout --` 或覆盖性复制。`base_dirty.patch` 只记录已跟踪
 改动；未跟踪文件只列名，不擅自打包或移动。
 
-### 16.2 获取远端分支并建立独立 worktree
+### 16.2 在现有 checkout 获取并安全切换 CAP-0
 
-仅在 `$BRIDGE_REPO` 尚不存在时运行：
+以下命令不使用 `reset`、`clean` 或强制 checkout。Git 若发现现有已跟踪或未跟踪文件会被
+覆盖，将拒绝切换并保持原工作树不变；此时停止并人工检查，不得强行覆盖。
 
 ```bash
 cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 
-test ! -e "$BRIDGE_REPO"
 git -C "$BRIDGE_BASE" fetch origin \
   refs/heads/bridgetp/phase9-cap0-pilot:refs/remotes/origin/bridgetp/phase9-cap0-pilot
-git -C "$BRIDGE_BASE" worktree add --detach \
-  "$BRIDGE_REPO" origin/bridgetp/phase9-cap0-pilot
+git -C "$BRIDGE_REPO" switch --detach origin/bridgetp/phase9-cap0-pilot
 ```
 
-如果目录已经存在，不删除它，先做只读核验：
+核验代码锚点并保存切换后的工作树状态。允许切换前已经存在且不与 CAP-0 冲突的用户文件
+继续留在目录中；不要把这些文件加入 CAP-0 提交：
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 
-git -C "$BRIDGE_REPO" status --short --branch
-git -C "$BRIDGE_REPO" rev-parse HEAD
-git -C "$BRIDGE_REPO" remote -v
-```
-
-只有确认这是以前创建的干净 CAP-0 worktree 后，才允许快进到远端：
-
-```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
-source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
-source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
-
-test -z "$(git -C "$BRIDGE_REPO" status --porcelain)"
-git -C "$BRIDGE_REPO" fetch origin \
-  refs/heads/bridgetp/phase9-cap0-pilot:refs/remotes/origin/bridgetp/phase9-cap0-pilot
-git -C "$BRIDGE_REPO" checkout --detach origin/bridgetp/phase9-cap0-pilot
-```
-
-核验代码锚点和干净状态：
-
-```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
-source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
-source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
-
-test -z "$(git status --porcelain)"
 git merge-base --is-ancestor 73b03bbe61c0398704dc77548e615d0c92c05c0a HEAD
 git status --short --branch | tee "$E0_DIR/cap0_git_status.txt"
 git rev-parse HEAD | tee "$E0_DIR/cap0_git_head.txt"
@@ -596,7 +572,7 @@ git remote -v | tee "$E0_DIR/cap0_git_remote.txt"
 ### 16.3 环境和 GPU 取证
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 
@@ -612,7 +588,7 @@ sha256sum "$BRIDGE_MODEL/config.json" "$BRIDGE_MODEL/generation_config.json" \
 ### 16.4 CPU 回归
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 
@@ -656,7 +632,7 @@ test -z "$(git status --porcelain)"
 先确认 8001/8200 未被旧进程占用；若有占用，人工确认其归属并正常停止，不用 `pkill -f`：
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 
@@ -669,7 +645,7 @@ ss -ltnp | grep -E ':(8001|8200)\b' || true
 终端 G1：TP4，监听 8200：
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 
@@ -689,7 +665,7 @@ CUDA_VISIBLE_DEVICES=1,2,3,4 "$BRIDGE_PY" \
 终端 G2：TP1，监听 8001：
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 
@@ -709,7 +685,7 @@ CUDA_VISIBLE_DEVICES=0 "$BRIDGE_PY" \
 终端 G3：等待健康并读取日志：
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 
@@ -737,7 +713,7 @@ grep -Ei 'GPU KV cache size|GPU blocks|num_gpu_blocks' \
 把日志中各 server 报告的 per-rank 数写入环境文件。TP4 的值不要乘 4：
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 
@@ -761,7 +737,7 @@ printf 'export TP1_BLOCKS=%s\nexport TP4_BLOCKS=%s\n' \
 复制到第一个 smoke slot，并使用不与 formal ID 重叠的新 ID。
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 
@@ -822,7 +798,7 @@ formal summarize，也不要把该目录合并进旧 49 条 D 结果。
 放进 controller 的 run directory：
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 
@@ -834,7 +810,7 @@ mkdir -p "$CAP0_MANIFEST_ROOT/working" "$CAP0_MANIFEST_ROOT/frozen"
 冻结为 server 实际暴露的 `bridgetp-model`：
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 
@@ -883,7 +859,7 @@ PY
 只允许在 bring-up 阶段改上述六个 workload 参数。场景达到预期状态后冻结并记录 hash：
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 
@@ -905,7 +881,7 @@ sha256sum "$CAP0_MANIFEST_ROOT/frozen/$FROZEN_NAME.json" \
 每轮先设置 `CAP0_CLASS`、`CAP0_REP`、manifest 和 guard：
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 
@@ -958,7 +934,7 @@ sha256sum "$CAP0_BG_MANIFEST" > "$CAP0_PROV_DIR/background_manifest.sha256"
 三个 held-out 场景设置 `CAP0_CAPACITY_ENABLED=1` 和已冻结的正 guard：
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 source /root/autodl-tmp/bridgetp/phase9_cap0_active.env
@@ -992,7 +968,7 @@ CUDA、模型加载、端口和 connector 异常都会立即显示，同时由 `
 终端 T1：TP4 target，GPU1--4，HTTP 端口 8200：
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 source /root/autodl-tmp/bridgetp/phase9_cap0_active.env
@@ -1025,7 +1001,7 @@ CUDA_VISIBLE_DEVICES=1,2,3,4 "$BRIDGE_PY" \
 终端 T2：TP1 source，GPU0，HTTP 端口 8001：
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 source /root/autodl-tmp/bridgetp/phase9_cap0_active.env
@@ -1067,7 +1043,7 @@ CUDA_VISIBLE_DEVICES=0 "$BRIDGE_PY" \
 终端 T6：等待两个 HTTP 服务健康，并保存进程信息：
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 source /root/autodl-tmp/bridgetp/phase9_cap0_active.env
@@ -1096,7 +1072,7 @@ ps -eo pid,ppid,lstart,args \
 29900 和 delivery 端口 30000--30003：
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 source /root/autodl-tmp/bridgetp/phase9_cap0_active.env
@@ -1110,7 +1086,7 @@ source /root/autodl-tmp/bridgetp/phase9_cap0_active.env
 每轮都重新核对日志 block 数与冻结值一致：
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 source /root/autodl-tmp/bridgetp/phase9_cap0_active.env
@@ -1125,7 +1101,7 @@ grep -Ei 'GPU KV cache size|GPU blocks|num_gpu_blocks' \
 先单独验证 manifest：
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 source /root/autodl-tmp/bridgetp/phase9_cap0_active.env
@@ -1139,7 +1115,7 @@ source /root/autodl-tmp/bridgetp/phase9_cap0_active.env
 shell 后台进程启动：
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 source /root/autodl-tmp/bridgetp/phase9_cap0_active.env
@@ -1156,7 +1132,7 @@ source /root/autodl-tmp/bridgetp/phase9_cap0_active.env
 时刻。calibration/no-migration 在 T5 使用：
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 source /root/autodl-tmp/bridgetp/phase9_cap0_active.env
@@ -1171,7 +1147,7 @@ source /root/autodl-tmp/bridgetp/phase9_cap0_active.env
 No-op、Rescue、Safe abandon 在 T5 使用相同命令但去掉 `--dry-run`：
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 source /root/autodl-tmp/bridgetp/phase9_cap0_active.env
@@ -1197,7 +1173,7 @@ tracker 仍记录 raw free-KV、EWMA decline、running、waiting 和 preemption�
 三轮完成后输出可审计摘要：
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 
@@ -1240,7 +1216,7 @@ ceil_to_block(max_i(F_i) + D_max * T_enter)
 guard，不是 OOM 概率。把最终整数写入并冻结：
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 
@@ -1270,7 +1246,7 @@ printf '%s  %s\n' \
 三者共同设置：
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 
@@ -1295,7 +1271,7 @@ bring-up 时只通过第 19 节 workload 参数形成条件：
 运行下面的只读 checker，`EXPECTED` 取 `calibration`、`noop`、`rescue` 或 `abandon`：
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 source /root/autodl-tmp/bridgetp/phase9_cap0_active.env
@@ -1349,7 +1325,7 @@ client stream 完整性和 background summary。
 ## 24. 每轮封存和 SHA-256
 
 ```bash
-cd /root/autodl-tmp/bridgetp/vllm_bridge_cap0
+cd /root/autodl-tmp/bridgetp/vllm_bridge
 source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate
 source /root/autodl-tmp/bridgetp/phase9_cap0_common.env
 source /root/autodl-tmp/bridgetp/phase9_cap0_active.env
