@@ -5,6 +5,7 @@ import json
 import sys
 import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
 from unittest import mock
 
@@ -235,6 +236,18 @@ class TestRescueAcceptance(unittest.TestCase):
             self.assertTrue(
                 any("exact readback failed" in error for error in result["errors"])
             )
+
+
+class TestRescueRunnerWiring(unittest.TestCase):
+    def test_rescue_allows_only_a_clean_stager_exit(self) -> None:
+        args = Namespace(validate_only=False)
+        with mock.patch.object(RUNNER, "parse_args", return_value=args), mock.patch.object(
+            RUNNER,
+            "validate_inputs",
+            return_value=("revision", 8448, {"target_jobs": 48}),
+        ), mock.patch.object(RUNNER.scenario_runner, "run") as run:
+            RUNNER.main()
+        self.assertTrue(run.call_args.kwargs["allow_clean_stager_exit"])
 
 
 if __name__ == "__main__":

@@ -449,6 +449,7 @@ def main() -> None:
         success_status="BRINGUP_COMPLETE",
         success_marker="RESCUE_BRINGUP_COMPLETE",
         acceptance_fn=accept_rescue,
+        allow_clean_stager_exit=True,
     )
 
 
