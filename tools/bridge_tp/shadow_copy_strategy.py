@@ -1,114 +1,95 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Performance model for BridgeTP Shadow KV-copy alternatives.
-
-This module deliberately models the transfer schedule without changing the
-production takeover path.  It compares a complete, newest-history-first
-backfill against a new-KV-only bridge that leaves historical attention on the
-source.  The latter is not a standalone takeover for a full-context model.
-"""
+"""C-series-calibrated model for Shadow-only KV transfer policies."""
 
 from __future__ import annotations
 
-from collections import deque
+from bisect import bisect_right
 from dataclasses import asdict, dataclass
 from typing import Literal
 
 
-Strategy = Literal["history_backfill", "new_kv_bridge"]
+Strategy = Literal["history_backfill", "new_kv_only"]
 
 
 @dataclass(frozen=True)
-class ShadowCopyInputs:
-    """Inputs shared by both Shadow-copy strategies."""
+class InterferenceCell:
+    """One paired C2 target-interference observation."""
+
+    load_band: str
+    repetition: int
+    target_rate_gib_s: float
+    effective_rate_gib_s: float
+    target_load_frac: float
+    baseline_mean_tpot_s: float
+    copy_mean_tpot_s: float
+    baseline_p99_tpot_s: float
+    copy_p99_tpot_s: float
+    baseline_p99_itl_s: float
+    copy_p99_itl_s: float
+
+    @property
+    def mean_tpot_penalty_s(self) -> float:
+        return self.copy_mean_tpot_s - self.baseline_mean_tpot_s
+
+    @property
+    def p99_tpot_penalty_s(self) -> float:
+        return self.copy_p99_tpot_s - self.baseline_p99_tpot_s
+
+    @property
+    def p99_itl_penalty_s(self) -> float:
+        return self.copy_p99_itl_s - self.baseline_p99_itl_s
+
+
+@dataclass(frozen=True)
+class ShadowTransferInputs:
+    """Inputs shared by the two Shadow-only transfer policies."""
 
     history_tokens: int
     remaining_tokens: int
     block_size: int
     kv_bytes_per_token: int
-    copy_rate_bytes_s: float
+    source_load_frac: float
     source_tpot_s: float
-    target_tpot_s: float
-    remote_attention_penalty_s: float
-    remote_attention_bytes_per_token: int
-    bridge_start_tokens: int = 1
+    interference: InterferenceCell
 
     def validate(self) -> None:
-        """Validate model inputs.
-
-        Raises:
-            ValueError: If a size, rate, or latency is outside its domain.
-        """
-        integer_fields = {
-            "history_tokens": self.history_tokens,
-            "remaining_tokens": self.remaining_tokens,
-            "block_size": self.block_size,
-            "kv_bytes_per_token": self.kv_bytes_per_token,
-            "remote_attention_bytes_per_token": (
-                self.remote_attention_bytes_per_token
-            ),
-            "bridge_start_tokens": self.bridge_start_tokens,
-        }
-        for name, value in integer_fields.items():
-            if value < 0:
-                raise ValueError(f"{name} must be nonnegative")
-        if self.history_tokens == 0:
-            raise ValueError("history_tokens must be positive")
-        if self.remaining_tokens == 0:
-            raise ValueError("remaining_tokens must be positive")
-        if self.block_size == 0 or self.kv_bytes_per_token == 0:
-            raise ValueError("block_size and kv_bytes_per_token must be positive")
-        if self.bridge_start_tokens == 0:
-            raise ValueError("bridge_start_tokens must be positive")
-        if self.bridge_start_tokens > self.remaining_tokens:
-            raise ValueError("bridge_start_tokens exceeds remaining_tokens")
-        if self.copy_rate_bytes_s <= 0:
-            raise ValueError("copy_rate_bytes_s must be positive")
-        if self.source_tpot_s <= 0 or self.target_tpot_s <= 0:
-            raise ValueError("TPOT values must be positive")
-        if self.remote_attention_penalty_s < 0:
-            raise ValueError("remote_attention_penalty_s must be nonnegative")
+        if self.history_tokens <= 0 or self.remaining_tokens <= 0:
+            raise ValueError("history_tokens and remaining_tokens must be positive")
+        if self.block_size <= 0 or self.kv_bytes_per_token <= 0:
+            raise ValueError("block_size and KV bytes must be positive")
+        if self.source_tpot_s <= 0:
+            raise ValueError("source_tpot_s must be positive")
+        if self.interference.effective_rate_gib_s <= 0:
+            raise ValueError("effective copy rate must be positive")
+        if self.interference.copy_mean_tpot_s <= 0:
+            raise ValueError("copy mean TPOT must be positive")
 
 
 @dataclass(frozen=True)
-class ShadowCopyResult:
-    """One strategy result for a fixed request and system condition."""
+class ShadowTransferResult:
+    """Result for one policy over the remaining source-generation window."""
 
     strategy: Strategy
-    completion_time_s: float
-    source_release_time_s: float
-    baseline_tp1_completion_s: float
-    latency_gain_vs_tp1_s: float
-    shadow_ready_time_s: float | None
-    source_tokens_before_switch: int
-    target_tokens_after_switch: int
+    observation_window_s: float
+    copy_active_time_s: float
+    copy_duty_cycle: float
+    bytes_sent: int
     history_bytes_sent: int
-    delta_bytes_sent: int
-    remote_attention_bytes_sent: int
-    total_network_bytes: int
-    history_blocks_completed: int
-    history_block_order: tuple[tuple[int, int], ...]
-    standalone_takeover: bool
-    source_needed_after_switch: bool
+    new_kv_bytes_sent: int
+    history_backlog_end_bytes: int
+    history_backlog_end_tokens: float
+    maximum_new_kv_lag_s: float
+    takeover_ready: bool
+    takeover_ready_time_s: float | None
+    source_finishes_before_ready: bool
+    estimated_affected_target_tokens: float
+    estimated_target_delay_s: float
     outcome: str
 
     def to_dict(self) -> dict[str, object]:
-        """Return a JSON/CSV-friendly representation."""
-        result = asdict(self)
-        result["history_block_order"] = ";".join(
-            f"[{start},{end})" for start, end in self.history_block_order
-        )
-        return result
-
-
-@dataclass
-class _TransferItem:
-    kind: Literal["history", "delta"]
-    start_token: int
-    end_token: int
-    remaining_bytes: float
-    original_bytes: int
+        return asdict(self)
 
 
 def kv_bytes_per_token(
@@ -125,288 +106,155 @@ def kv_bytes_per_token(
     return 2 * num_layers * num_kv_heads * head_size * dtype_bytes
 
 
-def remote_attention_bytes_per_token(
-    *, num_layers: int, hidden_size: int, dtype_bytes: int
-) -> int:
-    """Estimate aggregate query plus attention-output bytes per token.
-
-    This intentionally excludes protocol headers.  A real remote-attention
-    implementation must replace the estimate with measured wire bytes.
-    """
-    values = (num_layers, hidden_size, dtype_bytes)
-    if any(value <= 0 for value in values):
-        raise ValueError("remote-attention geometry values must be positive")
-    return 2 * num_layers * hidden_size * dtype_bytes
-
-
-def newest_first_history_blocks(
-    history_tokens: int, block_size: int
-) -> tuple[tuple[int, int], ...]:
-    """Return logical history ranges from the Shadow boundary toward token 0."""
-    if history_tokens <= 0 or block_size <= 0:
-        raise ValueError("history_tokens and block_size must be positive")
-    ranges = []
-    end = history_tokens
-    while end > 0:
-        start = max(0, end - block_size)
-        ranges.append((start, end))
-        end = start
-    return tuple(ranges)
+def interpolate_tpot(
+    load_frac: float,
+    load_knots: list[float],
+    tpot_knots_s: list[float],
+) -> float:
+    """Linearly interpolate inside a frozen monotone C1 TPOT curve."""
+    if len(load_knots) != len(tpot_knots_s) or not load_knots:
+        raise ValueError("invalid TPOT knot arrays")
+    if load_frac < load_knots[0] or load_frac > load_knots[-1]:
+        raise ValueError("source load is outside the C1 support")
+    right = bisect_right(load_knots, load_frac)
+    if right == 0:
+        return tpot_knots_s[0]
+    if right == len(load_knots):
+        return tpot_knots_s[-1]
+    left = right - 1
+    x0, x1 = load_knots[left], load_knots[right]
+    y0, y1 = tpot_knots_s[left], tpot_knots_s[right]
+    if x1 == x0:
+        return max(y0, y1)
+    weight = (load_frac - x0) / (x1 - x0)
+    return y0 + weight * (y1 - y0)
 
 
-def _newest_first_items(inputs: ShadowCopyInputs) -> deque[_TransferItem]:
-    return deque(
-        _TransferItem(
-            kind="history",
-            start_token=start,
-            end_token=end,
-            remaining_bytes=(end - start) * inputs.kv_bytes_per_token,
-            original_bytes=(end - start) * inputs.kv_bytes_per_token,
-        )
-        for start, end in newest_first_history_blocks(
-            inputs.history_tokens, inputs.block_size
-        )
-    )
+def _target_impact(
+    active_time_s: float, cell: InterferenceCell
+) -> tuple[float, float]:
+    affected = active_time_s / cell.copy_mean_tpot_s
+    return affected, affected * cell.mean_tpot_penalty_s
 
 
-def simulate_history_backfill(inputs: ShadowCopyInputs) -> ShadowCopyResult:
-    """Simulate newest-history-first backfill with delta priority.
-
-    History is transferred in logical blocks starting at the Shadow boundary.
-    A block already on the wire is not preempted, but every newly generated KV
-    delta takes priority before the next history block.  Takeover is allowed
-    only when all history and all produced deltas have been acknowledged.
-    """
+def simulate_history_backfill(
+    inputs: ShadowTransferInputs,
+) -> ShadowTransferResult:
+    """Simulate continuous newest-first history backfill plus new KV."""
     inputs.validate()
-    history = _newest_first_items(inputs)
-    deltas: deque[_TransferItem] = deque()
-    current: _TransferItem | None = None
-    now = 0.0
-    generated = 0
-    next_token_time = inputs.source_tpot_s
-    history_bytes_sent = 0.0
-    delta_bytes_sent = 0.0
-    completed_history: list[tuple[int, int]] = []
-    epsilon = 1e-12
+    copy_rate = inputs.interference.effective_rate_gib_s * 1024**3
+    new_kv_rate = inputs.kv_bytes_per_token / inputs.source_tpot_s
+    history_bytes = inputs.history_tokens * inputs.kv_bytes_per_token
+    window = inputs.remaining_tokens * inputs.source_tpot_s
+    drain_rate = copy_rate - new_kv_rate
 
-    while generated < inputs.remaining_tokens:
-        if current is None:
-            if deltas:
-                current = deltas.popleft()
-            elif history:
-                current = history.popleft()
-            else:
-                break
+    catch_up = None
+    if drain_rate > 0:
+        catch_up = history_bytes / drain_rate
+    ready = catch_up is not None and catch_up <= window
+    active_time = catch_up if ready else window
+    available_bytes = history_bytes + new_kv_rate * active_time
+    bytes_sent = min(copy_rate * active_time, available_bytes)
+    new_bytes = min(new_kv_rate * active_time, bytes_sent)
+    history_sent = max(0.0, bytes_sent - new_bytes)
+    backlog = max(0.0, history_bytes - history_sent)
+    affected, target_delay = _target_impact(active_time, inputs.interference)
 
-        finish_time = now + current.remaining_bytes / inputs.copy_rate_bytes_s
-        item_finished = finish_time <= next_token_time
-        event_time = finish_time if item_finished else next_token_time
-        transmitted = (
-            current.remaining_bytes
-            if item_finished
-            else max(0.0, event_time - now) * inputs.copy_rate_bytes_s
-        )
-        current.remaining_bytes -= transmitted
-        if current.kind == "history":
-            history_bytes_sent += transmitted
-        else:
-            delta_bytes_sent += transmitted
-        now = event_time
-
-        token_arrived = next_token_time <= now + epsilon
-        if item_finished:
-            if current.kind == "history":
-                completed_history.append(
-                    (current.start_token, current.end_token)
-                )
-            current = None
-        if token_arrived:
-            start = inputs.history_tokens + generated
-            generated += 1
-            deltas.append(
-                _TransferItem(
-                    kind="delta",
-                    start_token=start,
-                    end_token=start + 1,
-                    remaining_bytes=inputs.kv_bytes_per_token,
-                    original_bytes=inputs.kv_bytes_per_token,
-                )
-            )
-            next_token_time += inputs.source_tpot_s
-
-        if current is None and not history and not deltas:
-            target_tokens = inputs.remaining_tokens - generated
-            completion = now + target_tokens * inputs.target_tpot_s
-            baseline = inputs.remaining_tokens * inputs.source_tpot_s
-            return ShadowCopyResult(
-                strategy="history_backfill",
-                completion_time_s=completion,
-                source_release_time_s=now,
-                baseline_tp1_completion_s=baseline,
-                latency_gain_vs_tp1_s=baseline - completion,
-                shadow_ready_time_s=now,
-                source_tokens_before_switch=generated,
-                target_tokens_after_switch=target_tokens,
-                history_bytes_sent=round(history_bytes_sent),
-                delta_bytes_sent=round(delta_bytes_sent),
-                remote_attention_bytes_sent=0,
-                total_network_bytes=round(history_bytes_sent + delta_bytes_sent),
-                history_blocks_completed=len(completed_history),
-                history_block_order=tuple(completed_history),
-                standalone_takeover=True,
-                source_needed_after_switch=False,
-                outcome="TAKEOVER",
-            )
-
-    baseline = inputs.remaining_tokens * inputs.source_tpot_s
-    return ShadowCopyResult(
+    if ready:
+        outcome = "TAKEOVER_READY"
+    elif drain_rate <= 0:
+        outcome = "NEW_KV_RATE_EXCEEDS_COPY_RATE"
+    else:
+        outcome = "SOURCE_FINISHED_BEFORE_HISTORY_CAUGHT_UP"
+    return ShadowTransferResult(
         strategy="history_backfill",
-        completion_time_s=baseline,
-        source_release_time_s=baseline,
-        baseline_tp1_completion_s=baseline,
-        latency_gain_vs_tp1_s=0.0,
-        shadow_ready_time_s=None,
-        source_tokens_before_switch=inputs.remaining_tokens,
-        target_tokens_after_switch=0,
-        history_bytes_sent=round(history_bytes_sent),
-        delta_bytes_sent=round(delta_bytes_sent),
-        remote_attention_bytes_sent=0,
-        total_network_bytes=round(history_bytes_sent + delta_bytes_sent),
-        history_blocks_completed=len(completed_history),
-        history_block_order=tuple(completed_history),
-        standalone_takeover=False,
-        source_needed_after_switch=False,
-        outcome="SOURCE_FINISHED_BEFORE_TAKEOVER",
+        observation_window_s=window,
+        copy_active_time_s=active_time,
+        copy_duty_cycle=active_time / window,
+        bytes_sent=round(bytes_sent),
+        history_bytes_sent=round(history_sent),
+        new_kv_bytes_sent=round(new_bytes),
+        history_backlog_end_bytes=round(backlog),
+        history_backlog_end_tokens=backlog / inputs.kv_bytes_per_token,
+        maximum_new_kv_lag_s=inputs.kv_bytes_per_token / copy_rate,
+        takeover_ready=ready,
+        takeover_ready_time_s=catch_up if ready else None,
+        source_finishes_before_ready=not ready,
+        estimated_affected_target_tokens=affected,
+        estimated_target_delay_s=target_delay,
+        outcome=outcome,
     )
 
 
-def simulate_new_kv_bridge(inputs: ShadowCopyInputs) -> ShadowCopyResult:
-    """Simulate new-KV-only startup followed by remote-attention Bridge.
-
-    TP1 generates and transfers a small number of new token KV records before
-    TP4 becomes the compute endpoint.  Historical KV remains on TP1, so TP1 is
-    still required for remote attention until the request ends.
-    """
+def simulate_new_kv_only(
+    inputs: ShadowTransferInputs,
+) -> ShadowTransferResult:
+    """Simulate per-decode-step new-KV mirroring without history transfer."""
     inputs.validate()
-    now = 0.0
-    generated = 0
-    acknowledged = 0
-    next_token_time = inputs.source_tpot_s
-    pending_bytes = 0.0
-    transmitted = 0.0
-    epsilon = 1e-12
-
-    def source_finished() -> ShadowCopyResult:
-        baseline = inputs.remaining_tokens * inputs.source_tpot_s
-        delta_bytes = round(transmitted)
-        return ShadowCopyResult(
-            strategy="new_kv_bridge",
-            completion_time_s=baseline,
-            source_release_time_s=baseline,
-            baseline_tp1_completion_s=baseline,
-            latency_gain_vs_tp1_s=0.0,
-            shadow_ready_time_s=None,
-            source_tokens_before_switch=inputs.remaining_tokens,
-            target_tokens_after_switch=0,
-            history_bytes_sent=0,
-            delta_bytes_sent=delta_bytes,
-            remote_attention_bytes_sent=0,
-            total_network_bytes=delta_bytes,
-            history_blocks_completed=0,
-            history_block_order=(),
-            standalone_takeover=False,
-            source_needed_after_switch=False,
-            outcome="SOURCE_FINISHED_BEFORE_BRIDGE",
-        )
-
-    while acknowledged < inputs.bridge_start_tokens:
-        if pending_bytes <= epsilon:
-            now = next_token_time
-            generated += 1
-            pending_bytes += inputs.kv_bytes_per_token
-            next_token_time += inputs.source_tpot_s
-            if generated == inputs.remaining_tokens:
-                return source_finished()
-
-        finish_time = now + pending_bytes / inputs.copy_rate_bytes_s
-        if generated < inputs.remaining_tokens and next_token_time < finish_time:
-            sent = (next_token_time - now) * inputs.copy_rate_bytes_s
-            pending_bytes -= sent
-            transmitted += sent
-            now = next_token_time
-            generated += 1
-            pending_bytes += inputs.kv_bytes_per_token
-            next_token_time += inputs.source_tpot_s
-            if generated == inputs.remaining_tokens:
-                return source_finished()
-            continue
-
-        transmitted += pending_bytes
-        now = finish_time
-        acknowledged = generated
-        pending_bytes = 0.0
-
-    bridge_tokens = inputs.remaining_tokens - generated
-    bridge_tpot = inputs.target_tpot_s + inputs.remote_attention_penalty_s
-    completion = now + bridge_tokens * bridge_tpot
-    baseline = inputs.remaining_tokens * inputs.source_tpot_s
-    remote_bytes = bridge_tokens * inputs.remote_attention_bytes_per_token
-    delta_bytes = generated * inputs.kv_bytes_per_token
-    return ShadowCopyResult(
-        strategy="new_kv_bridge",
-        completion_time_s=completion,
-        source_release_time_s=completion,
-        baseline_tp1_completion_s=baseline,
-        latency_gain_vs_tp1_s=baseline - completion,
-        shadow_ready_time_s=now,
-        source_tokens_before_switch=generated,
-        target_tokens_after_switch=bridge_tokens,
+    copy_rate = inputs.interference.effective_rate_gib_s * 1024**3
+    window = inputs.remaining_tokens * inputs.source_tpot_s
+    new_bytes = inputs.remaining_tokens * inputs.kv_bytes_per_token
+    active_time = new_bytes / copy_rate
+    duty_cycle = min(1.0, active_time / window)
+    transfer_lag = inputs.kv_bytes_per_token / copy_rate
+    affected, target_delay = _target_impact(active_time, inputs.interference)
+    history_bytes = inputs.history_tokens * inputs.kv_bytes_per_token
+    stable = active_time <= window
+    return ShadowTransferResult(
+        strategy="new_kv_only",
+        observation_window_s=window,
+        copy_active_time_s=active_time,
+        copy_duty_cycle=duty_cycle,
+        bytes_sent=new_bytes,
         history_bytes_sent=0,
-        delta_bytes_sent=delta_bytes,
-        remote_attention_bytes_sent=remote_bytes,
-        total_network_bytes=delta_bytes + remote_bytes,
-        history_blocks_completed=0,
-        history_block_order=(),
-        standalone_takeover=False,
-        source_needed_after_switch=True,
-        outcome="BRIDGE_TO_REQUEST_END",
+        new_kv_bytes_sent=new_bytes,
+        history_backlog_end_bytes=history_bytes,
+        history_backlog_end_tokens=float(inputs.history_tokens),
+        maximum_new_kv_lag_s=transfer_lag,
+        takeover_ready=False,
+        takeover_ready_time_s=None,
+        source_finishes_before_ready=True,
+        estimated_affected_target_tokens=affected,
+        estimated_target_delay_s=target_delay,
+        outcome=(
+            "NEW_KV_SYNCHRONIZED_HISTORY_UNMOVED"
+            if stable
+            else "NEW_KV_RATE_EXCEEDS_COPY_RATE"
+        ),
     )
 
 
-def compare_shadow_strategies(
-    inputs: ShadowCopyInputs,
+def compare_shadow_transfers(
+    inputs: ShadowTransferInputs,
 ) -> dict[str, object]:
-    """Run both strategies and report objective-specific winners."""
+    """Compare Shadow transport overhead and readiness separately."""
     history = simulate_history_backfill(inputs)
-    bridge = simulate_new_kv_bridge(inputs)
-
-    def winner(a: float, b: float) -> str:
-        if abs(a - b) <= 1e-12:
-            return "tie"
-        return history.strategy if a < b else bridge.strategy
-
-    bridge_tokens = bridge.target_tokens_after_switch
-    break_even_ms: float | None = None
-    if bridge_tokens > 0:
-        base_bridge_time = (
-            bridge.shadow_ready_time_s or 0.0
-        ) + bridge_tokens * inputs.target_tpot_s
-        break_even_ms = (
-            (history.completion_time_s - base_bridge_time) / bridge_tokens * 1000
-        )
-
+    new_only = simulate_new_kv_only(inputs)
     return {
-        "inputs": asdict(inputs),
+        "inputs": {
+            "history_tokens": inputs.history_tokens,
+            "remaining_tokens": inputs.remaining_tokens,
+            "block_size": inputs.block_size,
+            "kv_bytes_per_token": inputs.kv_bytes_per_token,
+            "source_load_frac": inputs.source_load_frac,
+            "source_tpot_s": inputs.source_tpot_s,
+            **asdict(inputs.interference),
+            "mean_tpot_penalty_s": inputs.interference.mean_tpot_penalty_s,
+            "p99_tpot_penalty_s": inputs.interference.p99_tpot_penalty_s,
+            "p99_itl_penalty_s": inputs.interference.p99_itl_penalty_s,
+        },
         "history_backfill": history.to_dict(),
-        "new_kv_bridge": bridge.to_dict(),
-        "latency_winner": winner(
-            history.completion_time_s, bridge.completion_time_s
+        "new_kv_only": new_only.to_dict(),
+        "lower_bytes": (
+            history.strategy
+            if history.bytes_sent < new_only.bytes_sent
+            else new_only.strategy
         ),
-        "source_release_winner": winner(
-            history.source_release_time_s, bridge.source_release_time_s
+        "lower_estimated_interference": (
+            history.strategy
+            if history.estimated_target_delay_s
+            < new_only.estimated_target_delay_s
+            else new_only.strategy
         ),
-        "network_bytes_winner": winner(
-            history.total_network_bytes, bridge.total_network_bytes
-        ),
-        "new_kv_bridge_remote_penalty_break_even_ms": break_even_ms,
+        "takeover_ready": history.strategy if history.takeover_ready else "none",
     }
