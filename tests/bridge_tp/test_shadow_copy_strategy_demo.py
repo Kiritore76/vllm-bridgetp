@@ -3,42 +3,46 @@
 
 import unittest
 
+from tools.bridge_tp.run_shadow_copy_strategy_demo import empirical_quantile
 from tools.bridge_tp.shadow_copy_strategy import (
-    ShadowCopyInputs,
-    compare_shadow_strategies,
+    InterferenceCell,
+    ShadowTransferInputs,
+    compare_shadow_transfers,
+    interpolate_tpot,
     kv_bytes_per_token,
-    newest_first_history_blocks,
-    remote_attention_bytes_per_token,
     simulate_history_backfill,
-    simulate_new_kv_bridge,
+    simulate_new_kv_only,
 )
-from tools.bridge_tp.run_shadow_copy_strategy_demo import flatten_decision
 
 
 class TestShadowCopyStrategyDemo(unittest.TestCase):
-    def inputs(self, **overrides) -> ShadowCopyInputs:
+    def inputs(self, **overrides) -> ShadowTransferInputs:
+        cell = InterferenceCell(
+            load_band="low",
+            repetition=1,
+            target_rate_gib_s=0.4,
+            effective_rate_gib_s=0.4,
+            target_load_frac=0.2,
+            baseline_mean_tpot_s=0.05,
+            copy_mean_tpot_s=0.06,
+            baseline_p99_tpot_s=0.08,
+            copy_p99_tpot_s=0.09,
+            baseline_p99_itl_s=0.1,
+            copy_p99_itl_s=0.13,
+        )
         values = {
             "history_tokens": 64,
             "remaining_tokens": 32,
             "block_size": 16,
             "kv_bytes_per_token": 1024,
-            "copy_rate_bytes_s": 1024 * 1024,
+            "source_load_frac": 0.4,
             "source_tpot_s": 0.03,
-            "target_tpot_s": 0.01,
-            "remote_attention_penalty_s": 0.002,
-            "remote_attention_bytes_per_token": 2048,
-            "bridge_start_tokens": 1,
+            "interference": cell,
         }
         values.update(overrides)
-        return ShadowCopyInputs(**values)
+        return ShadowTransferInputs(**values)
 
-    def test_history_blocks_start_at_shadow_boundary(self) -> None:
-        self.assertEqual(
-            newest_first_history_blocks(40, 16),
-            ((24, 40), (8, 24), (0, 8)),
-        )
-
-    def test_qwen_geometry_counts_aggregate_bytes(self) -> None:
+    def test_qwen_geometry(self) -> None:
         self.assertEqual(
             kv_bytes_per_token(
                 num_layers=48,
@@ -48,75 +52,72 @@ class TestShadowCopyStrategyDemo(unittest.TestCase):
             ),
             196608,
         )
-        self.assertEqual(
-            remote_attention_bytes_per_token(
-                num_layers=48,
-                hidden_size=5120,
-                dtype_bytes=2,
-            ),
-            983040,
-        )
 
-    def test_history_backfill_can_reach_standalone_takeover(self) -> None:
+    def test_interpolate_tpot(self) -> None:
+        self.assertAlmostEqual(
+            interpolate_tpot(0.25, [0.2, 0.3], [0.02, 0.04]),
+            0.03,
+        )
+        with self.assertRaises(ValueError):
+            interpolate_tpot(0.1, [0.2, 0.3], [0.02, 0.04])
+
+    def test_empirical_higher_quantile(self) -> None:
+        self.assertEqual(empirical_quantile([1, 2, 3, 4], 0.5), 2)
+        self.assertEqual(empirical_quantile([1, 2, 3, 4], 0.9), 4)
+
+    def test_history_backfill_reaches_takeover_ready(self) -> None:
         result = simulate_history_backfill(self.inputs())
-        self.assertEqual(result.outcome, "TAKEOVER")
-        self.assertTrue(result.standalone_takeover)
-        self.assertFalse(result.source_needed_after_switch)
-        self.assertEqual(result.history_bytes_sent, 64 * 1024)
-        self.assertEqual(
-            result.history_block_order,
-            ((48, 64), (32, 48), (16, 32), (0, 16)),
-        )
+        self.assertTrue(result.takeover_ready)
+        self.assertEqual(result.history_backlog_end_bytes, 0)
+        self.assertEqual(result.outcome, "TAKEOVER_READY")
 
-    def test_history_backfill_cancels_when_source_finishes_first(self) -> None:
+    def test_history_backfill_can_miss_request_end(self) -> None:
+        slow_cell = InterferenceCell(
+            **{
+                **self.inputs().interference.__dict__,
+                "effective_rate_gib_s": 1e-6,
+            }
+        )
         result = simulate_history_backfill(
             self.inputs(
                 history_tokens=1024,
                 remaining_tokens=2,
-                copy_rate_bytes_s=1024,
+                interference=slow_cell,
             )
         )
-        self.assertEqual(result.outcome, "SOURCE_FINISHED_BEFORE_TAKEOVER")
-        self.assertFalse(result.standalone_takeover)
-        self.assertEqual(result.completion_time_s, 0.06)
+        self.assertFalse(result.takeover_ready)
+        self.assertGreater(result.history_backlog_end_tokens, 0)
 
-    def test_new_kv_bridge_keeps_source_until_request_end(self) -> None:
-        result = simulate_new_kv_bridge(self.inputs())
-        self.assertEqual(result.outcome, "BRIDGE_TO_REQUEST_END")
-        self.assertFalse(result.standalone_takeover)
-        self.assertTrue(result.source_needed_after_switch)
-        self.assertEqual(result.source_release_time_s, result.completion_time_s)
+    def test_new_only_keeps_all_history_backlog(self) -> None:
+        inputs = self.inputs()
+        result = simulate_new_kv_only(inputs)
+        self.assertFalse(result.takeover_ready)
         self.assertEqual(result.history_bytes_sent, 0)
-        self.assertGreater(result.remote_attention_bytes_sent, 0)
-
-    def test_new_kv_bridge_cancels_if_source_finishes_before_start(self) -> None:
-        result = simulate_new_kv_bridge(
-            self.inputs(
-                remaining_tokens=1,
-                copy_rate_bytes_s=1,
-            )
+        self.assertEqual(result.history_backlog_end_tokens, 64)
+        self.assertLess(result.copy_duty_cycle, 1)
+        self.assertAlmostEqual(
+            result.maximum_new_kv_lag_s,
+            1024 / (0.4 * 1024**3),
         )
-        self.assertEqual(result.outcome, "SOURCE_FINISHED_BEFORE_BRIDGE")
-        self.assertEqual(result.completion_time_s, 0.03)
-        self.assertEqual(result.target_tokens_after_switch, 0)
-        self.assertEqual(result.remote_attention_bytes_sent, 0)
 
-    def test_comparison_reports_separate_objectives(self) -> None:
-        result = compare_shadow_strategies(self.inputs())
-        self.assertIn(
-            result["latency_winner"],
-            ("history_backfill", "new_kv_bridge", "tie"),
+    def test_target_delay_uses_paired_c2_penalty(self) -> None:
+        result = simulate_new_kv_only(self.inputs())
+        expected_tokens = (
+            result.copy_active_time_s
+            / self.inputs().interference.copy_mean_tpot_s
         )
-        self.assertEqual(result["source_release_winner"], "history_backfill")
-        self.assertIsNotNone(result["new_kv_bridge_remote_penalty_break_even_ms"])
+        self.assertAlmostEqual(
+            result.estimated_target_delay_s,
+            expected_tokens * 0.01,
+        )
 
-    def test_decision_row_pairs_both_strategies(self) -> None:
-        comparison = compare_shadow_strategies(self.inputs())
-        row = flatten_decision(7, comparison)
-        self.assertEqual(row["comparison_id"], 7)
-        self.assertIn("history_completion_ms", row)
-        self.assertIn("bridge_completion_ms", row)
-        self.assertEqual(row["source_release_winner"], "history_backfill")
+    def test_comparison_separates_overhead_and_readiness(self) -> None:
+        result = compare_shadow_transfers(self.inputs())
+        self.assertEqual(result["lower_bytes"], "new_kv_only")
+        self.assertEqual(
+            result["lower_estimated_interference"], "new_kv_only"
+        )
+        self.assertEqual(result["takeover_ready"], "history_backfill")
 
 
 if __name__ == "__main__":
