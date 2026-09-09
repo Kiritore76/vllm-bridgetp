@@ -14,6 +14,10 @@ rank 0代表TP1，rank 1–4代表TP4。所有payload都通过NCCL真实传输�
 payload使用合成值和可复用buffer，但字节数对应Qwen2.5-14B的48层、8个KV head、head dim
 128、BF16几何：每个新token聚合192 KiB，每个16-token历史block聚合3 MiB。
 
+进程启动时先执行无负载传输预热；此外，每个AB/BA策略臂正式计时前都执行相同次数的
+NCCL＋该cell对应背景GEMM联合预热。联合预热不写入测量CSV，用于避免先运行的策略独自承担
+cuBLAS初始化和GPU升频成本。
+
 这是G3传输微基准，不是完整在线vLLM：它不释放真实paged-KV block、不生成真实token，也不在
 Bridge内重复运行G2已经测量的远端Attention。G4应把G2远端Attention表与本实验的传输/ACK表
 组合；G5再实现真实Bridge ownership推进。
@@ -98,7 +102,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4 \
   --target-load-repeats 4 \
   --outcomes COMMIT \
   --background-gemm-size 4096 \
-  --transport-warmup-steps 3
+  --transport-warmup-steps 3 \
+  --strategy-warmup-steps 5
 ```
 
 每个smoke进程应记录2行并通过验收。AB通过后再以新目录运行BA：
@@ -120,7 +125,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4 \
   --target-load-repeats 4 \
   --outcomes COMMIT \
   --background-gemm-size 4096 \
-  --transport-warmup-steps 3
+  --transport-warmup-steps 3 \
+  --strategy-warmup-steps 5
 ```
 
 smoke结果拿回检查后再冻结pilot/formal矩阵，不能跳过smoke直接运行大批次。
