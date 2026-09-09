@@ -14,6 +14,7 @@ if torch is not None:
         aggregate_bytes_for_tokens,
         make_cases,
         validate_rows,
+        validate_step_rows,
     )
 
 
@@ -65,6 +66,21 @@ class TestShadowStrategyTransferRunner(unittest.TestCase):
         acceptance = validate_rows([row], expected_rows=2)
         self.assertEqual(acceptance["status"], "FAIL")
         self.assertGreaterEqual(len(acceptance["errors"]), 7)
+
+    def test_raw_steps_must_reproduce_summary(self) -> None:
+        summary = {
+            "case_index": 1,
+            "shadow_steps": 1,
+            "bridge_steps": 1,
+            "actual_transfer_bytes": 30,
+        }
+        valid_steps = [
+            {"case_index": 1, "actual_bytes": 10, "all_verified": True},
+            {"case_index": 1, "actual_bytes": 20, "all_verified": True},
+        ]
+        self.assertEqual(validate_step_rows([summary], valid_steps), [])
+        valid_steps.pop()
+        self.assertGreaterEqual(len(validate_step_rows([summary], valid_steps)), 2)
 
 
 if __name__ == "__main__":

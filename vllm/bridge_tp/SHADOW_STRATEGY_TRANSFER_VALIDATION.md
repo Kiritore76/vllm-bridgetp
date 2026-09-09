@@ -48,6 +48,13 @@ Bridge内重复运行G2已经测量的远端Attention。G4应把G2远端Attentio
 - `takeover_ready`：commit episode是否完成全部传输和验证；
 - `actual_transfer_bytes == expected_transfer_bytes`：传输量是否精确。
 
+runner同时生成两级CSV：
+
+- `measurements.csv`：每个策略臂的汇总；
+- `step_measurements.csv`：每个Shadow/Bridge step的原始新KV ACK、历史ACK、TP4负载、实际字节
+  和总耗时，用于跨AB/BA重复合并后重新计算尾延迟。验收器会用原始step重新核对汇总字节和
+  step数量，缺失时fail closed。
+
 ## 4. 静态检查
 
 ```bash

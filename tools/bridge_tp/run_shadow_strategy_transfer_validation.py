@@ -541,7 +541,7 @@ def run_strategy(
     rank: int,
     buffers: PayloadBuffers,
     target_load: TargetLoad,
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
     plan = build_shadow_transfer_plan(
         strategy=strategy,
         outcome=case.outcome,
@@ -589,7 +589,7 @@ def run_strategy(
     status = "PASS" if all_verified and byte_exact else "FAIL"
     aggregate_new_bytes = aggregate_bytes_for_tokens(args, 1)
     aggregate_block_bytes = aggregate_bytes_for_tokens(args, args.block_size)
-    return {
+    summary = {
         "case_index": case_index,
         **asdict(case),
         "strategy": strategy,
@@ -650,6 +650,16 @@ def run_strategy(
         "takeover_ready": takeover_ready,
         "evidence_boundary": "G3_TRANSFER_MICROBENCHMARK",
     }
+    step_rows = [
+        {
+            "case_index": case_index,
+            **asdict(case),
+            "strategy": strategy,
+            **record,
+        }
+        for record in records
+    ]
+    return summary, step_rows
 
 
 def validate_rows(rows: list[dict[str, Any]], expected_rows: int) -> dict[str, Any]:
@@ -692,6 +702,32 @@ def validate_rows(rows: list[dict[str, Any]], expected_rows: int) -> dict[str, A
         "recorded_rows": len(rows),
         "errors": errors,
     }
+
+
+def validate_step_rows(
+    rows: list[dict[str, Any]],
+    step_rows: list[dict[str, Any]],
+) -> list[str]:
+    """Fail closed if raw step telemetry cannot reproduce each summary."""
+    errors = []
+    expected_steps = sum(
+        int(row["shadow_steps"]) + int(row["bridge_steps"]) for row in rows
+    )
+    if len(step_rows) != expected_steps:
+        errors.append(f"recorded {len(step_rows)} step rows, expected {expected_steps}")
+    for row in rows:
+        case_steps = [
+            step for step in step_rows if step["case_index"] == row["case_index"]
+        ]
+        if len(case_steps) != int(row["shadow_steps"]) + int(row["bridge_steps"]):
+            errors.append(f"case {row['case_index']}: incomplete raw step telemetry")
+        if sum(int(step["actual_bytes"]) for step in case_steps) != int(
+            row["actual_transfer_bytes"]
+        ):
+            errors.append(f"case {row['case_index']}: raw step byte total mismatch")
+        if not all(bool(step["all_verified"]) for step in case_steps):
+            errors.append(f"case {row['case_index']}: raw step verification failed")
+    return errors
 
 
 def write_csv(rows: list[dict[str, Any]], path: Path) -> None:
@@ -745,6 +781,7 @@ def main() -> None:
     )
 
     rows = []
+    step_rows = []
     case_index = 0
     for case in cases:
         for strategy in args.strategy_order:
@@ -760,7 +797,7 @@ def main() -> None:
                 load_repeats=case.target_load_repeats,
             )
             case_index += 1
-            row = run_strategy(
+            result = run_strategy(
                 args=args,
                 case=case,
                 strategy=strategy,
@@ -769,13 +806,17 @@ def main() -> None:
                 buffers=buffers,
                 target_load=target_load,
             )
-            if rank == 0 and row is not None:
+            if rank == 0 and result is not None:
+                row, measured_steps = result
                 rows.append(row)
+                step_rows.extend(measured_steps)
                 print(json.dumps(row, sort_keys=True), flush=True)
 
     acceptance = None
     if rank == 0:
         acceptance = validate_rows(rows, len(cases) * len(args.strategy_order))
+        acceptance["recorded_step_rows"] = len(step_rows)
+        acceptance["errors"].extend(validate_step_rows(rows, step_rows))
         mismatches = [
             entry
             for entry in inventory
@@ -784,8 +825,9 @@ def main() -> None:
             not in str(entry["device_name"]).lower()
         ]
         if mismatches:
-            acceptance["status"] = "FAIL"
             acceptance["errors"].append("GPU inventory does not match expectation")
+        if acceptance["errors"]:
+            acceptance["status"] = "FAIL"
         runner_path = Path(__file__).resolve()
         provenance = {
             **preflight,
@@ -802,6 +844,7 @@ def main() -> None:
             },
         }
         write_csv(rows, args.out_dir / "measurements.csv")
+        write_csv(step_rows, args.out_dir / "step_measurements.csv")
         (args.out_dir / "provenance.json").write_text(
             json.dumps(provenance, indent=2, default=str) + "\n",
             encoding="utf-8",
