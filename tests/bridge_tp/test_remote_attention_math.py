@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import argparse
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -13,6 +14,7 @@ except ModuleNotFoundError:  # pragma: no cover - local documentation hosts
 if torch is not None:
     from tools.bridge_tp.run_remote_attention_validation import (
         attention_stats,
+        command_arguments_for_provenance,
         full_attention,
         load_tensor_bundle,
         merge_stats,
@@ -73,6 +75,13 @@ class TestRemoteAttentionMath(unittest.TestCase):
 
     def test_percentile_uses_observed_higher_value(self) -> None:
         self.assertEqual(percentile([1.0, 2.0, 3.0, 4.0], 0.95), 4.0)
+
+    def test_provenance_arguments_do_not_mutate_path_arguments(self) -> None:
+        output_path = Path("results") / "smoke"
+        args = argparse.Namespace(out_dir=output_path, tensor_bundle=None)
+        serialized = command_arguments_for_provenance(args)
+        self.assertEqual(serialized["out_dir"], str(output_path))
+        self.assertIs(args.out_dir, output_path)
 
     def test_captured_tensor_bundle_contract(self) -> None:
         q, k, v = self.tensors()
