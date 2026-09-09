@@ -17,6 +17,7 @@ import hashlib
 import importlib.util
 import itertools
 import json
+import math
 import os
 import platform
 import statistics
@@ -50,6 +51,7 @@ class ExperimentCase:
     history_tokens: int
     shadow_steps: int
     target_load_repeats: int
+    target_load_profile: str
     outcome: str
 
 
@@ -95,6 +97,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--history-tokens", type=int, nargs="+", default=[1024])
     parser.add_argument("--shadow-steps", type=int, nargs="+", default=[8, 32])
     parser.add_argument("--target-load-repeats", type=int, nargs="+", default=[0, 4, 8])
+    parser.add_argument(
+        "--target-load-profiles",
+        nargs="+",
+        choices=[
+            "CONSTANT",
+            "STEP_UP_BRIDGE",
+            "STEP_DOWN_BRIDGE",
+            "PULSE",
+            "OSCILLATE",
+        ],
+        default=["CONSTANT"],
+        help="Phase-local TP4 load trajectories; repeats is the peak intensity.",
+    )
     parser.add_argument("--history-blocks-per-shadow-step", type=int, default=1)
     parser.add_argument("--background-gemm-size", type=int, default=4096)
     parser.add_argument("--transport-warmup-steps", type=int, default=3)
@@ -153,6 +168,7 @@ def make_cases(args: argparse.Namespace) -> list[ExperimentCase]:
             args.history_tokens,
             args.shadow_steps,
             args.target_load_repeats,
+            getattr(args, "target_load_profiles", ["CONSTANT"]),
             args.outcomes,
         )
     ]
@@ -163,12 +179,42 @@ def make_cases(args: argparse.Namespace) -> list[ExperimentCase]:
             raise ValueError("Shadow steps must be positive")
         if case.target_load_repeats < 0:
             raise ValueError("target load repeats cannot be negative")
+        scheduled_load_repeats(
+            case.target_load_profile,
+            case.target_load_repeats,
+            "SHADOW",
+            0,
+        )
     if len(args.strategy_order) != 2 or set(args.strategy_order) != {
         "S_NEW",
         "S_NEW_OLD",
     }:
         raise ValueError("strategy order must contain S_NEW and S_NEW_OLD exactly once")
     return cases
+
+
+def scheduled_load_repeats(
+    profile: str,
+    peak_repeats: int,
+    phase: str,
+    step: int,
+) -> int:
+    """Return the causal TP4 load intensity for one phase-local step."""
+    if peak_repeats < 0 or step < 0:
+        raise ValueError("load repeats and step must be non-negative")
+    if phase not in ("SHADOW", "BRIDGE"):
+        raise ValueError(f"unknown transfer phase {phase!r}")
+    if profile == "CONSTANT":
+        return peak_repeats
+    if profile == "STEP_UP_BRIDGE":
+        return peak_repeats if phase == "BRIDGE" else 0
+    if profile == "STEP_DOWN_BRIDGE":
+        return peak_repeats if phase == "SHADOW" else 0
+    if profile == "PULSE":
+        return peak_repeats if step % 4 == 0 else 0
+    if profile == "OSCILLATE":
+        return peak_repeats if step % 2 == 0 else 0
+    raise ValueError(f"unknown target load profile {profile!r}")
 
 
 def elements_per_rank_per_token(args: argparse.Namespace) -> int:
@@ -208,6 +254,7 @@ def validate_static_inputs(
 
     plans = []
     total_bytes = 0
+    measured_transfer_steps = 0
     for case in cases:
         for strategy in args.strategy_order:
             plan = build_shadow_transfer_plan(
@@ -220,6 +267,7 @@ def validate_static_inputs(
             )
             plans.append(plan)
             total_bytes += projected_case_bytes(args, plan)
+            measured_transfer_steps += plan.shadow_steps + plan.bridge_steps
     return {
         "format_version": 1,
         "status": "VALID",
@@ -233,11 +281,13 @@ def validate_static_inputs(
             args, args.block_size
         ),
         "projected_total_transfer_bytes": total_bytes,
+        "measured_transfer_steps": measured_transfer_steps,
+        "paired_target_control_steps": measured_transfer_steps * 2,
         "evidence_boundary": (
-            "Real NCCL payloads and CUDA GEMM contention with Qwen KV byte "
-            "geometry. Payload values are synthetic and buffers are reused; this "
-            "does not execute online vLLM, release real paged-KV blocks, or run "
-            "Bridge remote attention."
+            "Real NCCL payloads and bracketed CUDA GEMM controls with Qwen KV "
+            "byte geometry. Payload values are synthetic and buffers are reused; "
+            "this does not execute online vLLM, release real paged-KV blocks, "
+            "measure native request SLOs, or run Bridge remote attention."
         ),
     }
 
@@ -470,6 +520,47 @@ def run_logical_step(
     }
 
 
+def run_target_control_step(
+    *,
+    rank: int,
+    buffers: PayloadBuffers,
+    target_load: TargetLoad,
+    load_repeats: int,
+) -> float | None:
+    """Measure the same TP4 work without any Shadow/Bridge transfer."""
+    torch.cuda.synchronize()
+    gpu_barrier()
+    load_started = load_finished = None
+    if rank != 0:
+        load_started, load_finished = launch_target_load(target_load, load_repeats)
+
+    load_ms = 0.0
+    if rank != 0:
+        if load_started is not None and load_finished is not None:
+            load_finished.synchronize()
+            load_ms = load_started.elapsed_time(load_finished)
+        if buffers.target_done is None:
+            raise RuntimeError("target completion buffer is missing")
+        p2p_batch([dist.P2POp(dist.isend, buffers.target_done, 0)])
+    else:
+        if buffers.source_done is None:
+            raise RuntimeError("source completion buffers are missing")
+        p2p_batch(
+            [
+                dist.P2POp(dist.irecv, buffers.source_done[index], worker_rank)
+                for index, worker_rank in enumerate(
+                    range(1, len(buffers.source_done) + 1)
+                )
+            ]
+        )
+    torch.cuda.synchronize()
+    load_tensor = torch.tensor(load_ms, dtype=torch.float32, device="cuda")
+    dist.reduce(load_tensor, dst=0, op=dist.ReduceOp.MAX)
+    if rank != 0:
+        return None
+    return float(load_tensor.item())
+
+
 def run_phase(
     *,
     args: argparse.Namespace,
@@ -477,10 +568,22 @@ def run_phase(
     rank: int,
     buffers: PayloadBuffers,
     target_load: TargetLoad,
-    load_repeats: int,
+    peak_load_repeats: int,
+    load_profile: str,
 ) -> list[dict[str, Any]]:
     records = []
     for step_units in group_units_by_step(units):
+        phase = step_units[0].phase
+        step = step_units[0].step
+        load_repeats = scheduled_load_repeats(
+            load_profile, peak_load_repeats, phase, step
+        )
+        control_before = run_target_control_step(
+            rank=rank,
+            buffers=buffers,
+            target_load=target_load,
+            load_repeats=load_repeats,
+        )
         record = run_logical_step(
             args=args,
             units=step_units,
@@ -489,7 +592,30 @@ def run_phase(
             target_load=target_load,
             load_repeats=load_repeats,
         )
+        control_after = run_target_control_step(
+            rank=rank,
+            buffers=buffers,
+            target_load=target_load,
+            load_repeats=load_repeats,
+        )
         if rank == 0 and record is not None:
+            if control_before is None or control_after is None:
+                raise RuntimeError("rank zero did not receive TP4 control timing")
+            control_ms = (control_before + control_after) / 2
+            delta_ms = record["target_load_ms"] - control_ms
+            record.update(
+                {
+                    "scheduled_load_repeats": load_repeats,
+                    "target_control_before_ms": control_before,
+                    "target_control_after_ms": control_after,
+                    "target_control_ms": control_ms,
+                    "target_interference_delta_ms": delta_ms,
+                    "target_interference_harm_ms": max(0.0, delta_ms),
+                    "target_interference_slowdown_frac": (
+                        delta_ms / control_ms if control_ms > 0 else None
+                    ),
+                }
+            )
             records.append(record)
     return records
 
@@ -556,7 +682,8 @@ def run_strategy(
         rank=rank,
         buffers=buffers,
         target_load=target_load,
-        load_repeats=case.target_load_repeats,
+        peak_load_repeats=case.target_load_repeats,
+        load_profile=case.target_load_profile,
     )
     bridge_records = run_phase(
         args=args,
@@ -564,7 +691,8 @@ def run_strategy(
         rank=rank,
         buffers=buffers,
         target_load=target_load,
-        load_repeats=case.target_load_repeats,
+        peak_load_repeats=case.target_load_repeats,
+        load_profile=case.target_load_profile,
     )
     gpu_barrier()
     if rank != 0:
@@ -585,6 +713,30 @@ def run_strategy(
     ]
     shadow_load = [record["target_load_ms"] for record in shadow_records]
     bridge_load = [record["target_load_ms"] for record in bridge_records]
+    shadow_control = [record["target_control_ms"] for record in shadow_records]
+    bridge_control = [record["target_control_ms"] for record in bridge_records]
+    shadow_harm = [
+        record["target_interference_harm_ms"] for record in shadow_records
+    ]
+    bridge_harm = [
+        record["target_interference_harm_ms"] for record in bridge_records
+    ]
+    shadow_delta = [
+        record["target_interference_delta_ms"] for record in shadow_records
+    ]
+    bridge_delta = [
+        record["target_interference_delta_ms"] for record in bridge_records
+    ]
+    shadow_slowdown = [
+        record["target_interference_slowdown_frac"]
+        for record in shadow_records
+        if record["target_interference_slowdown_frac"] is not None
+    ]
+    bridge_slowdown = [
+        record["target_interference_slowdown_frac"]
+        for record in bridge_records
+        if record["target_interference_slowdown_frac"] is not None
+    ]
     takeover_ready = case.outcome == "COMMIT" and all_verified and byte_exact
     status = "PASS" if all_verified and byte_exact else "FAIL"
     aggregate_new_bytes = aggregate_bytes_for_tokens(args, 1)
@@ -613,6 +765,16 @@ def run_strategy(
         "shadow_history_ack_p95_ms": metric(shadow_history, 0.95),
         "shadow_target_load_p50_ms": metric(shadow_load),
         "shadow_target_load_p95_ms": metric(shadow_load, 0.95),
+        "shadow_target_control_p50_ms": metric(shadow_control),
+        "shadow_target_control_p95_ms": metric(shadow_control, 0.95),
+        "shadow_target_interference_harm_ms": sum(shadow_harm),
+        "shadow_target_interference_signed_delta_ms": sum(shadow_delta),
+        "shadow_target_interference_harm_p95_ms": metric(shadow_harm, 0.95),
+        "shadow_target_interference_slowdown_p50_frac": metric(shadow_slowdown),
+        "shadow_target_interference_slowdown_p95_frac": metric(
+            shadow_slowdown, 0.95
+        ),
+        "shadow_target_interference_observed_steps": len(shadow_slowdown),
         "history_backlog_after_shadow_tokens": (
             plan.bridge_entry_history_backlog_tokens
         ),
@@ -636,6 +798,20 @@ def run_strategy(
         "bridge_catchup_ms": sum(record["step_ms"] for record in bridge_records),
         "bridge_target_load_p50_ms": metric(bridge_load),
         "bridge_target_load_p95_ms": metric(bridge_load, 0.95),
+        "bridge_target_control_p50_ms": metric(bridge_control),
+        "bridge_target_control_p95_ms": metric(bridge_control, 0.95),
+        "bridge_target_interference_harm_ms": sum(bridge_harm),
+        "bridge_target_interference_signed_delta_ms": sum(bridge_delta),
+        "bridge_target_interference_harm_p95_ms": metric(bridge_harm, 0.95),
+        "bridge_target_interference_slowdown_p50_frac": metric(bridge_slowdown),
+        "bridge_target_interference_slowdown_p95_frac": metric(
+            bridge_slowdown, 0.95
+        ),
+        "bridge_target_interference_observed_steps": len(bridge_slowdown),
+        "transfer_only_target_interference_harm_ms": sum(shadow_harm)
+        + sum(bridge_harm),
+        "transfer_only_target_interference_signed_delta_ms": sum(shadow_delta)
+        + sum(bridge_delta),
         "cancel_wasted_history_bytes": (
             aggregate_bytes_for_tokens(args, plan.history_tokens_copied_in_shadow)
             if case.outcome == "CANCEL"
@@ -689,6 +865,7 @@ def validate_rows(rows: list[dict[str, Any]], expected_rows: int) -> dict[str, A
             row.get("history_tokens"),
             row.get("shadow_steps"),
             row.get("target_load_repeats"),
+            row.get("target_load_profile"),
             row.get("outcome"),
         )
         paired.setdefault(key, set()).add(row.get("strategy"))
@@ -727,6 +904,48 @@ def validate_step_rows(
             errors.append(f"case {row['case_index']}: raw step byte total mismatch")
         if not all(bool(step["all_verified"]) for step in case_steps):
             errors.append(f"case {row['case_index']}: raw step verification failed")
+        shadow_harm = sum(
+            float(step["target_interference_harm_ms"])
+            for step in case_steps
+            if step["phase"] == "SHADOW"
+        )
+        bridge_harm = sum(
+            float(step["target_interference_harm_ms"])
+            for step in case_steps
+            if step["phase"] == "BRIDGE"
+        )
+        if not math.isclose(
+            shadow_harm,
+            float(row["shadow_target_interference_harm_ms"]),
+            abs_tol=1e-9,
+        ):
+            errors.append(f"case {row['case_index']}: Shadow harm total mismatch")
+        if not math.isclose(
+            bridge_harm,
+            float(row["bridge_target_interference_harm_ms"]),
+            abs_tol=1e-9,
+        ):
+            errors.append(f"case {row['case_index']}: Bridge harm total mismatch")
+        for step in case_steps:
+            numeric = (
+                "target_control_before_ms",
+                "target_control_after_ms",
+                "target_control_ms",
+                "target_interference_delta_ms",
+                "target_interference_harm_ms",
+            )
+            if not all(math.isfinite(float(step[name])) for name in numeric):
+                errors.append(f"case {row['case_index']}: non-finite interference data")
+                break
+            if float(step["target_interference_harm_ms"]) < 0:
+                errors.append(f"case {row['case_index']}: negative interference harm")
+                break
+            if int(step["scheduled_load_repeats"]) == 0 and (
+                float(step["target_control_ms"]) != 0
+                or float(step["target_load_ms"]) != 0
+            ):
+                errors.append(f"case {row['case_index']}: idle control was not idle")
+                break
     return errors
 
 
