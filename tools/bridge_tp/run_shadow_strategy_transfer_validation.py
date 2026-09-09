@@ -98,6 +98,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--history-blocks-per-shadow-step", type=int, default=1)
     parser.add_argument("--background-gemm-size", type=int, default=4096)
     parser.add_argument("--transport-warmup-steps", type=int, default=3)
+    parser.add_argument("--strategy-warmup-steps", type=int, default=5)
     parser.add_argument("--dtype", choices=["bfloat16", "float16"], default="bfloat16")
     parser.add_argument("--num-layers", type=int, default=48)
     parser.add_argument("--num-kv-heads", type=int, default=8)
@@ -200,6 +201,8 @@ def validate_static_inputs(
         raise ValueError("world size must be one TP1 source plus all TP4 ranks")
     if args.background_gemm_size <= 0 or args.transport_warmup_steps < 0:
         raise ValueError("GEMM size must be positive and warmup cannot be negative")
+    if args.strategy_warmup_steps <= 0:
+        raise ValueError("every measured strategy requires positive joint warmup")
     if args.history_blocks_per_shadow_step <= 0:
         raise ValueError("history blocks per Shadow step must be positive")
 
@@ -497,8 +500,10 @@ def warm_up_transport(
     rank: int,
     buffers: PayloadBuffers,
     target_load: TargetLoad,
+    steps: int,
+    load_repeats: int,
 ) -> None:
-    for step in range(args.transport_warmup_steps):
+    for step in range(steps):
         units = [
             TransferUnit("SHADOW", step, "NEW", step, step + 1),
             TransferUnit(
@@ -515,7 +520,7 @@ def warm_up_transport(
             rank=rank,
             buffers=buffers,
             target_load=target_load,
-            load_repeats=0,
+            load_repeats=load_repeats,
         )
 
 
@@ -735,12 +740,25 @@ def main() -> None:
         rank=rank,
         buffers=buffers,
         target_load=target_load,
+        steps=args.transport_warmup_steps,
+        load_repeats=0,
     )
 
     rows = []
     case_index = 0
     for case in cases:
         for strategy in args.strategy_order:
+            # Condition both AB and BA arms immediately before measurement.
+            # This prevents the first arm from uniquely paying cuBLAS/NCCL
+            # initialization and GPU clock-ramp costs.
+            warm_up_transport(
+                args=args,
+                rank=rank,
+                buffers=buffers,
+                target_load=target_load,
+                steps=args.strategy_warmup_steps,
+                load_repeats=case.target_load_repeats,
+            )
             case_index += 1
             row = run_strategy(
                 args=args,
