@@ -59,6 +59,17 @@ def load_manifest(path: Path) -> dict[str, Any]:
     return value
 
 
+def percentile(values: list[float], fraction: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = fraction * (len(ordered) - 1)
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
@@ -108,13 +119,31 @@ def main() -> None:
         )
         request.setdefault("ignore_eos", True)
         event({"kind": "job_start", "job_id": job_id, "pool": job["pool"]})
+        request_started_unix_s = time.time()
+        token_times: list[float] = []
+
+        def record_token(_index: int, _token_id: int, unix_s: float) -> None:
+            if not token_times:
+                event(
+                    {
+                        "kind": "job_first_token",
+                        "job_id": job_id,
+                        "pool": job["pool"],
+                    }
+                )
+            token_times.append(unix_s)
         try:
             result = post_streaming_completion(
                 base_url,
                 request,
                 args.request_timeout_s,
-                lambda _index, _token_id, _unix_s: None,
+                record_token,
             )
+            request_ended_unix_s = time.time()
+            token_intervals_ms = [
+                (current - previous) * 1000
+                for previous, current in zip(token_times, token_times[1:])
+            ]
             summary = {
                 "job_id": job_id,
                 "pool": job["pool"],
@@ -122,6 +151,21 @@ def main() -> None:
                 "response_id": result["response_id"],
                 "finish_reason": result["finish_reason"],
                 "output_tokens": len(result["token_ids"]),
+                "request_started_unix_s": request_started_unix_s,
+                "first_token_unix_s": token_times[0] if token_times else None,
+                "last_token_unix_s": token_times[-1] if token_times else None,
+                "request_ended_unix_s": request_ended_unix_s,
+                "ttft_ms": (
+                    (token_times[0] - request_started_unix_s) * 1000
+                    if token_times
+                    else None
+                ),
+                "e2e_ms": (request_ended_unix_s - request_started_unix_s) * 1000,
+                "tpot_p50_ms": percentile(token_intervals_ms, 0.50),
+                "tpot_p95_ms": percentile(token_intervals_ms, 0.95),
+                "tpot_p99_ms": percentile(token_intervals_ms, 0.99),
+                # Preserved for paired pre/Shadow/Bridge/post window analysis.
+                "token_times_unix_s": token_times,
             }
             event({"kind": "job_end", **summary})
             atomic_json_dump(summary, out_dir / f"{job_id}.json")

@@ -161,6 +161,37 @@ def load_audit(path: Path) -> list[dict[str, Any]]:
     ]
 
 
+def wait_for_background_first_tokens(
+    event_path: Path,
+    process: common.ManagedProcess,
+    minimum_jobs: int,
+    timeout_s: float,
+) -> None:
+    if minimum_jobs <= 0:
+        return
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if process.process.poll() is not None:
+            raise RuntimeError(
+                "background workload ended before the online load was ready; "
+                f"see {process.log_path}"
+            )
+        jobs: set[str] = set()
+        try:
+            for line in event_path.read_text(encoding="utf-8").splitlines():
+                row = json.loads(line)
+                if row.get("kind") == "job_first_token":
+                    jobs.add(str(row.get("job_id")))
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+        if len(jobs) >= minimum_jobs:
+            return
+        time.sleep(0.1)
+    raise TimeoutError(
+        f"timed out waiting for {minimum_jobs} target jobs to emit a token"
+    )
+
+
 def accept_noop(
     controller_dir: Path,
     background_dir: Path,
@@ -347,6 +378,12 @@ def run(
     success_marker: str | None = None,
     acceptance_fn: Callable[[Path, Path, int, int], dict[str, Any]] | None = None,
     allow_clean_stager_exit: bool = False,
+    source_env_overrides: dict[str, str] | None = None,
+    controller_extra_args: list[str] | None = None,
+    background_before_source: bool = False,
+    background_before_controller: bool = False,
+    background_lead_s: float = 0.0,
+    background_ready_jobs: int = 0,
 ) -> dict[str, Any]:
     if phase not in {"bringup", "formal"}:
         raise ValueError(f"unsupported No-op phase {phase!r}")
@@ -408,6 +445,7 @@ def run(
     base_env = os.environ.copy()
     base_env["OMP_NUM_THREADS"] = "1"
     processes: list[common.ManagedProcess] = []
+    background: common.ManagedProcess | None = None
     status: dict[str, Any] = {
         "format_version": 1,
         "status": "RUNNING",
@@ -436,10 +474,47 @@ def run(
         )
         print(f"[{run_id}] target TP4 healthy", flush=True)
 
+        if background_before_source:
+            background = common.start_process(
+                "background workload",
+                [
+                    str(args.python_bin),
+                    str(common.BACKGROUND),
+                    "--manifest",
+                    str(args.manifest),
+                    "--source-url",
+                    f"http://127.0.0.1:{args.tp1_port}",
+                    "--target-url",
+                    f"http://127.0.0.1:{args.tp4_port}",
+                    "--out-dir",
+                    str(background_dir),
+                    "--request-timeout-s",
+                    str(args.run_timeout_s),
+                ],
+                base_env,
+                background_dir / "background.log",
+            )
+            processes.append(background)
+            wait_for_background_first_tokens(
+                background_dir / "background_events.jsonl",
+                background,
+                background_ready_jobs,
+                min(args.run_timeout_s, args.server_start_timeout_s),
+            )
+            if background_lead_s > 0:
+                time.sleep(background_lead_s)
+            if background.process.poll() not in {None, 0}:
+                raise RuntimeError(
+                    "background workload failed before source startup; "
+                    f"see {background.log_path}"
+                )
+
+        source_env = common.source_environment(args, run_id, controller_dir)
+        source_env.update(source_env_overrides or {})
         source = common.start_process(
             "source TP1",
             common.server_command(args, 1, args.tp1_port),
-            common.source_environment(args, run_id, controller_dir),
+            source_env,
             controller_dir / "source_tp1.log",
         )
         processes.append(source)
@@ -449,6 +524,36 @@ def run(
             args.server_start_timeout_s,
         )
         print(f"[{run_id}] source TP1 healthy", flush=True)
+
+        if background_before_controller and background is None:
+            background = common.start_process(
+                "background workload",
+                [
+                    str(args.python_bin),
+                    str(common.BACKGROUND),
+                    "--manifest",
+                    str(args.manifest),
+                    "--source-url",
+                    f"http://127.0.0.1:{args.tp1_port}",
+                    "--target-url",
+                    f"http://127.0.0.1:{args.tp4_port}",
+                    "--out-dir",
+                    str(background_dir),
+                    "--request-timeout-s",
+                    str(args.run_timeout_s),
+                ],
+                base_env,
+                background_dir / "background.log",
+            )
+            processes.append(background)
+            wait_for_background_first_tokens(
+                background_dir / "background_events.jsonl",
+                background,
+                background_ready_jobs,
+                min(args.run_timeout_s, args.server_start_timeout_s),
+            )
+            if background_lead_s > 0:
+                time.sleep(background_lead_s)
 
         stager = common.start_process(
             "stager",
@@ -476,22 +581,24 @@ def run(
         if stager.process.poll() is not None:
             raise RuntimeError("stager exited before the controller")
 
+        controller_command = [
+            str(args.python_bin),
+            str(common.CONTROLLER),
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(controller_dir),
+            "--source-request",
+            str(source_request),
+            "--migration-id",
+            run_id,
+            "--preflight-timeout-s",
+            "120",
+        ]
+        controller_command.extend(controller_extra_args or [])
         controller = common.start_process(
             "controller",
-            [
-                str(args.python_bin),
-                str(common.CONTROLLER),
-                "--config",
-                str(config_path),
-                "--run-dir",
-                str(controller_dir),
-                "--source-request",
-                str(source_request),
-                "--migration-id",
-                run_id,
-                "--preflight-timeout-s",
-                "120",
-            ],
+            controller_command,
             base_env,
             provenance_dir / "controller_console.txt",
         )
@@ -501,26 +608,27 @@ def run(
         )
         print(f"[{run_id}] source anchor live; starting No-op load", flush=True)
 
-        background = common.start_process(
-            "background workload",
-            [
-                str(args.python_bin),
-                str(common.BACKGROUND),
-                "--manifest",
-                str(args.manifest),
-                "--source-url",
-                f"http://127.0.0.1:{args.tp1_port}",
-                "--target-url",
-                f"http://127.0.0.1:{args.tp4_port}",
-                "--out-dir",
-                str(background_dir),
-                "--request-timeout-s",
-                str(args.run_timeout_s),
-            ],
-            base_env,
-            background_dir / "background.log",
-        )
-        processes.append(background)
+        if background is None:
+            background = common.start_process(
+                "background workload",
+                [
+                    str(args.python_bin),
+                    str(common.BACKGROUND),
+                    "--manifest",
+                    str(args.manifest),
+                    "--source-url",
+                    f"http://127.0.0.1:{args.tp1_port}",
+                    "--target-url",
+                    f"http://127.0.0.1:{args.tp4_port}",
+                    "--out-dir",
+                    str(background_dir),
+                    "--request-timeout-s",
+                    str(args.run_timeout_s),
+                ],
+                base_env,
+                background_dir / "background.log",
+            )
+            processes.append(background)
         common.wait_pair(controller, background, args.run_timeout_s)
         for service in (target, source):
             if service.process.poll() is not None:

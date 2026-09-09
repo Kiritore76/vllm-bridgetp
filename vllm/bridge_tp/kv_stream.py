@@ -88,6 +88,11 @@ class BridgeTPStreamConfig:
     # one anchor from a real multi-request scheduler batch.  Empty preserves
     # the Phase 6-8 single-request-only behaviour exactly.
     source_request_id_prefix: str = ""
+    # Phase 8 Shadow transfer policy.  S_NEW_OLD preserves the original
+    # behaviour: start the historical snapshot transfer as soon as Shadow is
+    # armed.  S_NEW mirrors only newly-computed KV during Shadow and defers the
+    # historical snapshot transfer until the fixed cutover/Bridge boundary.
+    shadow_strategy: str = "S_NEW_OLD"
     # False only when a Phase 9 controller has published a control block that
     # has not armed this migration yet.  Absent a control block this stays True,
     # so Phase 6/7/8 runs behave exactly as before.
@@ -142,6 +147,9 @@ class BridgeTPStreamConfig:
             source_request_id_prefix=os.getenv(
                 "BRIDGETP_STREAM_SOURCE_REQUEST_ID_PREFIX", ""
             ).strip(),
+            shadow_strategy=os.getenv(
+                "BRIDGETP_SHADOW_STRATEGY", "S_NEW_OLD"
+            ).strip().upper(),
         )
         if config.target_tp_size != 4:
             raise ValueError("BridgeTP Phase 6 currently requires target TP=4")
@@ -167,6 +175,10 @@ class BridgeTPStreamConfig:
             if self.phase8_cutover_output_tokens <= self.after_output_tokens:
                 raise ValueError(
                     "Phase 8 cutover boundary must follow the old-KV boundary"
+                )
+            if self.shadow_strategy not in {"S_NEW", "S_NEW_OLD"}:
+                raise ValueError(
+                    "BRIDGETP_SHADOW_STRATEGY must be S_NEW or S_NEW_OLD"
                 )
 
 
@@ -266,9 +278,41 @@ class _RankPublisher:
             name=f"bridgetp-stream-rank-{rank}",
             daemon=True,
         )
+        self._start_lock = threading.Lock()
+        self.started = False
+        self.started_unix_s: float | None = None
 
     def start(self) -> None:
-        self.thread.start()
+        with self._start_lock:
+            if self.started:
+                return
+            self.started = True
+            self.started_unix_s = time.time()
+            self.thread.start()
+
+    def cancel_before_start(self, reason: str) -> bool:
+        """Release a deferred S_NEW history publisher before Bridge starts."""
+        with self._start_lock:
+            if self.started:
+                return False
+            self.started = True
+            self.payload = b""
+            self.listener.close()
+            _atomic_json_dump(
+                {
+                    "format_version": 1,
+                    "phase": _phase_name(self.config),
+                    "migration_id": self.config.migration_id,
+                    "target_tp_rank": self.rank,
+                    "status": "CANCELLED_BEFORE_HISTORY_TRANSFER",
+                    "reason": reason,
+                    "completed_unix_s": time.time(),
+                },
+                self.config.run_dir
+                / "sender_receipts"
+                / f"tp_rank_{self.rank}.json",
+            )
+            return True
 
     def _serve(self) -> None:
         started = time.perf_counter()
@@ -490,8 +534,11 @@ def _publish_request(
             }
         )
 
-    for publisher in publishers:
-        publisher.start()
+    history_started_unix_s: float | None = None
+    if not config.phase8_enabled or config.shadow_strategy == "S_NEW_OLD":
+        history_started_unix_s = time.time()
+        for publisher in publishers:
+            publisher.start()
     _publishers.extend(publishers)
 
     computed_token_ids = [request.get_token_id(i) for i in range(num_computed)]
@@ -538,6 +585,12 @@ def _publish_request(
         "snapshot_prepare_ms": (time.perf_counter() - snapshot_started) * 1000,
         "chunk_bytes": config.chunk_bytes,
         "aggregate_rate_limit_gib_s": config.aggregate_rate_gib_s,
+        "shadow_strategy": config.shadow_strategy,
+        "history_transfer_phase": (
+            "SHADOW" if history_started_unix_s is not None else "BRIDGE"
+        ),
+        "history_transfer_started_unix_s": history_started_unix_s,
+        "shadow_started_unix_s": time.time(),
         "layers": layer_records,
         "ranks": rank_records,
     }
@@ -572,6 +625,7 @@ def _publish_request(
             block_size=block_size,
             block_axis=block_axis,
             layer_names=layer_names,
+            history_publishers=publishers,
         )
     logger.warning(
         "%s published live request %s at output=%d, "

@@ -65,6 +65,7 @@ class _Phase8SourceState:
     block_size: int
     block_axis: int
     layer_names: list[str]
+    history_publishers: list[Any] = field(default_factory=list)
     queues: list[queue.Queue[_DeltaWork | None]] = field(default_factory=list)
     workers: list[threading.Thread] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
@@ -78,6 +79,30 @@ class _Phase8SourceState:
         default_factory=threading.RLock,
         repr=False,
     )
+
+    def start_history_transfer(self) -> None:
+        if self.config.shadow_strategy != "S_NEW":
+            return
+        started = time.time()
+        for publisher in self.history_publishers:
+            publisher.start()
+        _atomic_json_dump(
+            {
+                "format_version": 1,
+                "phase": "BridgeTP D3 Phase 8",
+                "migration_id": self.config.migration_id,
+                "shadow_strategy": self.config.shadow_strategy,
+                "history_transfer_phase": "BRIDGE",
+                "started_unix_s": started,
+            },
+            self.config.run_dir / "history_transfer_start.json",
+        )
+
+    def cancel_deferred_history(self, reason: str) -> int:
+        return sum(
+            publisher.cancel_before_start(reason)
+            for publisher in self.history_publishers
+        )
 
     def start(self) -> None:
         for rank in range(self.config.target_tp_size):
@@ -253,6 +278,8 @@ class _Phase8SourceState:
             self.wait_for_acks()
             self.stop_workers()
             request = json.loads(cleanup_path.read_text(encoding="utf-8"))
+            reason = request.get("reason", "source ended before cutover")
+            cancelled_history_ranks = self.cancel_deferred_history(str(reason))
             _atomic_json_dump(
                 {
                     "format_version": 1,
@@ -260,9 +287,10 @@ class _Phase8SourceState:
                     "status": "CLEANED",
                     "migration_id": self.config.migration_id,
                     "component": "source_delta_mirror",
-                    "reason": request.get("reason", "source ended before cutover"),
+                    "reason": reason,
                     "delta_batches_drained": self.delta_batches,
                     "delta_tokens_drained": self.delta_tokens,
+                    "deferred_history_ranks_cancelled": cancelled_history_ranks,
                     "updated_unix_s": time.time(),
                 },
                 self.config.run_dir / "source_cleanup_receipt.json",
@@ -283,6 +311,7 @@ def start_phase8_source(
     block_size: int,
     block_axis: int,
     layer_names: list[str],
+    history_publishers: list[Any] | None = None,
 ) -> None:
     global _state
     if _state is not None:
@@ -295,6 +324,7 @@ def start_phase8_source(
         block_size=block_size,
         block_axis=block_axis,
         layer_names=list(layer_names),
+        history_publishers=list(history_publishers or []),
     )
     _state.start()
 
@@ -423,6 +453,10 @@ def maybe_publish_phase8_delta(
             f"Phase 8 cutover requires one pending token, observed {pending}"
         )
     state.wait_for_acks()
+    # S_NEW gives new-KV traffic priority throughout Shadow.  Only after every
+    # delta has reached the stager does the irreversible Bridge boundary start
+    # the historical snapshot transfer.
+    state.start_history_transfer()
     known_token_ids = [request.get_token_id(i) for i in range(num_known)]
     state.finalized = True
     state.stop_workers()
@@ -431,6 +465,7 @@ def maybe_publish_phase8_delta(
             "format_version": 1,
             "phase": "BridgeTP D3 Phase 8",
             "scope": "old-KV snapshot plus acknowledged new-KV deltas",
+            "shadow_strategy": config.shadow_strategy,
             "protocol_version": PROTOCOL_VERSION,
             "migration_id": config.migration_id,
             "session_token": state.session_token,
