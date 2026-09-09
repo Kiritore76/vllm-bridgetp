@@ -93,17 +93,20 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise ValueError("anchor must leave at least 64 target-owned tokens")
     if args.minimum_ready_target_jobs <= 0 or args.minimum_window_samples <= 0:
         raise ValueError("online sample thresholds must be positive")
-    for path in (
-        args.python_bin,
-        args.model_path,
-        args.manifest,
-        args.survival_table,
-        args.guard_file,
-        common.CONFIG_TEMPLATE,
-        common.SOURCE_REQUEST,
-    ):
-        if not path.exists():
-            raise FileNotFoundError(path)
+    if not args.python_bin.is_file():
+        raise FileNotFoundError(f"Python executable is missing: {args.python_bin}")
+    if not args.model_path.exists():
+        raise FileNotFoundError(f"model path is missing: {args.model_path}")
+    required_files = {
+        "manifest": args.manifest,
+        "survival table": args.survival_table,
+        "guard file": args.guard_file,
+        "controller template": common.CONFIG_TEMPLATE,
+        "source request": common.SOURCE_REQUEST,
+    }
+    for label, path in required_files.items():
+        if not path.is_file():
+            raise FileNotFoundError(f"{label} is not a file: {path}")
     revision = common.git("rev-parse", "HEAD")
     expected = common.git("rev-parse", args.expected_revision)
     if revision != expected:
