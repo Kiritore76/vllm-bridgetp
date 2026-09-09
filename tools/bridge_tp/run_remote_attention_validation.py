@@ -92,6 +92,17 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def command_arguments_for_provenance(
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Return JSON-friendly arguments without mutating the live namespace."""
+    arguments = dict(vars(args))
+    for name, value in arguments.items():
+        if isinstance(value, Path):
+            arguments[name] = str(value)
+    return arguments
+
+
 def git_revision() -> str:
     return subprocess.check_output(
         [
@@ -735,7 +746,7 @@ def main() -> None:
             "format_version": 1,
             "evidence_class": preflight["evidence_class"],
             "revision": revision,
-            "command_arguments": vars(args),
+            "command_arguments": command_arguments_for_provenance(args),
             "geometry": geometry.to_dict(),
             "world_size": world_size,
             "gpu_inventory": inventory,
@@ -755,7 +766,6 @@ def main() -> None:
                 "Bridge result."
             ),
         }
-        provenance["command_arguments"]["out_dir"] = str(args.out_dir)
         write_csv(rows, args.out_dir / "measurements.csv")
         (args.out_dir / "provenance.json").write_text(
             json.dumps(provenance, indent=2, default=str) + "\n",
