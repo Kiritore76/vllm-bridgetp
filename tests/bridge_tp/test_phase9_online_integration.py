@@ -501,6 +501,67 @@ class TestConfigFailClosed(unittest.TestCase):
 
 
 class TestRunnerTransitions(unittest.TestCase):
+    def test_diagnostic_shadow_does_not_reenter_policy_abandon(self) -> None:
+        class Policy:
+            cfg = types.SimpleNamespace(max_target_kv_usage_frac=0.85)
+
+            @staticmethod
+            def migration_bytes(_request) -> int:
+                return 1024
+
+            @staticmethod
+            def should_abandon(*_args, **_kwargs):
+                raise AssertionError("diagnostic path must not re-enter policy")
+
+        class Adapter:
+            @staticmethod
+            def set_rate(_rate: float, note: str) -> None:
+                del note
+
+        class Rate:
+            rate_bytes_s = 1024.0
+            rate_gib_s = 0.5
+            last_reason = "test"
+
+            @staticmethod
+            def step(*_args, **_kwargs) -> float:
+                return 1024.0
+
+        class Audit:
+            records: list[dict] = []
+
+            def write(self, value: dict) -> None:
+                self.records.append(value)
+
+        machine = MigrationStateMachine()
+        record = machine.create("migration", "request")
+        record.trigger_path = TriggerPath.DIAGNOSTIC_FIXED_BOUNDARY
+        machine.transition("migration", MigrationState.SHADOW, 1.0, "test")
+        step_shadow(
+            Policy(),
+            machine,
+            Adapter(),
+            Audit(),
+            record,
+            SourceRequestView(
+                request_id="request",
+                prompt_tokens=8,
+                output_tokens=40,
+                computed_tokens=47,
+                pending_tokens=1,
+                arrival_unix_s=0.0,
+                last_token_unix_s=1.0,
+            ),
+            object(),
+            types.SimpleNamespace(kv_usage_frac=0.0, p99_tpot_s=0.02),
+            0.0,
+            Rate(),
+            2.0,
+            False,
+            ProxyRecorder("external", ProxyMode.HOLD_BACK),
+        )
+        self.assertEqual(record.state, MigrationState.SHADOW)
+
     def test_capacity_clear_waits_for_cleanup_binding_before_cancel(self) -> None:
         class Policy:
             cfg = types.SimpleNamespace(max_target_kv_usage_frac=0.85)

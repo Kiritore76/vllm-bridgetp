@@ -411,11 +411,21 @@ def step_shadow(
     if not dry_run:
         adapter.set_rate(rate.rate_gib_s, note=rate.last_reason)
 
+    diagnostic_path = (
+        record.trigger_path is TriggerPath.DIAGNOSTIC_FIXED_BOUNDARY
+    )
     safety_path = record.trigger_path in {
         TriggerPath.CAPACITY_PILOT,
         TriggerPath.POLICY_OOM_RISK,
     }
-    if safety_path:
+    if diagnostic_path:
+        # Fixed-boundary experiments isolate mechanism timing.  Re-evaluating
+        # the online policy after forcibly entering Shadow would make paired
+        # strategy runs follow different state paths and invalidate the
+        # comparison.  Safety/readback/commit gates still remain mandatory.
+        abandon = False
+        reason = ""
+    elif safety_path:
         abandon = (
             pool4.kv_usage_frac > policy.cfg.max_target_kv_usage_frac + 0.10
         )

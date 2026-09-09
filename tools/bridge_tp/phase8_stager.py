@@ -447,6 +447,23 @@ def main() -> None:
         timeout_s=args.timeout_s,
     )
     delta_receivers.start()
+
+    cutover_path = args.run_dir / "cutover_manifest.json"
+    # S_NEW deliberately has no historical sender during reversible Shadow.
+    # Keep accepting deltas, but do not block on the four history sockets until
+    # the source publishes the irreversible cutover boundary.  This also lets
+    # a pre-cutover cleanup finish immediately without waiting for socket
+    # timeouts from history publishers that correctly never started.
+    if manifest.get("shadow_strategy", "S_NEW_OLD") == "S_NEW":
+        if not _wait_for_path(cutover_path, cleanup_path, deadline):
+            delta_receivers.close()
+            request = _load_json(cleanup_path)
+            delta_count = sum(len(value) for value in delta_receivers.by_rank)
+            for value in delta_receivers.by_rank:
+                value.clear()
+            _cleanup(args.run_dir, str(request.get("reason")), 0, delta_count)
+            return
+
     with ThreadPoolExecutor(max_workers=4) as executor:
         initial = list(
             executor.map(
@@ -457,7 +474,6 @@ def main() -> None:
             )
         )
 
-    cutover_path = args.run_dir / "cutover_manifest.json"
     if not _wait_for_path(cutover_path, cleanup_path, deadline):
         delta_receivers.close()
         request = _load_json(cleanup_path)
@@ -559,6 +575,11 @@ def main() -> None:
         "old_kv_num_computed_tokens": manifest["num_computed_tokens"],
         "new_kv_delta_tokens": cutover["delta_tokens"],
         "new_kv_delta_batches": cutover["delta_batches"],
+        "shadow_strategy": manifest.get("shadow_strategy", "S_NEW_OLD"),
+        "history_transfer_phase": manifest.get(
+            "history_transfer_phase", "SHADOW"
+        ),
+        "staging_ready_unix_s": time.time(),
         "ranks": ranks,
     }
     _atomic_json_dump(staging_manifest, args.run_dir / "staging_manifest.json")
