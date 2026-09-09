@@ -134,6 +134,7 @@ def make_config(
     guard: int,
     phase: str = "bringup",
     platform_note: str | None = None,
+    controller_config_overrides: dict[str, Any] | None = None,
 ) -> Path:
     config = common.read_json(common.CONFIG_TEMPLATE)
     config["run_dir"] = str(controller_dir)
@@ -148,6 +149,11 @@ def make_config(
     }[phase]
     config["capacity_pilot"]["enabled"] = True
     config["capacity_pilot"]["guard_free_kv_tokens"] = guard
+    for section, values in (controller_config_overrides or {}).items():
+        if not isinstance(values, dict) or not isinstance(config.get(section), dict):
+            config[section] = values
+            continue
+        config[section].update(values)
     path = provenance_dir / "controller_config.json"
     common.write_json(path, config)
     return path
@@ -380,6 +386,7 @@ def run(
     allow_clean_stager_exit: bool = False,
     source_env_overrides: dict[str, str] | None = None,
     controller_extra_args: list[str] | None = None,
+    controller_config_overrides: dict[str, Any] | None = None,
     background_before_source: bool = False,
     background_before_controller: bool = False,
     background_lead_s: float = 0.0,
@@ -402,6 +409,7 @@ def run(
         guard,
         phase=phase,
         platform_note=platform_note,
+        controller_config_overrides=controller_config_overrides,
     )
     source_request = common.make_source_request(args, provenance_dir)
     common.write_json(

@@ -1,9 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+from argparse import Namespace
 
 from tools.bridge_tp.build_shadow_strategy_online_manifest import build_manifest
 from tools.bridge_tp.run_phase9_capacity_background import percentile
+from tools.bridge_tp.run_shadow_rate_load_matrix import (
+    parse_load_profiles,
+    rate_label,
+    resolve_design,
+)
 from vllm.bridge_tp.online_shadow_strategy_protocol import (
     summarize_background_windows,
     validate_strategy_timing,
@@ -79,6 +85,34 @@ class TestOnlineWindows(unittest.TestCase):
         self.assertEqual(windows["BRIDGE"]["samples"], 1)
         self.assertEqual(windows["POST_COMMIT"]["samples"], 1)
         self.assertEqual(percentile([1.0, 3.0], 0.5), 2.0)
+
+
+class TestShadowRateLoadMatrix(unittest.TestCase):
+    def test_default_formal_design_covers_three_loads_and_five_rates(self) -> None:
+        args = Namespace(
+            phase="formal",
+            load_profile=None,
+            rates_gib_s=None,
+            repetitions=None,
+            minimum_window_samples=None,
+        )
+        loads, rates, repetitions, minimum_samples = resolve_design(args)
+        self.assertEqual(loads, [("low", 2), ("medium", 8), ("high", 24)])
+        self.assertEqual(rates, [0.2, 0.4, 0.8, 1.2, 0.0])
+        self.assertEqual(repetitions, 4)
+        self.assertEqual(minimum_samples, 128)
+
+    def test_load_profiles_and_rate_labels_are_unambiguous(self) -> None:
+        self.assertEqual(
+            parse_load_profiles(["quiet:3", "busy:20"], "smoke"),
+            [("quiet", 3), ("busy", 20)],
+        )
+        self.assertEqual(rate_label(0.4), "0p4gibs")
+        self.assertEqual(rate_label(0.0), "unlimited")
+
+    def test_rejects_duplicate_load_labels(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unique"):
+            parse_load_profiles(["busy:4", "busy:8"], "formal")
 
 
 if __name__ == "__main__":
