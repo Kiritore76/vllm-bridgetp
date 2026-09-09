@@ -13,6 +13,7 @@ if torch is not None:
     from tools.bridge_tp.run_shadow_strategy_transfer_validation import (
         aggregate_bytes_for_tokens,
         make_cases,
+        scheduled_load_repeats,
         validate_rows,
         validate_step_rows,
     )
@@ -49,6 +50,22 @@ class TestShadowStrategyTransferRunner(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exactly once"):
             make_cases(args)
 
+    def test_dynamic_load_profiles_are_phase_causal(self) -> None:
+        self.assertEqual(scheduled_load_repeats("CONSTANT", 8, "SHADOW", 3), 8)
+        self.assertEqual(
+            scheduled_load_repeats("STEP_UP_BRIDGE", 8, "SHADOW", 3), 0
+        )
+        self.assertEqual(
+            scheduled_load_repeats("STEP_UP_BRIDGE", 8, "BRIDGE", 3), 8
+        )
+        self.assertEqual(
+            scheduled_load_repeats("STEP_DOWN_BRIDGE", 8, "SHADOW", 3), 8
+        )
+        self.assertEqual(scheduled_load_repeats("PULSE", 8, "BRIDGE", 4), 8)
+        self.assertEqual(scheduled_load_repeats("PULSE", 8, "BRIDGE", 5), 0)
+        self.assertEqual(scheduled_load_repeats("OSCILLATE", 8, "SHADOW", 2), 8)
+        self.assertEqual(scheduled_load_repeats("OSCILLATE", 8, "SHADOW", 3), 0)
+
     def test_acceptance_fails_closed(self) -> None:
         row = {
             "case_index": 1,
@@ -73,10 +90,36 @@ class TestShadowStrategyTransferRunner(unittest.TestCase):
             "shadow_steps": 1,
             "bridge_steps": 1,
             "actual_transfer_bytes": 30,
+            "shadow_target_interference_harm_ms": 0.1,
+            "bridge_target_interference_harm_ms": 0.0,
         }
         valid_steps = [
-            {"case_index": 1, "actual_bytes": 10, "all_verified": True},
-            {"case_index": 1, "actual_bytes": 20, "all_verified": True},
+            {
+                "case_index": 1,
+                "phase": "SHADOW",
+                "actual_bytes": 10,
+                "all_verified": True,
+                "scheduled_load_repeats": 4,
+                "target_load_ms": 1.1,
+                "target_control_before_ms": 1.0,
+                "target_control_after_ms": 1.0,
+                "target_control_ms": 1.0,
+                "target_interference_delta_ms": 0.1,
+                "target_interference_harm_ms": 0.1,
+            },
+            {
+                "case_index": 1,
+                "phase": "BRIDGE",
+                "actual_bytes": 20,
+                "all_verified": True,
+                "scheduled_load_repeats": 0,
+                "target_load_ms": 0.0,
+                "target_control_before_ms": 0.0,
+                "target_control_after_ms": 0.0,
+                "target_control_ms": 0.0,
+                "target_interference_delta_ms": 0.0,
+                "target_interference_harm_ms": 0.0,
+            },
         ]
         self.assertEqual(validate_step_rows([summary], valid_steps), [])
         valid_steps.pop()

@@ -19,8 +19,9 @@ NCCL＋该cell对应背景GEMM联合预热。联合预热不写入测量CSV，�
 cuBLAS初始化和GPU升频成本。
 
 这是G3传输微基准，不是完整在线vLLM：它不释放真实paged-KV block、不生成真实token，也不在
-Bridge内重复运行G2已经测量的远端Attention。G4应把G2远端Attention表与本实验的传输/ACK表
-组合；G5再实现真实Bridge ownership推进。
+Bridge内重复运行G2已经测量的远端Attention。G3-I在每个传输step前后插入相同负载的无传输
+control，用两侧control均值抵消慢速漂移，分别估计Shadow复制和Bridge复制对TP4合成工作负载的
+干扰。G4仍需把G2远端Attention成本纳入Bridge；G5再用真实TP4请求测量TPOT、P99和goodput。
 
 ## 2. 状态语义
 
@@ -37,6 +38,9 @@ Bridge内重复运行G2已经测量的远端Attention。G4应把G2远端Attentio
 - `shadow_new_ack_p50_ms/p95_ms`：高优先级新KV的ACK延迟；
 - `shadow_history_ack_p50_ms/p95_ms`：机会型历史block的ACK延迟；
 - `shadow_target_load_p50_ms/p95_ms`：复制期间TP4背景GEMM完成时间；
+- `shadow_target_control_p50_ms/p95_ms`：同强度、无复制的配对TP4基线；
+- `shadow_target_interference_harm_ms`：Shadow各step的
+  `max(0, with_transfer - paired_control)`累加值；
 - `shadow_transfer_driver_ms`：微基准串行驱动完全部Shadow复制步骤的时间，不等同于在线TP1
   TPOT或请求停顿；
 - `history_backlog_after_shadow_tokens/bytes`：无论最终cancel还是commit，Shadow结束时尚未回填
@@ -44,6 +48,9 @@ Bridge内重复运行G2已经测量的远端Attention。G4应把G2远端Attentio
 - `bridge_entry_history_backlog_tokens/bytes`：进入不可逆Bridge时的历史债务；
 - `bridge_catchup_ms`：微基准驱动器实际清空剩余历史backlog的时间，是G4输入而非在线vLLM
   wall-clock结论；
+- `bridge_target_interference_harm_ms`：只包含Bridge复制的TP4干扰，不包含远端Attention；
+- `transfer_only_target_interference_harm_ms`：Shadow与Bridge复制干扰之和；不能直接等同于真实
+  TP4请求的SLO损失；
 - `cancel_wasted_history_bytes/total_bytes`：最终反悔时的投机浪费；
 - `takeover_ready`：commit episode是否完成全部传输和验证；
 - `actual_transfer_bytes == expected_transfer_bytes`：传输量是否精确。
@@ -55,7 +62,21 @@ runner同时生成两级CSV：
   和总耗时，用于跨AB/BA重复合并后重新计算尾延迟。验收器会用原始step重新核对汇总字节和
   step数量，缺失时fail closed。
 
-## 4. 静态检查
+## 4. 动态干扰轨迹
+
+`--target-load-repeats`给出峰值强度，`--target-load-profiles`定义轨迹：
+
+- `CONSTANT`：Shadow与Bridge始终维持峰值；
+- `STEP_UP_BRIDGE`：Shadow空闲，进入Bridge时升到峰值；
+- `STEP_DOWN_BRIDGE`：Shadow为峰值，进入Bridge时降为空闲；
+- `PULSE`：每4个phase-local step出现一次峰值脉冲；
+- `OSCILLATE`：phase-local step在峰值和空闲之间交替。
+
+每个非空闲step按`control-before -> transfer -> control-after`执行，paired control为两侧均值。
+空闲step保留在原始CSV中，但不进入slowdown比例的统计分母。轨迹只使用当前phase和step，
+不读取未来的commit/cancel结果。
+
+## 5. 静态检查
 
 ```bash
 cd /root/autodl-tmp/bridgetp/vllm_bridge
@@ -74,13 +95,14 @@ export OMP_NUM_THREADS=1
   --expected-revision "$(git rev-parse HEAD)" \
   --history-tokens 1024 \
   --shadow-steps 8 32 \
-  --target-load-repeats 0 4 8 \
+  --target-load-repeats 4 \
+  --target-load-profiles CONSTANT STEP_UP_BRIDGE STEP_DOWN_BRIDGE PULSE OSCILLATE \
   --outcomes CANCEL COMMIT
 ```
 
-静态pilot应报告12个paired cells、24行策略结果；不会创建`out-dir`。
+静态检查应报告20个paired cells、40行策略结果；不会创建`out-dir`。
 
-## 5. GPU smoke
+## 6. GPU smoke
 
 第一次只运行一个commit cell。AB与BA使用两个独立torchrun进程，以检验顺序效应：
 
@@ -138,8 +160,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4 \
 
 smoke结果拿回检查后再冻结pilot/formal矩阵，不能跳过smoke直接运行大批次。
 
-## 6. 验收含义
+## 7. 验收含义
 
 `acceptance.json`的`PASS`只证明调度不变量、真实传输、ACK和字节记账通过。最终策略结论还必须
 基于AB/BA配对、cancel与commit分层、多个历史长度和Shadow窗口，以及G2远端Attention成本与
-后续真实vLLM target-native请求伤害。
+后续真实vLLM target-native请求伤害。当前干扰指标只回答“真实NCCL复制会让合成TP4 GEMM慢
+多少”，不能单独得出最终策略胜负。
