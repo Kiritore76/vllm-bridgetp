@@ -61,6 +61,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minimum-ready-target-jobs", type=int, default=2)
     parser.add_argument("--background-lead-s", type=float, default=2.0)
     parser.add_argument("--minimum-window-samples", type=int, default=4)
+    parser.add_argument(
+        "--fixed-rate-gib-s",
+        type=float,
+        default=None,
+        help=(
+            "Pin aggregate migration bandwidth to this value. Zero means "
+            "unlimited. Omit to retain the adaptive Phase 9 rate controller."
+        ),
+    )
     parser.add_argument("--tp1-gpu", default="0")
     parser.add_argument("--tp4-gpus", default="1,2,3,4")
     parser.add_argument("--tp1-port", type=int, default=8001)
@@ -93,6 +102,8 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise ValueError("anchor must leave at least 64 target-owned tokens")
     if args.minimum_ready_target_jobs <= 0 or args.minimum_window_samples <= 0:
         raise ValueError("online sample thresholds must be positive")
+    if args.fixed_rate_gib_s is not None and args.fixed_rate_gib_s < 0:
+        raise ValueError("fixed migration rate cannot be negative")
     if not args.python_bin.is_file():
         raise FileNotFoundError(f"Python executable is missing: {args.python_bin}")
     if not args.model_path.exists():
@@ -145,6 +156,7 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         "trigger_output_tokens": args.trigger_output_tokens,
         "cutover_output_tokens": args.cutover_output_tokens,
         "minimum_ready_target_jobs": args.minimum_ready_target_jobs,
+        "fixed_rate_gib_s": args.fixed_rate_gib_s,
     }
 
 
@@ -169,6 +181,12 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             "handoff_stall_ms": acceptance["handoff_stall_ms"],
             "source_origin_tokens": acceptance["source_origin_tokens"],
             "target_origin_tokens": acceptance["target_origin_tokens"],
+            "fixed_rate_gib_s": acceptance.get("fixed_rate_gib_s"),
+            "history_payload_bytes": acceptance.get("history_payload_bytes"),
+            "history_observed_aggregate_gib_s": acceptance.get(
+                "history_observed_aggregate_gib_s"
+            ),
+            "history_max_stage_ms": acceptance.get("history_max_stage_ms"),
         }
         for window, metrics in acceptance["target_tpot_windows"].items():
             prefix = window.lower()
@@ -242,6 +260,7 @@ def accept_online(
     *,
     strategy: str,
     minimum_window_samples: int,
+    fixed_rate_gib_s: float | None = None,
 ) -> dict[str, Any]:
     background = common.read_json(background_dir / "background_summary.json")
     session = common.read_json(controller_dir / "session_manifest.json")
@@ -253,6 +272,10 @@ def accept_online(
     end_rows = [row for row in audit if row.get("kind") == "run_end"]
     transitions = [row.get("to") for row in audit if row.get("kind") == "transition"]
     receipts, receipt_errors = rescue.receipt_evidence(controller_dir)
+    initial_stage_receipts = [
+        common.read_json(path)
+        for path in sorted((controller_dir / "initial_stage_receipts").glob("*.json"))
+    ]
 
     shadow_start = float(session["shadow_started_unix_s"])
     bridge_start = float(cutover["updated_unix_s"])
@@ -317,6 +340,18 @@ def accept_online(
                 f"requires {minimum_window_samples}"
             )
     errors.extend(receipt_errors)
+    observed_rates = [
+        float(row["rate_gib_s"])
+        for row in audit
+        if row.get("kind") == "rate" and row.get("rate_gib_s") is not None
+    ]
+    if fixed_rate_gib_s is not None:
+        if not observed_rates:
+            errors.append("controller did not record fixed-rate actuation")
+        elif any(
+            abs(value - fixed_rate_gib_s) > 1e-9 for value in observed_rates
+        ):
+            errors.append("controller deviated from the requested fixed rate")
     return {
         "format_version": 1,
         "status": "PASS" if not errors else "FAIL",
@@ -327,6 +362,19 @@ def accept_online(
             "online remote attention is not executed."
         ),
         "strategy": strategy,
+        "fixed_rate_gib_s": fixed_rate_gib_s,
+        "observed_controller_rates_gib_s": sorted(set(observed_rates)),
+        "history_payload_bytes": sum(
+            int(row.get("payload_bytes", 0)) for row in initial_stage_receipts
+        ),
+        "history_observed_aggregate_gib_s": sum(
+            float(row.get("observed_gib_s", 0.0))
+            for row in initial_stage_receipts
+        ),
+        "history_max_stage_ms": max(
+            (float(row.get("stage_ms", 0.0)) for row in initial_stage_receipts),
+            default=0.0,
+        ),
         "target_jobs_completed": background.get("completed"),
         "shadow_duration_ms": (bridge_start - shadow_start) * 1000,
         "bridge_to_commit_ms": (committed - bridge_start) * 1000,
@@ -360,6 +408,7 @@ def main() -> None:
         "guard_free_kv_tokens": guard,
         "strategies": args.strategy_order,
         "repetitions": args.repetitions,
+        "fixed_rate_gib_s": args.fixed_rate_gib_s,
         "pressure": pressure,
         "evidence_boundary": "online Phase 8 takeover without remote attention",
     }
@@ -403,7 +452,24 @@ def main() -> None:
                         expected_anchor_tokens,
                         strategy=selected,
                         minimum_window_samples=args.minimum_window_samples,
+                        fixed_rate_gib_s=args.fixed_rate_gib_s,
                     )
+
+                source_env_overrides = {"BRIDGETP_SHADOW_STRATEGY": strategy}
+                controller_config_overrides = None
+                if args.fixed_rate_gib_s is not None:
+                    source_env_overrides["BRIDGETP_STREAM_RATE_GIB_S"] = str(
+                        args.fixed_rate_gib_s
+                    )
+                    fixed_rate_bytes_s = args.fixed_rate_gib_s * 1024**3
+                    controller_config_overrides = {
+                        "rate": {
+                            "b_min_bytes_s": fixed_rate_bytes_s,
+                            "b_max_bytes_s": fixed_rate_bytes_s,
+                            "b_start_bytes_s": fixed_rate_bytes_s,
+                            "b_hard_max_bytes_s": fixed_rate_bytes_s,
+                        }
+                    }
 
                 result = scenario_runner.run(
                     rep_args,
@@ -428,7 +494,8 @@ def main() -> None:
                     success_marker="PASS",
                     acceptance_fn=acceptance,
                     allow_clean_stager_exit=True,
-                    source_env_overrides={"BRIDGETP_SHADOW_STRATEGY": strategy},
+                    source_env_overrides=source_env_overrides,
+                    controller_config_overrides=controller_config_overrides,
                     controller_extra_args=[
                         "--diagnostic-trigger-output-tokens",
                         str(args.trigger_output_tokens),

@@ -41,6 +41,39 @@ FORMAL = load_script(
 
 
 class TestNoopManifest(unittest.TestCase):
+    def test_controller_config_overrides_pin_nested_rate_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            controller = root / "controller"
+            provenance = root / "provenance"
+            controller.mkdir()
+            provenance.mkdir()
+            survival = root / "survival.json"
+            survival.write_text("{}", encoding="utf-8")
+            args = Namespace(
+                tp1_blocks=1968,
+                tp4_blocks=35739,
+                survival_table=survival,
+            )
+            path = RUNNER.make_config(
+                args,
+                controller,
+                provenance,
+                8448,
+                controller_config_overrides={
+                    "rate": {
+                        "b_min_bytes_s": 123.0,
+                        "b_max_bytes_s": 123.0,
+                        "b_start_bytes_s": 123.0,
+                        "b_hard_max_bytes_s": 123.0,
+                    }
+                },
+            )
+            rate = json.loads(path.read_text(encoding="utf-8"))["rate"]
+            self.assertEqual(rate["b_min_bytes_s"], 123.0)
+            self.assertEqual(rate["b_hard_max_bytes_s"], 123.0)
+            self.assertEqual(rate["control_period_s"], 0.2)
+
     def test_default_manifest_exceeds_both_pool_pressure_floors(self) -> None:
         manifest = BUILDER.build_manifest()
         pressure = RUNNER.validate_noop_pressure(
