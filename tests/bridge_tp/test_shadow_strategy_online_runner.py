@@ -2,6 +2,8 @@
 
 import unittest
 from argparse import Namespace
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from tools.bridge_tp.build_shadow_strategy_online_manifest import build_manifest
 from tools.bridge_tp.run_phase9_capacity_background import percentile
@@ -9,6 +11,9 @@ from tools.bridge_tp.run_shadow_rate_load_matrix import (
     parse_load_profiles,
     rate_label,
     resolve_design,
+)
+from tools.bridge_tp.run_shadow_strategy_online_validation import (
+    write_measurements,
 )
 from vllm.bridge_tp.online_shadow_strategy_protocol import (
     summarize_background_windows,
@@ -85,6 +90,47 @@ class TestOnlineWindows(unittest.TestCase):
         self.assertEqual(windows["BRIDGE"]["samples"], 1)
         self.assertEqual(windows["POST_COMMIT"]["samples"], 1)
         self.assertEqual(percentile([1.0, 3.0], 0.5), 2.0)
+
+    def test_writes_shadow_only_architecture_pair(self) -> None:
+        windows = {
+            name: {
+                "jobs": 1,
+                "samples": 1,
+                "tpot_p50_ms": 1.0,
+                "tpot_p95_ms": 1.0,
+                "tpot_p99_ms": 1.0,
+            }
+            for name in ("PRE_SHADOW", "SHADOW", "BRIDGE", "POST_COMMIT")
+        }
+        runs = []
+        for architecture, strategy, stall in (
+            ("BRIDGE", "S_NEW", 20.0),
+            ("SHADOW_ONLY", "S_NEW_OLD", 10.0),
+        ):
+            runs.append(
+                {
+                    "repetition": 1,
+                    "architecture": architecture,
+                    "strategy": strategy,
+                    "acceptance": {
+                        "status": "PASS",
+                        "shadow_duration_ms": 100.0,
+                        "bridge_to_commit_ms": stall,
+                        "handoff_stall_ms": stall,
+                        "source_origin_tokens": 10,
+                        "target_origin_tokens": 20,
+                        "target_tpot_windows": windows,
+                    },
+                }
+            )
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_measurements(root, runs)
+            paired = (root / "paired_comparisons.csv").read_text(
+                encoding="utf-8"
+            )
+        self.assertIn("final_sync_ms_saved_by_shadow_only", paired)
+        self.assertIn("10.0", paired)
 
 
 class TestShadowRateLoadMatrix(unittest.TestCase):

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Run paired S_NEW/S_NEW_OLD experiments through live TP1/TP4 vLLM servers.
+"""Run paired Shadow-policy or Bridge/Shadow-only live TP1/TP4 experiments.
 
 This experiment uses the real Phase 8 KV export, TCP staging, TP4 restore,
 atomic takeover, and unified response proxy.  It measures target-request TPOT
@@ -55,6 +55,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--phase", choices=["smoke", "formal"], default="smoke")
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--strategy-order", nargs=2, default=["S_NEW", "S_NEW_OLD"])
+    parser.add_argument(
+        "--architecture-comparison",
+        action="store_true",
+        help=(
+            "pair the original Bridge path (S_NEW) with direct Shadow-only "
+            "takeover (S_NEW_OLD) instead of comparing copy policies alone"
+        ),
+    )
     parser.add_argument("--trigger-output-tokens", type=int, default=128)
     parser.add_argument("--cutover-output-tokens", type=int, default=160)
     parser.add_argument("--anchor-max-tokens", type=int, default=1024)
@@ -175,6 +183,7 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
         row: dict[str, Any] = {
             "repetition": run["repetition"],
             "strategy": run["strategy"],
+            "architecture": run.get("architecture", "BRIDGE"),
             "status": acceptance["status"],
             "shadow_duration_ms": acceptance["shadow_duration_ms"],
             "bridge_to_commit_ms": acceptance["bridge_to_commit_ms"],
@@ -187,6 +196,9 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
                 "history_observed_aggregate_gib_s"
             ),
             "history_max_stage_ms": acceptance.get("history_max_stage_ms"),
+            "history_ready_before_freeze_ms": acceptance.get(
+                "history_ready_before_freeze_ms"
+            ),
         }
         for window, metrics in acceptance["target_tpot_windows"].items():
             prefix = window.lower()
@@ -205,15 +217,26 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
     paired: list[dict[str, Any]] = []
     repetitions = sorted({int(row["repetition"]) for row in rows})
     for repetition in repetitions:
+        architecture_comparison = any(
+            row.get("architecture") == "SHADOW_ONLY" for row in rows
+        )
+        label_field = "architecture" if architecture_comparison else "strategy"
         by_strategy = {
-            str(row["strategy"]): row
+            str(row[label_field]): row
             for row in rows
             if int(row["repetition"]) == repetition
         }
-        if set(by_strategy) != {"S_NEW", "S_NEW_OLD"}:
+        expected_labels = (
+            {"BRIDGE", "SHADOW_ONLY"}
+            if architecture_comparison
+            else {"S_NEW", "S_NEW_OLD"}
+        )
+        if set(by_strategy) != expected_labels:
             continue
-        new = by_strategy["S_NEW"]
-        old = by_strategy["S_NEW_OLD"]
+        new = by_strategy["BRIDGE" if architecture_comparison else "S_NEW"]
+        old = by_strategy[
+            "SHADOW_ONLY" if architecture_comparison else "S_NEW_OLD"
+        ]
         required = (
             "bridge_to_commit_ms",
             "handoff_stall_ms",
@@ -242,6 +265,26 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
                     - float(new["bridge_tpot_p99_ms"])
                 ),
             }
+            if not architecture_comparison
+            else {
+                "repetition": repetition,
+                "final_sync_ms_saved_by_shadow_only": (
+                    float(new["bridge_to_commit_ms"])
+                    - float(old["bridge_to_commit_ms"])
+                ),
+                "handoff_stall_ms_saved_by_shadow_only": (
+                    float(new["handoff_stall_ms"])
+                    - float(old["handoff_stall_ms"])
+                ),
+                "shadow_target_p99_ms_delta_shadow_only": (
+                    float(old["shadow_tpot_p99_ms"])
+                    - float(new["shadow_tpot_p99_ms"])
+                ),
+                "final_sync_target_p99_ms_delta_shadow_only": (
+                    float(old["bridge_tpot_p99_ms"])
+                    - float(new["bridge_tpot_p99_ms"])
+                ),
+            }
         )
     if paired:
         with (out_root / "paired_comparisons.csv").open(
@@ -261,6 +304,7 @@ def accept_online(
     strategy: str,
     minimum_window_samples: int,
     fixed_rate_gib_s: float | None = None,
+    handoff_mode: str = "bridge",
 ) -> dict[str, Any]:
     background = common.read_json(background_dir / "background_summary.json")
     session = common.read_json(controller_dir / "session_manifest.json")
@@ -312,8 +356,30 @@ def accept_online(
             history_start_unix_s=history_start,
         )
     )
-    if transitions[-3:] != ["SHADOW", "HANDOFF", "TAKEOVER"]:
+    expected_transitions = (
+        ["SHADOW", "TAKEOVER"]
+        if handoff_mode == "shadow-only"
+        else ["SHADOW", "HANDOFF", "TAKEOVER"]
+    )
+    if transitions[-len(expected_transitions):] != expected_transitions:
         errors.append(f"unexpected migration transitions: {transitions!r}")
+    history_completed = [
+        float(row.get("completed_unix_s", float("inf")))
+        for row in initial_stage_receipts
+    ]
+    if handoff_mode == "shadow-only" and (
+        len(history_completed) != 4
+        or any(value > bridge_start for value in history_completed)
+    ):
+        errors.append(
+            "Shadow-only history did not finish staging on all ranks before "
+            "the source freeze boundary"
+        )
+    history_ready_before_freeze_ms = (
+        (bridge_start - max(history_completed)) * 1000
+        if len(history_completed) == 4
+        else None
+    )
     if len(end_rows) != 1 or end_rows[0].get("final_state") != "TAKEOVER":
         errors.append("controller did not finish in TAKEOVER")
     elif end_rows[0].get("trigger_path") != "DIAGNOSTIC_FIXED_BOUNDARY":
@@ -355,13 +421,21 @@ def accept_online(
     return {
         "format_version": 1,
         "status": "PASS" if not errors else "FAIL",
-        "evidence_class": "ONLINE_VLLM_PHASE8_STRATEGY_COMPARISON",
+        "evidence_class": (
+            "ONLINE_VLLM_SHADOW_ONLY_TAKEOVER"
+            if handoff_mode == "shadow-only"
+            else "ONLINE_VLLM_PHASE8_STRATEGY_COMPARISON"
+        ),
         "evidence_boundary": (
             "Real vLLM TP1/TP4 export, transfer, restore, takeover, unified "
-            "response, and target-request TPOT. Bridge waits for full history; "
-            "online remote attention is not executed."
+            "response, and target-request TPOT. The Shadow-only variant skips "
+            "the controller Bridge/Handoff state, but stages history on CPU "
+            "and restores TP4 after the final source freeze. The Bridge "
+            "baseline defers history until that boundary. Online remote "
+            "attention is not executed."
         ),
         "strategy": strategy,
+        "handoff_mode": handoff_mode,
         "fixed_rate_gib_s": fixed_rate_gib_s,
         "observed_controller_rates_gib_s": sorted(set(observed_rates)),
         "history_payload_bytes": sum(
@@ -375,6 +449,7 @@ def accept_online(
             (float(row.get("stage_ms", 0.0)) for row in initial_stage_receipts),
             default=0.0,
         ),
+        "history_ready_before_freeze_ms": history_ready_before_freeze_ms,
         "target_jobs_completed": background.get("completed"),
         "shadow_duration_ms": (bridge_start - shadow_start) * 1000,
         "bridge_to_commit_ms": (committed - bridge_start) * 1000,
@@ -407,6 +482,7 @@ def main() -> None:
         "guard_file_sha256": common.sha256(args.guard_file),
         "guard_free_kv_tokens": guard,
         "strategies": args.strategy_order,
+        "architecture_comparison": args.architecture_comparison,
         "repetitions": args.repetitions,
         "fixed_rate_gib_s": args.fixed_rate_gib_s,
         "pressure": pressure,
@@ -429,11 +505,21 @@ def main() -> None:
     common.write_json(out_root / "batch_status.json", batch)
     try:
         for repetition in range(1, args.repetitions + 1):
-            order = list(args.strategy_order)
+            variants = (
+                [
+                    ("BRIDGE", "S_NEW", "bridge"),
+                    ("SHADOW_ONLY", "S_NEW_OLD", "shadow-only"),
+                ]
+                if args.architecture_comparison
+                else [
+                    (strategy, strategy, "bridge")
+                    for strategy in args.strategy_order
+                ]
+            )
             if repetition % 2 == 0:
-                order.reverse()
-            for strategy in order:
-                label = f"r{repetition:02d}_{strategy.lower()}"
+                variants.reverse()
+            for architecture, strategy, handoff_mode in variants:
+                label = f"r{repetition:02d}_{architecture.lower()}"
                 rep_args = copy.copy(args)
                 rep_args.out_root = out_root / label
                 run_id = f"{out_root.name}-{label}"
@@ -444,6 +530,7 @@ def main() -> None:
                     expected_jobs: int,
                     expected_anchor_tokens: int,
                     selected: str = strategy,
+                    selected_handoff: str = handoff_mode,
                 ) -> dict[str, Any]:
                     return accept_online(
                         controller_dir,
@@ -453,6 +540,7 @@ def main() -> None:
                         strategy=selected,
                         minimum_window_samples=args.minimum_window_samples,
                         fixed_rate_gib_s=args.fixed_rate_gib_s,
+                        handoff_mode=selected_handoff,
                     )
 
                 source_env_overrides = {"BRIDGETP_SHADOW_STRATEGY": strategy}
@@ -480,14 +568,19 @@ def main() -> None:
                     repetition=repetition,
                     run_id=run_id,
                     scenario="shadow_online",
-                    scenario_title=f"Online Shadow strategy {strategy}",
+                    scenario_title=(
+                        f"Online {architecture} architecture comparison"
+                        if args.architecture_comparison
+                        else f"Online Shadow strategy {strategy}"
+                    ),
                     provenance_status=(
                         "SMOKE_NOT_REPORTABLE"
                         if args.phase == "smoke"
                         else "FORMAL_REPETITION"
                     ),
                     platform_note=(
-                        f"ONLINE SHADOW {strategy}; real Phase 8 takeover; "
+                        f"ONLINE {architecture} / {strategy}; real Phase 8 "
+                        "takeover; "
                         "no online remote attention"
                     ),
                     success_status="PASS",
@@ -501,6 +594,8 @@ def main() -> None:
                         str(args.trigger_output_tokens),
                         "--diagnostic-cutover-output-tokens",
                         str(args.cutover_output_tokens),
+                        "--handoff-mode",
+                        handoff_mode,
                     ],
                     background_before_controller=True,
                     background_lead_s=args.background_lead_s,
@@ -510,6 +605,8 @@ def main() -> None:
                     {
                         "repetition": repetition,
                         "strategy": strategy,
+                        "architecture": architecture,
+                        "handoff_mode": handoff_mode,
                         "status": result["status"],
                         "root": str(rep_args.out_root.resolve()),
                         "acceptance": result["acceptance"],
@@ -518,7 +615,8 @@ def main() -> None:
                 common.write_json(out_root / "batch_status.json", batch)
 
         errors = [
-            f"r{row['repetition']:02d} {row['strategy']} failed"
+            f"r{row['repetition']:02d} "
+            f"{row.get('architecture', row['strategy'])} failed"
             for row in batch["runs"]
             if row.get("status") != "PASS"
             or row.get("acceptance", {}).get("status") != "PASS"

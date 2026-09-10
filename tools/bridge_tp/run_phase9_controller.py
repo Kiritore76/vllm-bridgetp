@@ -106,6 +106,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--handoff-mode",
+        choices=("bridge", "shadow-only"),
+        default="bridge",
+        help=(
+            "bridge preserves SHADOW->HANDOFF->TAKEOVER; shadow-only keeps "
+            "TP1 ownership until all TP4 ranks are ready and commits directly"
+        ),
+    )
     args = parser.parse_args()
     trigger = args.diagnostic_trigger_output_tokens
     cutover = args.diagnostic_cutover_output_tokens
@@ -544,6 +553,64 @@ def step_handoff(
         raise
 
 
+def step_shadow_only_takeover(
+    machine: MigrationStateMachine,
+    adapter: ActionAdapter,
+    audit: AuditLog,
+    record: MigrationRecord,
+    recorder: ProxyRecorder,
+    now: float,
+    dry_run: bool,
+) -> None:
+    """Commit directly from Shadow after the normal four-rank readback gate.
+
+    This deliberately reuses the proven Phase 8 restore/receipt protocol.  It
+    removes the controller's Bridge/Handoff state; it does not claim that the
+    current prototype writes the historical snapshot directly into live TP4
+    GPU cache before the final source freeze.
+    """
+    ready, ranks, detail = adapter.poll_target_ready()
+    for rank in ranks:
+        machine.mark_rank_ready(record.migration_id, rank)
+    if not ready:
+        audit.write({"kind": "shadow_only_ready_wait", "detail": detail})
+        return
+    if dry_run:
+        return
+    try:
+        result = adapter.commit()
+    except ActionError as error:
+        audit.write({"kind": "shadow_only_commit_refused", "detail": str(error)})
+        try:
+            adapter.rollback(f"shadow-only commit refused: {error}")
+        except ActionError as rollback_error:
+            audit.write({"kind": "rollback_failed", "detail": str(rollback_error)})
+            machine.transition(
+                record.migration_id, MigrationState.FAILED, now, str(error)
+            )
+            return
+        recorder.on_rollback(now, str(error))
+        machine.transition(
+            record.migration_id, MigrationState.ROLLED_BACK, now, str(error)
+        )
+        return
+    committed_at = time.time()
+    recorder.on_commit(committed_at)
+    audit.write(
+        {
+            "kind": "shadow_only_commit",
+            "server_state": result,
+            "direct_transition": "SHADOW->TAKEOVER",
+        }
+    )
+    machine.transition(
+        record.migration_id,
+        MigrationState.TAKEOVER,
+        committed_at,
+        "shadow fully synchronized; direct atomic takeover",
+    )
+
+
 def _finish_source_without_commit(
     machine: MigrationStateMachine,
     adapter: ActionAdapter,
@@ -693,9 +760,13 @@ def main() -> None:
                     if diagnostic_trigger is not None
                     else None
                 ),
+                "handoff_mode": args.handoff_mode,
             },
         )
-        machine = MigrationStateMachine(audit_sink=audit.write)
+        machine = MigrationStateMachine(
+            audit_sink=audit.write,
+            allow_shadow_takeover=args.handoff_mode == "shadow-only",
+        )
         record = machine.create(
             args.migration_id or "dry-run",
             first_progress.request_id,
@@ -793,12 +864,41 @@ def main() -> None:
                         request_timeout_s=args.request_timeout_s,
                         target_future=target_future,
                     )
-                    if previous_target is None and target_future is not None:
+                    if (
+                        args.handoff_mode == "bridge"
+                        and previous_target is None
+                        and target_future is not None
+                    ):
                         machine.transition(
                             record.migration_id,
                             MigrationState.HANDOFF,
                             now,
                             "cutover manifest published and target admitted",
+                        )
+                    elif (
+                        args.handoff_mode == "shadow-only"
+                        and target_future is not None
+                    ):
+                        if record.t_cutover is None:
+                            record.t_cutover = now
+                            audit.write(
+                                {
+                                    "kind": "shadow_only_final_sync",
+                                    "unix_s": now,
+                                    "reason": (
+                                        "source freeze published; waiting for "
+                                        "four-rank TP4 exact readback"
+                                    ),
+                                }
+                            )
+                        step_shadow_only_takeover(
+                            machine,
+                            adapter,
+                            audit,
+                            record,
+                            recorder,
+                            now,
+                            args.dry_run,
                         )
                     else:
                         step_shadow(
