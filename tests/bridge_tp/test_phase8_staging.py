@@ -1,13 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from threading import Thread
+from time import monotonic, sleep
 
 import torch
 
 from tools.bridge_tp.phase8_stager import (
     _assemble_rank,
     _compact_history_block_layers,
+    _wait_for_final_watermark,
 )
+from tools.bridge_tp.run_phase9_cap0_calibration import write_json
 
 
 class TestPhase8Staging(unittest.TestCase):
@@ -61,6 +67,36 @@ class TestPhase8Staging(unittest.TestCase):
         expected = snapshot[2:3].clone()
         snapshot[2].zero_()
         self.assertTrue(torch.equal(block, expected))
+
+    def test_final_watermark_waits_past_streaming_file(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            watermark = root / "watermark.json"
+            cleanup = root / "cleanup.json"
+            write_json(
+                watermark,
+                {"status": "STREAMING", "end_token": 164},
+            )
+
+            def finish() -> None:
+                sleep(0.05)
+                write_json(
+                    watermark,
+                    {
+                        "status": "TARGET_READY",
+                        "end_token": 196,
+                        "target_request_id": "target",
+                    },
+                )
+
+            thread = Thread(target=finish)
+            thread.start()
+            result = _wait_for_final_watermark(
+                watermark, cleanup, monotonic() + 1, 196
+            )
+            thread.join()
+            self.assertIsNotNone(result)
+            self.assertEqual(result["status"], "TARGET_READY")
 
     def test_gap_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "coverage gap/overlap"):
