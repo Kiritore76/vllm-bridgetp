@@ -30,6 +30,7 @@ from typing import Any
 
 import torch
 
+from vllm.bridge_tp.controller.anchor_selector import select_source_request_id
 from vllm.bridge_tp.stream_protocol import (
     deserialize_rank_payload,
     recv_json,
@@ -416,14 +417,23 @@ def maybe_run_online_remote_attention(
 
     context = get_forward_context()
     req_ids = context.additional_kwargs.get("bridgetp_request_ids", [])
-    matches = [
-        index
-        for index, request_id in enumerate(req_ids)
-        if str(request_id).startswith(client.config.source_request_id_prefix)
-    ]
+    request_ids = [str(request_id) for request_id in req_ids]
+    selected_request_id = select_source_request_id(
+        request_ids,
+        client.config.source_request_id_prefix,
+    )
+    matches = (
+        [request_ids.index(selected_request_id)]
+        if selected_request_id is not None
+        else []
+    )
     if len(matches) != 1:
         if client.config.strict:
-            raise RuntimeError(f"expected one Bridge anchor row, observed {matches}")
+            raise RuntimeError(
+                "expected one Bridge anchor row; "
+                f"configured_prefix={client.config.source_request_id_prefix!r}, "
+                f"request_ids={request_ids!r}, matched_rows={matches!r}"
+            )
         return False
     if len(req_ids) != 1:
         raise RuntimeError(
