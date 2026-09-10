@@ -701,6 +701,33 @@ def run(
         raise
     finally:
         common.stop_processes(processes)
+        common.write_json(
+            out_root / "process_lifetimes.json",
+            {
+                "format_version": 1,
+                "clock": "wall_clock",
+                "note": (
+                    "Lifetime is launcher-observed process-group occupancy; "
+                    "servers may own worker child processes in the same group."
+                ),
+                "processes": [
+                    {
+                        "name": item.name,
+                        "pid": item.process.pid,
+                        "started_unix_s": item.started_unix_s,
+                        "ended_unix_s": item.ended_unix_s,
+                        "wall_time_s": (
+                            item.ended_unix_s - item.started_unix_s
+                            if item.ended_unix_s is not None
+                            else None
+                        ),
+                        "returncode": item.returncode,
+                        "log_path": str(item.log_path.resolve()),
+                    }
+                    for item in processes
+                ],
+            },
+        )
 
 
 def main() -> None:

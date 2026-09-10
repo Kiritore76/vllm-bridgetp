@@ -10,6 +10,7 @@ from tools.bridge_tp.run_shadow_rate_load_matrix import (
     rate_label,
     resolve_design,
 )
+from tools.bridge_tp.run_shadow_strategy_online_validation import summarize_slo
 from vllm.bridge_tp.online_shadow_strategy_protocol import (
     summarize_background_windows,
     validate_strategy_timing,
@@ -85,6 +86,25 @@ class TestOnlineWindows(unittest.TestCase):
         self.assertEqual(windows["BRIDGE"]["samples"], 1)
         self.assertEqual(windows["POST_COMMIT"]["samples"], 1)
         self.assertEqual(percentile([1.0, 3.0], 0.5), 2.0)
+
+    def test_slo_summary_counts_violations(self) -> None:
+        summary = summarize_slo(
+            [
+                {
+                    "status": "COMPLETED",
+                    "token_times_unix_s": [1.0, 1.01, 1.08],
+                    "tpot_p99_ms": 70.0,
+                    "ttft_ms": 1200.0,
+                    "e2e_ms": 2000.0,
+                }
+            ],
+            tpot_ms=50.0,
+            ttft_ms=1000.0,
+            e2e_ms=3000.0,
+        )
+        self.assertEqual(summary["tpot_interval_violations"], 1)
+        self.assertEqual(summary["ttft_violations"], 1)
+        self.assertEqual(summary["e2e_violations"], 0)
 
 
 class TestShadowRateLoadMatrix(unittest.TestCase):
