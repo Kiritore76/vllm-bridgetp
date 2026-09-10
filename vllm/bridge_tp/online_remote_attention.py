@@ -145,6 +145,11 @@ def _recv_tensor_payload(connection: socket.socket) -> tuple[dict[str, Any], int
     return deserialize_rank_payload(payload), len(payload)
 
 
+def _configure_low_latency_socket(connection: socket.socket) -> None:
+    """Disable Nagle delays for small synchronous attention messages."""
+    connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+
 @dataclass(frozen=True)
 class RemoteAttentionConfig:
     run_dir: Path
@@ -225,6 +230,7 @@ class RemoteAttentionRankServer:
                 except TimeoutError:
                     continue
                 with connection:
+                    _configure_low_latency_socket(connection)
                     connection.settimeout(self.config.timeout_s)
                     while True:
                         try:
@@ -247,29 +253,40 @@ class RemoteAttentionRankServer:
         cache = self.kv_caches.get(layer_name)
         if cache is None:
             raise KeyError(f"unknown target KV layer {layer_name!r}")
+        service_started = time.perf_counter()
         query = request["query"].to(device=cache.device, dtype=cache.dtype)
-        started = time.perf_counter()
+        query_ready = time.perf_counter()
         with self.kv_lock:
+            compute_started = time.perf_counter()
             key, value = gather_paged_kv(cache, self.block_ids, 0, boundary)
             stats = attention_stats(query, key, value, float(request["scale"]))
             if cache.device.type == "cuda":
                 torch.cuda.synchronize(cache.device)
+            compute_completed = time.perf_counter()
+        cpu_stats = {
+            "rank": self.rank,
+            "boundary": boundary,
+            "maximum": stats[0].cpu(),
+            "denominator": stats[1].cpu(),
+            "numerator": stats[2].cpu(),
+        }
+        stats_on_cpu = time.perf_counter()
+        send_started = time.perf_counter()
         response_bytes = _send_tensor_payload(
             connection,
-            {
-                "rank": self.rank,
-                "boundary": boundary,
-                "maximum": stats[0].cpu(),
-                "denominator": stats[1].cpu(),
-                "numerator": stats[2].cpu(),
-            },
+            cpu_stats,
         )
+        response_sent = time.perf_counter()
         self.calls += 1
         send_json(
             connection,
             {
                 "status": "PASS",
-                "compute_ms": (time.perf_counter() - started) * 1000,
+                "compute_ms": (compute_completed - compute_started) * 1000,
+                "target_query_h2d_ms": (query_ready - service_started) * 1000,
+                "target_stats_d2h_ms": (stats_on_cpu - compute_completed) * 1000,
+                "target_response_send_ms": (response_sent - send_started) * 1000,
+                "target_service_ms": (response_sent - service_started) * 1000,
                 "request_bytes": request_bytes,
                 "response_bytes": response_bytes,
             },
@@ -286,6 +303,8 @@ class RemoteAttentionClient:
         ]
         self.executor = ThreadPoolExecutor(max_workers=config.target_tp_size)
         self.verified_layers: set[str] = set()
+        self._boundary_sequence_length: int | None = None
+        self._boundary_value = 0
 
     def _connection(self, rank: int) -> socket.socket:
         existing = self._connections.get(rank)
@@ -297,6 +316,7 @@ class RemoteAttentionClient:
                 connection = socket.create_connection(
                     (self.config.host, self.config.base_port + rank), timeout=1.0
                 )
+                _configure_low_latency_socket(connection)
                 connection.settimeout(self.config.timeout_s)
                 self._connections[rank] = connection
                 return connection
@@ -307,7 +327,12 @@ class RemoteAttentionClient:
                     ) from error
                 time.sleep(0.005)
 
-    def common_boundary(self) -> int:
+    def common_boundary(self, sequence_length: int | None = None) -> int:
+        if (
+            sequence_length is not None
+            and sequence_length == self._boundary_sequence_length
+        ):
+            return self._boundary_value
         boundaries: list[int] = []
         for rank in range(self.config.target_tp_size):
             rank_dir = self.config.run_dir / "gpu_block_receipts" / f"tp_rank_{rank}"
@@ -334,7 +359,11 @@ class RemoteAttentionClient:
         if not manifest.is_file():
             return 0
         block_size = int(json.loads(manifest.read_text(encoding="utf-8"))["block_size"])
-        return min(boundaries) // block_size * block_size
+        boundary = min(boundaries) // block_size * block_size
+        if sequence_length is not None:
+            self._boundary_sequence_length = sequence_length
+            self._boundary_value = boundary
+        return boundary
 
     def rank_stats(
         self,
@@ -350,6 +379,7 @@ class RemoteAttentionClient:
         with self._connection_locks[rank]:
             connection = self._connection(rank)
             connection.settimeout(self.config.timeout_s)
+            send_started = time.perf_counter()
             request_bytes = _send_tensor_payload(
                 connection,
                 {
@@ -358,22 +388,32 @@ class RemoteAttentionClient:
                     "boundary": boundary,
                     "block_size": block_size,
                     "scale": scale,
-                    "query": query.detach().cpu(),
+                    "query": query,
                 },
             )
+            request_sent = time.perf_counter()
             response, response_bytes = _recv_tensor_payload(connection)
             trailer = recv_json(connection)
+            response_received = time.perf_counter()
         if trailer.get("status") != "PASS" or int(response["boundary"]) != boundary:
             raise RuntimeError("TP4 rejected the remote-attention request")
         stats = (
-            response["maximum"].to(query.device),
-            response["denominator"].to(query.device),
-            response["numerator"].to(query.device),
+            response["maximum"],
+            response["denominator"],
+            response["numerator"],
         )
         return stats, {
             "rank": rank,
             "round_trip_ms": (time.perf_counter() - started) * 1000,
+            "request_send_ms": (request_sent - send_started) * 1000,
+            "response_wait_ms": (response_received - request_sent) * 1000,
             "target_compute_ms": float(trailer["compute_ms"]),
+            "target_query_h2d_ms": float(trailer["target_query_h2d_ms"]),
+            "target_stats_d2h_ms": float(trailer["target_stats_d2h_ms"]),
+            "target_response_send_ms": float(
+                trailer["target_response_send_ms"]
+            ),
+            "target_service_ms": float(trailer["target_service_ms"]),
             "request_bytes": request_bytes,
             "response_bytes": response_bytes,
         }
@@ -445,8 +485,8 @@ def maybe_run_online_remote_attention(
     end = int(query_starts[request_index + 1])
     if end - start != 1:
         raise RuntimeError("online remote attention supports one-token decode only")
-    boundary = client.common_boundary()
     sequence_length = int(attn_metadata.seq_lens[request_index].item())
+    boundary = client.common_boundary(sequence_length)
     if boundary <= 0 or boundary >= sequence_length:
         return False
     block_ids = [int(value) for value in attn_metadata.block_table[request_index].tolist()]
@@ -455,8 +495,11 @@ def maybe_run_online_remote_attention(
     heads = int(anchor_query.shape[0])
     if heads % client.config.target_tp_size:
         raise ValueError("query heads do not divide over TP4")
-    rank_queries = list(torch.chunk(anchor_query, client.config.target_tp_size, dim=0))
     started = time.perf_counter()
+    query_cpu_started = time.perf_counter()
+    query_cpu = anchor_query.detach().to(device="cpu")
+    query_cpu_completed = time.perf_counter()
+    rank_queries = list(torch.chunk(query_cpu, client.config.target_tp_size, dim=0))
     futures = [
         client.executor.submit(
             client.rank_stats,
@@ -469,15 +512,27 @@ def maybe_run_online_remote_attention(
         )
         for rank, rank_query in enumerate(rank_queries)
     ]
-    responses = [future.result() for future in futures]
-    remote = tuple(
-        torch.cat([response[0][index] for response in responses], dim=0)
-        for index in range(3)
-    )
+    local_started = time.perf_counter()
     local_key, local_value = gather_paged_kv(
         kv_cache, block_ids, boundary, sequence_length
     )
-    local = attention_stats(anchor_query, local_key, local_value, float(layer.impl.scale))
+    local = attention_stats(
+        anchor_query,
+        local_key,
+        local_value,
+        float(layer.impl.scale),
+    )
+    local_completed = time.perf_counter()
+    responses = [future.result() for future in futures]
+    remote_cpu = tuple(
+        torch.cat([response[0][index] for response in responses], dim=0)
+        for index in range(3)
+    )
+    remote_h2d_started = time.perf_counter()
+    remote = tuple(
+        tensor.to(device=anchor_query.device) for tensor in remote_cpu
+    )
+    remote_h2d_completed = time.perf_counter()
     merged = merge_attention_stats(local, remote)
     max_abs_error: float | None = None
     mean_abs_error: float | None = None
@@ -526,6 +581,15 @@ def maybe_run_online_remote_attention(
             "remote_prefix_tokens": boundary,
             "local_suffix_tokens": sequence_length - boundary,
             "total_ms": elapsed_ms,
+            "source_query_d2h_ms": (
+                query_cpu_completed - query_cpu_started
+            ) * 1000,
+            "source_local_attention_ms": (
+                local_completed - local_started
+            ) * 1000,
+            "source_remote_stats_h2d_ms": (
+                remote_h2d_completed - remote_h2d_started
+            ) * 1000,
             "max_abs_error": max_abs_error,
             "mean_abs_error": mean_abs_error,
             "cosine_similarity": cosine_similarity,

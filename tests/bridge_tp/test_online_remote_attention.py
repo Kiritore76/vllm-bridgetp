@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import socket
 import unittest
+from unittest.mock import Mock
 
 try:
     import torch
 
     from vllm.bridge_tp.online_remote_attention import (
+        _configure_low_latency_socket,
         attention_stats,
         gather_paged_kv,
         merge_attention_stats,
@@ -19,6 +22,15 @@ except ModuleNotFoundError:
 
 @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch is unavailable")
 class TestOnlineRemoteAttention(unittest.TestCase):
+    def test_remote_attention_socket_disables_nagle(self) -> None:
+        connection = Mock()
+        _configure_low_latency_socket(connection)
+        connection.setsockopt.assert_called_once_with(
+            socket.IPPROTO_TCP,
+            socket.TCP_NODELAY,
+            1,
+        )
+
     def test_gathers_physical_blocks_in_logical_order(self) -> None:
         cache = torch.zeros(5, 2, 2, 1, 1)
         for block in range(5):
