@@ -491,6 +491,10 @@ def _publish_request(
                 "block_axis": block_axis,
                 "block_size": block_size,
                 "num_computed_tokens": num_computed,
+                # ``source_layers`` was index-selected with the request's
+                # logical block table, so block 0 here is the oldest request
+                # block and subsequent blocks follow increasing token index.
+                "history_copy_order": "TOKEN_ASCENDING_FROM_REQUEST_START",
                 "layers": rank_layers,
             }
         )
@@ -507,6 +511,7 @@ def _publish_request(
             "block_size": block_size,
             "block_axis": block_axis,
             "num_layers": len(rank_layers),
+            "history_copy_order": "TOKEN_ASCENDING_FROM_REQUEST_START",
             "raw_tensor_bytes": raw_rank_bytes,
             "payload_bytes": len(payload),
             "payload_sha256": payload_hash,
@@ -590,6 +595,7 @@ def _publish_request(
             "SHADOW" if history_started_unix_s is not None else "BRIDGE"
         ),
         "history_transfer_started_unix_s": history_started_unix_s,
+        "history_copy_order": "TOKEN_ASCENDING_FROM_REQUEST_START",
         "shadow_started_unix_s": time.time(),
         "layers": layer_records,
         "ranks": rank_records,
