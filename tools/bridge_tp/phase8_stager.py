@@ -84,6 +84,45 @@ def _wait_for_path(path: Path, cleanup: Path, deadline: float) -> bool:
     return True
 
 
+def _wait_for_final_watermark(
+    path: Path,
+    cleanup: Path,
+    deadline: float,
+    expected_end_token: int,
+) -> dict[str, Any] | None:
+    """Wait for a live GPU watermark to advance to its terminal state.
+
+    The connector publishes the watermark early with ``STREAMING`` status and
+    atomically replaces it with ``TARGET_READY`` after the last delta.  File
+    existence alone is therefore not a readiness condition.
+    """
+    while True:
+        if cleanup.exists():
+            return None
+        if path.exists():
+            try:
+                watermark = _load_json(path)
+            except (OSError, json.JSONDecodeError):
+                watermark = None
+            if watermark is not None:
+                status = watermark.get("status")
+                end_token = int(watermark.get("end_token", -1))
+                if status == "TARGET_READY" and end_token == expected_end_token:
+                    return watermark
+                if status in {"ERROR", "FAILED"}:
+                    raise RuntimeError(
+                        f"TP4 published terminal watermark status {status}: {path}"
+                    )
+                if end_token > expected_end_token:
+                    raise RuntimeError(
+                        "TP4 watermark advanced beyond the cutover boundary: "
+                        f"{end_token} > {expected_end_token}"
+                    )
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Timed out waiting for final GPU watermark {path}")
+        time.sleep(0.02)
+
+
 class _DeltaReceivers:
     def __init__(
         self,
@@ -618,15 +657,14 @@ def main() -> None:
             watermark_path = (
                 args.run_dir / "gpu_watermarks" / f"tp_rank_{rank}.json"
             )
-            if not _wait_for_path(watermark_path, cleanup_path, deadline):
+            watermark = _wait_for_final_watermark(
+                watermark_path,
+                cleanup_path,
+                deadline,
+                int(cutover["num_computed_tokens"]),
+            )
+            if watermark is None:
                 raise RuntimeError("GPU-resident Shadow was cancelled at cutover")
-            watermark = _load_json(watermark_path)
-            if (
-                watermark.get("status") != "TARGET_READY"
-                or int(watermark.get("end_token", -1))
-                != int(cutover["num_computed_tokens"])
-            ):
-                raise RuntimeError(f"TP4 rank {rank} has an invalid final watermark")
             _atomic_json_dump(
                 {
                     "format_version": 1,
