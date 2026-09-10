@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -40,6 +41,32 @@ def _atomic_json_dump(value: dict[str, Any], path: Path) -> None:
     os.replace(temporary, path)
 
 
+def _atomic_bytes_dump(value: bytes, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_bytes(value)
+    os.replace(temporary, path)
+
+
+def _compact_history_block_layers(
+    layers: dict[str, torch.Tensor],
+    block_axis: int,
+    logical_block: int,
+) -> dict[str, torch.Tensor]:
+    """Materialize one block without retaining the full snapshot storage.
+
+    ``Tensor.narrow`` can return a contiguous view whose backing storage still
+    spans every historical block.  ``torch.save`` serializes that backing
+    storage, so calling only ``contiguous()`` can repeat the complete history
+    once per logical block.  ``clone()`` gives each queued block compact,
+    independent storage.
+    """
+    return {
+        name: tensor.narrow(block_axis, logical_block, 1).clone()
+        for name, tensor in layers.items()
+    }
+
+
 def _load_json(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
@@ -57,6 +84,45 @@ def _wait_for_path(path: Path, cleanup: Path, deadline: float) -> bool:
     return True
 
 
+def _wait_for_final_watermark(
+    path: Path,
+    cleanup: Path,
+    deadline: float,
+    expected_end_token: int,
+) -> dict[str, Any] | None:
+    """Wait for a live GPU watermark to advance to its terminal state.
+
+    The connector publishes the watermark early with ``STREAMING`` status and
+    atomically replaces it with ``TARGET_READY`` after the last delta.  File
+    existence alone is therefore not a readiness condition.
+    """
+    while True:
+        if cleanup.exists():
+            return None
+        if path.exists():
+            try:
+                watermark = _load_json(path)
+            except (OSError, json.JSONDecodeError):
+                watermark = None
+            if watermark is not None:
+                status = watermark.get("status")
+                end_token = int(watermark.get("end_token", -1))
+                if status == "TARGET_READY" and end_token == expected_end_token:
+                    return watermark
+                if status in {"ERROR", "FAILED"}:
+                    raise RuntimeError(
+                        f"TP4 published terminal watermark status {status}: {path}"
+                    )
+                if end_token > expected_end_token:
+                    raise RuntimeError(
+                        "TP4 watermark advanced beyond the cutover boundary: "
+                        f"{end_token} > {expected_end_token}"
+                    )
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Timed out waiting for final GPU watermark {path}")
+        time.sleep(0.02)
+
+
 class _DeltaReceivers:
     def __init__(
         self,
@@ -66,12 +132,14 @@ class _DeltaReceivers:
         host: str,
         base_port: int,
         timeout_s: float,
+        live_gpu_queue: Path | None = None,
     ) -> None:
         self.manifest = manifest
         self.run_dir = run_dir
         self.host = host
         self.base_port = base_port
         self.timeout_s = timeout_s
+        self.live_gpu_queue = live_gpu_queue
         self.stop = threading.Event()
         self.lock = threading.Lock()
         self.by_rank: list[dict[int, dict[str, Any]]] = [
@@ -143,6 +211,13 @@ class _DeltaReceivers:
                                 f"duplicate Phase 8 delta start {start}"
                             )
                         self.by_rank[rank][start] = payload
+                    if self.live_gpu_queue is not None:
+                        _atomic_bytes_dump(
+                            payload_bytes,
+                            self.live_gpu_queue
+                            / f"tp_rank_{rank}"
+                            / f"delta_{start:012d}_{end:012d}.bin",
+                        )
                     receipt = {
                         "format_version": 1,
                         "phase": "BridgeTP D3 Phase 8",
@@ -176,7 +251,11 @@ class _DeltaReceivers:
 
 
 def _receive_initial_rank(
-    manifest: dict[str, Any], run_dir: Path, rank: int, timeout_s: float
+    manifest: dict[str, Any],
+    run_dir: Path,
+    rank: int,
+    timeout_s: float,
+    live_gpu_queue: Path | None = None,
 ) -> dict[str, Any]:
     record = manifest["ranks"][rank]
     started = time.perf_counter()
@@ -213,6 +292,31 @@ def _receive_initial_rank(
                 "exact_readback": True,
             },
         )
+    if live_gpu_queue is not None:
+        layers = payload.get("layers")
+        if not isinstance(layers, dict) or not layers:
+            raise ValueError("initial payload contains no KV layers")
+        block_axis = int(manifest["block_axis"])
+        for logical_block in range(int(manifest["num_blocks"])):
+            block_layers = _compact_history_block_layers(
+                layers, block_axis, logical_block
+            )
+            block_payload = serialize_rank_payload(
+                {
+                    "format_version": 1,
+                    "migration_id": manifest["migration_id"],
+                    "source_request_id": manifest["source_request_id"],
+                    "target_tp_rank": rank,
+                    "logical_block": logical_block,
+                    "layers": block_layers,
+                }
+            )
+            _atomic_bytes_dump(
+                block_payload,
+                live_gpu_queue
+                / f"tp_rank_{rank}"
+                / f"history_{logical_block:012d}.bin",
+            )
     _atomic_json_dump(
         {
             "format_version": 1,
@@ -426,6 +530,11 @@ def main() -> None:
     parser.add_argument("--delivery-host", default="127.0.0.1")
     parser.add_argument("--delivery-base-port", type=int, default=30000)
     parser.add_argument("--timeout-s", type=float, default=600)
+    parser.add_argument(
+        "--gpu-resident-shadow",
+        action="store_true",
+        help="relay initial history and every delta to dormant TP4 GPU blocks",
+    )
     args = parser.parse_args()
     args.run_dir.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + args.timeout_s
@@ -439,12 +548,16 @@ def main() -> None:
     if manifest.get("phase") != "BridgeTP D3 Phase 8":
         raise ValueError("CPU stager requires a Phase 8 source manifest")
 
+    live_gpu_queue = (
+        args.run_dir / "live_gpu_queue" if args.gpu_resident_shadow else None
+    )
     delta_receivers = _DeltaReceivers(
         manifest=manifest,
         run_dir=args.run_dir,
         host=args.delta_host,
         base_port=args.delta_base_port,
         timeout_s=args.timeout_s,
+        live_gpu_queue=live_gpu_queue,
     )
     delta_receivers.start()
 
@@ -468,7 +581,11 @@ def main() -> None:
         initial = list(
             executor.map(
                 lambda rank: _receive_initial_rank(
-                    manifest, args.run_dir, rank, args.timeout_s
+                    manifest,
+                    args.run_dir,
+                    rank,
+                    args.timeout_s,
+                    live_gpu_queue,
                 ),
                 range(4),
             )
@@ -485,6 +602,96 @@ def main() -> None:
         return
     cutover = _load_json(cutover_path)
     delta_receivers.close()
+
+    if args.gpu_resident_shadow:
+        ranks: list[dict[str, Any]] = []
+        for rank in range(4):
+            rank_dir = live_gpu_queue / f"tp_rank_{rank}"
+            payload_paths = [
+                *sorted(rank_dir.glob("history_*.bin")),
+                *sorted(rank_dir.glob("delta_*.bin")),
+            ]
+            digest = hashlib.sha256()
+            payload_bytes = 0
+            for path in payload_paths:
+                value = path.read_bytes()
+                digest.update(value)
+                payload_bytes += len(value)
+            ranks.append(
+                {
+                    "target_tp_rank": rank,
+                    "host": "shared-run-directory",
+                    "port": 0,
+                    "payload_bytes": payload_bytes,
+                    "payload_sha256": digest.hexdigest(),
+                    "num_frames": len(payload_paths),
+                    "delta_coverage": [
+                        [int(path.stem.split("_")[1]), int(path.stem.split("_")[2])]
+                        for path in payload_paths
+                        if path.name.startswith("delta_")
+                    ],
+                }
+            )
+        staging_manifest = {
+            **manifest,
+            "phase": "BridgeTP D3 Phase 8",
+            "scope": "live CPU relay into reserved TP4 GPU blocks",
+            "snapshot_num_output_tokens": cutover["cutover_num_output_tokens"],
+            "num_computed_tokens": cutover["num_computed_tokens"],
+            "pending_known_tokens": cutover["pending_known_tokens"],
+            "computed_token_ids": cutover["computed_token_ids"],
+            "pending_token_ids": cutover["pending_token_ids"],
+            "all_known_token_ids": cutover["all_known_token_ids"],
+            "num_blocks": cutover["num_blocks"],
+            "old_kv_num_computed_tokens": manifest["num_computed_tokens"],
+            "new_kv_delta_tokens": cutover["delta_tokens"],
+            "new_kv_delta_batches": cutover["delta_batches"],
+            "shadow_strategy": manifest.get("shadow_strategy", "S_NEW_OLD"),
+            "history_transfer_phase": "SHADOW",
+            "gpu_resident_shadow": True,
+            "staging_ready_unix_s": time.time(),
+            "ranks": ranks,
+        }
+        _atomic_json_dump(staging_manifest, args.run_dir / "staging_manifest.json")
+        for rank, record in enumerate(ranks):
+            watermark_path = (
+                args.run_dir / "gpu_watermarks" / f"tp_rank_{rank}.json"
+            )
+            watermark = _wait_for_final_watermark(
+                watermark_path,
+                cleanup_path,
+                deadline,
+                int(cutover["num_computed_tokens"]),
+            )
+            if watermark is None:
+                raise RuntimeError("GPU-resident Shadow was cancelled at cutover")
+            _atomic_json_dump(
+                {
+                    "format_version": 1,
+                    "phase": "BridgeTP D3 Phase 8",
+                    "status": "READY",
+                    "migration_id": manifest["migration_id"],
+                    "target_tp_rank": rank,
+                    "target_request_id": watermark["target_request_id"],
+                    "payload_bytes": record["payload_bytes"],
+                    "payload_sha256": record["payload_sha256"],
+                    "gpu_resident": True,
+                    "final_watermark": watermark["end_token"],
+                },
+                args.run_dir / "stage_delivery_receipts" / f"tp_rank_{rank}.json",
+            )
+        print(
+            json.dumps(
+                {
+                    "status": "GPU_RESIDENT_READY",
+                    "phase": "BridgeTP D3 Phase 8",
+                    "migration_id": manifest["migration_id"],
+                    "final_computed_tokens": cutover["num_computed_tokens"],
+                },
+                indent=2,
+            )
+        )
+        return
 
     assembled_by_rank: list[dict[str, torch.Tensor]] = []
     coverage_by_rank: list[list[list[int]]] = []

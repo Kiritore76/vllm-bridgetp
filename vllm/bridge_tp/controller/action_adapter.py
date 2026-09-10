@@ -93,8 +93,10 @@ class ActionAdapter:
         source_url: str,
         run_dir: str | Path | SessionBinding,
         expected_migration_id: str | None = None,
+        target_url: str | None = None,
     ) -> None:
         self.source_url = source_url.rstrip("/")
+        self.target_url = target_url.rstrip("/") if target_url else None
         self.expected_migration_id = expected_migration_id
         if isinstance(run_dir, SessionBinding):
             self.run_dir = run_dir.run_dir
@@ -333,6 +335,22 @@ class ActionAdapter:
         return _post(
             f"{self.source_url}/bridge_tp/v1/cleanup",
             self.binding.body(reason=reason, abort_source=abort_source),
+        )
+
+    def cancel_shadow_target(self, reason: str) -> dict[str, Any] | None:
+        """Abort and release an admitted dormant TP4 Shadow request."""
+        if self.target_url is None:
+            return None
+        control = RuntimeControl.load(self.run_dir)
+        if control is None or not control.target_request_admitted:
+            return None
+        target_request_id = f"bridgetp-phase9-target-{self.run_dir.name}"
+        return _post(
+            f"{self.target_url}/bridge_tp/v1/shadow_target_cleanup",
+            self.binding.body(
+                reason=reason,
+                target_request_id=target_request_id,
+            ),
         )
 
     def read_takeover_state(self) -> dict[str, Any] | None:

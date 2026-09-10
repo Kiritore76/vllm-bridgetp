@@ -294,7 +294,12 @@ def make_source_request(
     return path
 
 
-def target_connector(controller_dir: Path) -> str:
+def target_connector(
+    controller_dir: Path,
+    *,
+    gpu_resident_shadow: bool = False,
+    cutover_output_tokens: int = 0,
+) -> str:
     return json.dumps(
         {
             "kv_connector": "BridgeTPStreamingConnector",
@@ -303,7 +308,12 @@ def target_connector(controller_dir: Path) -> str:
             "kv_load_failure_policy": "fail",
             "kv_connector_extra_config": {
                 "bridgetp_stream_manifest": str(
-                    controller_dir / "staging_manifest.json"
+                    controller_dir
+                    / (
+                        "session_manifest.json"
+                        if gpu_resident_shadow
+                        else "staging_manifest.json"
+                    )
                 ),
                 "bridgetp_stream_receipt_dir": str(
                     controller_dir / "receiver_receipts"
@@ -314,6 +324,8 @@ def target_connector(controller_dir: Path) -> str:
                     controller_dir / "takeover_state.json"
                 ),
                 "bridgetp_takeover_control_timeout_s": 600,
+                "bridgetp_gpu_resident_shadow": gpu_resident_shadow,
+                "bridgetp_shadow_cutover_output_tokens": cutover_output_tokens,
             },
         },
         separators=(",", ":"),
