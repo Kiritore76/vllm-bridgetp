@@ -305,6 +305,21 @@ class RemoteAttentionClient:
         self.verified_layers: set[str] = set()
         self._boundary_sequence_length: int | None = None
         self._boundary_value = 0
+        self._activation_key: tuple[str, int] | None = None
+        self._remote_enabled_for_activation_key = False
+
+    def remote_enabled_for_forward(
+        self,
+        request_id: str,
+        sequence_length: int,
+        marker_active: bool,
+    ) -> bool:
+        """Latch Bridge activation for every layer of one decode forward."""
+        key = (request_id, sequence_length)
+        if key != self._activation_key:
+            self._activation_key = key
+            self._remote_enabled_for_activation_key = marker_active
+        return self._remote_enabled_for_activation_key
 
     def _connection(self, rank: int) -> socket.socket:
         existing = self._connections.get(rank)
@@ -451,8 +466,7 @@ def maybe_run_online_remote_attention(
     if client is None:
         return False
     marker = client.config.run_dir / "remote_attention_bridge.json"
-    if not marker.is_file():
-        return False
+    marker_active = marker.is_file()
     from vllm.forward_context import get_forward_context
 
     context = get_forward_context()
@@ -468,7 +482,7 @@ def maybe_run_online_remote_attention(
         else []
     )
     if len(matches) != 1:
-        if client.config.strict:
+        if marker_active and client.config.strict:
             raise RuntimeError(
                 "expected one Bridge anchor row; "
                 f"configured_prefix={client.config.source_request_id_prefix!r}, "
@@ -476,9 +490,11 @@ def maybe_run_online_remote_attention(
             )
         return False
     if len(req_ids) != 1:
-        raise RuntimeError(
-            "online remote attention requires an anchor-only TP1 decode batch"
-        )
+        if marker_active:
+            raise RuntimeError(
+                "online remote attention requires an anchor-only TP1 decode batch"
+            )
+        return False
     request_index = matches[0]
     query_starts = attn_metadata.query_start_loc.tolist()
     start = int(query_starts[request_index])
@@ -486,6 +502,12 @@ def maybe_run_online_remote_attention(
     if end - start != 1:
         raise RuntimeError("online remote attention supports one-token decode only")
     sequence_length = int(attn_metadata.seq_lens[request_index].item())
+    if not client.remote_enabled_for_forward(
+        request_ids[request_index],
+        sequence_length,
+        marker_active,
+    ):
+        return False
     boundary = client.common_boundary(sequence_length)
     if boundary <= 0 or boundary >= sequence_length:
         return False

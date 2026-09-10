@@ -576,6 +576,28 @@ def accept_online(
             errors.append(
                 f"online Bridge exercised {len(layer_names)} attention layers, expected 48"
             )
+        token_layers: dict[tuple[str, int], list[str]] = {}
+        for row in remote_attention_rows:
+            token_key = (
+                str(row.get("request_id")),
+                int(row.get("sequence_tokens", -1)),
+            )
+            token_layers.setdefault(token_key, []).append(
+                str(row.get("layer_name"))
+            )
+        incomplete_tokens = {
+            f"{request_id}@{sequence_tokens}": {
+                "calls": len(names),
+                "unique_layers": len(set(names)),
+            }
+            for (request_id, sequence_tokens), names in token_layers.items()
+            if len(names) != 48 or len(set(names)) != 48
+        }
+        if incomplete_tokens:
+            errors.append(
+                "online Bridge changed attention paths within a decode token: "
+                f"{incomplete_tokens}"
+            )
         if any(len(row.get("ranks", [])) != 4 for row in remote_attention_rows):
             errors.append("online Bridge did not use all four TP4 ranks per layer")
         if any(
@@ -832,6 +854,12 @@ def accept_online(
         "remote_attention_calls": len(remote_attention_rows),
         "remote_attention_layers": len(
             {str(row.get("layer_name")) for row in remote_attention_rows}
+        ),
+        "remote_attention_token_forwards": len(
+            {
+                (str(row.get("request_id")), int(row.get("sequence_tokens", -1)))
+                for row in remote_attention_rows
+            }
         ),
         "remote_attention_total_ms": {
             "p50": percentile(
