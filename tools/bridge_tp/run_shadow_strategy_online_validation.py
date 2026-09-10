@@ -192,9 +192,33 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         "target_jobs": len(jobs),
         "trigger_output_tokens": args.trigger_output_tokens,
         "cutover_output_tokens": args.cutover_output_tokens,
+        "shadow_window_output_tokens": (
+            args.cutover_output_tokens - args.trigger_output_tokens
+        ),
         "minimum_ready_target_jobs": args.minimum_ready_target_jobs,
         "fixed_rate_gib_s": args.fixed_rate_gib_s,
     }
+
+
+def build_controller_config_overrides(
+    *,
+    trigger_output_tokens: int,
+    cutover_output_tokens: int,
+    fixed_rate_gib_s: float | None,
+) -> dict[str, Any]:
+    """Keep the controller's configured Shadow window equal to the CLI design."""
+    overrides: dict[str, Any] = {
+        "handoff_output_tokens": cutover_output_tokens - trigger_output_tokens
+    }
+    if fixed_rate_gib_s is not None:
+        fixed_rate_bytes_s = fixed_rate_gib_s * 1024**3
+        overrides["rate"] = {
+            "b_min_bytes_s": fixed_rate_bytes_s,
+            "b_max_bytes_s": fixed_rate_bytes_s,
+            "b_start_bytes_s": fixed_rate_bytes_s,
+            "b_hard_max_bytes_s": fixed_rate_bytes_s,
+        }
+    return overrides
 
 
 def _load_rows(path: Path) -> list[dict[str, Any]]:
@@ -806,20 +830,15 @@ def main() -> None:
                     )
 
                 source_env_overrides = {"BRIDGETP_SHADOW_STRATEGY": strategy}
-                controller_config_overrides = None
+                controller_config_overrides = build_controller_config_overrides(
+                    trigger_output_tokens=args.trigger_output_tokens,
+                    cutover_output_tokens=args.cutover_output_tokens,
+                    fixed_rate_gib_s=args.fixed_rate_gib_s,
+                )
                 if args.fixed_rate_gib_s is not None:
                     source_env_overrides["BRIDGETP_STREAM_RATE_GIB_S"] = str(
                         args.fixed_rate_gib_s
                     )
-                    fixed_rate_bytes_s = args.fixed_rate_gib_s * 1024**3
-                    controller_config_overrides = {
-                        "rate": {
-                            "b_min_bytes_s": fixed_rate_bytes_s,
-                            "b_max_bytes_s": fixed_rate_bytes_s,
-                            "b_start_bytes_s": fixed_rate_bytes_s,
-                            "b_hard_max_bytes_s": fixed_rate_bytes_s,
-                        }
-                    }
 
                 result = scenario_runner.run(
                     rep_args,
