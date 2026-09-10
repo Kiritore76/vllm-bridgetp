@@ -583,14 +583,18 @@ def accept_online(
             for row in remote_attention_rows
         ):
             errors.append("online Bridge used an empty TP4 prefix")
-        if any(
-            float(row.get("max_abs_error", float("inf"))) > 0.02
+        verification_rows = [
+            row
             for row in remote_attention_rows
-        ):
+            if row.get("max_abs_error") is not None
+        ]
+        if len({str(row.get("layer_name")) for row in verification_rows}) != 48:
+            errors.append("online Bridge did not numerically verify all 48 layers")
+        if any(float(row["max_abs_error"]) > 0.02 for row in verification_rows):
             errors.append("online Bridge exceeded the split-attention max-abs tolerance")
         if any(
-            float(row.get("cosine_similarity", 0.0)) < 0.999
-            for row in remote_attention_rows
+            float(row["cosine_similarity"]) < 0.999
+            for row in verification_rows
         ):
             errors.append("online Bridge exceeded the split-attention cosine tolerance")
     if background.get("jobs") != expected_jobs:

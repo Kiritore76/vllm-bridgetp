@@ -284,6 +284,7 @@ class RemoteAttentionClient:
             threading.Lock() for _ in range(config.target_tp_size)
         ]
         self.executor = ThreadPoolExecutor(max_workers=config.target_tp_size)
+        self.verified_layers: set[str] = set()
 
     def _connection(self, rank: int) -> socket.socket:
         existing = self._connections.get(rank)
@@ -424,6 +425,10 @@ def maybe_run_online_remote_attention(
         if client.config.strict:
             raise RuntimeError(f"expected one Bridge anchor row, observed {matches}")
         return False
+    if len(req_ids) != 1:
+        raise RuntimeError(
+            "online remote attention requires an anchor-only TP1 decode batch"
+        )
     request_index = matches[0]
     query_starts = attn_metadata.query_start_loc.tolist()
     start = int(query_starts[request_index])
@@ -437,7 +442,6 @@ def maybe_run_online_remote_attention(
     block_ids = [int(value) for value in attn_metadata.block_table[request_index].tolist()]
     block_size = int(kv_cache.shape[2])
     anchor_query = query[start]
-    reference = output[start].detach().float().reshape_as(anchor_query).clone()
     heads = int(anchor_query.shape[0])
     if heads % client.config.target_tp_size:
         raise ValueError("query heads do not divide over TP4")
@@ -465,25 +469,40 @@ def maybe_run_online_remote_attention(
     )
     local = attention_stats(anchor_query, local_key, local_value, float(layer.impl.scale))
     merged = merge_attention_stats(local, remote)
-    difference = (merged.float() - reference).abs()
-    max_abs_error = float(difference.max().item())
-    mean_abs_error = float(difference.mean().item())
-    cosine_similarity = float(
-        torch.nn.functional.cosine_similarity(
-            merged.float().reshape(1, -1), reference.reshape(1, -1)
-        ).item()
-    )
-    max_tolerance = float(
-        os.getenv("BRIDGETP_REMOTE_ATTENTION_MAX_ABS_TOLERANCE", "0.02")
-    )
-    cosine_tolerance = float(
-        os.getenv("BRIDGETP_REMOTE_ATTENTION_MIN_COSINE", "0.999")
-    )
-    if max_abs_error > max_tolerance or cosine_similarity < cosine_tolerance:
-        raise RuntimeError(
-            "online remote attention differs from full local reference: "
-            f"max_abs={max_abs_error}, cosine={cosine_similarity}"
+    max_abs_error: float | None = None
+    mean_abs_error: float | None = None
+    cosine_similarity: float | None = None
+    if layer_name not in client.verified_layers:
+        full_key, full_value = gather_paged_kv(
+            kv_cache, block_ids, 0, sequence_length
         )
+        full = attention_stats(
+            anchor_query, full_key, full_value, float(layer.impl.scale)
+        )
+        reference = full[2] / full[1].unsqueeze(-1)
+        difference = (merged.float() - reference).abs()
+        max_abs_error = float(difference.max().item())
+        mean_abs_error = float(difference.mean().item())
+        cosine_similarity = float(
+            torch.nn.functional.cosine_similarity(
+                merged.float().reshape(1, -1), reference.reshape(1, -1)
+            ).item()
+        )
+        max_tolerance = float(
+            os.getenv("BRIDGETP_REMOTE_ATTENTION_MAX_ABS_TOLERANCE", "0.02")
+        )
+        cosine_tolerance = float(
+            os.getenv("BRIDGETP_REMOTE_ATTENTION_MIN_COSINE", "0.999")
+        )
+        if (
+            max_abs_error > max_tolerance
+            or cosine_similarity < cosine_tolerance
+        ):
+            raise RuntimeError(
+                "online remote attention differs from full local reference: "
+                f"max_abs={max_abs_error}, cosine={cosine_similarity}"
+            )
+        client.verified_layers.add(layer_name)
     output[start].copy_(merged.to(dtype=output.dtype))
     elapsed_ms = (time.perf_counter() - started) * 1000
     client.record(
