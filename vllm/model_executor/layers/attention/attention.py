@@ -748,6 +748,23 @@ def unified_attention_with_output(
     layer_name = _resolve_layer_name(layer_name)
     attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
 
+    # BridgeTP replaces the ordinary kernel only for a fail-closed, single-
+    # anchor Bridge decode.  All other forwards stay byte-for-byte on vLLM's
+    # normal backend path.
+    from vllm.bridge_tp.online_remote_attention import (
+        maybe_run_online_remote_attention,
+    )
+
+    handled = maybe_run_online_remote_attention(
+        layer_name=layer_name,
+        layer=self,
+        query=query,
+        kv_cache=kv_cache,
+        attn_metadata=attn_metadata,
+        output=output,
+    )
+    if handled:
+        return
     self.impl.forward(
         self,
         query,
@@ -758,23 +775,6 @@ def unified_attention_with_output(
         output=output,
         output_scale=output_scale,
         output_block_scale=output_block_scale,
-    )
-    # BridgeTP's online experiment first executes the ordinary local kernel for
-    # the full batch, then replaces only the explicitly selected anchor row
-    # with the merged TP1-suffix/TP4-prefix result.  Keeping this hook outside
-    # the backend makes the data-path integration backend-visible and keeps
-    # every non-anchor request byte-for-byte on vLLM's normal path.
-    from vllm.bridge_tp.online_remote_attention import (
-        maybe_run_online_remote_attention,
-    )
-
-    maybe_run_online_remote_attention(
-        layer_name=layer_name,
-        layer=self,
-        query=query,
-        kv_cache=kv_cache,
-        attn_metadata=attn_metadata,
-        output=output,
     )
 
 
