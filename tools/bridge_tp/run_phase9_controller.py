@@ -598,12 +598,11 @@ def step_shadow_only_takeover(
     now: float,
     dry_run: bool,
 ) -> None:
-    """Commit directly from Shadow after the normal four-rank readback gate.
+    """Commit directly from Shadow after the four-rank GPU readback gate.
 
-    This deliberately reuses the proven Phase 8 restore/receipt protocol.  It
-    removes the controller's Bridge/Handoff state; it does not claim that the
-    current prototype writes the historical snapshot directly into live TP4
-    GPU cache before the final source freeze.
+    In GPU-resident Shadow mode, the dormant TP4 request already owns its
+    final block table and history/deltas are injected into those blocks before
+    this gate succeeds.  The controller never enters Bridge/Handoff.
     """
     ready, ranks, detail = adapter.poll_target_ready()
     for rank in ranks:

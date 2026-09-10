@@ -259,6 +259,9 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             "status": acceptance["status"],
             "shadow_duration_ms": acceptance["shadow_duration_ms"],
             "bridge_to_commit_ms": acceptance["bridge_to_commit_ms"],
+            "final_sync_to_commit_ms": acceptance.get(
+                "final_sync_to_commit_ms"
+            ),
             "handoff_stall_ms": acceptance["handoff_stall_ms"],
             "source_origin_tokens": acceptance["source_origin_tokens"],
             "target_origin_tokens": acceptance["target_origin_tokens"],
@@ -620,6 +623,12 @@ def accept_online(
         for row in background.get("results", [])
         if row.get("status") == "COMPLETED"
     )
+    bridge_to_commit_ms = (committed - bridge_start) * 1000
+    reported_windows = dict(windows)
+    if handoff_mode == "shadow-only":
+        # Preserve the legacy BRIDGE key for old result readers while naming
+        # the actual Shadow-only interval accurately for new analyses.
+        reported_windows["FINAL_SYNC"] = dict(windows["BRIDGE"])
     return {
         "format_version": 1,
         "status": "PASS" if not errors else "FAIL",
@@ -673,7 +682,10 @@ def accept_online(
         "history_copy_order": session.get("history_copy_order"),
         "target_jobs_completed": background.get("completed"),
         "shadow_duration_ms": (bridge_start - shadow_start) * 1000,
-        "bridge_to_commit_ms": (committed - bridge_start) * 1000,
+        "bridge_to_commit_ms": bridge_to_commit_ms,
+        "final_sync_to_commit_ms": (
+            bridge_to_commit_ms if handoff_mode == "shadow-only" else None
+        ),
         "history_transfer_started_unix_s": history_start,
         "history_transfer_phase": session.get("history_transfer_phase"),
         "handoff_stall_ms": handoff_stall_ms,
@@ -700,7 +712,7 @@ def accept_online(
         "target_origin_tokens": proxy.get("target_origin_tokens"),
         "receiver_ranks": receipts.get("receiver_ranks"),
         "exact_readback": receipts.get("exact_readback"),
-        "target_tpot_windows": windows,
+        "target_tpot_windows": reported_windows,
         "errors": errors,
     }
 

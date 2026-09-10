@@ -48,6 +48,25 @@ def _atomic_bytes_dump(value: bytes, path: Path) -> None:
     os.replace(temporary, path)
 
 
+def _compact_history_block_layers(
+    layers: dict[str, torch.Tensor],
+    block_axis: int,
+    logical_block: int,
+) -> dict[str, torch.Tensor]:
+    """Materialize one block without retaining the full snapshot storage.
+
+    ``Tensor.narrow`` can return a contiguous view whose backing storage still
+    spans every historical block.  ``torch.save`` serializes that backing
+    storage, so calling only ``contiguous()`` can repeat the complete history
+    once per logical block.  ``clone()`` gives each queued block compact,
+    independent storage.
+    """
+    return {
+        name: tensor.narrow(block_axis, logical_block, 1).clone()
+        for name, tensor in layers.items()
+    }
+
+
 def _load_json(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
@@ -240,10 +259,9 @@ def _receive_initial_rank(
             raise ValueError("initial payload contains no KV layers")
         block_axis = int(manifest["block_axis"])
         for logical_block in range(int(manifest["num_blocks"])):
-            block_layers = {
-                name: tensor.narrow(block_axis, logical_block, 1).contiguous()
-                for name, tensor in layers.items()
-            }
+            block_layers = _compact_history_block_layers(
+                layers, block_axis, logical_block
+            )
             block_payload = serialize_rank_payload(
                 {
                     "format_version": 1,
