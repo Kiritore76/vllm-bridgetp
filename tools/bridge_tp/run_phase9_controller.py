@@ -106,6 +106,11 @@ def parse_args() -> argparse.Namespace:
             "--diagnostic-trigger-output-tokens"
         ),
     )
+    parser.add_argument(
+        "--diagnostic-bridge-output-tokens",
+        type=int,
+        help="fixed output-token boundary for SHADOW -> HANDOFF",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--handoff-mode",
@@ -124,18 +129,19 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     trigger = args.diagnostic_trigger_output_tokens
     cutover = args.diagnostic_cutover_output_tokens
+    bridge = args.diagnostic_bridge_output_tokens
     if (trigger is None) != (cutover is None):
         parser.error(
             "diagnostic trigger and cutover boundaries must be supplied together"
         )
     if trigger is not None and (trigger < 0 or cutover <= trigger):
         parser.error("diagnostic boundaries require 0 <= trigger < cutover")
-    if args.gpu_resident_shadow and (
-        args.handoff_mode != "shadow-only" or cutover is None
+    if bridge is not None and (
+        trigger is None or not trigger < bridge < cutover
     ):
-        parser.error(
-            "GPU-resident Shadow requires shadow-only mode and fixed boundaries"
-        )
+        parser.error("diagnostic Bridge boundary must be between trigger and cutover")
+    if args.gpu_resident_shadow and cutover is None:
+        parser.error("GPU-resident staging requires fixed diagnostic boundaries")
     return args
 
 
@@ -704,6 +710,7 @@ def main() -> None:
     config = ControllerConfig.load(args.config)
     diagnostic_trigger = args.diagnostic_trigger_output_tokens
     diagnostic_cutover = args.diagnostic_cutover_output_tokens
+    diagnostic_bridge = args.diagnostic_bridge_output_tokens
     if diagnostic_trigger is not None:
         diagnostic_gap = diagnostic_cutover - diagnostic_trigger
         if diagnostic_gap != config.handoff_output_tokens:
@@ -889,7 +896,6 @@ def main() -> None:
                         capacity_signal,
                     )
                 elif record.state is MigrationState.SHADOW:
-                    previous_target = target_future
                     target_future = _start_target_if_ready(
                         run_dir=run_dir,
                         source_request=source_request,
@@ -904,8 +910,11 @@ def main() -> None:
                     )
                     if (
                         args.handoff_mode == "bridge"
-                        and previous_target is None
                         and target_future is not None
+                        and (
+                            diagnostic_bridge is None
+                            or request.output_tokens >= diagnostic_bridge
+                        )
                     ):
                         machine.transition(
                             record.migration_id,
@@ -913,6 +922,17 @@ def main() -> None:
                             now,
                             "cutover manifest published and target admitted",
                         )
+                        if args.gpu_resident_shadow:
+                            atomic_json_dump(
+                                {
+                                    "format_version": 1,
+                                    "status": "ACTIVE",
+                                    "migration_id": record.migration_id,
+                                    "started_unix_s": now,
+                                    "scope": "TP1 suffix plus TP4 GPU prefix",
+                                },
+                                run_dir / "remote_attention_bridge.json",
+                            )
                     elif (
                         args.handoff_mode == "shadow-only"
                         and target_future is not None

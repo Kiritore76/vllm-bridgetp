@@ -58,6 +58,7 @@ from vllm.distributed.parallel_state import (
 from vllm.distributed.weight_transfer.base import SparseWeightPatch
 from vllm.forward_context import (
     BatchDescriptor,
+    get_forward_context,
     set_forward_context,
 )
 from vllm.logger import init_logger
@@ -4296,6 +4297,12 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            # The attention op normally has no request identities.  BridgeTP
+            # uses this immutable per-forward snapshot to select exactly one
+            # migration anchor while leaving colocated TP1 work untouched.
+            get_forward_context().additional_kwargs[
+                "bridgetp_request_ids"
+            ] = list(req_ids[:num_reqs])
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,

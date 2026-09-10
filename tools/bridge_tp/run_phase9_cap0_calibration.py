@@ -299,6 +299,8 @@ def target_connector(
     *,
     gpu_resident_shadow: bool = False,
     cutover_output_tokens: int = 0,
+    online_remote_attention: bool = False,
+    remote_attention_base_port: int = 30200,
 ) -> str:
     return json.dumps(
         {
@@ -326,6 +328,8 @@ def target_connector(
                 "bridgetp_takeover_control_timeout_s": 600,
                 "bridgetp_gpu_resident_shadow": gpu_resident_shadow,
                 "bridgetp_shadow_cutover_output_tokens": cutover_output_tokens,
+                "bridgetp_online_remote_attention": online_remote_attention,
+                "bridgetp_remote_attention_base_port": remote_attention_base_port,
             },
         },
         separators=(",", ":"),
