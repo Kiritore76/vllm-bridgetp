@@ -69,6 +69,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="run only the Shadow-only system on this branch",
     )
+    parser.add_argument(
+        "--gpu-resident-shadow",
+        action="store_true",
+        help=(
+            "reserve TP4 blocks at Shadow start and inject history/deltas "
+            "before direct takeover"
+        ),
+    )
     parser.add_argument("--slo-tpot-ms", type=float, default=50.0)
     parser.add_argument("--slo-ttft-ms", type=float, default=1000.0)
     parser.add_argument("--slo-e2e-ms", type=float, default=60000.0)
@@ -114,6 +122,8 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise ValueError("repetitions must be positive")
     if args.architecture_comparison and args.shadow_only_only:
         raise ValueError("select architecture comparison or Shadow-only, not both")
+    if args.gpu_resident_shadow and not args.shadow_only_only:
+        raise ValueError("GPU-resident Shadow currently requires --shadow-only-only")
     if set(args.strategy_order) != {"S_NEW", "S_NEW_OLD"}:
         raise ValueError("strategy order must contain S_NEW and S_NEW_OLD once")
     if not 0 < args.trigger_output_tokens < args.cutover_output_tokens:
@@ -261,6 +271,12 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             "history_ready_before_freeze_ms": acceptance.get(
                 "history_ready_before_freeze_ms"
             ),
+            "history_gpu_ready_before_freeze_ms": acceptance.get(
+                "history_gpu_ready_before_freeze_ms"
+            ),
+            "gpu_resident_shadow": acceptance.get("gpu_resident_shadow"),
+            "gpu_history_block_acks": acceptance.get("gpu_history_block_acks"),
+            "gpu_delta_acks": acceptance.get("gpu_delta_acks"),
             "anchor_tpot_p50_ms": acceptance.get("anchor_tpot", {}).get(
                 "p50_ms"
             ),
@@ -410,6 +426,10 @@ def accept_online(
         common.read_json(path)
         for path in sorted((controller_dir / "initial_stage_receipts").glob("*.json"))
     ]
+    gpu_initial_receipts = [
+        common.read_json(path)
+        for path in sorted((controller_dir / "gpu_initial_receipts").glob("*.json"))
+    ]
 
     shadow_start = float(session["shadow_started_unix_s"])
     bridge_start = float(cutover["updated_unix_s"])
@@ -471,6 +491,62 @@ def accept_online(
     history_ready_before_freeze_ms = (
         (bridge_start - max(history_completed)) * 1000
         if len(history_completed) == 4
+        else None
+    )
+    gpu_resident_shadow = staging.get("gpu_resident_shadow") is True
+    gpu_history_completed = [
+        float(row.get("completed_unix_s", float("inf")))
+        for row in gpu_initial_receipts
+    ]
+    if gpu_resident_shadow and (
+        len(gpu_history_completed) != 4
+        or any(value > bridge_start for value in gpu_history_completed)
+        or not all(row.get("exact_readback") is True for row in gpu_initial_receipts)
+    ):
+        errors.append(
+            "initial history was not GPU-resident on all ranks before cutover"
+        )
+    if gpu_resident_shadow:
+        initial_end = int(session["num_computed_tokens"])
+        final_end = int(cutover["num_computed_tokens"])
+        expected_blocks = int(session["num_blocks"])
+        for rank in range(4):
+            block_paths = sorted(
+                (
+                    controller_dir / "gpu_block_receipts" / f"tp_rank_{rank}"
+                ).glob("*.json")
+            )
+            blocks = [common.read_json(path) for path in block_paths]
+            if (
+                len(blocks) != expected_blocks
+                or [int(row.get("logical_block", -1)) for row in blocks]
+                != list(range(expected_blocks))
+                or not all(row.get("exact_readback") is True for row in blocks)
+            ):
+                errors.append(f"TP4 rank {rank} history block ACKs are incomplete")
+            delta_paths = sorted(
+                (
+                    controller_dir / "gpu_delta_receipts" / f"tp_rank_{rank}"
+                ).glob("*.json")
+            )
+            expected_start = initial_end
+            for path in delta_paths:
+                delta = common.read_json(path)
+                start = int(delta.get("start_token", -1))
+                end = int(delta.get("end_token", -1))
+                if (
+                    start != expected_start
+                    or end <= start
+                    or delta.get("exact_readback") is not True
+                ):
+                    errors.append(f"TP4 rank {rank} delta ACK coverage is invalid")
+                    break
+                expected_start = end
+            if expected_start != final_end:
+                errors.append(f"TP4 rank {rank} final GPU watermark is incomplete")
+    history_gpu_ready_before_freeze_ms = (
+        (bridge_start - max(gpu_history_completed)) * 1000
+        if len(gpu_history_completed) == 4
         else None
     )
     if len(end_rows) != 1 or end_rows[0].get("final_state") != "TAKEOVER":
@@ -548,17 +624,25 @@ def accept_online(
         "format_version": 1,
         "status": "PASS" if not errors else "FAIL",
         "evidence_class": (
-            "ONLINE_VLLM_SHADOW_ONLY_TAKEOVER"
+            "ONLINE_VLLM_GPU_RESIDENT_SHADOW_TAKEOVER"
+            if gpu_resident_shadow
+            else "ONLINE_VLLM_SHADOW_ONLY_TAKEOVER"
             if handoff_mode == "shadow-only"
             else "ONLINE_VLLM_PHASE8_STRATEGY_COMPARISON"
         ),
         "evidence_boundary": (
-            "Real vLLM TP1/TP4 export, transfer, restore, takeover, unified "
-            "response, and target-request TPOT. The Shadow-only variant skips "
-            "the controller Bridge/Handoff state, but stages history on CPU "
-            "and restores TP4 after the final source freeze. The Bridge "
-            "baseline defers history until that boundary. Online remote "
-            "attention is not executed."
+            "Real vLLM TP1/TP4 export, incremental CPU relay into reserved "
+            "TP4 GPU blocks, four-rank watermark, atomic takeover, unified "
+            "response, and target-request TPOT. TP4 performs no migrated-"
+            "request forward before commit; online remote attention is not "
+            "executed."
+            if gpu_resident_shadow
+            else "Real vLLM TP1/TP4 export, transfer, restore, takeover, "
+            "unified response, and target-request TPOT. The Shadow-only "
+            "variant skips the controller Bridge/Handoff state, but stages "
+            "history on CPU and restores TP4 after the final source freeze. "
+            "The Bridge baseline defers history until that boundary. Online "
+            "remote attention is not executed."
         ),
         "strategy": strategy,
         "handoff_mode": handoff_mode,
@@ -576,6 +660,16 @@ def accept_online(
             default=0.0,
         ),
         "history_ready_before_freeze_ms": history_ready_before_freeze_ms,
+        "history_gpu_ready_before_freeze_ms": history_gpu_ready_before_freeze_ms,
+        "gpu_resident_shadow": gpu_resident_shadow,
+        "gpu_history_block_acks": sum(
+            1
+            for _ in (controller_dir / "gpu_block_receipts").glob("**/*.json")
+        ),
+        "gpu_delta_acks": sum(
+            1
+            for _ in (controller_dir / "gpu_delta_receipts").glob("**/*.json")
+        ),
         "history_copy_order": session.get("history_copy_order"),
         "target_jobs_completed": background.get("completed"),
         "shadow_duration_ms": (bridge_start - shadow_start) * 1000,
@@ -626,6 +720,7 @@ def main() -> None:
         "strategies": args.strategy_order,
         "architecture_comparison": args.architecture_comparison,
         "shadow_only_only": args.shadow_only_only,
+        "gpu_resident_shadow": args.gpu_resident_shadow,
         "repetitions": args.repetitions,
         "fixed_rate_gib_s": args.fixed_rate_gib_s,
         "slo_thresholds": {
@@ -751,7 +846,8 @@ def main() -> None:
                         str(args.cutover_output_tokens),
                         "--handoff-mode",
                         handoff_mode,
-                    ],
+                    ]
+                    + (["--gpu-resident-shadow"] if args.gpu_resident_shadow else []),
                     background_before_controller=True,
                     background_lead_s=args.background_lead_s,
                     background_ready_jobs=args.minimum_ready_target_jobs,

@@ -209,6 +209,50 @@ def build_target_request(
     return target, cutover
 
 
+def build_gpu_resident_shadow_target_request(
+    source_request: dict[str, Any],
+    session: dict[str, Any],
+    run_name: str,
+    cutover_output_tokens: int,
+) -> tuple[dict[str, Any], int]:
+    """Build a dormant target request with space for future Shadow tokens.
+
+    Future token IDs are placeholders used only to size the scheduler-owned
+    allocation. The connector replaces them from ``cutover_manifest.json``
+    before the request is released for its first target-side forward.
+    """
+    source_errors = strict_greedy_sampling_errors(source_request)
+    if source_errors:
+        raise ValueError(
+            "source request does not carry the Phase 9 sampling contract: "
+            + "; ".join(source_errors)
+        )
+    known = list(session["all_known_token_ids"])
+    planned_known = int(session["num_prompt_tokens"]) + cutover_output_tokens
+    if planned_known <= len(known):
+        raise ValueError("Shadow target must reserve at least one future token")
+    placeholder = int(known[-1]) if known else 0
+    prompt = known + [placeholder] * (planned_known - len(known))
+    remaining = int(source_request["max_tokens"]) - cutover_output_tokens
+    if remaining <= 0:
+        raise ValueError("source max_tokens leaves no post-cutover target tokens")
+    target = freeze_strict_greedy_sampling(
+        {
+            "model": source_request["model"],
+            "request_id": f"bridgetp-phase9-target-{run_name}",
+            "prompt": prompt,
+            "max_tokens": remaining,
+            "ignore_eos": bool(source_request.get("ignore_eos", False)),
+            "stream": True,
+            "return_token_ids": True,
+            "kv_transfer_params": {MIGRATION_PARAM: session["migration_id"]},
+        }
+    )
+    if "logprobs" in source_request:
+        target["logprobs"] = int(source_request["logprobs"])
+    return target, cutover_output_tokens
+
+
 def honored_generation(path: str | Path) -> int | None:
     try:
         value = load_json(path)

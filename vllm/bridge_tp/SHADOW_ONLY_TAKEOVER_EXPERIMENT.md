@@ -15,21 +15,29 @@
 耗尽前追平。提前完成历史传输可以缩短最终同步/切换停顿；代价是 Shadow
 期间对繁忙 TP4 的额外干扰。
 
-## 当前原型真正实现了什么
+## 两级实现边界
 
-该分支增加了显式 `--handoff-mode shadow-only`。它不进入 Bridge/Handoff
-控制状态，并且状态机仍强制要求四个 rank 的 `TARGET_READY` 与 exact-readback
-证据，之后才允许原子提交。默认 `bridge` 路径不变。
+普通 `--handoff-mode shadow-only` 保留早期的 CPU staging 性能下界；显式增加
+`--gpu-resident-shadow` 后才启用最终结构。最终结构在 Shadow 开始时向 TP4
+提交 dormant target request，scheduler 为计划切换长度分配最终 paged-KV
+blocks，并将请求保持在 `WAITING_FOR_REMOTE_KVS`，所以它不会在提交前执行
+forward。
 
 实验使用真实 Qwen、真实 TP1/TP4 vLLM、真实 KV 导出、TCP 传输、重分片、
 TP4 restore、统一响应和 TP4 背景请求 TPOT。每轮交替运行顺序以降低热机和
 时间漂移偏差。
 
-当前实现的边界必须明确：Shadow 期间历史 KV 先到 CPU stager；最终冻结后
-才把拼装后的完整 KV restore 到 TP4 GPU。因此这是“去掉 Bridge 状态”的可运行
-原型和保守性能下界，不是最终的 TP4 GPU 原位增量写入实现，也不执行远端
-attention。正式论文若要宣称 TP4 在 TP1 继续解码时已经完全热接收，还需增加
-TP4 dormant-request KV 预分配与原位 patch 接口。
+GPU-resident 模式复用现有 TCP stager 作为 CPU 中继，但不等 source freeze 才
+restore：历史 KV 按逻辑 block 从 0 开始写入最终 TP4 blocks，每块生成四 rank
+readback receipt；新 KV delta 随 TP1 解码持续原位 patch，并为各 rank 推进连续
+watermark。cutover 时用真实 token IDs 替换只用于预留长度的占位 token，四个
+rank 都达到最终 watermark 后才能提交。提交前 TP1 是唯一 owner；提交后目标
+请求才首次执行 forward，因此 TP4 从 source 的最后 pending token 继续生成。
+
+这里仍不执行远端 attention，也没有 Bridge 状态。传输链路是
+`TP1 GPU -> source CPU -> TCP stager -> relay file/page cache -> TP4 GPU`；因此
+本实验能验证真实 GPU 常驻、增量覆盖、干扰和切换正确性，但中继实现尚不是
+RDMA/NCCL 优化后的最终数据面。
 
 ## 接受条件
 
@@ -40,6 +48,9 @@ TP4 dormant-request KV 预分配与原位 patch 接口。
 3. 四个 TP4 rank 全部 exact-readback，takeover 为 `COMMITTED`。
 4. 统一响应 token 索引连续，且同时包含 TP1 与 TP4 产生的 token。
 5. 背景任务全部完成，各观测窗口达到最小 TPOT 样本数。
+6. GPU-resident 模式还必须有完整的逐 block、逐 delta receipt，四个最终
+   watermark 等于 `cutover_manifest.num_computed_tokens`，且初始历史在 freeze
+   前已经位于 TP4 GPU。
 
 ## 主要指标
 
