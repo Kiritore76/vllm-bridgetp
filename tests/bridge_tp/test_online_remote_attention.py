@@ -10,6 +10,7 @@ try:
 
     from vllm.bridge_tp.online_remote_attention import (
         _configure_low_latency_socket,
+        RemoteAttentionClient,
         attention_stats,
         gather_paged_kv,
         merge_attention_stats,
@@ -30,6 +31,16 @@ class TestOnlineRemoteAttention(unittest.TestCase):
             socket.TCP_NODELAY,
             1,
         )
+
+    def test_remote_activation_is_latched_for_all_layers_of_a_token(self) -> None:
+        client = RemoteAttentionClient.__new__(RemoteAttentionClient)
+        client._activation_key = None
+        client._remote_enabled_for_activation_key = False
+
+        self.assertFalse(client.remote_enabled_for_forward("anchor", 100, False))
+        self.assertFalse(client.remote_enabled_for_forward("anchor", 100, True))
+        self.assertTrue(client.remote_enabled_for_forward("anchor", 101, True))
+        self.assertTrue(client.remote_enabled_for_forward("anchor", 101, False))
 
     def test_gathers_physical_blocks_in_logical_order(self) -> None:
         cache = torch.zeros(5, 2, 2, 1, 1)
