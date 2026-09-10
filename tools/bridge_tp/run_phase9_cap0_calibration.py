@@ -120,6 +120,9 @@ class ManagedProcess:
     process: subprocess.Popen[bytes]
     handle: Any
     log_path: Path
+    started_unix_s: float
+    ended_unix_s: float | None = None
+    returncode: int | None = None
 
 
 def start_process(
@@ -139,7 +142,7 @@ def start_process(
     if os.name != "nt":
         kwargs["start_new_session"] = True
     process = subprocess.Popen(command, **kwargs)
-    return ManagedProcess(name, process, handle, log_path)
+    return ManagedProcess(name, process, handle, log_path, time.time())
 
 
 def signal_process(item: ManagedProcess, sig: signal.Signals) -> None:
@@ -173,6 +176,8 @@ def stop_processes(processes: list[ManagedProcess]) -> None:
                 signal_process(item, signal.SIGKILL)
                 item.process.wait(timeout=10)
         item.handle.close()
+        item.ended_unix_s = time.time()
+        item.returncode = item.process.returncode
 
 
 def wait_healthy(url: str, process: ManagedProcess, timeout_s: float) -> None:

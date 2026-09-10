@@ -6,7 +6,8 @@
 
 - `BRIDGE`：Shadow 只传新 KV；到冻结边界后才传历史 KV，控制状态为
   `LOCAL -> SHADOW -> HANDOFF -> TAKEOVER`。
-- `SHADOW_ONLY`：Shadow 同时传历史 KV（从边界向前的快照）和持续产生的
+- `SHADOW_ONLY`：Shadow 从请求第 0 个 token 开始，按 token 递增顺序传历史
+  KV，同时传持续产生的
   新 KV；历史必须在冻结边界前完成 staging，四个 TP4 rank 完成精确恢复后，
   控制状态直接为 `LOCAL -> SHADOW -> TAKEOVER`。
 
@@ -47,6 +48,12 @@ TP4 dormant-request KV 预分配与原位 patch 接口。
 - `history_ready_before_freeze_ms`：历史传输领先冻结边界的裕量；必须非负。
 - `shadow_tpot_p99_ms`：提前复制对 TP4 原生流量的 Shadow 期干扰。
 - `paired_comparisons.csv`：逐 repetition 的 Shadow-only 相对 Bridge 差值。
+- `process_lifetimes.json`：TP1、TP4、stager、controller 和负载进程的占用时段。
+- `slo`：可配置 TPOT、TTFT、E2E 和切换停顿阈值及对应违约数/违约率。
+
+两个系统不必在同一分支执行。新分支使用 `--shadow-only-only` 只运行新方案；
+随后回到 Bridge 分支，在相同冻结输入与参数下只运行旧方案，最后按 repetition
+和运行顺序配对比较。
 
 只有多轮配对结果稳定、置信区间不跨零时，才能判断哪条路径性能更好；单次
 smoke 只验证机制与数据链路，不用于论文结论。
