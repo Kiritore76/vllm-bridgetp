@@ -29,6 +29,7 @@ from vllm.bridge_tp.controller.events import (
 )
 from vllm.bridge_tp.controller.online_io import (
     ProxyRecorder,
+    build_gpu_resident_shadow_target_request,
     build_target_request,
     honored_generation,
 )
@@ -106,6 +107,25 @@ class TestOnlineArtifacts(unittest.TestCase):
             request["kv_transfer_params"]["bridgetp_migration_id"],
             "migration",
         )
+        self.assertFalse(strict_greedy_sampling_errors(request))
+
+    def test_gpu_resident_target_reserves_future_token_positions(self) -> None:
+        source = freeze_strict_greedy_sampling(
+            {"model": "m", "max_tokens": 100, "logprobs": 20}
+        )
+        session = {
+            "num_prompt_tokens": 3,
+            "all_known_token_ids": [1, 2, 3, 4, 5],
+            "migration_id": "migration",
+        }
+        request, cutover = build_gpu_resident_shadow_target_request(
+            source, session, "run", 10
+        )
+
+        self.assertEqual(cutover, 10)
+        self.assertEqual(len(request["prompt"]), 13)
+        self.assertEqual(request["prompt"][:5], [1, 2, 3, 4, 5])
+        self.assertEqual(request["max_tokens"], 90)
         self.assertFalse(strict_greedy_sampling_errors(request))
 
     def test_source_request_freezes_model_sampling_defaults(self) -> None:

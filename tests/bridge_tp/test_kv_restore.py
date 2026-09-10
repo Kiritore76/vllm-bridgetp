@@ -5,7 +5,7 @@ import unittest
 
 import torch
 
-from vllm.bridge_tp.kv_restore import inject_rank_shard
+from vllm.bridge_tp.kv_restore import inject_rank_delta, inject_rank_shard
 
 
 class TestKVRestore(unittest.TestCase):
@@ -67,6 +67,32 @@ class TestKVRestore(unittest.TestCase):
                 self.source,
                 [1, 2, 3],
                 block_axis=0,
+            )
+
+    def test_injects_delta_across_noncontiguous_blocks(self) -> None:
+        destination = {"layer.0": torch.full((12, 2, 4, 2, 5), -1.0)}
+        delta = {
+            "layer.0": torch.arange(3 * 2 * 2 * 5, dtype=torch.float32).reshape(
+                3, 2, 2, 5
+            )
+        }
+        result = inject_rank_delta(
+            destination,
+            delta,
+            [7, 2, 10],
+            start_token=3,
+            end_token=6,
+            block_axis=0,
+            block_size=4,
+        )
+
+        self.assertTrue(result["exact_readback"])
+        for block, offset, delta_index in ((7, 3, 0), (2, 0, 1), (2, 1, 2)):
+            self.assertTrue(
+                torch.equal(
+                    destination["layer.0"][block, :, offset],
+                    delta["layer.0"][delta_index],
+                )
             )
 
 

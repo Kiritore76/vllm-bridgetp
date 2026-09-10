@@ -2,6 +2,8 @@
 
 import unittest
 from argparse import Namespace
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from tools.bridge_tp.build_shadow_strategy_online_manifest import build_manifest
 from tools.bridge_tp.run_phase9_capacity_background import percentile
@@ -10,7 +12,11 @@ from tools.bridge_tp.run_shadow_rate_load_matrix import (
     rate_label,
     resolve_design,
 )
-from tools.bridge_tp.run_shadow_strategy_online_validation import summarize_slo
+from tools.bridge_tp.run_shadow_strategy_online_validation import (
+    build_controller_config_overrides,
+    summarize_slo,
+    write_measurements,
+)
 from vllm.bridge_tp.online_shadow_strategy_protocol import (
     summarize_background_windows,
     validate_strategy_timing,
@@ -35,6 +41,17 @@ class TestOnlineShadowManifest(unittest.TestCase):
 
 
 class TestOnlineStrategyTiming(unittest.TestCase):
+    def test_controller_window_tracks_cli_boundaries(self) -> None:
+        overrides = build_controller_config_overrides(
+            trigger_output_tokens=64,
+            cutover_output_tokens=160,
+            fixed_rate_gib_s=0.4,
+        )
+        self.assertEqual(overrides["handoff_output_tokens"], 96)
+        expected_rate = 0.4 * 1024**3
+        self.assertEqual(overrides["rate"]["b_min_bytes_s"], expected_rate)
+        self.assertEqual(overrides["rate"]["b_max_bytes_s"], expected_rate)
+
     def test_s_new_requires_history_at_bridge(self) -> None:
         self.assertFalse(
             validate_strategy_timing(
@@ -87,7 +104,48 @@ class TestOnlineWindows(unittest.TestCase):
         self.assertEqual(windows["POST_COMMIT"]["samples"], 1)
         self.assertEqual(percentile([1.0, 3.0], 0.5), 2.0)
 
-    def test_slo_summary_counts_violations(self) -> None:
+    def test_writes_shadow_only_architecture_pair(self) -> None:
+        windows = {
+            name: {
+                "jobs": 1,
+                "samples": 1,
+                "tpot_p50_ms": 1.0,
+                "tpot_p95_ms": 1.0,
+                "tpot_p99_ms": 1.0,
+            }
+            for name in ("PRE_SHADOW", "SHADOW", "BRIDGE", "POST_COMMIT")
+        }
+        runs = []
+        for architecture, strategy, stall in (
+            ("BRIDGE", "S_NEW", 20.0),
+            ("SHADOW_ONLY", "S_NEW_OLD", 10.0),
+        ):
+            runs.append(
+                {
+                    "repetition": 1,
+                    "architecture": architecture,
+                    "strategy": strategy,
+                    "acceptance": {
+                        "status": "PASS",
+                        "shadow_duration_ms": 100.0,
+                        "bridge_to_commit_ms": stall,
+                        "handoff_stall_ms": stall,
+                        "source_origin_tokens": 10,
+                        "target_origin_tokens": 20,
+                        "target_tpot_windows": windows,
+                    },
+                }
+            )
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_measurements(root, runs)
+            paired = (root / "paired_comparisons.csv").read_text(
+                encoding="utf-8"
+            )
+        self.assertIn("final_sync_ms_saved_by_shadow_only", paired)
+        self.assertIn("10.0", paired)
+
+    def test_slo_summary_counts_token_and_request_violations(self) -> None:
         summary = summarize_slo(
             [
                 {
@@ -103,6 +161,7 @@ class TestOnlineWindows(unittest.TestCase):
             e2e_ms=3000.0,
         )
         self.assertEqual(summary["tpot_interval_violations"], 1)
+        self.assertEqual(summary["request_p99_tpot_violations"], 1)
         self.assertEqual(summary["ttft_violations"], 1)
         self.assertEqual(summary["e2e_violations"], 0)
 

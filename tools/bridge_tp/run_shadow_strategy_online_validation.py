@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Run paired S_NEW/S_NEW_OLD experiments through live TP1/TP4 vLLM servers.
+"""Run paired Shadow-policy or Bridge/Shadow-only live TP1/TP4 experiments.
 
 This experiment uses the real Phase 8 KV export, TCP staging, TP4 restore,
 atomic takeover, and unified response proxy.  It measures target-request TPOT
@@ -61,6 +61,27 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="run only the original S_NEW Bridge system on this branch",
     )
+    parser.add_argument(
+        "--architecture-comparison",
+        action="store_true",
+        help=(
+            "pair the original Bridge path (S_NEW) with direct Shadow-only "
+            "takeover (S_NEW_OLD) instead of comparing copy policies alone"
+        ),
+    )
+    parser.add_argument(
+        "--shadow-only-only",
+        action="store_true",
+        help="run only the Shadow-only system on this branch",
+    )
+    parser.add_argument(
+        "--gpu-resident-shadow",
+        action="store_true",
+        help=(
+            "reserve TP4 blocks at Shadow start and inject history/deltas "
+            "before direct takeover"
+        ),
+    )
     parser.add_argument("--slo-tpot-ms", type=float, default=50.0)
     parser.add_argument("--slo-ttft-ms", type=float, default=1000.0)
     parser.add_argument("--slo-e2e-ms", type=float, default=60000.0)
@@ -104,6 +125,21 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise ValueError("formal online validation requires at least three runs")
     if args.repetitions <= 0:
         raise ValueError("repetitions must be positive")
+    selected_modes = sum(
+        bool(value)
+        for value in (
+            args.bridge_only,
+            args.architecture_comparison,
+            args.shadow_only_only,
+        )
+    )
+    if selected_modes > 1:
+        raise ValueError(
+            "select at most one of Bridge-only, architecture comparison, "
+            "or Shadow-only"
+        )
+    if args.gpu_resident_shadow and not args.shadow_only_only:
+        raise ValueError("GPU-resident Shadow currently requires --shadow-only-only")
     if set(args.strategy_order) != {"S_NEW", "S_NEW_OLD"}:
         raise ValueError("strategy order must contain S_NEW and S_NEW_OLD once")
     if not 0 < args.trigger_output_tokens < args.cutover_output_tokens:
@@ -172,9 +208,33 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         "target_jobs": len(jobs),
         "trigger_output_tokens": args.trigger_output_tokens,
         "cutover_output_tokens": args.cutover_output_tokens,
+        "shadow_window_output_tokens": (
+            args.cutover_output_tokens - args.trigger_output_tokens
+        ),
         "minimum_ready_target_jobs": args.minimum_ready_target_jobs,
         "fixed_rate_gib_s": args.fixed_rate_gib_s,
     }
+
+
+def build_controller_config_overrides(
+    *,
+    trigger_output_tokens: int,
+    cutover_output_tokens: int,
+    fixed_rate_gib_s: float | None,
+) -> dict[str, Any]:
+    """Keep the controller's configured Shadow window equal to the CLI design."""
+    overrides: dict[str, Any] = {
+        "handoff_output_tokens": cutover_output_tokens - trigger_output_tokens
+    }
+    if fixed_rate_gib_s is not None:
+        fixed_rate_bytes_s = fixed_rate_gib_s * 1024**3
+        overrides["rate"] = {
+            "b_min_bytes_s": fixed_rate_bytes_s,
+            "b_max_bytes_s": fixed_rate_bytes_s,
+            "b_start_bytes_s": fixed_rate_bytes_s,
+            "b_hard_max_bytes_s": fixed_rate_bytes_s,
+        }
+    return overrides
 
 
 def _load_rows(path: Path) -> list[dict[str, Any]]:
@@ -235,9 +295,13 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
         row: dict[str, Any] = {
             "repetition": run["repetition"],
             "strategy": run["strategy"],
+            "architecture": run.get("architecture", "BRIDGE"),
             "status": acceptance["status"],
             "shadow_duration_ms": acceptance["shadow_duration_ms"],
             "bridge_to_commit_ms": acceptance["bridge_to_commit_ms"],
+            "final_sync_to_commit_ms": acceptance.get(
+                "final_sync_to_commit_ms"
+            ),
             "handoff_stall_ms": acceptance["handoff_stall_ms"],
             "source_origin_tokens": acceptance["source_origin_tokens"],
             "target_origin_tokens": acceptance["target_origin_tokens"],
@@ -247,6 +311,15 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
                 "history_observed_aggregate_gib_s"
             ),
             "history_max_stage_ms": acceptance.get("history_max_stage_ms"),
+            "history_ready_before_freeze_ms": acceptance.get(
+                "history_ready_before_freeze_ms"
+            ),
+            "history_gpu_ready_before_freeze_ms": acceptance.get(
+                "history_gpu_ready_before_freeze_ms"
+            ),
+            "gpu_resident_shadow": acceptance.get("gpu_resident_shadow"),
+            "gpu_history_block_acks": acceptance.get("gpu_history_block_acks"),
+            "gpu_delta_acks": acceptance.get("gpu_delta_acks"),
             "anchor_tpot_p50_ms": acceptance.get("anchor_tpot", {}).get(
                 "p50_ms"
             ),
@@ -289,15 +362,26 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
     paired: list[dict[str, Any]] = []
     repetitions = sorted({int(row["repetition"]) for row in rows})
     for repetition in repetitions:
+        architecture_comparison = any(
+            row.get("architecture") == "SHADOW_ONLY" for row in rows
+        )
+        label_field = "architecture" if architecture_comparison else "strategy"
         by_strategy = {
-            str(row["strategy"]): row
+            str(row[label_field]): row
             for row in rows
             if int(row["repetition"]) == repetition
         }
-        if set(by_strategy) != {"S_NEW", "S_NEW_OLD"}:
+        expected_labels = (
+            {"BRIDGE", "SHADOW_ONLY"}
+            if architecture_comparison
+            else {"S_NEW", "S_NEW_OLD"}
+        )
+        if set(by_strategy) != expected_labels:
             continue
-        new = by_strategy["S_NEW"]
-        old = by_strategy["S_NEW_OLD"]
+        new = by_strategy["BRIDGE" if architecture_comparison else "S_NEW"]
+        old = by_strategy[
+            "SHADOW_ONLY" if architecture_comparison else "S_NEW_OLD"
+        ]
         required = (
             "bridge_to_commit_ms",
             "handoff_stall_ms",
@@ -326,6 +410,26 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
                     - float(new["bridge_tpot_p99_ms"])
                 ),
             }
+            if not architecture_comparison
+            else {
+                "repetition": repetition,
+                "final_sync_ms_saved_by_shadow_only": (
+                    float(new["bridge_to_commit_ms"])
+                    - float(old["bridge_to_commit_ms"])
+                ),
+                "handoff_stall_ms_saved_by_shadow_only": (
+                    float(new["handoff_stall_ms"])
+                    - float(old["handoff_stall_ms"])
+                ),
+                "shadow_target_p99_ms_delta_shadow_only": (
+                    float(old["shadow_tpot_p99_ms"])
+                    - float(new["shadow_tpot_p99_ms"])
+                ),
+                "final_sync_target_p99_ms_delta_shadow_only": (
+                    float(old["bridge_tpot_p99_ms"])
+                    - float(new["bridge_tpot_p99_ms"])
+                ),
+            }
         )
     if paired:
         with (out_root / "paired_comparisons.csv").open(
@@ -345,6 +449,7 @@ def accept_online(
     strategy: str,
     minimum_window_samples: int,
     fixed_rate_gib_s: float | None = None,
+    handoff_mode: str = "bridge",
     slo_tpot_ms: float = 50.0,
     slo_ttft_ms: float = 1000.0,
     slo_e2e_ms: float = 60000.0,
@@ -363,6 +468,10 @@ def accept_online(
     initial_stage_receipts = [
         common.read_json(path)
         for path in sorted((controller_dir / "initial_stage_receipts").glob("*.json"))
+    ]
+    gpu_initial_receipts = [
+        common.read_json(path)
+        for path in sorted((controller_dir / "gpu_initial_receipts").glob("*.json"))
     ]
 
     shadow_start = float(session["shadow_started_unix_s"])
@@ -392,6 +501,9 @@ def accept_online(
         errors.append("session recorded the wrong Shadow strategy")
     if staging.get("shadow_strategy") != strategy:
         errors.append("staging recorded the wrong Shadow strategy")
+    expected_order = "TOKEN_ASCENDING_FROM_REQUEST_START"
+    if session.get("history_copy_order") != expected_order:
+        errors.append("history KV was not recorded as head-first token order")
     errors.extend(
         validate_strategy_timing(
             strategy,
@@ -400,8 +512,86 @@ def accept_online(
             history_start_unix_s=history_start,
         )
     )
-    if transitions[-3:] != ["SHADOW", "HANDOFF", "TAKEOVER"]:
+    expected_transitions = (
+        ["SHADOW", "TAKEOVER"]
+        if handoff_mode == "shadow-only"
+        else ["SHADOW", "HANDOFF", "TAKEOVER"]
+    )
+    if transitions[-len(expected_transitions):] != expected_transitions:
         errors.append(f"unexpected migration transitions: {transitions!r}")
+    history_completed = [
+        float(row.get("completed_unix_s", float("inf")))
+        for row in initial_stage_receipts
+    ]
+    if handoff_mode == "shadow-only" and (
+        len(history_completed) != 4
+        or any(value > bridge_start for value in history_completed)
+    ):
+        errors.append(
+            "Shadow-only history did not finish staging on all ranks before "
+            "the source freeze boundary"
+        )
+    history_ready_before_freeze_ms = (
+        (bridge_start - max(history_completed)) * 1000
+        if len(history_completed) == 4
+        else None
+    )
+    gpu_resident_shadow = staging.get("gpu_resident_shadow") is True
+    gpu_history_completed = [
+        float(row.get("completed_unix_s", float("inf")))
+        for row in gpu_initial_receipts
+    ]
+    if gpu_resident_shadow and (
+        len(gpu_history_completed) != 4
+        or any(value > bridge_start for value in gpu_history_completed)
+        or not all(row.get("exact_readback") is True for row in gpu_initial_receipts)
+    ):
+        errors.append(
+            "initial history was not GPU-resident on all ranks before cutover"
+        )
+    if gpu_resident_shadow:
+        initial_end = int(session["num_computed_tokens"])
+        final_end = int(cutover["num_computed_tokens"])
+        expected_blocks = int(session["num_blocks"])
+        for rank in range(4):
+            block_paths = sorted(
+                (
+                    controller_dir / "gpu_block_receipts" / f"tp_rank_{rank}"
+                ).glob("*.json")
+            )
+            blocks = [common.read_json(path) for path in block_paths]
+            if (
+                len(blocks) != expected_blocks
+                or [int(row.get("logical_block", -1)) for row in blocks]
+                != list(range(expected_blocks))
+                or not all(row.get("exact_readback") is True for row in blocks)
+            ):
+                errors.append(f"TP4 rank {rank} history block ACKs are incomplete")
+            delta_paths = sorted(
+                (
+                    controller_dir / "gpu_delta_receipts" / f"tp_rank_{rank}"
+                ).glob("*.json")
+            )
+            expected_start = initial_end
+            for path in delta_paths:
+                delta = common.read_json(path)
+                start = int(delta.get("start_token", -1))
+                end = int(delta.get("end_token", -1))
+                if (
+                    start != expected_start
+                    or end <= start
+                    or delta.get("exact_readback") is not True
+                ):
+                    errors.append(f"TP4 rank {rank} delta ACK coverage is invalid")
+                    break
+                expected_start = end
+            if expected_start != final_end:
+                errors.append(f"TP4 rank {rank} final GPU watermark is incomplete")
+    history_gpu_ready_before_freeze_ms = (
+        (bridge_start - max(gpu_history_completed)) * 1000
+        if len(gpu_history_completed) == 4
+        else None
+    )
     if len(end_rows) != 1 or end_rows[0].get("final_state") != "TAKEOVER":
         errors.append("controller did not finish in TAKEOVER")
     elif end_rows[0].get("trigger_path") != "DIAGNOSTIC_FIXED_BOUNDARY":
@@ -473,16 +663,38 @@ def accept_online(
         for row in background.get("results", [])
         if row.get("status") == "COMPLETED"
     )
+    bridge_to_commit_ms = (committed - bridge_start) * 1000
+    reported_windows = dict(windows)
+    if handoff_mode == "shadow-only":
+        # Preserve the legacy BRIDGE key for old result readers while naming
+        # the actual Shadow-only interval accurately for new analyses.
+        reported_windows["FINAL_SYNC"] = dict(windows["BRIDGE"])
     return {
         "format_version": 1,
         "status": "PASS" if not errors else "FAIL",
-        "evidence_class": "ONLINE_VLLM_PHASE8_STRATEGY_COMPARISON",
+        "evidence_class": (
+            "ONLINE_VLLM_GPU_RESIDENT_SHADOW_TAKEOVER"
+            if gpu_resident_shadow
+            else "ONLINE_VLLM_SHADOW_ONLY_TAKEOVER"
+            if handoff_mode == "shadow-only"
+            else "ONLINE_VLLM_PHASE8_STRATEGY_COMPARISON"
+        ),
         "evidence_boundary": (
-            "Real vLLM TP1/TP4 export, transfer, restore, takeover, unified "
-            "response, and target-request TPOT. Bridge waits for full history; "
-            "online remote attention is not executed."
+            "Real vLLM TP1/TP4 export, incremental CPU relay into reserved "
+            "TP4 GPU blocks, four-rank watermark, atomic takeover, unified "
+            "response, and target-request TPOT. TP4 performs no migrated-"
+            "request forward before commit; online remote attention is not "
+            "executed."
+            if gpu_resident_shadow
+            else "Real vLLM TP1/TP4 export, transfer, restore, takeover, "
+            "unified response, and target-request TPOT. The Shadow-only "
+            "variant skips the controller Bridge/Handoff state, but stages "
+            "history on CPU and restores TP4 after the final source freeze. "
+            "The Bridge baseline defers history until that boundary. Online "
+            "remote attention is not executed."
         ),
         "strategy": strategy,
+        "handoff_mode": handoff_mode,
         "fixed_rate_gib_s": fixed_rate_gib_s,
         "observed_controller_rates_gib_s": sorted(set(observed_rates)),
         "history_payload_bytes": sum(
@@ -496,9 +708,24 @@ def accept_online(
             (float(row.get("stage_ms", 0.0)) for row in initial_stage_receipts),
             default=0.0,
         ),
+        "history_ready_before_freeze_ms": history_ready_before_freeze_ms,
+        "history_gpu_ready_before_freeze_ms": history_gpu_ready_before_freeze_ms,
+        "gpu_resident_shadow": gpu_resident_shadow,
+        "gpu_history_block_acks": sum(
+            1
+            for _ in (controller_dir / "gpu_block_receipts").glob("**/*.json")
+        ),
+        "gpu_delta_acks": sum(
+            1
+            for _ in (controller_dir / "gpu_delta_receipts").glob("**/*.json")
+        ),
+        "history_copy_order": session.get("history_copy_order"),
         "target_jobs_completed": background.get("completed"),
         "shadow_duration_ms": (bridge_start - shadow_start) * 1000,
-        "bridge_to_commit_ms": (committed - bridge_start) * 1000,
+        "bridge_to_commit_ms": bridge_to_commit_ms,
+        "final_sync_to_commit_ms": (
+            bridge_to_commit_ms if handoff_mode == "shadow-only" else None
+        ),
         "history_transfer_started_unix_s": history_start,
         "history_transfer_phase": session.get("history_transfer_phase"),
         "handoff_stall_ms": handoff_stall_ms,
@@ -525,7 +752,7 @@ def accept_online(
         "target_origin_tokens": proxy.get("target_origin_tokens"),
         "receiver_ranks": receipts.get("receiver_ranks"),
         "exact_readback": receipts.get("exact_readback"),
-        "target_tpot_windows": windows,
+        "target_tpot_windows": reported_windows,
         "errors": errors,
     }
 
@@ -544,6 +771,9 @@ def main() -> None:
         "guard_free_kv_tokens": guard,
         "strategies": args.strategy_order,
         "bridge_only": args.bridge_only,
+        "architecture_comparison": args.architecture_comparison,
+        "shadow_only_only": args.shadow_only_only,
+        "gpu_resident_shadow": args.gpu_resident_shadow,
         "repetitions": args.repetitions,
         "fixed_rate_gib_s": args.fixed_rate_gib_s,
         "slo_thresholds": {
@@ -572,11 +802,27 @@ def main() -> None:
     common.write_json(out_root / "batch_status.json", batch)
     try:
         for repetition in range(1, args.repetitions + 1):
-            order = ["S_NEW"] if args.bridge_only else list(args.strategy_order)
+            variants = (
+                [("BRIDGE", "S_NEW", "bridge")]
+                if args.bridge_only
+                else (
+                [
+                    ("BRIDGE", "S_NEW", "bridge"),
+                    ("SHADOW_ONLY", "S_NEW_OLD", "shadow-only"),
+                ]
+                if args.architecture_comparison
+                else [("SHADOW_ONLY", "S_NEW_OLD", "shadow-only")]
+                if args.shadow_only_only
+                else [
+                    (strategy, strategy, "bridge")
+                    for strategy in args.strategy_order
+                ]
+                )
+            )
             if repetition % 2 == 0:
-                order.reverse()
-            for strategy in order:
-                label = f"r{repetition:02d}_{strategy.lower()}"
+                variants.reverse()
+            for architecture, strategy, handoff_mode in variants:
+                label = f"r{repetition:02d}_{architecture.lower()}"
                 rep_args = copy.copy(args)
                 rep_args.out_root = out_root / label
                 run_id = f"{out_root.name}-{label}"
@@ -587,6 +833,7 @@ def main() -> None:
                     expected_jobs: int,
                     expected_anchor_tokens: int,
                     selected: str = strategy,
+                    selected_handoff: str = handoff_mode,
                 ) -> dict[str, Any]:
                     return accept_online(
                         controller_dir,
@@ -596,6 +843,7 @@ def main() -> None:
                         strategy=selected,
                         minimum_window_samples=args.minimum_window_samples,
                         fixed_rate_gib_s=args.fixed_rate_gib_s,
+                        handoff_mode=selected_handoff,
                         slo_tpot_ms=args.slo_tpot_ms,
                         slo_ttft_ms=args.slo_ttft_ms,
                         slo_e2e_ms=args.slo_e2e_ms,
@@ -603,20 +851,15 @@ def main() -> None:
                     )
 
                 source_env_overrides = {"BRIDGETP_SHADOW_STRATEGY": strategy}
-                controller_config_overrides = None
+                controller_config_overrides = build_controller_config_overrides(
+                    trigger_output_tokens=args.trigger_output_tokens,
+                    cutover_output_tokens=args.cutover_output_tokens,
+                    fixed_rate_gib_s=args.fixed_rate_gib_s,
+                )
                 if args.fixed_rate_gib_s is not None:
                     source_env_overrides["BRIDGETP_STREAM_RATE_GIB_S"] = str(
                         args.fixed_rate_gib_s
                     )
-                    fixed_rate_bytes_s = args.fixed_rate_gib_s * 1024**3
-                    controller_config_overrides = {
-                        "rate": {
-                            "b_min_bytes_s": fixed_rate_bytes_s,
-                            "b_max_bytes_s": fixed_rate_bytes_s,
-                            "b_start_bytes_s": fixed_rate_bytes_s,
-                            "b_hard_max_bytes_s": fixed_rate_bytes_s,
-                        }
-                    }
 
                 result = scenario_runner.run(
                     rep_args,
@@ -627,14 +870,19 @@ def main() -> None:
                     repetition=repetition,
                     run_id=run_id,
                     scenario="shadow_online",
-                    scenario_title=f"Online Shadow strategy {strategy}",
+                    scenario_title=(
+                        f"Online {architecture} architecture comparison"
+                        if args.architecture_comparison
+                        else f"Online Shadow strategy {strategy}"
+                    ),
                     provenance_status=(
                         "SMOKE_NOT_REPORTABLE"
                         if args.phase == "smoke"
                         else "FORMAL_REPETITION"
                     ),
                     platform_note=(
-                        f"ONLINE SHADOW {strategy}; real Phase 8 takeover; "
+                        f"ONLINE {architecture} / {strategy}; real Phase 8 "
+                        "takeover; "
                         "no online remote attention"
                     ),
                     success_status="PASS",
@@ -648,7 +896,10 @@ def main() -> None:
                         str(args.trigger_output_tokens),
                         "--diagnostic-cutover-output-tokens",
                         str(args.cutover_output_tokens),
-                    ],
+                        "--handoff-mode",
+                        handoff_mode,
+                    ]
+                    + (["--gpu-resident-shadow"] if args.gpu_resident_shadow else []),
                     background_before_controller=True,
                     background_lead_s=args.background_lead_s,
                     background_ready_jobs=args.minimum_ready_target_jobs,
@@ -657,6 +908,8 @@ def main() -> None:
                     {
                         "repetition": repetition,
                         "strategy": strategy,
+                        "architecture": architecture,
+                        "handoff_mode": handoff_mode,
                         "status": result["status"],
                         "root": str(rep_args.out_root.resolve()),
                         "acceptance": result["acceptance"],
@@ -665,7 +918,8 @@ def main() -> None:
                 common.write_json(out_root / "batch_status.json", batch)
 
         errors = [
-            f"r{row['repetition']:02d} {row['strategy']} failed"
+            f"r{row['repetition']:02d} "
+            f"{row.get('architecture', row['strategy'])} failed"
             for row in batch["runs"]
             if row.get("status") != "PASS"
             or row.get("acceptance", {}).get("status") != "PASS"
@@ -674,7 +928,9 @@ def main() -> None:
             "format_version": 1,
             "status": "PASS" if not errors else "FAIL",
             "phase": args.phase,
-            "expected_runs": args.repetitions * (1 if args.bridge_only else 2),
+            "expected_runs": args.repetitions * (
+                1 if (args.bridge_only or args.shadow_only_only) else 2
+            ),
             "recorded_runs": len(batch["runs"]),
             "runs": batch["runs"],
             "errors": errors,

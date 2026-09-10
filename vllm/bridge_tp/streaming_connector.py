@@ -5,10 +5,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
 import re
 import socket
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from vllm.bridge_tp.block_layout import snapshot_target_block_ids
-from vllm.bridge_tp.kv_restore import inject_rank_shard
+from vllm.bridge_tp.kv_restore import inject_rank_delta, inject_rank_shard
 from vllm.bridge_tp.stream_protocol import (
     MIGRATION_PARAM,
     PROTOCOL_VERSION,
@@ -46,6 +49,10 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+class _ShadowCancelled(RuntimeError):
+    pass
+
+
 @dataclass
 class BridgeTPStreamRequest:
     migration_id: str
@@ -53,6 +60,7 @@ class BridgeTPStreamRequest:
     target_request_id: str
     target_block_ids: list[int]
     num_computed_tokens: int
+    gpu_resident_shadow: bool = False
 
 
 @dataclass
@@ -141,8 +149,24 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             raise ValueError("BridgeTP Phase 6 requires one KV-cache group")
         self._target_model = str(vllm_config.model_config.model)
         self._target_block_size = int(vllm_config.cache_config.block_size)
+        self.gpu_resident_shadow = bool(
+            self._kv_transfer_config.get_from_extra_config(
+                "bridgetp_gpu_resident_shadow", False
+            )
+        )
+        self.shadow_cutover_output_tokens = int(
+            self._kv_transfer_config.get_from_extra_config(
+                "bridgetp_shadow_cutover_output_tokens", 0
+            )
+        )
         self._manifest: dict[str, Any] | None = None
         self._pending_requests: dict[str, Request] = {}
+        self._active_requests: dict[str, Request] = {}
+        self._registered_kv_caches: dict[str, torch.Tensor] = {}
+        self._load_threads: dict[str, threading.Thread] = {}
+        self._completed_recvs: set[str] = set()
+        self._reported_recvs: set[str] = set()
+        self._load_errors: dict[str, BaseException] = {}
         self._claimed_target_request_id: str | None = None
         logger.warning(
             "BridgeTP Phase 6 streaming connector enabled; target waits for %s",
@@ -205,9 +229,17 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             return False
         manifest = self._load_manifest()
         prompt = request.prompt_token_ids
-        prompt_matches = prompt is not None and list(prompt) == list(
-            manifest["all_known_token_ids"]
-        )
+        if self.gpu_resident_shadow:
+            known = list(manifest["all_known_token_ids"])
+            prompt_matches = (
+                prompt is not None
+                and list(prompt[: len(known)]) == known
+                and request.num_tokens == self._planned_known_tokens(manifest)
+            )
+        else:
+            prompt_matches = prompt is not None and list(prompt) == list(
+                manifest["all_known_token_ids"]
+            )
         if migration_id != manifest["migration_id"]:
             raise ValueError(
                 "BridgeTP target migration id differs from the active manifest: "
@@ -218,9 +250,20 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 "Phase 6 target prompt must exactly equal the live snapshot token "
                 "history"
             )
-        if request.num_tokens != int(manifest["num_computed_tokens"]) + 1:
+        expected_computed = self._external_computed_tokens(manifest)
+        if request.num_tokens != expected_computed + 1:
             raise ValueError("Phase 6 requires exactly one pending token")
         return True
+
+    def _planned_known_tokens(self, manifest: dict[str, Any]) -> int:
+        if not self.gpu_resident_shadow:
+            return int(manifest["num_computed_tokens"]) + 1
+        if self.shadow_cutover_output_tokens <= 0:
+            raise ValueError("GPU-resident Shadow requires a cutover boundary")
+        return int(manifest["num_prompt_tokens"]) + self.shadow_cutover_output_tokens
+
+    def _external_computed_tokens(self, manifest: dict[str, Any]) -> int:
+        return self._planned_known_tokens(manifest) - 1
 
     def get_num_new_matched_tokens(
         self,
@@ -238,7 +281,11 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             and self._claimed_target_request_id != request.request_id
         ):
             raise RuntimeError("Phase 6 migration session was already claimed")
-        return int(self._load_manifest()["num_computed_tokens"]), False
+        manifest = self._load_manifest()
+        return (
+            self._external_computed_tokens(manifest),
+            self.gpu_resident_shadow,
+        )
 
     def update_state_after_alloc(
         self,
@@ -251,7 +298,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         manifest = self._load_manifest()
         if not self._request_matches(request):
             raise ValueError("Allocated request does not match Phase 6 session")
-        if num_external_tokens != int(manifest["num_computed_tokens"]):
+        if num_external_tokens != self._external_computed_tokens(manifest):
             raise ValueError("Target external-token count differs from snapshot")
         block_ids = blocks.get_block_ids()
         self._snapshot_target_block_ids(
@@ -260,7 +307,9 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             "Target block allocation differs from live snapshot",
         )
         self._claimed_target_request_id = request.request_id
+        setattr(request, "_bridgetp_target_block_ids", block_ids)
         self._pending_requests[request.request_id] = request
+        self._active_requests[request.request_id] = request
 
     def _snapshot_target_block_ids(
         self,
@@ -278,6 +327,18 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         decode.
         """
         manifest = self._load_manifest()
+        if self.gpu_resident_shadow:
+            planned_blocks = math.ceil(
+                self._external_computed_tokens(manifest)
+                / int(manifest["block_size"])
+            )
+            return snapshot_target_block_ids(
+                block_ids,
+                request_num_tokens=request.num_tokens,
+                block_size=int(manifest["block_size"]),
+                snapshot_blocks=planned_blocks,
+                error_message=error_message,
+            )
         return snapshot_target_block_ids(
             block_ids,
             request_num_tokens=request.num_tokens,
@@ -293,6 +354,26 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         if not self._pending_requests:
             return metadata
         manifest = self._load_manifest()
+        if self.gpu_resident_shadow:
+            pending = list(self._pending_requests.items())
+            self._pending_requests.clear()
+            for request_id, request in pending:
+                blocks = self._snapshot_target_block_ids(
+                    request,
+                    self._allocated_block_ids(request_id),
+                    "Worker block table differs from allocation",
+                )
+                metadata.requests.append(
+                    BridgeTPStreamRequest(
+                        migration_id=str(manifest["migration_id"]),
+                        source_request_id=str(manifest["source_request_id"]),
+                        target_request_id=request_id,
+                        target_block_ids=blocks,
+                        num_computed_tokens=self._external_computed_tokens(manifest),
+                        gpu_resident_shadow=True,
+                    )
+                )
+            return metadata
         for new_request in scheduler_output.scheduled_new_reqs:
             request = self._pending_requests.pop(new_request.req_id, None)
             if request is None:
@@ -319,6 +400,13 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             raise RuntimeError("Allocated Phase 6 request was not scheduled")
         return metadata
 
+    def _allocated_block_ids(self, request_id: str) -> tuple[list[int], ...]:
+        request = self._active_requests[request_id]
+        blocks = getattr(request, "_bridgetp_target_block_ids", None)
+        if blocks is None:
+            raise RuntimeError("GPU-resident target allocation was not recorded")
+        return blocks
+
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
         del kwargs
         metadata = self._get_connector_metadata()
@@ -329,6 +417,9 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         if len(metadata.requests) != 1:
             raise ValueError("Phase 6 restores one request at a time")
         request = metadata.requests[0]
+        if request.gpu_resident_shadow:
+            self._start_live_gpu_load(request)
+            return
         manifest = self._load_manifest()
         tp_rank = get_tp_group().rank_in_group
         record = manifest["ranks"][tp_rank]
@@ -545,6 +636,319 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         del layer_name
+
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        """Retain paged-KV tensors for asynchronous Shadow injection."""
+        self._registered_kv_caches = dict(kv_caches)
+
+    def _start_live_gpu_load(self, request: BridgeTPStreamRequest) -> None:
+        if request.target_request_id in self._load_threads:
+            return
+        if not self._registered_kv_caches:
+            raise RuntimeError("TP4 KV caches were not registered with connector")
+        thread = threading.Thread(
+            target=self._live_gpu_load,
+            args=(request,),
+            name=f"bridgetp-live-gpu-{_safe_name(request.target_request_id)}",
+            daemon=True,
+        )
+        self._load_threads[request.target_request_id] = thread
+        thread.start()
+
+    def _wait_for_file(self, path: Path, deadline: float) -> None:
+        while not path.is_file():
+            self._raise_if_shadow_cancelled()
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Timed out waiting for {path}")
+            time.sleep(0.005)
+
+    def _raise_if_shadow_cancelled(self) -> None:
+        if (
+            self.takeover_control_path is None
+            or not self.takeover_control_path.is_file()
+        ):
+            return
+        state = _load_json(self.takeover_control_path).get("state")
+        if state in {"ROLLED_BACK", "CANCELLED"}:
+            raise _ShadowCancelled(f"GPU-resident Shadow ended in {state}")
+
+    def _destination_layers(
+        self, shard_layers: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        destination = {
+            name: tensor
+            for name, tensor in self._registered_kv_caches.items()
+            if name in shard_layers
+        }
+        if set(destination) != set(shard_layers):
+            missing = sorted(set(shard_layers) - set(destination))
+            raise ValueError(f"Target model is missing KV layers: {missing}")
+        return destination
+
+    def _live_gpu_load(self, request: BridgeTPStreamRequest) -> None:
+        request_id = request.target_request_id
+        try:
+            manifest = self._load_manifest()
+            tp_rank = get_tp_group().rank_in_group
+            deadline = time.monotonic() + self.socket_timeout_s
+            queue_dir = self.manifest_path.parent / "live_gpu_queue" / (
+                f"tp_rank_{tp_rank}"
+            )
+            digest = hashlib.sha256()
+            aggregate_bytes = 0
+            device = next(iter(self._registered_kv_caches.values())).device
+            if device.type == "cuda":
+                torch.cuda.set_device(device)
+            started = time.perf_counter()
+            initial_end = int(manifest["num_computed_tokens"])
+            initial_blocks = math.ceil(initial_end / int(manifest["block_size"]))
+            exact_readback = True
+            for logical_block in range(initial_blocks):
+                block_path = queue_dir / f"history_{logical_block:012d}.bin"
+                self._wait_for_file(block_path, deadline)
+                block_bytes = block_path.read_bytes()
+                block = deserialize_rank_payload(block_bytes)
+                if int(block.get("logical_block", -1)) != logical_block:
+                    raise ValueError("History block index differs from filename")
+                block_layers = block.get("layers")
+                if not isinstance(block_layers, dict) or not block_layers:
+                    raise ValueError("Live Shadow history block has no KV layers")
+                validation = inject_rank_shard(
+                    self._destination_layers(block_layers),
+                    block_layers,
+                    [request.target_block_ids[logical_block]],
+                    block_axis=int(manifest["block_axis"]),
+                )
+                exact_readback = (
+                    exact_readback and validation["exact_readback"] is True
+                )
+                digest.update(block_bytes)
+                aggregate_bytes += len(block_bytes)
+                _atomic_json_dump(
+                    {
+                        "format_version": 1,
+                        "status": "BLOCK_GPU_RESIDENT",
+                        "migration_id": request.migration_id,
+                        "target_request_id": request_id,
+                        "tp_rank": tp_rank,
+                        "logical_block": logical_block,
+                        "end_token": min(
+                            (logical_block + 1) * int(manifest["block_size"]),
+                            initial_end,
+                        ),
+                        "exact_readback": validation["exact_readback"],
+                        "completed_unix_s": time.time(),
+                    },
+                    self.manifest_path.parent
+                    / "gpu_block_receipts"
+                    / f"tp_rank_{tp_rank}"
+                    / f"block_{logical_block:012d}.json",
+                )
+            current = initial_end
+            delta_batches = 0
+            _atomic_json_dump(
+                {
+                    "format_version": 1,
+                    "status": "INITIAL_HISTORY_GPU_RESIDENT",
+                    "migration_id": request.migration_id,
+                    "target_request_id": request_id,
+                    "tp_rank": tp_rank,
+                    "end_token": current,
+                    "exact_readback": exact_readback,
+                    "completed_unix_s": time.time(),
+                },
+                self.manifest_path.parent
+                / "gpu_initial_receipts"
+                / f"tp_rank_{tp_rank}.json",
+            )
+            while current < request.num_computed_tokens:
+                candidates = sorted(queue_dir.glob(f"delta_{current:012d}_*.bin"))
+                if not candidates:
+                    self._raise_if_shadow_cancelled()
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"Timed out waiting for TP4 rank {tp_rank} delta {current}"
+                        )
+                    time.sleep(0.005)
+                    continue
+                if len(candidates) != 1:
+                    raise ValueError(f"Ambiguous live delta beginning at {current}")
+                path = candidates[0]
+                delta_bytes = path.read_bytes()
+                delta = deserialize_rank_payload(delta_bytes)
+                start = int(delta["start_token"])
+                end = int(delta["end_token"])
+                if start != current or end > request.num_computed_tokens:
+                    raise ValueError(
+                        f"Non-contiguous live delta [{start}, {end}) at {current}"
+                    )
+                delta_layers = delta.get("layers")
+                if not isinstance(delta_layers, dict) or not delta_layers:
+                    raise ValueError("Live Shadow delta has no KV layers")
+                inject_rank_delta(
+                    self._destination_layers(delta_layers),
+                    delta_layers,
+                    request.target_block_ids,
+                    start_token=start,
+                    end_token=end,
+                    block_axis=int(manifest["block_axis"]),
+                    block_size=int(manifest["block_size"]),
+                )
+                digest.update(delta_bytes)
+                aggregate_bytes += len(delta_bytes)
+                current = end
+                delta_batches += 1
+                delta_receipt = {
+                    "format_version": 1,
+                    "status": "DELTA_GPU_RESIDENT",
+                    "migration_id": request.migration_id,
+                    "target_request_id": request_id,
+                    "tp_rank": tp_rank,
+                    "start_token": start,
+                    "end_token": end,
+                    "exact_readback": True,
+                    "completed_unix_s": time.time(),
+                }
+                _atomic_json_dump(
+                    delta_receipt,
+                    self.manifest_path.parent
+                    / "gpu_delta_receipts"
+                    / f"tp_rank_{tp_rank}"
+                    / f"delta_{start:012d}_{end:012d}.json",
+                )
+                _atomic_json_dump(
+                    {
+                        **delta_receipt,
+                        "status": "STREAMING",
+                        "end_token": current,
+                        "updated_unix_s": time.time(),
+                    },
+                    self.manifest_path.parent
+                    / "gpu_watermarks"
+                    / f"tp_rank_{tp_rank}.json",
+                )
+
+            cutover_path = self.manifest_path.parent / "cutover_manifest.json"
+            self._wait_for_file(cutover_path, deadline)
+            cutover = _load_json(cutover_path)
+            if int(cutover["num_computed_tokens"]) != current:
+                raise ValueError("Cutover boundary differs from GPU watermark")
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            receipt_path = (
+                self.receipt_dir / _safe_name(request_id) / f"tp_rank_{tp_rank}.json"
+            )
+            receipt = {
+                "format_version": 1,
+                "phase": self.expected_phase,
+                "scope": "GPU-resident incremental Shadow before atomic takeover",
+                "status": "TARGET_READY",
+                "migration_id": request.migration_id,
+                "source_request_id": request.source_request_id,
+                "target_request_id": request_id,
+                "tp_rank": tp_rank,
+                "target_block_ids": request.target_block_ids,
+                "num_computed_tokens": current,
+                "pending_tokens_to_compute": 1,
+                "payload_bytes": aggregate_bytes,
+                "payload_sha256": digest.hexdigest(),
+                "delta_batches": delta_batches,
+                "gpu_resident": True,
+                "exact_readback": exact_readback,
+                "target_ready_total_ms": (time.perf_counter() - started) * 1000,
+                "target_ready_unix_s": time.time(),
+            }
+            _atomic_json_dump(receipt, receipt_path)
+            _atomic_json_dump(
+                {
+                    "format_version": 1,
+                    "status": "TARGET_READY",
+                    "migration_id": request.migration_id,
+                    "target_request_id": request_id,
+                    "tp_rank": tp_rank,
+                    "end_token": current,
+                    "payload_bytes": aggregate_bytes,
+                    "payload_sha256": digest.hexdigest(),
+                    "updated_unix_s": time.time(),
+                },
+                self.manifest_path.parent
+                / "gpu_watermarks"
+                / f"tp_rank_{tp_rank}.json",
+            )
+            if self.takeover_control_path is not None:
+                while True:
+                    if self.takeover_control_path.is_file():
+                        control = _load_json(self.takeover_control_path)
+                        if control.get("state") == "COMMITTED":
+                            receipt["status"] = "OWNERSHIP_COMMITTED"
+                            receipt["takeover_state"] = "COMMITTED"
+                            receipt["ownership_ready_total_ms"] = (
+                                time.perf_counter() - started
+                            ) * 1000
+                            _atomic_json_dump(receipt, receipt_path)
+                            break
+                        if control.get("state") in {"ROLLED_BACK", "CANCELLED"}:
+                            raise _ShadowCancelled(
+                                f"Live Shadow ended in {control.get('state')}"
+                            )
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Timed out waiting for Shadow commit")
+                    time.sleep(0.005)
+            self._completed_recvs.add(request_id)
+        except _ShadowCancelled as error:
+            _atomic_json_dump(
+                {
+                    "format_version": 1,
+                    "status": "CLEANED",
+                    "target_request_id": request_id,
+                    "reason": str(error),
+                    "updated_unix_s": time.time(),
+                },
+                self.manifest_path.parent
+                / "gpu_cleanup_receipts"
+                / f"{_safe_name(request_id)}.json",
+            )
+            self._completed_recvs.add(request_id)
+        except BaseException as error:
+            self._load_errors[request_id] = error
+
+    def get_finished(
+        self, finished_req_ids: set[str]
+    ) -> tuple[set[str] | None, set[str] | None]:
+        del finished_req_ids
+        if self._load_errors:
+            request_id, error = next(iter(self._load_errors.items()))
+            raise RuntimeError(
+                f"GPU-resident Shadow load failed for {request_id}: {error}"
+            ) from error
+        ready = self._completed_recvs - self._reported_recvs
+        if not ready:
+            return None, None
+        self._reported_recvs.update(ready)
+        return None, set(ready)
+
+    def update_connector_output(self, connector_output: Any) -> None:
+        for request_id in connector_output.finished_recving or ():
+            request = self._active_requests.get(request_id)
+            if request is None or not self.gpu_resident_shadow:
+                continue
+            cutover_path = self.manifest_path.parent / "cutover_manifest.json"
+            if not cutover_path.is_file():
+                cleanup_path = (
+                    self.manifest_path.parent / "target_cleanup_receipt.json"
+                )
+                if cleanup_path.is_file():
+                    continue
+                raise FileNotFoundError("Shadow receive finished without cutover")
+            cutover = _load_json(cutover_path)
+            token_ids = list(cutover["all_known_token_ids"])
+            if len(token_ids) != request.num_tokens:
+                raise ValueError("Final Shadow token count differs from reservation")
+            request.prompt_token_ids = token_ids
+            request._all_token_ids[:] = token_ids
+            request.num_prompt_tokens = len(token_ids)
+            request.block_hashes.clear()
+            request.update_block_hashes()
 
     def save_kv_layer(
         self,

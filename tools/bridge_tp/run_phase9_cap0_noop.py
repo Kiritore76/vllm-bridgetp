@@ -465,13 +465,32 @@ def run(
         "started_unix_s": time.time(),
     }
     common.write_json(out_root / "status.json", status)
+    gpu_resident_shadow = bool(getattr(args, "gpu_resident_shadow", False))
     try:
         print(f"[{run_id}] starting target TP4", flush=True)
+        target_env = base_env | {"CUDA_VISIBLE_DEVICES": args.tp4_gpus}
+        if gpu_resident_shadow:
+            target_env.update(
+                {
+                    "BRIDGETP_TAKEOVER_ENABLED": "1",
+                    "BRIDGETP_TAKEOVER_MIGRATION_ID": run_id,
+                    "BRIDGETP_TAKEOVER_RUN_DIR": str(controller_dir),
+                }
+            )
         target = common.start_process(
             "target TP4",
             common.server_command(args, 4, args.tp4_port)
-            + ["--kv-transfer-config", common.target_connector(controller_dir)],
-            base_env | {"CUDA_VISIBLE_DEVICES": args.tp4_gpus},
+            + [
+                "--kv-transfer-config",
+                common.target_connector(
+                    controller_dir,
+                    gpu_resident_shadow=gpu_resident_shadow,
+                    cutover_output_tokens=int(
+                        getattr(args, "cutover_output_tokens", 0)
+                    ),
+                ),
+            ],
+            target_env,
             controller_dir / "target_tp4.log",
         )
         processes.append(target)
@@ -563,24 +582,27 @@ def run(
             if background_lead_s > 0:
                 time.sleep(background_lead_s)
 
+        stager_command = [
+            str(args.python_bin),
+            str(common.STAGER),
+            "--run-dir",
+            str(controller_dir),
+            "--delta-host",
+            "127.0.0.1",
+            "--delta-base-port",
+            str(args.delta_port),
+            "--delivery-host",
+            "127.0.0.1",
+            "--delivery-base-port",
+            str(args.delivery_port),
+            "--timeout-s",
+            str(args.stager_timeout_s),
+        ]
+        if gpu_resident_shadow:
+            stager_command.append("--gpu-resident-shadow")
         stager = common.start_process(
             "stager",
-            [
-                str(args.python_bin),
-                str(common.STAGER),
-                "--run-dir",
-                str(controller_dir),
-                "--delta-host",
-                "127.0.0.1",
-                "--delta-base-port",
-                str(args.delta_port),
-                "--delivery-host",
-                "127.0.0.1",
-                "--delivery-base-port",
-                str(args.delivery_port),
-                "--timeout-s",
-                str(args.stager_timeout_s),
-            ],
+            stager_command,
             base_env,
             controller_dir / "stager.log",
         )

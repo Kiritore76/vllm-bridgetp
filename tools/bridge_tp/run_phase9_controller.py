@@ -40,6 +40,7 @@ from vllm.bridge_tp.controller.events import (  # noqa: E402
 from vllm.bridge_tp.controller.online_io import (  # noqa: E402
     ProxyRecorder,
     atomic_json_dump,
+    build_gpu_resident_shadow_target_request,
     build_target_request,
     honored_generation,
     load_json,
@@ -106,6 +107,20 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--handoff-mode",
+        choices=("bridge", "shadow-only"),
+        default="bridge",
+        help=(
+            "bridge preserves SHADOW->HANDOFF->TAKEOVER; shadow-only keeps "
+            "TP1 ownership until all TP4 ranks are ready and commits directly"
+        ),
+    )
+    parser.add_argument(
+        "--gpu-resident-shadow",
+        action="store_true",
+        help="admit a dormant TP4 request at Shadow start and patch its KV blocks",
+    )
     args = parser.parse_args()
     trigger = args.diagnostic_trigger_output_tokens
     cutover = args.diagnostic_cutover_output_tokens
@@ -115,6 +130,12 @@ def parse_args() -> argparse.Namespace:
         )
     if trigger is not None and (trigger < 0 or cutover <= trigger):
         parser.error("diagnostic boundaries require 0 <= trigger < cutover")
+    if args.gpu_resident_shadow and (
+        args.handoff_mode != "shadow-only" or cutover is None
+    ):
+        parser.error(
+            "GPU-resident Shadow requires shadow-only mode and fixed boundaries"
+        )
     return args
 
 
@@ -212,18 +233,29 @@ def _start_target_if_ready(
     target_url: str,
     request_timeout_s: float,
     target_future: Future[dict[str, Any]] | None,
+    gpu_resident_shadow: bool = False,
+    cutover_output_tokens: int | None = None,
 ) -> Future[dict[str, Any]] | None:
     if target_future is not None:
         return target_future
-    path = run_dir / "staging_manifest.json"
+    path = run_dir / (
+        "session_manifest.json" if gpu_resident_shadow else "staging_manifest.json"
+    )
     if not path.exists():
         return None
     staging = load_json(path)
-    target_request, cutover = build_target_request(
-        source_request,
-        staging,
-        run_dir.name,
-    )
+    if gpu_resident_shadow:
+        if cutover_output_tokens is None:
+            raise ValueError("GPU-resident Shadow has no cutover boundary")
+        target_request, cutover = build_gpu_resident_shadow_target_request(
+            source_request, staging, run_dir.name, cutover_output_tokens
+        )
+    else:
+        target_request, cutover = build_target_request(
+            source_request,
+            staging,
+            run_dir.name,
+        )
     if recorder.proxy.cutover_index != cutover:
         raise RuntimeError(
             "stager cutover differs from controller cutover: "
@@ -477,6 +509,19 @@ def step_shadow(
                             ),
                         }
                     )
+                    cancel_target = getattr(adapter, "cancel_shadow_target", None)
+                    if callable(cancel_target):
+                        target_cleanup = cancel_target(reason)
+                        audit.write(
+                            {
+                                "kind": "target_cleanup_complete",
+                                "status": (
+                                    target_cleanup.get("status")
+                                    if target_cleanup is not None
+                                    else None
+                                ),
+                            }
+                        )
                 except ActionError as error:
                     audit.write({"kind": "action_error", "detail": str(error)})
         terminal_now = time.time()
@@ -542,6 +587,63 @@ def step_handoff(
     except IllegalTransition as error:
         audit.write({"kind": "invariant_violation", "detail": str(error)})
         raise
+
+
+def step_shadow_only_takeover(
+    machine: MigrationStateMachine,
+    adapter: ActionAdapter,
+    audit: AuditLog,
+    record: MigrationRecord,
+    recorder: ProxyRecorder,
+    now: float,
+    dry_run: bool,
+) -> None:
+    """Commit directly from Shadow after the four-rank GPU readback gate.
+
+    In GPU-resident Shadow mode, the dormant TP4 request already owns its
+    final block table and history/deltas are injected into those blocks before
+    this gate succeeds.  The controller never enters Bridge/Handoff.
+    """
+    ready, ranks, detail = adapter.poll_target_ready()
+    for rank in ranks:
+        machine.mark_rank_ready(record.migration_id, rank)
+    if not ready:
+        audit.write({"kind": "shadow_only_ready_wait", "detail": detail})
+        return
+    if dry_run:
+        return
+    try:
+        result = adapter.commit()
+    except ActionError as error:
+        audit.write({"kind": "shadow_only_commit_refused", "detail": str(error)})
+        try:
+            adapter.rollback(f"shadow-only commit refused: {error}")
+        except ActionError as rollback_error:
+            audit.write({"kind": "rollback_failed", "detail": str(rollback_error)})
+            machine.transition(
+                record.migration_id, MigrationState.FAILED, now, str(error)
+            )
+            return
+        recorder.on_rollback(now, str(error))
+        machine.transition(
+            record.migration_id, MigrationState.ROLLED_BACK, now, str(error)
+        )
+        return
+    committed_at = time.time()
+    recorder.on_commit(committed_at)
+    audit.write(
+        {
+            "kind": "shadow_only_commit",
+            "server_state": result,
+            "direct_transition": "SHADOW->TAKEOVER",
+        }
+    )
+    machine.transition(
+        record.migration_id,
+        MigrationState.TAKEOVER,
+        committed_at,
+        "shadow fully synchronized; direct atomic takeover",
+    )
 
 
 def _finish_source_without_commit(
@@ -636,6 +738,7 @@ def main() -> None:
         config.source_url,
         run_dir,
         expected_migration_id=args.migration_id or None,
+        target_url=config.target_url,
     )
     probe = RuntimeControl(armed=False, note="phase 9 preflight").write(run_dir)
 
@@ -693,9 +796,13 @@ def main() -> None:
                     if diagnostic_trigger is not None
                     else None
                 ),
+                "handoff_mode": args.handoff_mode,
             },
         )
-        machine = MigrationStateMachine(audit_sink=audit.write)
+        machine = MigrationStateMachine(
+            audit_sink=audit.write,
+            allow_shadow_takeover=args.handoff_mode == "shadow-only",
+        )
         record = machine.create(
             args.migration_id or "dry-run",
             first_progress.request_id,
@@ -792,13 +899,48 @@ def main() -> None:
                         target_url=config.target_url,
                         request_timeout_s=args.request_timeout_s,
                         target_future=target_future,
+                        gpu_resident_shadow=args.gpu_resident_shadow,
+                        cutover_output_tokens=diagnostic_cutover,
                     )
-                    if previous_target is None and target_future is not None:
+                    if (
+                        args.handoff_mode == "bridge"
+                        and previous_target is None
+                        and target_future is not None
+                    ):
                         machine.transition(
                             record.migration_id,
                             MigrationState.HANDOFF,
                             now,
                             "cutover manifest published and target admitted",
+                        )
+                    elif (
+                        args.handoff_mode == "shadow-only"
+                        and target_future is not None
+                        and (
+                            not args.gpu_resident_shadow
+                            or (run_dir / "cutover_manifest.json").exists()
+                        )
+                    ):
+                        if record.t_cutover is None:
+                            record.t_cutover = now
+                            audit.write(
+                                {
+                                    "kind": "shadow_only_final_sync",
+                                    "unix_s": now,
+                                    "reason": (
+                                        "source freeze published; waiting for "
+                                        "four-rank TP4 exact readback"
+                                    ),
+                                }
+                            )
+                        step_shadow_only_takeover(
+                            machine,
+                            adapter,
+                            audit,
+                            record,
+                            recorder,
+                            now,
+                            args.dry_run,
                         )
                     else:
                         step_shadow(
