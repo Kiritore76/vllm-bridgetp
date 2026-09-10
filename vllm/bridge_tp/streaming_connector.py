@@ -21,6 +21,10 @@ import torch
 
 from vllm.bridge_tp.block_layout import snapshot_target_block_ids
 from vllm.bridge_tp.kv_restore import inject_rank_delta, inject_rank_shard
+from vllm.bridge_tp.online_remote_attention import (
+    RemoteAttentionConfig,
+    RemoteAttentionRankServer,
+)
 from vllm.bridge_tp.stream_protocol import (
     MIGRATION_PARAM,
     PROTOCOL_VERSION,
@@ -159,11 +163,23 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 "bridgetp_shadow_cutover_output_tokens", 0
             )
         )
+        self.online_remote_attention = bool(
+            self._kv_transfer_config.get_from_extra_config(
+                "bridgetp_online_remote_attention", False
+            )
+        )
+        self.remote_attention_base_port = int(
+            self._kv_transfer_config.get_from_extra_config(
+                "bridgetp_remote_attention_base_port", 30200
+            )
+        )
         self._manifest: dict[str, Any] | None = None
         self._pending_requests: dict[str, Request] = {}
         self._active_requests: dict[str, Request] = {}
         self._registered_kv_caches: dict[str, torch.Tensor] = {}
         self._load_threads: dict[str, threading.Thread] = {}
+        self._gpu_kv_lock = threading.RLock()
+        self._remote_attention_servers: dict[str, RemoteAttentionRankServer] = {}
         self._completed_recvs: set[str] = set()
         self._reported_recvs: set[str] = set()
         self._load_errors: dict[str, BaseException] = {}
@@ -646,6 +662,23 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             return
         if not self._registered_kv_caches:
             raise RuntimeError("TP4 KV caches were not registered with connector")
+        if self.online_remote_attention:
+            tp_rank = get_tp_group().rank_in_group
+            server = RemoteAttentionRankServer(
+                config=RemoteAttentionConfig(
+                    run_dir=self.manifest_path.parent,
+                    host="127.0.0.1",
+                    base_port=self.remote_attention_base_port,
+                    timeout_s=self.socket_timeout_s,
+                    source_request_id_prefix="target-does-not-select-source",
+                ),
+                rank=tp_rank,
+                kv_caches=self._registered_kv_caches,
+                block_ids=request.target_block_ids,
+                kv_lock=self._gpu_kv_lock,
+            )
+            self._remote_attention_servers[request.target_request_id] = server
+            server.start()
         thread = threading.Thread(
             target=self._live_gpu_load,
             args=(request,),
@@ -713,12 +746,13 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 block_layers = block.get("layers")
                 if not isinstance(block_layers, dict) or not block_layers:
                     raise ValueError("Live Shadow history block has no KV layers")
-                validation = inject_rank_shard(
-                    self._destination_layers(block_layers),
-                    block_layers,
-                    [request.target_block_ids[logical_block]],
-                    block_axis=int(manifest["block_axis"]),
-                )
+                with self._gpu_kv_lock:
+                    validation = inject_rank_shard(
+                        self._destination_layers(block_layers),
+                        block_layers,
+                        [request.target_block_ids[logical_block]],
+                        block_axis=int(manifest["block_axis"]),
+                    )
                 exact_readback = (
                     exact_readback and validation["exact_readback"] is True
                 )
@@ -785,15 +819,16 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 delta_layers = delta.get("layers")
                 if not isinstance(delta_layers, dict) or not delta_layers:
                     raise ValueError("Live Shadow delta has no KV layers")
-                inject_rank_delta(
-                    self._destination_layers(delta_layers),
-                    delta_layers,
-                    request.target_block_ids,
-                    start_token=start,
-                    end_token=end,
-                    block_axis=int(manifest["block_axis"]),
-                    block_size=int(manifest["block_size"]),
-                )
+                with self._gpu_kv_lock:
+                    inject_rank_delta(
+                        self._destination_layers(delta_layers),
+                        delta_layers,
+                        request.target_block_ids,
+                        start_token=start,
+                        end_token=end,
+                        block_axis=int(manifest["block_axis"]),
+                        block_size=int(manifest["block_size"]),
+                    )
                 digest.update(delta_bytes)
                 aggregate_bytes += len(delta_bytes)
                 current = end

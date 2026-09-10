@@ -465,7 +465,13 @@ def run(
         "started_unix_s": time.time(),
     }
     common.write_json(out_root / "status.json", status)
-    gpu_resident_shadow = bool(getattr(args, "gpu_resident_shadow", False))
+    online_remote_attention = bool(
+        getattr(args, "online_remote_attention", False)
+    )
+    gpu_resident_shadow = bool(
+        getattr(args, "gpu_resident_shadow", False)
+        or online_remote_attention
+    )
     try:
         print(f"[{run_id}] starting target TP4", flush=True)
         target_env = base_env | {"CUDA_VISIBLE_DEVICES": args.tp4_gpus}
@@ -487,6 +493,10 @@ def run(
                     gpu_resident_shadow=gpu_resident_shadow,
                     cutover_output_tokens=int(
                         getattr(args, "cutover_output_tokens", 0)
+                    ),
+                    online_remote_attention=online_remote_attention,
+                    remote_attention_base_port=int(
+                        getattr(args, "remote_attention_base_port", 30200)
                     ),
                 ),
             ],
@@ -538,9 +548,12 @@ def run(
 
         source_env = common.source_environment(args, run_id, controller_dir)
         source_env.update(source_env_overrides or {})
+        source_command = common.server_command(args, 1, args.tp1_port)
+        if bool(getattr(args, "force_source_eager", False)):
+            source_command.append("--enforce-eager")
         source = common.start_process(
             "source TP1",
-            common.server_command(args, 1, args.tp1_port),
+            source_command,
             source_env,
             controller_dir / "source_tp1.log",
         )
