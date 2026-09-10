@@ -32,6 +32,7 @@ from tools.bridge_tp.run_phase9_capacity_background import (  # noqa: E402
     load_manifest,
 )
 from vllm.bridge_tp.online_shadow_strategy_protocol import (  # noqa: E402
+    percentile,
     summarize_background_windows,
     validate_strategy_timing,
 )
@@ -55,6 +56,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--phase", choices=["smoke", "formal"], default="smoke")
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--strategy-order", nargs=2, default=["S_NEW", "S_NEW_OLD"])
+    parser.add_argument(
+        "--bridge-only",
+        action="store_true",
+        help="run only the original S_NEW Bridge system on this branch",
+    )
+    parser.add_argument("--slo-tpot-ms", type=float, default=50.0)
+    parser.add_argument("--slo-ttft-ms", type=float, default=1000.0)
+    parser.add_argument("--slo-e2e-ms", type=float, default=60000.0)
+    parser.add_argument("--slo-handoff-ms", type=float, default=1000.0)
     parser.add_argument("--trigger-output-tokens", type=int, default=128)
     parser.add_argument("--cutover-output-tokens", type=int, default=160)
     parser.add_argument("--anchor-max-tokens", type=int, default=1024)
@@ -91,7 +101,7 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
     if os.name == "nt":
         raise RuntimeError("online Shadow validation requires Linux and five GPUs")
     if args.phase == "formal" and args.repetitions < 3:
-        raise ValueError("formal online validation requires at least three pairs")
+        raise ValueError("formal online validation requires at least three runs")
     if args.repetitions <= 0:
         raise ValueError("repetitions must be positive")
     if set(args.strategy_order) != {"S_NEW", "S_NEW_OLD"}:
@@ -102,6 +112,13 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise ValueError("anchor must leave at least 64 target-owned tokens")
     if args.minimum_ready_target_jobs <= 0 or args.minimum_window_samples <= 0:
         raise ValueError("online sample thresholds must be positive")
+    if min(
+        args.slo_tpot_ms,
+        args.slo_ttft_ms,
+        args.slo_e2e_ms,
+        args.slo_handoff_ms,
+    ) <= 0:
+        raise ValueError("SLO thresholds must be positive")
     if args.fixed_rate_gib_s is not None and args.fixed_rate_gib_s < 0:
         raise ValueError("fixed migration rate cannot be negative")
     if not args.python_bin.is_file():
@@ -168,6 +185,49 @@ def _load_rows(path: Path) -> list[dict[str, Any]]:
     ]
 
 
+def summarize_slo(
+    results: list[dict[str, Any]],
+    *,
+    tpot_ms: float,
+    ttft_ms: float,
+    e2e_ms: float,
+) -> dict[str, Any]:
+    completed = [row for row in results if row.get("status") == "COMPLETED"]
+    intervals: list[float] = []
+    for row in completed:
+        times = [float(value) for value in row.get("token_times_unix_s", [])]
+        intervals.extend(
+            (current - previous) * 1000
+            for previous, current in zip(times, times[1:])
+        )
+    violating_intervals = sum(value > tpot_ms for value in intervals)
+    return {
+        "thresholds": {
+            "tpot_ms": tpot_ms,
+            "ttft_ms": ttft_ms,
+            "e2e_ms": e2e_ms,
+        },
+        "completed_requests": len(completed),
+        "token_intervals": len(intervals),
+        "tpot_interval_violations": violating_intervals,
+        "tpot_interval_violation_rate": (
+            violating_intervals / len(intervals) if intervals else None
+        ),
+        "request_p99_tpot_violations": sum(
+            float(row.get("tpot_p99_ms", float("inf"))) > tpot_ms
+            for row in completed
+        ),
+        "ttft_violations": sum(
+            float(row.get("ttft_ms", float("inf"))) > ttft_ms
+            for row in completed
+        ),
+        "e2e_violations": sum(
+            float(row.get("e2e_ms", float("inf"))) > e2e_ms
+            for row in completed
+        ),
+    }
+
+
 def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
     rows: list[dict[str, Any]] = []
     for run in runs:
@@ -187,6 +247,30 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
                 "history_observed_aggregate_gib_s"
             ),
             "history_max_stage_ms": acceptance.get("history_max_stage_ms"),
+            "anchor_tpot_p50_ms": acceptance.get("anchor_tpot", {}).get(
+                "p50_ms"
+            ),
+            "anchor_tpot_p95_ms": acceptance.get("anchor_tpot", {}).get(
+                "p95_ms"
+            ),
+            "anchor_tpot_p99_ms": acceptance.get("anchor_tpot", {}).get(
+                "p99_ms"
+            ),
+            "output_throughput_tokens_s": acceptance.get("workload", {}).get(
+                "output_throughput_tokens_s"
+            ),
+            "slo_tpot_interval_violation_rate": acceptance.get("slo", {}).get(
+                "tpot_interval_violation_rate"
+            ),
+            "slo_ttft_violations": acceptance.get("slo", {}).get(
+                "ttft_violations"
+            ),
+            "slo_e2e_violations": acceptance.get("slo", {}).get(
+                "e2e_violations"
+            ),
+            "slo_handoff_violation": acceptance.get("slo", {}).get(
+                "handoff_violation"
+            ),
         }
         for window, metrics in acceptance["target_tpot_windows"].items():
             prefix = window.lower()
@@ -261,6 +345,10 @@ def accept_online(
     strategy: str,
     minimum_window_samples: int,
     fixed_rate_gib_s: float | None = None,
+    slo_tpot_ms: float = 50.0,
+    slo_ttft_ms: float = 1000.0,
+    slo_e2e_ms: float = 60000.0,
+    slo_handoff_ms: float = 1000.0,
 ) -> dict[str, Any]:
     background = common.read_json(background_dir / "background_summary.json")
     session = common.read_json(controller_dir / "session_manifest.json")
@@ -352,6 +440,39 @@ def accept_online(
             abs(value - fixed_rate_gib_s) > 1e-9 for value in observed_rates
         ):
             errors.append("controller deviated from the requested fixed rate")
+    slo = summarize_slo(
+        background.get("results", []),
+        tpot_ms=slo_tpot_ms,
+        ttft_ms=slo_ttft_ms,
+        e2e_ms=slo_e2e_ms,
+    )
+    handoff_stall_ms = (
+        float(proxy["handoff_stall_s"]) * 1000
+        if proxy.get("handoff_stall_s") is not None
+        else None
+    )
+    slo["handoff_ms"] = handoff_stall_ms
+    slo["handoff_threshold_ms"] = slo_handoff_ms
+    slo["handoff_violation"] = (
+        handoff_stall_ms is None or handoff_stall_ms > slo_handoff_ms
+    )
+    emitted_times = [
+        float(row["unix_s"])
+        for row in proxy.get("emitted", [])
+        if row.get("unix_s") is not None
+    ]
+    anchor_intervals = [
+        (current - previous) * 1000
+        for previous, current in zip(emitted_times, emitted_times[1:])
+    ]
+    workload_start = float(background.get("start_unix_s", 0.0))
+    workload_end = float(background.get("end_unix_s", workload_start))
+    workload_seconds = max(0.0, workload_end - workload_start)
+    workload_tokens = sum(
+        int(row.get("output_tokens", 0))
+        for row in background.get("results", [])
+        if row.get("status") == "COMPLETED"
+    )
     return {
         "format_version": 1,
         "status": "PASS" if not errors else "FAIL",
@@ -380,11 +501,26 @@ def accept_online(
         "bridge_to_commit_ms": (committed - bridge_start) * 1000,
         "history_transfer_started_unix_s": history_start,
         "history_transfer_phase": session.get("history_transfer_phase"),
-        "handoff_stall_ms": (
-            float(proxy["handoff_stall_s"]) * 1000
-            if proxy.get("handoff_stall_s") is not None
-            else None
-        ),
+        "handoff_stall_ms": handoff_stall_ms,
+        "slo": slo,
+        "anchor_tpot": {
+            "samples": len(anchor_intervals),
+            "p50_ms": percentile(anchor_intervals, 0.50),
+            "p95_ms": percentile(anchor_intervals, 0.95),
+            "p99_ms": percentile(anchor_intervals, 0.99),
+        },
+        "workload": {
+            "wall_time_s": workload_seconds,
+            "output_tokens": workload_tokens,
+            "output_throughput_tokens_s": (
+                workload_tokens / workload_seconds if workload_seconds else None
+            ),
+            "request_throughput_s": (
+                background.get("completed", 0) / workload_seconds
+                if workload_seconds
+                else None
+            ),
+        },
         "source_origin_tokens": proxy.get("source_origin_tokens"),
         "target_origin_tokens": proxy.get("target_origin_tokens"),
         "receiver_ranks": receipts.get("receiver_ranks"),
@@ -407,8 +543,15 @@ def main() -> None:
         "guard_file_sha256": common.sha256(args.guard_file),
         "guard_free_kv_tokens": guard,
         "strategies": args.strategy_order,
+        "bridge_only": args.bridge_only,
         "repetitions": args.repetitions,
         "fixed_rate_gib_s": args.fixed_rate_gib_s,
+        "slo_thresholds": {
+            "tpot_ms": args.slo_tpot_ms,
+            "ttft_ms": args.slo_ttft_ms,
+            "e2e_ms": args.slo_e2e_ms,
+            "handoff_ms": args.slo_handoff_ms,
+        },
         "pressure": pressure,
         "evidence_boundary": "online Phase 8 takeover without remote attention",
     }
@@ -429,7 +572,7 @@ def main() -> None:
     common.write_json(out_root / "batch_status.json", batch)
     try:
         for repetition in range(1, args.repetitions + 1):
-            order = list(args.strategy_order)
+            order = ["S_NEW"] if args.bridge_only else list(args.strategy_order)
             if repetition % 2 == 0:
                 order.reverse()
             for strategy in order:
@@ -453,6 +596,10 @@ def main() -> None:
                         strategy=selected,
                         minimum_window_samples=args.minimum_window_samples,
                         fixed_rate_gib_s=args.fixed_rate_gib_s,
+                        slo_tpot_ms=args.slo_tpot_ms,
+                        slo_ttft_ms=args.slo_ttft_ms,
+                        slo_e2e_ms=args.slo_e2e_ms,
+                        slo_handoff_ms=args.slo_handoff_ms,
                     )
 
                 source_env_overrides = {"BRIDGETP_SHADOW_STRATEGY": strategy}
@@ -527,7 +674,7 @@ def main() -> None:
             "format_version": 1,
             "status": "PASS" if not errors else "FAIL",
             "phase": args.phase,
-            "expected_runs": args.repetitions * 2,
+            "expected_runs": args.repetitions * (1 if args.bridge_only else 2),
             "recorded_runs": len(batch["runs"]),
             "runs": batch["runs"],
             "errors": errors,
