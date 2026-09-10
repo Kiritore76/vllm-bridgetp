@@ -13,6 +13,7 @@ from tools.bridge_tp.run_shadow_rate_load_matrix import (
     resolve_design,
 )
 from tools.bridge_tp.run_shadow_strategy_online_validation import (
+    build_controller_config_overrides,
     summarize_slo,
     write_measurements,
 )
@@ -40,6 +41,17 @@ class TestOnlineShadowManifest(unittest.TestCase):
 
 
 class TestOnlineStrategyTiming(unittest.TestCase):
+    def test_controller_window_tracks_cli_boundaries(self) -> None:
+        overrides = build_controller_config_overrides(
+            trigger_output_tokens=64,
+            cutover_output_tokens=160,
+            fixed_rate_gib_s=0.4,
+        )
+        self.assertEqual(overrides["handoff_output_tokens"], 96)
+        expected_rate = 0.4 * 1024**3
+        self.assertEqual(overrides["rate"]["b_min_bytes_s"], expected_rate)
+        self.assertEqual(overrides["rate"]["b_max_bytes_s"], expected_rate)
+
     def test_s_new_requires_history_at_bridge(self) -> None:
         self.assertFalse(
             validate_strategy_timing(
