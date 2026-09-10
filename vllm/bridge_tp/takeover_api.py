@@ -298,5 +298,43 @@ async def takeover(raw_request: Request) -> dict[str, Any]:
         return committed
 
 
+@router.post("/bridge_tp/v1/shadow_target_cleanup")
+async def shadow_target_cleanup(raw_request: Request) -> dict[str, Any]:
+    """Abort a dormant target request when reversible Shadow is abandoned."""
+    try:
+        body = await raw_request.json()
+    except json.JSONDecodeError as error:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail=f"JSON decode error: {error}",
+        ) from error
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="Request body must be a JSON object",
+        )
+    run_dir, migration_id = _configured_session()
+    _validate_body(body, run_dir, migration_id)
+    target_request_id = str(body.get("target_request_id", "")).strip()
+    expected_request_id = f"bridgetp-phase9-target-{run_dir.name}"
+    if target_request_id != expected_request_id:
+        raise HTTPException(
+            status_code=HTTPStatus.FORBIDDEN,
+            detail="Shadow target request ID differs from configured session",
+        )
+    await raw_request.app.state.engine_client.abort(target_request_id)
+    receipt = {
+        "format_version": 1,
+        "phase": "BridgeTP D3 Phase 8",
+        "status": "CLEANED",
+        "migration_id": migration_id,
+        "target_request_id": target_request_id,
+        "reason": str(body.get("reason", "Shadow migration abandoned")),
+        "updated_unix_s": time.time(),
+    }
+    _atomic_json_dump(receipt, run_dir / "target_cleanup_receipt.json")
+    return receipt
+
+
 def attach_router(app: FastAPI) -> None:
     app.include_router(router)

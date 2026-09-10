@@ -229,3 +229,72 @@ def inject_rank_shard(
         "num_target_blocks": len(target_block_ids),
         "raw_tensor_bytes": raw_tensor_bytes,
     }
+
+
+def inject_rank_delta(
+    destination_layers: Mapping[str, torch.Tensor],
+    delta_layers: Mapping[str, torch.Tensor],
+    target_block_ids: list[int],
+    *,
+    start_token: int,
+    end_token: int,
+    block_axis: int,
+    block_size: int,
+) -> dict[str, int | bool]:
+    """Write a contiguous token delta into an existing paged-KV allocation."""
+    if not 0 <= start_token < end_token:
+        raise ValueError("Delta token interval must be non-empty")
+    if set(destination_layers) != set(delta_layers):
+        raise ValueError("Destination/delta layer names differ")
+    if end_token > len(target_block_ids) * block_size:
+        raise ValueError("Delta exceeds the reserved target block range")
+
+    raw_tensor_bytes = 0
+    for layer_name, source_cpu in delta_layers.items():
+        destination = destination_layers[layer_name]
+        normalized_block_axis = (
+            block_axis if block_axis >= 0 else destination.ndim + block_axis
+        )
+        token_axes = [
+            axis
+            for axis, size in enumerate(destination.shape)
+            if axis != normalized_block_axis and int(size) == block_size
+        ]
+        if len(token_axes) != 1:
+            raise ValueError(
+                f"Cannot infer token axis for {layer_name}: "
+                f"shape={tuple(destination.shape)}"
+            )
+        if source_cpu.ndim != destination.ndim - 1:
+            raise ValueError(f"Layer {layer_name} delta rank differs")
+        if int(source_cpu.shape[0]) != end_token - start_token:
+            raise ValueError(f"Layer {layer_name} delta token count differs")
+
+        token_axis = token_axes[0]
+        source = source_cpu.to(device=destination.device)
+        for offset, token_index in enumerate(range(start_token, end_token)):
+            destination_index: list[int | slice] = [slice(None)] * destination.ndim
+            destination_index[normalized_block_axis] = target_block_ids[
+                token_index // block_size
+            ]
+            destination_index[token_axis] = token_index % block_size
+            destination_slice = destination[tuple(destination_index)]
+            if destination_slice.shape != source[offset].shape:
+                raise ValueError(
+                    f"Layer {layer_name} delta shape differs at token {token_index}"
+                )
+            destination_slice.copy_(source[offset])
+            restored = destination_slice.detach().cpu()
+            if not torch.equal(restored, source_cpu[offset]):
+                raise ValueError(
+                    f"Layer {layer_name} delta readback differs at token "
+                    f"{token_index}"
+                )
+        raw_tensor_bytes += source_cpu.numel() * source_cpu.element_size()
+
+    return {
+        "exact_readback": True,
+        "num_layers": len(delta_layers),
+        "num_tokens": end_token - start_token,
+        "raw_tensor_bytes": raw_tensor_bytes,
+    }
