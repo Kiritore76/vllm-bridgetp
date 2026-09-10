@@ -90,6 +90,29 @@ class TestMigrationStateMachine(unittest.TestCase):
         sm.create("m1", "r1")
         return sm
 
+    def test_shadow_only_direct_takeover_requires_opt_in_and_all_ranks(self):
+        normal = MigrationStateMachine()
+        normal.create("normal", "request")
+        normal.transition("normal", MigrationState.SHADOW, 1.0)
+        for rank in range(4):
+            normal.mark_rank_ready("normal", rank)
+        with self.assertRaises(IllegalTransition):
+            normal.transition("normal", MigrationState.TAKEOVER, 2.0)
+
+        shadow_only = MigrationStateMachine(allow_shadow_takeover=True)
+        record = shadow_only.create("shadow-only", "request")
+        shadow_only.transition("shadow-only", MigrationState.SHADOW, 1.0)
+        with self.assertRaises(IllegalTransition):
+            shadow_only.transition("shadow-only", MigrationState.TAKEOVER, 2.0)
+        for rank in range(4):
+            shadow_only.mark_rank_ready("shadow-only", rank)
+        shadow_only.transition("shadow-only", MigrationState.TAKEOVER, 3.0)
+        self.assertIs(record.state, MigrationState.TAKEOVER)
+        self.assertEqual(
+            [state for _, state, _ in record.history],
+            [MigrationState.SHADOW, MigrationState.TAKEOVER],
+        )
+
     def test_happy_path_records_boundary_timestamps(self):
         sm = self.happy()
         sm.transition("m1", MigrationState.SHADOW, 1.0)

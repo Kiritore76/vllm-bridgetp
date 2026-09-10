@@ -57,9 +57,9 @@ TERMINAL_STATES = frozenset(
     }
 )
 
-# Legal transitions. Deliberately strict: the controller must never be able to
-# reach TAKEOVER without passing through HANDOFF, because HANDOFF is where the
-# four-rank exact-readback gate lives.
+# Default legal transitions.  The state-machine constructor can opt an
+# experiment into direct SHADOW -> TAKEOVER, while retaining the four-rank
+# exact-readback gate in ``transition``.
 LEGAL_TRANSITIONS: dict[MigrationState, frozenset[MigrationState]] = {
     MigrationState.LOCAL: frozenset(
         {

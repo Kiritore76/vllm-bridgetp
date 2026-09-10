@@ -4,9 +4,9 @@
 Two properties are enforced here rather than left to the caller, because both
 are correctness gates that Phase 7 already relies on:
 
-1. TAKEOVER is reachable only from HANDOFF. The controller can never commit a
-   migration whose four ranks have not reported exact readback, because
-   entering HANDOFF requires that evidence.
+1. TAKEOVER normally is reachable only from HANDOFF.  The experimental
+   Shadow-only path may opt into a direct SHADOW -> TAKEOVER transition, but
+   the same four-rank exact-readback gate is still enforced here.
 2. Transitions are idempotent and keyed by migration ID. Replaying the same
    transition is a no-op that returns the existing record rather than an error,
    so a controller retry after a timeout cannot double-commit.
@@ -65,10 +65,16 @@ class MigrationRecord:
 class MigrationStateMachine:
     """Owns migration records. Thread-safe; one lock for the whole table."""
 
-    def __init__(self, audit_sink: Callable[[dict], None] | None = None) -> None:
+    def __init__(
+        self,
+        audit_sink: Callable[[dict], None] | None = None,
+        *,
+        allow_shadow_takeover: bool = False,
+    ) -> None:
         self._records: dict[str, MigrationRecord] = {}
         self._lock = threading.RLock()
         self._audit = audit_sink or (lambda _record: None)
+        self._allow_shadow_takeover = bool(allow_shadow_takeover)
 
     # ---- lifecycle ----------------------------------------------------
     def create(self, migration_id: str, request_id: str) -> MigrationRecord:
@@ -117,6 +123,14 @@ class MigrationStateMachine:
                 return record  # idempotent replay
 
             allowed = LEGAL_TRANSITIONS.get(record.state, frozenset())
+            if (
+                self._allow_shadow_takeover
+                and record.state is MigrationState.SHADOW
+            ):
+                allowed = allowed | {
+                    MigrationState.TAKEOVER,
+                    MigrationState.ROLLED_BACK,
+                }
             if to not in allowed:
                 raise IllegalTransition(
                     f"migration {migration_id}: {record.state.value} -> {to.value} "
