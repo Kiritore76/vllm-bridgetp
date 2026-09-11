@@ -496,11 +496,6 @@ def maybe_run_online_remote_attention(
             )
         return False
     request_index = matches[0]
-    query_starts = attn_metadata.query_start_loc.tolist()
-    start = int(query_starts[request_index])
-    end = int(query_starts[request_index + 1])
-    if end - start != 1:
-        raise RuntimeError("online remote attention supports one-token decode only")
     sequence_length = int(attn_metadata.seq_lens[request_index].item())
     if not client.remote_enabled_for_forward(
         request_ids[request_index],
@@ -508,6 +503,11 @@ def maybe_run_online_remote_attention(
         marker_active,
     ):
         return False
+    query_starts = attn_metadata.query_start_loc.tolist()
+    start = int(query_starts[request_index])
+    end = int(query_starts[request_index + 1])
+    if end - start != 1:
+        raise RuntimeError("online remote attention supports one-token decode only")
     boundary = client.common_boundary(sequence_length)
     if boundary <= 0 or boundary >= sequence_length:
         return False
