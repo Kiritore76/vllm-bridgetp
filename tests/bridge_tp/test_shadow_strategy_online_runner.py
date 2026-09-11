@@ -120,6 +120,9 @@ class TestOnlineWindows(unittest.TestCase):
             ("BRIDGE", "S_NEW", 20.0),
             ("SHADOW_ONLY", "S_NEW_OLD", 10.0),
         ):
+            architecture_windows = dict(windows)
+            if architecture == "SHADOW_ONLY":
+                architecture_windows["FINAL_SYNC"] = dict(windows["BRIDGE"])
             runs.append(
                 {
                     "repetition": 1,
@@ -132,7 +135,7 @@ class TestOnlineWindows(unittest.TestCase):
                         "handoff_stall_ms": stall,
                         "source_origin_tokens": 10,
                         "target_origin_tokens": 20,
-                        "target_tpot_windows": windows,
+                        "target_tpot_windows": architecture_windows,
                     },
                 }
             )
@@ -142,8 +145,12 @@ class TestOnlineWindows(unittest.TestCase):
             paired = (root / "paired_comparisons.csv").read_text(
                 encoding="utf-8"
             )
+            measurements = (root / "measurements.csv").read_text(
+                encoding="utf-8"
+            )
         self.assertIn("final_sync_ms_saved_by_shadow_only", paired)
         self.assertIn("10.0", paired)
+        self.assertIn("final_sync_tpot_p99_ms", measurements)
 
     def test_slo_summary_counts_token_and_request_violations(self) -> None:
         summary = summarize_slo(
