@@ -2,8 +2,11 @@
 
 import math
 import socket
+import tempfile
 import unittest
-from unittest.mock import Mock
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 try:
     import torch
@@ -13,6 +16,7 @@ try:
         RemoteAttentionClient,
         attention_stats,
         gather_paged_kv,
+        maybe_run_online_remote_attention,
         merge_attention_stats,
     )
 
@@ -41,6 +45,41 @@ class TestOnlineRemoteAttention(unittest.TestCase):
         self.assertFalse(client.remote_enabled_for_forward("anchor", 100, True))
         self.assertTrue(client.remote_enabled_for_forward("anchor", 101, True))
         self.assertTrue(client.remote_enabled_for_forward("anchor", 101, False))
+
+    def test_prefill_bypasses_decode_checks_before_bridge(self) -> None:
+        client = RemoteAttentionClient.__new__(RemoteAttentionClient)
+        client._activation_key = None
+        client._remote_enabled_for_activation_key = False
+        with tempfile.TemporaryDirectory() as temporary:
+            client.config = SimpleNamespace(
+                run_dir=Path(temporary),
+                source_request_id_prefix="anchor",
+                strict=True,
+            )
+            context = SimpleNamespace(
+                additional_kwargs={"bridgetp_request_ids": ["cmpl-anchor-0"]}
+            )
+            metadata = SimpleNamespace(seq_lens=torch.tensor([32]))
+            with (
+                patch(
+                    "vllm.bridge_tp.online_remote_attention."
+                    "get_remote_attention_client",
+                    return_value=client,
+                ),
+                patch(
+                    "vllm.forward_context.get_forward_context",
+                    return_value=context,
+                ),
+            ):
+                handled = maybe_run_online_remote_attention(
+                    layer_name="model.layers.0.self_attn.attn",
+                    layer=None,
+                    query=None,
+                    kv_cache=None,
+                    attn_metadata=metadata,
+                    output=None,
+                )
+        self.assertFalse(handled)
 
     def test_gathers_physical_blocks_in_logical_order(self) -> None:
         cache = torch.zeros(5, 2, 2, 1, 1)
