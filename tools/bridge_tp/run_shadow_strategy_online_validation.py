@@ -362,6 +362,21 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             "gpu_delta_acks": acceptance.get("gpu_delta_acks"),
             "remote_attention_calls": acceptance.get("remote_attention_calls"),
             "remote_attention_layers": acceptance.get("remote_attention_layers"),
+            "remote_attention_token_forwards": acceptance.get(
+                "remote_attention_token_forwards"
+            ),
+            "remote_attention_visible_calls": acceptance.get(
+                "remote_attention_visible_calls"
+            ),
+            "remote_attention_visible_token_forwards": acceptance.get(
+                "remote_attention_visible_token_forwards"
+            ),
+            "remote_attention_speculative_calls": acceptance.get(
+                "remote_attention_speculative_calls"
+            ),
+            "remote_attention_speculative_token_forwards": acceptance.get(
+                "remote_attention_speculative_token_forwards"
+            ),
             "remote_attention_p50_ms": acceptance.get(
                 "remote_attention_total_ms", {}
             ).get("p50"),
@@ -370,6 +385,15 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             ).get("p95"),
             "remote_attention_p99_ms": acceptance.get(
                 "remote_attention_total_ms", {}
+            ).get("p99"),
+            "remote_attention_visible_p50_ms": acceptance.get(
+                "remote_attention_visible_total_ms", {}
+            ).get("p50"),
+            "remote_attention_visible_p95_ms": acceptance.get(
+                "remote_attention_visible_total_ms", {}
+            ).get("p95"),
+            "remote_attention_visible_p99_ms": acceptance.get(
+                "remote_attention_visible_total_ms", {}
             ).get("p99"),
             "source_process_wall_time_s": lifetime_by_name.get("source TP1"),
             "target_process_wall_time_s": lifetime_by_name.get("target TP4"),
@@ -540,6 +564,19 @@ def accept_online(
     remote_attention_rows = (
         _load_rows(remote_attention_path) if remote_attention_path.is_file() else []
     )
+    cutover_context_tokens = int(cutover["num_prompt_tokens"]) + int(
+        cutover["cutover_num_output_tokens"]
+    )
+    remote_attention_visible_rows = [
+        row
+        for row in remote_attention_rows
+        if int(row.get("sequence_tokens", -1)) < cutover_context_tokens
+    ]
+    remote_attention_speculative_rows = [
+        row
+        for row in remote_attention_rows
+        if int(row.get("sequence_tokens", -1)) >= cutover_context_tokens
+    ]
 
     shadow_start = float(session["shadow_started_unix_s"])
     freeze_unix_s = float(cutover["updated_unix_s"])
@@ -861,6 +898,22 @@ def accept_online(
                 for row in remote_attention_rows
             }
         ),
+        "remote_attention_visible_calls": len(remote_attention_visible_rows),
+        "remote_attention_visible_token_forwards": len(
+            {
+                (str(row.get("request_id")), int(row.get("sequence_tokens", -1)))
+                for row in remote_attention_visible_rows
+            }
+        ),
+        "remote_attention_speculative_calls": len(
+            remote_attention_speculative_rows
+        ),
+        "remote_attention_speculative_token_forwards": len(
+            {
+                (str(row.get("request_id")), int(row.get("sequence_tokens", -1)))
+                for row in remote_attention_speculative_rows
+            }
+        ),
         "remote_attention_total_ms": {
             "p50": percentile(
                 [float(row["total_ms"]) for row in remote_attention_rows], 0.50
@@ -870,6 +923,20 @@ def accept_online(
             ),
             "p99": percentile(
                 [float(row["total_ms"]) for row in remote_attention_rows], 0.99
+            ),
+        },
+        "remote_attention_visible_total_ms": {
+            "p50": percentile(
+                [float(row["total_ms"]) for row in remote_attention_visible_rows],
+                0.50,
+            ),
+            "p95": percentile(
+                [float(row["total_ms"]) for row in remote_attention_visible_rows],
+                0.95,
+            ),
+            "p99": percentile(
+                [float(row["total_ms"]) for row in remote_attention_visible_rows],
+                0.99,
             ),
         },
         "history_copy_order": session.get("history_copy_order"),
