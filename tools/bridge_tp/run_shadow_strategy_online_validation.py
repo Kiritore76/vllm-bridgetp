@@ -431,10 +431,21 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
         rows.append(row)
     if not rows:
         return
+    # Architecture comparisons intentionally expose different semantic windows:
+    # Bridge runs report BRIDGE while direct Shadow-only runs additionally report
+    # FINAL_SYNC.  Build a stable union instead of assuming the first row defines
+    # every later row; alternating pair order makes that assumption invalid.
+    fieldnames = list(rows[0])
+    known_fields = set(fieldnames)
+    for row in rows[1:]:
+        for field in row:
+            if field not in known_fields:
+                fieldnames.append(field)
+                known_fields.add(field)
     with (out_root / "measurements.csv").open(
         "w", encoding="utf-8", newline=""
     ) as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
