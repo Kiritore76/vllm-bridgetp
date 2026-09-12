@@ -18,8 +18,8 @@ from tools.bridge_tp.run_phase9_controller import (
     step_local,
     step_shadow,
 )
-from vllm.bridge_tp.controller.capacity_signal import CapacitySignal
 from vllm.bridge_tp.controller.action_adapter import ActionAdapter
+from vllm.bridge_tp.controller.capacity_signal import CapacitySignal
 from vllm.bridge_tp.controller.config import ControllerConfig
 from vllm.bridge_tp.controller.events import (
     Action,
@@ -127,6 +127,26 @@ class TestOnlineArtifacts(unittest.TestCase):
         self.assertEqual(request["prompt"][:5], [1, 2, 3, 4, 5])
         self.assertEqual(request["max_tokens"], 90)
         self.assertFalse(strict_greedy_sampling_errors(request))
+
+    def test_stop_copy_target_accepts_complete_frozen_prefix(self) -> None:
+        source = freeze_strict_greedy_sampling(
+            {"model": "m", "max_tokens": 100}
+        )
+        session = {
+            "num_prompt_tokens": 3,
+            "all_known_token_ids": [1, 2, 3, 4, 5],
+            "migration_id": "migration",
+        }
+        request, cutover = build_gpu_resident_shadow_target_request(
+            source,
+            session,
+            "run",
+            2,
+            allow_complete_prefix=True,
+        )
+        self.assertEqual(cutover, 2)
+        self.assertEqual(request["prompt"], [1, 2, 3, 4, 5])
+        self.assertEqual(request["max_tokens"], 98)
 
     def test_source_request_freezes_model_sampling_defaults(self) -> None:
         source = {

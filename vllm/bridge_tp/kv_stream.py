@@ -84,6 +84,7 @@ class BridgeTPStreamConfig:
     socket_timeout_s: float
     pin_memory: bool
     strict: bool
+    stop_and_copy: bool = False
     # Optional external request-ID prefix used by the capacity pilot to pick
     # one anchor from a real multi-request scheduler batch.  Empty preserves
     # the Phase 6-8 single-request-only behaviour exactly.
@@ -118,38 +119,31 @@ class BridgeTPStreamConfig:
             base_port=int(os.getenv("BRIDGETP_STREAM_BASE_PORT", "29600")),
             target_tp_size=int(os.getenv("BRIDGETP_STREAM_TARGET_TP", "4")),
             head_axis=int(os.getenv("BRIDGETP_STREAM_HEAD_AXIS", "3")),
-            expected_kv_heads=int(
-                os.getenv("BRIDGETP_STREAM_EXPECTED_KV_HEADS", "8")
-            ),
+            expected_kv_heads=int(os.getenv("BRIDGETP_STREAM_EXPECTED_KV_HEADS", "8")),
             after_output_tokens=int(
                 os.getenv("BRIDGETP_STREAM_AFTER_OUTPUT_TOKENS", "128")
             ),
             phase8_cutover_output_tokens=int(
                 os.getenv("BRIDGETP_PHASE8_CUTOVER_OUTPUT_TOKENS", "160")
             ),
-            phase8_delta_host=os.getenv(
-                "BRIDGETP_PHASE8_DELTA_HOST", "127.0.0.1"
-            ),
+            phase8_delta_host=os.getenv("BRIDGETP_PHASE8_DELTA_HOST", "127.0.0.1"),
             phase8_delta_base_port=int(
                 os.getenv("BRIDGETP_PHASE8_DELTA_BASE_PORT", "29900")
             ),
-            chunk_bytes=int(
-                os.getenv("BRIDGETP_STREAM_CHUNK_BYTES", str(1024 * 1024))
-            ),
-            aggregate_rate_gib_s=float(
-                os.getenv("BRIDGETP_STREAM_RATE_GIB_S", "0")
-            ),
+            chunk_bytes=int(os.getenv("BRIDGETP_STREAM_CHUNK_BYTES", str(1024 * 1024))),
+            aggregate_rate_gib_s=float(os.getenv("BRIDGETP_STREAM_RATE_GIB_S", "0")),
             socket_timeout_s=float(
                 os.getenv("BRIDGETP_STREAM_SOCKET_TIMEOUT_S", "600")
             ),
             pin_memory=_env_bool("BRIDGETP_STREAM_PIN_MEMORY", True),
             strict=_env_bool("BRIDGETP_STREAM_STRICT", True),
+            stop_and_copy=_env_bool("BRIDGETP_STOP_AND_COPY", False),
             source_request_id_prefix=os.getenv(
                 "BRIDGETP_STREAM_SOURCE_REQUEST_ID_PREFIX", ""
             ).strip(),
-            shadow_strategy=os.getenv(
-                "BRIDGETP_SHADOW_STRATEGY", "S_NEW_OLD"
-            ).strip().upper(),
+            shadow_strategy=os.getenv("BRIDGETP_SHADOW_STRATEGY", "S_NEW_OLD")
+            .strip()
+            .upper(),
         )
         if config.target_tp_size != 4:
             raise ValueError("BridgeTP Phase 6 currently requires target TP=4")
@@ -177,9 +171,9 @@ class BridgeTPStreamConfig:
                     "Phase 8 cutover boundary must follow the old-KV boundary"
                 )
             if self.shadow_strategy not in {"S_NEW", "S_NEW_OLD"}:
-                raise ValueError(
-                    "BRIDGETP_SHADOW_STRATEGY must be S_NEW or S_NEW_OLD"
-                )
+                raise ValueError("BRIDGETP_SHADOW_STRATEGY must be S_NEW or S_NEW_OLD")
+        if self.stop_and_copy and not self.phase8_enabled:
+            raise ValueError("BRIDGETP_STOP_AND_COPY requires Phase 8")
 
 
 def _phase_name(config: BridgeTPStreamConfig) -> str:
@@ -308,9 +302,7 @@ class _RankPublisher:
                     "reason": reason,
                     "completed_unix_s": time.time(),
                 },
-                self.config.run_dir
-                / "sender_receipts"
-                / f"tp_rank_{self.rank}.json",
+                self.config.run_dir / "sender_receipts" / f"tp_rank_{self.rank}.json",
             )
             return True
 
@@ -362,9 +354,7 @@ class _RankPublisher:
                     {
                         "status": "READY",
                         "peer": list(peer),
-                        "target_request_id": acknowledgement.get(
-                            "target_request_id"
-                        ),
+                        "target_request_id": acknowledgement.get("target_request_id"),
                         "exact_readback": acknowledgement.get("exact_readback"),
                         "rate_limit_aggregate_gib_s": (
                             self.config.aggregate_rate_gib_s
@@ -380,9 +370,7 @@ class _RankPublisher:
             receipt["completed_unix_s"] = time.time()
             _atomic_json_dump(
                 receipt,
-                self.config.run_dir
-                / "sender_receipts"
-                / f"tp_rank_{self.rank}.json",
+                self.config.run_dir / "sender_receipts" / f"tp_rank_{self.rank}.json",
             )
             self.listener.close()
             # The Phase 8 old-KV path must release its serialized source copy
@@ -393,11 +381,7 @@ class _RankPublisher:
         config = get_bridge_tp_stream_config()
         if not config.aggregate_rate_gib_s:
             return 0.0
-        return (
-            config.aggregate_rate_gib_s
-            * 1024**3
-            / config.target_tp_size
-        )
+        return config.aggregate_rate_gib_s * 1024**3 / config.target_tp_size
 
 
 def _publish_request(
@@ -441,17 +425,48 @@ def _publish_request(
             f"observed {pending}"
         )
 
+    freeze_request: dict[str, Any] | None = None
+    if config.stop_and_copy:
+        # This hook runs after the current model step has completed.  The
+        # EngineCore observes the file before its next schedule() call and
+        # retains this request and its KV while allowing peers to continue.
+        from vllm.bridge_tp.request_freeze import request_freeze
+
+        freeze_request = request_freeze(
+            config.run_dir,
+            request_id,
+            output_tokens=num_output_tokens,
+            num_computed_tokens=num_computed,
+        )
+    from vllm.bridge_tp.experiment_timeline import emit_event
+
+    emit_event(
+        config.run_dir,
+        "source_worker",
+        "SNAPSHOT_COPY_STARTED",
+        request_id=request_id,
+        migration_id=config.migration_id,
+        num_output_tokens=num_output_tokens,
+        stop_and_copy=config.stop_and_copy,
+    )
+
     block_ids, block_size = _get_request_block_ids(
         input_batch, request_index, num_computed
     )
     block_axis = _get_block_axis(attn_groups, cache_dtype, block_size)
     layer_names = _ordered_layer_names(kv_cache_config)
-    raw_source_bytes = _estimate_dump_bytes(
-        kv_caches, block_axis, len(block_ids)
-    )
+    raw_source_bytes = _estimate_dump_bytes(kv_caches, block_axis, len(block_ids))
     snapshot_started = time.perf_counter()
     source_layers, layer_records, d2h_ms = _copy_request_blocks(
         kv_caches, layer_names, block_ids, block_axis
+    )
+    emit_event(
+        config.run_dir,
+        "source_worker",
+        "SNAPSHOT_D2H_COMPLETE",
+        request_id=request_id,
+        migration_id=config.migration_id,
+        d2h_ms=d2h_ms,
     )
 
     session_token = secrets.token_hex(32)
@@ -477,8 +492,7 @@ def _publish_request(
             }
             pinned = True
         raw_rank_bytes = sum(
-            tensor.numel() * tensor.element_size()
-            for tensor in rank_layers.values()
+            tensor.numel() * tensor.element_size() for tensor in rank_layers.values()
         )
         total_raw_rank_bytes += raw_rank_bytes
         payload = serialize_rank_payload(
@@ -591,6 +605,10 @@ def _publish_request(
         "chunk_bytes": config.chunk_bytes,
         "aggregate_rate_limit_gib_s": config.aggregate_rate_gib_s,
         "shadow_strategy": config.shadow_strategy,
+        "stop_and_copy": config.stop_and_copy,
+        "freeze_requested_unix_ns": (
+            freeze_request["requested_unix_ns"] if freeze_request else None
+        ),
         "history_transfer_phase": (
             "SHADOW" if history_started_unix_s is not None else "BRIDGE"
         ),
@@ -606,10 +624,7 @@ def _publish_request(
             {
                 "format_version": 1,
                 "phase": phase,
-                "scope": (
-                    "application-level atomic handoff; "
-                    "no crash-consensus claim"
-                ),
+                "scope": ("application-level atomic handoff; no crash-consensus claim"),
                 "migration_id": config.migration_id,
                 "source_request_id": request_id,
                 "snapshot_num_output_tokens": num_output_tokens,
@@ -620,7 +635,7 @@ def _publish_request(
             config.run_dir / "takeover_state.json",
         )
     _published_request_ids.add(request_id)
-    if config.phase8_enabled:
+    if config.phase8_enabled and not config.stop_and_copy:
         from vllm.bridge_tp.phase8_source import start_phase8_source
 
         start_phase8_source(
@@ -633,9 +648,51 @@ def _publish_request(
             layer_names=layer_names,
             history_publishers=publishers,
         )
+    elif config.stop_and_copy:
+        # The request cannot generate after this snapshot, so the initial
+        # image is the final image and the ordinary Phase-8 delta set is empty.
+        _atomic_json_dump(
+            {
+                "format_version": 1,
+                "phase": "BridgeTP D3 Phase 8",
+                "scope": "frozen full-KV Stop-and-Copy image",
+                "shadow_strategy": config.shadow_strategy,
+                "stop_and_copy": True,
+                "protocol_version": PROTOCOL_VERSION,
+                "migration_id": config.migration_id,
+                "session_token": session_token,
+                "source_request_id": request_id,
+                "cutover_num_output_tokens": num_output_tokens,
+                "num_prompt_tokens": int(request.num_prompt_tokens),
+                "num_computed_tokens": num_computed,
+                "pending_known_tokens": pending,
+                "computed_token_ids": computed_token_ids,
+                "pending_token_ids": pending_token_ids,
+                "all_known_token_ids": all_known_token_ids,
+                "num_blocks": len(block_ids),
+                "block_size": block_size,
+                "block_axis": block_axis,
+                "delta_start_token": num_computed,
+                "delta_end_token": num_computed,
+                "delta_batches": 0,
+                "delta_tokens": 0,
+                "delta_payload_bytes": 0,
+                "delta_d2h_ms": 0.0,
+                "updated_unix_s": time.time(),
+            },
+            config.run_dir / "cutover_manifest.json",
+        )
+        emit_event(
+            config.run_dir,
+            "source_worker",
+            "FINAL_IMAGE_PUBLISHED",
+            request_id=request_id,
+            migration_id=config.migration_id,
+            num_computed_tokens=num_computed,
+            delta_tokens=0,
+        )
     logger.warning(
-        "%s published live request %s at output=%d, "
-        "computed=%d, pending=%d, run=%s",
+        "%s published live request %s at output=%d, computed=%d, pending=%d, run=%s",
         phase,
         request_id,
         num_output_tokens,

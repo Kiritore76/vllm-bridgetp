@@ -122,9 +122,7 @@ class _Phase8SourceState:
             daemon=True,
         ).start()
 
-    def _worker(
-        self, rank: int, work_queue: queue.Queue[_DeltaWork | None]
-    ) -> None:
+    def _worker(self, rank: int, work_queue: queue.Queue[_DeltaWork | None]) -> None:
         while True:
             work = work_queue.get()
             try:
@@ -175,8 +173,7 @@ class _Phase8SourceState:
             acknowledgement = recv_json(connection)
             if acknowledgement.get("status") != "STAGED":
                 raise RuntimeError(
-                    f"Phase 8 stager rank {rank} rejected delta: "
-                    f"{acknowledgement}"
+                    f"Phase 8 stager rank {rank} rejected delta: {acknowledgement}"
                 )
         _atomic_json_dump(
             {
@@ -383,9 +380,7 @@ def _copy_delta_rank_shards(
                 f"{delta.shape[delta_head_axis]} != "
                 f"{state.config.expected_kv_heads}"
             )
-        shards = torch.chunk(
-            delta, state.config.target_tp_size, dim=delta_head_axis
-        )
+        shards = torch.chunk(delta, state.config.target_tp_size, dim=delta_head_axis)
         if len(shards) != state.config.target_tp_size:
             raise ValueError("Phase 8 could not split all target TP ranks")
         for rank, shard in enumerate(shards):
@@ -496,9 +491,19 @@ def maybe_publish_phase8_delta(
         },
         config.run_dir / "cutover_manifest.json",
     )
+    from vllm.bridge_tp.experiment_timeline import emit_event
+
+    emit_event(
+        config.run_dir,
+        "source_worker",
+        "FINAL_DELTA_ACKED",
+        request_id=request_id,
+        migration_id=config.migration_id,
+        num_computed_tokens=num_computed,
+        delta_tokens=state.delta_tokens,
+    )
     logger.warning(
-        "BridgeTP Phase 8 cutover prepared at output=%d, computed=%d, "
-        "delta_tokens=%d",
+        "BridgeTP Phase 8 cutover prepared at output=%d, computed=%d, delta_tokens=%d",
         output_tokens,
         num_computed,
         state.delta_tokens,

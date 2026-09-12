@@ -910,6 +910,18 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 / "gpu_watermarks"
                 / f"tp_rank_{tp_rank}.json",
             )
+            from vllm.bridge_tp.experiment_timeline import emit_event
+
+            emit_event(
+                self.manifest_path.parent,
+                "target_connector",
+                "TARGET_RANK_READY",
+                request_id=request_id,
+                migration_id=request.migration_id,
+                tp_rank=tp_rank,
+                num_computed_tokens=current,
+                exact_readback=exact_readback,
+            )
             if self.takeover_control_path is not None:
                 while True:
                     if self.takeover_control_path.is_file():
