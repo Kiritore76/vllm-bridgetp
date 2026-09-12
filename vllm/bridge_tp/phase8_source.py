@@ -447,6 +447,20 @@ def maybe_publish_phase8_delta(
         raise ValueError(
             f"Phase 8 cutover requires one pending token, observed {pending}"
         )
+    # Shadow-only enables the request-level freeze gate.  Publish the control
+    # from the model-worker hook at the exact completed-token boundary so the
+    # scheduler cannot run ahead while the final delta and four-rank readback
+    # are being acknowledged.  Bridge mode leaves this gate disabled.
+    from vllm.bridge_tp.request_freeze import enabled_from_env, request_freeze
+
+    freeze_request = None
+    if enabled_from_env() and not getattr(config, "stop_and_copy", False):
+        freeze_request = request_freeze(
+            config.run_dir,
+            request_id,
+            output_tokens=output_tokens,
+            num_computed_tokens=num_computed,
+        )
     state.wait_for_acks()
     # S_NEW gives new-KV traffic priority throughout Shadow.  Only after every
     # delta has reached the stager does the irreversible Bridge boundary start
@@ -487,6 +501,9 @@ def maybe_publish_phase8_delta(
             "delta_tokens": state.delta_tokens,
             "delta_payload_bytes": state.delta_payload_bytes,
             "delta_d2h_ms": state.d2h_ms,
+            "freeze_requested_unix_ns": (
+                freeze_request["requested_unix_ns"] if freeze_request else None
+            ),
             "updated_unix_s": time.time(),
         },
         config.run_dir / "cutover_manifest.json",

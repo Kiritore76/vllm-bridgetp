@@ -589,6 +589,12 @@ def accept_online(
         common.read_json(path)
         for path in sorted((controller_dir / "gpu_initial_receipts").glob("*.json"))
     ]
+    frozen_receipt_path = controller_dir / "request_frozen_receipt.json"
+    frozen_receipt = (
+        common.read_json(frozen_receipt_path)
+        if frozen_receipt_path.is_file()
+        else None
+    )
     remote_attention_path = controller_dir / "online_remote_attention.jsonl"
     remote_attention_rows = (
         _load_rows(remote_attention_path) if remote_attention_path.is_file() else []
@@ -608,7 +614,11 @@ def accept_online(
     ]
 
     shadow_start = float(session["shadow_started_unix_s"])
-    freeze_unix_s = float(cutover["updated_unix_s"])
+    freeze_unix_s = (
+        int(frozen_receipt["frozen_unix_ns"]) / 1e9
+        if frozen_receipt is not None
+        else float(cutover["updated_unix_s"])
+    )
     bridge_marker_path = controller_dir / "remote_attention_bridge.json"
     bridge_start = (
         float(common.read_json(bridge_marker_path)["started_unix_s"])
@@ -708,6 +718,13 @@ def accept_online(
     )
     if transitions[-len(expected_transitions) :] != expected_transitions:
         errors.append(f"unexpected migration transitions: {transitions!r}")
+    if handoff_mode == "shadow-only" and not stop_and_copy:
+        if frozen_receipt is None:
+            errors.append("scheduler did not acknowledge the Shadow-only freeze")
+        elif int(frozen_receipt.get("num_output_tokens", -1)) != int(
+            cutover["cutover_num_output_tokens"]
+        ):
+            errors.append("scheduler froze Shadow-only at the wrong token boundary")
     history_completed = [
         float(row.get("completed_unix_s", float("inf")))
         for row in initial_stage_receipts
@@ -881,13 +898,7 @@ def accept_online(
         if row.get("status") == "COMPLETED"
     )
     bridge_to_commit_ms = (committed - bridge_start) * 1000
-    frozen_receipt_path = controller_dir / "request_frozen_receipt.json"
     release_receipt_path = controller_dir / "source_kv_release_receipt.json"
-    frozen_receipt = (
-        common.read_json(frozen_receipt_path)
-        if frozen_receipt_path.is_file()
-        else None
-    )
     release_receipt = (
         common.read_json(release_receipt_path)
         if release_receipt_path.is_file()

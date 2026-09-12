@@ -7,7 +7,7 @@
 1. `ALWAYS_TP1`：请求始终由 TP1 完成。
 2. `ALWAYS_TP4`：请求始终由 TP4 完成。
 3. `STOP_AND_COPY`：在 O64 完成后冻结单个 anchor，源 KV 保留；复制完整前缀并由四 rank 精确回读后，原子切到 TP4；源 KV 的释放必须发生在 `KVCacheManager.free()` 返回之后。
-4. `SHADOW_ONLY`：在 O64 开始从请求头部预拷贝历史 KV，同时 TP1 继续生成并传增量；O160 做最终同步，四 rank ready 后直接 `SHADOW→TAKEOVER`。
+4. `SHADOW_ONLY`：在 O64 开始从请求头部预拷贝历史 KV，同时 TP1 继续生成并传增量；本 smoke 在 O256 做最终同步，四 rank ready 后直接 `SHADOW→TAKEOVER`。O256 是依据首次 O160 运行中 2048-token 历史在 freeze 后约 3.36 秒才完成四 rank GPU 驻留而放宽的管线参数，不作为 A1–A5 的策略结论。
 
 每个模式运行 3 次，采用三组不同顺序降低热机/漂移偏差。smoke 通过后立即停止，不运行 A1–A5。
 

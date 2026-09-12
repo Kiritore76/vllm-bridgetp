@@ -41,7 +41,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--anchor-prompt-tokens", type=int, default=2048)
     parser.add_argument("--anchor-max-tokens", type=int, default=1024)
     parser.add_argument("--trigger-output-tokens", type=int, default=64)
-    parser.add_argument("--cutover-output-tokens", type=int, default=160)
+    # O160 left only 96 decode tokens for a 2048-token history and missed
+    # four-rank GPU residency by 3.36 s on the Section-7 reference host.
+    parser.add_argument("--cutover-output-tokens", type=int, default=256)
     parser.add_argument("--tp1-gpu", default="0")
     parser.add_argument("--tp4-gpus", default="1,2,3,4")
     parser.add_argument("--tp1-port", type=int, default=8001)
