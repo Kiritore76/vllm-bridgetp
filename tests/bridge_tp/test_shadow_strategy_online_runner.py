@@ -172,6 +172,24 @@ class TestOnlineWindows(unittest.TestCase):
         self.assertEqual(summary["ttft_violations"], 1)
         self.assertEqual(summary["e2e_violations"], 0)
 
+    def test_one_token_warmup_has_no_tpot_violation(self) -> None:
+        summary = summarize_slo(
+            [
+                {
+                    "status": "COMPLETED",
+                    "token_times_unix_s": [1.0],
+                    "tpot_p99_ms": None,
+                    "ttft_ms": 10.0,
+                    "e2e_ms": 12.0,
+                }
+            ],
+            tpot_ms=50.0,
+            ttft_ms=1000.0,
+            e2e_ms=3000.0,
+        )
+        self.assertEqual(summary["token_intervals"], 0)
+        self.assertEqual(summary["request_p99_tpot_violations"], 0)
+
 
 class TestShadowRateLoadMatrix(unittest.TestCase):
     def test_default_formal_design_covers_three_loads_and_five_rates(self) -> None:
