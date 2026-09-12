@@ -313,6 +313,13 @@ def summarize_slo(
     e2e_ms: float,
 ) -> dict[str, Any]:
     completed = [row for row in results if row.get("status") == "COMPLETED"]
+
+    def exceeds(row: dict[str, Any], field: str, threshold: float) -> bool:
+        value = row.get(field)
+        # A one-token warm-up has no inter-token interval, so its TPOT
+        # percentile is correctly undefined rather than an SLO violation.
+        return isinstance(value, (int, float)) and float(value) > threshold
+
     intervals: list[float] = []
     for row in completed:
         times = [float(value) for value in row.get("token_times_unix_s", [])]
@@ -333,13 +340,13 @@ def summarize_slo(
             violating_intervals / len(intervals) if intervals else None
         ),
         "request_p99_tpot_violations": sum(
-            float(row.get("tpot_p99_ms", float("inf"))) > tpot_ms for row in completed
+            exceeds(row, "tpot_p99_ms", tpot_ms) for row in completed
         ),
         "ttft_violations": sum(
-            float(row.get("ttft_ms", float("inf"))) > ttft_ms for row in completed
+            exceeds(row, "ttft_ms", ttft_ms) for row in completed
         ),
         "e2e_violations": sum(
-            float(row.get("e2e_ms", float("inf"))) > e2e_ms for row in completed
+            exceeds(row, "e2e_ms", e2e_ms) for row in completed
         ),
     }
 

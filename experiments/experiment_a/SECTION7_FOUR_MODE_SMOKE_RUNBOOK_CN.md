@@ -32,6 +32,7 @@ export GUARD_FILE=/root/autodl-tmp/bridgetp/phase9_cap0_manifests/frozen/guard_f
 export EXPECTED_REVISION=<EXPECTED_REVISION>
 export RUN_ID="experiment-a-section7-smoke-$(date -u +%Y%m%dT%H%M%SZ)"
 export OUT_ROOT="/root/autodl-tmp/bridgetp/results/experiment_a/${RUN_ID}"
+mkdir -p "$(dirname "$OUT_ROOT")"
 
 python tools/bridge_tp/run_experiment_a_four_mode_smoke.py \
   --validate-only \
