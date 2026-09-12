@@ -11,7 +11,7 @@
   "anchor_prompt_tokens": 2048,
   "anchor_output_tokens": 1024,
   "trigger_output_tokens": 64,
-  "shadow_cutover_output_tokens": 160,
+  "shadow_cutover_output_tokens": 256,
   "source_peer_jobs": 0,
   "measured_background_jobs": 0,
   "target_warmup_jobs": 1,
