@@ -83,6 +83,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--stop-and-copy-only",
+        action="store_true",
+        help=(
+            "run the request-level frozen full-KV Stop-and-Copy baseline; "
+            "only the selected anchor is stopped"
+        ),
+    )
+    parser.add_argument(
         "--online-remote-attention",
         action="store_true",
         help="execute TP4-prefix attention in the live Bridge token data path",
@@ -101,6 +109,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--cutover-output-tokens", type=int, default=160)
     parser.add_argument("--anchor-max-tokens", type=int, default=1024)
+    parser.add_argument("--anchor-prompt-tokens", type=int, default=None)
     parser.add_argument("--minimum-ready-target-jobs", type=int, default=2)
     parser.add_argument("--background-lead-s", type=float, default=2.0)
     parser.add_argument("--minimum-window-samples", type=int, default=4)
@@ -143,12 +152,13 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
             args.bridge_only,
             args.architecture_comparison,
             args.shadow_only_only,
+            args.stop_and_copy_only,
         )
     )
     if selected_modes > 1:
         raise ValueError(
             "select at most one of Bridge-only, architecture comparison, "
-            "or Shadow-only"
+            "Shadow-only, or Stop-and-Copy"
         )
     if args.online_remote_attention and not (
         args.bridge_only or args.architecture_comparison
@@ -157,7 +167,7 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
             "online remote attention requires Bridge-only or architecture comparison"
         )
     if args.gpu_resident_shadow and not (
-        args.shadow_only_only or args.online_remote_attention
+        args.shadow_only_only or args.stop_and_copy_only or args.online_remote_attention
     ):
         raise ValueError(
             "GPU-resident staging requires Shadow-only or online Bridge mode"
@@ -172,18 +182,30 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
             args.trigger_output_tokens + args.cutover_output_tokens
         ) // 2
         args.bridge_output_tokens = bridge_output_tokens
-    if not args.trigger_output_tokens < bridge_output_tokens < args.cutover_output_tokens:
+    if (
+        not args.trigger_output_tokens
+        < bridge_output_tokens
+        < args.cutover_output_tokens
+    ):
         raise ValueError("Bridge boundary must be strictly inside the Shadow window")
     if args.anchor_max_tokens <= args.cutover_output_tokens + 64:
         raise ValueError("anchor must leave at least 64 target-owned tokens")
-    if args.minimum_ready_target_jobs <= 0 or args.minimum_window_samples <= 0:
-        raise ValueError("online sample thresholds must be positive")
-    if min(
-        args.slo_tpot_ms,
-        args.slo_ttft_ms,
-        args.slo_e2e_ms,
-        args.slo_handoff_ms,
-    ) <= 0:
+    if (
+        args.anchor_prompt_tokens is not None
+        and args.anchor_prompt_tokens + args.anchor_max_tokens > args.max_model_len
+    ):
+        raise ValueError("anchor prompt plus output exceeds max model length")
+    if args.minimum_ready_target_jobs < 0 or args.minimum_window_samples < 0:
+        raise ValueError("online sample thresholds cannot be negative")
+    if (
+        min(
+            args.slo_tpot_ms,
+            args.slo_ttft_ms,
+            args.slo_e2e_ms,
+            args.slo_handoff_ms,
+        )
+        <= 0
+    ):
         raise ValueError("SLO thresholds must be positive")
     if args.fixed_rate_gib_s is not None and args.fixed_rate_gib_s < 0:
         raise ValueError("fixed migration rate cannot be negative")
@@ -205,9 +227,12 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
     expected = common.git("rev-parse", args.expected_revision)
     if revision != expected:
         raise RuntimeError(f"HEAD {revision} differs from expected {expected}")
-    if subprocess.run(
-        ["git", "-C", str(REPO), "diff", "--quiet", "HEAD", "--"]
-    ).returncode != 0:
+    if (
+        subprocess.run(
+            ["git", "-C", str(REPO), "diff", "--quiet", "HEAD", "--"]
+        ).returncode
+        != 0
+    ):
         raise RuntimeError("tracked working-tree changes are present")
     expected_hashes = (
         (args.manifest, args.expected_manifest_sha256, "manifest"),
@@ -234,17 +259,21 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
             raise ValueError(f"target job {job['job_id']} exceeds max model length")
     if args.out_root.exists():
         raise FileExistsError(f"refusing to reuse output root {args.out_root}")
-    return revision, guard, {
-        "target_jobs": len(jobs),
-        "trigger_output_tokens": args.trigger_output_tokens,
-        "cutover_output_tokens": args.cutover_output_tokens,
-        "bridge_output_tokens": args.bridge_output_tokens,
-        "shadow_window_output_tokens": (
-            args.cutover_output_tokens - args.trigger_output_tokens
-        ),
-        "minimum_ready_target_jobs": args.minimum_ready_target_jobs,
-        "fixed_rate_gib_s": args.fixed_rate_gib_s,
-    }
+    return (
+        revision,
+        guard,
+        {
+            "target_jobs": len(jobs),
+            "trigger_output_tokens": args.trigger_output_tokens,
+            "cutover_output_tokens": args.cutover_output_tokens,
+            "bridge_output_tokens": args.bridge_output_tokens,
+            "shadow_window_output_tokens": (
+                args.cutover_output_tokens - args.trigger_output_tokens
+            ),
+            "minimum_ready_target_jobs": args.minimum_ready_target_jobs,
+            "fixed_rate_gib_s": args.fixed_rate_gib_s,
+        },
+    )
 
 
 def build_controller_config_overrides(
@@ -288,8 +317,7 @@ def summarize_slo(
     for row in completed:
         times = [float(value) for value in row.get("token_times_unix_s", [])]
         intervals.extend(
-            (current - previous) * 1000
-            for previous, current in zip(times, times[1:])
+            (current - previous) * 1000 for previous, current in zip(times, times[1:])
         )
     violating_intervals = sum(value > tpot_ms for value in intervals)
     return {
@@ -305,16 +333,13 @@ def summarize_slo(
             violating_intervals / len(intervals) if intervals else None
         ),
         "request_p99_tpot_violations": sum(
-            float(row.get("tpot_p99_ms", float("inf"))) > tpot_ms
-            for row in completed
+            float(row.get("tpot_p99_ms", float("inf"))) > tpot_ms for row in completed
         ),
         "ttft_violations": sum(
-            float(row.get("ttft_ms", float("inf"))) > ttft_ms
-            for row in completed
+            float(row.get("ttft_ms", float("inf"))) > ttft_ms for row in completed
         ),
         "e2e_violations": sum(
-            float(row.get("e2e_ms", float("inf"))) > e2e_ms
-            for row in completed
+            float(row.get("e2e_ms", float("inf"))) > e2e_ms for row in completed
         ),
     }
 
@@ -339,10 +364,15 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             "status": acceptance["status"],
             "shadow_duration_ms": acceptance["shadow_duration_ms"],
             "bridge_to_commit_ms": acceptance["bridge_to_commit_ms"],
-            "final_sync_to_commit_ms": acceptance.get(
-                "final_sync_to_commit_ms"
-            ),
+            "final_sync_to_commit_ms": acceptance.get("final_sync_to_commit_ms"),
             "handoff_stall_ms": acceptance["handoff_stall_ms"],
+            "request_frozen_unix_s": acceptance.get("request_frozen_unix_s"),
+            "source_kv_released_unix_s": acceptance.get(
+                "source_kv_released_unix_s"
+            ),
+            "source_kv_release_after_commit_ms": acceptance.get(
+                "source_kv_release_after_commit_ms"
+            ),
             "source_origin_tokens": acceptance["source_origin_tokens"],
             "target_origin_tokens": acceptance["target_origin_tokens"],
             "fixed_rate_gib_s": acceptance.get("fixed_rate_gib_s"),
@@ -399,30 +429,18 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             "target_process_wall_time_s": lifetime_by_name.get("target TP4"),
             "stager_process_wall_time_s": lifetime_by_name.get("stager"),
             "controller_process_wall_time_s": lifetime_by_name.get("controller"),
-            "anchor_tpot_p50_ms": acceptance.get("anchor_tpot", {}).get(
-                "p50_ms"
-            ),
-            "anchor_tpot_p95_ms": acceptance.get("anchor_tpot", {}).get(
-                "p95_ms"
-            ),
-            "anchor_tpot_p99_ms": acceptance.get("anchor_tpot", {}).get(
-                "p99_ms"
-            ),
+            "anchor_tpot_p50_ms": acceptance.get("anchor_tpot", {}).get("p50_ms"),
+            "anchor_tpot_p95_ms": acceptance.get("anchor_tpot", {}).get("p95_ms"),
+            "anchor_tpot_p99_ms": acceptance.get("anchor_tpot", {}).get("p99_ms"),
             "output_throughput_tokens_s": acceptance.get("workload", {}).get(
                 "output_throughput_tokens_s"
             ),
             "slo_tpot_interval_violation_rate": acceptance.get("slo", {}).get(
                 "tpot_interval_violation_rate"
             ),
-            "slo_ttft_violations": acceptance.get("slo", {}).get(
-                "ttft_violations"
-            ),
-            "slo_e2e_violations": acceptance.get("slo", {}).get(
-                "e2e_violations"
-            ),
-            "slo_handoff_violation": acceptance.get("slo", {}).get(
-                "handoff_violation"
-            ),
+            "slo_ttft_violations": acceptance.get("slo", {}).get("ttft_violations"),
+            "slo_e2e_violations": acceptance.get("slo", {}).get("e2e_violations"),
+            "slo_handoff_violation": acceptance.get("slo", {}).get("handoff_violation"),
         }
         for window, metrics in acceptance["target_tpot_windows"].items():
             prefix = window.lower()
@@ -476,9 +494,7 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             if architecture_comparison
             else "S_NEW"
         ]
-        old = by_strategy[
-            "SHADOW_ONLY" if architecture_comparison else "S_NEW_OLD"
-        ]
+        old = by_strategy["SHADOW_ONLY" if architecture_comparison else "S_NEW_OLD"]
         required = (
             "bridge_to_commit_ms",
             "handoff_stall_ms",
@@ -495,16 +511,13 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
                     - float(old["bridge_to_commit_ms"])
                 ),
                 "handoff_stall_ms_saved_by_history_precopy": (
-                    float(new["handoff_stall_ms"])
-                    - float(old["handoff_stall_ms"])
+                    float(new["handoff_stall_ms"]) - float(old["handoff_stall_ms"])
                 ),
                 "shadow_target_p99_ms_extra_from_history_precopy": (
-                    float(old["shadow_tpot_p99_ms"])
-                    - float(new["shadow_tpot_p99_ms"])
+                    float(old["shadow_tpot_p99_ms"]) - float(new["shadow_tpot_p99_ms"])
                 ),
                 "bridge_target_p99_ms_delta_history_precopy": (
-                    float(old["bridge_tpot_p99_ms"])
-                    - float(new["bridge_tpot_p99_ms"])
+                    float(old["bridge_tpot_p99_ms"]) - float(new["bridge_tpot_p99_ms"])
                 ),
             }
             if not architecture_comparison
@@ -515,16 +528,13 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
                     - float(old["bridge_to_commit_ms"])
                 ),
                 "handoff_stall_ms_saved_by_shadow_only": (
-                    float(new["handoff_stall_ms"])
-                    - float(old["handoff_stall_ms"])
+                    float(new["handoff_stall_ms"]) - float(old["handoff_stall_ms"])
                 ),
                 "shadow_target_p99_ms_delta_shadow_only": (
-                    float(old["shadow_tpot_p99_ms"])
-                    - float(new["shadow_tpot_p99_ms"])
+                    float(old["shadow_tpot_p99_ms"]) - float(new["shadow_tpot_p99_ms"])
                 ),
                 "final_sync_target_p99_ms_delta_shadow_only": (
-                    float(old["bridge_tpot_p99_ms"])
-                    - float(new["bridge_tpot_p99_ms"])
+                    float(old["bridge_tpot_p99_ms"]) - float(new["bridge_tpot_p99_ms"])
                 ),
             }
         )
@@ -552,6 +562,7 @@ def accept_online(
     slo_ttft_ms: float = 1000.0,
     slo_e2e_ms: float = 60000.0,
     slo_handoff_ms: float = 1000.0,
+    stop_and_copy: bool = False,
 ) -> dict[str, Any]:
     background = common.read_json(background_dir / "background_summary.json")
     session = common.read_json(controller_dir / "session_manifest.json")
@@ -622,7 +633,8 @@ def accept_online(
         layer_names = {str(row.get("layer_name")) for row in remote_attention_rows}
         if len(layer_names) != 48:
             errors.append(
-                f"online Bridge exercised {len(layer_names)} attention layers, expected 48"
+                "online Bridge exercised "
+                f"{len(layer_names)} attention layers, expected 48"
             )
         token_layers: dict[tuple[str, int], list[str]] = {}
         for row in remote_attention_rows:
@@ -630,9 +642,7 @@ def accept_online(
                 str(row.get("request_id")),
                 int(row.get("sequence_tokens", -1)),
             )
-            token_layers.setdefault(token_key, []).append(
-                str(row.get("layer_name"))
-            )
+            token_layers.setdefault(token_key, []).append(str(row.get("layer_name")))
         incomplete_tokens = {
             f"{request_id}@{sequence_tokens}": {
                 "calls": len(names),
@@ -654,18 +664,15 @@ def accept_online(
         ):
             errors.append("online Bridge used an empty TP4 prefix")
         verification_rows = [
-            row
-            for row in remote_attention_rows
-            if row.get("max_abs_error") is not None
+            row for row in remote_attention_rows if row.get("max_abs_error") is not None
         ]
         if len({str(row.get("layer_name")) for row in verification_rows}) != 48:
             errors.append("online Bridge did not numerically verify all 48 layers")
         if any(float(row["max_abs_error"]) > 0.02 for row in verification_rows):
-            errors.append("online Bridge exceeded the split-attention max-abs tolerance")
-        if any(
-            float(row["cosine_similarity"]) < 0.999
-            for row in verification_rows
-        ):
+            errors.append(
+                "online Bridge exceeded the split-attention max-abs tolerance"
+            )
+        if any(float(row["cosine_similarity"]) < 0.999 for row in verification_rows):
             errors.append("online Bridge exceeded the split-attention cosine tolerance")
     if background.get("jobs") != expected_jobs:
         errors.append("background job count differs from manifest")
@@ -678,28 +685,33 @@ def accept_online(
     expected_order = "TOKEN_ASCENDING_FROM_REQUEST_START"
     if session.get("history_copy_order") != expected_order:
         errors.append("history KV was not recorded as head-first token order")
-    errors.extend(
-        validate_strategy_timing(
-            strategy,
-            shadow_start_unix_s=shadow_start,
-            bridge_start_unix_s=bridge_start,
-            history_start_unix_s=history_start,
+    if not stop_and_copy:
+        errors.extend(
+            validate_strategy_timing(
+                strategy,
+                shadow_start_unix_s=shadow_start,
+                bridge_start_unix_s=bridge_start,
+                history_start_unix_s=history_start,
+            )
         )
-    )
     expected_transitions = (
         ["SHADOW", "TAKEOVER"]
         if handoff_mode == "shadow-only"
         else ["SHADOW", "HANDOFF", "TAKEOVER"]
     )
-    if transitions[-len(expected_transitions):] != expected_transitions:
+    if transitions[-len(expected_transitions) :] != expected_transitions:
         errors.append(f"unexpected migration transitions: {transitions!r}")
     history_completed = [
         float(row.get("completed_unix_s", float("inf")))
         for row in initial_stage_receipts
     ]
-    if handoff_mode == "shadow-only" and (
-        len(history_completed) != 4
-        or any(value > freeze_unix_s for value in history_completed)
+    if (
+        handoff_mode == "shadow-only"
+        and not stop_and_copy
+        and (
+            len(history_completed) != 4
+            or any(value > freeze_unix_s for value in history_completed)
+        )
     ):
         errors.append(
             "Shadow-only history did not finish staging on all ranks before "
@@ -712,13 +724,18 @@ def accept_online(
     )
     gpu_resident_shadow = staging.get("gpu_resident_shadow") is True
     gpu_history_completed = [
-        float(row.get("completed_unix_s", float("inf")))
-        for row in gpu_initial_receipts
+        float(row.get("completed_unix_s", float("inf"))) for row in gpu_initial_receipts
     ]
-    if gpu_resident_shadow and (
-        len(gpu_history_completed) != 4
-        or any(value > freeze_unix_s for value in gpu_history_completed)
-        or not all(row.get("exact_readback") is True for row in gpu_initial_receipts)
+    if (
+        gpu_resident_shadow
+        and not stop_and_copy
+        and (
+            len(gpu_history_completed) != 4
+            or any(value > freeze_unix_s for value in gpu_history_completed)
+            or not all(
+                row.get("exact_readback") is True for row in gpu_initial_receipts
+            )
+        )
     ):
         errors.append(
             "initial history was not GPU-resident on all ranks before cutover"
@@ -729,9 +746,9 @@ def accept_online(
         expected_blocks = int(session["num_blocks"])
         for rank in range(4):
             block_paths = sorted(
-                (
-                    controller_dir / "gpu_block_receipts" / f"tp_rank_{rank}"
-                ).glob("*.json")
+                (controller_dir / "gpu_block_receipts" / f"tp_rank_{rank}").glob(
+                    "*.json"
+                )
             )
             blocks = [common.read_json(path) for path in block_paths]
             if (
@@ -742,9 +759,9 @@ def accept_online(
             ):
                 errors.append(f"TP4 rank {rank} history block ACKs are incomplete")
             delta_paths = sorted(
-                (
-                    controller_dir / "gpu_delta_receipts" / f"tp_rank_{rank}"
-                ).glob("*.json")
+                (controller_dir / "gpu_delta_receipts" / f"tp_rank_{rank}").glob(
+                    "*.json"
+                )
             )
             expected_start = initial_end
             for path in delta_paths:
@@ -776,22 +793,43 @@ def accept_online(
         errors.append("unified response proxy did not commit")
     if proxy.get("emitted_tokens") != expected_anchor_tokens:
         errors.append("unified response length differs from anchor budget")
-    if int(proxy.get("source_origin_tokens", 0)) <= 0 or int(
-        proxy.get("target_origin_tokens", 0)
-    ) <= 0:
+    if (
+        int(proxy.get("source_origin_tokens", 0)) <= 0
+        or int(proxy.get("target_origin_tokens", 0)) <= 0
+    ):
         errors.append("unified response does not contain tokens from both owners")
     if proxy.get("handoff_stall_s") is None:
         errors.append("unified response did not record a handoff stall")
     emitted = proxy.get("emitted", [])
     if [row.get("index") for row in emitted] != list(range(expected_anchor_tokens)):
         errors.append("unified response indices are not contiguous")
-    for window in ("PRE_SHADOW", "SHADOW", "BRIDGE"):
+    required_windows = (
+        ("PRE_SHADOW",)
+        if stop_and_copy
+        else (
+            "PRE_SHADOW",
+            "SHADOW",
+            "BRIDGE",
+        )
+    )
+    for window in required_windows:
         if int(windows[window]["samples"]) < minimum_window_samples:
             errors.append(
                 f"{window} has {windows[window]['samples']} TPOT samples, "
                 f"requires {minimum_window_samples}"
             )
     errors.extend(receipt_errors)
+    if stop_and_copy:
+        frozen_path = controller_dir / "request_frozen_receipt.json"
+        release_path = controller_dir / "source_kv_release_receipt.json"
+        if not frozen_path.is_file():
+            errors.append("scheduler did not acknowledge the per-request freeze")
+        if not release_path.is_file():
+            errors.append("source KV release was not observed after takeover")
+        if session.get("stop_and_copy") is not True:
+            errors.append("session did not record Stop-and-Copy mode")
+        if int(cutover.get("delta_tokens", -1)) != 0:
+            errors.append("Stop-and-Copy unexpectedly transferred live deltas")
     observed_rates = [
         float(row["rate_gib_s"])
         for row in audit
@@ -800,9 +838,7 @@ def accept_online(
     if fixed_rate_gib_s is not None:
         if not observed_rates:
             errors.append("controller did not record fixed-rate actuation")
-        elif any(
-            abs(value - fixed_rate_gib_s) > 1e-9 for value in observed_rates
-        ):
+        elif any(abs(value - fixed_rate_gib_s) > 1e-9 for value in observed_rates):
             errors.append("controller deviated from the requested fixed rate")
     slo = summarize_slo(
         background.get("results", []),
@@ -838,6 +874,23 @@ def accept_online(
         if row.get("status") == "COMPLETED"
     )
     bridge_to_commit_ms = (committed - bridge_start) * 1000
+    frozen_receipt_path = controller_dir / "request_frozen_receipt.json"
+    release_receipt_path = controller_dir / "source_kv_release_receipt.json"
+    frozen_receipt = (
+        common.read_json(frozen_receipt_path)
+        if frozen_receipt_path.is_file()
+        else None
+    )
+    release_receipt = (
+        common.read_json(release_receipt_path)
+        if release_receipt_path.is_file()
+        else None
+    )
+    source_kv_released_unix_s = (
+        int(release_receipt["released_unix_ns"]) / 1e9
+        if release_receipt is not None
+        else None
+    )
     reported_windows = dict(windows)
     if handoff_mode == "shadow-only":
         # Preserve the legacy BRIDGE key for old result readers while naming
@@ -847,7 +900,9 @@ def accept_online(
         "format_version": 1,
         "status": "PASS" if not errors else "FAIL",
         "evidence_class": (
-            "ONLINE_VLLM_BRIDGE_REMOTE_ATTENTION"
+            "ONLINE_VLLM_REQUEST_LEVEL_STOP_AND_COPY"
+            if stop_and_copy
+            else "ONLINE_VLLM_BRIDGE_REMOTE_ATTENTION"
             if require_remote_attention
             else "ONLINE_VLLM_GPU_RESIDENT_SHADOW_TAKEOVER"
             if gpu_resident_shadow
@@ -875,14 +930,14 @@ def accept_online(
         ),
         "strategy": strategy,
         "handoff_mode": handoff_mode,
+        "stop_and_copy": stop_and_copy,
         "fixed_rate_gib_s": fixed_rate_gib_s,
         "observed_controller_rates_gib_s": sorted(set(observed_rates)),
         "history_payload_bytes": sum(
             int(row.get("payload_bytes", 0)) for row in initial_stage_receipts
         ),
         "history_observed_aggregate_gib_s": sum(
-            float(row.get("observed_gib_s", 0.0))
-            for row in initial_stage_receipts
+            float(row.get("observed_gib_s", 0.0)) for row in initial_stage_receipts
         ),
         "history_max_stage_ms": max(
             (float(row.get("stage_ms", 0.0)) for row in initial_stage_receipts),
@@ -892,12 +947,10 @@ def accept_online(
         "history_gpu_ready_before_freeze_ms": history_gpu_ready_before_freeze_ms,
         "gpu_resident_shadow": gpu_resident_shadow,
         "gpu_history_block_acks": sum(
-            1
-            for _ in (controller_dir / "gpu_block_receipts").glob("**/*.json")
+            1 for _ in (controller_dir / "gpu_block_receipts").glob("**/*.json")
         ),
         "gpu_delta_acks": sum(
-            1
-            for _ in (controller_dir / "gpu_delta_receipts").glob("**/*.json")
+            1 for _ in (controller_dir / "gpu_delta_receipts").glob("**/*.json")
         ),
         "remote_attention_calls": len(remote_attention_rows),
         "remote_attention_layers": len(
@@ -916,9 +969,7 @@ def accept_online(
                 for row in remote_attention_visible_rows
             }
         ),
-        "remote_attention_speculative_calls": len(
-            remote_attention_speculative_rows
-        ),
+        "remote_attention_speculative_calls": len(remote_attention_speculative_rows),
         "remote_attention_speculative_token_forwards": len(
             {
                 (str(row.get("request_id")), int(row.get("sequence_tokens", -1)))
@@ -960,6 +1011,17 @@ def accept_online(
         "history_transfer_started_unix_s": history_start,
         "history_transfer_phase": session.get("history_transfer_phase"),
         "handoff_stall_ms": handoff_stall_ms,
+        "request_frozen_unix_s": (
+            int(frozen_receipt["frozen_unix_ns"]) / 1e9
+            if frozen_receipt is not None
+            else None
+        ),
+        "source_kv_released_unix_s": source_kv_released_unix_s,
+        "source_kv_release_after_commit_ms": (
+            (source_kv_released_unix_s - committed) * 1000
+            if source_kv_released_unix_s is not None
+            else None
+        ),
         "slo": slo,
         "anchor_tpot": {
             "samples": len(anchor_intervals),
@@ -1004,6 +1066,7 @@ def main() -> None:
         "bridge_only": args.bridge_only,
         "architecture_comparison": args.architecture_comparison,
         "shadow_only_only": args.shadow_only_only,
+        "stop_and_copy_only": args.stop_and_copy_only,
         "gpu_resident_shadow": args.gpu_resident_shadow,
         "online_remote_attention": args.online_remote_attention,
         "remote_attention_base_port": args.remote_attention_base_port,
@@ -1050,21 +1113,23 @@ def main() -> None:
                 ]
                 if args.bridge_only
                 else (
-                [
-                    (
-                        "BRIDGE_RA" if args.online_remote_attention else "BRIDGE",
-                        "S_NEW_OLD" if args.online_remote_attention else "S_NEW",
-                        "bridge",
-                    ),
-                    ("SHADOW_ONLY", "S_NEW_OLD", "shadow-only"),
-                ]
-                if args.architecture_comparison
-                else [("SHADOW_ONLY", "S_NEW_OLD", "shadow-only")]
-                if args.shadow_only_only
-                else [
-                    (strategy, strategy, "bridge")
-                    for strategy in args.strategy_order
-                ]
+                    [
+                        (
+                            "BRIDGE_RA" if args.online_remote_attention else "BRIDGE",
+                            "S_NEW_OLD" if args.online_remote_attention else "S_NEW",
+                            "bridge",
+                        ),
+                        ("SHADOW_ONLY", "S_NEW_OLD", "shadow-only"),
+                    ]
+                    if args.architecture_comparison
+                    else [("STOP_AND_COPY", "S_NEW_OLD", "shadow-only")]
+                    if args.stop_and_copy_only
+                    else [("SHADOW_ONLY", "S_NEW_OLD", "shadow-only")]
+                    if args.shadow_only_only
+                    else [
+                        (strategy, strategy, "bridge")
+                        for strategy in args.strategy_order
+                    ]
                 )
             )
             if repetition % 2 == 0:
@@ -1075,9 +1140,11 @@ def main() -> None:
                 selected_online_remote_attention = bool(
                     args.online_remote_attention and handoff_mode == "bridge"
                 )
+                selected_stop_and_copy = architecture == "STOP_AND_COPY"
                 rep_args.online_remote_attention = selected_online_remote_attention
                 rep_args.gpu_resident_shadow = bool(
                     args.gpu_resident_shadow
+                    or selected_stop_and_copy
                     or selected_online_remote_attention
                     or (
                         args.architecture_comparison
@@ -1085,6 +1152,10 @@ def main() -> None:
                         and handoff_mode == "shadow-only"
                     )
                 )
+                if selected_stop_and_copy:
+                    # The target connector's final watermark is the frozen
+                    # snapshot boundary, not Shadow's later delta boundary.
+                    rep_args.cutover_output_tokens = args.trigger_output_tokens
                 rep_args.force_source_eager = bool(args.online_remote_attention)
                 rep_args.out_root = out_root / label
                 run_id = f"{out_root.name}-{label}"
@@ -1097,6 +1168,7 @@ def main() -> None:
                     selected: str = strategy,
                     selected_handoff: str = handoff_mode,
                     selected_remote: bool = selected_online_remote_attention,
+                    selected_stop: bool = selected_stop_and_copy,
                 ) -> dict[str, Any]:
                     return accept_online(
                         controller_dir,
@@ -1112,9 +1184,25 @@ def main() -> None:
                         slo_ttft_ms=args.slo_ttft_ms,
                         slo_e2e_ms=args.slo_e2e_ms,
                         slo_handoff_ms=args.slo_handoff_ms,
+                        stop_and_copy=selected_stop,
                     )
 
                 source_env_overrides = {"BRIDGETP_SHADOW_STRATEGY": strategy}
+                if handoff_mode == "shadow-only":
+                    source_env_overrides["BRIDGETP_REQUEST_FREEZE_ENABLED"] = "1"
+                if selected_stop_and_copy:
+                    source_env_overrides.update(
+                        {
+                            "BRIDGETP_STOP_AND_COPY": "1",
+                            "BRIDGETP_REQUEST_FREEZE_ENABLED": "1",
+                            "BRIDGETP_STREAM_AFTER_OUTPUT_TOKENS": str(
+                                args.trigger_output_tokens
+                            ),
+                            "BRIDGETP_PHASE8_CUTOVER_OUTPUT_TOKENS": str(
+                                args.cutover_output_tokens
+                            ),
+                        }
+                    )
                 if selected_online_remote_attention:
                     source_env_overrides.update(
                         {
@@ -1183,7 +1271,8 @@ def main() -> None:
                         ["--gpu-resident-shadow"]
                         if rep_args.gpu_resident_shadow
                         else []
-                    ),
+                    )
+                    + (["--stop-and-copy"] if selected_stop_and_copy else []),
                     background_before_controller=True,
                     background_lead_s=args.background_lead_s,
                     background_ready_jobs=args.minimum_ready_target_jobs,
@@ -1194,6 +1283,7 @@ def main() -> None:
                         "strategy": strategy,
                         "architecture": architecture,
                         "handoff_mode": handoff_mode,
+                        "stop_and_copy": selected_stop_and_copy,
                         "status": result["status"],
                         "root": str(rep_args.out_root.resolve()),
                         "acceptance": result["acceptance"],
@@ -1212,8 +1302,13 @@ def main() -> None:
             "format_version": 1,
             "status": "PASS" if not errors else "FAIL",
             "phase": args.phase,
-            "expected_runs": args.repetitions * (
-                1 if (args.bridge_only or args.shadow_only_only) else 2
+            "expected_runs": args.repetitions
+            * (
+                1
+                if (
+                    args.bridge_only or args.shadow_only_only or args.stop_and_copy_only
+                )
+                else 2
             ),
             "recorded_runs": len(batch["runs"]),
             "runs": batch["runs"],

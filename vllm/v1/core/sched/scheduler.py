@@ -100,6 +100,12 @@ class Scheduler(SchedulerInterface):
         )
         self.prev_step_scheduled_req_ids: set[str] = set()
 
+        # Experimental BridgeTP request-level stop gate.  It is completely
+        # dormant unless explicitly enabled by the experiment runner.
+        from vllm.bridge_tp.request_freeze import RequestFreezeGate
+
+        self._bridgetp_request_freeze = RequestFreezeGate.from_env()
+
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
         self.max_num_scheduled_tokens = (
@@ -377,6 +383,14 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            if (
+                self._bridgetp_request_freeze is not None
+                and self._bridgetp_request_freeze.is_frozen(request.request_id)
+            ):
+                self._bridgetp_request_freeze.record_frozen(request, self.current_step)
+                req_index += 1
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -1907,6 +1921,8 @@ class Scheduler(SchedulerInterface):
     def _free_blocks(self, request: Request):
         assert request.is_finished()
         self.kv_cache_manager.free(request)
+        if self._bridgetp_request_freeze is not None:
+            self._bridgetp_request_freeze.record_released(request)
         del self.requests[request.request_id]
 
     @property

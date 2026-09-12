@@ -214,6 +214,8 @@ def build_gpu_resident_shadow_target_request(
     session: dict[str, Any],
     run_name: str,
     cutover_output_tokens: int,
+    *,
+    allow_complete_prefix: bool = False,
 ) -> tuple[dict[str, Any], int]:
     """Build a dormant target request with space for future Shadow tokens.
 
@@ -229,7 +231,9 @@ def build_gpu_resident_shadow_target_request(
         )
     known = list(session["all_known_token_ids"])
     planned_known = int(session["num_prompt_tokens"]) + cutover_output_tokens
-    if planned_known <= len(known):
+    if planned_known < len(known) or (
+        planned_known == len(known) and not allow_complete_prefix
+    ):
         raise ValueError("Shadow target must reserve at least one future token")
     placeholder = int(known[-1]) if known else 0
     prompt = known + [placeholder] * (planned_known - len(known))

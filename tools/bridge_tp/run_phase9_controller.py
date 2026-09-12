@@ -126,6 +126,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="admit a dormant TP4 request at Shadow start and patch its KV blocks",
     )
+    parser.add_argument(
+        "--stop-and-copy",
+        action="store_true",
+        help=(
+            "freeze the selected source request at the diagnostic trigger; "
+            "the following cutover value is only the Phase-8 control sentinel"
+        ),
+    )
     args = parser.parse_args()
     trigger = args.diagnostic_trigger_output_tokens
     cutover = args.diagnostic_cutover_output_tokens
@@ -136,9 +144,7 @@ def parse_args() -> argparse.Namespace:
         )
     if trigger is not None and (trigger < 0 or cutover <= trigger):
         parser.error("diagnostic boundaries require 0 <= trigger < cutover")
-    if bridge is not None and (
-        trigger is None or not trigger < bridge < cutover
-    ):
+    if bridge is not None and (trigger is None or not trigger < bridge < cutover):
         parser.error("diagnostic Bridge boundary must be between trigger and cutover")
     if args.gpu_resident_shadow and cutover is None:
         parser.error("GPU-resident staging requires fixed diagnostic boundaries")
@@ -241,6 +247,7 @@ def _start_target_if_ready(
     target_future: Future[dict[str, Any]] | None,
     gpu_resident_shadow: bool = False,
     cutover_output_tokens: int | None = None,
+    stop_and_copy: bool = False,
 ) -> Future[dict[str, Any]] | None:
     if target_future is not None:
         return target_future
@@ -253,8 +260,14 @@ def _start_target_if_ready(
     if gpu_resident_shadow:
         if cutover_output_tokens is None:
             raise ValueError("GPU-resident Shadow has no cutover boundary")
+        if stop_and_copy:
+            cutover_output_tokens = int(staging["snapshot_num_output_tokens"])
         target_request, cutover = build_gpu_resident_shadow_target_request(
-            source_request, staging, run_dir.name, cutover_output_tokens
+            source_request,
+            staging,
+            run_dir.name,
+            cutover_output_tokens,
+            allow_complete_prefix=stop_and_copy,
         )
     else:
         target_request, cutover = build_target_request(
@@ -297,6 +310,7 @@ def step_local(
     diagnostic_trigger_output_tokens: int | None = None,
     diagnostic_cutover_output_tokens: int | None = None,
     capacity_signal: CapacitySignal | None = None,
+    stop_and_copy: bool = False,
 ) -> None:
     decision = policy.evaluate(
         request,
@@ -334,8 +348,7 @@ def step_local(
             }
         )
     performance_allowed = not (
-        config.capacity_pilot.enabled
-        and config.capacity_pilot.exclusive_trigger_path
+        config.capacity_pilot.enabled and config.capacity_pilot.exclusive_trigger_path
     )
     should_start = (
         diagnostic_boundary
@@ -383,7 +396,7 @@ def step_local(
             }
         )
         return
-    recorder.set_cutover(cutover, now)
+    recorder.set_cutover(trigger if stop_and_copy else cutover, now)
     if diagnostic_boundary:
         trigger_path = TriggerPath.DIAGNOSTIC_FIXED_BOUNDARY
         trigger_reason = "diagnostic fixed boundary"
@@ -391,11 +404,14 @@ def step_local(
         trigger_path = TriggerPath.CAPACITY_PILOT
         trigger_reason = "CAP-0 measured source headroom trigger"
     else:
-        trigger_path = getattr(
-            decision,
-            "trigger_path",
-            None,
-        ) or TriggerPath.PERFORMANCE_OPPORTUNITY
+        trigger_path = (
+            getattr(
+                decision,
+                "trigger_path",
+                None,
+            )
+            or TriggerPath.PERFORMANCE_OPPORTUNITY
+        )
         trigger_reason = decision.reason
     adapter.arm_shadow(
         trigger,
@@ -449,9 +465,7 @@ def step_shadow(
     if not dry_run:
         adapter.set_rate(rate.rate_gib_s, note=rate.last_reason)
 
-    diagnostic_path = (
-        record.trigger_path is TriggerPath.DIAGNOSTIC_FIXED_BOUNDARY
-    )
+    diagnostic_path = record.trigger_path is TriggerPath.DIAGNOSTIC_FIXED_BOUNDARY
     safety_path = record.trigger_path in {
         TriggerPath.CAPACITY_PILOT,
         TriggerPath.POLICY_OOM_RISK,
@@ -464,13 +478,9 @@ def step_shadow(
         abandon = False
         reason = ""
     elif safety_path:
-        abandon = (
-            pool4.kv_usage_frac > policy.cfg.max_target_kv_usage_frac + 0.10
-        )
+        abandon = pool4.kv_usage_frac > policy.cfg.max_target_kv_usage_frac + 0.10
         reason = (
-            f"target risk too high: kv={pool4.kv_usage_frac:.2f}"
-            if abandon
-            else ""
+            f"target risk too high: kv={pool4.kv_usage_frac:.2f}" if abandon else ""
         )
         if (
             not abandon
@@ -735,6 +745,17 @@ def main() -> None:
         with unified_response_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(token, ensure_ascii=False) + "\n")
             handle.flush()
+        from vllm.bridge_tp.experiment_timeline import emit_event
+
+        emit_event(
+            run_dir,
+            "response_proxy",
+            "TOKEN_EMITTED",
+            request_id=str(source_request["request_id"]),
+            migration_id=args.migration_id or None,
+            token_index=int(token["index"]),
+            origin=str(token["origin"]),
+        )
 
     recorder = ProxyRecorder(
         str(source_request["request_id"]),
@@ -804,6 +825,7 @@ def main() -> None:
                     else None
                 ),
                 "handoff_mode": args.handoff_mode,
+                "stop_and_copy": args.stop_and_copy,
             },
         )
         machine = MigrationStateMachine(
@@ -894,6 +916,7 @@ def main() -> None:
                         diagnostic_trigger,
                         diagnostic_cutover,
                         capacity_signal,
+                        args.stop_and_copy,
                     )
                 elif record.state is MigrationState.SHADOW:
                     target_future = _start_target_if_ready(
@@ -907,6 +930,7 @@ def main() -> None:
                         target_future=target_future,
                         gpu_resident_shadow=args.gpu_resident_shadow,
                         cutover_output_tokens=diagnostic_cutover,
+                        stop_and_copy=args.stop_and_copy,
                     )
                     if (
                         args.handoff_mode == "bridge"

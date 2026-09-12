@@ -27,7 +27,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-
 REPO = Path(__file__).resolve().parents[2]
 BACKGROUND = REPO / "tools" / "bridge_tp" / "run_phase9_capacity_background.py"
 CONTROLLER = REPO / "tools" / "bridge_tp" / "run_phase9_controller.py"
@@ -288,6 +287,13 @@ def make_source_request(
     provenance_dir: Path,
 ) -> Path:
     request = read_json(SOURCE_REQUEST)
+    anchor_prompt_tokens = getattr(args, "anchor_prompt_tokens", None)
+    if anchor_prompt_tokens is not None:
+        if int(anchor_prompt_tokens) <= 0:
+            raise ValueError("anchor_prompt_tokens must be positive")
+        # A fixed valid vocabulary ID keeps all four modes byte-for-byte
+        # identical without introducing tokenizer-version drift.
+        request["prompt"] = [100] * int(anchor_prompt_tokens)
     request["max_tokens"] = args.anchor_max_tokens
     path = provenance_dir / "anchor_request.json"
     write_json(path, request)
@@ -402,9 +408,7 @@ def accept_calibration(
     transitions = [row for row in rows if row.get("kind") == "transition"]
     ends = [row for row in rows if row.get("kind") == "run_end"]
     migration_transitions = [
-        row
-        for row in transitions
-        if row.get("to") in {"SHADOW", "HANDOFF", "TAKEOVER"}
+        row for row in transitions if row.get("to") in {"SHADOW", "HANDOFF", "TAKEOVER"}
     ]
     telemetry_times = [
         float(row["tp1"]["sampled_unix_s"])
@@ -456,14 +460,12 @@ def accept_calibration(
     ):
         errors.append("background timing is missing")
     else:
-        if (
-            audit_end is None
-            or float(audit_end) + coverage_slack_s < float(background_end)
+        if audit_end is None or float(audit_end) + coverage_slack_s < float(
+            background_end
         ):
             errors.append("controller ended before the background workload")
-        if (
-            last_telemetry is None
-            or last_telemetry + coverage_slack_s < float(background_end)
+        if last_telemetry is None or last_telemetry + coverage_slack_s < float(
+            background_end
         ):
             errors.append("telemetry did not cover the background workload end")
     result = {
@@ -502,9 +504,7 @@ def calibration_metrics(controller_dir: Path) -> dict[str, Any]:
         None,
     )
     first = telemetry[first_index] if first_index is not None else None
-    before_first = (
-        telemetry[:first_index] if first_index is not None else telemetry
-    )
+    before_first = telemetry[:first_index] if first_index is not None else telemetry
 
     # Admission, completion and recompute can allocate or release thousands of
     # KV tokens between two scrapes.  Those discrete scheduler events are not a
@@ -543,8 +543,7 @@ def calibration_metrics(controller_dir: Path) -> dict[str, Any]:
 
     free = [int(row["capacity_signal"]["free_kv_tokens"]) for row in telemetry]
     decline = [
-        float(row["capacity_signal"]["decline_rate_tokens_s"])
-        for row in telemetry
+        float(row["capacity_signal"]["decline_rate_tokens_s"]) for row in telemetry
     ]
     kv_usage = [float(row["tp1"]["kv_usage_frac"]) for row in telemetry]
     waiting = [int(row["tp1"]["num_waiting"]) for row in telemetry]
@@ -745,9 +744,7 @@ def run_one(
             "minimum_peak_kv_usage_frac": args.minimum_peak_kv_usage_frac,
             "require_preemption": not args.allow_censored,
             "coverage_slack_s": args.coverage_slack_s,
-            "source_request_id_prefix": (
-                f"bridgetp-phase9-{controller_dir.name}"
-            ),
+            "source_request_id_prefix": (f"bridgetp-phase9-{controller_dir.name}"),
         },
     )
 
@@ -940,13 +937,19 @@ def validate_inputs(args: argparse.Namespace) -> str:
     expected = git("rev-parse", args.expected_revision)
     if revision != expected:
         raise RuntimeError(f"HEAD {revision} differs from expected {expected}")
-    if subprocess.run(
-        ["git", "-C", str(REPO), "diff", "--quiet", "HEAD", "--"]
-    ).returncode != 0:
+    if (
+        subprocess.run(
+            ["git", "-C", str(REPO), "diff", "--quiet", "HEAD", "--"]
+        ).returncode
+        != 0
+    ):
         raise RuntimeError("tracked working-tree changes are present")
-    if subprocess.run(
-        ["git", "-C", str(REPO), "diff", "--cached", "--quiet", "HEAD", "--"]
-    ).returncode != 0:
+    if (
+        subprocess.run(
+            ["git", "-C", str(REPO), "diff", "--cached", "--quiet", "HEAD", "--"]
+        ).returncode
+        != 0
+    ):
         raise RuntimeError("staged changes are present")
     if args.expected_manifest_sha256:
         actual = sha256(args.manifest)

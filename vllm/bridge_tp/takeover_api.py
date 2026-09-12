@@ -75,25 +75,17 @@ def _validate_target_ready(
 ) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
     phase8 = (run_dir / "staging_manifest.json").exists()
     sender_dir = (
-        run_dir / "stage_delivery_receipts"
-        if phase8
-        else run_dir / "sender_receipts"
+        run_dir / "stage_delivery_receipts" if phase8 else run_dir / "sender_receipts"
     )
-    senders = [
-        _load_json(sender_dir / f"tp_rank_{rank}.json")
-        for rank in range(4)
-    ]
+    senders = [_load_json(sender_dir / f"tp_rank_{rank}.json") for rank in range(4)]
     receiver_root = run_dir / "receiver_receipts"
     target_dirs = sorted(path for path in receiver_root.iterdir() if path.is_dir())
     if len(target_dirs) != 1:
         raise ValueError("Phase 7 requires exactly one target request directory")
     receivers = [
-        _load_json(target_dirs[0] / f"tp_rank_{rank}.json")
-        for rank in range(4)
+        _load_json(target_dirs[0] / f"tp_rank_{rank}.json") for rank in range(4)
     ]
-    target_request_ids = {
-        str(receipt["target_request_id"]) for receipt in receivers
-    }
+    target_request_ids = {str(receipt["target_request_id"]) for receipt in receivers}
     if len(target_request_ids) != 1:
         raise ValueError("TP4 ranks disagree on the target request ID")
     target_request_id = next(iter(target_request_ids))
@@ -235,10 +227,8 @@ async def takeover(raw_request: Request) -> dict[str, Any]:
 
         base_state = {
             "format_version": 1,
-        "phase": str(manifest.get("phase", "BridgeTP D3 Phase 7")),
-            "scope": (
-                "application-level atomic handoff; no crash-consensus claim"
-            ),
+            "phase": str(manifest.get("phase", "BridgeTP D3 Phase 7")),
+            "scope": ("application-level atomic handoff; no crash-consensus claim"),
             "migration_id": migration_id,
             "source_request_id": manifest["source_request_id"],
             "snapshot_num_output_tokens": manifest["snapshot_num_output_tokens"],
@@ -290,6 +280,15 @@ async def takeover(raw_request: Request) -> dict[str, Any]:
             "updated_unix_s": time.time(),
         }
         _atomic_json_dump(committed, state_path)
+        from vllm.bridge_tp.experiment_timeline import emit_event
+
+        emit_event(
+            run_dir,
+            "source_api",
+            "TAKEOVER_COMMITTED_SOURCE_ABORT_DISPATCHED",
+            request_id=source_external_request_id,
+            migration_id=migration_id,
+        )
         logger.warning(
             "BridgeTP takeover committed migration %s and aborted source %s",
             migration_id,
