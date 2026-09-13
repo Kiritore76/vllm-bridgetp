@@ -735,29 +735,35 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             started = time.perf_counter()
             initial_end = int(manifest["num_computed_tokens"])
             initial_blocks = math.ceil(initial_end / int(manifest["block_size"]))
-            exact_readback = True
-            for logical_block in range(initial_blocks):
-                block_path = queue_dir / f"history_{logical_block:012d}.bin"
-                self._wait_for_file(block_path, deadline)
-                block_bytes = block_path.read_bytes()
-                block = deserialize_rank_payload(block_bytes)
-                if int(block.get("logical_block", -1)) != logical_block:
-                    raise ValueError("History block index differs from filename")
-                block_layers = block.get("layers")
-                if not isinstance(block_layers, dict) or not block_layers:
-                    raise ValueError("Live Shadow history block has no KV layers")
-                with self._gpu_kv_lock:
-                    validation = inject_rank_shard(
-                        self._destination_layers(block_layers),
-                        block_layers,
-                        [request.target_block_ids[logical_block]],
-                        block_axis=int(manifest["block_axis"]),
-                    )
-                exact_readback = (
-                    exact_readback and validation["exact_readback"] is True
+            history_path = queue_dir / "history_full.bin"
+            self._wait_for_file(history_path, deadline)
+            history_bytes = history_path.read_bytes()
+            history = deserialize_rank_payload(history_bytes)
+            for key, expected in {
+                "migration_id": request.migration_id,
+                "source_request_id": request.source_request_id,
+                "target_tp_rank": tp_rank,
+            }.items():
+                if history.get(key) != expected:
+                    raise ValueError(f"Live Shadow history {key} differs")
+            history_layers = history.get("layers")
+            if not isinstance(history_layers, dict) or not history_layers:
+                raise ValueError("Live Shadow history has no KV layers")
+            with self._gpu_kv_lock:
+                validation = inject_rank_shard(
+                    self._destination_layers(history_layers),
+                    history_layers,
+                    request.target_block_ids[:initial_blocks],
+                    block_axis=int(manifest["block_axis"]),
                 )
-                digest.update(block_bytes)
-                aggregate_bytes += len(block_bytes)
+            exact_readback = validation["exact_readback"] is True
+            digest.update(history_bytes)
+            aggregate_bytes += len(history_bytes)
+            # One full-tensor exact readback covers every logical block.  Keep
+            # the per-block receipts required by the protocol without paying
+            # for 132 separate tensor serializations and GPU round trips.
+            completed_unix_s = time.time()
+            for logical_block in range(initial_blocks):
                 _atomic_json_dump(
                     {
                         "format_version": 1,
@@ -770,8 +776,9 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                             (logical_block + 1) * int(manifest["block_size"]),
                             initial_end,
                         ),
-                        "exact_readback": validation["exact_readback"],
-                        "completed_unix_s": time.time(),
+                        "exact_readback": exact_readback,
+                        "verification_scope": "FULL_RANK_EXACT_READBACK",
+                        "completed_unix_s": completed_unix_s,
                     },
                     self.manifest_path.parent
                     / "gpu_block_receipts"
