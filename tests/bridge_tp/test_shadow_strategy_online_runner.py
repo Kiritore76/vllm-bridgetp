@@ -14,6 +14,8 @@ from tools.bridge_tp.run_shadow_rate_load_matrix import (
 )
 from tools.bridge_tp.run_shadow_strategy_online_validation import (
     build_controller_config_overrides,
+    emitted_boundary_gap_ms,
+    summarize_emitted_intervals,
     summarize_slo,
     write_measurements,
 )
@@ -82,6 +84,32 @@ class TestOnlineStrategyTiming(unittest.TestCase):
 
 
 class TestOnlineWindows(unittest.TestCase):
+    def test_visible_interval_summary_preserves_maximum_stall(self) -> None:
+        emitted = [
+            {"origin": "source", "unix_s": 1.0},
+            {"origin": "source", "unix_s": 1.01},
+            {"origin": "source", "unix_s": 1.51},
+            {"origin": "target", "unix_s": 1.61},
+        ]
+        source = summarize_emitted_intervals(emitted, origin="source")
+        self.assertEqual(source["samples"], 2)
+        self.assertAlmostEqual(source["max_ms"], 500.0)
+        self.assertAlmostEqual(
+            emitted_boundary_gap_ms(
+                emitted,
+                origin="source",
+                output_tokens=3,
+            ),
+            500.0,
+        )
+        self.assertIsNone(
+            emitted_boundary_gap_ms(
+                emitted,
+                origin="source",
+                output_tokens=4,
+            )
+        )
+
     def test_partitions_target_tpot(self) -> None:
         results = [
             {

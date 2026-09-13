@@ -57,6 +57,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--server-start-timeout-s", type=float, default=900)
     parser.add_argument("--run-timeout-s", type=float, default=2400)
     parser.add_argument("--stager-timeout-s", type=float, default=1800)
+    parser.add_argument("--slo-tpot-ms", type=float, default=50.0)
+    parser.add_argument("--slo-ttft-ms", type=float, default=1000.0)
+    parser.add_argument("--slo-e2e-ms", type=float, default=60000.0)
+    parser.add_argument("--slo-handoff-ms", type=float, default=1000.0)
     parser.add_argument("--validate-only", action="store_true")
     return parser.parse_args()
 
@@ -200,11 +204,24 @@ def online_args(
         str(args.delivery_port),
         "--stager-timeout-s",
         str(args.stager_timeout_s),
+        "--slo-tpot-ms",
+        str(args.slo_tpot_ms),
+        "--slo-ttft-ms",
+        str(args.slo_ttft_ms),
+        "--slo-e2e-ms",
+        str(args.slo_e2e_ms),
+        "--slo-handoff-ms",
+        str(args.slo_handoff_ms),
         *shared_server_args(args),
     ]
 
 
-def extract_row(mode: str, repetition: int, root: Path) -> dict[str, Any]:
+def extract_row(
+    mode: str,
+    repetition: int,
+    root: Path,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
     if mode.startswith("ALWAYS_"):
         result_path = next(root.glob("r01_*/result.json"))
         result = common.read_json(result_path)
@@ -216,6 +233,8 @@ def extract_row(mode: str, repetition: int, root: Path) -> dict[str, Any]:
             "tpot_p50_ms": result["tpot_p50_ms"],
             "tpot_p95_ms": result["tpot_p95_ms"],
             "tpot_p99_ms": result["tpot_p99_ms"],
+            "mean_itl_ms": result.get("mean_itl_ms"),
+            "max_itl_ms": result.get("max_itl_ms"),
             "e2e_ms": result["e2e_ms"],
             "handoff_stall_ms": None,
             "final_sync_to_commit_ms": None,
@@ -225,6 +244,19 @@ def extract_row(mode: str, repetition: int, root: Path) -> dict[str, Any]:
             "target_origin_tokens": result["output_tokens"]
             if mode == "ALWAYS_TP4"
             else 0,
+            "migration_preparation_ms": None,
+            "trigger_to_source_kv_release_ms": None,
+            "commit_to_source_kv_release_ms": None,
+            "migration_bytes": 0,
+            "effective_kv_bandwidth_gib_s": None,
+            "slo_success": (
+                result["ttft_ms"] <= args.slo_ttft_ms
+                and result["e2e_ms"] <= args.slo_e2e_ms
+                and (
+                    result.get("max_itl_ms") is None
+                    or result["max_itl_ms"] <= args.slo_tpot_ms
+                )
+            ),
             "root": str(root.resolve()),
         }
     acceptance = common.read_json(root / "acceptance.json")
@@ -233,15 +265,29 @@ def extract_row(mode: str, repetition: int, root: Path) -> dict[str, Any]:
         "repetition": repetition,
         "mode": mode,
         "status": run["status"],
-        "ttft_ms": None,
+        "ttft_ms": run.get("anchor_ttft_ms"),
         "tpot_p50_ms": run.get("anchor_tpot", {}).get("p50_ms"),
         "tpot_p95_ms": run.get("anchor_tpot", {}).get("p95_ms"),
         "tpot_p99_ms": run.get("anchor_tpot", {}).get("p99_ms"),
-        "e2e_ms": None,
+        "mean_itl_ms": run.get("anchor_tpot", {}).get("mean_ms"),
+        "max_itl_ms": run.get("anchor_tpot", {}).get("max_ms"),
+        "e2e_ms": run.get("anchor_e2e_ms"),
         "handoff_stall_ms": run.get("handoff_stall_ms"),
         "final_sync_to_commit_ms": run.get("final_sync_to_commit_ms"),
         "source_origin_tokens": run.get("source_origin_tokens"),
         "target_origin_tokens": run.get("target_origin_tokens"),
+        "migration_preparation_ms": run.get("shadow_duration_ms"),
+        "trigger_to_source_kv_release_ms": run.get(
+            "trigger_to_source_kv_release_ms"
+        ),
+        "commit_to_source_kv_release_ms": run.get(
+            "source_kv_release_after_commit_ms"
+        ),
+        "migration_bytes": run.get("history_payload_bytes"),
+        "effective_kv_bandwidth_gib_s": run.get(
+            "history_observed_aggregate_gib_s"
+        ),
+        "slo_success": run.get("anchor_slo", {}).get("success"),
         "root": str(root.resolve()),
     }
 
@@ -339,7 +385,7 @@ def main() -> None:
                         raise RuntimeError(
                             f"timeline validation failed for r{repetition:02d} {mode}"
                         )
-                row = extract_row(mode, repetition, root)
+                row = extract_row(mode, repetition, root, args)
                 rows.append(row)
                 common.write_json(
                     args.out_root / "progress.json",

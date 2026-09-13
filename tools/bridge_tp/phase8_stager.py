@@ -14,6 +14,7 @@ import socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -123,6 +124,58 @@ def _wait_for_final_watermark(
         time.sleep(0.02)
 
 
+@dataclass
+class _InitialRank:
+    """Decoded initial snapshot plus compact wire-integrity evidence."""
+
+    payload: dict[str, Any]
+    wire_digest: Any
+    wire_bytes: int
+
+
+def _build_gpu_rank_record(
+    *,
+    manifest: dict[str, Any],
+    cutover: dict[str, Any],
+    rank: int,
+    initial: _InitialRank,
+    deltas: dict[int, dict[str, Any]],
+    wire_deltas: dict[int, bytes],
+) -> dict[str, Any]:
+    """Build terminal wire evidence without rereading the live queue."""
+
+    digest = initial.wire_digest.copy()
+    payload_bytes = initial.wire_bytes
+    expected_start = int(manifest["num_computed_tokens"])
+    delta_coverage: list[list[int]] = []
+    for start, value in sorted(wire_deltas.items()):
+        delta = deltas[start]
+        end = int(delta["end_token"])
+        if start != expected_start or end <= start:
+            raise ValueError(
+                f"rank {rank} GPU wire coverage gap/overlap at "
+                f"{expected_start}: [{start}, {end})"
+            )
+        digest.update(value)
+        payload_bytes += len(value)
+        delta_coverage.append([start, end])
+        expected_start = end
+    if expected_start != int(cutover["num_computed_tokens"]):
+        raise ValueError(
+            f"rank {rank} GPU wire coverage ended at {expected_start}, "
+            f"expected {cutover['num_computed_tokens']}"
+        )
+    return {
+        "target_tp_rank": rank,
+        "host": "shared-run-directory",
+        "port": 0,
+        "payload_bytes": payload_bytes,
+        "payload_sha256": digest.hexdigest(),
+        "num_frames": 1 + len(delta_coverage),
+        "delta_coverage": delta_coverage,
+    }
+
+
 class _DeltaReceivers:
     def __init__(
         self,
@@ -143,6 +196,14 @@ class _DeltaReceivers:
         self.stop = threading.Event()
         self.lock = threading.Lock()
         self.by_rank: list[dict[int, dict[str, Any]]] = [
+            {} for _ in range(4)
+        ]
+        # GPU-resident Shadow needs a digest of history followed by every
+        # delta at cutover. Retain only the much smaller delta wire images;
+        # the initial 100+ MB/rank history is folded into a hashlib state as
+        # soon as it arrives. This avoids rereading thousands of queue files
+        # while the source request is frozen.
+        self.wire_by_rank: list[dict[int, bytes]] = [
             {} for _ in range(4)
         ]
         self.errors: list[str] = []
@@ -211,6 +272,8 @@ class _DeltaReceivers:
                                 f"duplicate Phase 8 delta start {start}"
                             )
                         self.by_rank[rank][start] = payload
+                        if self.live_gpu_queue is not None:
+                            self.wire_by_rank[rank][start] = payload_bytes
                     if self.live_gpu_queue is not None:
                         _atomic_bytes_dump(
                             payload_bytes,
@@ -256,7 +319,7 @@ def _receive_initial_rank(
     rank: int,
     timeout_s: float,
     live_gpu_queue: Path | None = None,
-) -> dict[str, Any]:
+) -> _InitialRank:
     record = manifest["ranks"][rank]
     started = time.perf_counter()
     with socket.create_connection(
@@ -319,7 +382,11 @@ def _receive_initial_rank(
         },
         run_dir / "initial_stage_receipts" / f"tp_rank_{rank}.json",
     )
-    return payload
+    return _InitialRank(
+        payload=payload,
+        wire_digest=hashlib.sha256(payload_bytes),
+        wire_bytes=len(payload_bytes),
+    )
 
 
 def _token_axis(tensor: torch.Tensor, block_axis: int, block_size: int) -> int:
@@ -594,31 +661,15 @@ def main() -> None:
     if args.gpu_resident_shadow:
         ranks: list[dict[str, Any]] = []
         for rank in range(4):
-            rank_dir = live_gpu_queue / f"tp_rank_{rank}"
-            payload_paths = [
-                *sorted(rank_dir.glob("history_*.bin")),
-                *sorted(rank_dir.glob("delta_*.bin")),
-            ]
-            digest = hashlib.sha256()
-            payload_bytes = 0
-            for path in payload_paths:
-                value = path.read_bytes()
-                digest.update(value)
-                payload_bytes += len(value)
             ranks.append(
-                {
-                    "target_tp_rank": rank,
-                    "host": "shared-run-directory",
-                    "port": 0,
-                    "payload_bytes": payload_bytes,
-                    "payload_sha256": digest.hexdigest(),
-                    "num_frames": len(payload_paths),
-                    "delta_coverage": [
-                        [int(path.stem.split("_")[1]), int(path.stem.split("_")[2])]
-                        for path in payload_paths
-                        if path.name.startswith("delta_")
-                    ],
-                }
+                _build_gpu_rank_record(
+                    manifest=manifest,
+                    cutover=cutover,
+                    rank=rank,
+                    initial=initial[rank],
+                    deltas=delta_receivers.by_rank[rank],
+                    wire_deltas=delta_receivers.wire_by_rank[rank],
+                )
             )
         staging_manifest = {
             **manifest,
@@ -665,6 +716,8 @@ def main() -> None:
                     "payload_sha256": record["payload_sha256"],
                     "gpu_resident": True,
                     "final_watermark": watermark["end_token"],
+                    "ready_unix_s": time.time(),
+                    "evidence_source": "incremental_verified_receive",
                 },
                 args.run_dir / "stage_delivery_receipts" / f"tp_rank_{rank}.json",
             )
@@ -685,7 +738,7 @@ def main() -> None:
     coverage_by_rank: list[list[list[int]]] = []
     for rank in range(4):
         assembled, coverage = _assemble_rank(
-            initial=initial[rank],
+            initial=initial[rank].payload,
             deltas=delta_receivers.by_rank[rank],
             initial_end=int(manifest["num_computed_tokens"]),
             final_end=int(cutover["num_computed_tokens"]),
