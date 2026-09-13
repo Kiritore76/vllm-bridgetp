@@ -296,27 +296,15 @@ def _receive_initial_rank(
         layers = payload.get("layers")
         if not isinstance(layers, dict) or not layers:
             raise ValueError("initial payload contains no KV layers")
-        block_axis = int(manifest["block_axis"])
-        for logical_block in range(int(manifest["num_blocks"])):
-            block_layers = _compact_history_block_layers(
-                layers, block_axis, logical_block
-            )
-            block_payload = serialize_rank_payload(
-                {
-                    "format_version": 1,
-                    "migration_id": manifest["migration_id"],
-                    "source_request_id": manifest["source_request_id"],
-                    "target_tp_rank": rank,
-                    "logical_block": logical_block,
-                    "layers": block_layers,
-                }
-            )
-            _atomic_bytes_dump(
-                block_payload,
-                live_gpu_queue
-                / f"tp_rank_{rank}"
-                / f"history_{logical_block:012d}.bin",
-            )
+        # The source payload already contains compact logical blocks in token
+        # order.  Preserve it as one rank-level object instead of cloning and
+        # serializing every block independently.  The old path turned a single
+        # 104 MB receive into 132 torch.save calls per rank and dominated the
+        # online Shadow window with local filesystem work.
+        _atomic_bytes_dump(
+            payload_bytes,
+            live_gpu_queue / f"tp_rank_{rank}" / "history_full.bin",
+        )
     _atomic_json_dump(
         {
             "format_version": 1,
