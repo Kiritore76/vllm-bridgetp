@@ -351,6 +351,56 @@ def summarize_slo(
     }
 
 
+def summarize_emitted_intervals(
+    emitted: list[dict[str, Any]],
+    *,
+    origin: str | None = None,
+) -> dict[str, Any]:
+    """Summarize visible token gaps, including the outliers percentiles hide."""
+
+    selected = [
+        row
+        for row in emitted
+        if row.get("unix_s") is not None
+        and (origin is None or row.get("origin") == origin)
+    ]
+    intervals = [
+        (float(current["unix_s"]) - float(previous["unix_s"])) * 1000
+        for previous, current in zip(selected, selected[1:])
+    ]
+    return {
+        "samples": len(intervals),
+        "mean_ms": sum(intervals) / len(intervals) if intervals else None,
+        "p50_ms": percentile(intervals, 0.50),
+        "p95_ms": percentile(intervals, 0.95),
+        "p99_ms": percentile(intervals, 0.99),
+        "max_ms": max(intervals, default=None),
+    }
+
+
+def emitted_boundary_gap_ms(
+    emitted: list[dict[str, Any]],
+    *,
+    origin: str,
+    output_tokens: int,
+) -> float | None:
+    """Return the visible gap ending at a one-based output-token boundary."""
+
+    selected = [
+        row
+        for row in emitted
+        if row.get("origin") == origin and row.get("unix_s") is not None
+    ]
+    current = output_tokens - 1
+    previous = current - 1
+    if previous < 0 or current >= len(selected):
+        return None
+    return (
+        float(selected[current]["unix_s"])
+        - float(selected[previous]["unix_s"])
+    ) * 1000
+
+
 def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
     rows: list[dict[str, Any]] = []
     for run in runs:
@@ -379,6 +429,9 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             ),
             "source_kv_release_after_commit_ms": acceptance.get(
                 "source_kv_release_after_commit_ms"
+            ),
+            "trigger_to_source_kv_release_ms": acceptance.get(
+                "trigger_to_source_kv_release_ms"
             ),
             "source_origin_tokens": acceptance["source_origin_tokens"],
             "target_origin_tokens": acceptance["target_origin_tokens"],
@@ -437,8 +490,22 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             "stager_process_wall_time_s": lifetime_by_name.get("stager"),
             "controller_process_wall_time_s": lifetime_by_name.get("controller"),
             "anchor_tpot_p50_ms": acceptance.get("anchor_tpot", {}).get("p50_ms"),
+            "anchor_ttft_ms": acceptance.get("anchor_ttft_ms"),
+            "anchor_e2e_ms": acceptance.get("anchor_e2e_ms"),
+            "anchor_mean_itl_ms": acceptance.get("anchor_tpot", {}).get("mean_ms"),
             "anchor_tpot_p95_ms": acceptance.get("anchor_tpot", {}).get("p95_ms"),
             "anchor_tpot_p99_ms": acceptance.get("anchor_tpot", {}).get("p99_ms"),
+            "anchor_tpot_max_ms": acceptance.get("anchor_tpot", {}).get("max_ms"),
+            "source_tpot_p50_ms": acceptance.get("source_tpot", {}).get("p50_ms"),
+            "source_tpot_p95_ms": acceptance.get("source_tpot", {}).get("p95_ms"),
+            "source_tpot_p99_ms": acceptance.get("source_tpot", {}).get("p99_ms"),
+            "source_tpot_max_ms": acceptance.get("source_tpot", {}).get("max_ms"),
+            "snapshot_trigger_stall_ms": acceptance.get(
+                "snapshot_trigger_stall_ms"
+            ),
+            "freeze_boundary_stall_ms": acceptance.get(
+                "freeze_boundary_stall_ms"
+            ),
             "output_throughput_tokens_s": acceptance.get("workload", {}).get(
                 "output_throughput_tokens_s"
             ),
@@ -448,6 +515,10 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             "slo_ttft_violations": acceptance.get("slo", {}).get("ttft_violations"),
             "slo_e2e_violations": acceptance.get("slo", {}).get("e2e_violations"),
             "slo_handoff_violation": acceptance.get("slo", {}).get("handoff_violation"),
+            "anchor_slo_success": acceptance.get("anchor_slo", {}).get("success"),
+            "anchor_slo_itl_violation_rate": acceptance.get(
+                "anchor_slo", {}
+            ).get("itl_violation_rate"),
         }
         for window, metrics in acceptance["target_tpot_windows"].items():
             prefix = window.lower()
@@ -577,6 +648,18 @@ def accept_online(
     staging = common.read_json(controller_dir / "staging_manifest.json")
     takeover = common.read_json(controller_dir / "takeover_state.json")
     proxy = common.read_json(controller_dir / "response_proxy_stats.json")
+    source_response_path = controller_dir / "source_response.json"
+    target_response_path = controller_dir / "target_response.json"
+    source_response = (
+        common.read_json(source_response_path)
+        if source_response_path.is_file()
+        else {}
+    )
+    target_response = (
+        common.read_json(target_response_path)
+        if target_response_path.is_file()
+        else {}
+    )
     audit = _load_rows(controller_dir / "phase9_audit.jsonl")
     end_rows = [row for row in audit if row.get("kind") == "run_end"]
     transitions = [row.get("to") for row in audit if row.get("kind") == "transition"]
@@ -880,15 +963,32 @@ def accept_online(
     slo["handoff_violation"] = (
         handoff_stall_ms is None or handoff_stall_ms > slo_handoff_ms
     )
-    emitted_times = [
-        float(row["unix_s"])
-        for row in proxy.get("emitted", [])
-        if row.get("unix_s") is not None
-    ]
-    anchor_intervals = [
-        (current - previous) * 1000
-        for previous, current in zip(emitted_times, emitted_times[1:])
-    ]
+    emitted = proxy.get("emitted", [])
+    anchor_tpot = summarize_emitted_intervals(emitted)
+    source_tpot = summarize_emitted_intervals(emitted, origin="source")
+    snapshot_trigger_stall_ms = emitted_boundary_gap_ms(
+        emitted,
+        origin="source",
+        output_tokens=int(session["snapshot_num_output_tokens"]),
+    )
+    freeze_boundary_stall_ms = emitted_boundary_gap_ms(
+        emitted,
+        origin="source",
+        output_tokens=int(cutover["cutover_num_output_tokens"]),
+    )
+    anchor_started_unix_s = source_response.get("request_started_unix_s")
+    anchor_completed_unix_s = target_response.get("completed_unix_s")
+    anchor_ttft_ms = (
+        (float(emitted[0]["unix_s"]) - float(anchor_started_unix_s)) * 1000
+        if emitted and anchor_started_unix_s is not None
+        else source_response.get("ttft_ms")
+    )
+    anchor_e2e_ms = (
+        (float(anchor_completed_unix_s) - float(anchor_started_unix_s)) * 1000
+        if anchor_started_unix_s is not None
+        and anchor_completed_unix_s is not None
+        else None
+    )
     workload_start = float(background.get("start_unix_s", 0.0))
     workload_end = float(background.get("end_unix_s", workload_start))
     workload_seconds = max(0.0, workload_end - workload_start)
@@ -908,6 +1008,55 @@ def accept_online(
         int(release_receipt["released_unix_ns"]) / 1e9
         if release_receipt is not None
         else None
+    )
+    source_rows = [
+        row
+        for row in emitted
+        if row.get("origin") == "source" and row.get("unix_s") is not None
+    ]
+    trigger_index = int(session["snapshot_num_output_tokens"]) - 1
+    trigger_unix_s = (
+        float(source_rows[trigger_index]["unix_s"])
+        if 0 <= trigger_index < len(source_rows)
+        else None
+    )
+    trigger_to_source_kv_release_ms = (
+        (source_kv_released_unix_s - trigger_unix_s) * 1000
+        if source_kv_released_unix_s is not None and trigger_unix_s is not None
+        else None
+    )
+    anchor_slo = {
+        "ttft_violation": (
+            anchor_ttft_ms is None or float(anchor_ttft_ms) > slo_ttft_ms
+        ),
+        "e2e_violation": (
+            anchor_e2e_ms is None or float(anchor_e2e_ms) > slo_e2e_ms
+        ),
+        "itl_violations": None,
+        "itl_violation_rate": None,
+    }
+    anchor_source_times = [
+        float(row["unix_s"])
+        for row in emitted
+        if row.get("unix_s") is not None
+    ]
+    anchor_itls = [
+        (current - previous) * 1000
+        for previous, current in zip(anchor_source_times, anchor_source_times[1:])
+    ]
+    anchor_slo["itl_violations"] = sum(
+        value > slo_tpot_ms for value in anchor_itls
+    )
+    anchor_slo["itl_violation_rate"] = (
+        anchor_slo["itl_violations"] / len(anchor_itls)
+        if anchor_itls
+        else None
+    )
+    anchor_slo["success"] = not (
+        anchor_slo["ttft_violation"]
+        or anchor_slo["e2e_violation"]
+        or bool(anchor_slo["itl_violations"])
+        or slo["handoff_violation"]
     )
     reported_windows = dict(windows)
     if handoff_mode == "shadow-only":
@@ -1040,13 +1189,15 @@ def accept_online(
             if source_kv_released_unix_s is not None
             else None
         ),
+        "trigger_to_source_kv_release_ms": trigger_to_source_kv_release_ms,
         "slo": slo,
-        "anchor_tpot": {
-            "samples": len(anchor_intervals),
-            "p50_ms": percentile(anchor_intervals, 0.50),
-            "p95_ms": percentile(anchor_intervals, 0.95),
-            "p99_ms": percentile(anchor_intervals, 0.99),
-        },
+        "anchor_slo": anchor_slo,
+        "anchor_ttft_ms": anchor_ttft_ms,
+        "anchor_e2e_ms": anchor_e2e_ms,
+        "anchor_tpot": anchor_tpot,
+        "source_tpot": source_tpot,
+        "snapshot_trigger_stall_ms": snapshot_trigger_stall_ms,
+        "freeze_boundary_stall_ms": freeze_boundary_stall_ms,
         "workload": {
             "wall_time_s": workload_seconds,
             "output_tokens": workload_tokens,

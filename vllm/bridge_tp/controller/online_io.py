@@ -48,6 +48,8 @@ def post_streaming_completion(
     token_sink: TokenSink,
 ) -> dict[str, Any]:
     """Consume one OpenAI-compatible SSE completion and expose each token."""
+    request_started_monotonic = time.monotonic()
+    request_started_unix_s = time.time()
     request = urllib.request.Request(
         base_url.rstrip("/") + "/v1/completions",
         data=json.dumps(payload).encode(),
@@ -59,6 +61,7 @@ def post_streaming_completion(
     response_id: str | None = None
     finish_reason: str | None = None
     first_token_monotonic: float | None = None
+    first_token_unix_s: float | None = None
     saw_done = False
     try:
         with urllib.request.urlopen(request, timeout=timeout_s) as response:
@@ -83,6 +86,7 @@ def post_streaming_completion(
                     token_id = int(raw_token_id)
                     if first_token_monotonic is None:
                         first_token_monotonic = time.monotonic()
+                        first_token_unix_s = time.time()
                     index = len(token_ids)
                     token_ids.append(token_id)
                     token_sink(index, token_id, time.time())
@@ -99,11 +103,22 @@ def post_streaming_completion(
         ) from error
     if not saw_done or finish_reason is None:
         raise RuntimeError("streaming response ended before completion")
+    completed_monotonic = time.monotonic()
+    completed_unix_s = time.time()
     return {
         "response_id": response_id,
         "token_ids": token_ids,
         "finish_reason": finish_reason,
         "first_token_monotonic": first_token_monotonic,
+        "request_started_unix_s": request_started_unix_s,
+        "first_token_unix_s": first_token_unix_s,
+        "completed_unix_s": completed_unix_s,
+        "ttft_ms": (
+            (first_token_monotonic - request_started_monotonic) * 1000
+            if first_token_monotonic is not None
+            else None
+        ),
+        "e2e_ms": (completed_monotonic - request_started_monotonic) * 1000,
         "chunks": chunks,
     }
 

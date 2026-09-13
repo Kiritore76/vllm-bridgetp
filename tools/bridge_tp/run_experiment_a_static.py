@@ -191,9 +191,11 @@ def run_one(args: argparse.Namespace, root: Path, mode: str) -> dict[str, Any]:
             "output_tokens": len(token_rows),
             "ttft_ms": ttft_ms,
             "e2e_ms": (request_ended - request_started) * 1000,
+            "mean_itl_ms": sum(intervals) / len(intervals) if intervals else None,
             "tpot_p50_ms": percentile(intervals, 0.50),
             "tpot_p95_ms": percentile(intervals, 0.95),
             "tpot_p99_ms": percentile(intervals, 0.99),
+            "max_itl_ms": max(intervals, default=None),
             "token_rows": token_rows,
             "finish_reason": response.get("finish_reason"),
         }
