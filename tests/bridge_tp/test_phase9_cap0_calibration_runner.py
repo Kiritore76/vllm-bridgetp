@@ -242,6 +242,9 @@ class TestSourceSelectionContract(unittest.TestCase):
             delta_port=29900,
             gpu_direct_history=True,
             gpu_direct_base_port=30400,
+            gpu_direct_delta=True,
+            gpu_direct_delta_batch_tokens=8,
+            gpu_direct_delta_flush_ms=50.0,
         )
         environment = MODULE.source_environment(
             args,
@@ -250,6 +253,13 @@ class TestSourceSelectionContract(unittest.TestCase):
         )
         self.assertEqual(environment["BRIDGETP_GPU_DIRECT_HISTORY"], "1")
         self.assertEqual(environment["BRIDGETP_GPU_DIRECT_BASE_PORT"], "30400")
+        self.assertEqual(environment["BRIDGETP_GPU_DIRECT_DELTA"], "1")
+        self.assertEqual(
+            environment["BRIDGETP_GPU_DIRECT_DELTA_BATCH_TOKENS"], "8"
+        )
+        self.assertEqual(
+            environment["BRIDGETP_GPU_DIRECT_DELTA_FLUSH_MS"], "50.0"
+        )
 
 
 class TestCalibrationAcceptance(unittest.TestCase):

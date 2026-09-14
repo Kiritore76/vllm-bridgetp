@@ -738,6 +738,10 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             gpu_direct = (
                 manifest.get("history_transport") == "NCCL_P2P_GPU_DIRECT"
             )
+            gpu_direct_delta = (
+                manifest.get("delta_transport")
+                == "NCCL_P2P_GPU_DIRECT_PERSISTENT"
+            )
             if gpu_direct:
                 from vllm.bridge_tp.gpu_direct_history import (
                     GpuDirectHistoryReceiver,
@@ -753,6 +757,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     migration_id=request.migration_id,
                     rank=tp_rank,
                     layer_records=list(manifest["layers"]),
+                    keep_open=gpu_direct_delta,
                 )
                 history_layers = direct.layers
                 history_bytes = b""
@@ -860,27 +865,47 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     / f"tp_rank_{tp_rank}.json",
                 )
             while current < request.num_computed_tokens:
-                candidates = sorted(queue_dir.glob(f"delta_{current:012d}_*.bin"))
-                if not candidates:
-                    self._raise_if_shadow_cancelled()
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError(
-                            f"Timed out waiting for TP4 rank {tp_rank} delta {current}"
+                direct_delta = None
+                if gpu_direct_delta:
+                    direct_delta = receiver.receive_delta(
+                        migration_id=request.migration_id,
+                        rank=tp_rank,
+                    )
+                    if direct_delta is None:
+                        raise RuntimeError(
+                            "GPU-direct delta stream closed before cutover"
                         )
-                    time.sleep(0.005)
-                    continue
-                if len(candidates) != 1:
-                    raise ValueError(f"Ambiguous live delta beginning at {current}")
-                path = candidates[0]
-                delta_bytes = path.read_bytes()
-                delta = deserialize_rank_payload(delta_bytes)
-                start = int(delta["start_token"])
-                end = int(delta["end_token"])
+                    delta_bytes = b""
+                    start = int(direct_delta.start_token)
+                    end = int(direct_delta.end_token)
+                    delta_layers = direct_delta.layers
+                else:
+                    candidates = sorted(
+                        queue_dir.glob(f"delta_{current:012d}_*.bin")
+                    )
+                    if not candidates:
+                        self._raise_if_shadow_cancelled()
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(
+                                f"Timed out waiting for TP4 rank {tp_rank} "
+                                f"delta {current}"
+                            )
+                        time.sleep(0.005)
+                        continue
+                    if len(candidates) != 1:
+                        raise ValueError(
+                            f"Ambiguous live delta beginning at {current}"
+                        )
+                    path = candidates[0]
+                    delta_bytes = path.read_bytes()
+                    delta = deserialize_rank_payload(delta_bytes)
+                    start = int(delta["start_token"])
+                    end = int(delta["end_token"])
+                    delta_layers = delta.get("layers")
                 if start != current or end > request.num_computed_tokens:
                     raise ValueError(
                         f"Non-contiguous live delta [{start}, {end}) at {current}"
                     )
-                delta_layers = delta.get("layers")
                 if not isinstance(delta_layers, dict) or not delta_layers:
                     raise ValueError("Live Shadow delta has no KV layers")
                 with self._gpu_kv_lock:
@@ -893,8 +918,11 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                         block_axis=int(manifest["block_axis"]),
                         block_size=int(manifest["block_size"]),
                     )
-                digest.update(delta_bytes)
-                aggregate_bytes += len(delta_bytes)
+                if delta_bytes:
+                    digest.update(delta_bytes)
+                    aggregate_bytes += len(delta_bytes)
+                elif direct_delta is not None:
+                    aggregate_bytes += direct_delta.raw_tensor_bytes
                 current = end
                 delta_batches += 1
                 delta_receipt = {
@@ -926,7 +954,19 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     / "gpu_watermarks"
                     / f"tp_rank_{tp_rank}.json",
                 )
+                if gpu_direct_delta:
+                    receiver.acknowledge_delta(
+                        start_token=start,
+                        end_token=end,
+                    )
 
+            if gpu_direct_delta:
+                terminal = receiver.receive_delta(
+                    migration_id=request.migration_id,
+                    rank=tp_rank,
+                )
+                if terminal is not None:
+                    raise RuntimeError("GPU-direct delta stream has trailing data")
             cutover_path = self.manifest_path.parent / "cutover_manifest.json"
             self._wait_for_file(cutover_path, deadline)
             cutover = _load_json(cutover_path)

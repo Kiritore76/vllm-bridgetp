@@ -257,7 +257,8 @@ def inject_rank_delta(
         raise ValueError("Delta exceeds the reserved target block range")
 
     raw_tensor_bytes = 0
-    for layer_name, source_cpu in delta_layers.items():
+    mismatch_count: torch.Tensor | None = None
+    for layer_name, source_tensor in delta_layers.items():
         destination = destination_layers[layer_name]
         normalized_block_axis = (
             block_axis if block_axis >= 0 else destination.ndim + block_axis
@@ -272,13 +273,14 @@ def inject_rank_delta(
                 f"Cannot infer token axis for {layer_name}: "
                 f"shape={tuple(destination.shape)}"
             )
-        if source_cpu.ndim != destination.ndim - 1:
+        if source_tensor.ndim != destination.ndim - 1:
             raise ValueError(f"Layer {layer_name} delta rank differs")
-        if int(source_cpu.shape[0]) != end_token - start_token:
+        if int(source_tensor.shape[0]) != end_token - start_token:
             raise ValueError(f"Layer {layer_name} delta token count differs")
 
         token_axis = token_axes[0]
-        source = source_cpu.to(device=destination.device)
+        source = source_tensor.to(device=destination.device)
+        destination_slices: list[torch.Tensor] = []
         for offset, token_index in enumerate(range(start_token, end_token)):
             destination_index: list[int | slice] = [slice(None)] * destination.ndim
             destination_index[normalized_block_axis] = target_block_ids[
@@ -291,13 +293,21 @@ def inject_rank_delta(
                     f"Layer {layer_name} delta shape differs at token {token_index}"
                 )
             destination_slice.copy_(source[offset])
-            restored = destination_slice.detach().cpu()
-            if not torch.equal(restored, source_cpu[offset]):
-                raise ValueError(
-                    f"Layer {layer_name} delta readback differs at token "
-                    f"{token_index}"
-                )
-        raw_tensor_bytes += source_cpu.numel() * source_cpu.element_size()
+            destination_slices.append(destination_slice)
+        restored = torch.stack(destination_slices, dim=0)
+        expected = source
+        layer_mismatches = torch.count_nonzero(restored != expected)
+        mismatch_count = (
+            layer_mismatches
+            if mismatch_count is None
+            else mismatch_count + layer_mismatches
+        )
+        raw_tensor_bytes += source_tensor.numel() * source_tensor.element_size()
+
+    if mismatch_count is not None and int(mismatch_count.item()) != 0:
+        raise ValueError(
+            f"delta readback differs for [{start_token}, {end_token})"
+        )
 
     return {
         "exact_readback": True,

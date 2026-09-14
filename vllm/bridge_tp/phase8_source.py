@@ -73,6 +73,7 @@ class _Phase8SourceState:
     delta_tokens: int = 0
     delta_payload_bytes: int = 0
     d2h_ms: float = 0.0
+    last_flush_monotonic: float = field(default_factory=time.monotonic)
     finalized: bool = False
     stopped: bool = False
     lifecycle_lock: threading.RLock = field(
@@ -105,17 +106,18 @@ class _Phase8SourceState:
         )
 
     def start(self) -> None:
-        for rank in range(self.config.target_tp_size):
-            work_queue: queue.Queue[_DeltaWork | None] = queue.Queue()
-            worker = threading.Thread(
-                target=self._worker,
-                args=(rank, work_queue),
-                name=f"bridgetp-phase8-delta-rank-{rank}",
-                daemon=True,
-            )
-            self.queues.append(work_queue)
-            self.workers.append(worker)
-            worker.start()
+        if not self.config.gpu_direct_delta:
+            for rank in range(self.config.target_tp_size):
+                work_queue: queue.Queue[_DeltaWork | None] = queue.Queue()
+                worker = threading.Thread(
+                    target=self._worker,
+                    args=(rank, work_queue),
+                    name=f"bridgetp-phase8-delta-rank-{rank}",
+                    daemon=True,
+                )
+                self.queues.append(work_queue)
+                self.workers.append(worker)
+                worker.start()
         threading.Thread(
             target=self._watch_cleanup,
             name="bridgetp-phase8-source-cleanup",
@@ -247,6 +249,10 @@ class _Phase8SourceState:
             return True
 
     def wait_for_acks(self) -> None:
+        if self.config.gpu_direct_delta:
+            for publisher in self.history_publishers:
+                publisher.wait_for_deltas()
+            return
         for work_queue in self.queues:
             work_queue.join()
         if self.errors:
@@ -256,8 +262,34 @@ class _Phase8SourceState:
         if self.stopped:
             return
         self.stopped = True
+        if self.config.gpu_direct_delta:
+            for publisher in self.history_publishers:
+                publisher.stop_deltas()
+            return
         for work_queue in self.queues:
             work_queue.put(None)
+
+    def enqueue_gpu_delta(
+        self,
+        *,
+        block_ids: list[int],
+        start_token: int,
+        end_token: int,
+    ) -> bool:
+        with self.lifecycle_lock:
+            if self.finalized or self.stopped:
+                return False
+            if len(self.history_publishers) != 1:
+                raise RuntimeError("GPU-direct delta requires one history publisher")
+            self.history_publishers[0].enqueue_delta(
+                block_ids=block_ids,
+                start_token=start_token,
+                end_token=end_token,
+            )
+            self.delta_batches += 1
+            self.delta_tokens += end_token - start_token
+            self.last_flush_monotonic = time.monotonic()
+            return True
 
     def _watch_cleanup(self) -> None:
         cleanup_path = self.config.run_dir / "cleanup_request.json"
@@ -422,19 +454,36 @@ def maybe_publish_phase8_delta(
     if block_size != state.block_size:
         raise ValueError("Phase 8 block size changed during generation")
     start_token = state.last_computed_token
-    rank_payloads, d2h_ms = _copy_delta_rank_shards(
-        state=state,
-        kv_caches=kv_caches,
-        block_ids=block_ids,
-        start_token=start_token,
-        end_token=num_computed,
-    )
-    state.d2h_ms += d2h_ms
-    enqueued = state.enqueue(
-        start_token=start_token,
-        end_token=num_computed,
-        rank_payloads=rank_payloads,
-    )
+    if config.gpu_direct_delta:
+        pending_tokens = num_computed - start_token
+        elapsed_ms = (time.monotonic() - state.last_flush_monotonic) * 1000
+        token_trigger = pending_tokens >= config.gpu_direct_delta_batch_tokens
+        time_trigger = (
+            config.gpu_direct_delta_flush_ms > 0
+            and elapsed_ms >= config.gpu_direct_delta_flush_ms
+        )
+        final_trigger = output_tokens == config.phase8_cutover_output_tokens
+        if not (token_trigger or time_trigger or final_trigger):
+            return
+        enqueued = state.enqueue_gpu_delta(
+            block_ids=block_ids,
+            start_token=start_token,
+            end_token=num_computed,
+        )
+    else:
+        rank_payloads, d2h_ms = _copy_delta_rank_shards(
+            state=state,
+            kv_caches=kv_caches,
+            block_ids=block_ids,
+            start_token=start_token,
+            end_token=num_computed,
+        )
+        state.d2h_ms += d2h_ms
+        enqueued = state.enqueue(
+            start_token=start_token,
+            end_token=num_computed,
+            rank_payloads=rank_payloads,
+        )
     if not enqueued:
         return
     state.last_computed_token = num_computed
@@ -501,6 +550,18 @@ def maybe_publish_phase8_delta(
             "delta_tokens": state.delta_tokens,
             "delta_payload_bytes": state.delta_payload_bytes,
             "delta_d2h_ms": state.d2h_ms,
+            "delta_transport": (
+                "NCCL_P2P_GPU_DIRECT_PERSISTENT"
+                if config.gpu_direct_delta else "CPU_TCP_SERIALIZED"
+            ),
+            "delta_batch_tokens": (
+                config.gpu_direct_delta_batch_tokens
+                if config.gpu_direct_delta else None
+            ),
+            "delta_flush_ms": (
+                config.gpu_direct_delta_flush_ms
+                if config.gpu_direct_delta else None
+            ),
             "freeze_requested_unix_ns": (
                 freeze_request["requested_unix_ns"] if freeze_request else None
             ),

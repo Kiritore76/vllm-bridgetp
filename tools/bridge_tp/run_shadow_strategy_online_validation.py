@@ -89,6 +89,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--gpu-direct-base-port", type=int, default=30400)
     parser.add_argument(
+        "--gpu-direct-delta",
+        action="store_true",
+        help="stream batched Shadow deltas over the retained NCCL session",
+    )
+    parser.add_argument("--gpu-direct-delta-batch-tokens", type=int, default=4)
+    parser.add_argument("--gpu-direct-delta-flush-ms", type=float, default=25.0)
+    parser.add_argument(
         "--stop-and-copy-only",
         action="store_true",
         help=(
@@ -182,6 +189,14 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         )
     if args.gpu_direct_history and not args.gpu_resident_shadow:
         raise ValueError("GPU-direct history requires --gpu-resident-shadow")
+    if args.gpu_direct_delta and not args.gpu_direct_history:
+        raise ValueError("GPU-direct delta requires --gpu-direct-history")
+    if args.gpu_direct_delta and not args.shadow_only_only:
+        raise ValueError("GPU-direct delta batch sweep currently requires Shadow-only")
+    if args.gpu_direct_delta_batch_tokens <= 0:
+        raise ValueError("GPU-direct delta batch tokens must be positive")
+    if args.gpu_direct_delta_flush_ms < 0:
+        raise ValueError("GPU-direct delta flush time cannot be negative")
     if args.gpu_direct_history and not (
         1024 <= args.gpu_direct_base_port <= 65530
     ):
@@ -462,6 +477,28 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
                 "history_gpu_ready_before_freeze_ms"
             ),
             "gpu_resident_shadow": acceptance.get("gpu_resident_shadow"),
+            "gpu_direct_delta": acceptance.get("gpu_direct_delta"),
+            "gpu_direct_delta_batch_tokens": acceptance.get(
+                "gpu_direct_delta_batch_tokens"
+            ),
+            "gpu_direct_delta_flush_ms": acceptance.get(
+                "gpu_direct_delta_flush_ms"
+            ),
+            "gpu_direct_delta_batches": acceptance.get(
+                "gpu_direct_delta_batches"
+            ),
+            "gpu_direct_delta_tokens": acceptance.get(
+                "gpu_direct_delta_tokens"
+            ),
+            "gpu_direct_delta_payload_bytes": acceptance.get(
+                "gpu_direct_delta_payload_bytes"
+            ),
+            "gpu_direct_delta_total_ms": acceptance.get(
+                "gpu_direct_delta_total_ms"
+            ),
+            "gpu_direct_delta_max_batch_ms": acceptance.get(
+                "gpu_direct_delta_max_batch_ms"
+            ),
             "gpu_history_block_acks": acceptance.get("gpu_history_block_acks"),
             "gpu_delta_acks": acceptance.get("gpu_delta_acks"),
             "remote_attention_calls": acceptance.get("remote_attention_calls"),
@@ -845,6 +882,8 @@ def accept_online(
     )
     gpu_resident_shadow = staging.get("gpu_resident_shadow") is True
     gpu_direct_history = staging.get("gpu_direct_history") is True
+    gpu_direct_delta = staging.get("gpu_direct_delta") is True
+    direct_sender: dict[str, Any] = {}
     if gpu_direct_history:
         direct_sender_path = controller_dir / "gpu_direct_sender.json"
         if not direct_sender_path.is_file():
@@ -1114,7 +1153,12 @@ def accept_online(
             if require_remote_attention
             else (
                 "Real vLLM TP1-to-TP4 NCCL GPU-direct historical transfer, "
-                "incremental delta relay, four-rank GPU exact readback and "
+                + (
+                    "persistent batched NCCL GPU-direct delta streaming, "
+                    if gpu_direct_delta
+                    else "incremental CPU delta relay, "
+                )
+                + "four-rank GPU exact readback and "
                 "watermark, atomic takeover, unified response, and target-"
                 "request TPOT."
                 if gpu_direct_history
@@ -1151,6 +1195,27 @@ def accept_online(
         "history_gpu_ready_before_freeze_ms": history_gpu_ready_before_freeze_ms,
         "gpu_resident_shadow": gpu_resident_shadow,
         "gpu_direct_history": gpu_direct_history,
+        "gpu_direct_delta": gpu_direct_delta,
+        "gpu_direct_delta_batch_tokens": session.get(
+            "gpu_direct_delta_batch_tokens"
+        ),
+        "gpu_direct_delta_flush_ms": session.get("gpu_direct_delta_flush_ms"),
+        "gpu_direct_delta_batches": direct_sender.get("delta_batches"),
+        "gpu_direct_delta_tokens": direct_sender.get("delta_tokens"),
+        "gpu_direct_delta_payload_bytes": direct_sender.get(
+            "delta_payload_bytes"
+        ),
+        "gpu_direct_delta_total_ms": sum(
+            float(row.get("transfer_ms", 0.0))
+            for row in direct_sender.get("delta_records", [])
+        ),
+        "gpu_direct_delta_max_batch_ms": max(
+            (
+                float(row.get("transfer_ms", 0.0))
+                for row in direct_sender.get("delta_records", [])
+            ),
+            default=None,
+        ),
         "gpu_history_block_acks": sum(
             1 for _ in (controller_dir / "gpu_block_receipts").glob("**/*.json")
         ),
@@ -1276,6 +1341,9 @@ def main() -> None:
         "stop_and_copy_only": args.stop_and_copy_only,
         "gpu_resident_shadow": args.gpu_resident_shadow,
         "gpu_direct_history": args.gpu_direct_history,
+        "gpu_direct_delta": args.gpu_direct_delta,
+        "gpu_direct_delta_batch_tokens": args.gpu_direct_delta_batch_tokens,
+        "gpu_direct_delta_flush_ms": args.gpu_direct_delta_flush_ms,
         "gpu_direct_base_port": args.gpu_direct_base_port,
         "online_remote_attention": args.online_remote_attention,
         "remote_attention_base_port": args.remote_attention_base_port,

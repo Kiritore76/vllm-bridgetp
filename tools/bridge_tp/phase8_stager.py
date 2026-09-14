@@ -176,6 +176,37 @@ def _build_gpu_rank_record(
     }
 
 
+def _build_direct_gpu_rank_record(
+    *, manifest: dict[str, Any], cutover: dict[str, Any], run_dir: Path,
+    rank: int
+) -> dict[str, Any]:
+    receipts = sorted(
+        (run_dir / "gpu_direct_delta_sender_receipts").glob("delta_*.json")
+    )
+    rows = [_load_json(path) for path in receipts]
+    coverage = [[int(row["start_token"]), int(row["end_token"])] for row in rows]
+    expected = int(manifest["num_computed_tokens"])
+    for start, end in coverage:
+        if start != expected or end <= start:
+            raise ValueError("GPU-direct delta sender coverage is not contiguous")
+        expected = end
+    if expected != int(cutover["num_computed_tokens"]):
+        raise ValueError("GPU-direct delta sender coverage is incomplete")
+    delta_bytes = sum(int(row["payload_bytes"]) for row in rows)
+    return {
+        "target_tp_rank": rank,
+        "host": "persistent-nccl-session",
+        "port": 0,
+        "payload_bytes": (
+            int(manifest["ranks"][rank]["raw_tensor_bytes"])
+            + delta_bytes // int(manifest["target_tp_size"])
+        ),
+        "payload_sha256": "GPU_EXACT_READBACK",
+        "num_frames": 1 + len(coverage),
+        "delta_coverage": coverage,
+    }
+
+
 class _DeltaReceivers:
     def __init__(
         self,
@@ -609,6 +640,10 @@ def main() -> None:
     gpu_direct_history = (
         manifest.get("history_transport") == "NCCL_P2P_GPU_DIRECT"
     )
+    gpu_direct_delta = (
+        manifest.get("delta_transport")
+        == "NCCL_P2P_GPU_DIRECT_PERSISTENT"
+    )
     if gpu_direct_history and not args.gpu_resident_shadow:
         raise ValueError("GPU-direct history requires --gpu-resident-shadow")
     delta_receivers = _DeltaReceivers(
@@ -619,7 +654,8 @@ def main() -> None:
         timeout_s=args.timeout_s,
         live_gpu_queue=live_gpu_queue,
     )
-    delta_receivers.start()
+    if not gpu_direct_delta:
+        delta_receivers.start()
 
     cutover_path = args.run_dir / "cutover_manifest.json"
     # S_NEW deliberately has no historical sender during reversible Shadow.
@@ -681,22 +717,35 @@ def main() -> None:
     if args.gpu_resident_shadow:
         ranks: list[dict[str, Any]] = []
         for rank in range(4):
-            ranks.append(
-                _build_gpu_rank_record(
-                    manifest=manifest,
-                    cutover=cutover,
-                    rank=rank,
-                    initial=initial[rank],
-                    deltas=delta_receivers.by_rank[rank],
-                    wire_deltas=delta_receivers.wire_by_rank[rank],
+            if gpu_direct_delta:
+                ranks.append(
+                    _build_direct_gpu_rank_record(
+                        manifest=manifest,
+                        cutover=cutover,
+                        run_dir=args.run_dir,
+                        rank=rank,
+                    )
                 )
-            )
+            else:
+                ranks.append(
+                    _build_gpu_rank_record(
+                        manifest=manifest,
+                        cutover=cutover,
+                        rank=rank,
+                        initial=initial[rank],
+                        deltas=delta_receivers.by_rank[rank],
+                        wire_deltas=delta_receivers.wire_by_rank[rank],
+                    )
+                )
         staging_manifest = {
             **manifest,
             "phase": "BridgeTP D3 Phase 8",
             "scope": (
-                "NCCL GPU-direct history plus CPU delta relay into reserved "
+                "persistent NCCL GPU-direct history and delta into reserved "
                 "TP4 GPU blocks"
+                if gpu_direct_delta
+                else "NCCL GPU-direct history plus CPU delta relay into "
+                "reserved TP4 GPU blocks"
                 if gpu_direct_history
                 else "live CPU relay into reserved TP4 GPU blocks"
             ),
@@ -714,6 +763,7 @@ def main() -> None:
             "history_transfer_phase": "SHADOW",
             "gpu_resident_shadow": True,
             "gpu_direct_history": gpu_direct_history,
+            "gpu_direct_delta": gpu_direct_delta,
             "staging_ready_unix_s": time.time(),
             "ranks": ranks,
         }
