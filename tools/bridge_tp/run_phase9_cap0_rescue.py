@@ -162,6 +162,9 @@ def receipt_evidence(controller_dir: Path) -> tuple[dict[str, Any], list[str]]:
     target_request_id = target_dirs[0].name
     receiver_ranks: list[int] = []
     readbacks: list[bool] = []
+    ready_sync_scopes: list[str | None] = []
+    ready_event_wait_ms: list[float | None] = []
+    device_wide_synchronize: list[bool | None] = []
     for rank in range(4):
         sender_path = sender_dir / f"tp_rank_{rank}.json"
         receiver_path = target_dirs[0] / f"tp_rank_{rank}.json"
@@ -196,6 +199,10 @@ def receipt_evidence(controller_dir: Path) -> tuple[dict[str, Any], list[str]]:
         else:
             receiver_ranks.append(rank)
         readbacks.append(exact)
+        ready_sync_scopes.append(receiver.get("ready_sync_scope"))
+        wait_ms = receiver.get("ready_event_wait_ms")
+        ready_event_wait_ms.append(float(wait_ms) if wait_ms is not None else None)
+        device_wide_synchronize.append(receiver.get("device_wide_synchronize"))
 
     if staging.get("migration_id") != migration_id:
         errors.append("staging migration ID differs from the session")
@@ -213,6 +220,9 @@ def receipt_evidence(controller_dir: Path) -> tuple[dict[str, Any], list[str]]:
         "target_request_id": target_request_id,
         "receiver_ranks": receiver_ranks,
         "exact_readback": readbacks,
+        "ready_sync_scopes": ready_sync_scopes,
+        "ready_event_wait_ms": ready_event_wait_ms,
+        "device_wide_synchronize": device_wide_synchronize,
     }, errors
 
 

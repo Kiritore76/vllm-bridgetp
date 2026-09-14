@@ -434,6 +434,11 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
     rows: list[dict[str, Any]] = []
     for run in runs:
         acceptance = run["acceptance"]
+        ready_event_waits = [
+            float(value)
+            for value in (acceptance.get("target_ready_event_wait_ms") or [])
+            if value is not None
+        ]
         lifetime_path = Path(run.get("root", "")) / "process_lifetimes.json"
         lifetimes = (
             common.read_json(lifetime_path).get("processes", [])
@@ -501,6 +506,24 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             ),
             "gpu_history_block_acks": acceptance.get("gpu_history_block_acks"),
             "gpu_delta_acks": acceptance.get("gpu_delta_acks"),
+            "target_ready_sync_scopes": "|".join(
+                str(value)
+                for value in (acceptance.get("target_ready_sync_scopes") or [])
+            ),
+            "target_ready_event_wait_ms_mean": (
+                sum(ready_event_waits) / len(ready_event_waits)
+                if ready_event_waits
+                else None
+            ),
+            "target_ready_event_wait_ms_max": (
+                max(ready_event_waits) if ready_event_waits else None
+            ),
+            "target_device_wide_synchronize": any(
+                value is True
+                for value in (
+                    acceptance.get("target_device_wide_synchronize") or []
+                )
+            ),
             "remote_attention_calls": acceptance.get("remote_attention_calls"),
             "remote_attention_layers": acceptance.get("remote_attention_layers"),
             "remote_attention_token_forwards": acceptance.get(
@@ -898,6 +921,11 @@ def accept_online(
                 != list(range(4))
             ):
                 errors.append("GPU-direct history sender did not complete all ranks")
+        expected_sync_scope = "BRIDGETP_RESTORE_STREAM_EVENT"
+        if receipts.get("ready_sync_scopes") != [expected_sync_scope] * 4:
+            errors.append("TP4 ranks did not use BridgeTP restore-stream events")
+        if receipts.get("device_wide_synchronize") != [False] * 4:
+            errors.append("TP4 ranks used a device-wide CUDA synchronization")
     gpu_history_completed = [
         float(row.get("completed_unix_s", float("inf")))
         for row in gpu_initial_receipts
@@ -1156,6 +1184,8 @@ def accept_online(
                 + (
                     "persistent batched NCCL GPU-direct delta streaming, "
                     if gpu_direct_delta
+                    else "frozen full-image transfer with no live delta, "
+                    if stop_and_copy
                     else "incremental CPU delta relay, "
                 )
                 + "four-rank GPU exact readback and "
@@ -1317,6 +1347,11 @@ def accept_online(
         "target_origin_tokens": proxy.get("target_origin_tokens"),
         "receiver_ranks": receipts.get("receiver_ranks"),
         "exact_readback": receipts.get("exact_readback"),
+        "target_ready_sync_scopes": receipts.get("ready_sync_scopes"),
+        "target_ready_event_wait_ms": receipts.get("ready_event_wait_ms"),
+        "target_device_wide_synchronize": receipts.get(
+            "device_wide_synchronize"
+        ),
         "target_tpot_windows": reported_windows,
         "errors": errors,
     }
