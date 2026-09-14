@@ -209,6 +209,9 @@ class TestRescueAcceptance(unittest.TestCase):
                     **receipt,
                     "status": "OWNERSHIP_COMMITTED",
                     "exact_readback": exact_readback,
+                    "ready_sync_scope": "BRIDGETP_RESTORE_STREAM_EVENT",
+                    "ready_event_wait_ms": rank + 0.25,
+                    "device_wide_synchronize": False,
                 },
             )
 
@@ -229,6 +232,26 @@ class TestRescueAcceptance(unittest.TestCase):
                 "HANDOFF",
                 "TAKEOVER",
             ])
+
+    def test_receipt_evidence_preserves_rank_ready_sync_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.write_case(root)
+            evidence, errors = RUNNER.receipt_evidence(root / "controller")
+
+            self.assertEqual(errors, [])
+            self.assertEqual(
+                evidence["ready_sync_scopes"],
+                ["BRIDGETP_RESTORE_STREAM_EVENT"] * 4,
+            )
+            self.assertEqual(
+                evidence["ready_event_wait_ms"],
+                [0.25, 1.25, 2.25, 3.25],
+            )
+            self.assertEqual(
+                evidence["device_wide_synchronize"],
+                [False] * 4,
+            )
 
     def test_rejects_failed_rank_readback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

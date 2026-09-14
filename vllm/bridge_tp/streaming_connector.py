@@ -13,6 +13,7 @@ import re
 import socket
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -730,8 +731,11 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             digest = hashlib.sha256()
             aggregate_bytes = 0
             device = next(iter(self._registered_kv_caches.values())).device
+            restore_stream: torch.cuda.Stream | None = None
             if device.type == "cuda":
                 torch.cuda.set_device(device)
+                with torch.cuda.device(device):
+                    restore_stream = torch.cuda.Stream(device=device)
             started = time.perf_counter()
             initial_end = int(manifest["num_computed_tokens"])
             initial_blocks = math.ceil(initial_end / int(manifest["block_size"]))
@@ -780,7 +784,12 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     raise ValueError("Live Shadow history has no KV layers")
                 history_payload_bytes = len(history_bytes)
                 history_stage_ms = (time.perf_counter() - started) * 1000
-            with self._gpu_kv_lock:
+            restore_context = (
+                torch.cuda.stream(restore_stream)
+                if restore_stream is not None
+                else nullcontext()
+            )
+            with self._gpu_kv_lock, restore_context:
                 validation = inject_rank_shard(
                     self._destination_layers(history_layers),
                     history_layers,
@@ -908,7 +917,12 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     )
                 if not isinstance(delta_layers, dict) or not delta_layers:
                     raise ValueError("Live Shadow delta has no KV layers")
-                with self._gpu_kv_lock:
+                restore_context = (
+                    torch.cuda.stream(restore_stream)
+                    if restore_stream is not None
+                    else nullcontext()
+                )
+                with self._gpu_kv_lock, restore_context:
                     inject_rank_delta(
                         self._destination_layers(delta_layers),
                         delta_layers,
@@ -972,8 +986,18 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             cutover = _load_json(cutover_path)
             if int(cutover["num_computed_tokens"]) != current:
                 raise ValueError("Cutover boundary differs from GPU watermark")
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
+            ready_event_wait_started = time.perf_counter()
+            if restore_stream is not None:
+                with torch.cuda.device(device):
+                    ready_event = torch.cuda.Event(enable_timing=False)
+                    ready_event.record(restore_stream)
+                    ready_event.synchronize()
+                ready_sync_scope = "BRIDGETP_RESTORE_STREAM_EVENT"
+            else:
+                ready_sync_scope = "CPU_SYNCHRONOUS"
+            ready_event_wait_ms = (
+                time.perf_counter() - ready_event_wait_started
+            ) * 1000
             if gpu_direct:
                 staging_path = self.manifest_path.parent / "staging_manifest.json"
                 self._wait_for_file(staging_path, deadline)
@@ -1003,6 +1027,9 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 "delta_batches": delta_batches,
                 "gpu_resident": True,
                 "exact_readback": exact_readback,
+                "ready_sync_scope": ready_sync_scope,
+                "ready_event_wait_ms": ready_event_wait_ms,
+                "device_wide_synchronize": False,
                 "target_ready_total_ms": (time.perf_counter() - started) * 1000,
                 "target_ready_unix_s": time.time(),
             }
@@ -1017,6 +1044,9 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     "end_token": current,
                     "payload_bytes": aggregate_bytes,
                     "payload_sha256": terminal_digest,
+                    "ready_sync_scope": ready_sync_scope,
+                    "ready_event_wait_ms": ready_event_wait_ms,
+                    "device_wide_synchronize": False,
                     "updated_unix_s": time.time(),
                 },
                 self.manifest_path.parent
@@ -1034,6 +1064,9 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 tp_rank=tp_rank,
                 num_computed_tokens=current,
                 exact_readback=exact_readback,
+                ready_sync_scope=ready_sync_scope,
+                ready_event_wait_ms=ready_event_wait_ms,
+                device_wide_synchronize=False,
             )
             if self.takeover_control_path is not None:
                 while True:
