@@ -62,22 +62,28 @@ def _connect(address: str) -> socket.socket:
             time.sleep(0.02)
 
 
-def _send_tensor(
+def _send_group(
     nccl: NCCLLibrary,
-    comm: Any,
-    tensor: torch.Tensor,
-    stream: torch.cuda.Stream,
+    comms: list[Any],
+    tensors: list[torch.Tensor],
+    streams: list[torch.cuda.Stream],
 ) -> None:
-    with torch.cuda.stream(stream):
-        nccl.ncclSend(
-            buffer_type(tensor.data_ptr()),
-            tensor.numel(),
-            ncclDataTypeEnum.from_torch(tensor.dtype),
-            1,
-            comm,
-            cudaStream_t(stream.cuda_stream),
-        )
-    stream.synchronize()
+    nccl.ncclGroupStart()
+    try:
+        for comm, tensor, stream in zip(comms, tensors, streams):
+            with torch.cuda.stream(stream):
+                nccl.ncclSend(
+                    buffer_type(tensor.data_ptr()),
+                    tensor.numel(),
+                    ncclDataTypeEnum.from_torch(tensor.dtype),
+                    1,
+                    comm,
+                    cudaStream_t(stream.cuda_stream),
+                )
+    finally:
+        nccl.ncclGroupEnd()
+    for stream in streams:
+        stream.synchronize()
 
 
 def _recv_tensor(
@@ -121,7 +127,7 @@ class GpuDirectHistoryReceiver:
         *,
         migration_id: str,
         rank: int,
-        layer_names: list[str],
+        layer_records: list[dict[str, Any]],
     ) -> ReceiveResult:
         started = time.perf_counter()
         nccl = NCCLLibrary()
@@ -141,24 +147,42 @@ class GpuDirectHistoryReceiver:
                 stream = torch.cuda.Stream(device=self.device)
             send_json(connection, {"status": "COMM_READY"})
 
+            if not layer_records:
+                raise ValueError("GPU-direct history has no layer records")
+            dtype_names = {
+                str(row["dtype"]).removeprefix("torch.")
+                for row in layer_records
+            }
+            if len(dtype_names) != 1:
+                raise ValueError("GPU-direct packed history requires one dtype")
+            dtype = getattr(torch, dtype_names.pop())
+            shapes = [
+                [int(value) for value in row["rank_shape"]]
+                for row in layer_records
+            ]
+            counts = [
+                int(torch.tensor(shape).prod().item()) for shape in shapes
+            ]
+            with torch.cuda.device(self.device):
+                packed = torch.empty(sum(counts), dtype=dtype, device=self.device)
+            send_json(
+                connection,
+                {
+                    "status": "READY_TO_RECV",
+                    "tensor_id": tensor_id(migration_id, rank, 0),
+                    "numel": packed.numel(),
+                },
+            )
+            _recv_tensor(nccl, comm, packed, stream)
+            send_json(connection, {"status": "RECEIVED"})
             layers: dict[str, torch.Tensor] = {}
-            raw_bytes = 0
-            for layer_index, layer_name in enumerate(layer_names):
-                header = recv_json(connection)
-                expected_id = tensor_id(migration_id, rank, layer_index)
-                if header.get("tensor_id") != expected_id:
-                    raise ValueError("GPU-direct tensor order differs")
-                if header.get("layer_name") != layer_name:
-                    raise ValueError("GPU-direct layer name differs")
-                dtype = getattr(torch, str(header["dtype"]))
-                shape = [int(value) for value in header["shape"]]
-                with torch.cuda.device(self.device):
-                    value = torch.empty(shape, dtype=dtype, device=self.device)
-                send_json(connection, {"status": "READY_TO_RECV"})
-                _recv_tensor(nccl, comm, value, stream)
-                send_json(connection, {"status": "RECEIVED"})
-                layers[layer_name] = value
-                raw_bytes += value.numel() * value.element_size()
+            offset = 0
+            for record, shape, count in zip(layer_records, shapes, counts):
+                layers[str(record["layer_name"])] = packed.narrow(
+                    0, offset, count
+                ).view(shape)
+                offset += count
+            raw_bytes = packed.numel() * packed.element_size()
             send_json(connection, {"status": "COMPLETE"})
             return ReceiveResult(
                 layers=layers,
@@ -224,9 +248,18 @@ class GpuDirectHistorySender:
                 comms.append(comm)
 
             started = time.perf_counter()
-            bytes_by_rank = [0] * target_tp_size
             block_index = torch.tensor(
                 block_ids, dtype=torch.long, device=self.device
+            )
+            dtype = kv_caches[0].dtype
+            if any(cache.dtype != dtype for cache in kv_caches):
+                raise ValueError("GPU-direct packed history requires one dtype")
+            rank_elements = sum(
+                cache.numel()
+                // int(cache.shape[block_axis])
+                * len(block_ids)
+                // target_tp_size
+                for cache in kv_caches
             )
             with torch.cuda.device(self.device):
                 producer_stream = torch.cuda.Stream(device=self.device)
@@ -234,10 +267,13 @@ class GpuDirectHistorySender:
                     torch.cuda.Stream(device=self.device)
                     for _ in range(target_tp_size)
                 ]
+                packed_by_rank = [
+                    torch.empty(rank_elements, dtype=dtype, device=self.device)
+                    for _ in range(target_tp_size)
+                ]
+            offsets = [0] * target_tp_size
             with torch.cuda.stream(producer_stream):
-                for layer_index, (layer_name, cache) in enumerate(
-                    zip(layer_names, kv_caches)
-                ):
+                for cache in kv_caches:
                     if _cuda_device(cache.device) != self.device:
                         raise ValueError("all source KV caches must share one GPU")
                     selected = cache.index_select(block_axis, block_index)
@@ -245,46 +281,42 @@ class GpuDirectHistorySender:
                         raise ValueError(
                             "source KV heads are not divisible by target TP"
                         )
-                    shards = [
-                        shard.contiguous()
-                        for shard in selected.chunk(
-                            target_tp_size, dim=head_axis
-                        )
-                    ]
-                    producer_stream.synchronize()
-                    for rank, value in enumerate(shards):
-                        send_json(
-                            connections[rank],
-                            {
-                                "tensor_id": tensor_id(
-                                    migration_id, rank, layer_index
-                                ),
-                                "layer_name": layer_name,
-                                "shape": list(value.shape),
-                                "dtype": str(value.dtype).removeprefix("torch."),
-                            },
-                        )
-                        ready = recv_json(connections[rank])
-                        if ready.get("status") != "READY_TO_RECV":
-                            raise RuntimeError(
-                                f"rank {rank} rejected layer {layer_index}"
-                            )
-                        _send_tensor(
-                            nccl, comms[rank], value, send_streams[rank]
-                        )
-                        received = recv_json(connections[rank])
-                        if received.get("status") != "RECEIVED":
-                            raise RuntimeError(
-                                f"rank {rank} missed layer {layer_index}"
-                            )
-                        bytes_by_rank[rank] += (
-                            value.numel() * value.element_size()
-                        )
+                    for rank, shard in enumerate(
+                        selected.chunk(target_tp_size, dim=head_axis)
+                    ):
+                        flat = shard.contiguous().view(-1)
+                        packed_by_rank[rank].narrow(
+                            0, offsets[rank], flat.numel()
+                        ).copy_(flat)
+                        offsets[rank] += flat.numel()
+            producer_stream.synchronize()
+            if offsets != [rank_elements] * target_tp_size:
+                raise RuntimeError("GPU-direct packed history size differs")
+            for rank, connection in enumerate(connections):
+                ready = recv_json(connection)
+                if (
+                    ready.get("status") != "READY_TO_RECV"
+                    or int(ready.get("numel", -1)) != rank_elements
+                ):
+                    raise RuntimeError(
+                        f"GPU-direct rank {rank} rejected packed history"
+                    )
+            _send_group(nccl, comms, packed_by_rank, send_streams)
+            for rank, connection in enumerate(connections):
+                received = recv_json(connection)
+                if received.get("status") != "RECEIVED":
+                    raise RuntimeError(
+                        f"GPU-direct rank {rank} missed packed history"
+                    )
             for rank, connection in enumerate(connections):
                 final = recv_json(connection)
                 if final.get("status") != "COMPLETE":
                     raise RuntimeError(f"GPU-direct rank {rank} is incomplete")
             elapsed_ms = (time.perf_counter() - started) * 1000
+            bytes_by_rank = [
+                value.numel() * value.element_size()
+                for value in packed_by_rank
+            ]
             return [
                 {
                     "target_tp_rank": rank,

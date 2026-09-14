@@ -752,9 +752,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 direct = receiver.receive(
                     migration_id=request.migration_id,
                     rank=tp_rank,
-                    layer_names=[
-                        str(row["layer_name"]) for row in manifest["layers"]
-                    ],
+                    layer_records=list(manifest["layers"]),
                 )
                 history_layers = direct.layers
                 history_bytes = b""
