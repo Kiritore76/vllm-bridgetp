@@ -151,7 +151,7 @@ class BridgeTPStreamConfig:
             ),
             gpu_direct_delta=_env_bool("BRIDGETP_GPU_DIRECT_DELTA", False),
             gpu_direct_delta_batch_tokens=int(
-                os.getenv("BRIDGETP_GPU_DIRECT_DELTA_BATCH_TOKENS", "4")
+                os.getenv("BRIDGETP_GPU_DIRECT_DELTA_BATCH_TOKENS", "16")
             ),
             gpu_direct_delta_flush_ms=float(
                 os.getenv("BRIDGETP_GPU_DIRECT_DELTA_FLUSH_MS", "25")

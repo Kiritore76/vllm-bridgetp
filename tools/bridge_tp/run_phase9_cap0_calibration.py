@@ -397,7 +397,7 @@ def source_environment(
             {
                 "BRIDGETP_GPU_DIRECT_DELTA": "1",
                 "BRIDGETP_GPU_DIRECT_DELTA_BATCH_TOKENS": str(
-                    getattr(args, "gpu_direct_delta_batch_tokens", 4)
+                    getattr(args, "gpu_direct_delta_batch_tokens", 16)
                 ),
                 "BRIDGETP_GPU_DIRECT_DELTA_FLUSH_MS": str(
                     getattr(args, "gpu_direct_delta_flush_ms", 25.0)

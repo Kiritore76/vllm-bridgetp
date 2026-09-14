@@ -31,7 +31,7 @@ export SURVIVAL_TABLE=/root/autodl-tmp/bridgetp/phase9_cap0_inputs/survival_tabl
 export GUARD_FILE=/root/autodl-tmp/bridgetp/phase9_cap0_manifests/frozen/guard_free_kv_tokens.txt
 export EXPECTED_REVISION=<EXPECTED_REVISION>
 export RUN_ID="experiment-a-section7-smoke-$(date -u +%Y%m%dT%H%M%SZ)"
-export OUT_ROOT="/root/autodl-tmp/bridgetp/results/experiment_a/${RUN_ID}"
+export OUT_ROOT="/root/autodl-tmp/bridgetp/results/tp_runtime_adaptation/${RUN_ID}"
 mkdir -p "$(dirname "$OUT_ROOT")"
 
 python tools/bridge_tp/run_experiment_a_four_mode_smoke.py \
@@ -45,7 +45,11 @@ python tools/bridge_tp/run_experiment_a_four_mode_smoke.py \
   --expected-guard-sha256 0e86c353044f9610be1b5511ff21e870823b7f259c40ccde24188d84164b545b \
   --expected-guard 8448 \
   --tp1-blocks 1968 \
-  --tp4-blocks 35739
+  --tp4-blocks 35739 \
+  --gpu-direct-history \
+  --gpu-direct-delta \
+  --gpu-direct-delta-batch-tokens 16 \
+  --gpu-direct-delta-flush-ms 0
 export VALIDATE_RC=$?
 
 if [ "$VALIDATE_RC" -eq 0 ]; then
@@ -61,6 +65,10 @@ if [ "$VALIDATE_RC" -eq 0 ]; then
     --expected-guard 8448 \
     --tp1-blocks 1968 \
     --tp4-blocks 35739 \
+    --gpu-direct-history \
+    --gpu-direct-delta \
+    --gpu-direct-delta-batch-tokens 16 \
+    --gpu-direct-delta-flush-ms 0 \
     2>&1 | tee "${OUT_ROOT}.console.txt"
   export SMOKE_RC=${PIPESTATUS[0]}
 else

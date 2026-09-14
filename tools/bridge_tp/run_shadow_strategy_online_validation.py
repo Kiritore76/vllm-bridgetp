@@ -93,7 +93,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="stream batched Shadow deltas over the retained NCCL session",
     )
-    parser.add_argument("--gpu-direct-delta-batch-tokens", type=int, default=4)
+    parser.add_argument("--gpu-direct-delta-batch-tokens", type=int, default=16)
     parser.add_argument("--gpu-direct-delta-flush-ms", type=float, default=25.0)
     parser.add_argument(
         "--stop-and-copy-only",
