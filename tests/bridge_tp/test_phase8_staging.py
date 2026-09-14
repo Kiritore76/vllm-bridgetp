@@ -12,6 +12,7 @@ import torch
 from tools.bridge_tp.phase8_stager import (
     _InitialRank,
     _assemble_rank,
+    _build_direct_gpu_rank_record,
     _build_gpu_rank_record,
     _compact_history_block_layers,
     _wait_for_final_watermark,
@@ -145,6 +146,42 @@ class TestPhase8Staging(unittest.TestCase):
                 deltas={11: {"end_token": 13}},
                 wire_deltas={11: b"delta"},
             )
+
+    def test_direct_gpu_evidence_uses_sender_receipts(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            receipts = root / "gpu_direct_delta_sender_receipts"
+            write_json(
+                receipts / "delta_000000000010_000000000012.json",
+                {
+                    "start_token": 10,
+                    "end_token": 12,
+                    "payload_bytes": 400,
+                },
+            )
+            write_json(
+                receipts / "delta_000000000012_000000000013.json",
+                {
+                    "start_token": 12,
+                    "end_token": 13,
+                    "payload_bytes": 200,
+                },
+            )
+            record = _build_direct_gpu_rank_record(
+                manifest={
+                    "num_computed_tokens": 10,
+                    "target_tp_size": 4,
+                    "ranks": [{"raw_tensor_bytes": 1000}] * 4,
+                },
+                cutover={"num_computed_tokens": 13},
+                run_dir=root,
+                rank=2,
+            )
+
+        self.assertEqual(record["target_tp_rank"], 2)
+        self.assertEqual(record["delta_coverage"], [[10, 12], [12, 13]])
+        self.assertEqual(record["payload_bytes"], 1150)
+        self.assertEqual(record["payload_sha256"], "GPU_EXACT_READBACK")
 
     def test_gap_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "coverage gap/overlap"):

@@ -10,6 +10,7 @@ socket; every KV tensor remains on CUDA.
 from __future__ import annotations
 
 import base64
+import math
 import socket
 import time
 from dataclasses import dataclass
@@ -109,6 +110,8 @@ class ReceiveResult:
     layers: dict[str, torch.Tensor]
     raw_tensor_bytes: int
     receive_ms: float
+    start_token: int | None = None
+    end_token: int | None = None
 
 
 class GpuDirectHistoryReceiver:
@@ -121,6 +124,73 @@ class GpuDirectHistoryReceiver:
         self.listener.bind((host, port))
         self.listener.listen(1)
         self.listener.settimeout(_TIMEOUT_S)
+        self.nccl: NCCLLibrary | None = None
+        self.connection: socket.socket | None = None
+        self.comm: Any | None = None
+        self.stream: torch.cuda.Stream | None = None
+
+    def _open(self, *, migration_id: str, rank: int) -> None:
+        if self.connection is not None:
+            return
+        self.nccl = NCCLLibrary()
+        connection, _ = self.listener.accept()
+        connection.settimeout(_TIMEOUT_S)
+        hello = recv_json(connection)
+        if hello.get("migration_id") != migration_id:
+            raise ValueError("GPU-direct migration ID differs")
+        if int(hello.get("target_tp_rank", -1)) != rank:
+            raise ValueError("GPU-direct target rank differs")
+        unique_bytes = base64.b64decode(str(hello["nccl_unique_id_b64"]))
+        unique_id = self.nccl.unique_id_from_bytes(unique_bytes)
+        with torch.cuda.device(self.device):
+            self.comm = self.nccl.ncclCommInitRank(2, unique_id, 1)
+            self.stream = torch.cuda.Stream(device=self.device)
+        self.connection = connection
+        send_json(connection, {"status": "COMM_READY"})
+
+    @staticmethod
+    def _dtype(name: str) -> torch.dtype:
+        value = getattr(torch, name.removeprefix("torch."), None)
+        if not isinstance(value, torch.dtype):
+            raise ValueError(f"unsupported GPU-direct dtype {name!r}")
+        return value
+
+    def _receive_packed(
+        self,
+        *,
+        shapes: list[list[int]],
+        dtype: torch.dtype,
+        tensor_key: str,
+    ) -> tuple[torch.Tensor, float]:
+        if self.connection is None or self.nccl is None:
+            raise RuntimeError("GPU-direct receiver is not connected")
+        if self.comm is None or self.stream is None:
+            raise RuntimeError("GPU-direct receiver communicator is missing")
+        counts = [math.prod(shape) for shape in shapes]
+        with torch.cuda.device(self.device):
+            packed = torch.empty(sum(counts), dtype=dtype, device=self.device)
+        send_json(
+            self.connection,
+            {"status": "READY_TO_RECV", "tensor_id": tensor_key,
+             "numel": packed.numel()},
+        )
+        started = time.perf_counter()
+        _recv_tensor(self.nccl, self.comm, packed, self.stream)
+        return packed, (time.perf_counter() - started) * 1000
+
+    @staticmethod
+    def _unpack(
+        packed: torch.Tensor,
+        layer_names: list[str],
+        shapes: list[list[int]],
+    ) -> dict[str, torch.Tensor]:
+        layers: dict[str, torch.Tensor] = {}
+        offset = 0
+        for name, shape in zip(layer_names, shapes):
+            count = math.prod(shape)
+            layers[name] = packed.narrow(0, offset, count).view(shape)
+            offset += count
+        return layers
 
     def receive(
         self,
@@ -128,25 +198,11 @@ class GpuDirectHistoryReceiver:
         migration_id: str,
         rank: int,
         layer_records: list[dict[str, Any]],
+        keep_open: bool = False,
     ) -> ReceiveResult:
         started = time.perf_counter()
-        nccl = NCCLLibrary()
-        connection, _ = self.listener.accept()
-        connection.settimeout(_TIMEOUT_S)
-        comm = None
+        self._open(migration_id=migration_id, rank=rank)
         try:
-            hello = recv_json(connection)
-            if hello.get("migration_id") != migration_id:
-                raise ValueError("GPU-direct migration ID differs")
-            if int(hello.get("target_tp_rank", -1)) != rank:
-                raise ValueError("GPU-direct target rank differs")
-            unique_bytes = base64.b64decode(str(hello["nccl_unique_id_b64"]))
-            unique_id = nccl.unique_id_from_bytes(unique_bytes)
-            with torch.cuda.device(self.device):
-                comm = nccl.ncclCommInitRank(2, unique_id, 1)
-                stream = torch.cuda.Stream(device=self.device)
-            send_json(connection, {"status": "COMM_READY"})
-
             if not layer_records:
                 raise ValueError("GPU-direct history has no layer records")
             dtype_names = {
@@ -155,45 +211,85 @@ class GpuDirectHistoryReceiver:
             }
             if len(dtype_names) != 1:
                 raise ValueError("GPU-direct packed history requires one dtype")
-            dtype = getattr(torch, dtype_names.pop())
+            dtype = self._dtype(dtype_names.pop())
             shapes = [
                 [int(value) for value in row["rank_shape"]]
                 for row in layer_records
             ]
-            counts = [
-                int(torch.tensor(shape).prod().item()) for shape in shapes
-            ]
-            with torch.cuda.device(self.device):
-                packed = torch.empty(sum(counts), dtype=dtype, device=self.device)
-            send_json(
-                connection,
-                {
-                    "status": "READY_TO_RECV",
-                    "tensor_id": tensor_id(migration_id, rank, 0),
-                    "numel": packed.numel(),
-                },
+            packed, _ = self._receive_packed(
+                shapes=shapes,
+                dtype=dtype,
+                tensor_key=tensor_id(migration_id, rank, 0),
             )
-            _recv_tensor(nccl, comm, packed, stream)
-            send_json(connection, {"status": "RECEIVED"})
-            layers: dict[str, torch.Tensor] = {}
-            offset = 0
-            for record, shape, count in zip(layer_records, shapes, counts):
-                layers[str(record["layer_name"])] = packed.narrow(
-                    0, offset, count
-                ).view(shape)
-                offset += count
+            assert self.connection is not None
+            send_json(self.connection, {"status": "RECEIVED"})
+            layers = self._unpack(
+                packed,
+                [str(row["layer_name"]) for row in layer_records],
+                shapes,
+            )
             raw_bytes = packed.numel() * packed.element_size()
-            send_json(connection, {"status": "COMPLETE"})
-            return ReceiveResult(
+            send_json(self.connection, {"status": "COMPLETE"})
+            result = ReceiveResult(
                 layers=layers,
                 raw_tensor_bytes=raw_bytes,
                 receive_ms=(time.perf_counter() - started) * 1000,
             )
-        finally:
-            if comm is not None:
-                nccl.ncclCommDestroy(comm)
-            connection.close()
-            self.listener.close()
+            if not keep_open:
+                self.close()
+            return result
+        except Exception:
+            self.close()
+            raise
+
+    def receive_delta(self, *, migration_id: str, rank: int) -> ReceiveResult | None:
+        """Receive the next packed delta, or ``None`` after source close."""
+        if self.connection is None:
+            raise RuntimeError("history must be received before GPU delta")
+        header = recv_json(self.connection)
+        if header.get("op") == "CLOSE":
+            send_json(self.connection, {"status": "CLOSED"})
+            self.close()
+            return None
+        if header.get("op") != "DELTA":
+            raise ValueError(f"unexpected GPU-direct operation {header.get('op')!r}")
+        if header.get("migration_id") != migration_id:
+            raise ValueError("GPU-direct delta migration ID differs")
+        if int(header.get("target_tp_rank", -1)) != rank:
+            raise ValueError("GPU-direct delta rank differs")
+        shapes = [[int(value) for value in row] for row in header["shapes"]]
+        names = [str(value) for value in header["layer_names"]]
+        started = time.perf_counter()
+        packed, _ = self._receive_packed(
+            shapes=shapes,
+            dtype=self._dtype(str(header["dtype"])),
+            tensor_key=str(header["tensor_id"]),
+        )
+        return ReceiveResult(
+            layers=self._unpack(packed, names, shapes),
+            raw_tensor_bytes=packed.numel() * packed.element_size(),
+            receive_ms=(time.perf_counter() - started) * 1000,
+            start_token=int(header["start_token"]),
+            end_token=int(header["end_token"]),
+        )
+
+    def acknowledge_delta(self, *, start_token: int, end_token: int) -> None:
+        if self.connection is None:
+            raise RuntimeError("GPU-direct receiver is closed")
+        send_json(
+            self.connection,
+            {"status": "APPLIED", "start_token": start_token,
+             "end_token": end_token},
+        )
+
+    def close(self) -> None:
+        if self.comm is not None and self.nccl is not None:
+            self.nccl.ncclCommDestroy(self.comm)
+        self.comm = None
+        if self.connection is not None:
+            self.connection.close()
+        self.connection = None
+        self.listener.close()
 
 
 class GpuDirectHistorySender:
@@ -202,6 +298,11 @@ class GpuDirectHistorySender:
     def __init__(self, *, device: torch.device, host: str, port: int) -> None:
         del host, port
         self.device = _cuda_device(device)
+        self.nccl: NCCLLibrary | None = None
+        self.connections: list[socket.socket] = []
+        self.comms: list[Any] = []
+        self.streams: list[torch.cuda.Stream] = []
+        self.target_tp_size = 0
 
     def send(
         self,
@@ -214,6 +315,7 @@ class GpuDirectHistorySender:
         head_axis: int,
         target_tp_size: int,
         target_addresses: list[str],
+        keep_open: bool = False,
     ) -> list[dict[str, Any]]:
         if len(kv_caches) != len(layer_names):
             raise ValueError("KV cache and layer-name counts differ")
@@ -223,6 +325,7 @@ class GpuDirectHistorySender:
         nccl = NCCLLibrary()
         connections: list[socket.socket] = []
         comms: list[Any] = []
+        succeeded = False
         try:
             for rank, address in enumerate(target_addresses):
                 connection = _connect(address)
@@ -271,6 +374,7 @@ class GpuDirectHistorySender:
                     torch.empty(rank_elements, dtype=dtype, device=self.device)
                     for _ in range(target_tp_size)
                 ]
+            self.streams = send_streams
             offsets = [0] * target_tp_size
             with torch.cuda.stream(producer_stream):
                 for cache in kv_caches:
@@ -317,7 +421,7 @@ class GpuDirectHistorySender:
                 value.numel() * value.element_size()
                 for value in packed_by_rank
             ]
-            return [
+            result = [
                 {
                     "target_tp_rank": rank,
                     "raw_tensor_bytes": count,
@@ -330,8 +434,150 @@ class GpuDirectHistorySender:
                 }
                 for rank, count in enumerate(bytes_by_rank)
             ]
+            succeeded = True
+            if keep_open:
+                self.nccl = nccl
+                self.connections = connections
+                self.comms = comms
+                self.target_tp_size = target_tp_size
+            return result
         finally:
-            for comm in comms:
-                nccl.ncclCommDestroy(comm)
-            for connection in connections:
-                connection.close()
+            if not (keep_open and succeeded):
+                for comm in comms:
+                    nccl.ncclCommDestroy(comm)
+                for connection in connections:
+                    connection.close()
+
+    def send_delta(
+        self,
+        *,
+        migration_id: str,
+        kv_caches: list[torch.Tensor],
+        layer_names: list[str],
+        block_ids: list[int],
+        block_axis: int,
+        block_size: int,
+        head_axis: int,
+        expected_kv_heads: int,
+        start_token: int,
+        end_token: int,
+    ) -> dict[str, Any]:
+        """Pack and send one contiguous token range over retained NCCL links."""
+        if self.nccl is None or not self.connections or not self.comms:
+            raise RuntimeError("GPU-direct history session is not retained")
+        if not start_token < end_token:
+            raise ValueError("GPU-direct delta range is empty")
+        started = time.perf_counter()
+        rank_layers: list[list[torch.Tensor]] = [
+            [] for _ in range(self.target_tp_size)
+        ]
+        shapes_by_rank: list[list[list[int]]] = [
+            [] for _ in range(self.target_tp_size)
+        ]
+        with torch.cuda.device(self.device):
+            producer = torch.cuda.Stream(device=self.device)
+        with torch.cuda.stream(producer):
+            for cache in kv_caches:
+                token_axes = [
+                    axis for axis, size in enumerate(cache.shape)
+                    if axis != block_axis and int(size) == block_size
+                ]
+                if len(token_axes) != 1:
+                    raise ValueError("GPU-direct delta token axis is ambiguous")
+                token_axis = token_axes[0]
+                token_slices = []
+                for token_index in range(start_token, end_token):
+                    logical_block = token_index // block_size
+                    token_offset = token_index % block_size
+                    index: list[int | slice] = [slice(None)] * cache.ndim
+                    index[block_axis] = block_ids[logical_block]
+                    index[token_axis] = token_offset
+                    token_slices.append(cache[tuple(index)].detach())
+                delta = torch.stack(token_slices, dim=0)
+                delta_head_axis = head_axis + 1
+                for removed_axis in sorted((block_axis, token_axis)):
+                    if removed_axis < head_axis:
+                        delta_head_axis -= 1
+                if int(delta.shape[delta_head_axis]) != expected_kv_heads:
+                    raise ValueError("GPU-direct delta KV-head count differs")
+                shards = delta.chunk(self.target_tp_size, dim=delta_head_axis)
+                for rank, shard in enumerate(shards):
+                    contiguous = shard.contiguous()
+                    rank_layers[rank].append(contiguous)
+                    shapes_by_rank[rank].append(list(contiguous.shape))
+            packed_by_rank = [
+                torch.cat([value.view(-1) for value in layers])
+                for layers in rank_layers
+            ]
+        producer.synchronize()
+        for rank, connection in enumerate(self.connections):
+            send_json(
+                connection,
+                {
+                    "op": "DELTA",
+                    "migration_id": migration_id,
+                    "target_tp_rank": rank,
+                    "tensor_id": (
+                        f"{migration_id}#delta#rank{rank}#"
+                        f"{start_token}:{end_token}"
+                    ),
+                    "start_token": start_token,
+                    "end_token": end_token,
+                    "layer_names": layer_names,
+                    "shapes": shapes_by_rank[rank],
+                    "dtype": str(packed_by_rank[rank].dtype),
+                    "numel": packed_by_rank[rank].numel(),
+                },
+            )
+        for rank, connection in enumerate(self.connections):
+            ready = recv_json(connection)
+            if (
+                ready.get("status") != "READY_TO_RECV"
+                or int(ready.get("numel", -1)) != packed_by_rank[rank].numel()
+            ):
+                raise RuntimeError(f"GPU-direct rank {rank} rejected delta")
+        _send_group(self.nccl, self.comms, packed_by_rank, self.streams)
+        for rank, connection in enumerate(self.connections):
+            applied = recv_json(connection)
+            if (
+                applied.get("status") != "APPLIED"
+                or int(applied.get("start_token", -1)) != start_token
+                or int(applied.get("end_token", -1)) != end_token
+            ):
+                raise RuntimeError(f"GPU-direct rank {rank} did not apply delta")
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        total_bytes = sum(
+            value.numel() * value.element_size() for value in packed_by_rank
+        )
+        return {
+            "start_token": start_token,
+            "end_token": end_token,
+            "tokens": end_token - start_token,
+            "payload_bytes": total_bytes,
+            "transfer_ms": elapsed_ms,
+            "observed_aggregate_gib_s": (
+                total_bytes / 1024**3 / (elapsed_ms / 1000)
+                if elapsed_ms > 0 else None
+            ),
+        }
+
+    def close(self) -> None:
+        for connection in self.connections:
+            try:
+                send_json(connection, {"op": "CLOSE"})
+            except OSError:
+                pass
+        for connection in self.connections:
+            try:
+                recv_json(connection)
+            except (OSError, EOFError):
+                pass
+        if self.nccl is not None:
+            for comm in self.comms:
+                self.nccl.ncclCommDestroy(comm)
+        for connection in self.connections:
+            connection.close()
+        self.connections = []
+        self.comms = []
+        self.streams = []
+        self.nccl = None

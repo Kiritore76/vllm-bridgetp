@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import queue
 import secrets
 import socket
 import threading
@@ -85,6 +86,9 @@ class BridgeTPStreamConfig:
     pin_memory: bool
     strict: bool
     gpu_direct_history: bool
+    gpu_direct_delta: bool
+    gpu_direct_delta_batch_tokens: int
+    gpu_direct_delta_flush_ms: float
     gpu_direct_host: str
     gpu_direct_base_port: int
     stop_and_copy: bool = False
@@ -145,6 +149,13 @@ class BridgeTPStreamConfig:
             gpu_direct_history=_env_bool(
                 "BRIDGETP_GPU_DIRECT_HISTORY", False
             ),
+            gpu_direct_delta=_env_bool("BRIDGETP_GPU_DIRECT_DELTA", False),
+            gpu_direct_delta_batch_tokens=int(
+                os.getenv("BRIDGETP_GPU_DIRECT_DELTA_BATCH_TOKENS", "4")
+            ),
+            gpu_direct_delta_flush_ms=float(
+                os.getenv("BRIDGETP_GPU_DIRECT_DELTA_FLUSH_MS", "25")
+            ),
             gpu_direct_host=os.getenv(
                 "BRIDGETP_GPU_DIRECT_HOST", "127.0.0.1"
             ),
@@ -177,6 +188,14 @@ class BridgeTPStreamConfig:
             raise ValueError("BRIDGETP_STREAM_RATE_GIB_S cannot be negative")
         if self.gpu_direct_history and not self.phase8_enabled:
             raise ValueError("GPU-direct history currently requires Phase 8")
+        if self.gpu_direct_delta and not self.gpu_direct_history:
+            raise ValueError("GPU-direct delta requires GPU-direct history")
+        if self.gpu_direct_delta and self.shadow_strategy != "S_NEW_OLD":
+            raise ValueError("GPU-direct delta currently requires S_NEW_OLD")
+        if self.gpu_direct_delta_batch_tokens <= 0:
+            raise ValueError("GPU-direct delta batch tokens must be positive")
+        if self.gpu_direct_delta_flush_ms < 0:
+            raise ValueError("GPU-direct delta flush time cannot be negative")
         if self.gpu_direct_history and not (
             1024 <= self.gpu_direct_base_port <= 65530
         ):
@@ -416,6 +435,7 @@ class _GpuDirectHistoryPublisher:
         layer_names: list[str],
         block_ids: list[int],
         block_axis: int,
+        block_size: int,
     ) -> None:
         self.config = config
         self.request_id = request_id
@@ -423,8 +443,13 @@ class _GpuDirectHistoryPublisher:
         self.layer_names = layer_names
         self.block_ids = block_ids
         self.block_axis = block_axis
+        self.block_size = block_size
         self.started = False
         self._lock = threading.Lock()
+        self.delta_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        self.delta_errors: list[str] = []
+        self.delta_records: list[dict[str, Any]] = []
+        self.failure: str | None = None
         self.thread = threading.Thread(
             target=self._run,
             name="bridgetp-gpu-direct-history",
@@ -454,6 +479,39 @@ class _GpuDirectHistoryPublisher:
                 self.config.run_dir / "gpu_direct_sender.json",
             )
             return True
+
+    def enqueue_delta(
+        self,
+        *,
+        block_ids: list[int],
+        start_token: int,
+        end_token: int,
+    ) -> None:
+        if not self.config.gpu_direct_delta:
+            raise RuntimeError("GPU-direct delta is not enabled")
+        if self.failure is not None:
+            raise RuntimeError(self.failure)
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(self.kv_caches[0].device))
+        self.delta_queue.put(
+            {
+                "block_ids": list(block_ids),
+                "start_token": start_token,
+                "end_token": end_token,
+                "ready_event": event,
+            }
+        )
+
+    def wait_for_deltas(self) -> None:
+        self.delta_queue.join()
+        if self.failure is not None:
+            raise RuntimeError(self.failure)
+        if self.delta_errors:
+            raise RuntimeError("; ".join(self.delta_errors))
+
+    def stop_deltas(self) -> None:
+        if self.config.gpu_direct_delta:
+            self.delta_queue.put(None)
 
     def _run(self) -> None:
         from vllm.bridge_tp.gpu_direct_history import (
@@ -492,18 +550,93 @@ class _GpuDirectHistoryPublisher:
                     f"{self.config.gpu_direct_base_port + rank}"
                     for rank in range(self.config.target_tp_size)
                 ],
+                keep_open=self.config.gpu_direct_delta,
             )
+            if self.config.gpu_direct_delta:
+                receipt.update(
+                    {
+                        "status": "HISTORY_READY_DELTA_STREAMING",
+                        "ranks": ranks,
+                        "history_completed_unix_s": time.time(),
+                    }
+                )
+                _atomic_json_dump(
+                    receipt, self.config.run_dir / "gpu_direct_sender.json"
+                )
+                while True:
+                    work = self.delta_queue.get()
+                    try:
+                        if work is None:
+                            sender.close()
+                            break
+                        work["ready_event"].synchronize()
+                        record = sender.send_delta(
+                            migration_id=self.config.migration_id,
+                            kv_caches=self.kv_caches,
+                            layer_names=self.layer_names,
+                            block_ids=work["block_ids"],
+                            block_axis=self.block_axis,
+                            block_size=self.block_size,
+                            head_axis=self.config.head_axis,
+                            expected_kv_heads=self.config.expected_kv_heads,
+                            start_token=work["start_token"],
+                            end_token=work["end_token"],
+                        )
+                        self.delta_records.append(record)
+                        _atomic_json_dump(
+                            {
+                                "format_version": 1,
+                                "status": "APPLIED_ALL_RANKS",
+                                "migration_id": self.config.migration_id,
+                                **record,
+                                "completed_unix_s": time.time(),
+                            },
+                            self.config.run_dir
+                            / "gpu_direct_delta_sender_receipts"
+                            / (
+                                f"delta_{work['start_token']:012d}_"
+                                f"{work['end_token']:012d}.json"
+                            ),
+                        )
+                    except Exception as error:
+                        message = (
+                            f"tokens=[{work.get('start_token', '?')},"
+                            f"{work.get('end_token', '?')}): "
+                            f"{type(error).__name__}: {error}"
+                        )
+                        self.delta_errors.append(message)
+                        self.failure = message
+                        logger.exception("BridgeTP GPU-direct delta failed")
+                        raise
+                    finally:
+                        self.delta_queue.task_done()
             receipt.update(
                 {
                     "status": "READY",
                     "ranks": ranks,
+                    "delta_batches": len(self.delta_records),
+                    "delta_tokens": sum(
+                        int(row["tokens"]) for row in self.delta_records
+                    ),
+                    "delta_payload_bytes": sum(
+                        int(row["payload_bytes"]) for row in self.delta_records
+                    ),
+                    "delta_records": self.delta_records,
                     "completed_unix_s": time.time(),
                 }
             )
         except Exception as error:
-            receipt["error"] = f"{type(error).__name__}: {error}"
+            self.failure = self.failure or f"{type(error).__name__}: {error}"
+            receipt["error"] = self.failure
             receipt["completed_unix_s"] = time.time()
             logger.exception("BridgeTP GPU-direct history sender failed")
+            while True:
+                try:
+                    self.delta_queue.get_nowait()
+                except queue.Empty:
+                    break
+                else:
+                    self.delta_queue.task_done()
         finally:
             _atomic_json_dump(
                 receipt, self.config.run_dir / "gpu_direct_sender.json"
@@ -642,6 +775,7 @@ def _publish_request(
                 layer_names=layer_names,
                 block_ids=block_ids,
                 block_axis=block_axis,
+                block_size=block_size,
             )
         )
         d2h_ms = 0.0
@@ -790,6 +924,18 @@ def _publish_request(
             "NCCL_COMPLETION_PLUS_GPU_EXACT_READBACK"
             if config.gpu_direct_history
             else "SHA256_PLUS_GPU_EXACT_READBACK"
+        ),
+        "delta_transport": (
+            "NCCL_P2P_GPU_DIRECT_PERSISTENT"
+            if config.gpu_direct_delta else "CPU_TCP_SERIALIZED"
+        ),
+        "gpu_direct_delta_batch_tokens": (
+            config.gpu_direct_delta_batch_tokens
+            if config.gpu_direct_delta else None
+        ),
+        "gpu_direct_delta_flush_ms": (
+            config.gpu_direct_delta_flush_ms
+            if config.gpu_direct_delta else None
         ),
         "chunk_bytes": config.chunk_bytes,
         "aggregate_rate_limit_gib_s": config.aggregate_rate_gib_s,
