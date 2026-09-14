@@ -181,47 +181,54 @@ def inject_rank_shard(
         )
 
     raw_tensor_bytes = 0
-    for layer_name, source_cpu in shard_layers.items():
+    for layer_name, source_tensor in shard_layers.items():
         destination = destination_layers[layer_name]
         normalized_axis = (
             block_axis if block_axis >= 0 else destination.ndim + block_axis
         )
         if normalized_axis < 0 or normalized_axis >= destination.ndim:
             raise ValueError(f"Invalid block axis {block_axis} for {layer_name}")
-        if source_cpu.ndim != destination.ndim:
+        if source_tensor.ndim != destination.ndim:
             raise ValueError(f"Layer {layer_name} tensor ranks differ")
-        if source_cpu.shape[normalized_axis] != len(target_block_ids):
+        if source_tensor.shape[normalized_axis] != len(target_block_ids):
             raise ValueError(
                 f"Layer {layer_name} shard block count differs from allocation"
             )
         if max(target_block_ids) >= destination.shape[normalized_axis]:
             raise IndexError(f"Layer {layer_name} destination block is out of range")
         for axis, (source_size, destination_size) in enumerate(
-            zip(source_cpu.shape, destination.shape)
+            zip(source_tensor.shape, destination.shape)
         ):
             if axis != normalized_axis and source_size != destination_size:
                 raise ValueError(
                     f"Layer {layer_name} shape mismatch on axis {axis}: "
                     f"{source_size} != {destination_size}"
                 )
-        if source_cpu.dtype != destination.dtype:
+        if source_tensor.dtype != destination.dtype:
             raise ValueError(
                 f"Layer {layer_name} dtype mismatch: "
-                f"{source_cpu.dtype} != {destination.dtype}"
+                f"{source_tensor.dtype} != {destination.dtype}"
             )
 
         index = torch.tensor(
             target_block_ids, dtype=torch.long, device=destination.device
         )
-        source = source_cpu.to(device=destination.device)
+        source = source_tensor.to(device=destination.device)
         destination.index_copy_(normalized_axis, index, source)
-        restored = destination.index_select(normalized_axis, index).cpu()
-        if not torch.equal(restored, source_cpu):
-            mismatches = int(torch.count_nonzero(restored != source_cpu))
+        restored = destination.index_select(normalized_axis, index)
+        expected = (
+            source
+            if source_tensor.device == destination.device
+            else source_tensor
+        )
+        if expected.device != restored.device:
+            restored = restored.cpu()
+        if not torch.equal(restored, expected):
+            mismatches = int(torch.count_nonzero(restored != expected))
             raise ValueError(
                 f"Layer {layer_name} restore readback differs in {mismatches} elements"
             )
-        raw_tensor_bytes += source_cpu.numel() * source_cpu.element_size()
+        raw_tensor_bytes += source_tensor.numel() * source_tensor.element_size()
 
     return {
         "exact_readback": True,

@@ -606,6 +606,11 @@ def main() -> None:
     live_gpu_queue = (
         args.run_dir / "live_gpu_queue" if args.gpu_resident_shadow else None
     )
+    gpu_direct_history = (
+        manifest.get("history_transport") == "NCCL_P2P_GPU_DIRECT"
+    )
+    if gpu_direct_history and not args.gpu_resident_shadow:
+        raise ValueError("GPU-direct history requires --gpu-resident-shadow")
     delta_receivers = _DeltaReceivers(
         manifest=manifest,
         run_dir=args.run_dir,
@@ -632,19 +637,34 @@ def main() -> None:
             _cleanup(args.run_dir, str(request.get("reason")), 0, delta_count)
             return
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        initial = list(
-            executor.map(
-                lambda rank: _receive_initial_rank(
-                    manifest,
-                    args.run_dir,
-                    rank,
-                    args.timeout_s,
-                    live_gpu_queue,
+    if gpu_direct_history:
+        # TP4 workers receive historical tensors directly from TP1.  The CPU
+        # stager remains responsible only for delta relay and terminal
+        # watermark coordination.
+        initial = [
+            _InitialRank(
+                payload={},
+                wire_digest=hashlib.sha256(
+                    f"NCCL_P2P_GPU_DIRECT:rank={rank}".encode()
                 ),
-                range(4),
+                wire_bytes=int(manifest["ranks"][rank]["raw_tensor_bytes"]),
             )
-        )
+            for rank in range(4)
+        ]
+    else:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            initial = list(
+                executor.map(
+                    lambda rank: _receive_initial_rank(
+                        manifest,
+                        args.run_dir,
+                        rank,
+                        args.timeout_s,
+                        live_gpu_queue,
+                    ),
+                    range(4),
+                )
+            )
 
     if not _wait_for_path(cutover_path, cleanup_path, deadline):
         delta_receivers.close()
@@ -674,7 +694,12 @@ def main() -> None:
         staging_manifest = {
             **manifest,
             "phase": "BridgeTP D3 Phase 8",
-            "scope": "live CPU relay into reserved TP4 GPU blocks",
+            "scope": (
+                "NCCL GPU-direct history plus CPU delta relay into reserved "
+                "TP4 GPU blocks"
+                if gpu_direct_history
+                else "live CPU relay into reserved TP4 GPU blocks"
+            ),
             "snapshot_num_output_tokens": cutover["cutover_num_output_tokens"],
             "num_computed_tokens": cutover["num_computed_tokens"],
             "pending_known_tokens": cutover["pending_known_tokens"],
@@ -688,6 +713,7 @@ def main() -> None:
             "shadow_strategy": manifest.get("shadow_strategy", "S_NEW_OLD"),
             "history_transfer_phase": "SHADOW",
             "gpu_resident_shadow": True,
+            "gpu_direct_history": gpu_direct_history,
             "staging_ready_unix_s": time.time(),
             "ranks": ranks,
         }

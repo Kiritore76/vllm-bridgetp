@@ -235,6 +235,22 @@ class TestSourceSelectionContract(unittest.TestCase):
             "bridgetp-phase9-controller",
         )
 
+    def test_gpu_direct_history_environment_is_explicit(self) -> None:
+        args = SimpleNamespace(
+            tp1_gpu="0",
+            snapshot_port=29800,
+            delta_port=29900,
+            gpu_direct_history=True,
+            gpu_direct_base_port=30400,
+        )
+        environment = MODULE.source_environment(
+            args,
+            "gpu-direct-smoke",
+            Path("batch") / "smoke" / "controller",
+        )
+        self.assertEqual(environment["BRIDGETP_GPU_DIRECT_HISTORY"], "1")
+        self.assertEqual(environment["BRIDGETP_GPU_DIRECT_BASE_PORT"], "30400")
+
 
 class TestCalibrationAcceptance(unittest.TestCase):
     @staticmethod

@@ -83,6 +83,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--gpu-direct-history",
+        action="store_true",
+        help="move initial Shadow history by NCCL without a CPU tensor relay",
+    )
+    parser.add_argument("--gpu-direct-base-port", type=int, default=30400)
+    parser.add_argument(
         "--stop-and-copy-only",
         action="store_true",
         help=(
@@ -167,11 +173,19 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
             "online remote attention requires Bridge-only or architecture comparison"
         )
     if args.gpu_resident_shadow and not (
-        args.shadow_only_only or args.stop_and_copy_only or args.online_remote_attention
+        args.shadow_only_only
+        or args.stop_and_copy_only
+        or args.online_remote_attention
     ):
         raise ValueError(
             "GPU-resident staging requires Shadow-only or online Bridge mode"
         )
+    if args.gpu_direct_history and not args.gpu_resident_shadow:
+        raise ValueError("GPU-direct history requires --gpu-resident-shadow")
+    if args.gpu_direct_history and not (
+        1024 <= args.gpu_direct_base_port <= 65530
+    ):
+        raise ValueError("GPU-direct base port must leave five valid ports")
     if set(args.strategy_order) != {"S_NEW", "S_NEW_OLD"}:
         raise ValueError("strategy order must contain S_NEW and S_NEW_OLD once")
     if not 0 < args.trigger_output_tokens < args.cutover_output_tokens:
@@ -830,8 +844,24 @@ def accept_online(
         else None
     )
     gpu_resident_shadow = staging.get("gpu_resident_shadow") is True
+    gpu_direct_history = staging.get("gpu_direct_history") is True
+    if gpu_direct_history:
+        direct_sender_path = controller_dir / "gpu_direct_sender.json"
+        if not direct_sender_path.is_file():
+            errors.append("GPU-direct history sender receipt is missing")
+        else:
+            direct_sender = common.read_json(direct_sender_path)
+            direct_ranks = direct_sender.get("ranks", [])
+            if (
+                direct_sender.get("status") != "READY"
+                or len(direct_ranks) != 4
+                or [int(row.get("target_tp_rank", -1)) for row in direct_ranks]
+                != list(range(4))
+            ):
+                errors.append("GPU-direct history sender did not complete all ranks")
     gpu_history_completed = [
-        float(row.get("completed_unix_s", float("inf"))) for row in gpu_initial_receipts
+        float(row.get("completed_unix_s", float("inf")))
+        for row in gpu_initial_receipts
     ]
     if (
         gpu_resident_shadow
@@ -1082,11 +1112,18 @@ def accept_online(
             "GPU-resident prefix softmax statistics inside every migrated "
             "attention-layer output, followed by Phase 8 takeover."
             if require_remote_attention
-            else "Real vLLM TP1/TP4 export, incremental CPU relay into reserved "
-            "TP4 GPU blocks, four-rank watermark, atomic takeover, unified "
-            "response, and target-request TPOT. TP4 performs no migrated-"
-            "request forward before commit; online remote attention is not "
-            "executed."
+            else (
+                "Real vLLM TP1-to-TP4 NCCL GPU-direct historical transfer, "
+                "incremental delta relay, four-rank GPU exact readback and "
+                "watermark, atomic takeover, unified response, and target-"
+                "request TPOT."
+                if gpu_direct_history
+                else "Real vLLM TP1/TP4 export, incremental CPU relay into "
+                "reserved TP4 GPU blocks, four-rank watermark, atomic "
+                "takeover, unified response, and target-request TPOT. TP4 "
+                "performs no migrated-request forward before commit; online "
+                "remote attention is not executed."
+            )
             if gpu_resident_shadow
             else "Real vLLM TP1/TP4 export, transfer, restore, takeover, "
             "unified response, and target-request TPOT. The Shadow-only "
@@ -1113,6 +1150,7 @@ def accept_online(
         "history_ready_before_freeze_ms": history_ready_before_freeze_ms,
         "history_gpu_ready_before_freeze_ms": history_gpu_ready_before_freeze_ms,
         "gpu_resident_shadow": gpu_resident_shadow,
+        "gpu_direct_history": gpu_direct_history,
         "gpu_history_block_acks": sum(
             1 for _ in (controller_dir / "gpu_block_receipts").glob("**/*.json")
         ),
@@ -1237,6 +1275,8 @@ def main() -> None:
         "shadow_only_only": args.shadow_only_only,
         "stop_and_copy_only": args.stop_and_copy_only,
         "gpu_resident_shadow": args.gpu_resident_shadow,
+        "gpu_direct_history": args.gpu_direct_history,
+        "gpu_direct_base_port": args.gpu_direct_base_port,
         "online_remote_attention": args.online_remote_attention,
         "remote_attention_base_port": args.remote_attention_base_port,
         "bridge_output_tokens": args.bridge_output_tokens,

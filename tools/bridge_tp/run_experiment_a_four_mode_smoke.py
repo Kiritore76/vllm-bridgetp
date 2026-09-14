@@ -51,6 +51,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--snapshot-port", type=int, default=29800)
     parser.add_argument("--delta-port", type=int, default=29900)
     parser.add_argument("--delivery-port", type=int, default=30000)
+    parser.add_argument("--gpu-direct-history", action="store_true")
+    parser.add_argument("--gpu-direct-base-port", type=int, default=30400)
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.88)
@@ -163,7 +165,7 @@ def shared_server_args(args: argparse.Namespace) -> list[str]:
 def online_args(
     args: argparse.Namespace, manifest: Path, manifest_sha: str
 ) -> list[str]:
-    return [
+    result = [
         "--phase",
         "smoke",
         "--repetitions",
@@ -214,6 +216,16 @@ def online_args(
         str(args.slo_handoff_ms),
         *shared_server_args(args),
     ]
+    if args.gpu_direct_history:
+        result.extend(
+            [
+                "--gpu-resident-shadow",
+                "--gpu-direct-history",
+                "--gpu-direct-base-port",
+                str(args.gpu_direct_base_port),
+            ]
+        )
+    return result
 
 
 def extract_row(

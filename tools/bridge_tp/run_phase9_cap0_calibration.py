@@ -382,6 +382,16 @@ def source_environment(
             "BRIDGETP_TAKEOVER_RUN_DIR": str(controller_dir),
         }
     )
+    if bool(getattr(args, "gpu_direct_history", False)):
+        env.update(
+            {
+                "BRIDGETP_GPU_DIRECT_HISTORY": "1",
+                "BRIDGETP_GPU_DIRECT_HOST": "127.0.0.1",
+                "BRIDGETP_GPU_DIRECT_BASE_PORT": str(
+                    getattr(args, "gpu_direct_base_port", 30400)
+                ),
+            }
+        )
     return env
 
 
