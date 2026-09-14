@@ -735,20 +735,48 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             started = time.perf_counter()
             initial_end = int(manifest["num_computed_tokens"])
             initial_blocks = math.ceil(initial_end / int(manifest["block_size"]))
-            history_path = queue_dir / "history_full.bin"
-            self._wait_for_file(history_path, deadline)
-            history_bytes = history_path.read_bytes()
-            history = deserialize_rank_payload(history_bytes)
-            for key, expected in {
-                "migration_id": request.migration_id,
-                "source_request_id": request.source_request_id,
-                "target_tp_rank": tp_rank,
-            }.items():
-                if history.get(key) != expected:
-                    raise ValueError(f"Live Shadow history {key} differs")
-            history_layers = history.get("layers")
-            if not isinstance(history_layers, dict) or not history_layers:
-                raise ValueError("Live Shadow history has no KV layers")
+            gpu_direct = (
+                manifest.get("history_transport") == "NCCL_P2P_GPU_DIRECT"
+            )
+            if gpu_direct:
+                from vllm.bridge_tp.gpu_direct_history import (
+                    GpuDirectHistoryReceiver,
+                )
+
+                record = manifest["ranks"][tp_rank]
+                receiver = GpuDirectHistoryReceiver(
+                    device=device,
+                    host=str(record["host"]),
+                    port=int(record["port"]),
+                )
+                direct = receiver.receive(
+                    migration_id=request.migration_id,
+                    rank=tp_rank,
+                    layer_names=[
+                        str(row["layer_name"]) for row in manifest["layers"]
+                    ],
+                )
+                history_layers = direct.layers
+                history_bytes = b""
+                history_payload_bytes = direct.raw_tensor_bytes
+                history_stage_ms = direct.receive_ms
+            else:
+                history_path = queue_dir / "history_full.bin"
+                self._wait_for_file(history_path, deadline)
+                history_bytes = history_path.read_bytes()
+                history = deserialize_rank_payload(history_bytes)
+                for key, expected in {
+                    "migration_id": request.migration_id,
+                    "source_request_id": request.source_request_id,
+                    "target_tp_rank": tp_rank,
+                }.items():
+                    if history.get(key) != expected:
+                        raise ValueError(f"Live Shadow history {key} differs")
+                history_layers = history.get("layers")
+                if not isinstance(history_layers, dict) or not history_layers:
+                    raise ValueError("Live Shadow history has no KV layers")
+                history_payload_bytes = len(history_bytes)
+                history_stage_ms = (time.perf_counter() - started) * 1000
             with self._gpu_kv_lock:
                 validation = inject_rank_shard(
                     self._destination_layers(history_layers),
@@ -757,8 +785,11 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     block_axis=int(manifest["block_axis"]),
                 )
             exact_readback = validation["exact_readback"] is True
-            digest.update(history_bytes)
-            aggregate_bytes += len(history_bytes)
+            if gpu_direct:
+                history_stage_ms = (time.perf_counter() - started) * 1000
+            if history_bytes:
+                digest.update(history_bytes)
+            aggregate_bytes += history_payload_bytes
             # One full-tensor exact readback covers every logical block.  Keep
             # the per-block receipts required by the protocol without paying
             # for 132 separate tensor serializations and GPU round trips.
@@ -796,12 +827,40 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     "tp_rank": tp_rank,
                     "end_token": current,
                     "exact_readback": exact_readback,
+                    "transport": manifest.get("history_transport"),
                     "completed_unix_s": time.time(),
                 },
                 self.manifest_path.parent
                 / "gpu_initial_receipts"
                 / f"tp_rank_{tp_rank}.json",
             )
+            if gpu_direct:
+                completed = time.time()
+                _atomic_json_dump(
+                    {
+                        "format_version": 1,
+                        "phase": "BridgeTP D3 Phase 8",
+                        "status": "STAGED",
+                        "migration_id": request.migration_id,
+                        "target_tp_rank": tp_rank,
+                        "num_computed_tokens": initial_end,
+                        "stage_ms": history_stage_ms,
+                        "completed_unix_s": completed,
+                        "payload_bytes": history_payload_bytes,
+                        "observed_gib_s": (
+                            history_payload_bytes
+                            / 1024**3
+                            / (history_stage_ms / 1000)
+                            if history_stage_ms > 0
+                            else None
+                        ),
+                        "transport": manifest.get("history_transport"),
+                        "exact_readback": exact_readback,
+                    },
+                    self.manifest_path.parent
+                    / "initial_stage_receipts"
+                    / f"tp_rank_{tp_rank}.json",
+                )
             while current < request.num_computed_tokens:
                 candidates = sorted(queue_dir.glob(f"delta_{current:012d}_*.bin"))
                 if not candidates:
@@ -877,6 +936,15 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 raise ValueError("Cutover boundary differs from GPU watermark")
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
+            if gpu_direct:
+                staging_path = self.manifest_path.parent / "staging_manifest.json"
+                self._wait_for_file(staging_path, deadline)
+                staging = _load_json(staging_path)
+                terminal_record = staging["ranks"][tp_rank]
+                aggregate_bytes = int(terminal_record["payload_bytes"])
+                terminal_digest = str(terminal_record["payload_sha256"])
+            else:
+                terminal_digest = digest.hexdigest()
             receipt_path = (
                 self.receipt_dir / _safe_name(request_id) / f"tp_rank_{tp_rank}.json"
             )
@@ -893,7 +961,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 "num_computed_tokens": current,
                 "pending_tokens_to_compute": 1,
                 "payload_bytes": aggregate_bytes,
-                "payload_sha256": digest.hexdigest(),
+                "payload_sha256": terminal_digest,
                 "delta_batches": delta_batches,
                 "gpu_resident": True,
                 "exact_readback": exact_readback,
@@ -910,7 +978,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     "tp_rank": tp_rank,
                     "end_token": current,
                     "payload_bytes": aggregate_bytes,
-                    "payload_sha256": digest.hexdigest(),
+                    "payload_sha256": terminal_digest,
                     "updated_unix_s": time.time(),
                 },
                 self.manifest_path.parent

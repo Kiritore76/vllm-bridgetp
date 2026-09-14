@@ -84,6 +84,9 @@ class BridgeTPStreamConfig:
     socket_timeout_s: float
     pin_memory: bool
     strict: bool
+    gpu_direct_history: bool
+    gpu_direct_host: str
+    gpu_direct_base_port: int
     stop_and_copy: bool = False
     # Optional external request-ID prefix used by the capacity pilot to pick
     # one anchor from a real multi-request scheduler batch.  Empty preserves
@@ -130,13 +133,24 @@ class BridgeTPStreamConfig:
             phase8_delta_base_port=int(
                 os.getenv("BRIDGETP_PHASE8_DELTA_BASE_PORT", "29900")
             ),
-            chunk_bytes=int(os.getenv("BRIDGETP_STREAM_CHUNK_BYTES", str(1024 * 1024))),
+            chunk_bytes=int(
+                os.getenv("BRIDGETP_STREAM_CHUNK_BYTES", str(1024 * 1024))
+            ),
             aggregate_rate_gib_s=float(os.getenv("BRIDGETP_STREAM_RATE_GIB_S", "0")),
             socket_timeout_s=float(
                 os.getenv("BRIDGETP_STREAM_SOCKET_TIMEOUT_S", "600")
             ),
             pin_memory=_env_bool("BRIDGETP_STREAM_PIN_MEMORY", True),
             strict=_env_bool("BRIDGETP_STREAM_STRICT", True),
+            gpu_direct_history=_env_bool(
+                "BRIDGETP_GPU_DIRECT_HISTORY", False
+            ),
+            gpu_direct_host=os.getenv(
+                "BRIDGETP_GPU_DIRECT_HOST", "127.0.0.1"
+            ),
+            gpu_direct_base_port=int(
+                os.getenv("BRIDGETP_GPU_DIRECT_BASE_PORT", "30400")
+            ),
             stop_and_copy=_env_bool("BRIDGETP_STOP_AND_COPY", False),
             source_request_id_prefix=os.getenv(
                 "BRIDGETP_STREAM_SOURCE_REQUEST_ID_PREFIX", ""
@@ -161,6 +175,12 @@ class BridgeTPStreamConfig:
         """
         if self.aggregate_rate_gib_s < 0:
             raise ValueError("BRIDGETP_STREAM_RATE_GIB_S cannot be negative")
+        if self.gpu_direct_history and not self.phase8_enabled:
+            raise ValueError("GPU-direct history currently requires Phase 8")
+        if self.gpu_direct_history and not (
+            1024 <= self.gpu_direct_base_port <= 65530
+        ):
+            raise ValueError("GPU-direct base port must leave five valid ports")
         if self.after_output_tokens <= 0:
             raise ValueError("Snapshot output-token boundary must be positive")
         if self.phase8_enabled:
@@ -384,6 +404,112 @@ class _RankPublisher:
         return config.aggregate_rate_gib_s * 1024**3 / config.target_tp_size
 
 
+class _GpuDirectHistoryPublisher:
+    """Run the immutable historical copy on a background CUDA/NCCL stream."""
+
+    def __init__(
+        self,
+        *,
+        config: BridgeTPStreamConfig,
+        request_id: str,
+        kv_caches: list[torch.Tensor],
+        layer_names: list[str],
+        block_ids: list[int],
+        block_axis: int,
+    ) -> None:
+        self.config = config
+        self.request_id = request_id
+        self.kv_caches = kv_caches
+        self.layer_names = layer_names
+        self.block_ids = block_ids
+        self.block_axis = block_axis
+        self.started = False
+        self._lock = threading.Lock()
+        self.thread = threading.Thread(
+            target=self._run,
+            name="bridgetp-gpu-direct-history",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        with self._lock:
+            if self.started:
+                return
+            self.started = True
+            self.thread.start()
+
+    def cancel_before_start(self, reason: str) -> bool:
+        with self._lock:
+            if self.started:
+                return False
+            self.started = True
+            _atomic_json_dump(
+                {
+                    "format_version": 1,
+                    "status": "CANCELLED_BEFORE_HISTORY_TRANSFER",
+                    "migration_id": self.config.migration_id,
+                    "reason": reason,
+                    "completed_unix_s": time.time(),
+                },
+                self.config.run_dir / "gpu_direct_sender.json",
+            )
+            return True
+
+    def _run(self) -> None:
+        from vllm.bridge_tp.gpu_direct_history import (
+            INTEGRITY,
+            TRANSPORT,
+            GpuDirectHistorySender,
+        )
+
+        receipt: dict[str, Any] = {
+            "format_version": 1,
+            "status": "ERROR",
+            "migration_id": self.config.migration_id,
+            "source_request_id": self.request_id,
+            "transport": TRANSPORT,
+            "integrity": INTEGRITY,
+        }
+        try:
+            device = self.kv_caches[0].device
+            torch.cuda.set_device(device)
+            sender = GpuDirectHistorySender(
+                device=device,
+                host=self.config.gpu_direct_host,
+                port=self.config.gpu_direct_base_port
+                + self.config.target_tp_size,
+            )
+            ranks = sender.send(
+                migration_id=self.config.migration_id,
+                kv_caches=self.kv_caches,
+                layer_names=self.layer_names,
+                block_ids=self.block_ids,
+                block_axis=self.block_axis,
+                head_axis=self.config.head_axis,
+                target_tp_size=self.config.target_tp_size,
+                target_addresses=[
+                    f"{self.config.gpu_direct_host}:"
+                    f"{self.config.gpu_direct_base_port + rank}"
+                    for rank in range(self.config.target_tp_size)
+                ],
+            )
+            receipt.update(
+                {
+                    "status": "READY",
+                    "ranks": ranks,
+                    "completed_unix_s": time.time(),
+                }
+            )
+        except Exception as error:
+            receipt["error"] = f"{type(error).__name__}: {error}"
+            receipt["completed_unix_s"] = time.time()
+            logger.exception("BridgeTP GPU-direct history sender failed")
+        finally:
+            _atomic_json_dump(
+                receipt, self.config.run_dir / "gpu_direct_sender.json"
+            )
+
+
 def _publish_request(
     *,
     config: BridgeTPStreamConfig,
@@ -457,18 +583,6 @@ def _publish_request(
     layer_names = _ordered_layer_names(kv_cache_config)
     raw_source_bytes = _estimate_dump_bytes(kv_caches, block_axis, len(block_ids))
     snapshot_started = time.perf_counter()
-    source_layers, layer_records, d2h_ms = _copy_request_blocks(
-        kv_caches, layer_names, block_ids, block_axis
-    )
-    emit_event(
-        config.run_dir,
-        "source_worker",
-        "SNAPSHOT_D2H_COMPLETE",
-        request_id=request_id,
-        migration_id=config.migration_id,
-        d2h_ms=d2h_ms,
-    )
-
     session_token = secrets.token_hex(32)
     config.run_dir.mkdir(parents=True, exist_ok=True)
     if (config.run_dir / "session_manifest.json").exists():
@@ -476,82 +590,147 @@ def _publish_request(
             f"Phase 6 run directory was already used: {config.run_dir}"
         )
     rank_records: list[dict[str, Any]] = []
-    publishers: list[_RankPublisher] = []
+    publishers: list[Any] = []
     total_raw_rank_bytes = 0
-    for rank, rank_layers_unpinned in iter_tp_rank_shards(
-        source_layers,
-        head_axis=config.head_axis,
-        target_tp_size=config.target_tp_size,
-        expected_source_kv_heads=config.expected_kv_heads,
-    ):
-        rank_layers = rank_layers_unpinned
-        pinned = False
-        if config.pin_memory and torch.cuda.is_available():
-            rank_layers = {
-                name: tensor.pin_memory() for name, tensor in rank_layers.items()
-            }
-            pinned = True
-        raw_rank_bytes = sum(
-            tensor.numel() * tensor.element_size() for tensor in rank_layers.values()
+    if config.gpu_direct_history:
+        if not torch.cuda.is_available() or kv_caches[0].device.type != "cuda":
+            raise RuntimeError("GPU-direct history requires CUDA KV caches")
+        if len(kv_caches) != len(layer_names):
+            raise RuntimeError("KV-cache tensor count differs from layer count")
+        layer_records = []
+        for cache_index, (layer_name, cache) in enumerate(
+            zip(layer_names, kv_caches)
+        ):
+            dump_shape = list(cache.shape)
+            dump_shape[block_axis] = len(block_ids)
+            if int(dump_shape[config.head_axis]) != config.expected_kv_heads:
+                raise ValueError("source KV head count differs from configuration")
+            rank_shape = list(dump_shape)
+            rank_shape[config.head_axis] //= config.target_tp_size
+            layer_records.append(
+                {
+                    "cache_index": cache_index,
+                    "layer_name": layer_name,
+                    "source_shape": list(cache.shape),
+                    "dump_shape": dump_shape,
+                    "rank_shape": rank_shape,
+                    "dtype": str(cache.dtype),
+                    "block_axis": block_axis,
+                }
+            )
+        raw_rank_bytes = raw_source_bytes // config.target_tp_size
+        total_raw_rank_bytes = raw_rank_bytes * config.target_tp_size
+        for rank in range(config.target_tp_size):
+            rank_records.append(
+                {
+                    "target_tp_rank": rank,
+                    "host": config.gpu_direct_host,
+                    "port": config.gpu_direct_base_port + rank,
+                    "raw_tensor_bytes": raw_rank_bytes,
+                    "payload_bytes": raw_rank_bytes,
+                    "payload_sha256": "GPU_EXACT_READBACK",
+                    "num_frames": len(layer_names),
+                    "pinned_cpu": False,
+                    "transport": "NCCL_P2P_GPU_DIRECT",
+                }
+            )
+        publishers.append(
+            _GpuDirectHistoryPublisher(
+                config=config,
+                request_id=request_id,
+                kv_caches=kv_caches,
+                layer_names=layer_names,
+                block_ids=block_ids,
+                block_axis=block_axis,
+            )
         )
-        total_raw_rank_bytes += raw_rank_bytes
-        payload = serialize_rank_payload(
-            {
-                "format_version": 1,
+        d2h_ms = 0.0
+    else:
+        source_layers, layer_records, d2h_ms = _copy_request_blocks(
+            kv_caches, layer_names, block_ids, block_axis
+        )
+        emit_event(
+            config.run_dir,
+            "source_worker",
+            "SNAPSHOT_D2H_COMPLETE",
+            request_id=request_id,
+            migration_id=config.migration_id,
+            d2h_ms=d2h_ms,
+        )
+        for rank, rank_layers_unpinned in iter_tp_rank_shards(
+            source_layers,
+            head_axis=config.head_axis,
+            target_tp_size=config.target_tp_size,
+            expected_source_kv_heads=config.expected_kv_heads,
+        ):
+            rank_layers = rank_layers_unpinned
+            pinned = False
+            if config.pin_memory and torch.cuda.is_available():
+                rank_layers = {
+                    name: tensor.pin_memory() for name, tensor in rank_layers.items()
+                }
+                pinned = True
+            raw_rank_bytes = sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in rank_layers.values()
+            )
+            total_raw_rank_bytes += raw_rank_bytes
+            payload = serialize_rank_payload(
+                {
+                    "format_version": 1,
+                    "migration_id": config.migration_id,
+                    "source_request_id": request_id,
+                    "target_tp_size": config.target_tp_size,
+                    "target_tp_rank": rank,
+                    "block_axis": block_axis,
+                    "block_size": block_size,
+                    "num_computed_tokens": num_computed,
+                    "history_copy_order": (
+                        "TOKEN_ASCENDING_FROM_REQUEST_START"
+                    ),
+                    "layers": rank_layers,
+                }
+            )
+            payload_hash = sha256_bytes(payload)
+            num_frames = math.ceil(len(payload) / config.chunk_bytes)
+            header = {
+                "protocol_version": PROTOCOL_VERSION,
                 "migration_id": config.migration_id,
                 "source_request_id": request_id,
                 "target_tp_size": config.target_tp_size,
                 "target_tp_rank": rank,
-                "block_axis": block_axis,
-                "block_size": block_size,
                 "num_computed_tokens": num_computed,
-                # ``source_layers`` was index-selected with the request's
-                # logical block table, so block 0 here is the oldest request
-                # block and subsequent blocks follow increasing token index.
+                "pending_known_tokens": pending,
+                "block_size": block_size,
+                "block_axis": block_axis,
+                "num_layers": len(rank_layers),
                 "history_copy_order": "TOKEN_ASCENDING_FROM_REQUEST_START",
-                "layers": rank_layers,
-            }
-        )
-        payload_hash = sha256_bytes(payload)
-        num_frames = math.ceil(len(payload) / config.chunk_bytes)
-        header = {
-            "protocol_version": PROTOCOL_VERSION,
-            "migration_id": config.migration_id,
-            "source_request_id": request_id,
-            "target_tp_size": config.target_tp_size,
-            "target_tp_rank": rank,
-            "num_computed_tokens": num_computed,
-            "pending_known_tokens": pending,
-            "block_size": block_size,
-            "block_axis": block_axis,
-            "num_layers": len(rank_layers),
-            "history_copy_order": "TOKEN_ASCENDING_FROM_REQUEST_START",
-            "raw_tensor_bytes": raw_rank_bytes,
-            "payload_bytes": len(payload),
-            "payload_sha256": payload_hash,
-            "num_frames": num_frames,
-            "chunk_bytes": config.chunk_bytes,
-        }
-        publisher = _RankPublisher(
-            config=config,
-            session_token=session_token,
-            rank=rank,
-            payload=payload,
-            header=header,
-        )
-        publishers.append(publisher)
-        rank_records.append(
-            {
-                "target_tp_rank": rank,
-                "host": config.host,
-                "port": config.base_port + rank,
                 "raw_tensor_bytes": raw_rank_bytes,
                 "payload_bytes": len(payload),
                 "payload_sha256": payload_hash,
                 "num_frames": num_frames,
-                "pinned_cpu": pinned,
+                "chunk_bytes": config.chunk_bytes,
             }
-        )
+            publisher = _RankPublisher(
+                config=config,
+                session_token=session_token,
+                rank=rank,
+                payload=payload,
+                header=header,
+            )
+            publishers.append(publisher)
+            rank_records.append(
+                {
+                    "target_tp_rank": rank,
+                    "host": config.host,
+                    "port": config.base_port + rank,
+                    "raw_tensor_bytes": raw_rank_bytes,
+                    "payload_bytes": len(payload),
+                    "payload_sha256": payload_hash,
+                    "num_frames": num_frames,
+                    "pinned_cpu": pinned,
+                }
+            )
 
     history_started_unix_s: float | None = None
     if not config.phase8_enabled or config.shadow_strategy == "S_NEW_OLD":
@@ -590,7 +769,7 @@ def _publish_request(
         "expected_source_kv_heads": config.expected_kv_heads,
         "physical_block_ids": block_ids,
         "num_blocks": len(block_ids),
-        "num_layers": len(source_layers),
+        "num_layers": len(layer_names),
         "num_prompt_tokens": int(request.num_prompt_tokens),
         "snapshot_num_output_tokens": num_output_tokens,
         "num_computed_tokens": num_computed,
@@ -602,6 +781,16 @@ def _publish_request(
         "raw_rank_tensor_bytes_total": total_raw_rank_bytes,
         "d2h_snapshot_ms": d2h_ms,
         "snapshot_prepare_ms": (time.perf_counter() - snapshot_started) * 1000,
+        "history_transport": (
+            "NCCL_P2P_GPU_DIRECT"
+            if config.gpu_direct_history
+            else "CPU_TCP_SERIALIZED"
+        ),
+        "history_integrity": (
+            "NCCL_COMPLETION_PLUS_GPU_EXACT_READBACK"
+            if config.gpu_direct_history
+            else "SHA256_PLUS_GPU_EXACT_READBACK"
+        ),
         "chunk_bytes": config.chunk_bytes,
         "aggregate_rate_limit_gib_s": config.aggregate_rate_gib_s,
         "shadow_strategy": config.shadow_strategy,
@@ -624,7 +813,9 @@ def _publish_request(
             {
                 "format_version": 1,
                 "phase": phase,
-                "scope": ("application-level atomic handoff; no crash-consensus claim"),
+                "scope": (
+                    "application-level atomic handoff; no crash-consensus claim"
+                ),
                 "migration_id": config.migration_id,
                 "source_request_id": request_id,
                 "snapshot_num_output_tokens": num_output_tokens,
