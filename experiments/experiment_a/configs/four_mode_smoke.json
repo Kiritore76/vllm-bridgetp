@@ -16,5 +16,9 @@
   "measured_background_jobs": 0,
   "target_warmup_jobs": 1,
   "target_warmup_output_tokens": 1,
+  "shadow_history_transport": "NCCL_P2P_GPU_DIRECT",
+  "shadow_delta_transport": "NCCL_P2P_GPU_DIRECT_PERSISTENT",
+  "shadow_delta_batch_tokens": 16,
+  "shadow_delta_flush_ms": 0,
   "stop_before": "A1"
 }

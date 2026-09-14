@@ -53,6 +53,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--delivery-port", type=int, default=30000)
     parser.add_argument("--gpu-direct-history", action="store_true")
     parser.add_argument("--gpu-direct-base-port", type=int, default=30400)
+    parser.add_argument("--gpu-direct-delta", action="store_true")
+    parser.add_argument(
+        "--gpu-direct-delta-batch-tokens", type=int, default=16
+    )
+    parser.add_argument("--gpu-direct-delta-flush-ms", type=float, default=0.0)
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.88)
@@ -75,11 +80,56 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def baseline_info(args: argparse.Namespace, revision: str) -> dict[str, Any]:
+    key_files = [
+        REPO / "tools" / "bridge_tp" / "run_experiment_a_four_mode_smoke.py",
+        REPO / "tools" / "bridge_tp" / "run_shadow_strategy_online_validation.py",
+        REPO / "vllm" / "bridge_tp" / "experiment_timeline.py",
+        REPO / "vllm" / "bridge_tp" / "kv_stream.py",
+        REPO / "vllm" / "bridge_tp" / "phase8_source.py",
+        REPO / "vllm" / "bridge_tp" / "streaming_connector.py",
+        REPO / "vllm" / "bridge_tp" / "takeover_api.py",
+    ]
+    return {
+        "format_version": 1,
+        "status": "CAPTURED",
+        "revision": revision,
+        "branch": common.git("branch", "--show-current"),
+        "git_status_porcelain": common.git("status", "--porcelain"),
+        "key_file_sha256": {
+            str(path.relative_to(REPO)): sha256(path) for path in key_files
+        },
+        "model_path": str(args.model_path.resolve()),
+        "dtype": args.dtype,
+        "max_model_len": args.max_model_len,
+        "topology": {"source": "GPU0 TP1", "target": "GPU1-4 TP4"},
+        "server_invariants": {
+            "async_scheduling": False,
+            "prefix_caching": False,
+            "hybrid_kv_cache_manager": False,
+        },
+        "shadow_backend": {
+            "gpu_resident": True,
+            "gpu_direct_history": args.gpu_direct_history,
+            "gpu_direct_delta": args.gpu_direct_delta,
+            "delta_batch_tokens": args.gpu_direct_delta_batch_tokens,
+            "delta_flush_ms": args.gpu_direct_delta_flush_ms,
+        },
+        "scope": "Step 0 through Step 5; stop before A1",
+    }
+
+
 def validate(args: argparse.Namespace) -> str:
     if os.name == "nt":
         raise RuntimeError("four-mode smoke requires Linux and five GPUs")
     if args.repetitions != 3:
         raise ValueError("Section-7 smoke requires exactly three paired repetitions")
+    if args.gpu_direct_delta and not args.gpu_direct_history:
+        raise ValueError("GPU-direct delta requires GPU-direct history")
+    if args.gpu_direct_delta_batch_tokens <= 0:
+        raise ValueError("GPU-direct delta batch size must be positive")
+    if args.gpu_direct_delta_flush_ms < 0:
+        raise ValueError("GPU-direct delta flush time cannot be negative")
     if not args.model_path.exists():
         raise FileNotFoundError(f"model path is missing: {args.model_path}")
     for label, path, expected in (
@@ -163,7 +213,11 @@ def shared_server_args(args: argparse.Namespace) -> list[str]:
 
 
 def online_args(
-    args: argparse.Namespace, manifest: Path, manifest_sha: str
+    args: argparse.Namespace,
+    manifest: Path,
+    manifest_sha: str,
+    *,
+    enable_gpu_delta: bool,
 ) -> list[str]:
     result = [
         "--phase",
@@ -225,6 +279,16 @@ def online_args(
                 str(args.gpu_direct_base_port),
             ]
         )
+    if enable_gpu_delta:
+        result.extend(
+            [
+                "--gpu-direct-delta",
+                "--gpu-direct-delta-batch-tokens",
+                str(args.gpu_direct_delta_batch_tokens),
+                "--gpu-direct-delta-flush-ms",
+                str(args.gpu_direct_delta_flush_ms),
+            ]
+        )
     return result
 
 
@@ -261,6 +325,10 @@ def extract_row(
             "commit_to_source_kv_release_ms": None,
             "migration_bytes": 0,
             "effective_kv_bandwidth_gib_s": None,
+            "gpu_direct_delta": False,
+            "gpu_direct_delta_batch_tokens": None,
+            "gpu_direct_delta_batches": None,
+            "gpu_direct_delta_total_ms": None,
             "slo_success": (
                 result["ttft_ms"] <= args.slo_ttft_ms
                 and result["e2e_ms"] <= args.slo_e2e_ms
@@ -295,10 +363,19 @@ def extract_row(
         "commit_to_source_kv_release_ms": run.get(
             "source_kv_release_after_commit_ms"
         ),
-        "migration_bytes": run.get("history_payload_bytes"),
+        "migration_bytes": (
+            int(run.get("history_payload_bytes") or 0)
+            + int(run.get("gpu_direct_delta_payload_bytes") or 0)
+        ),
         "effective_kv_bandwidth_gib_s": run.get(
             "history_observed_aggregate_gib_s"
         ),
+        "gpu_direct_delta": run.get("gpu_direct_delta", False),
+        "gpu_direct_delta_batch_tokens": run.get(
+            "gpu_direct_delta_batch_tokens"
+        ),
+        "gpu_direct_delta_batches": run.get("gpu_direct_delta_batches"),
+        "gpu_direct_delta_total_ms": run.get("gpu_direct_delta_total_ms"),
         "slo_success": run.get("anchor_slo", {}).get("success"),
         "root": str(root.resolve()),
     }
@@ -318,6 +395,10 @@ def main() -> None:
         "anchor_max_tokens": args.anchor_max_tokens,
         "trigger_output_tokens": args.trigger_output_tokens,
         "shadow_cutover_output_tokens": args.cutover_output_tokens,
+        "gpu_direct_history": args.gpu_direct_history,
+        "gpu_direct_delta": args.gpu_direct_delta,
+        "gpu_direct_delta_batch_tokens": args.gpu_direct_delta_batch_tokens,
+        "gpu_direct_delta_flush_ms": args.gpu_direct_delta_flush_ms,
         "scope": "Stop after this smoke; A1-A5 are not launched",
     }
     if args.validate_only:
@@ -326,6 +407,9 @@ def main() -> None:
 
     args.out_root.mkdir(parents=True, exist_ok=False)
     common.write_json(args.out_root / "resolved_contract.json", contract)
+    common.write_json(
+        args.out_root / "baseline_info.json", baseline_info(args, revision)
+    )
     manifest = args.out_root / "target_warmup_manifest.json"
     common.write_json(
         manifest,
@@ -384,7 +468,14 @@ def main() -> None:
                         str(root),
                         selector,
                         "--gpu-resident-shadow",
-                        *online_args(args, manifest, manifest_sha),
+                        *online_args(
+                            args,
+                            manifest,
+                            manifest_sha,
+                            enable_gpu_delta=(
+                                mode == "SHADOW_ONLY" and args.gpu_direct_delta
+                            ),
+                        ),
                     ]
                 run_logged(
                     command,
@@ -427,6 +518,22 @@ def main() -> None:
         common.write_json(args.out_root / "acceptance.json", acceptance)
         if acceptance["status"] != "PASS":
             raise RuntimeError("; ".join(errors) or "four-mode row count mismatch")
+        common.write_json(
+            args.out_root / "step_gate_status.json",
+            {
+                "format_version": 1,
+                "status": "PASS",
+                "completed": [
+                    "STEP_0_BASELINE_CAPTURE",
+                    "STEP_1_TIMELINE_VALIDATION",
+                    "STEP_2_STATIC_TP1_TP4",
+                    "STEP_3_SHADOW_ONLY",
+                    "STEP_4_STOP_AND_COPY",
+                    "STEP_5_FOUR_MODE_SMOKE",
+                ],
+                "stopped_before": "A1",
+            },
+        )
         print(f"EXPERIMENT_A_FOUR_MODE_SMOKE_COMPLETE: {args.out_root}")
     except BaseException as error:
         common.write_json(
