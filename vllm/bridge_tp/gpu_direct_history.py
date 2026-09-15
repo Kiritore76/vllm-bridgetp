@@ -92,7 +92,7 @@ def _recv_tensor(
     comm: Any,
     tensor: torch.Tensor,
     stream: torch.cuda.Stream,
-) -> None:
+) -> torch.cuda.Event:
     with torch.cuda.stream(stream):
         nccl.ncclRecv(
             buffer_type(tensor.data_ptr()),
@@ -102,7 +102,9 @@ def _recv_tensor(
             comm,
             cudaStream_t(stream.cuda_stream),
         )
-    stream.synchronize()
+        receive_done = torch.cuda.Event(enable_timing=False)
+        receive_done.record(stream)
+    return receive_done
 
 
 @dataclass
@@ -110,6 +112,7 @@ class ReceiveResult:
     layers: dict[str, torch.Tensor]
     raw_tensor_bytes: int
     receive_ms: float
+    receive_done_event: torch.cuda.Event | None = None
     start_token: int | None = None
     end_token: int | None = None
 
@@ -161,7 +164,8 @@ class GpuDirectHistoryReceiver:
         shapes: list[list[int]],
         dtype: torch.dtype,
         tensor_key: str,
-    ) -> tuple[torch.Tensor, float]:
+        synchronize: bool,
+    ) -> tuple[torch.Tensor, float, torch.cuda.Event]:
         if self.connection is None or self.nccl is None:
             raise RuntimeError("GPU-direct receiver is not connected")
         if self.comm is None or self.stream is None:
@@ -175,8 +179,14 @@ class GpuDirectHistoryReceiver:
              "numel": packed.numel()},
         )
         started = time.perf_counter()
-        _recv_tensor(self.nccl, self.comm, packed, self.stream)
-        return packed, (time.perf_counter() - started) * 1000
+        receive_done = _recv_tensor(self.nccl, self.comm, packed, self.stream)
+        if synchronize:
+            receive_done.synchronize()
+        return (
+            packed,
+            (time.perf_counter() - started) * 1000,
+            receive_done,
+        )
 
     @staticmethod
     def _unpack(
@@ -199,6 +209,7 @@ class GpuDirectHistoryReceiver:
         rank: int,
         layer_records: list[dict[str, Any]],
         keep_open: bool = False,
+        synchronize: bool = True,
     ) -> ReceiveResult:
         started = time.perf_counter()
         self._open(migration_id=migration_id, rank=rank)
@@ -216,10 +227,11 @@ class GpuDirectHistoryReceiver:
                 [int(value) for value in row["rank_shape"]]
                 for row in layer_records
             ]
-            packed, _ = self._receive_packed(
+            packed, _, receive_done = self._receive_packed(
                 shapes=shapes,
                 dtype=dtype,
                 tensor_key=tensor_id(migration_id, rank, 0),
+                synchronize=synchronize,
             )
             assert self.connection is not None
             send_json(self.connection, {"status": "RECEIVED"})
@@ -234,6 +246,7 @@ class GpuDirectHistoryReceiver:
                 layers=layers,
                 raw_tensor_bytes=raw_bytes,
                 receive_ms=(time.perf_counter() - started) * 1000,
+                receive_done_event=receive_done,
             )
             if not keep_open:
                 self.close()
@@ -242,7 +255,13 @@ class GpuDirectHistoryReceiver:
             self.close()
             raise
 
-    def receive_delta(self, *, migration_id: str, rank: int) -> ReceiveResult | None:
+    def receive_delta(
+        self,
+        *,
+        migration_id: str,
+        rank: int,
+        synchronize: bool = True,
+    ) -> ReceiveResult | None:
         """Receive the next packed delta, or ``None`` after source close."""
         if self.connection is None:
             raise RuntimeError("history must be received before GPU delta")
@@ -260,15 +279,17 @@ class GpuDirectHistoryReceiver:
         shapes = [[int(value) for value in row] for row in header["shapes"]]
         names = [str(value) for value in header["layer_names"]]
         started = time.perf_counter()
-        packed, _ = self._receive_packed(
+        packed, _, receive_done = self._receive_packed(
             shapes=shapes,
             dtype=self._dtype(str(header["dtype"])),
             tensor_key=str(header["tensor_id"]),
+            synchronize=synchronize,
         )
         return ReceiveResult(
             layers=self._unpack(packed, names, shapes),
             raw_tensor_bytes=packed.numel() * packed.element_size(),
             receive_ms=(time.perf_counter() - started) * 1000,
+            receive_done_event=receive_done,
             start_token=int(header["start_token"]),
             end_token=int(header["end_token"]),
         )

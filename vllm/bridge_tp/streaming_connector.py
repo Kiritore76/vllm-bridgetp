@@ -53,6 +53,13 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_READY_SYNC_DEVICE_WIDE = "DEVICE_WIDE"
+_READY_SYNC_STREAM_EVENT = "STREAM_EVENT"
+_READY_SYNC_MODES = {
+    _READY_SYNC_DEVICE_WIDE,
+    _READY_SYNC_STREAM_EVENT,
+}
+
 
 class _ShadowCancelled(RuntimeError):
     pass
@@ -174,6 +181,15 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 "bridgetp_remote_attention_base_port", 30200
             )
         )
+        self.ready_sync_mode = str(
+            self._kv_transfer_config.get_from_extra_config(
+                "bridgetp_ready_sync_mode", _READY_SYNC_DEVICE_WIDE
+            )
+        ).upper()
+        if self.ready_sync_mode not in _READY_SYNC_MODES:
+            raise ValueError(
+                "bridgetp_ready_sync_mode must be DEVICE_WIDE or STREAM_EVENT"
+            )
         self._manifest: dict[str, Any] | None = None
         self._pending_requests: dict[str, Request] = {}
         self._active_requests: dict[str, Request] = {}
@@ -184,6 +200,8 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         self._completed_recvs: set[str] = set()
         self._reported_recvs: set[str] = set()
         self._load_errors: dict[str, BaseException] = {}
+        self._copy_done_events: dict[str, torch.cuda.Event] = {}
+        self._model_wait_streams: set[tuple[str, int]] = set()
         self._claimed_target_request_id: str | None = None
         logger.warning(
             "BridgeTP Phase 6 streaming connector enabled; target waits for %s",
@@ -435,6 +453,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             raise ValueError("Phase 6 restores one request at a time")
         request = metadata.requests[0]
         if request.gpu_resident_shadow:
+            self._claimed_target_request_id = request.target_request_id
             self._start_live_gpu_load(request)
             return
         manifest = self._load_manifest()
@@ -653,6 +672,45 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         del layer_name
+        if self.ready_sync_mode != _READY_SYNC_STREAM_EVENT:
+            return
+        request_id = self._claimed_target_request_id
+        if request_id is None:
+            return
+        with self._gpu_kv_lock:
+            copy_done = self._copy_done_events.get(request_id)
+        if copy_done is None:
+            # The connector may start a disjoint asynchronous load while an
+            # unrelated target request is already executing.  That request
+            # must not wait for an event that has not been armed yet.  The
+            # migrated request remains scheduler-blocked until TARGET_READY.
+            return
+        stream = torch.cuda.current_stream()
+        key = (request_id, int(stream.cuda_stream))
+        with self._gpu_kv_lock:
+            if key in self._model_wait_streams:
+                return
+            stream.wait_event(copy_done)
+            self._model_wait_streams.add(key)
+        tp_rank = get_tp_group().rank_in_group
+        receipt_path = (
+            self.receipt_dir / _safe_name(request_id) / f"tp_rank_{tp_rank}.json"
+        )
+        if receipt_path.is_file():
+            receipt = _load_json(receipt_path)
+            receipt["model_stream_wait_event"] = True
+            receipt["model_stream_cuda_stream"] = int(stream.cuda_stream)
+            _atomic_json_dump(receipt, receipt_path)
+        from vllm.bridge_tp.experiment_timeline import emit_event
+
+        emit_event(
+            self.manifest_path.parent,
+            "target_connector",
+            "MODEL_STREAM_WAIT_ARMED",
+            request_id=request_id,
+            tp_rank=tp_rank,
+            cuda_stream=int(stream.cuda_stream),
+        )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """Retain paged-KV tensors for asynchronous Shadow injection."""
@@ -730,9 +788,14 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             )
             digest = hashlib.sha256()
             aggregate_bytes = 0
+            receive_event_links = 0
             device = next(iter(self._registered_kv_caches.values())).device
             restore_stream: torch.cuda.Stream | None = None
-            if device.type == "cuda":
+            stream_event_mode = (
+                device.type == "cuda"
+                and self.ready_sync_mode == _READY_SYNC_STREAM_EVENT
+            )
+            if stream_event_mode:
                 torch.cuda.set_device(device)
                 with torch.cuda.device(device):
                     restore_stream = torch.cuda.Stream(device=device)
@@ -746,6 +809,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 manifest.get("delta_transport")
                 == "NCCL_P2P_GPU_DIRECT_PERSISTENT"
             )
+            direct = None
             if gpu_direct:
                 from vllm.bridge_tp.gpu_direct_history import (
                     GpuDirectHistoryReceiver,
@@ -762,6 +826,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     rank=tp_rank,
                     layer_records=list(manifest["layers"]),
                     keep_open=gpu_direct_delta,
+                    synchronize=not stream_event_mode,
                 )
                 history_layers = direct.layers
                 history_bytes = b""
@@ -790,6 +855,11 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 else nullcontext()
             )
             with self._gpu_kv_lock, restore_context:
+                if restore_stream is not None and direct is not None:
+                    if direct.receive_done_event is None:
+                        raise RuntimeError("GPU history has no receive-done event")
+                    restore_stream.wait_event(direct.receive_done_event)
+                    receive_event_links += 1
                 validation = inject_rank_shard(
                     self._destination_layers(history_layers),
                     history_layers,
@@ -879,6 +949,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     direct_delta = receiver.receive_delta(
                         migration_id=request.migration_id,
                         rank=tp_rank,
+                        synchronize=not stream_event_mode,
                     )
                     if direct_delta is None:
                         raise RuntimeError(
@@ -923,6 +994,11 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     else nullcontext()
                 )
                 with self._gpu_kv_lock, restore_context:
+                    if restore_stream is not None and direct_delta is not None:
+                        if direct_delta.receive_done_event is None:
+                            raise RuntimeError("GPU delta has no receive-done event")
+                        restore_stream.wait_event(direct_delta.receive_done_event)
+                        receive_event_links += 1
                     inject_rank_delta(
                         self._destination_layers(delta_layers),
                         delta_layers,
@@ -978,6 +1054,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 terminal = receiver.receive_delta(
                     migration_id=request.migration_id,
                     rank=tp_rank,
+                    synchronize=not stream_event_mode,
                 )
                 if terminal is not None:
                     raise RuntimeError("GPU-direct delta stream has trailing data")
@@ -986,18 +1063,34 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             cutover = _load_json(cutover_path)
             if int(cutover["num_computed_tokens"]) != current:
                 raise ValueError("Cutover boundary differs from GPU watermark")
-            ready_event_wait_started = time.perf_counter()
+            ready_wait_started = time.perf_counter()
+            copy_done: torch.cuda.Event | None = None
             if restore_stream is not None:
                 with torch.cuda.device(device):
-                    ready_event = torch.cuda.Event(enable_timing=False)
-                    ready_event.record(restore_stream)
-                    ready_event.synchronize()
+                    copy_done = torch.cuda.Event(enable_timing=False)
+                    copy_done.record(restore_stream)
+                    with self._gpu_kv_lock:
+                        self._copy_done_events[request_id] = copy_done
+                    copy_done.synchronize()
                 ready_sync_scope = "BRIDGETP_RESTORE_STREAM_EVENT"
+                device_wide_synchronize = False
+            elif device.type == "cuda":
+                torch.cuda.synchronize(device)
+                ready_sync_scope = "CUDA_DEVICE_WIDE_SYNCHRONIZE"
+                device_wide_synchronize = True
             else:
                 ready_sync_scope = "CPU_SYNCHRONOUS"
-            ready_event_wait_ms = (
-                time.perf_counter() - ready_event_wait_started
-            ) * 1000
+                device_wide_synchronize = False
+            ready_wait_ms = (time.perf_counter() - ready_wait_started) * 1000
+            receive_dependency_scope = (
+                "NCCL_RECEIVE_EVENT_TO_RESTORE_STREAM"
+                if restore_stream is not None and gpu_direct
+                else "CPU_STREAM_SYNCHRONIZE"
+                if gpu_direct
+                else "CPU_PAYLOAD_TO_RESTORE_STREAM"
+                if restore_stream is not None
+                else "CPU_SYNCHRONOUS"
+            )
             if gpu_direct:
                 staging_path = self.manifest_path.parent / "staging_manifest.json"
                 self._wait_for_file(staging_path, deadline)
@@ -1028,8 +1121,11 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 "gpu_resident": True,
                 "exact_readback": exact_readback,
                 "ready_sync_scope": ready_sync_scope,
-                "ready_event_wait_ms": ready_event_wait_ms,
-                "device_wide_synchronize": False,
+                "ready_event_wait_ms": ready_wait_ms,
+                "device_wide_synchronize": device_wide_synchronize,
+                "receive_dependency_scope": receive_dependency_scope,
+                "receive_event_links": receive_event_links,
+                "model_stream_wait_event": False,
                 "target_ready_total_ms": (time.perf_counter() - started) * 1000,
                 "target_ready_unix_s": time.time(),
             }
@@ -1045,8 +1141,10 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     "payload_bytes": aggregate_bytes,
                     "payload_sha256": terminal_digest,
                     "ready_sync_scope": ready_sync_scope,
-                    "ready_event_wait_ms": ready_event_wait_ms,
-                    "device_wide_synchronize": False,
+                    "ready_event_wait_ms": ready_wait_ms,
+                    "device_wide_synchronize": device_wide_synchronize,
+                    "receive_dependency_scope": receive_dependency_scope,
+                    "receive_event_links": receive_event_links,
                     "updated_unix_s": time.time(),
                 },
                 self.manifest_path.parent
@@ -1065,8 +1163,10 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 num_computed_tokens=current,
                 exact_readback=exact_readback,
                 ready_sync_scope=ready_sync_scope,
-                ready_event_wait_ms=ready_event_wait_ms,
-                device_wide_synchronize=False,
+                ready_event_wait_ms=ready_wait_ms,
+                device_wide_synchronize=device_wide_synchronize,
+                receive_dependency_scope=receive_dependency_scope,
+                receive_event_links=receive_event_links,
             )
             if self.takeover_control_path is not None:
                 while True:
