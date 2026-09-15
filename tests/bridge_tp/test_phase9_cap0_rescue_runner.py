@@ -212,6 +212,10 @@ class TestRescueAcceptance(unittest.TestCase):
                     "ready_sync_scope": "BRIDGETP_RESTORE_STREAM_EVENT",
                     "ready_event_wait_ms": rank + 0.25,
                     "device_wide_synchronize": False,
+                    "receive_dependency_scope": (
+                        "NCCL_RECEIVE_EVENT_TO_RESTORE_STREAM"
+                    ),
+                    "model_stream_wait_event": True,
                 },
             )
 
@@ -252,6 +256,11 @@ class TestRescueAcceptance(unittest.TestCase):
                 evidence["device_wide_synchronize"],
                 [False] * 4,
             )
+            self.assertEqual(
+                evidence["receive_dependency_scopes"],
+                ["NCCL_RECEIVE_EVENT_TO_RESTORE_STREAM"] * 4,
+            )
+            self.assertEqual(evidence["model_stream_wait_event"], [True] * 4)
 
     def test_rejects_failed_rank_readback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

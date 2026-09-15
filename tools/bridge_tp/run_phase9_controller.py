@@ -628,6 +628,8 @@ def step_shadow_only_takeover(
         return
     if dry_run:
         return
+    controller_wakeup_at = time.time()
+    commit_dispatched_at = time.time()
     try:
         result = adapter.commit()
     except ActionError as error:
@@ -652,6 +654,9 @@ def step_shadow_only_takeover(
             "kind": "shadow_only_commit",
             "server_state": result,
             "direct_transition": "SHADOW->TAKEOVER",
+            "controller_wakeup_unix_s": controller_wakeup_at,
+            "commit_dispatched_unix_s": commit_dispatched_at,
+            "commit_completed_unix_s": committed_at,
         }
     )
     machine.transition(

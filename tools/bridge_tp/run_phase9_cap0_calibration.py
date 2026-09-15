@@ -307,6 +307,7 @@ def target_connector(
     cutover_output_tokens: int = 0,
     online_remote_attention: bool = False,
     remote_attention_base_port: int = 30200,
+    ready_sync_mode: str = "DEVICE_WIDE",
 ) -> str:
     return json.dumps(
         {
@@ -336,6 +337,7 @@ def target_connector(
                 "bridgetp_shadow_cutover_output_tokens": cutover_output_tokens,
                 "bridgetp_online_remote_attention": online_remote_attention,
                 "bridgetp_remote_attention_base_port": remote_attention_base_port,
+                "bridgetp_ready_sync_mode": ready_sync_mode,
             },
         },
         separators=(",", ":"),

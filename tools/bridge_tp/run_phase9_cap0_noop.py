@@ -498,6 +498,9 @@ def run(
                     remote_attention_base_port=int(
                         getattr(args, "remote_attention_base_port", 30200)
                     ),
+                    ready_sync_mode=str(
+                        getattr(args, "ready_sync_mode", "DEVICE_WIDE")
+                    ),
                 ),
             ],
             target_env,

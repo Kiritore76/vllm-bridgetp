@@ -96,6 +96,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-direct-delta-batch-tokens", type=int, default=16)
     parser.add_argument("--gpu-direct-delta-flush-ms", type=float, default=25.0)
     parser.add_argument(
+        "--ready-sync-mode",
+        choices=["DEVICE_WIDE", "STREAM_EVENT"],
+        default="DEVICE_WIDE",
+        help="select the old whole-device or P0 stream/event target-ready path",
+    )
+    parser.add_argument(
+        "--ready-sync-comparison",
+        action="store_true",
+        help=(
+            "interleave DEVICE_WIDE and STREAM_EVENT Shadow-only runs within "
+            "each repetition"
+        ),
+    )
+    parser.add_argument(
         "--stop-and-copy-only",
         action="store_true",
         help=(
@@ -193,6 +207,22 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise ValueError("GPU-direct delta requires --gpu-direct-history")
     if args.gpu_direct_delta and not args.shadow_only_only:
         raise ValueError("GPU-direct delta batch sweep currently requires Shadow-only")
+    if args.ready_sync_mode == "STREAM_EVENT" and not (
+        args.gpu_resident_shadow and args.gpu_direct_history
+    ):
+        raise ValueError(
+            "STREAM_EVENT ready synchronization requires GPU-resident "
+            "GPU-direct history"
+        )
+    if args.ready_sync_comparison and not (
+        args.shadow_only_only
+        and args.gpu_resident_shadow
+        and args.gpu_direct_history
+        and args.gpu_direct_delta
+    ):
+        raise ValueError(
+            "ready sync comparison requires the GPU-direct Shadow-only path"
+        )
     if args.gpu_direct_delta_batch_tokens <= 0:
         raise ValueError("GPU-direct delta batch tokens must be positive")
     if args.gpu_direct_delta_flush_ms < 0:
@@ -452,11 +482,31 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             "repetition": run["repetition"],
             "strategy": run["strategy"],
             "architecture": run.get("architecture", "BRIDGE"),
+            "ready_sync_mode": run.get("ready_sync_mode"),
             "status": acceptance["status"],
             "shadow_duration_ms": acceptance["shadow_duration_ms"],
             "bridge_to_commit_ms": acceptance["bridge_to_commit_ms"],
             "final_sync_to_commit_ms": acceptance.get("final_sync_to_commit_ms"),
             "handoff_stall_ms": acceptance["handoff_stall_ms"],
+            "freeze_to_final_delta_ack_ms": acceptance.get(
+                "freeze_to_final_delta_ack_ms"
+            ),
+            "freeze_to_first_rank_ready_ms": acceptance.get(
+                "freeze_to_first_rank_ready_ms"
+            ),
+            "freeze_to_all_rank_ready_ms": acceptance.get(
+                "freeze_to_all_rank_ready_ms"
+            ),
+            "rank_ready_skew_ms": acceptance.get("rank_ready_skew_ms"),
+            "last_rank_ready_to_controller_wakeup_ms": acceptance.get(
+                "last_rank_ready_to_controller_wakeup_ms"
+            ),
+            "controller_wakeup_to_commit_ms": acceptance.get(
+                "controller_wakeup_to_commit_ms"
+            ),
+            "last_rank_ready_to_commit_ms": acceptance.get(
+                "last_rank_ready_to_commit_ms"
+            ),
             "request_frozen_unix_s": acceptance.get("request_frozen_unix_s"),
             "source_kv_released_unix_s": acceptance.get(
                 "source_kv_released_unix_s"
@@ -522,6 +572,18 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
                 value is True
                 for value in (
                     acceptance.get("target_device_wide_synchronize") or []
+                )
+            ),
+            "target_receive_dependency_scopes": "|".join(
+                str(value)
+                for value in (
+                    acceptance.get("target_receive_dependency_scopes") or []
+                )
+            ),
+            "target_model_stream_wait_event": all(
+                value is True
+                for value in (
+                    acceptance.get("target_model_stream_wait_event") or []
                 )
             ),
             "remote_attention_calls": acceptance.get("remote_attention_calls"),
@@ -619,6 +681,62 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
         writer.writeheader()
         writer.writerows(rows)
 
+    stage_fields = [
+        "repetition",
+        "architecture",
+        "ready_sync_mode",
+        "freeze_to_final_delta_ack_ms",
+        "freeze_to_first_rank_ready_ms",
+        "freeze_to_all_rank_ready_ms",
+        "rank_ready_skew_ms",
+        "last_rank_ready_to_controller_wakeup_ms",
+        "controller_wakeup_to_commit_ms",
+        "last_rank_ready_to_commit_ms",
+        "handoff_stall_ms",
+    ]
+    with (out_root / "handoff_stage_breakdown.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as handle:
+        writer = csv.DictWriter(handle, fieldnames=stage_fields)
+        writer.writeheader()
+        writer.writerows(
+            {field: row.get(field) for field in stage_fields} for row in rows
+        )
+
+    sync_comparisons: list[dict[str, Any]] = []
+    sync_metrics = stage_fields[3:]
+    for repetition in sorted({int(row["repetition"]) for row in rows}):
+        selected = {
+            str(row.get("ready_sync_mode")): row
+            for row in rows
+            if int(row["repetition"]) == repetition
+        }
+        if set(selected) != {"DEVICE_WIDE", "STREAM_EVENT"}:
+            continue
+        old = selected["DEVICE_WIDE"]
+        new = selected["STREAM_EVENT"]
+        comparison: dict[str, Any] = {"repetition": repetition}
+        for metric in sync_metrics:
+            old_value = old.get(metric)
+            new_value = new.get(metric)
+            comparison[f"old_{metric}"] = old_value
+            comparison[f"new_{metric}"] = new_value
+            comparison[f"saved_{metric}"] = (
+                float(old_value) - float(new_value)
+                if old_value is not None and new_value is not None
+                else None
+            )
+        sync_comparisons.append(comparison)
+    if sync_comparisons:
+        with (out_root / "p0_ready_sync_comparison.csv").open(
+            "w", encoding="utf-8", newline=""
+        ) as handle:
+            writer = csv.DictWriter(
+                handle, fieldnames=list(sync_comparisons[0])
+            )
+            writer.writeheader()
+            writer.writerows(sync_comparisons)
+
     paired: list[dict[str, Any]] = []
     repetitions = sorted({int(row["repetition"]) for row in rows})
     for repetition in repetitions:
@@ -715,6 +833,7 @@ def accept_online(
     slo_e2e_ms: float = 60000.0,
     slo_handoff_ms: float = 1000.0,
     stop_and_copy: bool = False,
+    ready_sync_mode: str = "DEVICE_WIDE",
 ) -> dict[str, Any]:
     background = common.read_json(background_dir / "background_summary.json")
     session = common.read_json(controller_dir / "session_manifest.json")
@@ -738,6 +857,12 @@ def accept_online(
     end_rows = [row for row in audit if row.get("kind") == "run_end"]
     transitions = [row.get("to") for row in audit if row.get("kind") == "transition"]
     receipts, receipt_errors = rescue.receipt_evidence(controller_dir)
+    target_receipts = [
+        common.read_json(path)
+        for path in sorted(
+            (controller_dir / "receiver_receipts").glob("*/*.json")
+        )
+    ]
     initial_stage_receipts = [
         common.read_json(path)
         for path in sorted((controller_dir / "initial_stage_receipts").glob("*.json"))
@@ -783,6 +908,23 @@ def accept_online(
         else freeze_unix_s
     )
     committed = float(takeover["updated_unix_s"])
+    rank_ready_times = [
+        float(row["target_ready_unix_s"])
+        for row in target_receipts
+        if row.get("target_ready_unix_s") is not None
+    ]
+    delta_apply_times = [
+        float(common.read_json(path)["completed_unix_s"])
+        for path in sorted(
+            (controller_dir / "gpu_delta_receipts").glob("**/*.json")
+        )
+    ]
+    commit_rows = [
+        row for row in audit if row.get("kind") == "shadow_only_commit"
+    ]
+    commit_row = commit_rows[-1] if commit_rows else {}
+    controller_wakeup = commit_row.get("controller_wakeup_unix_s")
+    commit_completed = commit_row.get("commit_completed_unix_s", committed)
     if strategy == "S_NEW":
         history_start = float(
             common.read_json(controller_dir / "history_transfer_start.json")[
@@ -921,11 +1063,25 @@ def accept_online(
                 != list(range(4))
             ):
                 errors.append("GPU-direct history sender did not complete all ranks")
-        expected_sync_scope = "BRIDGETP_RESTORE_STREAM_EVENT"
+        expected_sync_scope = (
+            "BRIDGETP_RESTORE_STREAM_EVENT"
+            if ready_sync_mode == "STREAM_EVENT"
+            else "CUDA_DEVICE_WIDE_SYNCHRONIZE"
+        )
+        expected_device_sync = ready_sync_mode == "DEVICE_WIDE"
         if receipts.get("ready_sync_scopes") != [expected_sync_scope] * 4:
-            errors.append("TP4 ranks did not use BridgeTP restore-stream events")
-        if receipts.get("device_wide_synchronize") != [False] * 4:
-            errors.append("TP4 ranks used a device-wide CUDA synchronization")
+            errors.append("TP4 ranks used the wrong target-ready synchronization")
+        if receipts.get("device_wide_synchronize") != [
+            expected_device_sync
+        ] * 4:
+            errors.append("TP4 ranks reported the wrong device synchronization")
+        if ready_sync_mode == "STREAM_EVENT":
+            if receipts.get("receive_dependency_scopes") != [
+                "NCCL_RECEIVE_EVENT_TO_RESTORE_STREAM"
+            ] * 4:
+                errors.append("TP4 ranks did not chain NCCL receive events to restore")
+            if receipts.get("model_stream_wait_event") != [True] * 4:
+                errors.append("TP4 model streams did not wait for copy-done events")
     gpu_history_completed = [
         float(row.get("completed_unix_s", float("inf")))
         for row in gpu_initial_receipts
@@ -1207,6 +1363,7 @@ def accept_online(
             "remote attention is not executed."
         ),
         "strategy": strategy,
+        "ready_sync_mode": ready_sync_mode,
         "handoff_mode": handoff_mode,
         "stop_and_copy": stop_and_copy,
         "fixed_rate_gib_s": fixed_rate_gib_s,
@@ -1311,6 +1468,41 @@ def accept_online(
         "history_transfer_started_unix_s": history_start,
         "history_transfer_phase": session.get("history_transfer_phase"),
         "handoff_stall_ms": handoff_stall_ms,
+        "freeze_to_final_delta_ack_ms": (
+            (max(delta_apply_times) - freeze_unix_s) * 1000
+            if delta_apply_times
+            else None
+        ),
+        "freeze_to_first_rank_ready_ms": (
+            (min(rank_ready_times) - freeze_unix_s) * 1000
+            if len(rank_ready_times) == 4
+            else None
+        ),
+        "freeze_to_all_rank_ready_ms": (
+            (max(rank_ready_times) - freeze_unix_s) * 1000
+            if len(rank_ready_times) == 4
+            else None
+        ),
+        "rank_ready_skew_ms": (
+            (max(rank_ready_times) - min(rank_ready_times)) * 1000
+            if len(rank_ready_times) == 4
+            else None
+        ),
+        "last_rank_ready_to_controller_wakeup_ms": (
+            (float(controller_wakeup) - max(rank_ready_times)) * 1000
+            if len(rank_ready_times) == 4 and controller_wakeup is not None
+            else None
+        ),
+        "controller_wakeup_to_commit_ms": (
+            (float(commit_completed) - float(controller_wakeup)) * 1000
+            if controller_wakeup is not None
+            else None
+        ),
+        "last_rank_ready_to_commit_ms": (
+            (float(commit_completed) - max(rank_ready_times)) * 1000
+            if len(rank_ready_times) == 4
+            else None
+        ),
         "request_frozen_unix_s": (
             int(frozen_receipt["frozen_unix_ns"]) / 1e9
             if frozen_receipt is not None
@@ -1352,6 +1544,12 @@ def accept_online(
         "target_device_wide_synchronize": receipts.get(
             "device_wide_synchronize"
         ),
+        "target_receive_dependency_scopes": receipts.get(
+            "receive_dependency_scopes"
+        ),
+        "target_model_stream_wait_event": receipts.get(
+            "model_stream_wait_event"
+        ),
         "target_tpot_windows": reported_windows,
         "errors": errors,
     }
@@ -1379,6 +1577,8 @@ def main() -> None:
         "gpu_direct_delta": args.gpu_direct_delta,
         "gpu_direct_delta_batch_tokens": args.gpu_direct_delta_batch_tokens,
         "gpu_direct_delta_flush_ms": args.gpu_direct_delta_flush_ms,
+        "ready_sync_mode": args.ready_sync_mode,
+        "ready_sync_comparison": args.ready_sync_comparison,
         "gpu_direct_base_port": args.gpu_direct_base_port,
         "online_remote_attention": args.online_remote_attention,
         "remote_attention_base_port": args.remote_attention_base_port,
@@ -1444,6 +1644,11 @@ def main() -> None:
                     ]
                 )
             )
+            if args.ready_sync_comparison:
+                variants = [
+                    ("SHADOW_ONLY_SYNC_OLD", "S_NEW_OLD", "shadow-only"),
+                    ("SHADOW_ONLY_SYNC_NEW", "S_NEW_OLD", "shadow-only"),
+                ]
             if repetition % 2 == 0:
                 variants.reverse()
             for architecture, strategy, handoff_mode in variants:
@@ -1454,6 +1659,14 @@ def main() -> None:
                 )
                 selected_stop_and_copy = architecture == "STOP_AND_COPY"
                 rep_args.online_remote_attention = selected_online_remote_attention
+                selected_ready_sync_mode = (
+                    "DEVICE_WIDE"
+                    if architecture == "SHADOW_ONLY_SYNC_OLD"
+                    else "STREAM_EVENT"
+                    if architecture == "SHADOW_ONLY_SYNC_NEW"
+                    else args.ready_sync_mode
+                )
+                rep_args.ready_sync_mode = selected_ready_sync_mode
                 rep_args.gpu_resident_shadow = bool(
                     args.gpu_resident_shadow
                     or selected_stop_and_copy
@@ -1481,6 +1694,7 @@ def main() -> None:
                     selected_handoff: str = handoff_mode,
                     selected_remote: bool = selected_online_remote_attention,
                     selected_stop: bool = selected_stop_and_copy,
+                    selected_ready_sync: str = selected_ready_sync_mode,
                 ) -> dict[str, Any]:
                     return accept_online(
                         controller_dir,
@@ -1497,6 +1711,7 @@ def main() -> None:
                         slo_e2e_ms=args.slo_e2e_ms,
                         slo_handoff_ms=args.slo_handoff_ms,
                         stop_and_copy=selected_stop,
+                        ready_sync_mode=selected_ready_sync,
                     )
 
                 source_env_overrides = {"BRIDGETP_SHADOW_STRATEGY": strategy}
@@ -1596,6 +1811,7 @@ def main() -> None:
                         "architecture": architecture,
                         "handoff_mode": handoff_mode,
                         "stop_and_copy": selected_stop_and_copy,
+                        "ready_sync_mode": selected_ready_sync_mode,
                         "status": result["status"],
                         "root": str(rep_args.out_root.resolve()),
                         "acceptance": result["acceptance"],
@@ -1616,7 +1832,9 @@ def main() -> None:
             "phase": args.phase,
             "expected_runs": args.repetitions
             * (
-                1
+                2
+                if args.ready_sync_comparison
+                else 1
                 if (
                     args.bridge_only or args.shadow_only_only or args.stop_and_copy_only
                 )

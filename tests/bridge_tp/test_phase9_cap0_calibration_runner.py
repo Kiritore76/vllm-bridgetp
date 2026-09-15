@@ -219,6 +219,17 @@ class TestSmokeContract(unittest.TestCase):
 
 
 class TestSourceSelectionContract(unittest.TestCase):
+    def test_target_connector_records_ready_sync_mode(self) -> None:
+        config = json.loads(
+            MODULE.target_connector(
+                Path("run") / "controller",
+                gpu_resident_shadow=True,
+                ready_sync_mode="STREAM_EVENT",
+            )
+        )
+        extra = config["kv_connector_extra_config"]
+        self.assertEqual(extra["bridgetp_ready_sync_mode"], "STREAM_EVENT")
+
     def test_nested_controller_directory_drives_anchor_prefix(self) -> None:
         args = SimpleNamespace(
             tp1_gpu="0",
