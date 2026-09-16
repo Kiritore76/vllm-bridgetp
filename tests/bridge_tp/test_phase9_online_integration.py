@@ -9,6 +9,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -441,6 +442,66 @@ class TestDynamicRateProvider(unittest.TestCase):
 
 
 class TestLazyActionBinding(unittest.TestCase):
+    def test_ready_latch_polls_after_all_rank_hints(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            probe.bind(("127.0.0.1", 0))
+            port = int(probe.getsockname()[1])
+            probe.close()
+            adapter = ActionAdapter(
+                "http://source",
+                Path(temporary),
+                expected_migration_id="m",
+                ready_notification_mode="UDP",
+                ready_notification_port=port,
+                ready_latch_poll_ms=2.0,
+            )
+            authoritative = threading.Event()
+
+            def poll() -> tuple[bool, set[int], str]:
+                if authoritative.is_set():
+                    return True, {0, 1, 2, 3}, "all four ranks ready"
+                return False, set(), "sender receipts pending"
+
+            adapter.poll_target_ready = poll  # type: ignore[method-assign]
+
+            def publish_hints() -> None:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+                    for rank in range(4):
+                        sender.sendto(
+                            json.dumps(
+                                {
+                                    "migration_id": "m",
+                                    "tp_rank": rank,
+                                    "sent_unix_s": time.time(),
+                                }
+                            ).encode("utf-8"),
+                            ("127.0.0.1", port),
+                        )
+
+            hint_timer = threading.Timer(0.01, publish_hints)
+            ready_timer = threading.Timer(0.05, authoritative.set)
+            hint_timer.start()
+            ready_timer.start()
+            started = time.monotonic()
+            try:
+                ready, ranks, _detail = adapter.wait_for_target_ready(0.5)
+            finally:
+                hint_timer.join()
+                ready_timer.join()
+                adapter.close()
+            elapsed = time.monotonic() - started
+
+            self.assertTrue(ready)
+            self.assertEqual(ranks, {0, 1, 2, 3})
+            self.assertLess(elapsed, 0.25)
+            evidence = adapter.ready_notification_evidence()
+            self.assertEqual(evidence["notified_ranks"], [0, 1, 2, 3])
+            self.assertGreater(evidence["ready_latch_poll_count"], 0)
+            self.assertIsNotNone(
+                evidence["ready_latch_to_authoritative_ready_ms"]
+            )
+
     def test_udp_notification_wakes_authoritative_receipt_gate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             run_dir = Path(temporary)

@@ -122,6 +122,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--ready-notification-host", default="127.0.0.1")
     parser.add_argument("--ready-notification-port", type=int, default=30500)
+    parser.add_argument("--ready-latch-poll-ms", type=float, default=5.0)
     parser.add_argument(
         "--deferred-comm-destroy",
         action="store_true",
@@ -298,6 +299,8 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         or args.ready_notification_comparison
     ) and not (0 < args.ready_notification_port <= 65535):
         raise ValueError("UDP ready notification port is invalid")
+    if args.ready_latch_poll_ms < 0:
+        raise ValueError("ready latch poll interval cannot be negative")
     if args.gpu_direct_delta_batch_tokens <= 0:
         raise ValueError("GPU-direct delta batch tokens must be positive")
     if args.gpu_direct_delta_flush_ms < 0:
@@ -594,6 +597,13 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             "ready_notification_delivery_ms": acceptance.get(
                 "ready_notification_delivery_ms"
             ),
+            "ready_latch_poll_ms": acceptance.get("ready_latch_poll_ms"),
+            "ready_latch_poll_count": acceptance.get(
+                "ready_latch_poll_count"
+            ),
+            "ready_latch_to_authoritative_ready_ms": acceptance.get(
+                "ready_latch_to_authoritative_ready_ms"
+            ),
             "request_frozen_unix_s": acceptance.get("request_frozen_unix_s"),
             "source_kv_released_unix_s": acceptance.get(
                 "source_kv_released_unix_s"
@@ -796,6 +806,9 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
         "last_rank_ready_to_commit_ms",
         "ready_notification_count",
         "ready_notification_delivery_ms",
+        "ready_latch_poll_ms",
+        "ready_latch_poll_count",
+        "ready_latch_to_authoritative_ready_ms",
         "handoff_stall_ms",
     ]
     with (out_root / "handoff_stage_breakdown.csv").open(
@@ -1820,6 +1833,13 @@ def accept_online(
         "ready_notification_delivery_ms": ready_notification.get(
             "last_notification_delivery_ms"
         ),
+        "ready_latch_poll_ms": ready_notification.get("ready_latch_poll_ms"),
+        "ready_latch_poll_count": ready_notification.get(
+            "ready_latch_poll_count"
+        ),
+        "ready_latch_to_authoritative_ready_ms": ready_notification.get(
+            "ready_latch_to_authoritative_ready_ms"
+        ),
         "target_tpot_windows": reported_windows,
         "errors": errors,
     }
@@ -1853,6 +1873,7 @@ def main() -> None:
         "ready_notification_comparison": args.ready_notification_comparison,
         "ready_notification_host": args.ready_notification_host,
         "ready_notification_port": args.ready_notification_port,
+        "ready_latch_poll_ms": args.ready_latch_poll_ms,
         "deferred_comm_destroy": args.deferred_comm_destroy,
         "deferred_comm_destroy_comparison": (
             args.deferred_comm_destroy_comparison
@@ -2115,6 +2136,8 @@ def main() -> None:
                         args.ready_notification_host,
                         "--ready-notification-port",
                         str(args.ready_notification_port),
+                        "--ready-latch-poll-ms",
+                        str(args.ready_latch_poll_ms),
                     ]
                     + (
                         ["--gpu-resident-shadow"]

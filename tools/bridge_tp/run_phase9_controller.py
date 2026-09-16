@@ -142,6 +142,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--ready-notification-host", default="127.0.0.1")
     parser.add_argument("--ready-notification-port", type=int, default=0)
+    parser.add_argument(
+        "--ready-latch-poll-ms",
+        type=float,
+        default=5.0,
+        help=(
+            "authoritative receipt polling interval after all four UDP "
+            "rank-ready hints have arrived; zero preserves timeout polling"
+        ),
+    )
     args = parser.parse_args()
     trigger = args.diagnostic_trigger_output_tokens
     cutover = args.diagnostic_cutover_output_tokens
@@ -160,6 +169,8 @@ def parse_args() -> argparse.Namespace:
         0 < args.ready_notification_port <= 65535
     ):
         parser.error("UDP ready notification port is invalid")
+    if args.ready_latch_poll_ms < 0:
+        parser.error("ready latch poll interval cannot be negative")
     return args
 
 
@@ -789,6 +800,7 @@ def main() -> None:
         ready_notification_mode=args.ready_notification_mode,
         ready_notification_host=args.ready_notification_host,
         ready_notification_port=args.ready_notification_port,
+        ready_latch_poll_ms=args.ready_latch_poll_ms,
     )
     probe = RuntimeControl(armed=False, note="phase 9 preflight").write(run_dir)
 
@@ -849,6 +861,7 @@ def main() -> None:
                 "handoff_mode": args.handoff_mode,
                 "stop_and_copy": args.stop_and_copy,
                 "ready_notification_mode": args.ready_notification_mode,
+                "ready_latch_poll_ms": args.ready_latch_poll_ms,
             },
         )
         machine = MigrationStateMachine(
