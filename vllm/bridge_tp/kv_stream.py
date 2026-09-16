@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import math
 import os
@@ -50,6 +51,28 @@ _TRUE = {"1", "true", "yes", "on"}
 _published_request_ids: set[str] = set()
 _disabled_after_error = False
 _publishers: list[_RankPublisher] = []
+_retained_gpu_senders: list[Any] = []
+_retained_gpu_senders_lock = threading.Lock()
+
+
+def _retain_gpu_sender(sender: Any) -> int:
+    with _retained_gpu_senders_lock:
+        _retained_gpu_senders.append(sender)
+        return len(_retained_gpu_senders)
+
+
+def _abort_retained_gpu_senders() -> None:
+    with _retained_gpu_senders_lock:
+        retained = list(_retained_gpu_senders)
+        _retained_gpu_senders.clear()
+    for sender in retained:
+        try:
+            sender.abort()
+        except BaseException:  # pragma: no cover - interpreter shutdown
+            logger.exception("BridgeTP pooled sender shutdown failed")
+
+
+atexit.register(_abort_retained_gpu_senders)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -105,6 +128,7 @@ class BridgeTPStreamConfig:
     # has not armed this migration yet.  Absent a control block this stays True,
     # so Phase 6/7/8 runs behave exactly as before.
     armed: bool = True
+    defer_communicator_destroy: bool = False
 
     @classmethod
     def from_env(cls) -> BridgeTPStreamConfig:
@@ -169,6 +193,9 @@ class BridgeTPStreamConfig:
             shadow_strategy=os.getenv("BRIDGETP_SHADOW_STRATEGY", "S_NEW_OLD")
             .strip()
             .upper(),
+            defer_communicator_destroy=_env_bool(
+                "BRIDGETP_DEFER_COMMUNICATOR_DESTROY", False
+            ),
         )
         if config.target_tp_size != 4:
             raise ValueError("BridgeTP Phase 6 currently requires target TP=4")
@@ -610,7 +637,16 @@ class _GpuDirectHistoryPublisher:
                     consumed = 1
                     try:
                         if work is None:
-                            sender.close()
+                            if self.config.defer_communicator_destroy:
+                                sender.close_control()
+                                receipt["communicator_lifecycle"] = (
+                                    "POOLED_UNTIL_PROCESS_SHUTDOWN"
+                                )
+                                receipt["communicator_pool_size"] = (
+                                    _retain_gpu_sender(sender)
+                                )
+                            else:
+                                sender.close()
                             break
                         work, consumed = self._take_coalesced_delta(work)
                         self.delta_coalesced_submissions += consumed - 1

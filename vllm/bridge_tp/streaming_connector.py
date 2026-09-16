@@ -1448,7 +1448,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         )
 
     def shutdown(self) -> None:
-        """Destroy pooled target communicators only as the worker exits."""
+        """Abort pooled target communicators only as the worker exits."""
         with self._retained_gpu_receivers_lock:
             retained = list(self._retained_gpu_receivers.values())
             self._retained_gpu_receivers.clear()
@@ -1456,7 +1456,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             started_unix_s = time.time()
             error: str | None = None
             try:
-                receiver.close()
+                receiver.abort()
             except BaseException as exc:  # pragma: no cover - shutdown path
                 error = f"{type(exc).__name__}: {exc}"
                 logger.exception(
@@ -1468,9 +1468,9 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 {
                     **evidence,
                     "status": (
-                        "DESTROYED_AT_CONNECTOR_SHUTDOWN"
+                        "ABORTED_AT_CONNECTOR_SHUTDOWN"
                         if error is None
-                        else "DESTROY_FAILED_AT_CONNECTOR_SHUTDOWN"
+                        else "ABORT_FAILED_AT_CONNECTOR_SHUTDOWN"
                     ),
                     "destroy_started_unix_s": started_unix_s,
                     "destroy_completed_unix_s": completed_unix_s,

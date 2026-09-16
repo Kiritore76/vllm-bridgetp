@@ -416,6 +416,8 @@ def source_environment(
                 ),
             }
         )
+    if bool(getattr(args, "deferred_comm_destroy", False)):
+        env["BRIDGETP_DEFER_COMMUNICATOR_DESTROY"] = "1"
     return env
 
 

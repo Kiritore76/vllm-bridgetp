@@ -280,6 +280,7 @@ class TestSourceSelectionContract(unittest.TestCase):
             gpu_direct_delta=True,
             gpu_direct_delta_batch_tokens=8,
             gpu_direct_delta_flush_ms=50.0,
+            deferred_comm_destroy=True,
         )
         environment = MODULE.source_environment(
             args,
@@ -294,6 +295,9 @@ class TestSourceSelectionContract(unittest.TestCase):
         )
         self.assertEqual(
             environment["BRIDGETP_GPU_DIRECT_DELTA_FLUSH_MS"], "50.0"
+        )
+        self.assertEqual(
+            environment["BRIDGETP_DEFER_COMMUNICATOR_DESTROY"], "1"
         )
 
 
