@@ -221,6 +221,11 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             0 < self.ready_notification_port <= 65535
         ):
             raise ValueError("UDP ready notification port is invalid")
+        self.defer_communicator_destroy = bool(
+            self._kv_transfer_config.get_from_extra_config(
+                "bridgetp_defer_communicator_destroy", False
+            )
+        )
         self._manifest: dict[str, Any] | None = None
         self._pending_requests: dict[str, Request] = {}
         self._active_requests: dict[str, Request] = {}
@@ -878,6 +883,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 == "NCCL_P2P_GPU_DIRECT_PERSISTENT"
             )
             direct = None
+            receiver = None
             if gpu_direct:
                 from vllm.bridge_tp.gpu_direct_history import (
                     GpuDirectHistoryReceiver,
@@ -888,6 +894,9 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     device=device,
                     host=str(record["host"]),
                     port=int(record["port"]),
+                    defer_communicator_destroy=(
+                        self.defer_communicator_destroy
+                    ),
                 )
                 direct = receiver.receive(
                     migration_id=request.migration_id,
@@ -1266,6 +1275,36 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 receive_dependency_scope=receive_dependency_scope,
                 receive_event_links=receive_event_links,
             )
+            if (
+                gpu_direct_delta
+                and receiver is not None
+                and self.defer_communicator_destroy
+            ):
+                destroy_receipt_path = (
+                    self.manifest_path.parent
+                    / "gpu_communicator_destroy_receipts"
+                    / f"tp_rank_{tp_rank}.json"
+                )
+
+                def record_destroy(
+                    evidence: dict[str, Any],
+                    *,
+                    path: Path = destroy_receipt_path,
+                    rank: int = tp_rank,
+                ) -> None:
+                    _atomic_json_dump(
+                        {
+                            "format_version": 1,
+                            "migration_id": request.migration_id,
+                            "target_request_id": request_id,
+                            "tp_rank": rank,
+                            "deferred_until_after_target_ready": True,
+                            **evidence,
+                        },
+                        path,
+                    )
+
+                receiver.destroy_async(record_destroy)
             if self.takeover_control_path is not None:
                 while True:
                     if self.takeover_control_path.is_file():
@@ -1287,6 +1326,8 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     time.sleep(0.005)
             self._completed_recvs.add(request_id)
         except _ShadowCancelled as error:
+            if receiver is not None:
+                receiver.close()
             _atomic_json_dump(
                 {
                     "format_version": 1,
@@ -1301,6 +1342,8 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             )
             self._completed_recvs.add(request_id)
         except BaseException as error:
+            if receiver is not None:
+                receiver.close()
             self._load_errors[request_id] = error
 
     def get_finished(

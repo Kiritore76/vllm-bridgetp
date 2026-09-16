@@ -12,9 +12,10 @@ from __future__ import annotations
 import base64
 import math
 import socket
+import threading
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
@@ -120,8 +121,16 @@ class ReceiveResult:
 class GpuDirectHistoryReceiver:
     """Receive one TP4 rank's historical shard directly into CUDA tensors."""
 
-    def __init__(self, *, device: torch.device, host: str, port: int) -> None:
+    def __init__(
+        self,
+        *,
+        device: torch.device,
+        host: str,
+        port: int,
+        defer_communicator_destroy: bool = False,
+    ) -> None:
         self.device = _cuda_device(device)
+        self.defer_communicator_destroy = defer_communicator_destroy
         self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.listener.bind((host, port))
@@ -131,6 +140,12 @@ class GpuDirectHistoryReceiver:
         self.connection: socket.socket | None = None
         self.comm: Any | None = None
         self.stream: torch.cuda.Stream | None = None
+        self.terminal_close_received_unix_s: float | None = None
+        self.control_closed_unix_s: float | None = None
+        self.destroy_started_unix_s: float | None = None
+        self.destroy_completed_unix_s: float | None = None
+        self.destroy_error: str | None = None
+        self._destroy_thread: threading.Thread | None = None
 
     def _open(self, *, migration_id: str, rank: int) -> None:
         if self.connection is not None:
@@ -267,8 +282,18 @@ class GpuDirectHistoryReceiver:
             raise RuntimeError("history must be received before GPU delta")
         header = recv_json(self.connection)
         if header.get("op") == "CLOSE":
+            self.terminal_close_received_unix_s = time.time()
             send_json(self.connection, {"status": "CLOSED"})
-            self.close()
+            if self.defer_communicator_destroy:
+                # TARGET_READY is a data-dependency statement, not a resource-
+                # reclamation statement.  Destroying a blocking NCCL
+                # communicator here used to put communicator finalization on
+                # the handoff critical path.  Close the control sockets now;
+                # the connector starts destruction only after publishing the
+                # authoritative TARGET_READY receipt.
+                self._close_control()
+            else:
+                self.close()
             return None
         if header.get("op") != "DELTA":
             raise ValueError(f"unexpected GPU-direct operation {header.get('op')!r}")
@@ -303,14 +328,100 @@ class GpuDirectHistoryReceiver:
              "end_token": end_token},
         )
 
-    def close(self) -> None:
-        if self.comm is not None and self.nccl is not None:
-            self.nccl.ncclCommDestroy(self.comm)
-        self.comm = None
+    def _close_control(self) -> None:
+        closed = False
         if self.connection is not None:
             self.connection.close()
+            closed = True
         self.connection = None
-        self.listener.close()
+        try:
+            if self.listener.fileno() >= 0:
+                self.listener.close()
+                closed = True
+        except OSError:
+            pass
+        if closed:
+            self.control_closed_unix_s = time.time()
+
+    def destroy_async(
+        self,
+        on_update: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        """Destroy a quiesced communicator outside the ready critical path."""
+        if self._destroy_thread is not None:
+            return
+        nccl = self.nccl
+        comm = self.comm
+        if nccl is None or comm is None:
+            return
+        self.nccl = None
+        self.comm = None
+        # Keep the Python stream alive until destroy has returned.  It owns no
+        # new work after CLOSE, but retaining it avoids premature wrapper
+        # reclamation while NCCL finalizes the communicator.
+        stream = self.stream
+        self.stream = None
+
+        def publish(status: str) -> None:
+            if on_update is None:
+                return
+            try:
+                on_update(
+                    {
+                        "status": status,
+                        "terminal_close_received_unix_s": (
+                            self.terminal_close_received_unix_s
+                        ),
+                        "control_closed_unix_s": self.control_closed_unix_s,
+                        "destroy_started_unix_s": self.destroy_started_unix_s,
+                        "destroy_completed_unix_s": (
+                            self.destroy_completed_unix_s
+                        ),
+                        "destroy_ms": (
+                            (
+                                self.destroy_completed_unix_s
+                                - self.destroy_started_unix_s
+                            )
+                            * 1000
+                            if self.destroy_started_unix_s is not None
+                            and self.destroy_completed_unix_s is not None
+                            else None
+                        ),
+                        "error": self.destroy_error,
+                    }
+                )
+            except Exception:
+                # Cleanup must not be skipped because optional diagnostic
+                # evidence could not be persisted during server shutdown.
+                pass
+
+        def destroy(held_stream: torch.cuda.Stream | None = stream) -> None:
+            self.destroy_started_unix_s = time.time()
+            publish("DESTROYING")
+            try:
+                nccl.ncclCommDestroy(comm)
+            except BaseException as error:
+                self.destroy_error = f"{type(error).__name__}: {error}"
+            finally:
+                self.destroy_completed_unix_s = time.time()
+                publish("ERROR" if self.destroy_error else "DESTROYED")
+                del held_stream
+
+        self._destroy_thread = threading.Thread(
+            target=destroy,
+            name="bridgetp-nccl-destroy",
+            daemon=True,
+        )
+        self._destroy_thread.start()
+
+    def close(self) -> None:
+        if self._destroy_thread is None and self.comm is not None:
+            assert self.nccl is not None
+            self.nccl.ncclCommDestroy(self.comm)
+            self.comm = None
+            self.nccl = None
+        self.stream = None
+        self._close_control()
 
 
 class GpuDirectHistorySender:

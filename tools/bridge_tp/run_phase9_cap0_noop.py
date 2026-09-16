@@ -510,6 +510,9 @@ def run(
                     ready_notification_port=int(
                         getattr(args, "ready_notification_port", 0)
                     ),
+                    defer_communicator_destroy=bool(
+                        getattr(args, "deferred_comm_destroy", False)
+                    ),
                 ),
             ],
             target_env,
