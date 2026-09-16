@@ -123,6 +123,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ready-notification-host", default="127.0.0.1")
     parser.add_argument("--ready-notification-port", type=int, default=30500)
     parser.add_argument(
+        "--deferred-comm-destroy",
+        action="store_true",
+        help=(
+            "publish TP4 TARGET_READY before asynchronously destroying the "
+            "quiesced GPU-direct NCCL communicator"
+        ),
+    )
+    parser.add_argument(
         "--stop-and-copy-only",
         action="store_true",
         help=(
@@ -220,6 +228,10 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise ValueError("GPU-direct delta requires --gpu-direct-history")
     if args.gpu_direct_delta and not args.shadow_only_only:
         raise ValueError("GPU-direct delta batch sweep currently requires Shadow-only")
+    if args.deferred_comm_destroy and not args.gpu_direct_delta:
+        raise ValueError(
+            "deferred communicator destroy requires persistent GPU-direct delta"
+        )
     if args.ready_sync_mode == "STREAM_EVENT" and not (
         args.gpu_resident_shadow and args.gpu_direct_history
     ):
@@ -500,6 +512,11 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             for value in (acceptance.get("target_ready_event_wait_ms") or [])
             if value is not None
         ]
+        communicator_destroy_ms = [
+            float(value)
+            for value in (acceptance.get("communicator_destroy_ms") or [])
+            if value is not None
+        ]
         lifetime_path = Path(run.get("root", "")) / "process_lifetimes.json"
         lifetimes = (
             common.read_json(lifetime_path).get("processes", [])
@@ -571,6 +588,20 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             ),
             "gpu_resident_shadow": acceptance.get("gpu_resident_shadow"),
             "gpu_direct_delta": acceptance.get("gpu_direct_delta"),
+            "deferred_comm_destroy": acceptance.get(
+                "deferred_comm_destroy"
+            ),
+            "communicator_destroy_ms_max": (
+                max(communicator_destroy_ms)
+                if communicator_destroy_ms
+                else None
+            ),
+            "communicator_destroy_statuses": "|".join(
+                str(value)
+                for value in (
+                    acceptance.get("communicator_destroy_statuses") or []
+                )
+            ),
             "gpu_direct_delta_batch_tokens": acceptance.get(
                 "gpu_direct_delta_batch_tokens"
             ),
@@ -909,6 +940,7 @@ def accept_online(
     stop_and_copy: bool = False,
     ready_sync_mode: str = "DEVICE_WIDE",
     ready_notification_mode: str = "FILE_POLL",
+    deferred_comm_destroy: bool = False,
 ) -> dict[str, Any]:
     background = common.read_json(background_dir / "background_summary.json")
     session = common.read_json(controller_dir / "session_manifest.json")
@@ -936,6 +968,14 @@ def accept_online(
         common.read_json(path)
         for path in sorted(
             (controller_dir / "receiver_receipts").glob("*/*.json")
+        )
+    ]
+    communicator_destroy_receipts = [
+        common.read_json(path)
+        for path in sorted(
+            (controller_dir / "gpu_communicator_destroy_receipts").glob(
+                "tp_rank_*.json"
+            )
         )
     ]
     initial_stage_receipts = [
@@ -1158,6 +1198,40 @@ def accept_online(
                 errors.append("TP4 ranks did not chain NCCL receive events to restore")
             if receipts.get("model_stream_wait_event") != [True] * 4:
                 errors.append("TP4 model streams did not wait for copy-done events")
+        if deferred_comm_destroy:
+            ready_by_rank = {
+                int(row.get("tp_rank", -1)): float(row["target_ready_unix_s"])
+                for row in target_receipts
+                if row.get("target_ready_unix_s") is not None
+            }
+            destroy_by_rank = {
+                int(row.get("tp_rank", -1)): row
+                for row in communicator_destroy_receipts
+            }
+            if sorted(destroy_by_rank) != list(range(4)):
+                errors.append(
+                    "deferred communicator destroy receipts are incomplete"
+                )
+            else:
+                for rank, destroy in sorted(destroy_by_rank.items()):
+                    if destroy.get("status") != "DESTROYED":
+                        errors.append(
+                            f"TP4 rank {rank} communicator was not destroyed"
+                        )
+                    if destroy.get("deferred_until_after_target_ready") is not True:
+                        errors.append(
+                            f"TP4 rank {rank} communicator teardown was not deferred"
+                        )
+                    started_unix_s = destroy.get("destroy_started_unix_s")
+                    if (
+                        started_unix_s is None
+                        or rank not in ready_by_rank
+                        or float(started_unix_s) < ready_by_rank[rank]
+                    ):
+                        errors.append(
+                            f"TP4 rank {rank} communicator teardown started "
+                            "before TARGET_READY"
+                        )
     gpu_history_completed = [
         float(row.get("completed_unix_s", float("inf")))
         for row in gpu_initial_receipts
@@ -1470,6 +1544,35 @@ def accept_online(
         "gpu_resident_shadow": gpu_resident_shadow,
         "gpu_direct_history": gpu_direct_history,
         "gpu_direct_delta": gpu_direct_delta,
+        "deferred_comm_destroy": deferred_comm_destroy,
+        "communicator_destroy_statuses": [
+            row.get("status") for row in communicator_destroy_receipts
+        ],
+        "communicator_destroy_ms": [
+            row.get("destroy_ms") for row in communicator_destroy_receipts
+        ],
+        "communicator_destroy_started_after_target_ready_ms": [
+            (
+                float(row["destroy_started_unix_s"])
+                - float(
+                    next(
+                        receipt["target_ready_unix_s"]
+                        for receipt in target_receipts
+                        if int(receipt.get("tp_rank", -1))
+                        == int(row.get("tp_rank", -2))
+                    )
+                )
+            )
+            * 1000
+            for row in communicator_destroy_receipts
+            if row.get("destroy_started_unix_s") is not None
+            and any(
+                int(receipt.get("tp_rank", -1))
+                == int(row.get("tp_rank", -2))
+                and receipt.get("target_ready_unix_s") is not None
+                for receipt in target_receipts
+            )
+        ],
         "gpu_direct_delta_batch_tokens": session.get(
             "gpu_direct_delta_batch_tokens"
         ),
@@ -1682,6 +1785,7 @@ def main() -> None:
         "ready_notification_comparison": args.ready_notification_comparison,
         "ready_notification_host": args.ready_notification_host,
         "ready_notification_port": args.ready_notification_port,
+        "deferred_comm_destroy": args.deferred_comm_destroy,
         "gpu_direct_base_port": args.gpu_direct_base_port,
         "online_remote_attention": args.online_remote_attention,
         "remote_attention_base_port": args.remote_attention_base_port,
@@ -1816,6 +1920,9 @@ def main() -> None:
                     selected_ready_notification: str = (
                         selected_ready_notification_mode
                     ),
+                    selected_deferred_destroy: bool = (
+                        args.deferred_comm_destroy
+                    ),
                 ) -> dict[str, Any]:
                     return accept_online(
                         controller_dir,
@@ -1836,6 +1943,7 @@ def main() -> None:
                         ready_notification_mode=(
                             selected_ready_notification
                         ),
+                        deferred_comm_destroy=selected_deferred_destroy,
                     )
 
                 source_env_overrides = {"BRIDGETP_SHADOW_STRATEGY": strategy}
