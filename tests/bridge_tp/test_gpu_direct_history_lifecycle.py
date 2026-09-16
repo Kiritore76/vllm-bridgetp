@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import queue
 import threading
 import unittest
 from unittest.mock import Mock, patch
@@ -10,6 +11,66 @@ from unittest.mock import Mock, patch
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "requires torch")
 class TestGpuDirectHistoryLifecycle(unittest.TestCase):
+    def test_delta_backlog_coalesces_to_latest_contiguous_watermark(self) -> None:
+        from vllm.bridge_tp.kv_stream import _GpuDirectHistoryPublisher
+
+        publisher = object.__new__(_GpuDirectHistoryPublisher)
+        publisher.delta_queue = queue.Queue()
+        first = {
+            "block_ids": [10],
+            "start_token": 64,
+            "end_token": 80,
+            "ready_event": "event-80",
+        }
+        publisher.delta_queue.put(
+            {
+                "block_ids": [10, 11],
+                "start_token": 80,
+                "end_token": 96,
+                "ready_event": "event-96",
+            }
+        )
+        publisher.delta_queue.put(
+            {
+                "block_ids": [10, 11],
+                "start_token": 96,
+                "end_token": 112,
+                "ready_event": "event-112",
+            }
+        )
+
+        merged, consumed = publisher._take_coalesced_delta(first)
+
+        self.assertEqual(consumed, 3)
+        self.assertEqual(merged["start_token"], 64)
+        self.assertEqual(merged["end_token"], 112)
+        self.assertEqual(merged["block_ids"], [10, 11])
+        self.assertEqual(merged["ready_event"], "event-112")
+        self.assertTrue(publisher.delta_queue.empty())
+
+    def test_delta_backlog_rejects_a_watermark_gap(self) -> None:
+        from vllm.bridge_tp.kv_stream import _GpuDirectHistoryPublisher
+
+        publisher = object.__new__(_GpuDirectHistoryPublisher)
+        publisher.delta_queue = queue.Queue()
+        publisher.delta_queue.put(
+            {
+                "block_ids": [10],
+                "start_token": 96,
+                "end_token": 112,
+                "ready_event": "event-112",
+            }
+        )
+        first = {
+            "block_ids": [10],
+            "start_token": 64,
+            "end_token": 80,
+            "ready_event": "event-80",
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "not contiguous"):
+            publisher._take_coalesced_delta(first)
+
     def test_terminal_close_defers_communicator_destroy(self) -> None:
         from vllm.bridge_tp.gpu_direct_history import GpuDirectHistoryReceiver
 

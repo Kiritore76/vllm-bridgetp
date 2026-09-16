@@ -671,6 +671,12 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             "gpu_direct_delta_batches": acceptance.get(
                 "gpu_direct_delta_batches"
             ),
+            "gpu_direct_delta_logical_submissions": acceptance.get(
+                "gpu_direct_delta_logical_submissions"
+            ),
+            "gpu_direct_delta_coalesced_submissions": acceptance.get(
+                "gpu_direct_delta_coalesced_submissions"
+            ),
             "gpu_direct_delta_tokens": acceptance.get(
                 "gpu_direct_delta_tokens"
             ),
@@ -770,6 +776,13 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             ),
             "freeze_boundary_stall_ms": acceptance.get(
                 "freeze_boundary_stall_ms"
+            ),
+            "final_delta_enqueue_ms": acceptance.get(
+                "final_delta_enqueue_ms"
+            ),
+            "final_delta_drain_ms": acceptance.get("final_delta_drain_ms"),
+            "cutover_hook_to_delta_drain_ms": acceptance.get(
+                "cutover_hook_to_delta_drain_ms"
             ),
             "output_throughput_tokens_s": acceptance.get("workload", {}).get(
                 "output_throughput_tokens_s"
@@ -1677,6 +1690,12 @@ def accept_online(
         ),
         "gpu_direct_delta_flush_ms": session.get("gpu_direct_delta_flush_ms"),
         "gpu_direct_delta_batches": direct_sender.get("delta_batches"),
+        "gpu_direct_delta_logical_submissions": direct_sender.get(
+            "delta_logical_submissions"
+        ),
+        "gpu_direct_delta_coalesced_submissions": direct_sender.get(
+            "delta_coalesced_submissions"
+        ),
         "gpu_direct_delta_tokens": direct_sender.get("delta_tokens"),
         "gpu_direct_delta_payload_bytes": direct_sender.get(
             "delta_payload_bytes"
@@ -1812,6 +1831,26 @@ def accept_online(
         "source_tpot": source_tpot,
         "snapshot_trigger_stall_ms": snapshot_trigger_stall_ms,
         "freeze_boundary_stall_ms": freeze_boundary_stall_ms,
+        "cutover_hook_enter_unix_s": (
+            int(cutover["cutover_hook_enter_unix_ns"]) / 1e9
+            if cutover.get("cutover_hook_enter_unix_ns") is not None
+            else None
+        ),
+        "final_delta_enqueued_unix_s": (
+            int(cutover["final_delta_enqueued_unix_ns"]) / 1e9
+            if cutover.get("final_delta_enqueued_unix_ns") is not None
+            else None
+        ),
+        "delta_drain_completed_unix_s": (
+            int(cutover["delta_drain_completed_unix_ns"]) / 1e9
+            if cutover.get("delta_drain_completed_unix_ns") is not None
+            else None
+        ),
+        "final_delta_enqueue_ms": cutover.get("final_delta_enqueue_ms"),
+        "final_delta_drain_ms": cutover.get("final_delta_drain_ms"),
+        "cutover_hook_to_delta_drain_ms": cutover.get(
+            "cutover_hook_to_delta_drain_ms"
+        ),
         "workload": {
             "wall_time_s": workload_seconds,
             "output_tokens": workload_tokens,

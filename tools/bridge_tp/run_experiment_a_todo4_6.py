@@ -401,6 +401,11 @@ def extract_row(cell: Cell, root: Path) -> dict[str, Any]:
                 result.get("output_tokens") if cell.mode == "ALWAYS_TP4" else 0
             ),
             "source_kv_release_after_commit_ms": None,
+            "gpu_direct_delta_batches": None,
+            "gpu_direct_delta_logical_submissions": None,
+            "gpu_direct_delta_coalesced_submissions": None,
+            "final_delta_drain_ms": None,
+            "cutover_hook_to_delta_drain_ms": None,
             "mechanism_valid": result["status"] == "PASS",
             "measurement_valid": result["status"] == "PASS",
             "slo_success": None,
@@ -431,6 +436,17 @@ def extract_row(cell: Cell, root: Path) -> dict[str, Any]:
             "target_origin_tokens": run.get("target_origin_tokens"),
             "source_kv_release_after_commit_ms": run.get(
                 "source_kv_release_after_commit_ms"
+            ),
+            "gpu_direct_delta_batches": run.get("gpu_direct_delta_batches"),
+            "gpu_direct_delta_logical_submissions": run.get(
+                "gpu_direct_delta_logical_submissions"
+            ),
+            "gpu_direct_delta_coalesced_submissions": run.get(
+                "gpu_direct_delta_coalesced_submissions"
+            ),
+            "final_delta_drain_ms": run.get("final_delta_drain_ms"),
+            "cutover_hook_to_delta_drain_ms": run.get(
+                "cutover_hook_to_delta_drain_ms"
             ),
             "mechanism_valid": run["status"] == "PASS" and not run.get("errors"),
             "measurement_valid": run.get("anchor_e2e_ms") is not None,
