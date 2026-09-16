@@ -406,6 +406,9 @@ def extract_row(cell: Cell, root: Path) -> dict[str, Any]:
             "gpu_direct_delta_coalesced_submissions": None,
             "final_delta_drain_ms": None,
             "cutover_hook_to_delta_drain_ms": None,
+            "gpu_direct_delta_pack_ms": None,
+            "gpu_direct_delta_nccl_send_ms": None,
+            "gpu_direct_delta_target_apply_ack_ms": None,
             "mechanism_valid": result["status"] == "PASS",
             "measurement_valid": result["status"] == "PASS",
             "slo_success": None,
@@ -447,6 +450,15 @@ def extract_row(cell: Cell, root: Path) -> dict[str, Any]:
             "final_delta_drain_ms": run.get("final_delta_drain_ms"),
             "cutover_hook_to_delta_drain_ms": run.get(
                 "cutover_hook_to_delta_drain_ms"
+            ),
+            "gpu_direct_delta_pack_ms": run.get(
+                "gpu_direct_delta_pack_ms"
+            ),
+            "gpu_direct_delta_nccl_send_ms": run.get(
+                "gpu_direct_delta_nccl_send_ms"
+            ),
+            "gpu_direct_delta_target_apply_ack_ms": run.get(
+                "gpu_direct_delta_target_apply_ack_ms"
             ),
             "mechanism_valid": run["status"] == "PASS" and not run.get("errors"),
             "measurement_valid": run.get("anchor_e2e_ms") is not None,

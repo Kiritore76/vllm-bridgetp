@@ -279,24 +279,51 @@ def inject_rank_delta(
             raise ValueError(f"Layer {layer_name} delta token count differs")
 
         token_axis = token_axes[0]
+        remaining_axes = [
+            axis for axis in range(destination.ndim)
+            if axis not in (normalized_block_axis, token_axis)
+        ]
+        block_major = destination.permute(
+            normalized_block_axis, token_axis, *remaining_axes
+        )
         source = source_tensor.to(device=destination.device)
-        destination_slices: list[torch.Tensor] = []
-        for offset, token_index in enumerate(range(start_token, end_token)):
-            destination_index: list[int | slice] = [slice(None)] * destination.ndim
-            destination_index[normalized_block_axis] = target_block_ids[
-                token_index // block_size
+        if tuple(source.shape[1:]) != tuple(block_major.shape[2:]):
+            raise ValueError(f"Layer {layer_name} delta payload shape differs")
+
+        # Copy one contiguous slice per touched logical block.  The previous
+        # implementation launched one copy and retained one Python tensor view
+        # per token, which made a 64-token delta execute thousands of tiny CUDA
+        # operations across all layers.  At most the two edge blocks are
+        # partial; every interior block is copied as one block-sized slice.
+        layer_mismatches: torch.Tensor | None = None
+        first_block = start_token // block_size
+        final_block = (end_token - 1) // block_size
+        for logical_block in range(first_block, final_block + 1):
+            interval_start = max(start_token, logical_block * block_size)
+            interval_end = min(end_token, (logical_block + 1) * block_size)
+            token_count = interval_end - interval_start
+            source_offset = interval_start - start_token
+            block_offset = interval_start % block_size
+            destination_slice = block_major[
+                target_block_ids[logical_block],
+                block_offset:block_offset + token_count,
             ]
-            destination_index[token_axis] = token_index % block_size
-            destination_slice = destination[tuple(destination_index)]
-            if destination_slice.shape != source[offset].shape:
+            source_slice = source.narrow(0, source_offset, token_count)
+            if destination_slice.shape != source_slice.shape:
                 raise ValueError(
-                    f"Layer {layer_name} delta shape differs at token {token_index}"
+                    f"Layer {layer_name} delta shape differs for logical "
+                    f"block {logical_block}"
                 )
-            destination_slice.copy_(source[offset])
-            destination_slices.append(destination_slice)
-        restored = torch.stack(destination_slices, dim=0)
-        expected = source
-        layer_mismatches = torch.count_nonzero(restored != expected)
+            destination_slice.copy_(source_slice)
+            segment_mismatches = torch.count_nonzero(
+                destination_slice != source_slice
+            )
+            layer_mismatches = (
+                segment_mismatches
+                if layer_mismatches is None
+                else layer_mismatches + segment_mismatches
+            )
+        assert layer_mismatches is not None
         mismatch_count = (
             layer_mismatches
             if mismatch_count is None

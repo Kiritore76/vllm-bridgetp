@@ -686,6 +686,18 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             "gpu_direct_delta_total_ms": acceptance.get(
                 "gpu_direct_delta_total_ms"
             ),
+            "gpu_direct_delta_pack_ms": acceptance.get(
+                "gpu_direct_delta_pack_ms"
+            ),
+            "gpu_direct_delta_receiver_ready_ms": acceptance.get(
+                "gpu_direct_delta_receiver_ready_ms"
+            ),
+            "gpu_direct_delta_nccl_send_ms": acceptance.get(
+                "gpu_direct_delta_nccl_send_ms"
+            ),
+            "gpu_direct_delta_target_apply_ack_ms": acceptance.get(
+                "gpu_direct_delta_target_apply_ack_ms"
+            ),
             "gpu_direct_delta_max_batch_ms": acceptance.get(
                 "gpu_direct_delta_max_batch_ms"
             ),
@@ -1702,6 +1714,22 @@ def accept_online(
         ),
         "gpu_direct_delta_total_ms": sum(
             float(row.get("transfer_ms", 0.0))
+            for row in direct_sender.get("delta_records", [])
+        ),
+        "gpu_direct_delta_pack_ms": sum(
+            float(row.get("pack_ms", 0.0))
+            for row in direct_sender.get("delta_records", [])
+        ),
+        "gpu_direct_delta_receiver_ready_ms": sum(
+            float(row.get("receiver_ready_ms", 0.0))
+            for row in direct_sender.get("delta_records", [])
+        ),
+        "gpu_direct_delta_nccl_send_ms": sum(
+            float(row.get("nccl_send_ms", 0.0))
+            for row in direct_sender.get("delta_records", [])
+        ),
+        "gpu_direct_delta_target_apply_ack_ms": sum(
+            float(row.get("target_apply_ack_ms", 0.0))
             for row in direct_sender.get("delta_records", [])
         ),
         "gpu_direct_delta_max_batch_ms": max(

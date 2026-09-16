@@ -434,6 +434,7 @@ class GpuDirectHistorySender:
         self.connections: list[socket.socket] = []
         self.comms: list[Any] = []
         self.streams: list[torch.cuda.Stream] = []
+        self.producer_stream: torch.cuda.Stream | None = None
         self.target_tp_size = 0
 
     def send(
@@ -571,6 +572,7 @@ class GpuDirectHistorySender:
                 self.nccl = nccl
                 self.connections = connections
                 self.comms = comms
+                self.producer_stream = producer_stream
                 self.target_tp_size = target_tp_size
             return result
         finally:
@@ -600,36 +602,61 @@ class GpuDirectHistorySender:
         if not start_token < end_token:
             raise ValueError("GPU-direct delta range is empty")
         started = time.perf_counter()
+        pack_started = time.perf_counter()
         rank_layers: list[list[torch.Tensor]] = [
             [] for _ in range(self.target_tp_size)
         ]
         shapes_by_rank: list[list[list[int]]] = [
             [] for _ in range(self.target_tp_size)
         ]
-        with torch.cuda.device(self.device):
-            producer = torch.cuda.Stream(device=self.device)
+        producer = self.producer_stream
+        if producer is None:
+            with torch.cuda.device(self.device):
+                producer = torch.cuda.Stream(device=self.device)
         with torch.cuda.stream(producer):
             for cache in kv_caches:
+                normalized_block_axis = (
+                    block_axis if block_axis >= 0 else cache.ndim + block_axis
+                )
+                normalized_head_axis = (
+                    head_axis if head_axis >= 0 else cache.ndim + head_axis
+                )
                 token_axes = [
                     axis for axis, size in enumerate(cache.shape)
-                    if axis != block_axis and int(size) == block_size
+                    if axis != normalized_block_axis and int(size) == block_size
                 ]
                 if len(token_axes) != 1:
                     raise ValueError("GPU-direct delta token axis is ambiguous")
                 token_axis = token_axes[0]
-                token_slices = []
-                for token_index in range(start_token, end_token):
-                    logical_block = token_index // block_size
-                    token_offset = token_index % block_size
-                    index: list[int | slice] = [slice(None)] * cache.ndim
-                    index[block_axis] = block_ids[logical_block]
-                    index[token_axis] = token_offset
-                    token_slices.append(cache[tuple(index)].detach())
-                delta = torch.stack(token_slices, dim=0)
-                delta_head_axis = head_axis + 1
-                for removed_axis in sorted((block_axis, token_axis)):
-                    if removed_axis < head_axis:
-                        delta_head_axis -= 1
+                first_block = start_token // block_size
+                final_block = (end_token - 1) // block_size
+                physical_blocks = torch.tensor(
+                    block_ids[first_block:final_block + 1],
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                selected = cache.index_select(
+                    normalized_block_axis, physical_blocks
+                )
+                remaining_axes = [
+                    axis for axis in range(cache.ndim)
+                    if axis not in (normalized_block_axis, token_axis)
+                ]
+                block_major = selected.permute(
+                    normalized_block_axis, token_axis, *remaining_axes
+                )
+                flattened = block_major.reshape(
+                    block_major.shape[0] * block_size,
+                    *(cache.shape[axis] for axis in remaining_axes),
+                )
+                delta = flattened.narrow(
+                    0,
+                    start_token % block_size,
+                    end_token - start_token,
+                )
+                delta_head_axis = 1 + remaining_axes.index(
+                    normalized_head_axis
+                )
                 if int(delta.shape[delta_head_axis]) != expected_kv_heads:
                     raise ValueError("GPU-direct delta KV-head count differs")
                 shards = delta.chunk(self.target_tp_size, dim=delta_head_axis)
@@ -642,6 +669,8 @@ class GpuDirectHistorySender:
                 for layers in rank_layers
             ]
         producer.synchronize()
+        pack_ms = (time.perf_counter() - pack_started) * 1000
+        receiver_ready_started = time.perf_counter()
         for rank, connection in enumerate(self.connections):
             send_json(
                 connection,
@@ -655,6 +684,7 @@ class GpuDirectHistorySender:
                     ),
                     "start_token": start_token,
                     "end_token": end_token,
+                    "layout": "BLOCK_MAJOR_TOKEN_CONTIGUOUS_V1",
                     "layer_names": layer_names,
                     "shapes": shapes_by_rank[rank],
                     "dtype": str(packed_by_rank[rank].dtype),
@@ -668,7 +698,13 @@ class GpuDirectHistorySender:
                 or int(ready.get("numel", -1)) != packed_by_rank[rank].numel()
             ):
                 raise RuntimeError(f"GPU-direct rank {rank} rejected delta")
+        receiver_ready_ms = (
+            time.perf_counter() - receiver_ready_started
+        ) * 1000
+        nccl_started = time.perf_counter()
         _send_group(self.nccl, self.comms, packed_by_rank, self.streams)
+        nccl_send_ms = (time.perf_counter() - nccl_started) * 1000
+        apply_ack_started = time.perf_counter()
         for rank, connection in enumerate(self.connections):
             applied = recv_json(connection)
             if (
@@ -677,6 +713,9 @@ class GpuDirectHistorySender:
                 or int(applied.get("end_token", -1)) != end_token
             ):
                 raise RuntimeError(f"GPU-direct rank {rank} did not apply delta")
+        target_apply_ack_ms = (
+            time.perf_counter() - apply_ack_started
+        ) * 1000
         elapsed_ms = (time.perf_counter() - started) * 1000
         total_bytes = sum(
             value.numel() * value.element_size() for value in packed_by_rank
@@ -687,6 +726,11 @@ class GpuDirectHistorySender:
             "tokens": end_token - start_token,
             "payload_bytes": total_bytes,
             "transfer_ms": elapsed_ms,
+            "pack_ms": pack_ms,
+            "receiver_ready_ms": receiver_ready_ms,
+            "nccl_send_ms": nccl_send_ms,
+            "target_apply_ack_ms": target_apply_ack_ms,
+            "layout": "BLOCK_MAJOR_TOKEN_CONTIGUOUS_V1",
             "observed_aggregate_gib_s": (
                 total_bytes / 1024**3 / (elapsed_ms / 1000)
                 if elapsed_ms > 0 else None
@@ -707,6 +751,7 @@ class GpuDirectHistorySender:
         if self.nccl is not None:
             for comm in self.comms:
                 self.nccl.ncclCommDestroy(comm)
+        self.producer_stream = None
         for connection in self.connections:
             connection.close()
         self.connections = []
