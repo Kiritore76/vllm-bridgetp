@@ -78,6 +78,14 @@ class BridgeTPStreamRequest:
 @dataclass
 class BridgeTPStreamMetadata(KVConnectorMetadata):
     requests: list[BridgeTPStreamRequest] = field(default_factory=list)
+    # A GPU-resident Shadow request is first scheduled only to launch its
+    # asynchronous receive and is then scheduler-blocked until takeover.  The
+    # first post-takeover model step therefore needs fresh metadata so the
+    # model stream can wait on the copy-done event created by the background
+    # receive thread.  Keep this separate from ``requests``: replaying the
+    # latter would incorrectly restart the load and could make unrelated TP4
+    # work wait for the migration.
+    model_wait_request_ids: list[str] = field(default_factory=list)
 
 
 def _safe_name(value: str) -> str:
@@ -202,6 +210,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         self._load_errors: dict[str, BaseException] = {}
         self._copy_done_events: dict[str, torch.cuda.Event] = {}
         self._model_wait_streams: set[tuple[str, int]] = set()
+        self._model_wait_pending_requests: set[str] = set()
         self._claimed_target_request_id: str | None = None
         logger.warning(
             "BridgeTP Phase 6 streaming connector enabled; target waits for %s",
@@ -386,6 +395,21 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         metadata = BridgeTPStreamMetadata()
+        scheduled_request_ids = {
+            request.req_id for request in scheduler_output.scheduled_new_reqs
+        }
+        scheduled_cached_reqs = getattr(
+            scheduler_output, "scheduled_cached_reqs", None
+        )
+        if scheduled_cached_reqs is not None:
+            scheduled_request_ids.update(scheduled_cached_reqs.req_ids)
+        model_wait_pending = getattr(
+            self, "_model_wait_pending_requests", set()
+        )
+        metadata.model_wait_request_ids = sorted(
+            model_wait_pending & scheduled_request_ids
+        )
+        model_wait_pending.difference_update(metadata.model_wait_request_ids)
         if not self._pending_requests:
             return metadata
         manifest = self._load_manifest()
@@ -674,43 +698,51 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         del layer_name
         if self.ready_sync_mode != _READY_SYNC_STREAM_EVENT:
             return
-        request_id = self._claimed_target_request_id
-        if request_id is None:
-            return
-        with self._gpu_kv_lock:
-            copy_done = self._copy_done_events.get(request_id)
-        if copy_done is None:
-            # The connector may start a disjoint asynchronous load while an
-            # unrelated target request is already executing.  That request
-            # must not wait for an event that has not been armed yet.  The
-            # migrated request remains scheduler-blocked until TARGET_READY.
+        metadata = self._get_connector_metadata()
+        if not isinstance(metadata, BridgeTPStreamMetadata):
+            raise TypeError("Unexpected BridgeTP Phase 6 connector metadata")
+        if not metadata.model_wait_request_ids:
             return
         stream = torch.cuda.current_stream()
-        key = (request_id, int(stream.cuda_stream))
-        with self._gpu_kv_lock:
-            if key in self._model_wait_streams:
-                return
-            stream.wait_event(copy_done)
-            self._model_wait_streams.add(key)
-        tp_rank = get_tp_group().rank_in_group
-        receipt_path = (
-            self.receipt_dir / _safe_name(request_id) / f"tp_rank_{tp_rank}.json"
-        )
-        if receipt_path.is_file():
+        for request_id in metadata.model_wait_request_ids:
+            with self._gpu_kv_lock:
+                copy_done = self._copy_done_events.get(request_id)
+            if copy_done is None:
+                raise RuntimeError(
+                    "BridgeTP model step was released before its copy-done "
+                    f"event was armed: {request_id}"
+                )
+            key = (request_id, int(stream.cuda_stream))
+            with self._gpu_kv_lock:
+                if key in self._model_wait_streams:
+                    continue
+                stream.wait_event(copy_done)
+                self._model_wait_streams.add(key)
+            tp_rank = get_tp_group().rank_in_group
+            receipt_path = (
+                self.receipt_dir
+                / _safe_name(request_id)
+                / f"tp_rank_{tp_rank}.json"
+            )
+            if not receipt_path.is_file():
+                raise FileNotFoundError(
+                    "BridgeTP target receipt is missing before model-stream "
+                    f"wait: {receipt_path}"
+                )
             receipt = _load_json(receipt_path)
             receipt["model_stream_wait_event"] = True
             receipt["model_stream_cuda_stream"] = int(stream.cuda_stream)
             _atomic_json_dump(receipt, receipt_path)
-        from vllm.bridge_tp.experiment_timeline import emit_event
+            from vllm.bridge_tp.experiment_timeline import emit_event
 
-        emit_event(
-            self.manifest_path.parent,
-            "target_connector",
-            "MODEL_STREAM_WAIT_ARMED",
-            request_id=request_id,
-            tp_rank=tp_rank,
-            cuda_stream=int(stream.cuda_stream),
-        )
+            emit_event(
+                self.manifest_path.parent,
+                "target_connector",
+                "MODEL_STREAM_WAIT_ARMED",
+                request_id=request_id,
+                tp_rank=tp_rank,
+                cuda_stream=int(stream.cuda_stream),
+            )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """Retain paged-KV tensors for asynchronous Shadow injection."""
@@ -1071,7 +1103,6 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     copy_done.record(restore_stream)
                     with self._gpu_kv_lock:
                         self._copy_done_events[request_id] = copy_done
-                    copy_done.synchronize()
                 ready_sync_scope = "BRIDGETP_RESTORE_STREAM_EVENT"
                 device_wide_synchronize = False
             elif device.type == "cuda":
@@ -1242,6 +1273,8 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             request.num_prompt_tokens = len(token_ids)
             request.block_hashes.clear()
             request.update_block_hashes()
+            if self.ready_sync_mode == _READY_SYNC_STREAM_EVENT:
+                self._model_wait_pending_requests.add(request_id)
 
     def save_kv_layer(
         self,
