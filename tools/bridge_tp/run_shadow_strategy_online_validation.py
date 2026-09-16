@@ -131,6 +131,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--deferred-comm-destroy-comparison",
+        action="store_true",
+        help=(
+            "interleave synchronous and post-TARGET_READY communicator "
+            "destruction within every repetition"
+        ),
+    )
+    parser.add_argument(
         "--stop-and-copy-only",
         action="store_true",
         help=(
@@ -232,6 +240,22 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise ValueError(
             "deferred communicator destroy requires persistent GPU-direct delta"
         )
+    if args.deferred_comm_destroy_comparison and not (
+        args.shadow_only_only
+        and args.gpu_resident_shadow
+        and args.gpu_direct_history
+        and args.gpu_direct_delta
+        and args.ready_sync_mode == "STREAM_EVENT"
+        and args.ready_notification_mode == "UDP"
+    ):
+        raise ValueError(
+            "deferred destroy comparison requires the P1 STREAM_EVENT/UDP "
+            "GPU-direct Shadow-only path"
+        )
+    if args.deferred_comm_destroy and args.deferred_comm_destroy_comparison:
+        raise ValueError(
+            "select either fixed deferred destroy or its comparison"
+        )
     if args.ready_sync_mode == "STREAM_EVENT" and not (
         args.gpu_resident_shadow and args.gpu_direct_history
     ):
@@ -259,8 +283,16 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
             "ready notification comparison requires the P0 STREAM_EVENT "
             "GPU-direct Shadow-only path"
         )
-    if args.ready_notification_comparison and args.ready_sync_comparison:
-        raise ValueError("select only one P0/P1 comparison at a time")
+    comparison_count = sum(
+        bool(value)
+        for value in (
+            args.ready_sync_comparison,
+            args.ready_notification_comparison,
+            args.deferred_comm_destroy_comparison,
+        )
+    )
+    if comparison_count > 1:
+        raise ValueError("select only one P0/P1/teardown comparison at a time")
     if (
         args.ready_notification_mode == "UDP"
         or args.ready_notification_comparison
@@ -841,6 +873,42 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             )
             writer.writeheader()
             writer.writerows(notification_comparisons)
+
+    destroy_comparisons: list[dict[str, Any]] = []
+    for repetition in sorted({int(row["repetition"]) for row in rows}):
+        selected = {
+            bool(row.get("deferred_comm_destroy")): row
+            for row in rows
+            if int(row["repetition"]) == repetition
+        }
+        if set(selected) != {False, True}:
+            continue
+        old = selected[False]
+        new = selected[True]
+        comparison = {"repetition": repetition}
+        for metric in sync_metrics:
+            old_value = old.get(metric)
+            new_value = new.get(metric)
+            comparison[f"old_{metric}"] = old_value
+            comparison[f"new_{metric}"] = new_value
+            comparison[f"saved_{metric}"] = (
+                float(old_value) - float(new_value)
+                if old_value is not None and new_value is not None
+                else None
+            )
+        comparison["new_communicator_destroy_ms_max"] = new.get(
+            "communicator_destroy_ms_max"
+        )
+        destroy_comparisons.append(comparison)
+    if destroy_comparisons:
+        with (out_root / "deferred_destroy_comparison.csv").open(
+            "w", encoding="utf-8", newline=""
+        ) as handle:
+            writer = csv.DictWriter(
+                handle, fieldnames=list(destroy_comparisons[0])
+            )
+            writer.writeheader()
+            writer.writerows(destroy_comparisons)
 
     paired: list[dict[str, Any]] = []
     repetitions = sorted({int(row["repetition"]) for row in rows})
@@ -1786,6 +1854,9 @@ def main() -> None:
         "ready_notification_host": args.ready_notification_host,
         "ready_notification_port": args.ready_notification_port,
         "deferred_comm_destroy": args.deferred_comm_destroy,
+        "deferred_comm_destroy_comparison": (
+            args.deferred_comm_destroy_comparison
+        ),
         "gpu_direct_base_port": args.gpu_direct_base_port,
         "online_remote_attention": args.online_remote_attention,
         "remote_attention_base_port": args.remote_attention_base_port,
@@ -1861,6 +1932,11 @@ def main() -> None:
                     ("SHADOW_ONLY_NOTIFY_OLD", "S_NEW_OLD", "shadow-only"),
                     ("SHADOW_ONLY_NOTIFY_NEW", "S_NEW_OLD", "shadow-only"),
                 ]
+            if args.deferred_comm_destroy_comparison:
+                variants = [
+                    ("SHADOW_ONLY_DESTROY_OLD", "S_NEW_OLD", "shadow-only"),
+                    ("SHADOW_ONLY_DESTROY_NEW", "S_NEW_OLD", "shadow-only"),
+                ]
             if repetition % 2 == 0:
                 variants.reverse()
             for architecture, strategy, handoff_mode in variants:
@@ -1889,6 +1965,14 @@ def main() -> None:
                 rep_args.ready_notification_mode = (
                     selected_ready_notification_mode
                 )
+                selected_deferred_destroy = (
+                    False
+                    if architecture == "SHADOW_ONLY_DESTROY_OLD"
+                    else True
+                    if architecture == "SHADOW_ONLY_DESTROY_NEW"
+                    else args.deferred_comm_destroy
+                )
+                rep_args.deferred_comm_destroy = selected_deferred_destroy
                 rep_args.gpu_resident_shadow = bool(
                     args.gpu_resident_shadow
                     or selected_stop_and_copy
@@ -1921,7 +2005,7 @@ def main() -> None:
                         selected_ready_notification_mode
                     ),
                     selected_deferred_destroy: bool = (
-                        args.deferred_comm_destroy
+                        selected_deferred_destroy
                     ),
                 ) -> dict[str, Any]:
                     return accept_online(
@@ -2053,6 +2137,7 @@ def main() -> None:
                         "ready_notification_mode": (
                             selected_ready_notification_mode
                         ),
+                        "deferred_comm_destroy": selected_deferred_destroy,
                         "status": result["status"],
                         "root": str(rep_args.out_root.resolve()),
                         "acceptance": result["acceptance"],
@@ -2077,6 +2162,7 @@ def main() -> None:
                 if (
                     args.ready_sync_comparison
                     or args.ready_notification_comparison
+                    or args.deferred_comm_destroy_comparison
                 )
                 else 1
                 if (
