@@ -308,6 +308,9 @@ def target_connector(
     online_remote_attention: bool = False,
     remote_attention_base_port: int = 30200,
     ready_sync_mode: str = "DEVICE_WIDE",
+    ready_notification_mode: str = "FILE_POLL",
+    ready_notification_host: str = "127.0.0.1",
+    ready_notification_port: int = 0,
 ) -> str:
     return json.dumps(
         {
@@ -338,6 +341,9 @@ def target_connector(
                 "bridgetp_online_remote_attention": online_remote_attention,
                 "bridgetp_remote_attention_base_port": remote_attention_base_port,
                 "bridgetp_ready_sync_mode": ready_sync_mode,
+                "bridgetp_ready_notification_mode": ready_notification_mode,
+                "bridgetp_ready_notification_host": ready_notification_host,
+                "bridgetp_ready_notification_port": ready_notification_port,
             },
         },
         separators=(",", ":"),

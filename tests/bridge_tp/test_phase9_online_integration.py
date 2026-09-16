@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import socket
 import sys
 import tempfile
 import threading
@@ -440,6 +441,85 @@ class TestDynamicRateProvider(unittest.TestCase):
 
 
 class TestLazyActionBinding(unittest.TestCase):
+    def test_udp_notification_wakes_authoritative_receipt_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            (run_dir / "session_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "migration_id": "m",
+                        "session_token": "s",
+                        "source_request_id": "r",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "staging_manifest.json").write_text("{}", encoding="utf-8")
+            sender_dir = run_dir / "stage_delivery_receipts"
+            receiver_dir = run_dir / "receiver_receipts" / "target"
+            sender_dir.mkdir()
+            receiver_dir.mkdir(parents=True)
+
+            def write_rank(rank: int) -> None:
+                sender = {
+                    "migration_id": "m",
+                    "status": "READY",
+                    "payload_sha256": f"sha-{rank}",
+                    "payload_bytes": rank + 1,
+                }
+                receiver = {
+                    "migration_id": "m",
+                    "status": "TARGET_READY",
+                    "exact_readback": True,
+                    "payload_sha256": f"sha-{rank}",
+                    "payload_bytes": rank + 1,
+                }
+                (sender_dir / f"tp_rank_{rank}.json").write_text(
+                    json.dumps(sender), encoding="utf-8"
+                )
+                (receiver_dir / f"tp_rank_{rank}.json").write_text(
+                    json.dumps(receiver), encoding="utf-8"
+                )
+
+            for rank in range(3):
+                write_rank(rank)
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            probe.bind(("127.0.0.1", 0))
+            port = int(probe.getsockname()[1])
+            probe.close()
+            adapter = ActionAdapter(
+                "http://source",
+                run_dir,
+                expected_migration_id="m",
+                ready_notification_mode="UDP",
+                ready_notification_port=port,
+            )
+
+            def publish_last_rank() -> None:
+                write_rank(3)
+                message = json.dumps(
+                    {
+                        "migration_id": "m",
+                        "tp_rank": 3,
+                        "sent_unix_s": 1.0,
+                    }
+                ).encode("utf-8")
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+                    sender.sendto(message, ("127.0.0.1", port))
+
+            timer = threading.Timer(0.02, publish_last_rank)
+            timer.start()
+            try:
+                ready, ranks, _detail = adapter.wait_for_target_ready(1.0)
+            finally:
+                timer.join()
+                adapter.close()
+            self.assertTrue(ready)
+            self.assertEqual(ranks, {0, 1, 2, 3})
+            evidence = adapter.ready_notification_evidence()
+            self.assertEqual(evidence["notification_count"], 1)
+            self.assertEqual(evidence["notified_ranks"], [3])
+
     def test_runtime_control_precedes_session_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             run_dir = Path(temporary)

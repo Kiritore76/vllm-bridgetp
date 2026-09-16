@@ -230,6 +230,19 @@ class TestSourceSelectionContract(unittest.TestCase):
         extra = config["kv_connector_extra_config"]
         self.assertEqual(extra["bridgetp_ready_sync_mode"], "STREAM_EVENT")
 
+    def test_target_connector_records_ready_notification_endpoint(self) -> None:
+        config = json.loads(
+            MODULE.target_connector(
+                Path("run") / "controller",
+                gpu_resident_shadow=True,
+                ready_notification_mode="UDP",
+                ready_notification_port=30500,
+            )
+        )
+        extra = config["kv_connector_extra_config"]
+        self.assertEqual(extra["bridgetp_ready_notification_mode"], "UDP")
+        self.assertEqual(extra["bridgetp_ready_notification_port"], 30500)
+
     def test_nested_controller_directory_drives_anchor_prefix(self) -> None:
         args = SimpleNamespace(
             tp1_gpu="0",

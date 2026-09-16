@@ -27,6 +27,7 @@ server will reject.
 from __future__ import annotations
 
 import json
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -94,6 +95,9 @@ class ActionAdapter:
         run_dir: str | Path | SessionBinding,
         expected_migration_id: str | None = None,
         target_url: str | None = None,
+        ready_notification_mode: str = "FILE_POLL",
+        ready_notification_host: str = "127.0.0.1",
+        ready_notification_port: int = 0,
     ) -> None:
         self.source_url = source_url.rstrip("/")
         self.target_url = target_url.rstrip("/") if target_url else None
@@ -104,6 +108,22 @@ class ActionAdapter:
         else:
             self.run_dir = Path(run_dir)
             self._binding = None
+        self.ready_notification_mode = ready_notification_mode.upper()
+        if self.ready_notification_mode not in {"FILE_POLL", "UDP"}:
+            raise ValueError(
+                "ready_notification_mode must be FILE_POLL or UDP"
+            )
+        self._ready_socket: socket.socket | None = None
+        self._ready_notification_ranks: set[int] = set()
+        self._ready_notification_count = 0
+        self._last_ready_notification: dict[str, Any] | None = None
+        if self.ready_notification_mode == "UDP":
+            if not 0 < ready_notification_port <= 65535:
+                raise ValueError("UDP ready notification port is invalid")
+            ready_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            ready_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            ready_socket.bind((ready_notification_host, ready_notification_port))
+            self._ready_socket = ready_socket
 
     @property
     def binding(self) -> SessionBinding:
@@ -308,6 +328,106 @@ class ActionAdapter:
             if len(ready) == 4
             else (f"{len(ready)}/4 ranks ready"),
         )
+
+    def wait_for_target_ready(
+        self,
+        timeout_s: float,
+    ) -> tuple[bool, set[int], str]:
+        """Wait for a rank-ready notification, then verify disk evidence.
+
+        UDP is only a wake-up hint.  The authoritative readiness result still
+        comes from ``poll_target_ready``, which revalidates all sender and
+        receiver receipts.  A lost or malformed datagram therefore falls back
+        to the same fail-closed file gate used before P1.
+        """
+        ready, ranks, detail = self.poll_target_ready()
+        if ready:
+            self._drain_ready_notifications()
+            return ready, ranks, detail
+        if self._ready_socket is None or timeout_s <= 0:
+            return ready, ranks, detail
+
+        deadline = time.monotonic() + timeout_s
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return self.poll_target_ready()
+            self._ready_socket.settimeout(remaining)
+            try:
+                payload, _address = self._ready_socket.recvfrom(65536)
+            except TimeoutError:
+                return self.poll_target_ready()
+            except OSError:
+                return self.poll_target_ready()
+            if not self._record_ready_notification(payload):
+                continue
+            ready, ranks, detail = self.poll_target_ready()
+            if ready:
+                self._drain_ready_notifications()
+                return ready, ranks, detail
+
+    def _record_ready_notification(self, payload: bytes) -> bool:
+        try:
+            message = json.loads(payload.decode("utf-8"))
+            rank = int(message["tp_rank"])
+            migration_id = str(message["migration_id"])
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ):
+            return False
+        if not 0 <= rank < 4:
+            return False
+        if (
+            self.expected_migration_id
+            and migration_id != self.expected_migration_id
+        ):
+            return False
+        message["controller_received_unix_s"] = time.time()
+        self._last_ready_notification = message
+        self._ready_notification_ranks.add(rank)
+        self._ready_notification_count += 1
+        return True
+
+    def _drain_ready_notifications(self) -> None:
+        if self._ready_socket is None:
+            return
+        self._ready_socket.setblocking(False)
+        while True:
+            try:
+                payload, _address = self._ready_socket.recvfrom(65536)
+            except BlockingIOError:
+                return
+            except OSError:
+                return
+            self._record_ready_notification(payload)
+
+    def ready_notification_evidence(self) -> dict[str, Any]:
+        """Return diagnostic evidence without making it a safety gate."""
+        last = self._last_ready_notification or {}
+        sent = last.get("sent_unix_s")
+        received = last.get("controller_received_unix_s")
+        return {
+            "mode": self.ready_notification_mode,
+            "notification_count": self._ready_notification_count,
+            "notified_ranks": sorted(self._ready_notification_ranks),
+            "last_notification_sent_unix_s": sent,
+            "last_notification_received_unix_s": received,
+            "last_notification_delivery_ms": (
+                (float(received) - float(sent)) * 1000
+                if sent is not None and received is not None
+                else None
+            ),
+        }
+
+    def close(self) -> None:
+        """Release the optional persistent P1 notification socket."""
+        if self._ready_socket is not None:
+            self._ready_socket.close()
+            self._ready_socket = None
 
     # ---- terminal actions ----------------------------------------------
     def commit(self) -> dict[str, Any]:
