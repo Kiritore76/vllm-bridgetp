@@ -55,6 +55,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tp4-blocks", type=int, required=True)
     parser.add_argument("--phase", choices=["smoke", "formal"], default="smoke")
     parser.add_argument("--repetitions", type=int, default=1)
+    parser.add_argument(
+        "--managed-formal-subrun",
+        action="store_true",
+        help=(
+            "allow one formal repetition when a parent matrix runner owns "
+            "interleaving, repetition counting, and final acceptance"
+        ),
+    )
     parser.add_argument("--strategy-order", nargs=2, default=["S_NEW", "S_NEW_OLD"])
     parser.add_argument(
         "--bridge-only",
@@ -199,8 +207,18 @@ def parse_args() -> argparse.Namespace:
 def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]:
     if os.name == "nt":
         raise RuntimeError("online Shadow validation requires Linux and five GPUs")
-    if args.phase == "formal" and args.repetitions < 3:
+    if (
+        args.phase == "formal"
+        and args.repetitions < 3
+        and not args.managed_formal_subrun
+    ):
         raise ValueError("formal online validation requires at least three runs")
+    if args.managed_formal_subrun and (
+        args.phase != "formal" or args.repetitions != 1
+    ):
+        raise ValueError(
+            "managed formal subruns require --phase formal --repetitions 1"
+        )
     if args.repetitions <= 0:
         raise ValueError("repetitions must be positive")
     selected_modes = sum(
@@ -1851,6 +1869,7 @@ def main() -> None:
     contract = {
         "format_version": 1,
         "phase": args.phase,
+        "managed_formal_subrun": args.managed_formal_subrun,
         "revision": revision,
         "manifest": str(args.manifest.resolve()),
         "manifest_sha256": common.sha256(args.manifest),
