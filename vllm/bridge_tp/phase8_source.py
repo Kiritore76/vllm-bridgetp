@@ -454,6 +454,8 @@ def maybe_publish_phase8_delta(
     if block_size != state.block_size:
         raise ValueError("Phase 8 block size changed during generation")
     start_token = state.last_computed_token
+    cutover_hook_enter_unix_ns = None
+    cutover_hook_enter_monotonic_ns = None
     if config.gpu_direct_delta:
         pending_tokens = num_computed - start_token
         elapsed_ms = (time.monotonic() - state.last_flush_monotonic) * 1000
@@ -465,6 +467,9 @@ def maybe_publish_phase8_delta(
         final_trigger = output_tokens == config.phase8_cutover_output_tokens
         if not (token_trigger or time_trigger or final_trigger):
             return
+        if final_trigger:
+            cutover_hook_enter_unix_ns = time.time_ns()
+            cutover_hook_enter_monotonic_ns = time.monotonic_ns()
         enqueued = state.enqueue_gpu_delta(
             block_ids=block_ids,
             start_token=start_token,
@@ -490,6 +495,9 @@ def maybe_publish_phase8_delta(
     if output_tokens != config.phase8_cutover_output_tokens:
         return
 
+    final_delta_enqueued_unix_ns = time.time_ns()
+    final_delta_enqueued_monotonic_ns = time.monotonic_ns()
+
     num_known = int(request.num_tokens)
     pending = num_known - num_computed
     if pending != 1:
@@ -510,7 +518,10 @@ def maybe_publish_phase8_delta(
             output_tokens=output_tokens,
             num_computed_tokens=num_computed,
         )
+    delta_drain_started_monotonic_ns = time.monotonic_ns()
     state.wait_for_acks()
+    delta_drain_completed_unix_ns = time.time_ns()
+    delta_drain_completed_monotonic_ns = time.monotonic_ns()
     # S_NEW gives new-KV traffic priority throughout Shadow.  Only after every
     # delta has reached the stager does the irreversible Bridge boundary start
     # the historical snapshot transfer.
@@ -564,6 +575,32 @@ def maybe_publish_phase8_delta(
             ),
             "freeze_requested_unix_ns": (
                 freeze_request["requested_unix_ns"] if freeze_request else None
+            ),
+            "cutover_hook_enter_unix_ns": cutover_hook_enter_unix_ns,
+            "final_delta_enqueued_unix_ns": final_delta_enqueued_unix_ns,
+            "delta_drain_completed_unix_ns": delta_drain_completed_unix_ns,
+            "final_delta_enqueue_ms": (
+                (
+                    final_delta_enqueued_monotonic_ns
+                    - cutover_hook_enter_monotonic_ns
+                )
+                / 1e6
+                if cutover_hook_enter_monotonic_ns is not None
+                else None
+            ),
+            "final_delta_drain_ms": (
+                delta_drain_completed_monotonic_ns
+                - delta_drain_started_monotonic_ns
+            )
+            / 1e6,
+            "cutover_hook_to_delta_drain_ms": (
+                (
+                    delta_drain_completed_monotonic_ns
+                    - cutover_hook_enter_monotonic_ns
+                )
+                / 1e6
+                if cutover_hook_enter_monotonic_ns is not None
+                else None
             ),
             "updated_unix_s": time.time(),
         },

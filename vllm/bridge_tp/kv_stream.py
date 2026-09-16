@@ -449,6 +449,8 @@ class _GpuDirectHistoryPublisher:
         self.delta_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self.delta_errors: list[str] = []
         self.delta_records: list[dict[str, Any]] = []
+        self.delta_submissions = 0
+        self.delta_coalesced_submissions = 0
         self.failure: str | None = None
         self.thread = threading.Thread(
             target=self._run,
@@ -493,6 +495,7 @@ class _GpuDirectHistoryPublisher:
             raise RuntimeError(self.failure)
         event = torch.cuda.Event()
         event.record(torch.cuda.current_stream(self.kv_caches[0].device))
+        self.delta_submissions += 1
         self.delta_queue.put(
             {
                 "block_ids": list(block_ids),
@@ -501,6 +504,45 @@ class _GpuDirectHistoryPublisher:
                 "ready_event": event,
             }
         )
+
+    def _take_coalesced_delta(
+        self, first: dict[str, Any]
+    ) -> tuple[dict[str, Any], int]:
+        """Merge queued contiguous deltas into one physical transfer.
+
+        The model thread still publishes at the configured logical batch
+        boundary.  If transport has fallen behind, completed-token KV is
+        immutable, so the transport thread can safely repack the entire
+        acknowledged-to-latest range from the live cache and pay the four-rank
+        control/ACK cost once.
+        """
+
+        merged = first
+        consumed = 1
+        while True:
+            try:
+                candidate = self.delta_queue.get_nowait()
+            except queue.Empty:
+                break
+            if candidate is None:
+                # stop_deltas() is normally called only after join(), but keep
+                # the queue accounting correct if shutdown races this drain.
+                self.delta_queue.put(None)
+                self.delta_queue.task_done()
+                break
+            if int(candidate["start_token"]) != int(merged["end_token"]):
+                self.delta_queue.task_done()
+                raise RuntimeError(
+                    "GPU-direct delta submissions are not contiguous"
+                )
+            merged = {
+                "block_ids": candidate["block_ids"],
+                "start_token": first["start_token"],
+                "end_token": candidate["end_token"],
+                "ready_event": candidate["ready_event"],
+            }
+            consumed += 1
+        return merged, consumed
 
     def wait_for_deltas(self) -> None:
         self.delta_queue.join()
@@ -565,10 +607,13 @@ class _GpuDirectHistoryPublisher:
                 )
                 while True:
                     work = self.delta_queue.get()
+                    consumed = 1
                     try:
                         if work is None:
                             sender.close()
                             break
+                        work, consumed = self._take_coalesced_delta(work)
+                        self.delta_coalesced_submissions += consumed - 1
                         work["ready_event"].synchronize()
                         record = sender.send_delta(
                             migration_id=self.config.migration_id,
@@ -582,6 +627,8 @@ class _GpuDirectHistoryPublisher:
                             start_token=work["start_token"],
                             end_token=work["end_token"],
                         )
+                        record["logical_submissions"] = consumed
+                        record["completed_unix_s"] = time.time()
                         self.delta_records.append(record)
                         _atomic_json_dump(
                             {
@@ -609,12 +656,17 @@ class _GpuDirectHistoryPublisher:
                         logger.exception("BridgeTP GPU-direct delta failed")
                         raise
                     finally:
-                        self.delta_queue.task_done()
+                        for _ in range(consumed):
+                            self.delta_queue.task_done()
             receipt.update(
                 {
                     "status": "READY",
                     "ranks": ranks,
                     "delta_batches": len(self.delta_records),
+                    "delta_logical_submissions": self.delta_submissions,
+                    "delta_coalesced_submissions": (
+                        self.delta_coalesced_submissions
+                    ),
                     "delta_tokens": sum(
                         int(row["tokens"]) for row in self.delta_records
                     ),
