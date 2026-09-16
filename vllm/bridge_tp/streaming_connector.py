@@ -1070,13 +1070,14 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     if restore_stream is not None
                     else nullcontext()
                 )
+                delta_apply_started = time.perf_counter()
                 with self._gpu_kv_lock, restore_context:
                     if restore_stream is not None and direct_delta is not None:
                         if direct_delta.receive_done_event is None:
                             raise RuntimeError("GPU delta has no receive-done event")
                         restore_stream.wait_event(direct_delta.receive_done_event)
                         receive_event_links += 1
-                    inject_rank_delta(
+                    delta_validation = inject_rank_delta(
                         self._destination_layers(delta_layers),
                         delta_layers,
                         request.target_block_ids,
@@ -1085,6 +1086,9 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                         block_axis=int(manifest["block_axis"]),
                         block_size=int(manifest["block_size"]),
                     )
+                delta_apply_ms = (
+                    time.perf_counter() - delta_apply_started
+                ) * 1000
                 if delta_bytes:
                     digest.update(delta_bytes)
                     aggregate_bytes += len(delta_bytes)
@@ -1100,7 +1104,18 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     "tp_rank": tp_rank,
                     "start_token": start,
                     "end_token": end,
-                    "exact_readback": True,
+                    "exact_readback": (
+                        delta_validation.get("exact_readback") is True
+                    ),
+                    "receive_ms": (
+                        direct_delta.receive_ms
+                        if direct_delta is not None else None
+                    ),
+                    "apply_and_readback_ms": delta_apply_ms,
+                    "layout": (
+                        "BLOCK_MAJOR_TOKEN_CONTIGUOUS_V1"
+                        if direct_delta is not None else "TOKEN_MAJOR_V1"
+                    ),
                     "completed_unix_s": time.time(),
                 }
                 _atomic_json_dump(
