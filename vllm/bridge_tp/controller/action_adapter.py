@@ -98,6 +98,7 @@ class ActionAdapter:
         ready_notification_mode: str = "FILE_POLL",
         ready_notification_host: str = "127.0.0.1",
         ready_notification_port: int = 0,
+        ready_latch_poll_ms: float = 5.0,
     ) -> None:
         self.source_url = source_url.rstrip("/")
         self.target_url = target_url.rstrip("/") if target_url else None
@@ -117,6 +118,12 @@ class ActionAdapter:
         self._ready_notification_ranks: set[int] = set()
         self._ready_notification_count = 0
         self._last_ready_notification: dict[str, Any] | None = None
+        if ready_latch_poll_ms < 0:
+            raise ValueError("ready_latch_poll_ms cannot be negative")
+        self.ready_latch_poll_s = ready_latch_poll_ms / 1000
+        self._ready_latch_armed_unix_s: float | None = None
+        self._ready_latch_poll_count = 0
+        self._authoritative_ready_unix_s: float | None = None
         if self.ready_notification_mode == "UDP":
             if not 0 < ready_notification_port <= 65535:
                 raise ValueError("UDP ready notification port is invalid")
@@ -342,6 +349,7 @@ class ActionAdapter:
         """
         ready, ranks, detail = self.poll_target_ready()
         if ready:
+            self._authoritative_ready_unix_s = time.time()
             self._drain_ready_notifications()
             return ready, ranks, detail
         if self._ready_socket is None or timeout_s <= 0:
@@ -351,18 +359,42 @@ class ActionAdapter:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return self.poll_target_ready()
-            self._ready_socket.settimeout(remaining)
+                result = self.poll_target_ready()
+                if result[0]:
+                    self._authoritative_ready_unix_s = time.time()
+                return result
+            latch_armed = len(self._ready_notification_ranks) == 4
+            if latch_armed and self._ready_latch_armed_unix_s is None:
+                self._ready_latch_armed_unix_s = time.time()
+            socket_timeout = remaining
+            if latch_armed and self.ready_latch_poll_s > 0:
+                socket_timeout = min(remaining, self.ready_latch_poll_s)
+            self._ready_socket.settimeout(socket_timeout)
             try:
                 payload, _address = self._ready_socket.recvfrom(65536)
             except TimeoutError:
-                return self.poll_target_ready()
+                if latch_armed and self.ready_latch_poll_s > 0:
+                    self._ready_latch_poll_count += 1
+                    ready, ranks, detail = self.poll_target_ready()
+                    if ready:
+                        self._authoritative_ready_unix_s = time.time()
+                        self._drain_ready_notifications()
+                        return ready, ranks, detail
+                    continue
+                result = self.poll_target_ready()
+                if result[0]:
+                    self._authoritative_ready_unix_s = time.time()
+                return result
             except OSError:
-                return self.poll_target_ready()
+                result = self.poll_target_ready()
+                if result[0]:
+                    self._authoritative_ready_unix_s = time.time()
+                return result
             if not self._record_ready_notification(payload):
                 continue
             ready, ranks, detail = self.poll_target_ready()
             if ready:
+                self._authoritative_ready_unix_s = time.time()
                 self._drain_ready_notifications()
                 return ready, ranks, detail
 
@@ -419,6 +451,20 @@ class ActionAdapter:
             "last_notification_delivery_ms": (
                 (float(received) - float(sent)) * 1000
                 if sent is not None and received is not None
+                else None
+            ),
+            "ready_latch_poll_ms": self.ready_latch_poll_s * 1000,
+            "ready_latch_armed_unix_s": self._ready_latch_armed_unix_s,
+            "ready_latch_poll_count": self._ready_latch_poll_count,
+            "authoritative_ready_unix_s": self._authoritative_ready_unix_s,
+            "ready_latch_to_authoritative_ready_ms": (
+                (
+                    self._authoritative_ready_unix_s
+                    - self._ready_latch_armed_unix_s
+                )
+                * 1000
+                if self._authoritative_ready_unix_s is not None
+                and self._ready_latch_armed_unix_s is not None
                 else None
             ),
         }
