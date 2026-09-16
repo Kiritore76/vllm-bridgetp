@@ -471,6 +471,11 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, BridgeTPStreamMetadata):
             raise TypeError("Unexpected BridgeTP Phase 6 connector metadata")
+        # This hook runs outside the compiled/CUDA-graph model body on every
+        # model execution.  Arm the dependency here rather than relying only
+        # on wait_for_layer_load(): decode CUDA-graph replay does not re-enter
+        # the per-attention Python wrapper that calls that method.
+        self._arm_model_stream_waits(metadata)
         if not metadata.requests:
             return
         if len(metadata.requests) != 1:
@@ -694,13 +699,11 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             receipt["status"],
         )
 
-    def wait_for_layer_load(self, layer_name: str) -> None:
-        del layer_name
+    def _arm_model_stream_waits(
+        self, metadata: BridgeTPStreamMetadata
+    ) -> None:
         if self.ready_sync_mode != _READY_SYNC_STREAM_EVENT:
             return
-        metadata = self._get_connector_metadata()
-        if not isinstance(metadata, BridgeTPStreamMetadata):
-            raise TypeError("Unexpected BridgeTP Phase 6 connector metadata")
         if not metadata.model_wait_request_ids:
             return
         stream = torch.cuda.current_stream()
@@ -743,6 +746,16 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 tp_rank=tp_rank,
                 cuda_stream=int(stream.cuda_stream),
             )
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        del layer_name
+        metadata = self._get_connector_metadata()
+        if not isinstance(metadata, BridgeTPStreamMetadata):
+            raise TypeError("Unexpected BridgeTP Phase 6 connector metadata")
+        # Eager model execution may still enter this layer hook.  Keep it as
+        # an idempotent fallback; start_load_kv() already armed the dependency
+        # for CUDA-graph execution and the stream-key guard prevents repeats.
+        self._arm_model_stream_waits(metadata)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """Retain paged-KV tensors for asynchronous Shadow injection."""

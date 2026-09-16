@@ -332,7 +332,10 @@ class TestOptInConfiguration(unittest.TestCase):
 
     @unittest.skipUnless(importlib.util.find_spec("torch"), "requires torch")
     def test_streaming_connector_rearms_wait_only_for_migrated_request(self):
-        from vllm.bridge_tp.streaming_connector import BridgeTPStreamingConnector
+        from vllm.bridge_tp.streaming_connector import (
+            BridgeTPStreamingConnector,
+            BridgeTPStreamMetadata,
+        )
 
         connector = object.__new__(BridgeTPStreamingConnector)
         connector._pending_requests = {}
@@ -355,6 +358,14 @@ class TestOptInConfiguration(unittest.TestCase):
             migrated_metadata.model_wait_request_ids, ["migrated"]
         )
         self.assertEqual(connector._model_wait_pending_requests, set())
+
+        worker = object.__new__(BridgeTPStreamingConnector)
+        worker._connector_metadata = BridgeTPStreamMetadata(
+            model_wait_request_ids=["migrated"]
+        )
+        with patch.object(worker, "_arm_model_stream_waits") as arm:
+            worker.start_load_kv(None)
+        arm.assert_called_once_with(worker._connector_metadata)
 
     @unittest.skipUnless(importlib.util.find_spec("torch"), "requires torch")
     def test_streaming_connector_rejects_unexpected_extra_tail_blocks(self):
