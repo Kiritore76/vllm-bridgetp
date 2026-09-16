@@ -198,6 +198,29 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             raise ValueError(
                 "bridgetp_ready_sync_mode must be DEVICE_WIDE or STREAM_EVENT"
             )
+        self.ready_notification_mode = str(
+            self._kv_transfer_config.get_from_extra_config(
+                "bridgetp_ready_notification_mode", "FILE_POLL"
+            )
+        ).upper()
+        if self.ready_notification_mode not in {"FILE_POLL", "UDP"}:
+            raise ValueError(
+                "bridgetp_ready_notification_mode must be FILE_POLL or UDP"
+            )
+        self.ready_notification_host = str(
+            self._kv_transfer_config.get_from_extra_config(
+                "bridgetp_ready_notification_host", "127.0.0.1"
+            )
+        )
+        self.ready_notification_port = int(
+            self._kv_transfer_config.get_from_extra_config(
+                "bridgetp_ready_notification_port", 0
+            )
+        )
+        if self.ready_notification_mode == "UDP" and not (
+            0 < self.ready_notification_port <= 65535
+        ):
+            raise ValueError("UDP ready notification port is invalid")
         self._manifest: dict[str, Any] | None = None
         self._pending_requests: dict[str, Request] = {}
         self._active_requests: dict[str, Request] = {}
@@ -1195,6 +1218,37 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 / "gpu_watermarks"
                 / f"tp_rank_{tp_rank}.json",
             )
+            if self.ready_notification_mode == "UDP":
+                notification = {
+                    "format_version": 1,
+                    "kind": "TARGET_RANK_READY",
+                    "migration_id": request.migration_id,
+                    "target_request_id": request_id,
+                    "tp_rank": tp_rank,
+                    "sent_unix_s": time.time(),
+                }
+                payload = json.dumps(
+                    notification, separators=(",", ":")
+                ).encode("utf-8")
+                try:
+                    with socket.socket(
+                        socket.AF_INET, socket.SOCK_DGRAM
+                    ) as notifier:
+                        notifier.sendto(
+                            payload,
+                            (
+                                self.ready_notification_host,
+                                self.ready_notification_port,
+                            ),
+                        )
+                except OSError as error:
+                    # The receipt remains authoritative.  Losing the optional
+                    # wake-up hint must preserve the old polling fallback.
+                    logger.warning(
+                        "BridgeTP ready notification failed for rank %d: %s",
+                        tp_rank,
+                        error,
+                    )
             from vllm.bridge_tp.experiment_timeline import emit_event
 
             emit_event(

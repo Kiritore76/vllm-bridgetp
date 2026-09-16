@@ -501,6 +501,15 @@ def run(
                     ready_sync_mode=str(
                         getattr(args, "ready_sync_mode", "DEVICE_WIDE")
                     ),
+                    ready_notification_mode=str(
+                        getattr(args, "ready_notification_mode", "FILE_POLL")
+                    ),
+                    ready_notification_host=str(
+                        getattr(args, "ready_notification_host", "127.0.0.1")
+                    ),
+                    ready_notification_port=int(
+                        getattr(args, "ready_notification_port", 0)
+                    ),
                 ),
             ],
             target_env,

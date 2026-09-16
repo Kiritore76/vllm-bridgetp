@@ -110,6 +110,19 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ready-notification-mode",
+        choices=["FILE_POLL", "UDP"],
+        default="FILE_POLL",
+        help="P1 controller wake-up path",
+    )
+    parser.add_argument(
+        "--ready-notification-comparison",
+        action="store_true",
+        help="interleave FILE_POLL and UDP ready notification runs",
+    )
+    parser.add_argument("--ready-notification-host", default="127.0.0.1")
+    parser.add_argument("--ready-notification-port", type=int, default=30500)
+    parser.add_argument(
         "--stop-and-copy-only",
         action="store_true",
         help=(
@@ -223,6 +236,24 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise ValueError(
             "ready sync comparison requires the GPU-direct Shadow-only path"
         )
+    if args.ready_notification_comparison and not (
+        args.shadow_only_only
+        and args.gpu_resident_shadow
+        and args.gpu_direct_history
+        and args.gpu_direct_delta
+        and args.ready_sync_mode == "STREAM_EVENT"
+    ):
+        raise ValueError(
+            "ready notification comparison requires the P0 STREAM_EVENT "
+            "GPU-direct Shadow-only path"
+        )
+    if args.ready_notification_comparison and args.ready_sync_comparison:
+        raise ValueError("select only one P0/P1 comparison at a time")
+    if (
+        args.ready_notification_mode == "UDP"
+        or args.ready_notification_comparison
+    ) and not (0 < args.ready_notification_port <= 65535):
+        raise ValueError("UDP ready notification port is invalid")
     if args.gpu_direct_delta_batch_tokens <= 0:
         raise ValueError("GPU-direct delta batch tokens must be positive")
     if args.gpu_direct_delta_flush_ms < 0:
@@ -483,6 +514,7 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             "strategy": run["strategy"],
             "architecture": run.get("architecture", "BRIDGE"),
             "ready_sync_mode": run.get("ready_sync_mode"),
+            "ready_notification_mode": run.get("ready_notification_mode"),
             "status": acceptance["status"],
             "shadow_duration_ms": acceptance["shadow_duration_ms"],
             "bridge_to_commit_ms": acceptance["bridge_to_commit_ms"],
@@ -506,6 +538,12 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             ),
             "last_rank_ready_to_commit_ms": acceptance.get(
                 "last_rank_ready_to_commit_ms"
+            ),
+            "ready_notification_count": acceptance.get(
+                "ready_notification_count"
+            ),
+            "ready_notification_delivery_ms": acceptance.get(
+                "ready_notification_delivery_ms"
             ),
             "request_frozen_unix_s": acceptance.get("request_frozen_unix_s"),
             "source_kv_released_unix_s": acceptance.get(
@@ -685,6 +723,7 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
         "repetition",
         "architecture",
         "ready_sync_mode",
+        "ready_notification_mode",
         "freeze_to_final_delta_ack_ms",
         "freeze_to_first_rank_ready_ms",
         "freeze_to_all_rank_ready_ms",
@@ -692,6 +731,8 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
         "last_rank_ready_to_controller_wakeup_ms",
         "controller_wakeup_to_commit_ms",
         "last_rank_ready_to_commit_ms",
+        "ready_notification_count",
+        "ready_notification_delivery_ms",
         "handoff_stall_ms",
     ]
     with (out_root / "handoff_stage_breakdown.csv").open(
@@ -704,7 +745,7 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
         )
 
     sync_comparisons: list[dict[str, Any]] = []
-    sync_metrics = stage_fields[3:]
+    sync_metrics = stage_fields[4:]
     for repetition in sorted({int(row["repetition"]) for row in rows}):
         selected = {
             str(row.get("ready_sync_mode")): row
@@ -736,6 +777,39 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             )
             writer.writeheader()
             writer.writerows(sync_comparisons)
+
+    notification_comparisons: list[dict[str, Any]] = []
+    for repetition in sorted({int(row["repetition"]) for row in rows}):
+        selected = {
+            str(row.get("ready_notification_mode")): row
+            for row in rows
+            if int(row["repetition"]) == repetition
+        }
+        if set(selected) != {"FILE_POLL", "UDP"}:
+            continue
+        old = selected["FILE_POLL"]
+        new = selected["UDP"]
+        comparison = {"repetition": repetition}
+        for metric in sync_metrics:
+            old_value = old.get(metric)
+            new_value = new.get(metric)
+            comparison[f"old_{metric}"] = old_value
+            comparison[f"new_{metric}"] = new_value
+            comparison[f"saved_{metric}"] = (
+                float(old_value) - float(new_value)
+                if old_value is not None and new_value is not None
+                else None
+            )
+        notification_comparisons.append(comparison)
+    if notification_comparisons:
+        with (out_root / "p1_ready_notification_comparison.csv").open(
+            "w", encoding="utf-8", newline=""
+        ) as handle:
+            writer = csv.DictWriter(
+                handle, fieldnames=list(notification_comparisons[0])
+            )
+            writer.writeheader()
+            writer.writerows(notification_comparisons)
 
     paired: list[dict[str, Any]] = []
     repetitions = sorted({int(row["repetition"]) for row in rows})
@@ -834,6 +908,7 @@ def accept_online(
     slo_handoff_ms: float = 1000.0,
     stop_and_copy: bool = False,
     ready_sync_mode: str = "DEVICE_WIDE",
+    ready_notification_mode: str = "FILE_POLL",
 ) -> dict[str, Any]:
     background = common.read_json(background_dir / "background_summary.json")
     session = common.read_json(controller_dir / "session_manifest.json")
@@ -925,6 +1000,7 @@ def accept_online(
     commit_row = commit_rows[-1] if commit_rows else {}
     controller_wakeup = commit_row.get("controller_wakeup_unix_s")
     commit_completed = commit_row.get("commit_completed_unix_s", committed)
+    ready_notification = commit_row.get("ready_notification") or {}
     if strategy == "S_NEW":
         history_start = float(
             common.read_json(controller_dir / "history_transfer_start.json")[
@@ -1149,6 +1225,17 @@ def accept_online(
         errors.append("controller did not use the fixed experimental boundary")
     if takeover.get("state") != "COMMITTED":
         errors.append("takeover state is not COMMITTED")
+    if handoff_mode == "shadow-only":
+        observed_notification_mode = str(
+            ready_notification.get("mode", "FILE_POLL")
+        )
+        if observed_notification_mode != ready_notification_mode:
+            errors.append("controller ready notification mode differs")
+        if (
+            ready_notification_mode == "UDP"
+            and int(ready_notification.get("notification_count", 0)) <= 0
+        ):
+            errors.append("controller did not receive a UDP ready notification")
     if proxy.get("committed") is not True:
         errors.append("unified response proxy did not commit")
     if proxy.get("emitted_tokens") != expected_anchor_tokens:
@@ -1550,6 +1637,18 @@ def accept_online(
         "target_model_stream_wait_event": receipts.get(
             "model_stream_wait_event"
         ),
+        "ready_notification_mode": ready_notification.get(
+            "mode", "FILE_POLL"
+        ),
+        "ready_notification_count": ready_notification.get(
+            "notification_count", 0
+        ),
+        "ready_notification_ranks": ready_notification.get(
+            "notified_ranks", []
+        ),
+        "ready_notification_delivery_ms": ready_notification.get(
+            "last_notification_delivery_ms"
+        ),
         "target_tpot_windows": reported_windows,
         "errors": errors,
     }
@@ -1579,6 +1678,10 @@ def main() -> None:
         "gpu_direct_delta_flush_ms": args.gpu_direct_delta_flush_ms,
         "ready_sync_mode": args.ready_sync_mode,
         "ready_sync_comparison": args.ready_sync_comparison,
+        "ready_notification_mode": args.ready_notification_mode,
+        "ready_notification_comparison": args.ready_notification_comparison,
+        "ready_notification_host": args.ready_notification_host,
+        "ready_notification_port": args.ready_notification_port,
         "gpu_direct_base_port": args.gpu_direct_base_port,
         "online_remote_attention": args.online_remote_attention,
         "remote_attention_base_port": args.remote_attention_base_port,
@@ -1649,6 +1752,11 @@ def main() -> None:
                     ("SHADOW_ONLY_SYNC_OLD", "S_NEW_OLD", "shadow-only"),
                     ("SHADOW_ONLY_SYNC_NEW", "S_NEW_OLD", "shadow-only"),
                 ]
+            if args.ready_notification_comparison:
+                variants = [
+                    ("SHADOW_ONLY_NOTIFY_OLD", "S_NEW_OLD", "shadow-only"),
+                    ("SHADOW_ONLY_NOTIFY_NEW", "S_NEW_OLD", "shadow-only"),
+                ]
             if repetition % 2 == 0:
                 variants.reverse()
             for architecture, strategy, handoff_mode in variants:
@@ -1667,6 +1775,16 @@ def main() -> None:
                     else args.ready_sync_mode
                 )
                 rep_args.ready_sync_mode = selected_ready_sync_mode
+                selected_ready_notification_mode = (
+                    "FILE_POLL"
+                    if architecture == "SHADOW_ONLY_NOTIFY_OLD"
+                    else "UDP"
+                    if architecture == "SHADOW_ONLY_NOTIFY_NEW"
+                    else args.ready_notification_mode
+                )
+                rep_args.ready_notification_mode = (
+                    selected_ready_notification_mode
+                )
                 rep_args.gpu_resident_shadow = bool(
                     args.gpu_resident_shadow
                     or selected_stop_and_copy
@@ -1695,6 +1813,9 @@ def main() -> None:
                     selected_remote: bool = selected_online_remote_attention,
                     selected_stop: bool = selected_stop_and_copy,
                     selected_ready_sync: str = selected_ready_sync_mode,
+                    selected_ready_notification: str = (
+                        selected_ready_notification_mode
+                    ),
                 ) -> dict[str, Any]:
                     return accept_online(
                         controller_dir,
@@ -1712,6 +1833,9 @@ def main() -> None:
                         slo_handoff_ms=args.slo_handoff_ms,
                         stop_and_copy=selected_stop,
                         ready_sync_mode=selected_ready_sync,
+                        ready_notification_mode=(
+                            selected_ready_notification
+                        ),
                     )
 
                 source_env_overrides = {"BRIDGETP_SHADOW_STRATEGY": strategy}
@@ -1793,6 +1917,12 @@ def main() -> None:
                         str(args.bridge_output_tokens),
                         "--handoff-mode",
                         handoff_mode,
+                        "--ready-notification-mode",
+                        selected_ready_notification_mode,
+                        "--ready-notification-host",
+                        args.ready_notification_host,
+                        "--ready-notification-port",
+                        str(args.ready_notification_port),
                     ]
                     + (
                         ["--gpu-resident-shadow"]
@@ -1812,6 +1942,9 @@ def main() -> None:
                         "handoff_mode": handoff_mode,
                         "stop_and_copy": selected_stop_and_copy,
                         "ready_sync_mode": selected_ready_sync_mode,
+                        "ready_notification_mode": (
+                            selected_ready_notification_mode
+                        ),
                         "status": result["status"],
                         "root": str(rep_args.out_root.resolve()),
                         "acceptance": result["acceptance"],
@@ -1833,7 +1966,10 @@ def main() -> None:
             "expected_runs": args.repetitions
             * (
                 2
-                if args.ready_sync_comparison
+                if (
+                    args.ready_sync_comparison
+                    or args.ready_notification_comparison
+                )
                 else 1
                 if (
                     args.bridge_only or args.shadow_only_only or args.stop_and_copy_only

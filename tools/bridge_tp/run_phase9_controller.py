@@ -134,6 +134,14 @@ def parse_args() -> argparse.Namespace:
             "the following cutover value is only the Phase-8 control sentinel"
         ),
     )
+    parser.add_argument(
+        "--ready-notification-mode",
+        choices=("FILE_POLL", "UDP"),
+        default="FILE_POLL",
+        help="P1 target-ready wake-up path; receipts remain authoritative",
+    )
+    parser.add_argument("--ready-notification-host", default="127.0.0.1")
+    parser.add_argument("--ready-notification-port", type=int, default=0)
     args = parser.parse_args()
     trigger = args.diagnostic_trigger_output_tokens
     cutover = args.diagnostic_cutover_output_tokens
@@ -148,6 +156,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("diagnostic Bridge boundary must be between trigger and cutover")
     if args.gpu_resident_shadow and cutover is None:
         parser.error("GPU-resident staging requires fixed diagnostic boundaries")
+    if args.ready_notification_mode == "UDP" and not (
+        0 < args.ready_notification_port <= 65535
+    ):
+        parser.error("UDP ready notification port is invalid")
     return args
 
 
@@ -613,6 +625,7 @@ def step_shadow_only_takeover(
     recorder: ProxyRecorder,
     now: float,
     dry_run: bool,
+    ready_wait_timeout_s: float = 0.0,
 ) -> None:
     """Commit directly from Shadow after the four-rank GPU readback gate.
 
@@ -620,7 +633,7 @@ def step_shadow_only_takeover(
     final block table and history/deltas are injected into those blocks before
     this gate succeeds.  The controller never enters Bridge/Handoff.
     """
-    ready, ranks, detail = adapter.poll_target_ready()
+    ready, ranks, detail = adapter.wait_for_target_ready(ready_wait_timeout_s)
     for rank in ranks:
         machine.mark_rank_ready(record.migration_id, rank)
     if not ready:
@@ -657,6 +670,7 @@ def step_shadow_only_takeover(
             "controller_wakeup_unix_s": controller_wakeup_at,
             "commit_dispatched_unix_s": commit_dispatched_at,
             "commit_completed_unix_s": committed_at,
+            "ready_notification": adapter.ready_notification_evidence(),
         }
     )
     machine.transition(
@@ -772,6 +786,9 @@ def main() -> None:
         run_dir,
         expected_migration_id=args.migration_id or None,
         target_url=config.target_url,
+        ready_notification_mode=args.ready_notification_mode,
+        ready_notification_host=args.ready_notification_host,
+        ready_notification_port=args.ready_notification_port,
     )
     probe = RuntimeControl(armed=False, note="phase 9 preflight").write(run_dir)
 
@@ -831,6 +848,7 @@ def main() -> None:
                 ),
                 "handoff_mode": args.handoff_mode,
                 "stop_and_copy": args.stop_and_copy,
+                "ready_notification_mode": args.ready_notification_mode,
             },
         )
         machine = MigrationStateMachine(
@@ -856,6 +874,7 @@ def main() -> None:
             while not _STOP and time.monotonic() < deadline and not record.is_terminal:
                 tick += 1
                 now = time.time()
+                ready_notification_waited = False
                 if source_future.done():
                     source_result = source_future.result()
                     _finish_source_without_commit(
@@ -990,6 +1009,15 @@ def main() -> None:
                             recorder,
                             now,
                             args.dry_run,
+                            (
+                                config.tick_s
+                                if args.ready_notification_mode == "UDP"
+                                else 0.0
+                            ),
+                        )
+                        ready_notification_waited = (
+                            args.ready_notification_mode == "UDP"
+                            and record.state is not MigrationState.TAKEOVER
                         )
                     else:
                         step_shadow(
@@ -1018,7 +1046,8 @@ def main() -> None:
                         now,
                         args.dry_run,
                     )
-                time.sleep(config.tick_s)
+                if not ready_notification_waited:
+                    time.sleep(config.tick_s)
         finally:
             audit.write(
                 {
@@ -1038,6 +1067,7 @@ def main() -> None:
                 }
             )
             audit.close()
+            adapter.close()
             atomic_json_dump(
                 recorder.stats(),
                 run_dir / "response_proxy_stats.json",
