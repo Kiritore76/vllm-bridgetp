@@ -135,16 +135,16 @@ def parse_args() -> argparse.Namespace:
         "--deferred-comm-destroy",
         action="store_true",
         help=(
-            "publish TP4 TARGET_READY before asynchronously destroying the "
-            "quiesced GPU-direct NCCL communicator"
+            "retain source and target GPU-direct NCCL communicators until "
+            "their worker processes shut down"
         ),
     )
     parser.add_argument(
         "--deferred-comm-destroy-comparison",
         action="store_true",
         help=(
-            "interleave synchronous and post-TARGET_READY communicator "
-            "destruction within every repetition"
+            "interleave synchronous communicator destruction and the "
+            "process-lifetime communicator pool within every repetition"
         ),
     )
     parser.add_argument(
@@ -1303,6 +1303,13 @@ def accept_online(
                 != list(range(4))
             ):
                 errors.append("GPU-direct history sender did not complete all ranks")
+            if deferred_comm_destroy and direct_sender.get(
+                "communicator_lifecycle"
+            ) != "POOLED_UNTIL_PROCESS_SHUTDOWN":
+                errors.append(
+                    "GPU-direct source communicators did not enter the "
+                    "process-lifetime pool"
+                )
         expected_sync_scope = (
             "BRIDGETP_RESTORE_STREAM_EVENT"
             if ready_sync_mode == "STREAM_EVENT"
@@ -1341,7 +1348,7 @@ def accept_online(
                     status = destroy.get("status")
                     if status not in {
                         "POOLED_UNTIL_CONNECTOR_SHUTDOWN",
-                        "DESTROYED_AT_CONNECTOR_SHUTDOWN",
+                        "ABORTED_AT_CONNECTOR_SHUTDOWN",
                     }:
                         errors.append(
                             f"TP4 rank {rank} communicator did not enter the "
@@ -1686,6 +1693,12 @@ def accept_online(
         "communicator_destroy_statuses": [
             row.get("status") for row in communicator_destroy_receipts
         ],
+        "source_communicator_lifecycle": direct_sender.get(
+            "communicator_lifecycle"
+        ),
+        "source_communicator_pool_size": direct_sender.get(
+            "communicator_pool_size"
+        ),
         "communicator_destroy_ms": [
             row.get("destroy_ms") for row in communicator_destroy_receipts
         ],

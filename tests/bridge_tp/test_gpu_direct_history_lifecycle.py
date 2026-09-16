@@ -139,6 +139,41 @@ class TestGpuDirectHistoryLifecycle(unittest.TestCase):
         self.assertEqual(updates[-1]["status"], "DESTROYED")
         self.assertIsNotNone(updates[-1]["destroy_ms"])
 
+    def test_sender_control_close_does_not_destroy_communicators(self) -> None:
+        from vllm.bridge_tp.gpu_direct_history import GpuDirectHistorySender
+
+        sender = object.__new__(GpuDirectHistorySender)
+        sender.connections = [Mock(), Mock()]
+        sender.comms = [object(), object()]
+        sender.nccl = Mock()
+        with (
+            patch("vllm.bridge_tp.gpu_direct_history.send_json"),
+            patch(
+                "vllm.bridge_tp.gpu_direct_history.recv_json",
+                return_value={"status": "CLOSED"},
+            ),
+        ):
+            sender.close_control()
+
+        self.assertEqual(sender.connections, [])
+        self.assertEqual(len(sender.comms), 2)
+        sender.nccl.ncclCommDestroy.assert_not_called()
+        sender.nccl.ncclCommAbort.assert_not_called()
+
+    def test_source_pool_aborts_senders_only_at_process_shutdown(self) -> None:
+        from vllm.bridge_tp import kv_stream
+
+        sender = Mock()
+        with kv_stream._retained_gpu_senders_lock:
+            kv_stream._retained_gpu_senders.clear()
+        self.assertEqual(kv_stream._retain_gpu_sender(sender), 1)
+        sender.abort.assert_not_called()
+
+        kv_stream._abort_retained_gpu_senders()
+
+        sender.abort.assert_called_once_with()
+        self.assertFalse(kv_stream._retained_gpu_senders)
+
     def test_connector_pool_retains_receiver_until_shutdown(self) -> None:
         from vllm.bridge_tp.streaming_connector import BridgeTPStreamingConnector
 
@@ -162,15 +197,15 @@ class TestGpuDirectHistoryLifecycle(unittest.TestCase):
             )
             self.assertTrue(receipt_path.is_file())
             self.assertEqual(len(connector._retained_gpu_receivers), 1)
-            receiver.close.assert_not_called()
+            receiver.abort.assert_not_called()
 
             connector.shutdown()
 
-            receiver.close.assert_called_once_with()
+            receiver.abort.assert_called_once_with()
             self.assertFalse(connector._retained_gpu_receivers)
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
             self.assertEqual(
-                receipt["status"], "DESTROYED_AT_CONNECTOR_SHUTDOWN"
+                receipt["status"], "ABORTED_AT_CONNECTOR_SHUTDOWN"
             )
 
 

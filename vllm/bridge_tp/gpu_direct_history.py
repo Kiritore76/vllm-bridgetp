@@ -423,6 +423,16 @@ class GpuDirectHistoryReceiver:
         self.stream = None
         self._close_control()
 
+    def abort(self) -> None:
+        """Release a pooled communicator during worker shutdown."""
+        if self.comm is not None:
+            assert self.nccl is not None
+            self.nccl.ncclCommAbort(self.comm)
+            self.comm = None
+            self.nccl = None
+        self.stream = None
+        self._close_control()
+
 
 class GpuDirectHistorySender:
     """Reshard TP1 KV on GPU and send each shard to its TP4 rank."""
@@ -737,7 +747,8 @@ class GpuDirectHistorySender:
             ),
         }
 
-    def close(self) -> None:
+    def close_control(self) -> None:
+        """Complete the wire protocol without destroying communicators."""
         for connection in self.connections:
             try:
                 send_json(connection, {"op": "CLOSE"})
@@ -748,13 +759,27 @@ class GpuDirectHistorySender:
                 recv_json(connection)
             except (OSError, EOFError):
                 pass
+        for connection in self.connections:
+            connection.close()
+        self.connections = []
+
+    def close(self) -> None:
+        self.close_control()
         if self.nccl is not None:
             for comm in self.comms:
                 self.nccl.ncclCommDestroy(comm)
         self.producer_stream = None
-        for connection in self.connections:
-            connection.close()
-        self.connections = []
+        self.comms = []
+        self.streams = []
+        self.nccl = None
+
+    def abort(self) -> None:
+        """Release pooled communicators without peer-finalize coordination."""
+        self.close_control()
+        if self.nccl is not None:
+            for comm in self.comms:
+                self.nccl.ncclCommAbort(comm)
+        self.producer_stream = None
         self.comms = []
         self.streams = []
         self.nccl = None
