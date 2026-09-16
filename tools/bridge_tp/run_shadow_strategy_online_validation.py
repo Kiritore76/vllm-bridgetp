@@ -1334,27 +1334,41 @@ def accept_online(
             }
             if sorted(destroy_by_rank) != list(range(4)):
                 errors.append(
-                    "deferred communicator destroy receipts are incomplete"
+                    "connector-lifetime communicator pool receipts are incomplete"
                 )
             else:
                 for rank, destroy in sorted(destroy_by_rank.items()):
-                    if destroy.get("status") != "DESTROYED":
+                    status = destroy.get("status")
+                    if status not in {
+                        "POOLED_UNTIL_CONNECTOR_SHUTDOWN",
+                        "DESTROYED_AT_CONNECTOR_SHUTDOWN",
+                    }:
                         errors.append(
-                            f"TP4 rank {rank} communicator was not destroyed"
+                            f"TP4 rank {rank} communicator did not enter the "
+                            "connector-lifetime pool"
                         )
                     if destroy.get("deferred_until_after_target_ready") is not True:
                         errors.append(
                             f"TP4 rank {rank} communicator teardown was not deferred"
                         )
-                    started_unix_s = destroy.get("destroy_started_unix_s")
+                    retained_unix_s = destroy.get("retained_unix_s")
                     if (
-                        started_unix_s is None
+                        retained_unix_s is None
                         or rank not in ready_by_rank
-                        or float(started_unix_s) < ready_by_rank[rank]
+                        or float(retained_unix_s) < ready_by_rank[rank]
                     ):
                         errors.append(
-                            f"TP4 rank {rank} communicator teardown started "
+                            f"TP4 rank {rank} communicator entered the pool "
                             "before TARGET_READY"
+                        )
+                    started_unix_s = destroy.get("destroy_started_unix_s")
+                    if (
+                        status == "POOLED_UNTIL_CONNECTOR_SHUTDOWN"
+                        and started_unix_s is not None
+                    ):
+                        errors.append(
+                            f"TP4 rank {rank} communicator destruction started "
+                            "before connector shutdown"
                         )
     gpu_history_completed = [
         float(row.get("completed_unix_s", float("inf")))
@@ -1690,6 +1704,28 @@ def accept_online(
             * 1000
             for row in communicator_destroy_receipts
             if row.get("destroy_started_unix_s") is not None
+            and any(
+                int(receipt.get("tp_rank", -1))
+                == int(row.get("tp_rank", -2))
+                and receipt.get("target_ready_unix_s") is not None
+                for receipt in target_receipts
+            )
+        ],
+        "communicator_pool_retained_after_target_ready_ms": [
+            (
+                float(row["retained_unix_s"])
+                - float(
+                    next(
+                        receipt["target_ready_unix_s"]
+                        for receipt in target_receipts
+                        if int(receipt.get("tp_rank", -1))
+                        == int(row.get("tp_rank", -2))
+                    )
+                )
+            )
+            * 1000
+            for row in communicator_destroy_receipts
+            if row.get("retained_unix_s") is not None
             and any(
                 int(receipt.get("tp_rank", -1))
                 == int(row.get("tp_rank", -2))

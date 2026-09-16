@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import queue
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 
@@ -135,6 +138,40 @@ class TestGpuDirectHistoryLifecycle(unittest.TestCase):
         self.assertFalse(receiver._destroy_thread.is_alive())
         self.assertEqual(updates[-1]["status"], "DESTROYED")
         self.assertIsNotNone(updates[-1]["destroy_ms"])
+
+    def test_connector_pool_retains_receiver_until_shutdown(self) -> None:
+        from vllm.bridge_tp.streaming_connector import BridgeTPStreamingConnector
+
+        connector = object.__new__(BridgeTPStreamingConnector)
+        connector._retained_gpu_receivers = {}
+        connector._retained_gpu_receivers_lock = threading.Lock()
+        receiver = Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            connector.manifest_path = Path(directory) / "manifest.json"
+            connector._retain_gpu_receiver(
+                receiver,
+                request_id="request",
+                migration_id="migration",
+                tp_rank=0,
+            )
+
+            receipt_path = (
+                Path(directory)
+                / "gpu_communicator_destroy_receipts"
+                / "tp_rank_0.json"
+            )
+            self.assertTrue(receipt_path.is_file())
+            self.assertEqual(len(connector._retained_gpu_receivers), 1)
+            receiver.close.assert_not_called()
+
+            connector.shutdown()
+
+            receiver.close.assert_called_once_with()
+            self.assertFalse(connector._retained_gpu_receivers)
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                receipt["status"], "DESTROYED_AT_CONNECTOR_SHUTDOWN"
+            )
 
 
 if __name__ == "__main__":

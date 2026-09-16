@@ -239,6 +239,16 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         self._copy_done_events: dict[str, torch.cuda.Event] = {}
         self._model_wait_streams: set[tuple[str, int]] = set()
         self._model_wait_pending_requests: set[str] = set()
+        # Keep completed target-side GPU-direct receivers alive for the
+        # connector lifetime.  Destroying an NCCL communicator immediately
+        # after TARGET_READY can serialize with unrelated TP4 decode work and
+        # create a large post-takeover token gap.  The source-side transport
+        # and TP1 KV ownership are independent and are still released at
+        # takeover; only the target communicator handle is retained here.
+        self._retained_gpu_receivers: dict[
+            str, tuple[Any, Path, dict[str, Any]]
+        ] = {}
+        self._retained_gpu_receivers_lock = threading.Lock()
         self._claimed_target_request_id: str | None = None
         logger.warning(
             "BridgeTP Phase 6 streaming connector enabled; target waits for %s",
@@ -1290,36 +1300,6 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 receive_dependency_scope=receive_dependency_scope,
                 receive_event_links=receive_event_links,
             )
-            if (
-                gpu_direct_delta
-                and receiver is not None
-                and self.defer_communicator_destroy
-            ):
-                destroy_receipt_path = (
-                    self.manifest_path.parent
-                    / "gpu_communicator_destroy_receipts"
-                    / f"tp_rank_{tp_rank}.json"
-                )
-
-                def record_destroy(
-                    evidence: dict[str, Any],
-                    *,
-                    path: Path = destroy_receipt_path,
-                    rank: int = tp_rank,
-                ) -> None:
-                    _atomic_json_dump(
-                        {
-                            "format_version": 1,
-                            "migration_id": request.migration_id,
-                            "target_request_id": request_id,
-                            "tp_rank": rank,
-                            "deferred_until_after_target_ready": True,
-                            **evidence,
-                        },
-                        path,
-                    )
-
-                receiver.destroy_async(record_destroy)
             if self.takeover_control_path is not None:
                 while True:
                     if self.takeover_control_path.is_file():
@@ -1339,6 +1319,17 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     if time.monotonic() >= deadline:
                         raise TimeoutError("Timed out waiting for Shadow commit")
                     time.sleep(0.005)
+            if (
+                gpu_direct_delta
+                and receiver is not None
+                and self.defer_communicator_destroy
+            ):
+                self._retain_gpu_receiver(
+                    receiver,
+                    request_id=request_id,
+                    migration_id=request.migration_id,
+                    tp_rank=tp_rank,
+                )
             self._completed_recvs.add(request_id)
         except _ShadowCancelled as error:
             if receiver is not None:
@@ -1412,3 +1403,83 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
 
     def wait_for_save(self) -> None:
         return
+
+    def _retain_gpu_receiver(
+        self,
+        receiver: Any,
+        *,
+        request_id: str,
+        migration_id: str,
+        tp_rank: int,
+    ) -> None:
+        """Retain one target communicator until connector shutdown."""
+        key = f"{migration_id}:{request_id}:{tp_rank}"
+        receipt_path = (
+            self.manifest_path.parent
+            / "gpu_communicator_destroy_receipts"
+            / f"tp_rank_{tp_rank}.json"
+        )
+        evidence = {
+            "format_version": 1,
+            "migration_id": migration_id,
+            "target_request_id": request_id,
+            "tp_rank": tp_rank,
+            "status": "POOLED_UNTIL_CONNECTOR_SHUTDOWN",
+            "lifecycle": "CONNECTOR_LIFETIME_POOL",
+            "deferred_until_after_target_ready": True,
+            "retained_unix_s": time.time(),
+            "destroy_started_unix_s": None,
+            "destroy_completed_unix_s": None,
+            "destroy_ms": None,
+        }
+        with self._retained_gpu_receivers_lock:
+            self._retained_gpu_receivers[key] = (
+                receiver,
+                receipt_path,
+                evidence,
+            )
+            evidence["pool_size"] = len(self._retained_gpu_receivers)
+        _atomic_json_dump(evidence, receipt_path)
+        logger.info(
+            "BridgeTP retained target communicator for rank %d until "
+            "connector shutdown (pool size=%d)",
+            tp_rank,
+            evidence["pool_size"],
+        )
+
+    def shutdown(self) -> None:
+        """Destroy pooled target communicators only as the worker exits."""
+        with self._retained_gpu_receivers_lock:
+            retained = list(self._retained_gpu_receivers.values())
+            self._retained_gpu_receivers.clear()
+        for receiver, receipt_path, evidence in retained:
+            started_unix_s = time.time()
+            error: str | None = None
+            try:
+                receiver.close()
+            except BaseException as exc:  # pragma: no cover - shutdown path
+                error = f"{type(exc).__name__}: {exc}"
+                logger.exception(
+                    "BridgeTP pooled communicator shutdown failed for rank %s",
+                    evidence.get("tp_rank"),
+                )
+            completed_unix_s = time.time()
+            _atomic_json_dump(
+                {
+                    **evidence,
+                    "status": (
+                        "DESTROYED_AT_CONNECTOR_SHUTDOWN"
+                        if error is None
+                        else "DESTROY_FAILED_AT_CONNECTOR_SHUTDOWN"
+                    ),
+                    "destroy_started_unix_s": started_unix_s,
+                    "destroy_completed_unix_s": completed_unix_s,
+                    "destroy_ms": (
+                        completed_unix_s - started_unix_s
+                    )
+                    * 1000,
+                    "destroy_error": error,
+                },
+                receipt_path,
+            )
+        super().shutdown()
