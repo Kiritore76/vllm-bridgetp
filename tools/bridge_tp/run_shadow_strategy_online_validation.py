@@ -148,6 +148,22 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--post-takeover-comm-destroy",
+        action="store_true",
+        help=(
+            "experiment-only: keep terminal-close off the ready path, then "
+            "destroy target communicators asynchronously after ownership commit"
+        ),
+    )
+    parser.add_argument(
+        "--post-takeover-destroy-comparison",
+        action="store_true",
+        help=(
+            "interleave process-lifetime pooling and post-takeover async "
+            "target communicator destruction within every repetition"
+        ),
+    )
+    parser.add_argument(
         "--stop-and-copy-only",
         action="store_true",
         help=(
@@ -259,6 +275,30 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise ValueError(
             "deferred communicator destroy requires persistent GPU-direct delta"
         )
+    if args.post_takeover_comm_destroy and not (
+        args.shadow_only_only
+        and args.gpu_resident_shadow
+        and args.gpu_direct_history
+        and args.gpu_direct_delta
+        and args.ready_sync_mode == "STREAM_EVENT"
+        and args.ready_notification_mode == "UDP"
+    ):
+        raise ValueError(
+            "post-takeover destroy requires the STREAM_EVENT/UDP persistent "
+            "GPU-direct Shadow-only path"
+        )
+    if args.post_takeover_destroy_comparison and not (
+        args.shadow_only_only
+        and args.gpu_resident_shadow
+        and args.gpu_direct_history
+        and args.gpu_direct_delta
+        and args.ready_sync_mode == "STREAM_EVENT"
+        and args.ready_notification_mode == "UDP"
+    ):
+        raise ValueError(
+            "post-takeover destroy comparison requires the STREAM_EVENT/UDP "
+            "persistent GPU-direct Shadow-only path"
+        )
     if args.deferred_comm_destroy_comparison and not (
         args.shadow_only_only
         and args.gpu_resident_shadow
@@ -274,6 +314,20 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
     if args.deferred_comm_destroy and args.deferred_comm_destroy_comparison:
         raise ValueError(
             "select either fixed deferred destroy or its comparison"
+        )
+    if args.post_takeover_comm_destroy and args.deferred_comm_destroy:
+        raise ValueError(
+            "post-takeover destroy selects deferred terminal-close handling "
+            "automatically; do not also pass --deferred-comm-destroy"
+        )
+    if args.post_takeover_destroy_comparison and (
+        args.deferred_comm_destroy
+        or args.deferred_comm_destroy_comparison
+        or args.post_takeover_comm_destroy
+    ):
+        raise ValueError(
+            "post-takeover destroy comparison cannot be combined with another "
+            "communicator-lifecycle selector"
         )
     if args.ready_sync_mode == "STREAM_EVENT" and not (
         args.gpu_resident_shadow and args.gpu_direct_history
@@ -308,6 +362,7 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
             args.ready_sync_comparison,
             args.ready_notification_comparison,
             args.deferred_comm_destroy_comparison,
+            args.post_takeover_destroy_comparison,
         )
     )
     if comparison_count > 1:
@@ -651,6 +706,9 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             "deferred_comm_destroy": acceptance.get(
                 "deferred_comm_destroy"
             ),
+            "post_takeover_comm_destroy": acceptance.get(
+                "post_takeover_comm_destroy"
+            ),
             "communicator_destroy_ms_max": (
                 max(communicator_destroy_ms)
                 if communicator_destroy_ms
@@ -966,6 +1024,50 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             writer.writeheader()
             writer.writerows(destroy_comparisons)
 
+    post_destroy_comparisons: list[dict[str, Any]] = []
+    post_destroy_metrics = sync_metrics + [
+        "post_commit_tpot_p50_ms",
+        "post_commit_tpot_p95_ms",
+        "post_commit_tpot_p99_ms",
+        "communicator_destroy_ms_max",
+    ]
+    for repetition in sorted({int(row["repetition"]) for row in rows}):
+        selected = {
+            str(row.get("architecture")): row
+            for row in rows
+            if int(row["repetition"]) == repetition
+            and row.get("architecture")
+            in {"SHADOW_ONLY_POOL", "SHADOW_ONLY_POST_DESTROY"}
+        }
+        if set(selected) != {
+            "SHADOW_ONLY_POOL",
+            "SHADOW_ONLY_POST_DESTROY",
+        }:
+            continue
+        pool = selected["SHADOW_ONLY_POOL"]
+        destroy = selected["SHADOW_ONLY_POST_DESTROY"]
+        comparison = {"repetition": repetition}
+        for metric in post_destroy_metrics:
+            pool_value = pool.get(metric)
+            destroy_value = destroy.get(metric)
+            comparison[f"pool_{metric}"] = pool_value
+            comparison[f"post_destroy_{metric}"] = destroy_value
+            comparison[f"post_destroy_minus_pool_{metric}"] = (
+                float(destroy_value) - float(pool_value)
+                if pool_value is not None and destroy_value is not None
+                else None
+            )
+        post_destroy_comparisons.append(comparison)
+    if post_destroy_comparisons:
+        with (out_root / "post_takeover_destroy_comparison.csv").open(
+            "w", encoding="utf-8", newline=""
+        ) as handle:
+            writer = csv.DictWriter(
+                handle, fieldnames=list(post_destroy_comparisons[0])
+            )
+            writer.writeheader()
+            writer.writerows(post_destroy_comparisons)
+
     paired: list[dict[str, Any]] = []
     repetitions = sorted({int(row["repetition"]) for row in rows})
     for repetition in repetitions:
@@ -1065,6 +1167,7 @@ def accept_online(
     ready_sync_mode: str = "DEVICE_WIDE",
     ready_notification_mode: str = "FILE_POLL",
     deferred_comm_destroy: bool = False,
+    post_takeover_comm_destroy: bool = False,
 ) -> dict[str, Any]:
     background = common.read_json(background_dir / "background_summary.json")
     session = common.read_json(controller_dir / "session_manifest.json")
@@ -1341,12 +1444,29 @@ def accept_online(
             }
             if sorted(destroy_by_rank) != list(range(4)):
                 errors.append(
-                    "connector-lifetime communicator pool receipts are incomplete"
+                    "communicator lifecycle receipts are incomplete"
                 )
             else:
                 for rank, destroy in sorted(destroy_by_rank.items()):
                     status = destroy.get("status")
-                    if status not in {
+                    if post_takeover_comm_destroy:
+                        if status != "DESTROYED":
+                            errors.append(
+                                f"TP4 rank {rank} post-takeover communicator "
+                                "destruction did not complete"
+                            )
+                        started = destroy.get("destroy_started_unix_s")
+                        commit_observed = destroy.get("commit_observed_unix_s")
+                        if (
+                            started is None
+                            or commit_observed is None
+                            or float(started) < float(commit_observed)
+                        ):
+                            errors.append(
+                                f"TP4 rank {rank} communicator destruction "
+                                "started before ownership commit"
+                            )
+                    elif status not in {
                         "POOLED_UNTIL_CONNECTOR_SHUTDOWN",
                         "ABORTED_AT_CONNECTOR_SHUTDOWN",
                     }:
@@ -1358,19 +1478,24 @@ def accept_online(
                         errors.append(
                             f"TP4 rank {rank} communicator teardown was not deferred"
                         )
-                    retained_unix_s = destroy.get("retained_unix_s")
+                    lifecycle_unix_s = (
+                        destroy.get("destroy_started_unix_s")
+                        if post_takeover_comm_destroy
+                        else destroy.get("retained_unix_s")
+                    )
                     if (
-                        retained_unix_s is None
+                        lifecycle_unix_s is None
                         or rank not in ready_by_rank
-                        or float(retained_unix_s) < ready_by_rank[rank]
+                        or float(lifecycle_unix_s) < ready_by_rank[rank]
                     ):
                         errors.append(
-                            f"TP4 rank {rank} communicator entered the pool "
-                            "before TARGET_READY"
+                            f"TP4 rank {rank} communicator lifecycle action "
+                            "started before TARGET_READY"
                         )
                     started_unix_s = destroy.get("destroy_started_unix_s")
                     if (
-                        status == "POOLED_UNTIL_CONNECTOR_SHUTDOWN"
+                        not post_takeover_comm_destroy
+                        and status == "POOLED_UNTIL_CONNECTOR_SHUTDOWN"
                         and started_unix_s is not None
                     ):
                         errors.append(
@@ -1690,6 +1815,7 @@ def accept_online(
         "gpu_direct_history": gpu_direct_history,
         "gpu_direct_delta": gpu_direct_delta,
         "deferred_comm_destroy": deferred_comm_destroy,
+        "post_takeover_comm_destroy": post_takeover_comm_destroy,
         "communicator_destroy_statuses": [
             row.get("status") for row in communicator_destroy_receipts
         ],
@@ -1723,6 +1849,11 @@ def accept_online(
                 and receipt.get("target_ready_unix_s") is not None
                 for receipt in target_receipts
             )
+        ],
+        "communicator_destroy_started_after_commit_ms": [
+            row.get("destroy_started_after_commit_ms")
+            for row in communicator_destroy_receipts
+            if row.get("destroy_started_after_commit_ms") is not None
         ],
         "communicator_pool_retained_after_target_ready_ms": [
             (
@@ -2013,6 +2144,10 @@ def main() -> None:
         "deferred_comm_destroy_comparison": (
             args.deferred_comm_destroy_comparison
         ),
+        "post_takeover_comm_destroy": args.post_takeover_comm_destroy,
+        "post_takeover_destroy_comparison": (
+            args.post_takeover_destroy_comparison
+        ),
         "gpu_direct_base_port": args.gpu_direct_base_port,
         "online_remote_attention": args.online_remote_attention,
         "remote_attention_base_port": args.remote_attention_base_port,
@@ -2093,6 +2228,11 @@ def main() -> None:
                     ("SHADOW_ONLY_DESTROY_OLD", "S_NEW_OLD", "shadow-only"),
                     ("SHADOW_ONLY_DESTROY_NEW", "S_NEW_OLD", "shadow-only"),
                 ]
+            if args.post_takeover_destroy_comparison:
+                variants = [
+                    ("SHADOW_ONLY_POOL", "S_NEW_OLD", "shadow-only"),
+                    ("SHADOW_ONLY_POST_DESTROY", "S_NEW_OLD", "shadow-only"),
+                ]
             if repetition % 2 == 0:
                 variants.reverse()
             for architecture, strategy, handoff_mode in variants:
@@ -2126,9 +2266,25 @@ def main() -> None:
                     if architecture == "SHADOW_ONLY_DESTROY_OLD"
                     else True
                     if architecture == "SHADOW_ONLY_DESTROY_NEW"
-                    else args.deferred_comm_destroy
+                    else True
+                    if architecture
+                    in {"SHADOW_ONLY_POOL", "SHADOW_ONLY_POST_DESTROY"}
+                    else bool(
+                        args.deferred_comm_destroy
+                        or args.post_takeover_comm_destroy
+                    )
                 )
                 rep_args.deferred_comm_destroy = selected_deferred_destroy
+                selected_post_takeover_destroy = bool(
+                    architecture == "SHADOW_ONLY_POST_DESTROY"
+                    or (
+                        not args.post_takeover_destroy_comparison
+                        and args.post_takeover_comm_destroy
+                    )
+                )
+                rep_args.post_takeover_comm_destroy = (
+                    selected_post_takeover_destroy
+                )
                 rep_args.gpu_resident_shadow = bool(
                     args.gpu_resident_shadow
                     or selected_stop_and_copy
@@ -2163,6 +2319,9 @@ def main() -> None:
                     selected_deferred_destroy: bool = (
                         selected_deferred_destroy
                     ),
+                    selected_post_destroy: bool = (
+                        selected_post_takeover_destroy
+                    ),
                 ) -> dict[str, Any]:
                     return accept_online(
                         controller_dir,
@@ -2184,6 +2343,7 @@ def main() -> None:
                             selected_ready_notification
                         ),
                         deferred_comm_destroy=selected_deferred_destroy,
+                        post_takeover_comm_destroy=selected_post_destroy,
                     )
 
                 source_env_overrides = {"BRIDGETP_SHADOW_STRATEGY": strategy}
@@ -2296,6 +2456,9 @@ def main() -> None:
                             selected_ready_notification_mode
                         ),
                         "deferred_comm_destroy": selected_deferred_destroy,
+                        "post_takeover_comm_destroy": (
+                            selected_post_takeover_destroy
+                        ),
                         "status": result["status"],
                         "root": str(rep_args.out_root.resolve()),
                         "acceptance": result["acceptance"],

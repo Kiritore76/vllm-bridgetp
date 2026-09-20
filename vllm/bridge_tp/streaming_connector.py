@@ -226,6 +226,19 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 "bridgetp_defer_communicator_destroy", False
             )
         )
+        self.post_takeover_communicator_destroy = bool(
+            self._kv_transfer_config.get_from_extra_config(
+                "bridgetp_post_takeover_communicator_destroy", False
+            )
+        )
+        if (
+            self.post_takeover_communicator_destroy
+            and not self.defer_communicator_destroy
+        ):
+            raise ValueError(
+                "post-takeover communicator destruction requires deferred "
+                "terminal-close handling"
+            )
         self._manifest: dict[str, Any] | None = None
         self._pending_requests: dict[str, Request] = {}
         self._active_requests: dict[str, Request] = {}
@@ -906,6 +919,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     port=int(record["port"]),
                     defer_communicator_destroy=(
                         self.defer_communicator_destroy
+                        or self.post_takeover_communicator_destroy
                     ),
                 )
                 direct = receiver.receive(
@@ -1300,11 +1314,13 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 receive_dependency_scope=receive_dependency_scope,
                 receive_event_links=receive_event_links,
             )
+            commit_observed_unix_s: float | None = None
             if self.takeover_control_path is not None:
                 while True:
                     if self.takeover_control_path.is_file():
                         control = _load_json(self.takeover_control_path)
                         if control.get("state") == "COMMITTED":
+                            commit_observed_unix_s = time.time()
                             receipt["status"] = "OWNERSHIP_COMMITTED"
                             receipt["takeover_state"] = "COMMITTED"
                             receipt["ownership_ready_total_ms"] = (
@@ -1324,12 +1340,29 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 and receiver is not None
                 and self.defer_communicator_destroy
             ):
-                self._retain_gpu_receiver(
-                    receiver,
-                    request_id=request_id,
-                    migration_id=request.migration_id,
-                    tp_rank=tp_rank,
-                )
+                if self.post_takeover_communicator_destroy:
+                    if commit_observed_unix_s is None:
+                        raise RuntimeError(
+                            "post-takeover communicator destruction requires "
+                            "an observed ownership commit"
+                        )
+                    self._destroy_gpu_receiver_after_takeover(
+                        receiver,
+                        request_id=request_id,
+                        migration_id=request.migration_id,
+                        tp_rank=tp_rank,
+                        target_ready_unix_s=float(
+                            receipt["target_ready_unix_s"]
+                        ),
+                        commit_observed_unix_s=commit_observed_unix_s,
+                    )
+                else:
+                    self._retain_gpu_receiver(
+                        receiver,
+                        request_id=request_id,
+                        migration_id=request.migration_id,
+                        tp_rank=tp_rank,
+                    )
             self._completed_recvs.add(request_id)
         except _ShadowCancelled as error:
             if receiver is not None:
@@ -1446,6 +1479,62 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             tp_rank,
             evidence["pool_size"],
         )
+
+    def _destroy_gpu_receiver_after_takeover(
+        self,
+        receiver: Any,
+        *,
+        request_id: str,
+        migration_id: str,
+        tp_rank: int,
+        target_ready_unix_s: float,
+        commit_observed_unix_s: float,
+    ) -> None:
+        """Destroy one communicator asynchronously after ownership commit.
+
+        This is an experiment-only lifecycle used to measure whether NCCL
+        finalization overlaps and perturbs TP4 decode.  The process-lifetime
+        connector pool remains the production/default deferred lifecycle.
+        """
+        receipt_path = (
+            self.manifest_path.parent
+            / "gpu_communicator_destroy_receipts"
+            / f"tp_rank_{tp_rank}.json"
+        )
+        base = {
+            "format_version": 1,
+            "migration_id": migration_id,
+            "target_request_id": request_id,
+            "tp_rank": tp_rank,
+            "lifecycle": "POST_TAKEOVER_ASYNC_DESTROY",
+            "deferred_until_after_target_ready": True,
+            "target_ready_unix_s": target_ready_unix_s,
+            "commit_observed_unix_s": commit_observed_unix_s,
+            "scheduled_unix_s": time.time(),
+        }
+
+        def record_destroy(update: dict[str, Any]) -> None:
+            started = update.get("destroy_started_unix_s")
+            _atomic_json_dump(
+                {
+                    **base,
+                    **update,
+                    "destroy_started_after_target_ready_ms": (
+                        (float(started) - target_ready_unix_s) * 1000
+                        if started is not None
+                        else None
+                    ),
+                    "destroy_started_after_commit_ms": (
+                        (float(started) - commit_observed_unix_s) * 1000
+                        if started is not None
+                        else None
+                    ),
+                },
+                receipt_path,
+            )
+
+        _atomic_json_dump({**base, "status": "SCHEDULED"}, receipt_path)
+        receiver.destroy_async(record_destroy)
 
     def shutdown(self) -> None:
         """Abort pooled target communicators only as the worker exits."""
