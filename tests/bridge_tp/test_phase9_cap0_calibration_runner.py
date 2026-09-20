@@ -254,6 +254,21 @@ class TestSourceSelectionContract(unittest.TestCase):
         extra = config["kv_connector_extra_config"]
         self.assertTrue(extra["bridgetp_defer_communicator_destroy"])
 
+    def test_target_connector_records_post_takeover_destroy(self) -> None:
+        config = json.loads(
+            MODULE.target_connector(
+                Path("run") / "controller",
+                gpu_resident_shadow=True,
+                defer_communicator_destroy=True,
+                post_takeover_communicator_destroy=True,
+            )
+        )
+        extra = config["kv_connector_extra_config"]
+        self.assertTrue(extra["bridgetp_defer_communicator_destroy"])
+        self.assertTrue(
+            extra["bridgetp_post_takeover_communicator_destroy"]
+        )
+
     def test_nested_controller_directory_drives_anchor_prefix(self) -> None:
         args = SimpleNamespace(
             tp1_gpu="0",

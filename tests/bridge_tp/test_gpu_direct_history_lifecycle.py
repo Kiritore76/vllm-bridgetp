@@ -208,6 +208,55 @@ class TestGpuDirectHistoryLifecycle(unittest.TestCase):
                 receipt["status"], "ABORTED_AT_CONNECTOR_SHUTDOWN"
             )
 
+    def test_post_takeover_destroy_records_commit_ordering(self) -> None:
+        from vllm.bridge_tp.streaming_connector import (
+            BridgeTPStreamingConnector,
+        )
+
+        connector = object.__new__(BridgeTPStreamingConnector)
+        receiver = Mock()
+
+        def destroy_async(callback: object) -> None:
+            callback(
+                {
+                    "status": "DESTROYED",
+                    "destroy_started_unix_s": 12.5,
+                    "destroy_completed_unix_s": 13.0,
+                    "destroy_ms": 500.0,
+                    "error": None,
+                }
+            )
+
+        receiver.destroy_async.side_effect = destroy_async
+        with tempfile.TemporaryDirectory() as directory:
+            connector.manifest_path = Path(directory) / "manifest.json"
+            connector._destroy_gpu_receiver_after_takeover(
+                receiver,
+                request_id="request",
+                migration_id="migration",
+                tp_rank=2,
+                target_ready_unix_s=10.0,
+                commit_observed_unix_s=12.0,
+            )
+
+            receipt = json.loads(
+                (
+                    Path(directory)
+                    / "gpu_communicator_destroy_receipts"
+                    / "tp_rank_2.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(receipt["status"], "DESTROYED")
+            self.assertEqual(
+                receipt["lifecycle"], "POST_TAKEOVER_ASYNC_DESTROY"
+            )
+            self.assertEqual(
+                receipt["destroy_started_after_target_ready_ms"], 2500.0
+            )
+            self.assertEqual(
+                receipt["destroy_started_after_commit_ms"], 500.0
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

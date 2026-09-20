@@ -312,6 +312,7 @@ def target_connector(
     ready_notification_host: str = "127.0.0.1",
     ready_notification_port: int = 0,
     defer_communicator_destroy: bool = False,
+    post_takeover_communicator_destroy: bool = False,
 ) -> str:
     return json.dumps(
         {
@@ -347,6 +348,9 @@ def target_connector(
                 "bridgetp_ready_notification_port": ready_notification_port,
                 "bridgetp_defer_communicator_destroy": (
                     defer_communicator_destroy
+                ),
+                "bridgetp_post_takeover_communicator_destroy": (
+                    post_takeover_communicator_destroy
                 ),
             },
         },

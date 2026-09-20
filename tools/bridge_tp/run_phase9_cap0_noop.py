@@ -513,6 +513,9 @@ def run(
                     defer_communicator_destroy=bool(
                         getattr(args, "deferred_comm_destroy", False)
                     ),
+                    post_takeover_communicator_destroy=bool(
+                        getattr(args, "post_takeover_comm_destroy", False)
+                    ),
                 ),
             ],
             target_env,
