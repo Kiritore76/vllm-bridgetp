@@ -373,6 +373,21 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
     return revision, guard, pressure
 
 
+def target_environment(
+    base_env: dict[str, str],
+    *,
+    tp4_gpus: str,
+) -> dict[str, str]:
+    target_env = base_env | {"CUDA_VISIBLE_DEVICES": tp4_gpus}
+    # Persistent-channel publication is a source-side concern. The TP4
+    # receiver gets its identity through --kv-transfer-config. Do not leak
+    # publisher settings into target model workers: BridgeTPStreamConfig
+    # validates them during sample_tokens even when streaming is disabled.
+    target_env.pop("BRIDGETP_PERSISTENT_CHANNEL", None)
+    target_env.pop("BRIDGETP_CHANNEL_GENERATION", None)
+    return target_env
+
+
 def run(
     args: argparse.Namespace,
     revision: str,
@@ -491,7 +506,10 @@ def run(
     )
     try:
         print(f"[{run_id}] starting target TP4", flush=True)
-        target_env = base_env | {"CUDA_VISIBLE_DEVICES": args.tp4_gpus}
+        target_env = target_environment(
+            base_env,
+            tp4_gpus=args.tp4_gpus,
+        )
         if gpu_resident_shadow:
             target_env.update(
                 {
@@ -500,8 +518,6 @@ def run(
                     "BRIDGETP_TAKEOVER_RUN_DIR": str(server_dir),
                 }
             )
-        if bool(getattr(args, "persistent_channel", False)):
-            target_env["BRIDGETP_PERSISTENT_CHANNEL"] = "1"
         target = service_pool.get("target") if service_pool is not None else None
         if target is None:
             target = common.start_process(
