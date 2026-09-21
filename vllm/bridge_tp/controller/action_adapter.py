@@ -221,6 +221,8 @@ class ActionAdapter:
             ),
             rate_gib_s=float(rate_gib_s),
             target_request_admitted=current.target_request_admitted,
+            migration_id=current.migration_id,
+            source_request_id_prefix=current.source_request_id_prefix,
             note=note or "shadow armed by Phase 9 controller",
         ).write(self.run_dir)
 
@@ -233,6 +235,8 @@ class ActionAdapter:
             cutover_output_tokens=current.cutover_output_tokens,
             rate_gib_s=float(rate_gib_s),
             target_request_admitted=current.target_request_admitted,
+            migration_id=current.migration_id,
+            source_request_id_prefix=current.source_request_id_prefix,
             note=note or "rate update",
         ).write(self.run_dir)
 
@@ -253,6 +257,8 @@ class ActionAdapter:
             cutover_output_tokens=int(cutover_output_tokens),
             rate_gib_s=current.rate_gib_s,
             target_request_admitted=current.target_request_admitted,
+            migration_id=current.migration_id,
+            source_request_id_prefix=current.source_request_id_prefix,
             note=note or "cutover boundary set",
         ).write(self.run_dir)
 
@@ -265,6 +271,8 @@ class ActionAdapter:
             cutover_output_tokens=current.cutover_output_tokens,
             rate_gib_s=current.rate_gib_s,
             target_request_admitted=True,
+            migration_id=current.migration_id,
+            source_request_id_prefix=current.source_request_id_prefix,
             note=note or "target request admitted",
         ).write(self.run_dir)
 
@@ -277,6 +285,8 @@ class ActionAdapter:
             cutover_output_tokens=current.cutover_output_tokens,
             rate_gib_s=current.rate_gib_s,
             target_request_admitted=current.target_request_admitted,
+            migration_id=current.migration_id,
+            source_request_id_prefix=current.source_request_id_prefix,
             note=note or "migration disarmed",
         ).write(self.run_dir)
 

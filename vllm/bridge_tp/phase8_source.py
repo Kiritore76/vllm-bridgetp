@@ -343,7 +343,7 @@ def start_phase8_source(
     history_publishers: list[Any] | None = None,
 ) -> None:
     global _state
-    if _state is not None:
+    if _state is not None and not _state.finalized:
         raise RuntimeError("BridgeTP Phase 8 source session already exists")
     _state = _Phase8SourceState(
         config=config,

@@ -42,12 +42,28 @@ def _atomic_json_dump(value: dict[str, Any], path: Path) -> None:
 def _configured_session() -> tuple[Path, str]:
     run_dir_value = os.getenv("BRIDGETP_TAKEOVER_RUN_DIR", "").strip()
     migration_id = os.getenv("BRIDGETP_TAKEOVER_MIGRATION_ID", "").strip()
-    if not run_dir_value or not migration_id:
+    persistent = os.getenv("BRIDGETP_PERSISTENT_CHANNEL", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not run_dir_value or (not migration_id and not persistent):
         raise HTTPException(
             status_code=HTTPStatus.SERVICE_UNAVAILABLE,
             detail="BridgeTP takeover session is not configured",
         )
-    return Path(run_dir_value).resolve(), migration_id
+    run_dir = Path(run_dir_value)
+    if persistent:
+        try:
+            active = _load_json(run_dir / "session_manifest.json")
+            migration_id = str(active["migration_id"])
+        except (OSError, KeyError, TypeError, ValueError) as error:
+            raise HTTPException(
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                detail=f"Persistent BridgeTP session is not active: {error}",
+            ) from error
+    return run_dir, migration_id
 
 
 def _validate_body(

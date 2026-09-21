@@ -77,6 +77,11 @@ class RuntimeControl:
     cutover_output_tokens: int | None = None
     rate_gib_s: float | None = None
     target_request_admitted: bool = False
+    # Persistent-channel servers stay alive across request migrations.  These
+    # two fields bind the process-lifetime channel to the currently active
+    # request-lifetime session without rebuilding the communicator.
+    migration_id: str | None = None
+    source_request_id_prefix: str | None = None
     note: str = ""
 
     # ---- read side (server process) -----------------------------------
@@ -151,7 +156,9 @@ def mark_control_honored(run_dir: str | os.PathLike[str], generation: int) -> No
     Writes at most once per generation per process, so the decode path pays a
     dict lookup rather than a filesystem write on every iteration.
     """
-    key = str(run_dir)
+    # resolve() intentionally distinguishes successive per-request session
+    # directories reached through one stable persistent-channel symlink.
+    key = str(RuntimeControl.path(run_dir).resolve())
     with _honored_lock:
         if _honored_generation.get(key) == generation:
             return

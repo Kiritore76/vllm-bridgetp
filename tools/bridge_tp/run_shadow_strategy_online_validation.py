@@ -113,6 +113,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--channel-generation", type=int, default=0)
     parser.add_argument(
+        "--persistent-sequential-reuse",
+        action="store_true",
+        help=(
+            "keep one TP1/TP4 server pair alive across all repetitions so "
+            "C0 measures real cross-request communicator reuse"
+        ),
+    )
+    parser.add_argument(
+        "--persistent-session-gap-s",
+        type=float,
+        default=0.0,
+        help="delay after each session has returned to IDLE",
+    )
+    parser.add_argument(
         "--ready-sync-mode",
         choices=["DEVICE_WIDE", "STREAM_EVENT"],
         default="DEVICE_WIDE",
@@ -290,6 +304,12 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
             "persistent channel requires the GPU-resident GPU-direct "
             "Shadow-only path"
         )
+    if args.persistent_sequential_reuse and not args.persistent_channel:
+        raise ValueError(
+            "persistent sequential reuse requires --persistent-channel"
+        )
+    if args.persistent_session_gap_s < 0:
+        raise ValueError("persistent session gap cannot be negative")
     if args.channel_generation < 0:
         raise ValueError("channel generation cannot be negative")
     if args.persistent_channel and (
@@ -639,6 +659,82 @@ def emitted_boundary_gap_ms(
         float(selected[current]["unix_s"])
         - float(selected[previous]["unix_s"])
     ) * 1000
+
+
+def capture_persistent_memory(
+    processes: list[Any],
+) -> dict[str, Any]:
+    """Capture process-tree RSS and per-process GPU memory after one session."""
+    roots = {int(item.process.pid) for item in processes}
+    rows: list[dict[str, int]] = []
+    selected = set(roots)
+    proc = Path("/proc")
+    if proc.is_dir():
+        process_table: dict[int, tuple[int, int]] = {}
+        for child in proc.iterdir():
+            if not child.name.isdigit():
+                continue
+            try:
+                status = (child / "status").read_text(encoding="utf-8")
+            except OSError:
+                continue
+            values: dict[str, str] = {}
+            for line in status.splitlines():
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    values[key] = value.strip()
+            try:
+                parent = int(values.get("PPid", "-1"))
+                rss_kib = int(values.get("VmRSS", "0 kB").split()[0])
+                process_table[int(child.name)] = (parent, rss_kib)
+            except (ValueError, IndexError):
+                continue
+        changed = True
+        while changed:
+            changed = False
+            for pid, (parent, _) in process_table.items():
+                if parent in selected and pid not in selected:
+                    selected.add(pid)
+                    changed = True
+        rows = [
+            {
+                "pid": pid,
+                "ppid": process_table[pid][0],
+                "rss_kib": process_table[pid][1],
+            }
+            for pid in sorted(selected & process_table.keys())
+        ]
+    gpu_rows: list[dict[str, int]] = []
+    try:
+        completed = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=pid,used_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        for line in completed.stdout.splitlines():
+            pid_text, memory_text = (part.strip() for part in line.split(",", 1))
+            pid = int(pid_text)
+            if pid in selected:
+                gpu_rows.append(
+                    {"pid": pid, "used_memory_mib": int(memory_text)}
+                )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return {
+        "format_version": 1,
+        "captured_unix_s": time.time(),
+        "root_pids": sorted(roots),
+        "processes": rows,
+        "process_tree_rss_kib": sum(row["rss_kib"] for row in rows),
+        "gpu_processes": gpu_rows,
+        "gpu_used_memory_mib": sum(row["used_memory_mib"] for row in gpu_rows),
+    }
 
 
 def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
@@ -1199,6 +1295,7 @@ def accept_online(
     deferred_comm_destroy: bool = False,
     post_takeover_comm_destroy: bool = False,
     persistent_channel: bool = False,
+    persistent_expected_session_count: int = 1,
 ) -> dict[str, Any]:
     background = common.read_json(background_dir / "background_summary.json")
     session = common.read_json(controller_dir / "session_manifest.json")
@@ -1423,6 +1520,7 @@ def accept_online(
     gpu_direct_history = staging.get("gpu_direct_history") is True
     gpu_direct_delta = staging.get("gpu_direct_delta") is True
     direct_sender: dict[str, Any] = {}
+    target_channel_receipts: list[dict[str, Any]] = []
     if gpu_direct_history:
         direct_sender_path = controller_dir / "gpu_direct_sender.json"
         if not direct_sender_path.is_file():
@@ -1459,7 +1557,9 @@ def accept_online(
                     errors.append(
                         "GPU-direct source channel was destroyed during request"
                     )
-                if int(direct_sender.get("channel_session_count", -1)) != 1:
+                if int(direct_sender.get("channel_session_count", -1)) != int(
+                    persistent_expected_session_count
+                ):
                     errors.append(
                         "GPU-direct source channel session count differs"
                     )
@@ -1488,6 +1588,12 @@ def accept_online(
                     if int(row.get("channel_destroy_count", -1)) != 0:
                         errors.append(
                             "persistent target channel was destroyed during request"
+                        )
+                    if int(row.get("channel_session_count", -1)) != int(
+                        persistent_expected_session_count
+                    ):
+                        errors.append(
+                            "persistent target channel session count differs"
                         )
                     if row.get("session_request_id") != session.get(
                         "source_request_id"
@@ -1832,6 +1938,8 @@ def accept_online(
     return {
         "format_version": 1,
         "status": "PASS" if not errors else "FAIL",
+        "migration_id": session.get("migration_id"),
+        "source_request_id": session.get("source_request_id"),
         "evidence_class": (
             "ONLINE_VLLM_REQUEST_LEVEL_STOP_AND_COPY"
             if stop_and_copy
@@ -2165,6 +2273,38 @@ def accept_online(
         "target_origin_tokens": proxy.get("target_origin_tokens"),
         "receiver_ranks": receipts.get("receiver_ranks"),
         "exact_readback": receipts.get("exact_readback"),
+        "persistent_channel_evidence": (
+            {
+                "source": {
+                    key: direct_sender.get(key)
+                    for key in (
+                        "communicator_lifecycle",
+                        "channel_generation",
+                        "channel_create_count",
+                        "channel_destroy_count",
+                        "channel_session_count",
+                        "buffer_high_water_bytes",
+                    )
+                },
+                "targets": [
+                    {
+                        key: row.get(key)
+                        for key in (
+                            "tp_rank",
+                            "status",
+                            "channel_generation",
+                            "channel_create_count",
+                            "channel_destroy_count",
+                            "channel_session_count",
+                            "buffer_high_water_bytes",
+                        )
+                    }
+                    for row in target_channel_receipts
+                ],
+            }
+            if persistent_channel
+            else None
+        ),
         "target_ready_sync_scopes": receipts.get("ready_sync_scopes"),
         "target_ready_event_wait_ms": receipts.get("ready_event_wait_ms"),
         "target_device_wide_synchronize": receipts.get(
@@ -2223,6 +2363,8 @@ def main() -> None:
         "gpu_direct_delta": args.gpu_direct_delta,
         "persistent_channel": args.persistent_channel,
         "channel_generation": args.channel_generation,
+        "persistent_sequential_reuse": args.persistent_sequential_reuse,
+        "persistent_session_gap_s": args.persistent_session_gap_s,
         "gpu_direct_delta_batch_tokens": args.gpu_direct_delta_batch_tokens,
         "gpu_direct_delta_flush_ms": args.gpu_direct_delta_flush_ms,
         "ready_sync_mode": args.ready_sync_mode,
@@ -2274,6 +2416,12 @@ def main() -> None:
         "runs": [],
     }
     common.write_json(out_root / "batch_status.json", batch)
+    service_pool: dict[str, Any] | None = None
+    if args.persistent_sequential_reuse:
+        service_pool = {
+            "runtime_root": out_root / "persistent_runtime",
+            "processes": [],
+        }
     try:
         for repetition in range(1, args.repetitions + 1):
             variants = (
@@ -2437,6 +2585,11 @@ def main() -> None:
                         deferred_comm_destroy=selected_deferred_destroy,
                         post_takeover_comm_destroy=selected_post_destroy,
                         persistent_channel=args.persistent_channel,
+                        persistent_expected_session_count=(
+                            repetition
+                            if args.persistent_sequential_reuse
+                            else 1
+                        ),
                     )
 
                 source_env_overrides = {"BRIDGETP_SHADOW_STRATEGY": strategy}
@@ -2536,7 +2689,17 @@ def main() -> None:
                     background_before_controller=True,
                     background_lead_s=args.background_lead_s,
                     background_ready_jobs=args.minimum_ready_target_jobs,
+                    service_pool=service_pool,
                 )
+                memory_snapshot = None
+                if service_pool is not None:
+                    memory_snapshot = capture_persistent_memory(
+                        list(service_pool.get("processes", []))
+                    )
+                    common.write_json(
+                        rep_args.out_root / "persistent_memory_snapshot.json",
+                        memory_snapshot,
+                    )
                 batch["runs"].append(
                     {
                         "repetition": repetition,
@@ -2557,9 +2720,91 @@ def main() -> None:
                         "status": result["status"],
                         "root": str(rep_args.out_root.resolve()),
                         "acceptance": result["acceptance"],
+                        "persistent_memory": memory_snapshot,
                     }
                 )
                 common.write_json(out_root / "batch_status.json", batch)
+                if (
+                    args.persistent_sequential_reuse
+                    and args.persistent_session_gap_s > 0
+                ):
+                    time.sleep(args.persistent_session_gap_s)
+
+        persistent_summary = None
+        if args.persistent_sequential_reuse:
+            session_rows = [row["acceptance"] for row in batch["runs"]]
+            last_evidence = (
+                session_rows[-1].get("persistent_channel_evidence")
+                if session_rows
+                else None
+            ) or {}
+            source_channel = last_evidence.get("source") or {}
+            target_channels = last_evidence.get("targets") or []
+            migration_ids = [row.get("migration_id") for row in session_rows]
+            source_request_ids = [
+                row.get("source_request_id") for row in session_rows
+            ]
+            memory_rows = [
+                row.get("persistent_memory")
+                for row in batch["runs"]
+                if row.get("persistent_memory") is not None
+            ]
+            persistent_errors: list[str] = []
+            if len(set(migration_ids)) != len(migration_ids):
+                persistent_errors.append("migration IDs are not unique")
+            if len(set(source_request_ids)) != len(source_request_ids):
+                persistent_errors.append("source request IDs are not unique")
+            if int(source_channel.get("channel_create_count", -1)) != 1:
+                persistent_errors.append("source communicator was not created once")
+            if int(source_channel.get("channel_destroy_count", -1)) != 0:
+                persistent_errors.append("source communicator was destroyed")
+            if int(source_channel.get("channel_session_count", -1)) != len(
+                session_rows
+            ):
+                persistent_errors.append("source session count is incomplete")
+            if len(target_channels) != 4 or any(
+                int(row.get("channel_create_count", -1)) != 1
+                or int(row.get("channel_destroy_count", -1)) != 0
+                or int(row.get("channel_session_count", -1))
+                != len(session_rows)
+                for row in target_channels
+            ):
+                persistent_errors.append("target channel lifecycle differs")
+            rss_values = [
+                int(row.get("process_tree_rss_kib", 0)) for row in memory_rows
+            ]
+            gpu_values = [
+                int(row.get("gpu_used_memory_mib", 0)) for row in memory_rows
+            ]
+            handoff_values = [
+                float(row["handoff_stall_ms"])
+                for row in session_rows
+                if row.get("handoff_stall_ms") is not None
+            ]
+            persistent_summary = {
+                "format_version": 1,
+                "status": "PASS" if not persistent_errors else "FAIL",
+                "channel_generation": args.channel_generation,
+                "sessions": len(session_rows),
+                "migration_ids": migration_ids,
+                "source_request_ids": source_request_ids,
+                "source_channel": source_channel,
+                "target_channels": target_channels,
+                "handoff_stall_ms": handoff_values,
+                "process_tree_rss_kib": rss_values,
+                "gpu_used_memory_mib": gpu_values,
+                "rss_growth_kib": (
+                    rss_values[-1] - rss_values[0] if rss_values else None
+                ),
+                "gpu_growth_mib": (
+                    gpu_values[-1] - gpu_values[0] if gpu_values else None
+                ),
+                "errors": persistent_errors,
+            }
+            common.write_json(
+                out_root / "persistent_channel_summary.json",
+                persistent_summary,
+            )
 
         errors = [
             f"r{row['repetition']:02d} "
@@ -2568,6 +2813,8 @@ def main() -> None:
             if row.get("status") != "PASS"
             or row.get("acceptance", {}).get("status") != "PASS"
         ]
+        if persistent_summary is not None:
+            errors.extend(persistent_summary["errors"])
         final = {
             "format_version": 1,
             "status": "PASS" if not errors else "FAIL",
@@ -2588,6 +2835,7 @@ def main() -> None:
             ),
             "recorded_runs": len(batch["runs"]),
             "runs": batch["runs"],
+            "persistent_channel_summary": persistent_summary,
             "errors": errors,
         }
         write_measurements(out_root, batch["runs"])
@@ -2604,6 +2852,29 @@ def main() -> None:
         batch["error"] = f"{type(error).__name__}: {error}"
         common.write_json(out_root / "batch_status.json", batch)
         raise
+    finally:
+        if service_pool is not None:
+            pooled = list(service_pool.get("processes", []))
+            common.stop_processes(pooled)
+            common.write_json(
+                out_root / "persistent_process_lifetimes.json",
+                {
+                    "format_version": 1,
+                    "channel_generation": args.channel_generation,
+                    "sessions_requested": args.repetitions,
+                    "processes": [
+                        {
+                            "name": item.name,
+                            "pid": item.process.pid,
+                            "started_unix_s": item.started_unix_s,
+                            "ended_unix_s": item.ended_unix_s,
+                            "returncode": item.returncode,
+                            "log_path": str(item.log_path.resolve()),
+                        }
+                        for item in pooled
+                    ],
+                },
+            )
 
 
 if __name__ == "__main__":

@@ -151,6 +151,10 @@ def parse_args() -> argparse.Namespace:
             "rank-ready hints have arrived; zero preserves timeout polling"
         ),
     )
+    parser.add_argument(
+        "--source-request-id",
+        help="explicit request identity for persistent sequential sessions",
+    )
     args = parser.parse_args()
     trigger = args.diagnostic_trigger_output_tokens
     cutover = args.diagnostic_cutover_output_tokens
@@ -174,11 +178,15 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def _prepare_source_request(source: dict[str, Any], run_dir: Path) -> dict[str, Any]:
+def _prepare_source_request(
+    source: dict[str, Any],
+    run_dir: Path,
+    request_id: str | None = None,
+) -> dict[str, Any]:
     request = freeze_strict_greedy_sampling(source)
     request.update(
         {
-            "request_id": f"bridgetp-phase9-{run_dir.name}",
+            "request_id": request_id or f"bridgetp-phase9-{run_dir.name}",
             "stream": True,
             "return_token_ids": True,
         }
@@ -271,6 +279,7 @@ def _start_target_if_ready(
     gpu_resident_shadow: bool = False,
     cutover_output_tokens: int | None = None,
     stop_and_copy: bool = False,
+    target_request_name: str | None = None,
 ) -> Future[dict[str, Any]] | None:
     if target_future is not None:
         return target_future
@@ -288,7 +297,7 @@ def _start_target_if_ready(
         target_request, cutover = build_gpu_resident_shadow_target_request(
             source_request,
             staging,
-            run_dir.name,
+            target_request_name or run_dir.name,
             cutover_output_tokens,
             allow_complete_prefix=stop_and_copy,
         )
@@ -296,7 +305,7 @@ def _start_target_if_ready(
         target_request, cutover = build_target_request(
             source_request,
             staging,
-            run_dir.name,
+            target_request_name or run_dir.name,
         )
     if recorder.proxy.cutover_index != cutover:
         raise RuntimeError(
@@ -766,6 +775,7 @@ def main() -> None:
     source_request = _prepare_source_request(
         load_json(args.source_request),
         run_dir,
+        args.source_request_id,
     )
     atomic_json_dump(source_request, run_dir / "source_request.json")
 
@@ -802,7 +812,12 @@ def main() -> None:
         ready_notification_port=args.ready_notification_port,
         ready_latch_poll_ms=args.ready_latch_poll_ms,
     )
-    probe = RuntimeControl(armed=False, note="phase 9 preflight").write(run_dir)
+    probe = RuntimeControl(
+        armed=False,
+        migration_id=args.migration_id or None,
+        source_request_id_prefix=str(source_request["request_id"]),
+        note="phase 9 preflight",
+    ).write(run_dir)
 
     target_future: Future[dict[str, Any]] | None = None
     audit: AuditLog | None = None
@@ -968,6 +983,11 @@ def main() -> None:
                         gpu_resident_shadow=args.gpu_resident_shadow,
                         cutover_output_tokens=diagnostic_cutover,
                         stop_and_copy=args.stop_and_copy,
+                        target_request_name=(
+                            args.migration_id
+                            if args.source_request_id
+                            else None
+                        ),
                     )
                     if (
                         args.handoff_mode == "bridge"
