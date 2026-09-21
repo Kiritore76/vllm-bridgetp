@@ -19,7 +19,14 @@ from typing import Any, Callable
 
 import torch
 
-from vllm.bridge_tp.stream_protocol import recv_json, send_json
+from vllm.bridge_tp.stream_protocol import (
+    PayloadType,
+    PersistentChannelLifecycle,
+    ProtocolViolation,
+    SessionEnvelope,
+    recv_json,
+    send_json,
+)
 from vllm.distributed.device_communicators.pynccl_wrapper import (
     NCCLLibrary,
     buffer_type,
@@ -30,6 +37,44 @@ from vllm.distributed.device_communicators.pynccl_wrapper import (
 TRANSPORT = "NCCL_P2P_GPU_DIRECT"
 INTEGRITY = "NCCL_COMPLETION_PLUS_GPU_EXACT_READBACK"
 _TIMEOUT_S = 600.0
+
+
+def _session_message(
+    operation: str,
+    envelope: SessionEnvelope,
+    **extra: Any,
+) -> dict[str, Any]:
+    return {"op": operation, **envelope.to_wire(), **extra}
+
+
+def _ack_envelope(envelope: SessionEnvelope) -> SessionEnvelope:
+    return SessionEnvelope(
+        channel_generation=envelope.channel_generation,
+        migration_id=envelope.migration_id,
+        request_id=envelope.request_id,
+        sequence_number=envelope.sequence_number,
+        payload_type=PayloadType.ACK,
+        token_start=envelope.token_start,
+        token_end=envelope.token_end,
+        rank=envelope.rank,
+    )
+
+
+def _validate_ack(
+    value: dict[str, Any],
+    *,
+    expected_status: str,
+    expected: SessionEnvelope,
+) -> None:
+    if value.get("status") != expected_status:
+        raise ProtocolViolation(
+            f"persistent-channel rank {expected.rank} returned "
+            f"{value.get('status')!r}, expected {expected_status!r}"
+        )
+    received = SessionEnvelope.from_wire(value)
+    expected_ack = _ack_envelope(expected)
+    if received != expected_ack:
+        raise ProtocolViolation("persistent-channel ACK identity differs")
 
 
 def tensor_id(migration_id: str, rank: int, layer_index: int) -> str:
@@ -146,6 +191,15 @@ class GpuDirectHistoryReceiver:
         self.destroy_completed_unix_s: float | None = None
         self.destroy_error: str | None = None
         self._destroy_thread: threading.Thread | None = None
+        self.persistent_channel = False
+        self.channel_generation = 0
+        self.topology_key = ""
+        self.lifecycle: PersistentChannelLifecycle | None = None
+        self._active_request_id: str | None = None
+        self._last_delta_envelope: SessionEnvelope | None = None
+        self._packed_buffer: torch.Tensor | None = None
+        self.buffer_capacity_elements = 0
+        self.buffer_high_water_bytes = 0
 
     def _open(self, *, migration_id: str, rank: int) -> None:
         if self.connection is not None:
@@ -154,7 +208,8 @@ class GpuDirectHistoryReceiver:
         connection, _ = self.listener.accept()
         connection.settimeout(_TIMEOUT_S)
         hello = recv_json(connection)
-        if hello.get("migration_id") != migration_id:
+        persistent_channel = bool(hello.get("persistent_channel", False))
+        if not persistent_channel and hello.get("migration_id") != migration_id:
             raise ValueError("GPU-direct migration ID differs")
         if int(hello.get("target_tp_rank", -1)) != rank:
             raise ValueError("GPU-direct target rank differs")
@@ -164,7 +219,65 @@ class GpuDirectHistoryReceiver:
             self.comm = self.nccl.ncclCommInitRank(2, unique_id, 1)
             self.stream = torch.cuda.Stream(device=self.device)
         self.connection = connection
-        send_json(connection, {"status": "COMM_READY"})
+        if persistent_channel:
+            generation = int(hello.get("channel_generation", -1))
+            topology_key = str(hello.get("topology_key", ""))
+            if generation < 0 or not topology_key:
+                raise ProtocolViolation(
+                    "persistent-channel hello is missing channel identity"
+                )
+            self.persistent_channel = True
+            self.channel_generation = generation
+            self.topology_key = topology_key
+            self.lifecycle = PersistentChannelLifecycle(
+                topology_key=topology_key,
+                expected_ranks=frozenset({rank}),
+                channel_generation=generation,
+            )
+            self.lifecycle.mark_open()
+            send_json(
+                connection,
+                {
+                    "status": "CHANNEL_READY",
+                    "channel_generation": generation,
+                    "target_tp_rank": rank,
+                },
+            )
+        else:
+            send_json(connection, {"status": "COMM_READY"})
+
+    def _start_persistent_session(
+        self,
+        *,
+        migration_id: str,
+        request_id: str,
+    ) -> SessionEnvelope:
+        if self.connection is None or self.lifecycle is None:
+            raise RuntimeError("persistent GPU-direct channel is not open")
+        message = recv_json(self.connection)
+        if message.get("op") != "START_SESSION":
+            raise ProtocolViolation("expected START_SESSION")
+        envelope = SessionEnvelope.from_wire(message)
+        if envelope.payload_type is not PayloadType.START_SESSION:
+            raise ProtocolViolation("START_SESSION payload type differs")
+        if envelope.migration_id != migration_id:
+            raise ProtocolViolation("START_SESSION migration_id differs")
+        if envelope.request_id != request_id:
+            raise ProtocolViolation("START_SESSION request_id differs")
+        session = self.lifecycle.start_session(
+            migration_id=migration_id,
+            request_id=request_id,
+        )
+        session.accept_inbound(envelope)
+        self._active_request_id = request_id
+        send_json(
+            self.connection,
+            {
+                "status": "SESSION_READY",
+                **_ack_envelope(envelope).to_wire(),
+            },
+        )
+        return envelope
 
     @staticmethod
     def _dtype(name: str) -> torch.dtype:
@@ -180,19 +293,43 @@ class GpuDirectHistoryReceiver:
         dtype: torch.dtype,
         tensor_key: str,
         synchronize: bool,
+        envelope: SessionEnvelope | None = None,
     ) -> tuple[torch.Tensor, float, torch.cuda.Event]:
         if self.connection is None or self.nccl is None:
             raise RuntimeError("GPU-direct receiver is not connected")
         if self.comm is None or self.stream is None:
             raise RuntimeError("GPU-direct receiver communicator is missing")
         counts = [math.prod(shape) for shape in shapes]
+        required_elements = sum(counts)
         with torch.cuda.device(self.device):
-            packed = torch.empty(sum(counts), dtype=dtype, device=self.device)
-        send_json(
-            self.connection,
-            {"status": "READY_TO_RECV", "tensor_id": tensor_key,
-             "numel": packed.numel()},
-        )
+            reusable_buffer = (
+                self.persistent_channel
+                and self._packed_buffer is not None
+                and self._packed_buffer.dtype == dtype
+                and self.buffer_capacity_elements >= required_elements
+            )
+            if not reusable_buffer:
+                capacity = max(required_elements, self.buffer_capacity_elements)
+                self._packed_buffer = torch.empty(
+                    capacity,
+                    dtype=dtype,
+                    device=self.device,
+                )
+                self.buffer_capacity_elements = capacity
+                self.buffer_high_water_bytes = max(
+                    self.buffer_high_water_bytes,
+                    capacity * self._packed_buffer.element_size(),
+                )
+            assert self._packed_buffer is not None
+            packed = self._packed_buffer.narrow(0, 0, required_elements)
+        ready: dict[str, Any] = {
+            "status": "READY_TO_RECV",
+            "tensor_id": tensor_key,
+            "numel": packed.numel(),
+        }
+        if envelope is not None:
+            ready.update(_ack_envelope(envelope).to_wire())
+        send_json(self.connection, ready)
         started = time.perf_counter()
         receive_done = _recv_tensor(self.nccl, self.comm, packed, self.stream)
         if synchronize:
@@ -221,6 +358,7 @@ class GpuDirectHistoryReceiver:
         self,
         *,
         migration_id: str,
+        request_id: str | None = None,
         rank: int,
         layer_records: list[dict[str, Any]],
         keep_open: bool = False,
@@ -229,6 +367,30 @@ class GpuDirectHistoryReceiver:
         started = time.perf_counter()
         self._open(migration_id=migration_id, rank=rank)
         try:
+            history_envelope: SessionEnvelope | None = None
+            if self.persistent_channel:
+                if not keep_open:
+                    raise ProtocolViolation(
+                        "persistent receiver must keep channel open"
+                    )
+                if not request_id:
+                    raise ProtocolViolation(
+                        "persistent history requires request_id"
+                    )
+                self._start_persistent_session(
+                    migration_id=migration_id,
+                    request_id=request_id,
+                )
+                assert self.connection is not None
+                history_message = recv_json(self.connection)
+                if history_message.get("op") != "HISTORY":
+                    raise ProtocolViolation("expected HISTORY")
+                history_envelope = SessionEnvelope.from_wire(history_message)
+                if history_envelope.payload_type is not PayloadType.HISTORY:
+                    raise ProtocolViolation("HISTORY payload type differs")
+                assert self.lifecycle is not None
+                assert self.lifecycle.active_session is not None
+                self.lifecycle.active_session.accept_inbound(history_envelope)
             if not layer_records:
                 raise ValueError("GPU-direct history has no layer records")
             dtype_names = {
@@ -247,16 +409,35 @@ class GpuDirectHistoryReceiver:
                 dtype=dtype,
                 tensor_key=tensor_id(migration_id, rank, 0),
                 synchronize=synchronize,
+                envelope=history_envelope,
             )
             assert self.connection is not None
-            send_json(self.connection, {"status": "RECEIVED"})
+            if history_envelope is None:
+                send_json(self.connection, {"status": "RECEIVED"})
+            else:
+                send_json(
+                    self.connection,
+                    {
+                        "status": "RECEIVED",
+                        **_ack_envelope(history_envelope).to_wire(),
+                    },
+                )
             layers = self._unpack(
                 packed,
                 [str(row["layer_name"]) for row in layer_records],
                 shapes,
             )
             raw_bytes = packed.numel() * packed.element_size()
-            send_json(self.connection, {"status": "COMPLETE"})
+            if history_envelope is None:
+                send_json(self.connection, {"status": "COMPLETE"})
+            else:
+                send_json(
+                    self.connection,
+                    {
+                        "status": "COMPLETE",
+                        **_ack_envelope(history_envelope).to_wire(),
+                    },
+                )
             result = ReceiveResult(
                 layers=layers,
                 raw_tensor_bytes=raw_bytes,
@@ -281,6 +462,30 @@ class GpuDirectHistoryReceiver:
         if self.connection is None:
             raise RuntimeError("history must be received before GPU delta")
         header = recv_json(self.connection)
+        if (
+            getattr(self, "persistent_channel", False)
+            and header.get("op") == "END_SESSION"
+        ):
+            envelope = SessionEnvelope.from_wire(header)
+            if envelope.payload_type is not PayloadType.END_SESSION:
+                raise ProtocolViolation("END_SESSION payload type differs")
+            if self.lifecycle is None or self.lifecycle.active_session is None:
+                raise ProtocolViolation("persistent channel has no active session")
+            session = self.lifecycle.active_session
+            session.accept_inbound(envelope)
+            session.mark_rank_ready(rank)
+            session.commit()
+            send_json(
+                self.connection,
+                {
+                    "status": "SESSION_ENDED",
+                    **_ack_envelope(envelope).to_wire(),
+                },
+            )
+            self.lifecycle.finish_session()
+            self._active_request_id = None
+            self._last_delta_envelope = None
+            return None
         if header.get("op") == "CLOSE":
             self.terminal_close_received_unix_s = time.time()
             send_json(self.connection, {"status": "CLOSED"})
@@ -301,6 +506,15 @@ class GpuDirectHistoryReceiver:
             raise ValueError("GPU-direct delta migration ID differs")
         if int(header.get("target_tp_rank", -1)) != rank:
             raise ValueError("GPU-direct delta rank differs")
+        delta_envelope: SessionEnvelope | None = None
+        if getattr(self, "persistent_channel", False):
+            delta_envelope = SessionEnvelope.from_wire(header)
+            if delta_envelope.payload_type is not PayloadType.DELTA:
+                raise ProtocolViolation("DELTA payload type differs")
+            if self.lifecycle is None or self.lifecycle.active_session is None:
+                raise ProtocolViolation("persistent channel has no active session")
+            self.lifecycle.active_session.accept_inbound(delta_envelope)
+            self._last_delta_envelope = delta_envelope
         shapes = [[int(value) for value in row] for row in header["shapes"]]
         names = [str(value) for value in header["layer_names"]]
         started = time.perf_counter()
@@ -309,6 +523,7 @@ class GpuDirectHistoryReceiver:
             dtype=self._dtype(str(header["dtype"])),
             tensor_key=str(header["tensor_id"]),
             synchronize=synchronize,
+            envelope=delta_envelope,
         )
         return ReceiveResult(
             layers=self._unpack(packed, names, shapes),
@@ -322,11 +537,32 @@ class GpuDirectHistoryReceiver:
     def acknowledge_delta(self, *, start_token: int, end_token: int) -> None:
         if self.connection is None:
             raise RuntimeError("GPU-direct receiver is closed")
-        send_json(
-            self.connection,
-            {"status": "APPLIED", "start_token": start_token,
-             "end_token": end_token},
-        )
+        if getattr(self, "persistent_channel", False):
+            envelope = self._last_delta_envelope
+            if envelope is None:
+                raise ProtocolViolation("persistent delta ACK has no message")
+            if (
+                envelope.token_start != start_token
+                or envelope.token_end != end_token
+            ):
+                raise ProtocolViolation("persistent delta ACK range differs")
+            send_json(
+                self.connection,
+                {
+                    "status": "APPLIED",
+                    **_ack_envelope(envelope).to_wire(),
+                },
+            )
+            self._last_delta_envelope = None
+        else:
+            send_json(
+                self.connection,
+                {
+                    "status": "APPLIED",
+                    "start_token": start_token,
+                    "end_token": end_token,
+                },
+            )
 
     def _close_control(self) -> None:
         closed = False
@@ -415,22 +651,36 @@ class GpuDirectHistoryReceiver:
         self._destroy_thread.start()
 
     def close(self) -> None:
+        if self.lifecycle is not None:
+            if self.lifecycle.active_session is not None:
+                self.lifecycle.active_session.cancel()
+                self.lifecycle.finish_session()
+            self.lifecycle.shutdown()
         if self._destroy_thread is None and self.comm is not None:
             assert self.nccl is not None
             self.nccl.ncclCommDestroy(self.comm)
             self.comm = None
             self.nccl = None
         self.stream = None
+        self._packed_buffer = None
+        self.buffer_capacity_elements = 0
         self._close_control()
 
     def abort(self) -> None:
         """Release a pooled communicator during worker shutdown."""
+        if self.lifecycle is not None:
+            if self.lifecycle.active_session is not None:
+                self.lifecycle.active_session.cancel()
+                self.lifecycle.finish_session()
+            self.lifecycle.shutdown()
         if self.comm is not None:
             assert self.nccl is not None
             self.nccl.ncclCommAbort(self.comm)
             self.comm = None
             self.nccl = None
         self.stream = None
+        self._packed_buffer = None
+        self.buffer_capacity_elements = 0
         self._close_control()
 
 
@@ -446,11 +696,49 @@ class GpuDirectHistorySender:
         self.streams: list[torch.cuda.Stream] = []
         self.producer_stream: torch.cuda.Stream | None = None
         self.target_tp_size = 0
+        self.target_addresses: tuple[str, ...] = ()
+        self.persistent_channel = False
+        self.channel_generation = 0
+        self.topology_key = ""
+        self.lifecycle: PersistentChannelLifecycle | None = None
+        self._active_migration_id: str | None = None
+        self._active_request_id: str | None = None
+        self._next_sequence_by_rank: dict[int, int] = {}
+        self._packed_buffers: list[torch.Tensor] = []
+        self.buffer_capacity_elements = 0
+        self.buffer_high_water_bytes = 0
+
+    def _next_envelope(
+        self,
+        *,
+        rank: int,
+        payload_type: PayloadType,
+        token_start: int,
+        token_end: int,
+    ) -> SessionEnvelope:
+        if self._active_migration_id is None or self._active_request_id is None:
+            raise ProtocolViolation("persistent sender has no active session")
+        sequence = self._next_sequence_by_rank[rank]
+        self._next_sequence_by_rank[rank] = sequence + 1
+        return SessionEnvelope(
+            channel_generation=self.channel_generation,
+            migration_id=self._active_migration_id,
+            request_id=self._active_request_id,
+            sequence_number=sequence,
+            payload_type=payload_type,
+            token_start=token_start,
+            token_end=token_end,
+            rank=rank,
+        )
 
     def send(
         self,
         *,
         migration_id: str,
+        request_id: str | None = None,
+        channel_generation: int = 0,
+        persistent_channel: bool = False,
+        history_end_token: int | None = None,
         kv_caches: list[torch.Tensor],
         layer_names: list[str],
         block_ids: list[int],
@@ -464,34 +752,111 @@ class GpuDirectHistorySender:
             raise ValueError("KV cache and layer-name counts differ")
         if len(target_addresses) != target_tp_size:
             raise ValueError("target address count differs from TP size")
+        if persistent_channel and not request_id:
+            raise ValueError("persistent GPU-direct history requires request_id")
+        if persistent_channel and history_end_token is None:
+            raise ValueError(
+                "persistent GPU-direct history requires history_end_token"
+            )
+        if persistent_channel and not keep_open:
+            raise ValueError("persistent GPU-direct history must keep channel open")
 
-        nccl = NCCLLibrary()
-        connections: list[socket.socket] = []
-        comms: list[Any] = []
+        topology_key = "|".join(target_addresses)
+        reuse_channel = persistent_channel and self.nccl is not None
+        if reuse_channel:
+            if not self.persistent_channel or self.lifecycle is None:
+                raise ProtocolViolation("sender does not own a persistent channel")
+            if channel_generation != self.channel_generation:
+                raise ProtocolViolation("sender channel generation differs")
+            if topology_key != self.topology_key:
+                raise ProtocolViolation("sender topology differs")
+            if target_tp_size != self.target_tp_size:
+                raise ProtocolViolation("sender target TP size differs")
+            nccl = self.nccl
+            connections = self.connections
+            comms = self.comms
+        else:
+            nccl = NCCLLibrary()
+            connections = []
+            comms = []
         succeeded = False
         try:
-            for rank, address in enumerate(target_addresses):
-                connection = _connect(address)
-                unique_id = nccl.ncclGetUniqueId()
-                send_json(
-                    connection,
-                    {
-                        "migration_id": migration_id,
-                        "target_tp_rank": rank,
-                        "nccl_unique_id_b64": base64.b64encode(
-                            bytes(unique_id.internal)
-                        ).decode("ascii"),
-                    },
-                )
-                with torch.cuda.device(self.device):
-                    comm = nccl.ncclCommInitRank(2, unique_id, 0)
-                ready = recv_json(connection)
-                if ready.get("status") != "COMM_READY":
-                    raise RuntimeError(
-                        f"GPU-direct rank {rank} did not become ready"
+            if not reuse_channel:
+                for rank, address in enumerate(target_addresses):
+                    connection = _connect(address)
+                    unique_id = nccl.ncclGetUniqueId()
+                    send_json(
+                        connection,
+                        {
+                            "migration_id": migration_id,
+                            "target_tp_rank": rank,
+                            "nccl_unique_id_b64": base64.b64encode(
+                                bytes(unique_id.internal)
+                            ).decode("ascii"),
+                            "persistent_channel": persistent_channel,
+                            "channel_generation": channel_generation,
+                            "topology_key": topology_key,
+                        },
                     )
-                connections.append(connection)
-                comms.append(comm)
+                    with torch.cuda.device(self.device):
+                        comm = nccl.ncclCommInitRank(2, unique_id, 0)
+                    ready = recv_json(connection)
+                    expected_status = (
+                        "CHANNEL_READY" if persistent_channel else "COMM_READY"
+                    )
+                    if ready.get("status") != expected_status:
+                        raise RuntimeError(
+                            f"GPU-direct rank {rank} did not become ready"
+                        )
+                    if persistent_channel and (
+                        int(ready.get("channel_generation", -1))
+                        != channel_generation
+                        or int(ready.get("target_tp_rank", -1)) != rank
+                    ):
+                        raise ProtocolViolation(
+                            f"GPU-direct rank {rank} channel identity differs"
+                        )
+                    connections.append(connection)
+                    comms.append(comm)
+                if persistent_channel:
+                    self.persistent_channel = True
+                    self.channel_generation = channel_generation
+                    self.topology_key = topology_key
+                    self.lifecycle = PersistentChannelLifecycle(
+                        topology_key=topology_key,
+                        expected_ranks=frozenset(range(target_tp_size)),
+                        channel_generation=channel_generation,
+                    )
+                    self.lifecycle.mark_open()
+
+            if persistent_channel:
+                assert request_id is not None
+                assert self.lifecycle is not None
+                self.lifecycle.start_session(
+                    migration_id=migration_id,
+                    request_id=request_id,
+                )
+                self._active_migration_id = migration_id
+                self._active_request_id = request_id
+                self._next_sequence_by_rank = {
+                    rank: 0 for rank in range(target_tp_size)
+                }
+                for rank, connection in enumerate(connections):
+                    envelope = self._next_envelope(
+                        rank=rank,
+                        payload_type=PayloadType.START_SESSION,
+                        token_start=0,
+                        token_end=0,
+                    )
+                    send_json(
+                        connection,
+                        _session_message("START_SESSION", envelope),
+                    )
+                    _validate_ack(
+                        recv_json(connection),
+                        expected_status="SESSION_READY",
+                        expected=envelope,
+                    )
 
             started = time.perf_counter()
             block_index = torch.tensor(
@@ -508,15 +873,43 @@ class GpuDirectHistorySender:
                 for cache in kv_caches
             )
             with torch.cuda.device(self.device):
-                producer_stream = torch.cuda.Stream(device=self.device)
-                send_streams = [
-                    torch.cuda.Stream(device=self.device)
-                    for _ in range(target_tp_size)
-                ]
-                packed_by_rank = [
-                    torch.empty(rank_elements, dtype=dtype, device=self.device)
-                    for _ in range(target_tp_size)
-                ]
+                producer_stream = self.producer_stream
+                if producer_stream is None:
+                    producer_stream = torch.cuda.Stream(device=self.device)
+                send_streams = self.streams
+                if len(send_streams) != target_tp_size:
+                    send_streams = [
+                        torch.cuda.Stream(device=self.device)
+                        for _ in range(target_tp_size)
+                    ]
+                reusable_buffers = (
+                    persistent_channel
+                    and len(self._packed_buffers) == target_tp_size
+                    and self.buffer_capacity_elements >= rank_elements
+                    and all(value.dtype == dtype for value in self._packed_buffers)
+                )
+                if reusable_buffers:
+                    packed_by_rank = [
+                        value.narrow(0, 0, rank_elements)
+                        for value in self._packed_buffers
+                    ]
+                else:
+                    capacity = max(rank_elements, self.buffer_capacity_elements)
+                    self._packed_buffers = [
+                        torch.empty(capacity, dtype=dtype, device=self.device)
+                        for _ in range(target_tp_size)
+                    ]
+                    self.buffer_capacity_elements = capacity
+                    packed_by_rank = [
+                        value.narrow(0, 0, rank_elements)
+                        for value in self._packed_buffers
+                    ]
+                    self.buffer_high_water_bytes = max(
+                        self.buffer_high_water_bytes,
+                        capacity
+                        * kv_caches[0].element_size()
+                        * target_tp_size,
+                    )
             self.streams = send_streams
             offsets = [0] * target_tp_size
             with torch.cuda.stream(producer_stream):
@@ -539,6 +932,27 @@ class GpuDirectHistorySender:
             producer_stream.synchronize()
             if offsets != [rank_elements] * target_tp_size:
                 raise RuntimeError("GPU-direct packed history size differs")
+            history_envelopes: dict[int, SessionEnvelope] = {}
+            if persistent_channel:
+                assert history_end_token is not None
+                assert self.lifecycle is not None
+                assert self.lifecycle.active_session is not None
+                for rank, connection in enumerate(connections):
+                    envelope = self._next_envelope(
+                        rank=rank,
+                        payload_type=PayloadType.HISTORY,
+                        token_start=0,
+                        token_end=history_end_token,
+                    )
+                    history_envelopes[rank] = envelope
+                    self.lifecycle.active_session.expect_ack(
+                        rank=rank,
+                        sequence_number=envelope.sequence_number,
+                    )
+                    send_json(
+                        connection,
+                        _session_message("HISTORY", envelope),
+                    )
             for rank, connection in enumerate(connections):
                 ready = recv_json(connection)
                 if (
@@ -548,6 +962,12 @@ class GpuDirectHistorySender:
                     raise RuntimeError(
                         f"GPU-direct rank {rank} rejected packed history"
                     )
+                if persistent_channel:
+                    _validate_ack(
+                        ready,
+                        expected_status="READY_TO_RECV",
+                        expected=history_envelopes[rank],
+                    )
             _send_group(nccl, comms, packed_by_rank, send_streams)
             for rank, connection in enumerate(connections):
                 received = recv_json(connection)
@@ -555,10 +975,30 @@ class GpuDirectHistorySender:
                     raise RuntimeError(
                         f"GPU-direct rank {rank} missed packed history"
                     )
+                if persistent_channel:
+                    _validate_ack(
+                        received,
+                        expected_status="RECEIVED",
+                        expected=history_envelopes[rank],
+                    )
             for rank, connection in enumerate(connections):
                 final = recv_json(connection)
                 if final.get("status") != "COMPLETE":
                     raise RuntimeError(f"GPU-direct rank {rank} is incomplete")
+                if persistent_channel:
+                    _validate_ack(
+                        final,
+                        expected_status="COMPLETE",
+                        expected=history_envelopes[rank],
+                    )
+                    assert self.lifecycle is not None
+                    assert self.lifecycle.active_session is not None
+                    self.lifecycle.active_session.acknowledge(
+                        rank=rank,
+                        sequence_number=(
+                            history_envelopes[rank].sequence_number
+                        ),
+                    )
             elapsed_ms = (time.perf_counter() - started) * 1000
             bytes_by_rank = [
                 value.numel() * value.element_size()
@@ -569,6 +1009,24 @@ class GpuDirectHistorySender:
                     "target_tp_rank": rank,
                     "raw_tensor_bytes": count,
                     "transfer_ms": elapsed_ms,
+                    "channel_generation": (
+                        self.channel_generation if persistent_channel else None
+                    ),
+                    "channel_create_count": (
+                        self.lifecycle.create_count
+                        if persistent_channel and self.lifecycle is not None
+                        else None
+                    ),
+                    "channel_session_count": (
+                        self.lifecycle.session_count
+                        if persistent_channel and self.lifecycle is not None
+                        else None
+                    ),
+                    "buffer_high_water_bytes": (
+                        self.buffer_high_water_bytes
+                        if persistent_channel
+                        else None
+                    ),
                     "observed_gib_s": (
                         count / 1024**3 / (elapsed_ms / 1000)
                         if elapsed_ms > 0
@@ -584,6 +1042,7 @@ class GpuDirectHistorySender:
                 self.comms = comms
                 self.producer_stream = producer_stream
                 self.target_tp_size = target_tp_size
+                self.target_addresses = tuple(target_addresses)
             return result
         finally:
             if not (keep_open and succeeded):
@@ -611,6 +1070,8 @@ class GpuDirectHistorySender:
             raise RuntimeError("GPU-direct history session is not retained")
         if not start_token < end_token:
             raise ValueError("GPU-direct delta range is empty")
+        if self.persistent_channel and migration_id != self._active_migration_id:
+            raise ProtocolViolation("persistent delta migration_id differs")
         started = time.perf_counter()
         pack_started = time.perf_counter()
         rank_layers: list[list[torch.Tensor]] = [
@@ -681,7 +1142,26 @@ class GpuDirectHistorySender:
         producer.synchronize()
         pack_ms = (time.perf_counter() - pack_started) * 1000
         receiver_ready_started = time.perf_counter()
+        delta_envelopes: dict[int, SessionEnvelope] = {}
         for rank, connection in enumerate(self.connections):
+            identity: dict[str, Any] = {}
+            if self.persistent_channel:
+                if self.lifecycle is None or self.lifecycle.active_session is None:
+                    raise ProtocolViolation(
+                        "persistent sender has no active session"
+                    )
+                envelope = self._next_envelope(
+                    rank=rank,
+                    payload_type=PayloadType.DELTA,
+                    token_start=start_token,
+                    token_end=end_token,
+                )
+                delta_envelopes[rank] = envelope
+                self.lifecycle.active_session.expect_ack(
+                    rank=rank,
+                    sequence_number=envelope.sequence_number,
+                )
+                identity = envelope.to_wire()
             send_json(
                 connection,
                 {
@@ -699,6 +1179,7 @@ class GpuDirectHistorySender:
                     "shapes": shapes_by_rank[rank],
                     "dtype": str(packed_by_rank[rank].dtype),
                     "numel": packed_by_rank[rank].numel(),
+                    **identity,
                 },
             )
         for rank, connection in enumerate(self.connections):
@@ -708,6 +1189,12 @@ class GpuDirectHistorySender:
                 or int(ready.get("numel", -1)) != packed_by_rank[rank].numel()
             ):
                 raise RuntimeError(f"GPU-direct rank {rank} rejected delta")
+            if self.persistent_channel:
+                _validate_ack(
+                    ready,
+                    expected_status="READY_TO_RECV",
+                    expected=delta_envelopes[rank],
+                )
         receiver_ready_ms = (
             time.perf_counter() - receiver_ready_started
         ) * 1000
@@ -717,7 +1204,19 @@ class GpuDirectHistorySender:
         apply_ack_started = time.perf_counter()
         for rank, connection in enumerate(self.connections):
             applied = recv_json(connection)
-            if (
+            if self.persistent_channel:
+                _validate_ack(
+                    applied,
+                    expected_status="APPLIED",
+                    expected=delta_envelopes[rank],
+                )
+                assert self.lifecycle is not None
+                assert self.lifecycle.active_session is not None
+                self.lifecycle.active_session.acknowledge(
+                    rank=rank,
+                    sequence_number=delta_envelopes[rank].sequence_number,
+                )
+            elif (
                 applied.get("status") != "APPLIED"
                 or int(applied.get("start_token", -1)) != start_token
                 or int(applied.get("end_token", -1)) != end_token
@@ -747,6 +1246,40 @@ class GpuDirectHistorySender:
             ),
         }
 
+    def end_session(self) -> None:
+        """End one request while preserving the persistent channel."""
+        if not self.persistent_channel or self.lifecycle is None:
+            raise ProtocolViolation("sender does not own a persistent channel")
+        session = self.lifecycle.active_session
+        if session is None:
+            raise ProtocolViolation("persistent sender has no active session")
+        end_envelopes: dict[int, SessionEnvelope] = {}
+        for rank, connection in enumerate(self.connections):
+            envelope = self._next_envelope(
+                rank=rank,
+                payload_type=PayloadType.END_SESSION,
+                token_start=session.delta_watermarks.get(
+                    rank, session.history_watermarks.get(rank, 0)
+                ),
+                token_end=session.delta_watermarks.get(
+                    rank, session.history_watermarks.get(rank, 0)
+                ),
+            )
+            end_envelopes[rank] = envelope
+            send_json(connection, _session_message("END_SESSION", envelope))
+        for rank, connection in enumerate(self.connections):
+            _validate_ack(
+                recv_json(connection),
+                expected_status="SESSION_ENDED",
+                expected=end_envelopes[rank],
+            )
+            session.mark_rank_ready(rank)
+        session.commit()
+        self.lifecycle.finish_session()
+        self._active_migration_id = None
+        self._active_request_id = None
+        self._next_sequence_by_rank.clear()
+
     def close_control(self) -> None:
         """Complete the wire protocol without destroying communicators."""
         for connection in self.connections:
@@ -765,10 +1298,17 @@ class GpuDirectHistorySender:
 
     def close(self) -> None:
         self.close_control()
+        if self.lifecycle is not None:
+            if self.lifecycle.active_session is not None:
+                self.lifecycle.active_session.cancel()
+                self.lifecycle.finish_session()
+            self.lifecycle.shutdown()
         if self.nccl is not None:
             for comm in self.comms:
                 self.nccl.ncclCommDestroy(comm)
         self.producer_stream = None
+        self._packed_buffers = []
+        self.buffer_capacity_elements = 0
         self.comms = []
         self.streams = []
         self.nccl = None
@@ -776,10 +1316,17 @@ class GpuDirectHistorySender:
     def abort(self) -> None:
         """Release pooled communicators without peer-finalize coordination."""
         self.close_control()
+        if self.lifecycle is not None:
+            if self.lifecycle.active_session is not None:
+                self.lifecycle.active_session.cancel()
+                self.lifecycle.finish_session()
+            self.lifecycle.shutdown()
         if self.nccl is not None:
             for comm in self.comms:
                 self.nccl.ncclCommAbort(comm)
         self.producer_stream = None
+        self._packed_buffers = []
+        self.buffer_capacity_elements = 0
         self.comms = []
         self.streams = []
         self.nccl = None
