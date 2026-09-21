@@ -75,6 +75,13 @@ class BridgeTPStreamRequest:
     gpu_resident_shadow: bool = False
 
 
+def _persistent_session_request_id(request: BridgeTPStreamRequest) -> str:
+    """Return the source request identity shared by both migration peers."""
+    if not request.source_request_id:
+        raise ValueError("Persistent migration requires a source request ID")
+    return request.source_request_id
+
+
 @dataclass
 class BridgeTPStreamMetadata(KVConnectorMetadata):
     requests: list[BridgeTPStreamRequest] = field(default_factory=list)
@@ -903,6 +910,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
 
     def _live_gpu_load(self, request: BridgeTPStreamRequest) -> None:
         request_id = request.target_request_id
+        session_request_id = _persistent_session_request_id(request)
         try:
             manifest = self._load_manifest()
             tp_rank = get_tp_group().rank_in_group
@@ -964,7 +972,10 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     )
                 direct = receiver.receive(
                     migration_id=request.migration_id,
-                    request_id=request_id,
+                    # Session identity follows the request whose KV is being
+                    # moved.  TP4 creates a different runtime request ID for
+                    # the continuation, so it cannot be used on the wire.
+                    request_id=session_request_id,
                     rank=tp_rank,
                     layer_records=list(manifest["layers"]),
                     keep_open=gpu_direct_delta,
@@ -1379,7 +1390,8 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             if self.persistent_channel and receiver is not None:
                 self._record_persistent_receiver_idle(
                     receiver,
-                    request_id=request_id,
+                    target_request_id=request_id,
+                    session_request_id=session_request_id,
                     migration_id=request.migration_id,
                     tp_rank=tp_rank,
                 )
@@ -1497,7 +1509,8 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         self,
         receiver: Any,
         *,
-        request_id: str,
+        target_request_id: str,
+        session_request_id: str,
         migration_id: str,
         tp_rank: int,
     ) -> None:
@@ -1510,7 +1523,8 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             {
                 "format_version": 1,
                 "migration_id": migration_id,
-                "target_request_id": request_id,
+                "session_request_id": session_request_id,
+                "target_request_id": target_request_id,
                 "tp_rank": tp_rank,
                 "status": "PERSISTENT_CHANNEL_IDLE",
                 "channel_generation": lifecycle.channel_generation,
