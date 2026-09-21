@@ -269,6 +269,19 @@ class TestSourceSelectionContract(unittest.TestCase):
             extra["bridgetp_post_takeover_communicator_destroy"]
         )
 
+    def test_target_connector_records_persistent_channel_identity(self) -> None:
+        config = json.loads(
+            MODULE.target_connector(
+                Path("run") / "controller",
+                gpu_resident_shadow=True,
+                persistent_channel=True,
+                channel_generation=7,
+            )
+        )
+        extra = config["kv_connector_extra_config"]
+        self.assertTrue(extra["bridgetp_persistent_channel"])
+        self.assertEqual(extra["bridgetp_channel_generation"], 7)
+
     def test_nested_controller_directory_drives_anchor_prefix(self) -> None:
         args = SimpleNamespace(
             tp1_gpu="0",
@@ -296,6 +309,8 @@ class TestSourceSelectionContract(unittest.TestCase):
             gpu_direct_delta_batch_tokens=8,
             gpu_direct_delta_flush_ms=50.0,
             deferred_comm_destroy=True,
+            persistent_channel=True,
+            channel_generation=7,
         )
         environment = MODULE.source_environment(
             args,
@@ -314,6 +329,8 @@ class TestSourceSelectionContract(unittest.TestCase):
         self.assertEqual(
             environment["BRIDGETP_DEFER_COMMUNICATOR_DESTROY"], "1"
         )
+        self.assertEqual(environment["BRIDGETP_PERSISTENT_CHANNEL"], "1")
+        self.assertEqual(environment["BRIDGETP_CHANNEL_GENERATION"], "7")
 
 
 class TestCalibrationAcceptance(unittest.TestCase):

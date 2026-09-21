@@ -516,6 +516,12 @@ def run(
                     post_takeover_communicator_destroy=bool(
                         getattr(args, "post_takeover_comm_destroy", False)
                     ),
+                    persistent_channel=bool(
+                        getattr(args, "persistent_channel", False)
+                    ),
+                    channel_generation=int(
+                        getattr(args, "channel_generation", 0)
+                    ),
                 ),
             ],
             target_env,

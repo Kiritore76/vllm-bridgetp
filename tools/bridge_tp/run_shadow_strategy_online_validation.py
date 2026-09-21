@@ -104,6 +104,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-direct-delta-batch-tokens", type=int, default=16)
     parser.add_argument("--gpu-direct-delta-flush-ms", type=float, default=25.0)
     parser.add_argument(
+        "--persistent-channel",
+        action="store_true",
+        help=(
+            "reuse one GPU-direct communicator across migration sessions; "
+            "C0 initially permits only one active session"
+        ),
+    )
+    parser.add_argument("--channel-generation", type=int, default=0)
+    parser.add_argument(
         "--ready-sync-mode",
         choices=["DEVICE_WIDE", "STREAM_EVENT"],
         default="DEVICE_WIDE",
@@ -271,6 +280,27 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise ValueError("GPU-direct delta requires --gpu-direct-history")
     if args.gpu_direct_delta and not args.shadow_only_only:
         raise ValueError("GPU-direct delta batch sweep currently requires Shadow-only")
+    if args.persistent_channel and not (
+        args.shadow_only_only
+        and args.gpu_resident_shadow
+        and args.gpu_direct_history
+        and args.gpu_direct_delta
+    ):
+        raise ValueError(
+            "persistent channel requires the GPU-resident GPU-direct "
+            "Shadow-only path"
+        )
+    if args.channel_generation < 0:
+        raise ValueError("channel generation cannot be negative")
+    if args.persistent_channel and (
+        args.deferred_comm_destroy
+        or args.post_takeover_comm_destroy
+        or args.deferred_comm_destroy_comparison
+        or args.post_takeover_destroy_comparison
+    ):
+        raise ValueError(
+            "persistent channel cannot be combined with a destroy experiment"
+        )
     if args.deferred_comm_destroy and not args.gpu_direct_delta:
         raise ValueError(
             "deferred communicator destroy requires persistent GPU-direct delta"
@@ -1168,6 +1198,7 @@ def accept_online(
     ready_notification_mode: str = "FILE_POLL",
     deferred_comm_destroy: bool = False,
     post_takeover_comm_destroy: bool = False,
+    persistent_channel: bool = False,
 ) -> dict[str, Any]:
     background = common.read_json(background_dir / "background_summary.json")
     session = common.read_json(controller_dir / "session_manifest.json")
@@ -1413,6 +1444,51 @@ def accept_online(
                     "GPU-direct source communicators did not enter the "
                     "process-lifetime pool"
                 )
+            if persistent_channel:
+                if direct_sender.get("communicator_lifecycle") != (
+                    "PERSISTENT_CHANNEL_IDLE"
+                ):
+                    errors.append(
+                        "GPU-direct source channel did not return to IDLE"
+                    )
+                if int(direct_sender.get("channel_create_count", -1)) != 1:
+                    errors.append(
+                        "GPU-direct source channel create count differs"
+                    )
+                if int(direct_sender.get("channel_destroy_count", -1)) != 0:
+                    errors.append(
+                        "GPU-direct source channel was destroyed during request"
+                    )
+                if int(direct_sender.get("channel_session_count", -1)) != 1:
+                    errors.append(
+                        "GPU-direct source channel session count differs"
+                    )
+                target_channel_receipts = [
+                    common.read_json(path)
+                    for path in sorted(
+                        (
+                            controller_dir
+                            / "persistent_channel_receipts"
+                        ).glob("tp_rank_*.json")
+                    )
+                ]
+                if len(target_channel_receipts) != 4:
+                    errors.append(
+                        "persistent target channel receipts are incomplete"
+                    )
+                for row in target_channel_receipts:
+                    if row.get("status") != "PERSISTENT_CHANNEL_IDLE":
+                        errors.append(
+                            "persistent target channel did not return to IDLE"
+                        )
+                    if int(row.get("channel_create_count", -1)) != 1:
+                        errors.append(
+                            "persistent target channel create count differs"
+                        )
+                    if int(row.get("channel_destroy_count", -1)) != 0:
+                        errors.append(
+                            "persistent target channel was destroyed during request"
+                        )
         expected_sync_scope = (
             "BRIDGETP_RESTORE_STREAM_EVENT"
             if ready_sync_mode == "STREAM_EVENT"
@@ -1814,6 +1890,14 @@ def accept_online(
         "gpu_resident_shadow": gpu_resident_shadow,
         "gpu_direct_history": gpu_direct_history,
         "gpu_direct_delta": gpu_direct_delta,
+        "persistent_channel": persistent_channel,
+        "channel_generation": direct_sender.get("channel_generation"),
+        "channel_create_count": direct_sender.get("channel_create_count"),
+        "channel_destroy_count": direct_sender.get("channel_destroy_count"),
+        "channel_session_count": direct_sender.get("channel_session_count"),
+        "channel_buffer_high_water_bytes": direct_sender.get(
+            "buffer_high_water_bytes"
+        ),
         "deferred_comm_destroy": deferred_comm_destroy,
         "post_takeover_comm_destroy": post_takeover_comm_destroy,
         "communicator_destroy_statuses": [
@@ -2131,6 +2215,8 @@ def main() -> None:
         "gpu_resident_shadow": args.gpu_resident_shadow,
         "gpu_direct_history": args.gpu_direct_history,
         "gpu_direct_delta": args.gpu_direct_delta,
+        "persistent_channel": args.persistent_channel,
+        "channel_generation": args.channel_generation,
         "gpu_direct_delta_batch_tokens": args.gpu_direct_delta_batch_tokens,
         "gpu_direct_delta_flush_ms": args.gpu_direct_delta_flush_ms,
         "ready_sync_mode": args.ready_sync_mode,
@@ -2344,6 +2430,7 @@ def main() -> None:
                         ),
                         deferred_comm_destroy=selected_deferred_destroy,
                         post_takeover_comm_destroy=selected_post_destroy,
+                        persistent_channel=args.persistent_channel,
                     )
 
                 source_env_overrides = {"BRIDGETP_SHADOW_STRATEGY": strategy}
@@ -2459,6 +2546,8 @@ def main() -> None:
                         "post_takeover_comm_destroy": (
                             selected_post_takeover_destroy
                         ),
+                        "persistent_channel": args.persistent_channel,
+                        "channel_generation": args.channel_generation,
                         "status": result["status"],
                         "root": str(rep_args.out_root.resolve()),
                         "acceptance": result["acceptance"],

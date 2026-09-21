@@ -313,6 +313,8 @@ def target_connector(
     ready_notification_port: int = 0,
     defer_communicator_destroy: bool = False,
     post_takeover_communicator_destroy: bool = False,
+    persistent_channel: bool = False,
+    channel_generation: int = 0,
 ) -> str:
     return json.dumps(
         {
@@ -352,6 +354,8 @@ def target_connector(
                 "bridgetp_post_takeover_communicator_destroy": (
                     post_takeover_communicator_destroy
                 ),
+                "bridgetp_persistent_channel": persistent_channel,
+                "bridgetp_channel_generation": channel_generation,
             },
         },
         separators=(",", ":"),
@@ -422,6 +426,11 @@ def source_environment(
         )
     if bool(getattr(args, "deferred_comm_destroy", False)):
         env["BRIDGETP_DEFER_COMMUNICATOR_DESTROY"] = "1"
+    if bool(getattr(args, "persistent_channel", False)):
+        env["BRIDGETP_PERSISTENT_CHANNEL"] = "1"
+        env["BRIDGETP_CHANNEL_GENERATION"] = str(
+            int(getattr(args, "channel_generation", 0))
+        )
     return env
 
 

@@ -239,6 +239,22 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 "post-takeover communicator destruction requires deferred "
                 "terminal-close handling"
             )
+        self.persistent_channel = bool(
+            self._kv_transfer_config.get_from_extra_config(
+                "bridgetp_persistent_channel", False
+            )
+        )
+        self.channel_generation = int(
+            self._kv_transfer_config.get_from_extra_config(
+                "bridgetp_channel_generation", 0
+            )
+        )
+        if self.channel_generation < 0:
+            raise ValueError("bridgetp_channel_generation cannot be negative")
+        if self.persistent_channel and self.post_takeover_communicator_destroy:
+            raise ValueError(
+                "persistent channel cannot use post-takeover destruction"
+            )
         self._manifest: dict[str, Any] | None = None
         self._pending_requests: dict[str, Request] = {}
         self._active_requests: dict[str, Request] = {}
@@ -262,6 +278,8 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             str, tuple[Any, Path, dict[str, Any]]
         ] = {}
         self._retained_gpu_receivers_lock = threading.Lock()
+        self._persistent_gpu_receiver: Any | None = None
+        self._persistent_gpu_receiver_lock = threading.Lock()
         self._claimed_target_request_id: str | None = None
         logger.warning(
             "BridgeTP Phase 6 streaming connector enabled; target waits for %s",
@@ -306,6 +324,16 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             raise ValueError("Phase 6 token boundary is inconsistent")
         if len(computed) != int(manifest["num_computed_tokens"]):
             raise ValueError("Phase 6 computed token count is inconsistent")
+        manifest_persistent = bool(manifest.get("persistent_channel", False))
+        if manifest_persistent != self.persistent_channel:
+            raise ValueError(
+                "Persistent-channel connector and manifest settings differ"
+            )
+        if manifest_persistent and (
+            int(manifest.get("channel_generation", -1))
+            != self.channel_generation
+        ):
+            raise ValueError("Persistent-channel generation differs")
         self._manifest = manifest
         return manifest
 
@@ -913,17 +941,30 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 )
 
                 record = manifest["ranks"][tp_rank]
-                receiver = GpuDirectHistoryReceiver(
-                    device=device,
-                    host=str(record["host"]),
-                    port=int(record["port"]),
-                    defer_communicator_destroy=(
-                        self.defer_communicator_destroy
-                        or self.post_takeover_communicator_destroy
-                    ),
-                )
+                if self.persistent_channel:
+                    with self._persistent_gpu_receiver_lock:
+                        receiver = self._persistent_gpu_receiver
+                        if receiver is None:
+                            receiver = GpuDirectHistoryReceiver(
+                                device=device,
+                                host=str(record["host"]),
+                                port=int(record["port"]),
+                                defer_communicator_destroy=True,
+                            )
+                            self._persistent_gpu_receiver = receiver
+                else:
+                    receiver = GpuDirectHistoryReceiver(
+                        device=device,
+                        host=str(record["host"]),
+                        port=int(record["port"]),
+                        defer_communicator_destroy=(
+                            self.defer_communicator_destroy
+                            or self.post_takeover_communicator_destroy
+                        ),
+                    )
                 direct = receiver.receive(
                     migration_id=request.migration_id,
+                    request_id=request_id,
                     rank=tp_rank,
                     layer_records=list(manifest["layers"]),
                     keep_open=gpu_direct_delta,
@@ -1335,7 +1376,14 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     if time.monotonic() >= deadline:
                         raise TimeoutError("Timed out waiting for Shadow commit")
                     time.sleep(0.005)
-            if (
+            if self.persistent_channel and receiver is not None:
+                self._record_persistent_receiver_idle(
+                    receiver,
+                    request_id=request_id,
+                    migration_id=request.migration_id,
+                    tp_rank=tp_rank,
+                )
+            elif (
                 gpu_direct_delta
                 and receiver is not None
                 and self.defer_communicator_destroy
@@ -1367,6 +1415,10 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         except _ShadowCancelled as error:
             if receiver is not None:
                 receiver.close()
+                if self.persistent_channel:
+                    with self._persistent_gpu_receiver_lock:
+                        if self._persistent_gpu_receiver is receiver:
+                            self._persistent_gpu_receiver = None
             _atomic_json_dump(
                 {
                     "format_version": 1,
@@ -1383,6 +1435,10 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         except BaseException as error:
             if receiver is not None:
                 receiver.close()
+                if self.persistent_channel:
+                    with self._persistent_gpu_receiver_lock:
+                        if self._persistent_gpu_receiver is receiver:
+                            self._persistent_gpu_receiver = None
             self._load_errors[request_id] = error
 
     def get_finished(
@@ -1436,6 +1492,41 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
 
     def wait_for_save(self) -> None:
         return
+
+    def _record_persistent_receiver_idle(
+        self,
+        receiver: Any,
+        *,
+        request_id: str,
+        migration_id: str,
+        tp_rank: int,
+    ) -> None:
+        lifecycle = receiver.lifecycle
+        if lifecycle is None or lifecycle.state.value != "IDLE":
+            raise RuntimeError(
+                "Persistent target channel did not return to IDLE"
+            )
+        _atomic_json_dump(
+            {
+                "format_version": 1,
+                "migration_id": migration_id,
+                "target_request_id": request_id,
+                "tp_rank": tp_rank,
+                "status": "PERSISTENT_CHANNEL_IDLE",
+                "channel_generation": lifecycle.channel_generation,
+                "channel_create_count": lifecycle.create_count,
+                "channel_destroy_count": lifecycle.destroy_count,
+                "channel_rebuild_count": lifecycle.rebuild_count,
+                "channel_session_count": lifecycle.session_count,
+                "buffer_high_water_bytes": (
+                    receiver.buffer_high_water_bytes
+                ),
+                "completed_unix_s": time.time(),
+            },
+            self.manifest_path.parent
+            / "persistent_channel_receipts"
+            / f"tp_rank_{tp_rank}.json",
+        )
 
     def _retain_gpu_receiver(
         self,
@@ -1538,6 +1629,11 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
 
     def shutdown(self) -> None:
         """Abort pooled target communicators only as the worker exits."""
+        with self._persistent_gpu_receiver_lock:
+            persistent_receiver = self._persistent_gpu_receiver
+            self._persistent_gpu_receiver = None
+        if persistent_receiver is not None:
+            persistent_receiver.abort()
         with self._retained_gpu_receivers_lock:
             retained = list(self._retained_gpu_receivers.values())
             self._retained_gpu_receivers.clear()
