@@ -9,6 +9,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 
@@ -304,12 +305,49 @@ class TestGpuDirectHistoryLifecycle(unittest.TestCase):
         sender.abort.assert_called_once_with()
         self.assertFalse(kv_stream._retained_gpu_senders)
 
+    def test_persistent_source_registry_reuses_one_idle_sender(self) -> None:
+        from vllm.bridge_tp import kv_stream
+
+        config = SimpleNamespace(
+            gpu_direct_host="127.0.0.1",
+            gpu_direct_base_port=30400,
+            target_tp_size=4,
+            channel_generation=2,
+        )
+        device = SimpleNamespace(index=0)
+        sender = Mock()
+        with kv_stream._persistent_gpu_senders_lock:
+            kv_stream._persistent_gpu_senders.clear()
+            kv_stream._active_persistent_gpu_senders.clear()
+        with patch(
+            "vllm.bridge_tp.gpu_direct_history.GpuDirectHistorySender",
+            return_value=sender,
+        ) as sender_type:
+            key, first = kv_stream._acquire_persistent_gpu_sender(
+                config, device
+            )
+            with self.assertRaisesRegex(RuntimeError, "active session"):
+                kv_stream._acquire_persistent_gpu_sender(config, device)
+            kv_stream._release_persistent_gpu_sender(key)
+            second_key, second = kv_stream._acquire_persistent_gpu_sender(
+                config, device
+            )
+            kv_stream._release_persistent_gpu_sender(second_key)
+
+        self.assertEqual(key, second_key)
+        self.assertIs(first, second)
+        sender_type.assert_called_once()
+        kv_stream._abort_retained_gpu_senders()
+        sender.abort.assert_called_once_with()
+
     def test_connector_pool_retains_receiver_until_shutdown(self) -> None:
         from vllm.bridge_tp.streaming_connector import BridgeTPStreamingConnector
 
         connector = object.__new__(BridgeTPStreamingConnector)
         connector._retained_gpu_receivers = {}
         connector._retained_gpu_receivers_lock = threading.Lock()
+        connector._persistent_gpu_receiver = None
+        connector._persistent_gpu_receiver_lock = threading.Lock()
         receiver = Mock()
         with tempfile.TemporaryDirectory() as directory:
             connector.manifest_path = Path(directory) / "manifest.json"
@@ -337,6 +375,43 @@ class TestGpuDirectHistoryLifecycle(unittest.TestCase):
             self.assertEqual(
                 receipt["status"], "ABORTED_AT_CONNECTOR_SHUTDOWN"
             )
+
+    def test_connector_records_persistent_receiver_idle(self) -> None:
+        from vllm.bridge_tp.streaming_connector import BridgeTPStreamingConnector
+        from vllm.bridge_tp.stream_protocol import ChannelState
+
+        connector = object.__new__(BridgeTPStreamingConnector)
+        receiver = SimpleNamespace(
+            lifecycle=SimpleNamespace(
+                state=ChannelState.IDLE,
+                channel_generation=5,
+                create_count=1,
+                destroy_count=0,
+                rebuild_count=0,
+                session_count=2,
+            ),
+            buffer_high_water_bytes=4096,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            connector.manifest_path = Path(directory) / "manifest.json"
+            connector._record_persistent_receiver_idle(
+                receiver,
+                request_id="request-2",
+                migration_id="migration-2",
+                tp_rank=3,
+            )
+            receipt = json.loads(
+                (
+                    Path(directory)
+                    / "persistent_channel_receipts"
+                    / "tp_rank_3.json"
+                ).read_text(encoding="utf-8")
+            )
+        self.assertEqual(receipt["status"], "PERSISTENT_CHANNEL_IDLE")
+        self.assertEqual(receipt["channel_generation"], 5)
+        self.assertEqual(receipt["channel_create_count"], 1)
+        self.assertEqual(receipt["channel_destroy_count"], 0)
+        self.assertEqual(receipt["channel_session_count"], 2)
 
     def test_post_takeover_destroy_records_commit_ordering(self) -> None:
         from vllm.bridge_tp.streaming_connector import (

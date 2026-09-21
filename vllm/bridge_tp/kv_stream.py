@@ -53,6 +53,9 @@ _disabled_after_error = False
 _publishers: list[_RankPublisher] = []
 _retained_gpu_senders: list[Any] = []
 _retained_gpu_senders_lock = threading.Lock()
+_persistent_gpu_senders: dict[str, Any] = {}
+_active_persistent_gpu_senders: set[str] = set()
+_persistent_gpu_senders_lock = threading.Lock()
 
 
 def _retain_gpu_sender(sender: Any) -> int:
@@ -70,6 +73,71 @@ def _abort_retained_gpu_senders() -> None:
             sender.abort()
         except BaseException:  # pragma: no cover - interpreter shutdown
             logger.exception("BridgeTP pooled sender shutdown failed")
+    with _persistent_gpu_senders_lock:
+        persistent = list(_persistent_gpu_senders.values())
+        _persistent_gpu_senders.clear()
+        _active_persistent_gpu_senders.clear()
+    for sender in persistent:
+        try:
+            sender.abort()
+        except BaseException:  # pragma: no cover - interpreter shutdown
+            logger.exception("BridgeTP persistent sender shutdown failed")
+
+
+def _persistent_sender_key(
+    config: "BridgeTPStreamConfig", device: torch.device
+) -> str:
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    addresses = ",".join(
+        f"{config.gpu_direct_host}:{config.gpu_direct_base_port + rank}"
+        for rank in range(config.target_tp_size)
+    )
+    return (
+        f"cuda:{device_index}|tp={config.target_tp_size}|"
+        f"generation={config.channel_generation}|{addresses}"
+    )
+
+
+def _acquire_persistent_gpu_sender(
+    config: "BridgeTPStreamConfig", device: torch.device
+) -> tuple[str, Any]:
+    from vllm.bridge_tp.gpu_direct_history import GpuDirectHistorySender
+
+    key = _persistent_sender_key(config, device)
+    with _persistent_gpu_senders_lock:
+        if key in _active_persistent_gpu_senders:
+            raise RuntimeError(
+                "Persistent GPU-direct channel already has an active session"
+            )
+        sender = _persistent_gpu_senders.get(key)
+        if sender is None:
+            sender = GpuDirectHistorySender(
+                device=device,
+                host=config.gpu_direct_host,
+                port=(
+                    config.gpu_direct_base_port + config.target_tp_size
+                ),
+            )
+            _persistent_gpu_senders[key] = sender
+        _active_persistent_gpu_senders.add(key)
+        return key, sender
+
+
+def _release_persistent_gpu_sender(key: str) -> None:
+    with _persistent_gpu_senders_lock:
+        if key not in _active_persistent_gpu_senders:
+            raise RuntimeError("Persistent GPU-direct sender was not active")
+        _active_persistent_gpu_senders.remove(key)
+
+
+def _discard_persistent_gpu_sender(key: str, sender: Any) -> None:
+    with _persistent_gpu_senders_lock:
+        _active_persistent_gpu_senders.discard(key)
+        if _persistent_gpu_senders.get(key) is sender:
+            del _persistent_gpu_senders[key]
+    sender.abort()
 
 
 atexit.register(_abort_retained_gpu_senders)
@@ -129,6 +197,8 @@ class BridgeTPStreamConfig:
     # so Phase 6/7/8 runs behave exactly as before.
     armed: bool = True
     defer_communicator_destroy: bool = False
+    persistent_channel: bool = False
+    channel_generation: int = 0
 
     @classmethod
     def from_env(cls) -> BridgeTPStreamConfig:
@@ -196,6 +266,12 @@ class BridgeTPStreamConfig:
             defer_communicator_destroy=_env_bool(
                 "BRIDGETP_DEFER_COMMUNICATOR_DESTROY", False
             ),
+            persistent_channel=_env_bool(
+                "BRIDGETP_PERSISTENT_CHANNEL", False
+            ),
+            channel_generation=int(
+                os.getenv("BRIDGETP_CHANNEL_GENERATION", "0")
+            ),
         )
         if config.target_tp_size != 4:
             raise ValueError("BridgeTP Phase 6 currently requires target TP=4")
@@ -219,6 +295,12 @@ class BridgeTPStreamConfig:
             raise ValueError("GPU-direct delta requires GPU-direct history")
         if self.gpu_direct_delta and self.shadow_strategy != "S_NEW_OLD":
             raise ValueError("GPU-direct delta currently requires S_NEW_OLD")
+        if self.persistent_channel and not self.gpu_direct_delta:
+            raise ValueError(
+                "Persistent channel currently requires GPU-direct delta"
+            )
+        if self.channel_generation < 0:
+            raise ValueError("BRIDGETP_CHANNEL_GENERATION cannot be negative")
         if self.gpu_direct_delta_batch_tokens <= 0:
             raise ValueError("GPU-direct delta batch tokens must be positive")
         if self.gpu_direct_delta_flush_ms < 0:
@@ -463,6 +545,7 @@ class _GpuDirectHistoryPublisher:
         block_ids: list[int],
         block_axis: int,
         block_size: int,
+        history_end_token: int,
     ) -> None:
         self.config = config
         self.request_id = request_id
@@ -471,6 +554,7 @@ class _GpuDirectHistoryPublisher:
         self.block_ids = block_ids
         self.block_axis = block_axis
         self.block_size = block_size
+        self.history_end_token = history_end_token
         self.started = False
         self._lock = threading.Lock()
         self.delta_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
@@ -597,17 +681,29 @@ class _GpuDirectHistoryPublisher:
             "transport": TRANSPORT,
             "integrity": INTEGRITY,
         }
+        persistent_key: str | None = None
+        persistent_released = False
+        sender: Any | None = None
         try:
             device = self.kv_caches[0].device
             torch.cuda.set_device(device)
-            sender = GpuDirectHistorySender(
-                device=device,
-                host=self.config.gpu_direct_host,
-                port=self.config.gpu_direct_base_port
-                + self.config.target_tp_size,
-            )
+            if self.config.persistent_channel:
+                persistent_key, sender = _acquire_persistent_gpu_sender(
+                    self.config, device
+                )
+            else:
+                sender = GpuDirectHistorySender(
+                    device=device,
+                    host=self.config.gpu_direct_host,
+                    port=self.config.gpu_direct_base_port
+                    + self.config.target_tp_size,
+                )
             ranks = sender.send(
                 migration_id=self.config.migration_id,
+                request_id=self.request_id,
+                channel_generation=self.config.channel_generation,
+                persistent_channel=self.config.persistent_channel,
+                history_end_token=self.history_end_token,
                 kv_caches=self.kv_caches,
                 layer_names=self.layer_names,
                 block_ids=self.block_ids,
@@ -637,7 +733,31 @@ class _GpuDirectHistoryPublisher:
                     consumed = 1
                     try:
                         if work is None:
-                            if self.config.defer_communicator_destroy:
+                            if self.config.persistent_channel:
+                                sender.end_session()
+                                assert persistent_key is not None
+                                _release_persistent_gpu_sender(persistent_key)
+                                persistent_released = True
+                                receipt["communicator_lifecycle"] = (
+                                    "PERSISTENT_CHANNEL_IDLE"
+                                )
+                                assert sender.lifecycle is not None
+                                receipt["channel_generation"] = (
+                                    sender.lifecycle.channel_generation
+                                )
+                                receipt["channel_create_count"] = (
+                                    sender.lifecycle.create_count
+                                )
+                                receipt["channel_destroy_count"] = (
+                                    sender.lifecycle.destroy_count
+                                )
+                                receipt["channel_session_count"] = (
+                                    sender.lifecycle.session_count
+                                )
+                                receipt["buffer_high_water_bytes"] = (
+                                    sender.buffer_high_water_bytes
+                                )
+                            elif self.config.defer_communicator_destroy:
                                 sender.close_control()
                                 receipt["communicator_lifecycle"] = (
                                     "POOLED_UNTIL_PROCESS_SHUTDOWN"
@@ -714,6 +834,19 @@ class _GpuDirectHistoryPublisher:
                 }
             )
         except Exception as error:
+            if (
+                self.config.persistent_channel
+                and persistent_key is not None
+                and sender is not None
+                and not persistent_released
+            ):
+                try:
+                    _discard_persistent_gpu_sender(persistent_key, sender)
+                except BaseException:
+                    logger.exception(
+                        "BridgeTP failed to discard a poisoned persistent "
+                        "sender"
+                    )
             self.failure = self.failure or f"{type(error).__name__}: {error}"
             receipt["error"] = self.failure
             receipt["completed_unix_s"] = time.time()
@@ -864,6 +997,7 @@ def _publish_request(
                 block_ids=block_ids,
                 block_axis=block_axis,
                 block_size=block_size,
+                history_end_token=num_computed,
             )
         )
         d2h_ms = 0.0
@@ -1016,6 +1150,10 @@ def _publish_request(
         "delta_transport": (
             "NCCL_P2P_GPU_DIRECT_PERSISTENT"
             if config.gpu_direct_delta else "CPU_TCP_SERIALIZED"
+        ),
+        "persistent_channel": config.persistent_channel,
+        "channel_generation": (
+            config.channel_generation if config.persistent_channel else None
         ),
         "gpu_direct_delta_batch_tokens": (
             config.gpu_direct_delta_batch_tokens
