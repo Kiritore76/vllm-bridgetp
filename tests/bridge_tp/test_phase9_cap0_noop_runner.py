@@ -41,6 +41,22 @@ FORMAL = load_script(
 
 
 class TestNoopManifest(unittest.TestCase):
+    def test_target_workers_do_not_receive_source_persistent_env(self) -> None:
+        source_like_env = {
+            "BRIDGETP_PERSISTENT_CHANNEL": "1",
+            "BRIDGETP_CHANNEL_GENERATION": "7",
+            "UNCHANGED": "value",
+        }
+        target_env = RUNNER.target_environment(
+            source_like_env,
+            tp4_gpus="1,2,3,4",
+        )
+
+        self.assertNotIn("BRIDGETP_PERSISTENT_CHANNEL", target_env)
+        self.assertNotIn("BRIDGETP_CHANNEL_GENERATION", target_env)
+        self.assertEqual(target_env["CUDA_VISIBLE_DEVICES"], "1,2,3,4")
+        self.assertEqual(target_env["UNCHANGED"], "value")
+
     def test_controller_config_overrides_pin_nested_rate_values(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
