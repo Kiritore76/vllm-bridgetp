@@ -46,6 +46,50 @@ class TestRequestFreezeGate(unittest.TestCase):
         with patch.dict("os.environ", {}, clear=True):
             self.assertIsNone(RequestFreezeGate.from_env())
 
+    def test_records_freeze_for_each_sequential_request(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            gate = RequestFreezeGate(root)
+            first = SimpleNamespace(
+                request_id="anchor-1",
+                num_prompt_tokens=2048,
+                output_token_ids=[1] * 64,
+                num_computed_tokens=2111,
+            )
+            second = SimpleNamespace(
+                request_id="anchor-2",
+                num_prompt_tokens=2048,
+                output_token_ids=[2] * 96,
+                num_computed_tokens=2143,
+            )
+
+            request_freeze(
+                root,
+                first.request_id,
+                output_tokens=64,
+                num_computed_tokens=2111,
+            )
+            self.assertTrue(gate.is_frozen(first.request_id))
+            gate.record_frozen(first, scheduler_step=77)
+
+            request_freeze(
+                root,
+                second.request_id,
+                output_tokens=96,
+                num_computed_tokens=2143,
+            )
+            self.assertTrue(gate.is_frozen(second.request_id))
+            gate.record_frozen(second, scheduler_step=99)
+
+            frozen = json.loads(
+                (root / "request_frozen_receipt.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(frozen["request_id"], second.request_id)
+            self.assertEqual(frozen["scheduler_step"], 99)
+            self.assertEqual(frozen["num_output_tokens"], 96)
+
 
 class TestExperimentTimeline(unittest.TestCase):
     def test_merge_process_timeline(self) -> None:

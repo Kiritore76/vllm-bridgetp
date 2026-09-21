@@ -74,7 +74,7 @@ class RequestFreezeGate:
         self.release_receipt_path = self.run_dir / "source_kv_release_receipt.json"
         self._mtime_ns = -1
         self._request_id: str | None = None
-        self._recorded_frozen = False
+        self._recorded_frozen_request_id: str | None = None
         self._request_prefix = os.getenv(
             "BRIDGETP_STREAM_SOURCE_REQUEST_ID_PREFIX", ""
         ).strip()
@@ -109,9 +109,9 @@ class RequestFreezeGate:
         return self._request_id == request_id
 
     def record_frozen(self, request: Any, scheduler_step: int) -> None:
-        if self._recorded_frozen:
+        if self._recorded_frozen_request_id == request.request_id:
             return
-        self._recorded_frozen = True
+        self._recorded_frozen_request_id = request.request_id
         _atomic_json_dump(
             {
                 "format_version": 1,
