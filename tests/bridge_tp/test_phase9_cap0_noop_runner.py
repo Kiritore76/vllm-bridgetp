@@ -54,6 +54,8 @@ class TestNoopManifest(unittest.TestCase):
                 tp1_blocks=1968,
                 tp4_blocks=35739,
                 survival_table=survival,
+                tp1_port=8101,
+                tp4_port=8300,
             )
             path = RUNNER.make_config(
                 args,
@@ -69,7 +71,10 @@ class TestNoopManifest(unittest.TestCase):
                     }
                 },
             )
-            rate = json.loads(path.read_text(encoding="utf-8"))["rate"]
+            config = json.loads(path.read_text(encoding="utf-8"))
+            rate = config["rate"]
+            self.assertEqual(config["source_url"], "http://127.0.0.1:8101")
+            self.assertEqual(config["target_url"], "http://127.0.0.1:8300")
             self.assertEqual(rate["b_min_bytes_s"], 123.0)
             self.assertEqual(rate["b_hard_max_bytes_s"], 123.0)
             self.assertEqual(rate["control_period_s"], 0.2)

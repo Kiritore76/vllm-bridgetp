@@ -137,6 +137,12 @@ def make_config(
     controller_config_overrides: dict[str, Any] | None = None,
 ) -> Path:
     config = common.read_json(common.CONFIG_TEMPLATE)
+    config["source_url"] = (
+        f"http://127.0.0.1:{int(getattr(args, 'tp1_port', 8001))}"
+    )
+    config["target_url"] = (
+        f"http://127.0.0.1:{int(getattr(args, 'tp4_port', 8200))}"
+    )
     config["run_dir"] = str(controller_dir)
     config["tp1_total_kv_blocks"] = args.tp1_blocks
     config["tp4_total_kv_blocks"] = args.tp4_blocks
