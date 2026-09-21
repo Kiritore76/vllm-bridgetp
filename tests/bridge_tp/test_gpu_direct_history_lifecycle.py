@@ -160,6 +160,136 @@ class TestGpuDirectHistoryLifecycle(unittest.TestCase):
         sender.nccl.ncclCommDestroy.assert_not_called()
         sender.nccl.ncclCommAbort.assert_not_called()
 
+    def test_persistent_sender_ends_session_without_closing_channel(self) -> None:
+        from vllm.bridge_tp.gpu_direct_history import GpuDirectHistorySender
+        from vllm.bridge_tp.stream_protocol import (
+            ChannelState,
+            PayloadType,
+            PersistentChannelLifecycle,
+            SessionEnvelope,
+        )
+
+        sender = object.__new__(GpuDirectHistorySender)
+        sender.persistent_channel = True
+        sender.channel_generation = 9
+        sender.lifecycle = PersistentChannelLifecycle(
+            topology_key="tp1-to-tp4",
+            expected_ranks=frozenset({0, 1}),
+            channel_generation=9,
+        )
+        sender.lifecycle.mark_open()
+        sender.lifecycle.start_session(
+            migration_id="migration-1",
+            request_id="request-1",
+        )
+        sender._active_migration_id = "migration-1"
+        sender._active_request_id = "request-1"
+        sender._next_sequence_by_rank = {0: 0, 1: 0}
+        sender.connections = [Mock(), Mock()]
+
+        acknowledgements = [
+            {
+                "status": "SESSION_ENDED",
+                **SessionEnvelope(
+                    channel_generation=9,
+                    migration_id="migration-1",
+                    request_id="request-1",
+                    sequence_number=0,
+                    payload_type=PayloadType.ACK,
+                    token_start=0,
+                    token_end=0,
+                    rank=rank,
+                ).to_wire(),
+            }
+            for rank in range(2)
+        ]
+        with (
+            patch("vllm.bridge_tp.gpu_direct_history.send_json") as send,
+            patch(
+                "vllm.bridge_tp.gpu_direct_history.recv_json",
+                side_effect=acknowledgements,
+            ),
+        ):
+            sender.end_session()
+
+        self.assertEqual(send.call_count, 2)
+        self.assertEqual(sender.lifecycle.state, ChannelState.IDLE)
+        self.assertEqual(sender.lifecycle.destroy_count, 0)
+        self.assertEqual(sender.lifecycle.session_count, 1)
+        self.assertEqual(len(sender.connections), 2)
+        for connection in sender.connections:
+            connection.close.assert_not_called()
+
+    def test_persistent_receiver_ends_session_without_closing_channel(self) -> None:
+        from vllm.bridge_tp.gpu_direct_history import GpuDirectHistoryReceiver
+        from vllm.bridge_tp.stream_protocol import (
+            ChannelState,
+            PayloadType,
+            PersistentChannelLifecycle,
+            SessionEnvelope,
+        )
+
+        receiver = object.__new__(GpuDirectHistoryReceiver)
+        receiver.connection = Mock()
+        receiver.persistent_channel = True
+        receiver.lifecycle = PersistentChannelLifecycle(
+            topology_key="tp1-to-tp4-rank0",
+            expected_ranks=frozenset({0}),
+            channel_generation=3,
+        )
+        receiver.lifecycle.mark_open()
+        session = receiver.lifecycle.start_session(
+            migration_id="migration-1",
+            request_id="request-1",
+        )
+        for sequence, payload_type in enumerate(
+            (PayloadType.START_SESSION, PayloadType.HISTORY)
+        ):
+            session.accept_inbound(
+                SessionEnvelope(
+                    channel_generation=3,
+                    migration_id="migration-1",
+                    request_id="request-1",
+                    sequence_number=sequence,
+                    payload_type=payload_type,
+                    token_start=0,
+                    token_end=0,
+                    rank=0,
+                )
+            )
+        receiver._active_request_id = "request-1"
+        receiver._last_delta_envelope = None
+        terminal = {
+            "op": "END_SESSION",
+            **SessionEnvelope(
+                channel_generation=3,
+                migration_id="migration-1",
+                request_id="request-1",
+                sequence_number=2,
+                payload_type=PayloadType.END_SESSION,
+                token_start=0,
+                token_end=0,
+                rank=0,
+            ).to_wire(),
+        }
+        with (
+            patch(
+                "vllm.bridge_tp.gpu_direct_history.recv_json",
+                return_value=terminal,
+            ),
+            patch("vllm.bridge_tp.gpu_direct_history.send_json") as send,
+        ):
+            result = receiver.receive_delta(
+                migration_id="migration-1",
+                rank=0,
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(receiver.lifecycle.state, ChannelState.IDLE)
+        self.assertEqual(receiver.lifecycle.destroy_count, 0)
+        receiver.connection.close.assert_not_called()
+        self.assertEqual(send.call_count, 1)
+
     def test_source_pool_aborts_senders_only_at_process_shutdown(self) -> None:
         from vllm.bridge_tp import kv_stream
 
