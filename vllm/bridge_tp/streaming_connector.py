@@ -109,6 +109,107 @@ def _atomic_json_dump(value: dict[str, Any], path: Path) -> None:
     os.replace(temporary, path)
 
 
+def _gpu_direct_diagnostics_enabled() -> bool:
+    """Return whether fine-grained GPU-direct restore diagnostics are on.
+
+    These markers are deliberately opt-in: they persist a small JSON file at
+    each phase boundary, which is invaluable for a failure investigation but
+    should not become part of a production migration's hot path.
+    """
+    return os.environ.get("BRIDGETP_GPU_DIRECT_DIAGNOSTICS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _write_gpu_direct_rank_diagnostic(
+    manifest_path: Path,
+    *,
+    request_id: str,
+    migration_id: str,
+    tp_rank: int,
+    phase: str,
+    device: torch.device,
+    receiver: Any | None = None,
+    receive_event_ready: bool | None = None,
+    error: BaseException | None = None,
+    **extra: Any,
+) -> None:
+    """Persist one crash-survivable target-rank restore boundary marker.
+
+    A sender-side NCCL ``COMPLETE`` only proves that a tensor reached the
+    receiver stream.  It does *not* prove that this rank injected the tensor
+    into its vLLM KV cache, completed its readback, or returned to an idle
+    persistent-channel session.  Keep those states separately observable.
+    """
+    if not _gpu_direct_diagnostics_enabled():
+        return
+    value: dict[str, Any] = {
+        "format_version": 1,
+        "migration_id": migration_id,
+        "target_request_id": request_id,
+        "tp_rank": tp_rank,
+        "phase": phase,
+        "pid": os.getpid(),
+        "unix_s": time.time(),
+        "receive_event_ready": receive_event_ready,
+        **extra,
+    }
+    if device.type == "cuda":
+        try:
+            value["cuda_memory_allocated_bytes"] = torch.cuda.memory_allocated(
+                device
+            )
+            value["cuda_memory_reserved_bytes"] = torch.cuda.memory_reserved(
+                device
+            )
+            value["cuda_max_memory_allocated_bytes"] = (
+                torch.cuda.max_memory_allocated(device)
+            )
+        except BaseException as memory_error:
+            value["cuda_memory_error"] = (
+                f"{type(memory_error).__name__}: {memory_error}"
+            )
+    if receiver is not None:
+        lifecycle = getattr(receiver, "lifecycle", None)
+        value.update(
+            {
+                "receiver_connected": getattr(receiver, "connection", None)
+                is not None,
+                "receiver_persistent_channel": bool(
+                    getattr(receiver, "persistent_channel", False)
+                ),
+                "receiver_buffer_capacity_elements": getattr(
+                    receiver, "buffer_capacity_elements", None
+                ),
+                "receiver_buffer_high_water_bytes": getattr(
+                    receiver, "buffer_high_water_bytes", None
+                ),
+                "receiver_lifecycle_state": (
+                    lifecycle.state.value if lifecycle is not None else None
+                ),
+                "receiver_channel_generation": (
+                    lifecycle.channel_generation if lifecycle is not None else None
+                ),
+                "receiver_channel_session_count": (
+                    lifecycle.session_count if lifecycle is not None else None
+                ),
+            }
+        )
+    if error is not None:
+        value["error"] = f"{type(error).__name__}: {error}"
+    _atomic_json_dump(
+        value,
+        manifest_path.parent
+        / "gpu_direct_rank_diagnostics"
+        / _safe_name(request_id)
+        / f"tp_rank_{tp_rank}"
+        / f"{phase}.json",
+    )
+
+
 def _load_json(path: Path) -> dict[str, Any]:
     with path.open(encoding="utf-8") as file:
         value = json.load(file)
@@ -942,6 +1043,10 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
     def _live_gpu_load(self, request: BridgeTPStreamRequest) -> None:
         request_id = request.target_request_id
         session_request_id = _persistent_session_request_id(request)
+        diagnostic_phase = "ENTER"
+        receiver: Any | None = None
+        device: torch.device | None = None
+        tp_rank: int | None = None
         try:
             manifest = self._load_manifest()
             tp_rank = get_tp_group().rank_in_group
@@ -973,7 +1078,6 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 == "NCCL_P2P_GPU_DIRECT_PERSISTENT"
             )
             direct = None
-            receiver = None
             if gpu_direct:
                 from vllm.bridge_tp.gpu_direct_history import (
                     GpuDirectHistoryReceiver,
@@ -1001,6 +1105,16 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                             or self.post_takeover_communicator_destroy
                         ),
                     )
+                diagnostic_phase = "BEFORE_HISTORY_RECEIVE"
+                _write_gpu_direct_rank_diagnostic(
+                    self.manifest_path,
+                    request_id=request_id,
+                    migration_id=request.migration_id,
+                    tp_rank=tp_rank,
+                    phase=diagnostic_phase,
+                    device=device,
+                    receiver=receiver,
+                )
                 direct = receiver.receive(
                     migration_id=request.migration_id,
                     # Session identity follows the request whose KV is being
@@ -1011,6 +1125,22 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     layer_records=list(manifest["layers"]),
                     keep_open=gpu_direct_delta,
                     synchronize=not stream_event_mode,
+                )
+                diagnostic_phase = "AFTER_HISTORY_RECEIVE"
+                _write_gpu_direct_rank_diagnostic(
+                    self.manifest_path,
+                    request_id=request_id,
+                    migration_id=request.migration_id,
+                    tp_rank=tp_rank,
+                    phase=diagnostic_phase,
+                    device=device,
+                    receiver=receiver,
+                    receive_event_ready=(
+                        direct.receive_done_event.query()
+                        if direct.receive_done_event is not None
+                        else None
+                    ),
+                    history_raw_tensor_bytes=direct.raw_tensor_bytes,
                 )
                 history_layers = direct.layers
                 history_bytes = b""
@@ -1038,6 +1168,21 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 if restore_stream is not None
                 else nullcontext()
             )
+            diagnostic_phase = "BEFORE_HISTORY_INJECT"
+            _write_gpu_direct_rank_diagnostic(
+                self.manifest_path,
+                request_id=request_id,
+                migration_id=request.migration_id,
+                tp_rank=tp_rank,
+                phase=diagnostic_phase,
+                device=device,
+                receiver=receiver,
+                receive_event_ready=(
+                    direct.receive_done_event.query()
+                    if direct is not None and direct.receive_done_event is not None
+                    else None
+                ),
+            )
             with self._gpu_kv_lock, restore_context:
                 if restore_stream is not None and direct is not None:
                     if direct.receive_done_event is None:
@@ -1050,6 +1195,17 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     request.target_block_ids[:initial_blocks],
                     block_axis=int(manifest["block_axis"]),
                 )
+            diagnostic_phase = "AFTER_HISTORY_INJECT_AND_READBACK"
+            _write_gpu_direct_rank_diagnostic(
+                self.manifest_path,
+                request_id=request_id,
+                migration_id=request.migration_id,
+                tp_rank=tp_rank,
+                phase=diagnostic_phase,
+                device=device,
+                receiver=receiver,
+                history_exact_readback=(validation.get("exact_readback") is True),
+            )
             exact_readback = validation["exact_readback"] is True
             if gpu_direct:
                 history_stage_ms = (time.perf_counter() - started) * 1000
@@ -1100,6 +1256,17 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 / "gpu_initial_receipts"
                 / f"tp_rank_{tp_rank}.json",
             )
+            diagnostic_phase = "HISTORY_GPU_RESIDENT_RECEIPT_WRITTEN"
+            _write_gpu_direct_rank_diagnostic(
+                self.manifest_path,
+                request_id=request_id,
+                migration_id=request.migration_id,
+                tp_rank=tp_rank,
+                phase=diagnostic_phase,
+                device=device,
+                receiver=receiver,
+                history_end_token=current,
+            )
             if gpu_direct:
                 completed = time.time()
                 _atomic_json_dump(
@@ -1130,6 +1297,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             while current < request.num_computed_tokens:
                 direct_delta = None
                 if gpu_direct_delta:
+                    diagnostic_phase = "BEFORE_DELTA_RECEIVE"
                     direct_delta = receiver.receive_delta(
                         migration_id=request.migration_id,
                         rank=tp_rank,
@@ -1178,6 +1346,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     else nullcontext()
                 )
                 delta_apply_started = time.perf_counter()
+                diagnostic_phase = "BEFORE_DELTA_INJECT"
                 with self._gpu_kv_lock, restore_context:
                     if restore_stream is not None and direct_delta is not None:
                         if direct_delta.receive_done_event is None:
@@ -1193,6 +1362,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                         block_axis=int(manifest["block_axis"]),
                         block_size=int(manifest["block_size"]),
                     )
+                diagnostic_phase = "AFTER_DELTA_INJECT_AND_READBACK"
                 delta_apply_ms = (
                     time.perf_counter() - delta_apply_started
                 ) * 1000
@@ -1247,6 +1417,23 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     receiver.acknowledge_delta(
                         start_token=start,
                         end_token=end,
+                    )
+                    _write_gpu_direct_rank_diagnostic(
+                        self.manifest_path,
+                        request_id=request_id,
+                        migration_id=request.migration_id,
+                        tp_rank=tp_rank,
+                        phase=(
+                            "DELTA_APPLIED_"
+                            f"{start:012d}_{end:012d}"
+                        ),
+                        device=device,
+                        receiver=receiver,
+                        delta_start_token=start,
+                        delta_end_token=end,
+                        delta_exact_readback=(
+                            delta_validation.get("exact_readback") is True
+                        ),
                     )
 
             if gpu_direct_delta:
@@ -1426,6 +1613,18 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     migration_id=request.migration_id,
                     tp_rank=tp_rank,
                 )
+                diagnostic_phase = "PERSISTENT_SESSION_IDLE"
+                _write_gpu_direct_rank_diagnostic(
+                    self.manifest_path,
+                    request_id=request_id,
+                    migration_id=request.migration_id,
+                    tp_rank=tp_rank,
+                    phase=diagnostic_phase,
+                    device=device,
+                    receiver=receiver,
+                    final_watermark=current,
+                    delta_batches=delta_batches,
+                )
             elif (
                 gpu_direct_delta
                 and receiver is not None
@@ -1476,6 +1675,17 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             )
             self._completed_recvs.add(request_id)
         except BaseException as error:
+            if device is not None and tp_rank is not None:
+                _write_gpu_direct_rank_diagnostic(
+                    self.manifest_path,
+                    request_id=request_id,
+                    migration_id=request.migration_id,
+                    tp_rank=tp_rank,
+                    phase=f"FAILED_AT_{diagnostic_phase}",
+                    device=device,
+                    receiver=receiver,
+                    error=error,
+                )
             if receiver is not None:
                 receiver.close()
                 if self.persistent_channel:
