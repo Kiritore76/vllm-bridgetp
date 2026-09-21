@@ -219,6 +219,27 @@ class TestSmokeContract(unittest.TestCase):
 
 
 class TestSourceSelectionContract(unittest.TestCase):
+    def test_controller_config_uses_selected_server_ports(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            controller = root / "controller"
+            provenance = root / "provenance"
+            controller.mkdir()
+            provenance.mkdir()
+            survival = root / "survival.json"
+            survival.write_text("{}", encoding="utf-8")
+            args = SimpleNamespace(
+                tp1_blocks=1968,
+                tp4_blocks=35739,
+                tp1_port=8101,
+                tp4_port=8300,
+                survival_table=survival,
+            )
+            path = MODULE.make_config(args, controller, provenance)
+            config = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(config["source_url"], "http://127.0.0.1:8101")
+        self.assertEqual(config["target_url"], "http://127.0.0.1:8300")
+
     def test_target_connector_records_ready_sync_mode(self) -> None:
         config = json.loads(
             MODULE.target_connector(
