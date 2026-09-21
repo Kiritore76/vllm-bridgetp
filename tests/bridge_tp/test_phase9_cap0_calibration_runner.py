@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 
 SCRIPT = (
@@ -219,6 +220,18 @@ class TestSmokeContract(unittest.TestCase):
 
 
 class TestSourceSelectionContract(unittest.TestCase):
+    def test_posix_cleanup_signals_group_after_parent_exit(self) -> None:
+        process = mock.Mock()
+        process.pid = 4321
+        process.poll.return_value = 1
+        managed = SimpleNamespace(process=process)
+        with (
+            mock.patch.object(MODULE.os, "name", "posix"),
+            mock.patch.object(MODULE.os, "killpg", create=True) as killpg,
+        ):
+            MODULE.signal_process(managed, MODULE.signal.SIGTERM)
+        killpg.assert_called_once_with(4321, MODULE.signal.SIGTERM)
+
     def test_controller_config_uses_selected_server_ports(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
