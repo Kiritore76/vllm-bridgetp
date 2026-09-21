@@ -365,6 +365,12 @@ def get_bridge_tp_stream_config() -> BridgeTPStreamConfig:
     overlaid = replace(
         base,
         armed=bool(control.armed),
+        migration_id=(control.migration_id or base.migration_id),
+        source_request_id_prefix=(
+            control.source_request_id_prefix
+            if control.source_request_id_prefix is not None
+            else base.source_request_id_prefix
+        ),
         after_output_tokens=(
             control.trigger_output_tokens
             if control.trigger_output_tokens is not None
@@ -1321,6 +1327,11 @@ def maybe_publish_kv_stream(
     if not config.enabled or _disabled_after_error:
         return
     try:
+        if config.persistent_channel:
+            # A committed source request disappears from the live scheduler.
+            # Retire only that request-local marker; the process-lifetime GPU
+            # sender and communicator remain in the persistent registry.
+            _published_request_ids.intersection_update(requests)
         request_ids = input_batch.req_ids
         request_id = select_source_request_id(
             request_ids,
@@ -1328,7 +1339,11 @@ def maybe_publish_kv_stream(
         )
         if request_id is None:
             return
-        if _published_request_ids and request_id not in _published_request_ids:
+        if (
+            not config.persistent_channel
+            and _published_request_ids
+            and request_id not in _published_request_ids
+        ):
             # A dedicated validation server owns one migration session. Later
             # clean-control requests must not overwrite its progress evidence
             # or reuse its ports and run directory.

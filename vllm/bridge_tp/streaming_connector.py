@@ -251,6 +251,17 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 "bridgetp_persistent_channel", False
             )
         )
+        if self.persistent_channel:
+            # Keep the lexical active-session path.  resolve() would pin the
+            # connector to the first symlink target and make later sessions
+            # invisible even though the communicator itself remains alive.
+            self.manifest_path = Path(manifest_path).absolute()
+            self.receipt_dir = Path(receipt_dir).absolute()
+            self.takeover_control_path = (
+                Path(takeover_control_path).absolute()
+                if takeover_control_path
+                else None
+            )
         self.channel_generation = int(
             self._kv_transfer_config.get_from_extra_config(
                 "bridgetp_channel_generation", 0
@@ -293,9 +304,28 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             self.manifest_path,
         )
 
-    def _load_manifest(self) -> dict[str, Any]:
+    def _load_manifest(
+        self, expected_migration_id: str | None = None
+    ) -> dict[str, Any]:
         if self._manifest is not None:
-            return self._manifest
+            active_id = str(self._manifest.get("migration_id", ""))
+            if expected_migration_id is None or active_id == expected_migration_id:
+                return self._manifest
+            if not self.persistent_channel:
+                return self._manifest
+            # A new request-level session may replace the manifest behind the
+            # stable active-session path only after the process-lifetime
+            # receiver has drained the previous session back to IDLE.
+            with self._persistent_gpu_receiver_lock:
+                receiver = self._persistent_gpu_receiver
+                lifecycle = receiver.lifecycle if receiver is not None else None
+                if lifecycle is not None and lifecycle.state.value != "IDLE":
+                    raise RuntimeError(
+                        "Persistent target channel received a new session "
+                        "before the previous session returned to IDLE"
+                    )
+            self._manifest = None
+            self._claimed_target_request_id = None
         with self.manifest_path.open(encoding="utf-8") as file:
             manifest = json.load(file)
         required = {
@@ -357,7 +387,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     f"{MIGRATION_PARAM!r}; refusing local recomputation"
                 )
             return False
-        manifest = self._load_manifest()
+        manifest = self._load_manifest(str(migration_id))
         prompt = request.prompt_token_ids
         if self.gpu_resident_shadow:
             known = list(manifest["all_known_token_ids"])
@@ -567,6 +597,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         if len(metadata.requests) != 1:
             raise ValueError("Phase 6 restores one request at a time")
         request = metadata.requests[0]
+        self._load_manifest(request.migration_id)
         if request.gpu_resident_shadow:
             self._claimed_target_request_id = request.target_request_id
             self._start_live_gpu_load(request)
@@ -1467,6 +1498,28 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             return None, None
         self._reported_recvs.update(ready)
         return None, set(ready)
+
+    def request_finished(
+        self,
+        request: Request,
+        block_ids: list[int],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Drop request-local bookkeeping while retaining channel resources."""
+        del block_ids
+        request_id = request.request_id
+        self._pending_requests.pop(request_id, None)
+        self._active_requests.pop(request_id, None)
+        self._load_threads.pop(request_id, None)
+        self._load_errors.pop(request_id, None)
+        with self._gpu_kv_lock:
+            self._copy_done_events.pop(request_id, None)
+            self._model_wait_streams = {
+                row for row in self._model_wait_streams if row[0] != request_id
+            }
+            self._model_wait_pending_requests.discard(request_id)
+        self._completed_recvs.discard(request_id)
+        self._reported_recvs.discard(request_id)
+        return False, None
 
     def update_connector_output(self, connector_output: Any) -> None:
         for request_id in connector_output.finished_recving or ():

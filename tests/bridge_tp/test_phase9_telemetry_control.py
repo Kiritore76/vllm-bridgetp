@@ -218,13 +218,18 @@ class TestRuntimeControl(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_roundtrip_and_generation_bump(self):
-        written = RuntimeControl(armed=True, trigger_output_tokens=128).write(
-            self.run_dir
-        )
+        written = RuntimeControl(
+            armed=True,
+            trigger_output_tokens=128,
+            migration_id="migration-2",
+            source_request_id_prefix="request-2",
+        ).write(self.run_dir)
         self.assertEqual(written.generation, 1)
         back = RuntimeControl.load(self.run_dir)
         self.assertTrue(back.armed)
         self.assertEqual(back.trigger_output_tokens, 128)
+        self.assertEqual(back.migration_id, "migration-2")
+        self.assertEqual(back.source_request_id_prefix, "request-2")
         self.assertEqual(written.write(self.run_dir).generation, 2)
 
     def test_missing_control_block_loads_as_none(self):

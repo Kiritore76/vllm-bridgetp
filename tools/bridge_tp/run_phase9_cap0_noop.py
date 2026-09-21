@@ -397,6 +397,7 @@ def run(
     background_before_controller: bool = False,
     background_lead_s: float = 0.0,
     background_ready_jobs: int = 0,
+    service_pool: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if phase not in {"bringup", "formal"}:
         raise ValueError(f"unsupported No-op phase {phase!r}")
@@ -406,6 +407,16 @@ def run(
     provenance_dir = out_root / "provenance"
     for path in (controller_dir, background_dir, provenance_dir):
         path.mkdir(parents=True, exist_ok=False)
+    server_dir = controller_dir
+    if service_pool is not None:
+        runtime_root = Path(service_pool["runtime_root"])
+        runtime_root.mkdir(parents=True, exist_ok=True)
+        active = runtime_root / "active"
+        pending = runtime_root / "active.next"
+        pending.unlink(missing_ok=True)
+        pending.symlink_to(controller_dir, target_is_directory=True)
+        os.replace(pending, active)
+        server_dir = active
     run_id = run_id or out_root.name
     manifest = load_manifest(args.manifest)
     config_path = make_config(
@@ -486,54 +497,66 @@ def run(
                 {
                     "BRIDGETP_TAKEOVER_ENABLED": "1",
                     "BRIDGETP_TAKEOVER_MIGRATION_ID": run_id,
-                    "BRIDGETP_TAKEOVER_RUN_DIR": str(controller_dir),
+                    "BRIDGETP_TAKEOVER_RUN_DIR": str(server_dir),
                 }
             )
-        target = common.start_process(
-            "target TP4",
-            common.server_command(args, 4, args.tp4_port)
-            + [
-                "--kv-transfer-config",
-                common.target_connector(
-                    controller_dir,
-                    gpu_resident_shadow=gpu_resident_shadow,
-                    cutover_output_tokens=int(
-                        getattr(args, "cutover_output_tokens", 0)
+        if bool(getattr(args, "persistent_channel", False)):
+            target_env["BRIDGETP_PERSISTENT_CHANNEL"] = "1"
+        target = service_pool.get("target") if service_pool is not None else None
+        if target is None:
+            target = common.start_process(
+                "target TP4",
+                common.server_command(args, 4, args.tp4_port)
+                + [
+                    "--kv-transfer-config",
+                    common.target_connector(
+                        server_dir,
+                        gpu_resident_shadow=gpu_resident_shadow,
+                        cutover_output_tokens=int(
+                            getattr(args, "cutover_output_tokens", 0)
+                        ),
+                        online_remote_attention=online_remote_attention,
+                        remote_attention_base_port=int(
+                            getattr(args, "remote_attention_base_port", 30200)
+                        ),
+                        ready_sync_mode=str(
+                            getattr(args, "ready_sync_mode", "DEVICE_WIDE")
+                        ),
+                        ready_notification_mode=str(
+                            getattr(args, "ready_notification_mode", "FILE_POLL")
+                        ),
+                        ready_notification_host=str(
+                            getattr(args, "ready_notification_host", "127.0.0.1")
+                        ),
+                        ready_notification_port=int(
+                            getattr(args, "ready_notification_port", 0)
+                        ),
+                        defer_communicator_destroy=bool(
+                            getattr(args, "deferred_comm_destroy", False)
+                        ),
+                        post_takeover_communicator_destroy=bool(
+                            getattr(args, "post_takeover_comm_destroy", False)
+                        ),
+                        persistent_channel=bool(
+                            getattr(args, "persistent_channel", False)
+                        ),
+                        channel_generation=int(
+                            getattr(args, "channel_generation", 0)
+                        ),
                     ),
-                    online_remote_attention=online_remote_attention,
-                    remote_attention_base_port=int(
-                        getattr(args, "remote_attention_base_port", 30200)
-                    ),
-                    ready_sync_mode=str(
-                        getattr(args, "ready_sync_mode", "DEVICE_WIDE")
-                    ),
-                    ready_notification_mode=str(
-                        getattr(args, "ready_notification_mode", "FILE_POLL")
-                    ),
-                    ready_notification_host=str(
-                        getattr(args, "ready_notification_host", "127.0.0.1")
-                    ),
-                    ready_notification_port=int(
-                        getattr(args, "ready_notification_port", 0)
-                    ),
-                    defer_communicator_destroy=bool(
-                        getattr(args, "deferred_comm_destroy", False)
-                    ),
-                    post_takeover_communicator_destroy=bool(
-                        getattr(args, "post_takeover_comm_destroy", False)
-                    ),
-                    persistent_channel=bool(
-                        getattr(args, "persistent_channel", False)
-                    ),
-                    channel_generation=int(
-                        getattr(args, "channel_generation", 0)
-                    ),
+                ],
+                target_env,
+                (
+                    Path(service_pool["runtime_root"]) / "target_tp4.log"
+                    if service_pool is not None
+                    else controller_dir / "target_tp4.log"
                 ),
-            ],
-            target_env,
-            controller_dir / "target_tp4.log",
-        )
-        processes.append(target)
+            )
+            if service_pool is not None:
+                service_pool["target"] = target
+                service_pool.setdefault("processes", []).append(target)
+            else:
+                processes.append(target)
         common.wait_healthy(
             f"http://127.0.0.1:{args.tp4_port}",
             target,
@@ -576,18 +599,28 @@ def run(
                     f"see {background.log_path}"
                 )
 
-        source_env = common.source_environment(args, run_id, controller_dir)
+        source_env = common.source_environment(args, run_id, server_dir)
         source_env.update(source_env_overrides or {})
         source_command = common.server_command(args, 1, args.tp1_port)
         if bool(getattr(args, "force_source_eager", False)):
             source_command.append("--enforce-eager")
-        source = common.start_process(
-            "source TP1",
-            source_command,
-            source_env,
-            controller_dir / "source_tp1.log",
-        )
-        processes.append(source)
+        source = service_pool.get("source") if service_pool is not None else None
+        if source is None:
+            source = common.start_process(
+                "source TP1",
+                source_command,
+                source_env,
+                (
+                    Path(service_pool["runtime_root"]) / "source_tp1.log"
+                    if service_pool is not None
+                    else controller_dir / "source_tp1.log"
+                ),
+            )
+            if service_pool is not None:
+                service_pool["source"] = source
+                service_pool.setdefault("processes", []).append(source)
+            else:
+                processes.append(source)
         common.wait_healthy(
             f"http://127.0.0.1:{args.tp1_port}",
             source,
@@ -668,6 +701,10 @@ def run(
             "--preflight-timeout-s",
             "120",
         ]
+        if service_pool is not None:
+            controller_command.extend(
+                ["--source-request-id", f"bridgetp-phase9-{run_id}"]
+            )
         controller_command.extend(controller_extra_args or [])
         controller = common.start_process(
             "controller",
