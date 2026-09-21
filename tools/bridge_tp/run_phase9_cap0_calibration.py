@@ -145,32 +145,63 @@ def start_process(
 
 
 def signal_process(item: ManagedProcess, sig: signal.Signals) -> None:
-    if item.process.poll() is not None:
-        return
     if os.name == "nt":
+        if item.process.poll() is not None:
+            return
         if sig == signal.SIGKILL:
             item.process.kill()
         else:
             item.process.terminate()
     else:
-        os.killpg(item.process.pid, sig)
+        # The API-server parent can exit before its EngineCore/worker children.
+        # The process group remains the cleanup authority in that state, so do
+        # not use the parent return code as proof that GPU workers are gone.
+        try:
+            os.killpg(item.process.pid, sig)
+        except ProcessLookupError:
+            return
+
+
+def process_group_alive(item: ManagedProcess) -> bool:
+    item.process.poll()
+    if os.name == "nt":
+        return item.process.returncode is None
+    try:
+        os.killpg(item.process.pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def wait_for_process_groups(
+    processes: list[ManagedProcess], timeout_s: float
+) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if not any(process_group_alive(item) for item in processes):
+            return True
+        time.sleep(0.1)
+    return not any(process_group_alive(item) for item in processes)
 
 
 def stop_processes(processes: list[ManagedProcess]) -> None:
     for item in reversed(processes):
         signal_process(item, signal.SIGINT)
-    deadline = time.monotonic() + 45
-    for item in reversed(processes):
-        if item.process.poll() is None:
-            try:
-                item.process.wait(timeout=max(0.1, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
+    if not wait_for_process_groups(processes, 45):
+        for item in reversed(processes):
+            if process_group_alive(item):
                 signal_process(item, signal.SIGTERM)
-    deadline = time.monotonic() + 20
+    if not wait_for_process_groups(processes, 20):
+        for item in reversed(processes):
+            if process_group_alive(item):
+                signal_process(item, signal.SIGKILL)
+        wait_for_process_groups(processes, 10)
     for item in reversed(processes):
         if item.process.poll() is None:
             try:
-                item.process.wait(timeout=max(0.1, deadline - time.monotonic()))
+                item.process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 signal_process(item, signal.SIGKILL)
                 item.process.wait(timeout=10)
