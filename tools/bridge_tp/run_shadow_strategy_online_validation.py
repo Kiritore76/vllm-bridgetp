@@ -1489,6 +1489,12 @@ def accept_online(
                         errors.append(
                             "persistent target channel was destroyed during request"
                         )
+                    if row.get("session_request_id") != session.get(
+                        "source_request_id"
+                    ):
+                        errors.append(
+                            "persistent target session request identity differs"
+                        )
         expected_sync_scope = (
             "BRIDGETP_RESTORE_STREAM_EVENT"
             if ready_sync_mode == "STREAM_EVENT"

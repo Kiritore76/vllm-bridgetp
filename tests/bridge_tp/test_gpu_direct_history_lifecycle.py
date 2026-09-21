@@ -15,6 +15,24 @@ from unittest.mock import Mock, patch
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "requires torch")
 class TestGpuDirectHistoryLifecycle(unittest.TestCase):
+    def test_persistent_session_uses_source_request_identity(self) -> None:
+        from vllm.bridge_tp.streaming_connector import (
+            BridgeTPStreamRequest,
+            _persistent_session_request_id,
+        )
+
+        request = BridgeTPStreamRequest(
+            migration_id="migration-1",
+            source_request_id="source-request-1",
+            target_request_id="target-request-9",
+            target_block_ids=[],
+            num_computed_tokens=0,
+        )
+        self.assertEqual(
+            _persistent_session_request_id(request),
+            "source-request-1",
+        )
+
     def test_delta_backlog_coalesces_to_latest_contiguous_watermark(self) -> None:
         from vllm.bridge_tp.kv_stream import _GpuDirectHistoryPublisher
 
@@ -396,7 +414,8 @@ class TestGpuDirectHistoryLifecycle(unittest.TestCase):
             connector.manifest_path = Path(directory) / "manifest.json"
             connector._record_persistent_receiver_idle(
                 receiver,
-                request_id="request-2",
+                target_request_id="target-request-2",
+                session_request_id="source-request-2",
                 migration_id="migration-2",
                 tp_rank=3,
             )
@@ -409,6 +428,8 @@ class TestGpuDirectHistoryLifecycle(unittest.TestCase):
             )
         self.assertEqual(receipt["status"], "PERSISTENT_CHANNEL_IDLE")
         self.assertEqual(receipt["channel_generation"], 5)
+        self.assertEqual(receipt["session_request_id"], "source-request-2")
+        self.assertEqual(receipt["target_request_id"], "target-request-2")
         self.assertEqual(receipt["channel_create_count"], 1)
         self.assertEqual(receipt["channel_destroy_count"], 0)
         self.assertEqual(receipt["channel_session_count"], 2)
