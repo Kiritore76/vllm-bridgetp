@@ -325,6 +325,24 @@ def _start_target_if_ready(
             # target request cannot be admitted until that dynamic boundary
             # has been atomically published.
             return None
+        # The target scheduler may start matching the request as soon as the
+        # session manifest appears.  For dynamic earliest-ready runs the
+        # connector obtains the prompt boundary from cutover_manifest.json;
+        # admit the target only after that publication is visible and agrees
+        # with the controller's selected boundary.  Otherwise TP4 can enter
+        # _planned_known_tokens with no boundary and terminate EngineCore.
+        if not stop_and_copy:
+            cutover_path = run_dir / "cutover_manifest.json"
+            if not cutover_path.is_file():
+                return None
+            try:
+                published_cutover = int(
+                    load_json(cutover_path)["cutover_num_output_tokens"]
+                )
+            except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
+                return None
+            if published_cutover != int(cutover_output_tokens):
+                return None
         if stop_and_copy:
             cutover_output_tokens = int(staging["snapshot_num_output_tokens"])
         target_request, cutover = build_gpu_resident_shadow_target_request(
