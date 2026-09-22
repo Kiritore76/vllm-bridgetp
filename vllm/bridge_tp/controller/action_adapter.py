@@ -317,15 +317,21 @@ class ActionAdapter:
                 continue
             if receipt.get("migration_id") != binding.migration_id:
                 return False, ready, f"rank {rank} initial receipt migration ID differs"
-            # A buffered tensor is only a staging artifact.  It is not yet
-            # safe to use as the earliest commit boundary because the model
-            # stream may still be waiting for restore/injection.  A1-D's
-            # EARLIEST_READY arm must therefore use the same exact resident
-            # evidence as the normal takeover gate.
-            if receipt.get("status") != "INITIAL_HISTORY_GPU_RESIDENT":
+            if receipt.get("status") not in {
+                "INITIAL_HISTORY_GPU_RESIDENT",
+                "INITIAL_HISTORY_GPU_BUFFERED",
+            }:
                 continue
-            if receipt.get("exact_readback") is not True:
+            if (
+                receipt.get("status") == "INITIAL_HISTORY_GPU_RESIDENT"
+                and receipt.get("exact_readback") is not True
+            ):
                 return False, ready, f"rank {rank} initial GPU history readback FAILED"
+            if (
+                receipt.get("status") == "INITIAL_HISTORY_GPU_BUFFERED"
+                and receipt.get("gpu_ready") is not True
+            ):
+                return False, ready, f"rank {rank} initial GPU history buffer is not ready"
             ready.add(rank)
         return (
             len(ready) == 4,
