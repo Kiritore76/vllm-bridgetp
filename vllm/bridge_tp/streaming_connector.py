@@ -591,14 +591,35 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         cutover_output_tokens = self.shadow_cutover_output_tokens
         if cutover_output_tokens <= 0:
             # EARLIEST_READY deliberately leaves the connector boundary
-            # dynamic.  The target request is admitted only after the
-            # controller publishes the authoritative cutover manifest.
+            # dynamic.  The controller publishes the selected boundary in
+            # runtime_control.json before admitting TP4.  Use that boundary
+            # to allocate/match the target request so the GPU-direct delta
+            # receiver can start; the later cutover manifest remains the
+            # authoritative final consistency check in _live_gpu_load.
             cutover_path = self.manifest_path.parent / "cutover_manifest.json"
-            if not cutover_path.is_file():
-                raise ValueError(
-                    "GPU-resident Shadow requires a published cutover boundary"
-                )
-            cutover = _load_json(cutover_path)
+            if cutover_path.is_file():
+                cutover = _load_json(cutover_path)
+            else:
+                control_path = self.manifest_path.parent / "runtime_control.json"
+                try:
+                    control = _load_json(control_path)
+                    selected = int(control["cutover_output_tokens"])
+                except (
+                    FileNotFoundError,
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                    OSError,
+                    json.JSONDecodeError,
+                ) as error:
+                    raise ValueError(
+                        "GPU-resident Shadow requires a selected cutover boundary"
+                    ) from error
+                if selected <= 0:
+                    raise ValueError(
+                        "GPU-resident Shadow requires a positive selected cutover"
+                    )
+                return int(manifest["num_prompt_tokens"]) + selected
             return int(manifest["num_prompt_tokens"]) + int(
                 cutover["cutover_num_output_tokens"]
             )
