@@ -291,6 +291,45 @@ class ActionAdapter:
         ).write(self.run_dir)
 
     # ---- readiness evidence -------------------------------------------
+    def poll_initial_history_gpu_ready(self) -> tuple[bool, set[int], str]:
+        """Return whether the initial Shadow history is GPU-resident on TP4.
+
+        This is deliberately *not* the final ``TARGET_READY`` commit gate.
+        During an earliest-ready experiment the source still owns generation,
+        so final readiness cannot exist until the source freezes and sends its
+        final delta.  The only non-circular early signal is the four initial
+        GPU-history receipts emitted after exact TP4 readback.
+        """
+        binding = self.refresh_binding()
+        if binding is None:
+            return False, set(), "session manifest not created yet"
+        receipt_dir = self.run_dir / "gpu_initial_receipts"
+        if not receipt_dir.is_dir():
+            return False, set(), "initial GPU-history receipts not created yet"
+        ready: set[int] = set()
+        for rank in range(4):
+            path = receipt_dir / f"tp_rank_{rank}.json"
+            if not path.is_file():
+                continue
+            try:
+                receipt = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if receipt.get("migration_id") != binding.migration_id:
+                return False, ready, f"rank {rank} initial receipt migration ID differs"
+            if receipt.get("status") != "INITIAL_HISTORY_GPU_RESIDENT":
+                continue
+            if receipt.get("exact_readback") is not True:
+                return False, ready, f"rank {rank} initial GPU history readback FAILED"
+            ready.add(rank)
+        return (
+            len(ready) == 4,
+            ready,
+            "all four ranks initial history GPU-ready"
+            if len(ready) == 4
+            else f"{len(ready)}/4 ranks initial history GPU-ready",
+        )
+
     def poll_target_ready(self) -> tuple[bool, set[int], str]:
         """Mirror the server's ``_validate_target_ready`` gate.
 

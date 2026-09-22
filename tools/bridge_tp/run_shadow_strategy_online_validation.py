@@ -212,6 +212,16 @@ def parse_args() -> argparse.Namespace:
         help="SHADOW-to-BRIDGE boundary; default is the window midpoint",
     )
     parser.add_argument("--cutover-output-tokens", type=int, default=160)
+    parser.add_argument(
+        "--commit-timing",
+        choices=("FIXED", "EARLIEST_READY"),
+        default="FIXED",
+        help=(
+            "FIXED freezes at --cutover-output-tokens. EARLIEST_READY waits "
+            "for exact initial history GPU residency on all TP4 ranks, then "
+            "publishes the first safe dynamic cutover."
+        ),
+    )
     parser.add_argument("--anchor-max-tokens", type=int, default=1024)
     parser.add_argument("--anchor-prompt-tokens", type=int, default=None)
     parser.add_argument("--minimum-ready-target-jobs", type=int, default=2)
@@ -434,7 +444,13 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise ValueError("GPU-direct base port must leave five valid ports")
     if set(args.strategy_order) != {"S_NEW", "S_NEW_OLD"}:
         raise ValueError("strategy order must contain S_NEW and S_NEW_OLD once")
-    if not 0 < args.trigger_output_tokens < args.cutover_output_tokens:
+    earliest_ready = args.commit_timing == "EARLIEST_READY"
+    if earliest_ready:
+        if not 0 < args.trigger_output_tokens < args.anchor_max_tokens - 64:
+            raise ValueError(
+                "earliest-ready trigger must leave at least 64 target-owned tokens"
+            )
+    elif not 0 < args.trigger_output_tokens < args.cutover_output_tokens:
         raise ValueError("trigger/cutover boundaries are invalid")
     bridge_output_tokens = args.bridge_output_tokens
     if bridge_output_tokens is None:
@@ -442,13 +458,13 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
             args.trigger_output_tokens + args.cutover_output_tokens
         ) // 2
         args.bridge_output_tokens = bridge_output_tokens
-    if (
-        not args.trigger_output_tokens
+    if not earliest_ready and not (
+        args.trigger_output_tokens
         < bridge_output_tokens
         < args.cutover_output_tokens
     ):
         raise ValueError("Bridge boundary must be strictly inside the Shadow window")
-    if args.anchor_max_tokens <= args.cutover_output_tokens + 64:
+    if not earliest_ready and args.anchor_max_tokens <= args.cutover_output_tokens + 64:
         raise ValueError("anchor must leave at least 64 target-owned tokens")
     if (
         args.anchor_prompt_tokens is not None
@@ -525,10 +541,17 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         {
             "target_jobs": len(jobs),
             "trigger_output_tokens": args.trigger_output_tokens,
-            "cutover_output_tokens": args.cutover_output_tokens,
-            "bridge_output_tokens": args.bridge_output_tokens,
+            "commit_timing": args.commit_timing,
+            "cutover_output_tokens": (
+                None if earliest_ready else args.cutover_output_tokens
+            ),
+            "bridge_output_tokens": (
+                None if earliest_ready else args.bridge_output_tokens
+            ),
             "shadow_window_output_tokens": (
-                args.cutover_output_tokens - args.trigger_output_tokens
+                None
+                if earliest_ready
+                else args.cutover_output_tokens - args.trigger_output_tokens
             ),
             "minimum_ready_target_jobs": args.minimum_ready_target_jobs,
             "fixed_rate_gib_s": args.fixed_rate_gib_s,
@@ -1296,6 +1319,7 @@ def accept_online(
     post_takeover_comm_destroy: bool = False,
     persistent_channel: bool = False,
     persistent_expected_session_count: int = 1,
+    commit_timing: str = "FIXED",
 ) -> dict[str, Any]:
     background = common.read_json(background_dir / "background_summary.json")
     session = common.read_json(controller_dir / "session_manifest.json")
@@ -1316,6 +1340,16 @@ def accept_online(
         else {}
     )
     audit = _load_rows(controller_dir / "phase9_audit.jsonl")
+    earliest_ready_armed = [
+        row
+        for row in audit
+        if row.get("kind") == "diagnostic_earliest_ready_armed"
+    ]
+    earliest_ready_selected = [
+        row
+        for row in audit
+        if row.get("kind") == "earliest_ready_cutover_selected"
+    ]
     end_rows = [row for row in audit if row.get("kind") == "run_end"]
     transitions = [row.get("to") for row in audit if row.get("kind") == "transition"]
     receipts, receipt_errors = rescue.receipt_evidence(controller_dir)
@@ -1495,6 +1529,15 @@ def accept_online(
             cutover["cutover_num_output_tokens"]
         ):
             errors.append("scheduler froze Shadow-only at the wrong token boundary")
+    if commit_timing == "EARLIEST_READY":
+        if len(earliest_ready_armed) != 1:
+            errors.append("earliest-ready cutover was not armed exactly once")
+        if len(earliest_ready_selected) != 1:
+            errors.append("earliest-ready cutover was not selected exactly once")
+        elif int(earliest_ready_selected[0].get("cutover_output_tokens", -1)) != int(
+            cutover["cutover_num_output_tokens"]
+        ):
+            errors.append("selected earliest-ready boundary differs from source freeze")
     history_completed = [
         float(row.get("completed_unix_s", float("inf")))
         for row in initial_stage_receipts
@@ -1708,6 +1751,16 @@ def accept_online(
         errors.append(
             "initial history was not GPU-resident on all ranks before cutover"
         )
+    if commit_timing == "EARLIEST_READY" and earliest_ready_selected:
+        selected_unix_s = float(earliest_ready_selected[0].get("unix_s", 0.0))
+        if (
+            len(gpu_history_completed) != 4
+            or any(value > selected_unix_s for value in gpu_history_completed)
+        ):
+            errors.append(
+                "earliest-ready boundary was selected before all initial GPU "
+                "history receipts completed"
+            )
     if gpu_resident_shadow:
         initial_end = int(session["num_computed_tokens"])
         final_end = int(cutover["num_computed_tokens"])
@@ -1984,6 +2037,22 @@ def accept_online(
             "remote attention is not executed."
         ),
         "strategy": strategy,
+        "commit_timing": commit_timing,
+        "earliest_ready_cutover_output_tokens": (
+            earliest_ready_selected[0].get("cutover_output_tokens")
+            if earliest_ready_selected
+            else None
+        ),
+        "earliest_ready_selection_output_tokens": (
+            earliest_ready_selected[0].get("selection_output_tokens")
+            if earliest_ready_selected
+            else None
+        ),
+        "earliest_ready_selection_unix_s": (
+            earliest_ready_selected[0].get("unix_s")
+            if earliest_ready_selected
+            else None
+        ),
         "ready_sync_mode": ready_sync_mode,
         "handoff_mode": handoff_mode,
         "stop_and_copy": stop_and_copy,
@@ -2385,6 +2454,7 @@ def main() -> None:
         "gpu_direct_base_port": args.gpu_direct_base_port,
         "online_remote_attention": args.online_remote_attention,
         "remote_attention_base_port": args.remote_attention_base_port,
+        "commit_timing": args.commit_timing,
         "bridge_output_tokens": args.bridge_output_tokens,
         "repetitions": args.repetitions,
         "fixed_rate_gib_s": args.fixed_rate_gib_s,
@@ -2590,6 +2660,7 @@ def main() -> None:
                             if args.persistent_sequential_reuse
                             else 1
                         ),
+                        commit_timing=args.commit_timing,
                     )
 
                 source_env_overrides = {"BRIDGETP_SHADOW_STRATEGY": strategy}
@@ -2628,6 +2699,38 @@ def main() -> None:
                         args.fixed_rate_gib_s
                     )
 
+                controller_extra_args = [
+                    "--diagnostic-trigger-output-tokens",
+                    str(args.trigger_output_tokens),
+                ]
+                if args.commit_timing == "EARLIEST_READY":
+                    controller_extra_args.append(
+                        "--diagnostic-earliest-ready-cutover"
+                    )
+                else:
+                    controller_extra_args.extend(
+                        [
+                            "--diagnostic-cutover-output-tokens",
+                            str(args.cutover_output_tokens),
+                            "--diagnostic-bridge-output-tokens",
+                            str(args.bridge_output_tokens),
+                        ]
+                    )
+                controller_extra_args.extend(
+                    [
+                        "--handoff-mode",
+                        handoff_mode,
+                        "--ready-notification-mode",
+                        selected_ready_notification_mode,
+                        "--ready-notification-host",
+                        args.ready_notification_host,
+                        "--ready-notification-port",
+                        str(args.ready_notification_port),
+                        "--ready-latch-poll-ms",
+                        str(args.ready_latch_poll_ms),
+                    ]
+                )
+
                 result = scenario_runner.run(
                     rep_args,
                     revision,
@@ -2662,24 +2765,7 @@ def main() -> None:
                     allow_clean_stager_exit=True,
                     source_env_overrides=source_env_overrides,
                     controller_config_overrides=controller_config_overrides,
-                    controller_extra_args=[
-                        "--diagnostic-trigger-output-tokens",
-                        str(args.trigger_output_tokens),
-                        "--diagnostic-cutover-output-tokens",
-                        str(args.cutover_output_tokens),
-                        "--diagnostic-bridge-output-tokens",
-                        str(args.bridge_output_tokens),
-                        "--handoff-mode",
-                        handoff_mode,
-                        "--ready-notification-mode",
-                        selected_ready_notification_mode,
-                        "--ready-notification-host",
-                        args.ready_notification_host,
-                        "--ready-notification-port",
-                        str(args.ready_notification_port),
-                        "--ready-latch-poll-ms",
-                        str(args.ready_latch_poll_ms),
-                    ]
+                    controller_extra_args=controller_extra_args
                     + (
                         ["--gpu-resident-shadow"]
                         if rep_args.gpu_resident_shadow

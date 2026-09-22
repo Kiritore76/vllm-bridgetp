@@ -135,6 +135,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--diagnostic-earliest-ready-cutover",
+        action="store_true",
+        help=(
+            "after the fixed diagnostic trigger, select the first safe "
+            "source cutover boundary only after initial history is GPU-ready "
+            "with exact readback on all four TP4 ranks"
+        ),
+    )
+    parser.add_argument(
         "--ready-notification-mode",
         choices=("FILE_POLL", "UDP"),
         default="FILE_POLL",
@@ -159,15 +168,35 @@ def parse_args() -> argparse.Namespace:
     trigger = args.diagnostic_trigger_output_tokens
     cutover = args.diagnostic_cutover_output_tokens
     bridge = args.diagnostic_bridge_output_tokens
-    if (trigger is None) != (cutover is None):
+    if args.diagnostic_earliest_ready_cutover and (
+        trigger is None or cutover is not None
+    ):
+        parser.error(
+            "earliest-ready cutover requires a trigger and forbids a fixed cutover"
+        )
+    if not args.diagnostic_earliest_ready_cutover and (
+        (trigger is None) != (cutover is None)
+    ):
         parser.error(
             "diagnostic trigger and cutover boundaries must be supplied together"
         )
-    if trigger is not None and (trigger < 0 or cutover <= trigger):
+    if (
+        trigger is not None
+        and cutover is not None
+        and (trigger < 0 or cutover <= trigger)
+    ):
         parser.error("diagnostic boundaries require 0 <= trigger < cutover")
-    if bridge is not None and (trigger is None or not trigger < bridge < cutover):
+    if bridge is not None and (
+        trigger is None
+        or cutover is None
+        or not trigger < bridge < cutover
+    ):
         parser.error("diagnostic Bridge boundary must be between trigger and cutover")
-    if args.gpu_resident_shadow and cutover is None:
+    if (
+        args.gpu_resident_shadow
+        and cutover is None
+        and not args.diagnostic_earliest_ready_cutover
+    ):
         parser.error("GPU-resident staging requires fixed diagnostic boundaries")
     if args.ready_notification_mode == "UDP" and not (
         0 < args.ready_notification_port <= 65535
@@ -291,7 +320,11 @@ def _start_target_if_ready(
     staging = load_json(path)
     if gpu_resident_shadow:
         if cutover_output_tokens is None:
-            raise ValueError("GPU-resident Shadow has no cutover boundary")
+            # Earliest-ready Shadow has started the GPU history transfer but
+            # deliberately has not chosen a source freeze boundary yet.  The
+            # target request cannot be admitted until that dynamic boundary
+            # has been atomically published.
+            return None
         if stop_and_copy:
             cutover_output_tokens = int(staging["snapshot_num_output_tokens"])
         target_request, cutover = build_gpu_resident_shadow_target_request(
@@ -341,6 +374,7 @@ def step_local(
     max_tokens: int,
     diagnostic_trigger_output_tokens: int | None = None,
     diagnostic_cutover_output_tokens: int | None = None,
+    diagnostic_earliest_ready_cutover: bool = False,
     capacity_signal: CapacitySignal | None = None,
     stop_and_copy: bool = False,
 ) -> None:
@@ -393,10 +427,21 @@ def step_local(
         trigger = request.output_tokens + 1
         cutover = trigger + config.handoff_output_tokens
     else:
-        if diagnostic_cutover_output_tokens is None:
+        if (
+            diagnostic_cutover_output_tokens is None
+            and not diagnostic_earliest_ready_cutover
+        ):
             raise RuntimeError("diagnostic cutover boundary is missing")
         trigger = diagnostic_trigger_output_tokens
-        cutover = diagnostic_cutover_output_tokens
+        # The source still needs an initial upper boundary while its history
+        # and deltas stream.  It is replaced once all four initial TP4
+        # GPU-history receipts are exact.  Do not expose this sentinel as the
+        # response-proxy cutover; that boundary is selected later.
+        cutover = (
+            max_tokens - 1
+            if diagnostic_earliest_ready_cutover
+            else diagnostic_cutover_output_tokens
+        )
         if request.output_tokens >= trigger:
             audit.write(
                 {
@@ -428,7 +473,8 @@ def step_local(
             }
         )
         return
-    recorder.set_cutover(trigger if stop_and_copy else cutover, now)
+    if not diagnostic_earliest_ready_cutover:
+        recorder.set_cutover(trigger if stop_and_copy else cutover, now)
     if diagnostic_boundary:
         trigger_path = TriggerPath.DIAGNOSTIC_FIXED_BOUNDARY
         trigger_reason = "diagnostic fixed boundary"
@@ -452,9 +498,20 @@ def step_local(
         note=trigger_reason,
     )
     record.trigger_output_tokens = trigger
-    record.cutover_output_tokens = cutover
+    record.cutover_output_tokens = (
+        None if diagnostic_earliest_ready_cutover else cutover
+    )
     record.t_decision = now
     record.trigger_path = trigger_path
+    if diagnostic_earliest_ready_cutover:
+        audit.write(
+            {
+                "kind": "diagnostic_earliest_ready_armed",
+                "trigger_output_tokens": trigger,
+                "initial_cutover_sentinel": cutover,
+                "reason": "wait for four initial GPU-history exact receipts",
+            }
+        )
     machine.transition(
         record.migration_id,
         MigrationState.SHADOW,
@@ -478,6 +535,8 @@ def step_shadow(
     dry_run: bool,
     recorder: ProxyRecorder,
     capacity_signal: CapacitySignal | None = None,
+    diagnostic_earliest_ready_cutover: bool = False,
+    max_tokens: int | None = None,
 ) -> None:
     remaining = policy.migration_bytes(request)
     new_rate = rate.step(
@@ -496,6 +555,50 @@ def step_shadow(
     )
     if not dry_run:
         adapter.set_rate(rate.rate_gib_s, note=rate.last_reason)
+
+    if diagnostic_earliest_ready_cutover and record.cutover_output_tokens is None:
+        ready, ranks, detail = adapter.poll_initial_history_gpu_ready()
+        audit.write(
+            {
+                "kind": "earliest_ready_poll",
+                "ready": ready,
+                "ranks": sorted(ranks),
+                "detail": detail,
+                "observed_output_tokens": request.output_tokens,
+            }
+        )
+        if ready:
+            if max_tokens is None:
+                raise RuntimeError("earliest-ready cutover needs source max_tokens")
+            # The controller and source read the control file asynchronously.
+            # A 16-token lead (one block) ensures the source cannot run past a
+            # newly lowered boundary before observing the atomic update.
+            cutover = max(
+                int(request.output_tokens) + 16,
+                int(record.trigger_output_tokens or 0) + 1,
+            )
+            if cutover >= max_tokens:
+                raise RuntimeError(
+                    "initial history became ready too late for a safe earliest-ready "
+                    f"cutover: selected={cutover}, max_tokens={max_tokens}"
+                )
+            if not dry_run:
+                adapter.set_cutover(
+                    cutover,
+                    note="earliest-ready: four initial GPU-history receipts exact",
+                )
+            recorder.set_cutover(cutover, now)
+            record.cutover_output_tokens = cutover
+            audit.write(
+                {
+                    "kind": "earliest_ready_cutover_selected",
+                    "cutover_output_tokens": cutover,
+                    "selection_output_tokens": request.output_tokens,
+                    "safety_lead_tokens": cutover - request.output_tokens,
+                    "ranks": sorted(ranks),
+                    "detail": detail,
+                }
+            )
 
     diagnostic_path = record.trigger_path is TriggerPath.DIAGNOSTIC_FIXED_BOUNDARY
     safety_path = record.trigger_path in {
@@ -760,7 +863,8 @@ def main() -> None:
     diagnostic_trigger = args.diagnostic_trigger_output_tokens
     diagnostic_cutover = args.diagnostic_cutover_output_tokens
     diagnostic_bridge = args.diagnostic_bridge_output_tokens
-    if diagnostic_trigger is not None:
+    if diagnostic_trigger is not None and not args.diagnostic_earliest_ready_cutover:
+        assert diagnostic_cutover is not None
         diagnostic_gap = diagnostic_cutover - diagnostic_trigger
         if diagnostic_gap != config.handoff_output_tokens:
             raise SystemExit(
@@ -967,6 +1071,7 @@ def main() -> None:
                         int(source_request["max_tokens"]),
                         diagnostic_trigger,
                         diagnostic_cutover,
+                        args.diagnostic_earliest_ready_cutover,
                         capacity_signal,
                         args.stop_and_copy,
                     )
@@ -981,7 +1086,7 @@ def main() -> None:
                         request_timeout_s=args.request_timeout_s,
                         target_future=target_future,
                         gpu_resident_shadow=args.gpu_resident_shadow,
-                        cutover_output_tokens=diagnostic_cutover,
+                        cutover_output_tokens=record.cutover_output_tokens,
                         stop_and_copy=args.stop_and_copy,
                         target_request_name=(
                             args.migration_id
@@ -1068,6 +1173,8 @@ def main() -> None:
                             args.dry_run,
                             recorder,
                             capacity_signal,
+                            args.diagnostic_earliest_ready_cutover,
+                            int(source_request["max_tokens"]),
                         )
                 elif record.state is MigrationState.HANDOFF:
                     step_handoff(
