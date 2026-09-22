@@ -1109,6 +1109,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             )
 
             while not self._prebind_receiver_stop.is_set():
+                receiver: Any | None = None
                 try:
                     if not self.manifest_path.is_file():
                         time.sleep(0.005)
@@ -1136,6 +1137,20 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                             or self.persistent_channel
                         ),
                     )
+                    # Publish the listener before entering receive().  The
+                    # receive call may block until TP1 starts sending; live
+                    # load must wait on this same object rather than trying
+                    # to bind the port a second time.
+                    with self._prebound_gpu_receiver_lock:
+                        if self._prebound_gpu_receiver is None:
+                            self._prebound_gpu_receiver = receiver
+                            if self.persistent_channel:
+                                with self._persistent_gpu_receiver_lock:
+                                    if self._persistent_gpu_receiver is None:
+                                        self._persistent_gpu_receiver = receiver
+                        else:
+                            receiver.close()
+                            receiver = self._prebound_gpu_receiver
                     direct = receiver.receive(
                         migration_id=str(manifest["migration_id"]),
                         request_id=str(manifest["source_request_id"]),
@@ -1147,17 +1162,6 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                         ),
                         synchronize=True,
                     )
-                    with self._prebound_gpu_receiver_lock:
-                        if self._prebound_gpu_receiver is None:
-                            self._prebound_gpu_receiver = receiver
-                            if self.persistent_channel:
-                                with self._persistent_gpu_receiver_lock:
-                                    if self._persistent_gpu_receiver is None:
-                                        self._persistent_gpu_receiver = receiver
-                                    else:
-                                        receiver.close()
-                        else:
-                            receiver.close()
                     with self._prebound_gpu_history_lock:
                         self._prebound_gpu_history = (
                             str(manifest["migration_id"]),
@@ -1188,8 +1192,26 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     ValueError,
                     RuntimeError,
                 ):
-                    # The manifest can be observed while it is being replaced;
-                    # retry until the connector shuts down.
+                    # Before a listener exists, the manifest can be observed
+                    # while it is being replaced, so retry.  Once a listener
+                    # has been published, do not keep it alive indefinitely:
+                    # clear it and let live load take the normal fallback
+                    # path rather than leaving a port occupied forever.
+                    if receiver is not None:
+                        with self._prebound_gpu_receiver_lock:
+                            if self._prebound_gpu_receiver is receiver:
+                                self._prebound_gpu_receiver = None
+                        with self._persistent_gpu_receiver_lock:
+                            if self._persistent_gpu_receiver is receiver:
+                                self._persistent_gpu_receiver = None
+                        try:
+                            receiver.close()
+                        except BaseException:
+                            logger.exception(
+                                "GPU-direct prebind receiver cleanup failed"
+                            )
+                        self._prebind_receiver_ready.set()
+                        return
                     time.sleep(0.005)
                 except BaseException:
                     logger.exception("GPU-direct receiver prebind failed")
@@ -1384,17 +1406,26 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 record = manifest["ranks"][tp_rank]
                 with self._prebound_gpu_receiver_lock:
                     receiver = self._prebound_gpu_receiver
-                    if receiver is not None and not self.persistent_channel:
-                        self._prebound_gpu_receiver = None
+                if receiver is not None:
+                    # The prebind worker owns the receive operation.  Wait
+                    # for its history handle instead of calling receive()
+                    # concurrently on the same listener.
+                    if not self._prebind_receiver_ready.wait(
+                        timeout=self.socket_timeout_s
+                    ):
+                        raise TimeoutError(
+                            "Timed out waiting for GPU-direct prebind receiver"
+                        )
+                    with self._prebound_gpu_receiver_lock:
+                        receiver = self._prebound_gpu_receiver
+                        if receiver is not None and not self.persistent_channel:
+                            self._prebound_gpu_receiver = None
                 if receiver is None:
-                    # register_kv_caches starts prebind asynchronously.  A
-                    # short request can reach _live_gpu_load before that
-                    # worker publishes its receiver, causing a second bind()
-                    # on the same rank/port and an Address-in-use crash.
-                    # Wait for the worker's terminal publication before
-                    # deciding whether a new receiver is actually needed.
+                    # register_kv_caches starts prebind asynchronously.  If it
+                    # terminated without publishing a listener, create the
+                    # normal live receiver as a fallback.
                     prebind_thread = self._prebind_receiver_thread
-                    if prebind_thread is not None:
+                    if prebind_thread is not None and not self._prebind_receiver_ready.is_set():
                         self._prebind_receiver_ready.wait(
                             timeout=self.socket_timeout_s
                         )
