@@ -2609,6 +2609,12 @@ def main() -> None:
                     # The target connector's final watermark is the frozen
                     # snapshot boundary, not Shadow's later delta boundary.
                     rep_args.cutover_output_tokens = args.trigger_output_tokens
+                elif args.commit_timing == "EARLIEST_READY":
+                    # The target request is admitted only after the
+                    # controller publishes cutover_manifest.json.  A zero
+                    # connector boundary enables that manifest-driven lookup;
+                    # it is not used as a runtime cutover value.
+                    rep_args.cutover_output_tokens = 0
                 rep_args.force_source_eager = bool(args.online_remote_attention)
                 rep_args.out_root = out_root / label
                 run_id = f"{out_root.name}-{label}"

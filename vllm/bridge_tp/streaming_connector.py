@@ -588,9 +588,19 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
     def _planned_known_tokens(self, manifest: dict[str, Any]) -> int:
         if not self.gpu_resident_shadow:
             return int(manifest["num_computed_tokens"]) + 1
-        if self.shadow_cutover_output_tokens <= 0:
-            raise ValueError("GPU-resident Shadow requires a cutover boundary")
-        return int(manifest["num_prompt_tokens"]) + self.shadow_cutover_output_tokens
+        cutover_output_tokens = self.shadow_cutover_output_tokens
+        if cutover_output_tokens <= 0:
+            # EARLIEST_READY deliberately leaves the connector boundary
+            # dynamic.  The target request is admitted only after the
+            # controller publishes the authoritative cutover manifest.
+            cutover_path = self.manifest_path.parent / "cutover_manifest.json"
+            if not cutover_path.is_file():
+                raise ValueError(
+                    "GPU-resident Shadow requires a published cutover boundary"
+                )
+            cutover = _load_json(cutover_path)
+            return int(cutover["cutover_num_output_tokens"])
+        return int(manifest["num_prompt_tokens"]) + cutover_output_tokens
 
     def _external_computed_tokens(self, manifest: dict[str, Any]) -> int:
         return self._planned_known_tokens(manifest) - 1
