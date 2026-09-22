@@ -1753,9 +1753,21 @@ def accept_online(
         )
     if commit_timing == "EARLIEST_READY" and earliest_ready_selected:
         selected_unix_s = float(earliest_ready_selected[0].get("unix_s", 0.0))
+        # The controller selects EARLIEST_READY only from exact resident
+        # receipts.  Prefer the append-only resident timestamp and retain the
+        # buffered timestamp separately for overlap diagnostics.
+        resident_completed = [
+            float(
+                row.get(
+                    "gpu_history_resident_unix_s",
+                    row.get("completed_unix_s", float("inf")),
+                )
+            )
+            for row in gpu_initial_receipts
+        ]
         if (
-            len(gpu_history_completed) != 4
-            or any(value > selected_unix_s for value in gpu_history_completed)
+            len(resident_completed) != 4
+            or any(value > selected_unix_s for value in resident_completed)
         ):
             errors.append(
                 "earliest-ready boundary was selected before all initial GPU "
