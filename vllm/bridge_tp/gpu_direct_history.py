@@ -564,6 +564,28 @@ class GpuDirectHistoryReceiver:
                 },
             )
 
+    def release_session_payload_buffer(self) -> int:
+        """Drop old-session KV payload storage while retaining the channel.
+
+        The persistent communicator is process-lifetime state, whereas the
+        packed receive buffer contains a previous request's KV payload.  Do
+        not let the latter look like a request-level KV leak.  CUDA's caching
+        allocator may keep the released bytes in ``memory_reserved`` for
+        reuse, but ``memory_allocated`` will no longer include this buffer.
+        """
+        if self.lifecycle is None or self.lifecycle.state.value != "IDLE":
+            raise RuntimeError(
+                "persistent payload buffer can only be released while IDLE"
+            )
+        released = (
+            self._packed_buffer.numel() * self._packed_buffer.element_size()
+            if self._packed_buffer is not None
+            else 0
+        )
+        self._packed_buffer = None
+        self.buffer_capacity_elements = 0
+        return released
+
     def _close_control(self) -> None:
         closed = False
         if self.connection is not None:
