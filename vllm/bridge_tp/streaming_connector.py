@@ -451,6 +451,16 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         self._retained_gpu_receivers_lock = threading.Lock()
         self._persistent_gpu_receiver: Any | None = None
         self._persistent_gpu_receiver_lock = threading.Lock()
+        # Earliest-ready can publish the source session manifest before the
+        # controller has selected the final cutover boundary.  Bind the
+        # per-rank GPU-direct listener as soon as that manifest appears so
+        # the TP1 publisher never races a target request for port 30400.
+        # Tensor injection still happens only from _live_gpu_load after the
+        # target request has allocated its KV blocks.
+        self._prebound_gpu_receiver: Any | None = None
+        self._prebound_gpu_receiver_lock = threading.Lock()
+        self._prebind_receiver_thread: threading.Thread | None = None
+        self._prebind_receiver_stop = threading.Event()
         # Use one restore stream for all sequential sessions.  Recreating it
         # per session strands the readback temporaries in separate CUDA
         # allocator stream caches and looks like a TP4 KV leak in nvidia-smi.
@@ -1039,6 +1049,84 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """Retain paged-KV tensors for asynchronous Shadow injection."""
         self._registered_kv_caches = dict(kv_caches)
+        if self.gpu_resident_shadow:
+            self._start_gpu_direct_receiver_prebind()
+
+    def _start_gpu_direct_receiver_prebind(self) -> None:
+        """Bind the GPU-direct listener before dynamic cutover is known.
+
+        The receiver constructor only binds the TCP rendezvous socket; NCCL
+        communicator creation and tensor receive remain in ``_live_gpu_load``.
+        This removes the earliest-ready startup cycle without changing the
+        target request's ownership or cutover semantics.
+        """
+        if self._prebind_receiver_thread is not None:
+            return
+
+        def worker() -> None:
+            from vllm.bridge_tp.gpu_direct_history import (
+                GpuDirectHistoryReceiver,
+            )
+
+            while not self._prebind_receiver_stop.is_set():
+                try:
+                    if not self.manifest_path.is_file():
+                        time.sleep(0.005)
+                        continue
+                    manifest = _load_json(self.manifest_path)
+                    if manifest.get("history_transport") != "NCCL_P2P_GPU_DIRECT":
+                        return
+                    ranks = manifest.get("ranks")
+                    if not isinstance(ranks, list):
+                        return
+                    tp_rank = get_tp_group().rank_in_group
+                    record = ranks[tp_rank]
+                    device = next(
+                        iter(self._registered_kv_caches.values())
+                    ).device
+                    receiver = GpuDirectHistoryReceiver(
+                        device=device,
+                        host=str(record["host"]),
+                        port=int(record["port"]),
+                        defer_communicator_destroy=(
+                            self.defer_communicator_destroy
+                            or self.post_takeover_communicator_destroy
+                            or self.persistent_channel
+                        ),
+                    )
+                    with self._prebound_gpu_receiver_lock:
+                        if self._prebound_gpu_receiver is None:
+                            self._prebound_gpu_receiver = receiver
+                            if self.persistent_channel:
+                                with self._persistent_gpu_receiver_lock:
+                                    if self._persistent_gpu_receiver is None:
+                                        self._persistent_gpu_receiver = receiver
+                                    else:
+                                        receiver.close()
+                        else:
+                            receiver.close()
+                    return
+                except (
+                    OSError,
+                    KeyError,
+                    IndexError,
+                    TypeError,
+                    ValueError,
+                    RuntimeError,
+                ):
+                    # The manifest can be observed while it is being replaced;
+                    # retry until the connector shuts down.
+                    time.sleep(0.005)
+                except BaseException:
+                    logger.exception("GPU-direct receiver prebind failed")
+                    return
+
+        self._prebind_receiver_thread = threading.Thread(
+            target=worker,
+            name="bridgetp-gpu-direct-prebind",
+            daemon=True,
+        )
+        self._prebind_receiver_thread.start()
 
     def _service_gpu_restore_quiescence(self) -> None:
         """Pause this TP worker at a safe pre-forward boundary if requested."""
@@ -1219,27 +1307,32 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 )
 
                 record = manifest["ranks"][tp_rank]
-                if self.persistent_channel:
-                    with self._persistent_gpu_receiver_lock:
-                        receiver = self._persistent_gpu_receiver
-                        if receiver is None:
-                            receiver = GpuDirectHistoryReceiver(
-                                device=device,
-                                host=str(record["host"]),
-                                port=int(record["port"]),
-                                defer_communicator_destroy=True,
-                            )
-                            self._persistent_gpu_receiver = receiver
-                else:
-                    receiver = GpuDirectHistoryReceiver(
-                        device=device,
-                        host=str(record["host"]),
-                        port=int(record["port"]),
-                        defer_communicator_destroy=(
-                            self.defer_communicator_destroy
-                            or self.post_takeover_communicator_destroy
-                        ),
-                    )
+                with self._prebound_gpu_receiver_lock:
+                    receiver = self._prebound_gpu_receiver
+                    if receiver is not None and not self.persistent_channel:
+                        self._prebound_gpu_receiver = None
+                if receiver is None:
+                    if self.persistent_channel:
+                        with self._persistent_gpu_receiver_lock:
+                            receiver = self._persistent_gpu_receiver
+                            if receiver is None:
+                                receiver = GpuDirectHistoryReceiver(
+                                    device=device,
+                                    host=str(record["host"]),
+                                    port=int(record["port"]),
+                                    defer_communicator_destroy=True,
+                                )
+                                self._persistent_gpu_receiver = receiver
+                    else:
+                        receiver = GpuDirectHistoryReceiver(
+                            device=device,
+                            host=str(record["host"]),
+                            port=int(record["port"]),
+                            defer_communicator_destroy=(
+                                self.defer_communicator_destroy
+                                or self.post_takeover_communicator_destroy
+                            ),
+                        )
                 diagnostic_phase = "BEFORE_HISTORY_RECEIVE"
                 _write_gpu_direct_rank_diagnostic(
                     self.manifest_path,
@@ -2122,9 +2215,18 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
 
     def shutdown(self) -> None:
         """Abort pooled target communicators only as the worker exits."""
+        self._prebind_receiver_stop.set()
+        with self._prebound_gpu_receiver_lock:
+            prebound_receiver = self._prebound_gpu_receiver
+            self._prebound_gpu_receiver = None
         with self._persistent_gpu_receiver_lock:
             persistent_receiver = self._persistent_gpu_receiver
             self._persistent_gpu_receiver = None
+        if (
+            prebound_receiver is not None
+            and prebound_receiver is not persistent_receiver
+        ):
+            prebound_receiver.abort()
         if persistent_receiver is not None:
             persistent_receiver.abort()
         with self._retained_gpu_receivers_lock:
