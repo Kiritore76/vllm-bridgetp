@@ -66,6 +66,24 @@ class _ShadowCancelled(RuntimeError):
 
 
 @dataclass
+class _GpuRestoreQuiescence:
+    """A request-local handshake which makes a KV restore exclusive.
+
+    NCCL receive is intentionally asynchronous, but injecting received data
+    mutates paged KV tensors.  A Python background thread must therefore not
+    issue that mutation concurrently with the TP worker's next model forward.
+    The worker records an event after its already-enqueued model work, pauses
+    before its next forward, and the restore stream waits for that event.
+    """
+
+    requested: threading.Event = field(default_factory=threading.Event)
+    worker_quiesced: threading.Event = field(default_factory=threading.Event)
+    restore_complete: threading.Event = field(default_factory=threading.Event)
+    model_stream_event: torch.cuda.Event | None = None
+    error: BaseException | None = None
+
+
+@dataclass
 class BridgeTPStreamRequest:
     migration_id: str
     source_request_id: str
@@ -376,6 +394,11 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 "bridgetp_persistent_channel", False
             )
         )
+        self.release_persistent_payload_buffer = bool(
+            self._kv_transfer_config.get_from_extra_config(
+                "bridgetp_release_persistent_payload_buffer", True
+            )
+        )
         if self.persistent_channel:
             # Keep the lexical active-session path.  resolve() would pin the
             # connector to the first symlink target and make later sessions
@@ -404,6 +427,11 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         self._registered_kv_caches: dict[str, torch.Tensor] = {}
         self._load_threads: dict[str, threading.Thread] = {}
         self._gpu_kv_lock = threading.RLock()
+        # GPU-direct receive happens on a background thread.  These gates
+        # temporarily pause the next TP4 model forward while that thread
+        # writes the initial history into the live paged-KV tensors.
+        self._gpu_restore_quiescence: dict[str, _GpuRestoreQuiescence] = {}
+        self._gpu_restore_quiescence_lock = threading.Lock()
         self._remote_attention_servers: dict[str, RemoteAttentionRankServer] = {}
         self._completed_recvs: set[str] = set()
         self._reported_recvs: set[str] = set()
@@ -712,6 +740,10 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, BridgeTPStreamMetadata):
             raise TypeError("Unexpected BridgeTP Phase 6 connector metadata")
+        # Do this before arming request-specific copy waits and before the
+        # early return for ordinary TP4 background work.  That work is exactly
+        # what previously raced the background restore on some ranks.
+        self._service_gpu_restore_quiescence()
         # This hook runs outside the compiled/CUDA-graph model body on every
         # model execution.  Arm the dependency here rather than relying only
         # on wait_for_layer_load(): decode CUDA-graph replay does not re-enter
@@ -1003,6 +1035,67 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         """Retain paged-KV tensors for asynchronous Shadow injection."""
         self._registered_kv_caches = dict(kv_caches)
 
+    def _service_gpu_restore_quiescence(self) -> None:
+        """Pause this TP worker at a safe pre-forward boundary if requested."""
+        with self._gpu_restore_quiescence_lock:
+            gates = [
+                gate
+                for gate in self._gpu_restore_quiescence.values()
+                if gate.requested.is_set() and not gate.worker_quiesced.is_set()
+            ]
+        for gate in gates:
+            # start_load_kv runs on the model worker immediately before the
+            # next forward.  Recording here makes the restore stream depend on
+            # all model work already queued on this worker's current stream.
+            stream = torch.cuda.current_stream()
+            event = torch.cuda.Event(enable_timing=False)
+            event.record(stream)
+            gate.model_stream_event = event
+            gate.worker_quiesced.set()
+            if not gate.restore_complete.wait(timeout=self.socket_timeout_s):
+                raise TimeoutError(
+                    "Timed out waiting for GPU-direct KV restore to leave "
+                    "its TP4 quiescence window"
+                )
+            if gate.error is not None:
+                raise RuntimeError(
+                    "GPU-direct KV restore failed while TP4 was quiesced"
+                ) from gate.error
+
+    def _enter_gpu_restore_quiescence(
+        self,
+        request_id: str,
+        restore_stream: torch.cuda.Stream,
+    ) -> _GpuRestoreQuiescence:
+        with self._gpu_restore_quiescence_lock:
+            gate = self._gpu_restore_quiescence.get(request_id)
+        if gate is None:
+            raise RuntimeError("GPU-direct restore gate is missing")
+        gate.requested.set()
+        try:
+            if not gate.worker_quiesced.wait(timeout=self.socket_timeout_s):
+                raise TimeoutError(
+                    "Timed out waiting for TP4 worker to quiesce before "
+                    "GPU-direct KV restore"
+                )
+            if gate.model_stream_event is None:
+                raise RuntimeError("TP4 quiescence did not record a model event")
+            restore_stream.wait_event(gate.model_stream_event)
+            return gate
+        except BaseException as error:
+            self._leave_gpu_restore_quiescence(gate, error)
+            raise
+
+    @staticmethod
+    def _leave_gpu_restore_quiescence(
+        gate: _GpuRestoreQuiescence | None,
+        error: BaseException | None = None,
+    ) -> None:
+        if gate is None:
+            return
+        gate.error = error
+        gate.restore_complete.set()
+
     def _start_live_gpu_load(self, request: BridgeTPStreamRequest) -> None:
         if request.target_request_id in self._load_threads:
             return
@@ -1025,6 +1118,10 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             )
             self._remote_attention_servers[request.target_request_id] = server
             server.start()
+        with self._gpu_restore_quiescence_lock:
+            self._gpu_restore_quiescence[request.target_request_id] = (
+                _GpuRestoreQuiescence()
+            )
         thread = threading.Thread(
             target=self._live_gpu_load,
             args=(request,),
@@ -1068,6 +1165,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         request_id = request.target_request_id
         session_request_id = _persistent_session_request_id(request)
         diagnostic_phase = "ENTER"
+        history_quiescence: _GpuRestoreQuiescence | None = None
         receiver: Any | None = None
         device: torch.device | None = None
         tp_rank: int | None = None
@@ -1207,35 +1305,46 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     else None
                 ),
             )
-            with self._gpu_kv_lock, restore_context:
-                if restore_stream is not None and direct is not None:
-                    if direct.receive_done_event is None:
-                        raise RuntimeError("GPU history has no receive-done event")
-                    restore_stream.wait_event(direct.receive_done_event)
-                    receive_event_links += 1
-
-                layer_trace_hook = None
-                if _gpu_direct_layer_diagnostics_enabled(receiver):
-                    def layer_trace_hook(operation: str, layer_name: str) -> None:
-                        _write_gpu_direct_rank_diagnostic(
-                            self.manifest_path,
-                            request_id=request_id,
-                            migration_id=request.migration_id,
-                            tp_rank=tp_rank,
-                            phase=f"{operation}_{_safe_name(layer_name)}",
-                            device=device,
-                            receiver=receiver,
-                            layer_name=layer_name,
-                            layer_operation=operation,
-                        )
-
-                validation = inject_rank_shard(
-                    self._destination_layers(history_layers),
-                    history_layers,
-                    request.target_block_ids[:initial_blocks],
-                    block_axis=int(manifest["block_axis"]),
-                    layer_trace_hook=layer_trace_hook,
+            if restore_stream is not None and direct is not None:
+                history_quiescence = self._enter_gpu_restore_quiescence(
+                    request_id, restore_stream
                 )
+            try:
+                with self._gpu_kv_lock, restore_context:
+                    if restore_stream is not None and direct is not None:
+                        if direct.receive_done_event is None:
+                            raise RuntimeError("GPU history has no receive-done event")
+                        restore_stream.wait_event(direct.receive_done_event)
+                        receive_event_links += 1
+
+                    layer_trace_hook = None
+                    if _gpu_direct_layer_diagnostics_enabled(receiver):
+                        def layer_trace_hook(operation: str, layer_name: str) -> None:
+                            _write_gpu_direct_rank_diagnostic(
+                                self.manifest_path,
+                                request_id=request_id,
+                                migration_id=request.migration_id,
+                                tp_rank=tp_rank,
+                                phase=f"{operation}_{_safe_name(layer_name)}",
+                                device=device,
+                                receiver=receiver,
+                                layer_name=layer_name,
+                                layer_operation=operation,
+                            )
+
+                    validation = inject_rank_shard(
+                        self._destination_layers(history_layers),
+                        history_layers,
+                        request.target_block_ids[:initial_blocks],
+                        block_axis=int(manifest["block_axis"]),
+                        layer_trace_hook=layer_trace_hook,
+                    )
+            except BaseException as error:
+                self._leave_gpu_restore_quiescence(history_quiescence, error)
+                raise
+            else:
+                self._leave_gpu_restore_quiescence(history_quiescence)
+                history_quiescence = None
             diagnostic_phase = "AFTER_HISTORY_INJECT_AND_READBACK"
             _write_gpu_direct_rank_diagnostic(
                 self.manifest_path,
@@ -1758,6 +1867,9 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         """Drop request-local bookkeeping while retaining channel resources."""
         del block_ids
         request_id = request.request_id
+        # The communicator remains pooled, but its previous request's packed
+        # receive tensor must not stay live after the request is gone.
+        self._release_persistent_payload_buffer(request_id)
         self._pending_requests.pop(request_id, None)
         self._active_requests.pop(request_id, None)
         self._load_threads.pop(request_id, None)
@@ -1768,6 +1880,8 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 row for row in self._model_wait_streams if row[0] != request_id
             }
             self._model_wait_pending_requests.discard(request_id)
+        with self._gpu_restore_quiescence_lock:
+            self._gpu_restore_quiescence.pop(request_id, None)
         self._completed_recvs.discard(request_id)
         self._reported_recvs.discard(request_id)
         return False, None
@@ -1843,6 +1957,46 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             },
             self.manifest_path.parent
             / "persistent_channel_receipts"
+            / f"tp_rank_{tp_rank}.json",
+        )
+
+    def _release_persistent_payload_buffer(self, request_id: str) -> None:
+        """Release request-scoped packed KV storage after request completion."""
+        if not (
+            self.persistent_channel and self.release_persistent_payload_buffer
+        ):
+            return
+        with self._persistent_gpu_receiver_lock:
+            receiver = self._persistent_gpu_receiver
+            lifecycle = receiver.lifecycle if receiver is not None else None
+            if receiver is None or lifecycle is None or lifecycle.state.value != "IDLE":
+                return
+            device = receiver.device
+            with torch.cuda.device(device):
+                allocated_before = torch.cuda.memory_allocated(device)
+                reserved_before = torch.cuda.memory_reserved(device)
+            released_bytes = receiver.release_session_payload_buffer()
+            with torch.cuda.device(device):
+                allocated_after = torch.cuda.memory_allocated(device)
+                reserved_after = torch.cuda.memory_reserved(device)
+        tp_rank = get_tp_group().rank_in_group
+        _atomic_json_dump(
+            {
+                "format_version": 1,
+                "status": "PERSISTENT_SESSION_PAYLOAD_RELEASED",
+                "target_request_id": request_id,
+                "tp_rank": tp_rank,
+                "released_payload_bytes": released_bytes,
+                "cuda_memory_allocated_before_bytes": allocated_before,
+                "cuda_memory_allocated_after_bytes": allocated_after,
+                # PyTorch is allowed to retain freed blocks in its allocator
+                # cache.  This field makes that distinction explicit.
+                "cuda_memory_reserved_before_bytes": reserved_before,
+                "cuda_memory_reserved_after_bytes": reserved_after,
+                "completed_unix_s": time.time(),
+            },
+            self.manifest_path.parent
+            / "persistent_payload_cleanup"
             / f"tp_rank_{tp_rank}.json",
         )
 
