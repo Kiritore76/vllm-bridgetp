@@ -124,6 +124,30 @@ def _gpu_direct_diagnostics_enabled() -> bool:
     }
 
 
+def _gpu_direct_layer_diagnostics_enabled(receiver: Any | None) -> bool:
+    """Enable per-layer markers only for a selected persistent session range."""
+    if not _gpu_direct_diagnostics_enabled():
+        return False
+    if os.environ.get("BRIDGETP_GPU_DIRECT_LAYER_DIAGNOSTICS", "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return False
+    try:
+        minimum_session = int(
+            os.environ.get("BRIDGETP_GPU_DIRECT_LAYER_DIAGNOSTICS_MIN_SESSION", "1")
+        )
+    except ValueError as error:
+        raise ValueError(
+            "BRIDGETP_GPU_DIRECT_LAYER_DIAGNOSTICS_MIN_SESSION must be an integer"
+        ) from error
+    lifecycle = getattr(receiver, "lifecycle", None)
+    session_count = int(getattr(lifecycle, "session_count", 0))
+    return session_count >= minimum_session
+
+
 def _write_gpu_direct_rank_diagnostic(
     manifest_path: Path,
     *,
@@ -1189,11 +1213,28 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                         raise RuntimeError("GPU history has no receive-done event")
                     restore_stream.wait_event(direct.receive_done_event)
                     receive_event_links += 1
+
+                layer_trace_hook = None
+                if _gpu_direct_layer_diagnostics_enabled(receiver):
+                    def layer_trace_hook(operation: str, layer_name: str) -> None:
+                        _write_gpu_direct_rank_diagnostic(
+                            self.manifest_path,
+                            request_id=request_id,
+                            migration_id=request.migration_id,
+                            tp_rank=tp_rank,
+                            phase=f"{operation}_{_safe_name(layer_name)}",
+                            device=device,
+                            receiver=receiver,
+                            layer_name=layer_name,
+                            layer_operation=operation,
+                        )
+
                 validation = inject_rank_shard(
                     self._destination_layers(history_layers),
                     history_layers,
                     request.target_block_ids[:initial_blocks],
                     block_axis=int(manifest["block_axis"]),
+                    layer_trace_hook=layer_trace_hook,
                 )
             diagnostic_phase = "AFTER_HISTORY_INJECT_AND_READBACK"
             _write_gpu_direct_rank_diagnostic(

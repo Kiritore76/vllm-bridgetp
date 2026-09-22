@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -165,8 +165,14 @@ def inject_rank_shard(
     target_block_ids: list[int],
     *,
     block_axis: int,
+    layer_trace_hook: Callable[[str, str], None] | None = None,
 ) -> dict[str, int | bool]:
-    """Synchronously write one rank shard and require an exact readback."""
+    """Synchronously write one rank shard and require an exact readback.
+
+    ``layer_trace_hook`` is deliberately optional and has no production-path
+    cost when omitted.  The online persistent-channel failure investigation
+    uses it to identify the precise layer and operation that fails to return.
+    """
     if not target_block_ids:
         raise ValueError("No destination blocks were allocated")
     if len(set(target_block_ids)) != len(target_block_ids):
@@ -182,6 +188,8 @@ def inject_rank_shard(
 
     raw_tensor_bytes = 0
     for layer_name, source_tensor in shard_layers.items():
+        if layer_trace_hook is not None:
+            layer_trace_hook("BEFORE_SOURCE_TO_DEVICE", layer_name)
         destination = destination_layers[layer_name]
         normalized_axis = (
             block_axis if block_axis >= 0 else destination.ndim + block_axis
@@ -214,8 +222,16 @@ def inject_rank_shard(
             target_block_ids, dtype=torch.long, device=destination.device
         )
         source = source_tensor.to(device=destination.device)
+        if layer_trace_hook is not None:
+            layer_trace_hook("AFTER_SOURCE_TO_DEVICE", layer_name)
+            layer_trace_hook("BEFORE_INDEX_COPY", layer_name)
         destination.index_copy_(normalized_axis, index, source)
+        if layer_trace_hook is not None:
+            layer_trace_hook("AFTER_INDEX_COPY", layer_name)
+            layer_trace_hook("BEFORE_INDEX_SELECT", layer_name)
         restored = destination.index_select(normalized_axis, index)
+        if layer_trace_hook is not None:
+            layer_trace_hook("AFTER_INDEX_SELECT", layer_name)
         expected = (
             source
             if source_tensor.device == destination.device
@@ -223,11 +239,15 @@ def inject_rank_shard(
         )
         if expected.device != restored.device:
             restored = restored.cpu()
+        if layer_trace_hook is not None:
+            layer_trace_hook("BEFORE_EXACT_READBACK", layer_name)
         if not torch.equal(restored, expected):
             mismatches = int(torch.count_nonzero(restored != expected))
             raise ValueError(
                 f"Layer {layer_name} restore readback differs in {mismatches} elements"
             )
+        if layer_trace_hook is not None:
+            layer_trace_hook("AFTER_EXACT_READBACK", layer_name)
         raw_tensor_bytes += source_tensor.numel() * source_tensor.element_size()
 
     return {

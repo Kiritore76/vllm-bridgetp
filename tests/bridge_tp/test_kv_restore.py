@@ -40,6 +40,35 @@ class TestKVRestore(unittest.TestCase):
             )
             self.assertTrue(torch.all(self.destination[layer_name][0] == -1.0))
 
+    def test_layer_trace_identifies_each_restore_operation(self) -> None:
+        events: list[tuple[str, str]] = []
+        inject_rank_shard(
+            self.destination,
+            self.source,
+            [7, 2, 10],
+            block_axis=0,
+            layer_trace_hook=lambda operation, layer: events.append(
+                (operation, layer)
+            ),
+        )
+        self.assertEqual(
+            events,
+            [
+                (operation, layer)
+                for layer in ("layer.0", "layer.1")
+                for operation in (
+                    "BEFORE_SOURCE_TO_DEVICE",
+                    "AFTER_SOURCE_TO_DEVICE",
+                    "BEFORE_INDEX_COPY",
+                    "AFTER_INDEX_COPY",
+                    "BEFORE_INDEX_SELECT",
+                    "AFTER_INDEX_SELECT",
+                    "BEFORE_EXACT_READBACK",
+                    "AFTER_EXACT_READBACK",
+                )
+            ],
+        )
+
     def test_rejects_duplicate_target_blocks(self) -> None:
         with self.assertRaisesRegex(ValueError, "not unique"):
             inject_rank_shard(
