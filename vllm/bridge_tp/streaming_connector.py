@@ -599,7 +599,9 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     "GPU-resident Shadow requires a published cutover boundary"
                 )
             cutover = _load_json(cutover_path)
-            return int(cutover["cutover_num_output_tokens"])
+            return int(manifest["num_prompt_tokens"]) + int(
+                cutover["cutover_num_output_tokens"]
+            )
         return int(manifest["num_prompt_tokens"]) + cutover_output_tokens
 
     def _external_computed_tokens(self, manifest: dict[str, Any]) -> int:
