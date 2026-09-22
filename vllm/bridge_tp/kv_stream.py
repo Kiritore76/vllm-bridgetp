@@ -766,6 +766,13 @@ class _GpuDirectHistoryPublisher:
                                 receipt["last_session_payload_released_bytes"] = (
                                     sender.last_session_payload_released_bytes
                                 )
+                                with torch.cuda.device(sender.device):
+                                    receipt["cuda_memory_allocated_bytes"] = (
+                                        torch.cuda.memory_allocated(sender.device)
+                                    )
+                                    receipt["cuda_memory_reserved_bytes"] = (
+                                        torch.cuda.memory_reserved(sender.device)
+                                    )
                             elif self.config.defer_communicator_destroy:
                                 sender.close_control()
                                 receipt["communicator_lifecycle"] = (
