@@ -451,6 +451,11 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         self._retained_gpu_receivers_lock = threading.Lock()
         self._persistent_gpu_receiver: Any | None = None
         self._persistent_gpu_receiver_lock = threading.Lock()
+        # Use one restore stream for all sequential sessions.  Recreating it
+        # per session strands the readback temporaries in separate CUDA
+        # allocator stream caches and looks like a TP4 KV leak in nvidia-smi.
+        self._persistent_restore_stream: torch.cuda.Stream | None = None
+        self._persistent_restore_stream_lock = threading.Lock()
         self._claimed_target_request_id: str | None = None
         logger.warning(
             "BridgeTP Phase 6 streaming connector enabled; target waits for %s",
@@ -1188,7 +1193,15 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             if stream_event_mode:
                 torch.cuda.set_device(device)
                 with torch.cuda.device(device):
-                    restore_stream = torch.cuda.Stream(device=device)
+                    if self.persistent_channel:
+                        with self._persistent_restore_stream_lock:
+                            if self._persistent_restore_stream is None:
+                                self._persistent_restore_stream = torch.cuda.Stream(
+                                    device=device
+                                )
+                            restore_stream = self._persistent_restore_stream
+                    else:
+                        restore_stream = torch.cuda.Stream(device=device)
             started = time.perf_counter()
             initial_end = int(manifest["num_computed_tokens"])
             initial_blocks = math.ceil(initial_end / int(manifest["block_size"]))
@@ -1937,6 +1950,9 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             raise RuntimeError(
                 "Persistent target channel did not return to IDLE"
             )
+        with torch.cuda.device(receiver.device):
+            cuda_memory_allocated = torch.cuda.memory_allocated(receiver.device)
+            cuda_memory_reserved = torch.cuda.memory_reserved(receiver.device)
         _atomic_json_dump(
             {
                 "format_version": 1,
@@ -1956,6 +1972,8 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 "last_session_payload_released_bytes": getattr(
                     receiver, "last_session_payload_released_bytes", None
                 ),
+                "cuda_memory_allocated_bytes": cuda_memory_allocated,
+                "cuda_memory_reserved_bytes": cuda_memory_reserved,
                 "completed_unix_s": time.time(),
             },
             self.manifest_path.parent
