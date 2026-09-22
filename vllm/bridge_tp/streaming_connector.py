@@ -1156,6 +1156,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                             str(manifest["migration_id"]),
                             direct,
                         )
+                    buffered_completed = time.time()
                     _atomic_json_dump(
                         {
                             "format_version": 1,
@@ -1165,7 +1166,8 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                             "exact_readback": None,
                             "gpu_ready": True,
                             "storage": "TEMPORARY_GPU_BUFFER",
-                            "completed_unix_s": time.time(),
+                            "completed_unix_s": buffered_completed,
+                            "gpu_history_buffered_unix_s": buffered_completed,
                         },
                         self.manifest_path.parent
                         / "gpu_initial_receipts"
@@ -1568,8 +1570,21 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 )
             current = initial_end
             delta_batches = 0
-            _atomic_json_dump(
-                {
+            receipt_path = (
+                self.manifest_path.parent
+                / "gpu_initial_receipts"
+                / f"tp_rank_{tp_rank}.json"
+            )
+            prior_receipt: dict[str, Any] = {}
+            try:
+                if receipt_path.is_file():
+                    loaded = _load_json(receipt_path)
+                    if isinstance(loaded, dict):
+                        prior_receipt = loaded
+            except (OSError, ValueError, TypeError):
+                prior_receipt = {}
+            resident_completed = time.time()
+            resident_receipt = {
                     "format_version": 1,
                     "status": "INITIAL_HISTORY_GPU_RESIDENT",
                     "migration_id": request.migration_id,
@@ -1578,12 +1593,15 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     "end_token": current,
                     "exact_readback": exact_readback,
                     "transport": manifest.get("history_transport"),
-                    "completed_unix_s": time.time(),
-                },
-                self.manifest_path.parent
-                / "gpu_initial_receipts"
-                / f"tp_rank_{tp_rank}.json",
-            )
+                    "completed_unix_s": resident_completed,
+                    "gpu_history_resident_unix_s": resident_completed,
+                }
+            buffered_completed = prior_receipt.get("gpu_history_buffered_unix_s")
+            if buffered_completed is not None:
+                resident_receipt["gpu_history_buffered_unix_s"] = float(
+                    buffered_completed
+                )
+            _atomic_json_dump(resident_receipt, receipt_path)
             diagnostic_phase = "HISTORY_GPU_RESIDENT_RECEIPT_WRITTEN"
             _write_gpu_direct_rank_diagnostic(
                 self.manifest_path,
