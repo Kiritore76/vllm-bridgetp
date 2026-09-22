@@ -1953,6 +1953,9 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 "buffer_high_water_bytes": (
                     receiver.buffer_high_water_bytes
                 ),
+                "last_session_payload_released_bytes": getattr(
+                    receiver, "last_session_payload_released_bytes", None
+                ),
                 "completed_unix_s": time.time(),
             },
             self.manifest_path.parent
