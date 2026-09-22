@@ -463,6 +463,11 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         self._prebound_gpu_history_lock = threading.Lock()
         self._prebind_receiver_thread: threading.Thread | None = None
         self._prebind_receiver_stop = threading.Event()
+        # Live model execution must not race the prebind worker while it is
+        # still binding the per-rank listener.  The event is signalled only
+        # after both the receiver and the buffered history handle are
+        # published, so a waiter can safely reuse them.
+        self._prebind_receiver_ready = threading.Event()
         # Use one restore stream for all sequential sessions.  Recreating it
         # per session strands the readback temporaries in separate CUDA
         # allocator stream caches and looks like a TP4 KV leak in nvidia-smi.
@@ -1110,9 +1115,11 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                         continue
                     manifest = _load_json(self.manifest_path)
                     if manifest.get("history_transport") != "NCCL_P2P_GPU_DIRECT":
+                        self._prebind_receiver_ready.set()
                         return
                     ranks = manifest.get("ranks")
                     if not isinstance(ranks, list):
+                        self._prebind_receiver_ready.set()
                         return
                     tp_rank = get_tp_group().rank_in_group
                     record = ranks[tp_rank]
@@ -1171,6 +1178,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                         / "gpu_initial_receipts"
                         / f"tp_rank_{tp_rank}.json",
                     )
+                    self._prebind_receiver_ready.set()
                     return
                 except (
                     OSError,
@@ -1185,6 +1193,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     time.sleep(0.005)
                 except BaseException:
                     logger.exception("GPU-direct receiver prebind failed")
+                    self._prebind_receiver_ready.set()
                     return
 
         self._prebind_receiver_thread = threading.Thread(
@@ -1378,6 +1387,21 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     if receiver is not None and not self.persistent_channel:
                         self._prebound_gpu_receiver = None
                 if receiver is None:
+                    # register_kv_caches starts prebind asynchronously.  A
+                    # short request can reach _live_gpu_load before that
+                    # worker publishes its receiver, causing a second bind()
+                    # on the same rank/port and an Address-in-use crash.
+                    # Wait for the worker's terminal publication before
+                    # deciding whether a new receiver is actually needed.
+                    prebind_thread = self._prebind_receiver_thread
+                    if prebind_thread is not None:
+                        self._prebind_receiver_ready.wait(
+                            timeout=self.socket_timeout_s
+                        )
+                        with self._prebound_gpu_receiver_lock:
+                            receiver = self._prebound_gpu_receiver
+                            if receiver is not None and not self.persistent_channel:
+                                self._prebound_gpu_receiver = None
                     if self.persistent_channel:
                         with self._persistent_gpu_receiver_lock:
                             receiver = self._persistent_gpu_receiver
