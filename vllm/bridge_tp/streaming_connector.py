@@ -459,6 +459,8 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         # target request has allocated its KV blocks.
         self._prebound_gpu_receiver: Any | None = None
         self._prebound_gpu_receiver_lock = threading.Lock()
+        self._prebound_gpu_history: tuple[str, Any] | None = None
+        self._prebound_gpu_history_lock = threading.Lock()
         self._prebind_receiver_thread: threading.Thread | None = None
         self._prebind_receiver_stop = threading.Event()
         # Use one restore stream for all sequential sessions.  Recreating it
@@ -1094,6 +1096,17 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                             or self.persistent_channel
                         ),
                     )
+                    direct = receiver.receive(
+                        migration_id=str(manifest["migration_id"]),
+                        request_id=str(manifest["source_request_id"]),
+                        rank=tp_rank,
+                        layer_records=list(manifest["layers"]),
+                        keep_open=(
+                            manifest.get("delta_transport")
+                            == "NCCL_P2P_GPU_DIRECT_PERSISTENT"
+                        ),
+                        synchronize=True,
+                    )
                     with self._prebound_gpu_receiver_lock:
                         if self._prebound_gpu_receiver is None:
                             self._prebound_gpu_receiver = receiver
@@ -1105,6 +1118,26 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                                         receiver.close()
                         else:
                             receiver.close()
+                    with self._prebound_gpu_history_lock:
+                        self._prebound_gpu_history = (
+                            str(manifest["migration_id"]),
+                            direct,
+                        )
+                    _atomic_json_dump(
+                        {
+                            "format_version": 1,
+                            "status": "INITIAL_HISTORY_GPU_BUFFERED",
+                            "migration_id": str(manifest["migration_id"]),
+                            "target_tp_rank": tp_rank,
+                            "exact_readback": None,
+                            "gpu_ready": True,
+                            "storage": "TEMPORARY_GPU_BUFFER",
+                            "completed_unix_s": time.time(),
+                        },
+                        self.manifest_path.parent
+                        / "gpu_initial_receipts"
+                        / f"tp_rank_{tp_rank}.json",
+                    )
                     return
                 except (
                     OSError,
@@ -1343,17 +1376,23 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     device=device,
                     receiver=receiver,
                 )
-                direct = receiver.receive(
-                    migration_id=request.migration_id,
-                    # Session identity follows the request whose KV is being
-                    # moved.  TP4 creates a different runtime request ID for
-                    # the continuation, so it cannot be used on the wire.
-                    request_id=session_request_id,
-                    rank=tp_rank,
-                    layer_records=list(manifest["layers"]),
-                    keep_open=gpu_direct_delta,
-                    synchronize=not stream_event_mode,
-                )
+                with self._prebound_gpu_history_lock:
+                    prebound = self._prebound_gpu_history
+                    if prebound is not None and prebound[0] == request.migration_id:
+                        direct = prebound[1]
+                        self._prebound_gpu_history = None
+                if direct is None:
+                    direct = receiver.receive(
+                        migration_id=request.migration_id,
+                        # Session identity follows the request whose KV is being
+                        # moved.  TP4 creates a different runtime request ID for
+                        # the continuation, so it cannot be used on the wire.
+                        request_id=session_request_id,
+                        rank=tp_rank,
+                        layer_records=list(manifest["layers"]),
+                        keep_open=gpu_direct_delta,
+                        synchronize=not stream_event_mode,
+                    )
                 diagnostic_phase = "AFTER_HISTORY_RECEIVE"
                 _write_gpu_direct_rank_diagnostic(
                     self.manifest_path,
@@ -2216,6 +2255,8 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
     def shutdown(self) -> None:
         """Abort pooled target communicators only as the worker exits."""
         self._prebind_receiver_stop.set()
+        with self._prebound_gpu_history_lock:
+            self._prebound_gpu_history = None
         with self._prebound_gpu_receiver_lock:
             prebound_receiver = self._prebound_gpu_receiver
             self._prebound_gpu_receiver = None
