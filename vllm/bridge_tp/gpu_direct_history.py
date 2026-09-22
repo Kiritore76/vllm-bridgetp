@@ -200,6 +200,7 @@ class GpuDirectHistoryReceiver:
         self._packed_buffer: torch.Tensor | None = None
         self.buffer_capacity_elements = 0
         self.buffer_high_water_bytes = 0
+        self.last_session_payload_released_bytes = 0
 
     def _open(self, *, migration_id: str, rank: int) -> None:
         if self.connection is not None:
@@ -268,6 +269,7 @@ class GpuDirectHistoryReceiver:
             migration_id=migration_id,
             request_id=request_id,
         )
+        self.last_session_payload_released_bytes = 0
         session.accept_inbound(envelope)
         self._active_request_id = request_id
         send_json(
@@ -485,6 +487,9 @@ class GpuDirectHistoryReceiver:
             self.lifecycle.finish_session()
             self._active_request_id = None
             self._last_delta_envelope = None
+            self.last_session_payload_released_bytes = (
+                self.release_session_payload_buffer()
+            )
             return None
         if header.get("op") == "CLOSE":
             self.terminal_close_received_unix_s = time.time()
@@ -729,6 +734,7 @@ class GpuDirectHistorySender:
         self._packed_buffers: list[torch.Tensor] = []
         self.buffer_capacity_elements = 0
         self.buffer_high_water_bytes = 0
+        self.last_session_payload_released_bytes = 0
 
     def _next_envelope(
         self,
@@ -858,6 +864,7 @@ class GpuDirectHistorySender:
                     migration_id=migration_id,
                     request_id=request_id,
                 )
+                self.last_session_payload_released_bytes = 0
                 self._active_migration_id = migration_id
                 self._active_request_id = request_id
                 self._next_sequence_by_rank = {
@@ -1301,6 +1308,22 @@ class GpuDirectHistorySender:
         self._active_migration_id = None
         self._active_request_id = None
         self._next_sequence_by_rank.clear()
+        self.last_session_payload_released_bytes = (
+            self.release_session_payload_buffers()
+        )
+
+    def release_session_payload_buffers(self) -> int:
+        """Drop completed-request payload buffers without closing NCCL."""
+        if self.lifecycle is None or self.lifecycle.state.value != "IDLE":
+            raise RuntimeError(
+                "persistent payload buffers can only be released while IDLE"
+            )
+        released = sum(
+            value.numel() * value.element_size() for value in self._packed_buffers
+        )
+        self._packed_buffers = []
+        self.buffer_capacity_elements = 0
+        return released
 
     def close_control(self) -> None:
         """Complete the wire protocol without destroying communicators."""

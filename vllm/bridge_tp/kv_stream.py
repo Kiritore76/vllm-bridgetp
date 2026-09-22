@@ -763,6 +763,9 @@ class _GpuDirectHistoryPublisher:
                                 receipt["buffer_high_water_bytes"] = (
                                     sender.buffer_high_water_bytes
                                 )
+                                receipt["last_session_payload_released_bytes"] = (
+                                    sender.last_session_payload_released_bytes
+                                )
                             elif self.config.defer_communicator_destroy:
                                 sender.close_control()
                                 receipt["communicator_lifecycle"] = (
