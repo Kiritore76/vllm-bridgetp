@@ -43,6 +43,7 @@ class MigrationRecord:
 
     # boundaries
     trigger_output_tokens: int | None = None
+    candidate_cutover_output_tokens: int | None = None
     cutover_output_tokens: int | None = None
     trigger_path: TriggerPath | None = None
 

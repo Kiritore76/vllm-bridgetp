@@ -291,17 +291,56 @@ class ActionAdapter:
         ).write(self.run_dir)
 
     # ---- readiness evidence -------------------------------------------
+    def poll_initial_history_gpu_buffered(self) -> tuple[bool, set[int], str]:
+        """Return whether all four initial history shards reached TP4 GPU memory.
+
+        This is only an admission gate for the dormant target request. The
+        source cutover remains the sentinel until exact resident readback.
+        """
+        binding = self.refresh_binding()
+        if binding is None:
+            return False, set(), "session manifest not created yet"
+        receipt_dir = self.run_dir / "gpu_initial_receipts"
+        if not receipt_dir.is_dir():
+            return False, set(), "initial GPU-history receipts not created yet"
+        buffered: set[int] = set()
+        for rank in range(4):
+            path = receipt_dir / f"tp_rank_{rank}.json"
+            if not path.is_file():
+                continue
+            try:
+                receipt = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if receipt.get("migration_id") != binding.migration_id:
+                return False, buffered, f"rank {rank} initial receipt migration ID differs"
+            status = receipt.get("status")
+            if status == "INITIAL_HISTORY_GPU_BUFFERED":
+                if receipt.get("gpu_ready") is True:
+                    buffered.add(rank)
+            elif status == "INITIAL_HISTORY_GPU_RESIDENT":
+                if receipt.get("exact_readback") is not True:
+                    return False, buffered, f"rank {rank} initial GPU readback FAILED"
+                buffered.add(rank)
+        return (
+            len(buffered) == 4,
+            buffered,
+            "all four ranks initial history GPU-buffered"
+            if len(buffered) == 4
+            else f"{len(buffered)}/4 ranks initial history GPU-buffered",
+        )
+
     def poll_initial_history_gpu_ready(self) -> tuple[bool, set[int], str]:
         """Return whether the initial Shadow history is safely ready on TP4.
 
         This is deliberately *not* the final ``TARGET_READY`` commit gate.
         During an earliest-ready experiment the source still owns generation,
         so final readiness cannot exist until the source freezes and sends its
-        final delta.  The only non-circular early signal is the four initial
-        GPU-history receipts emitted after exact TP4 readback. A temporary
-        ``INITIAL_HISTORY_GPU_BUFFERED`` receipt is deliberately not enough:
-        it only proves that a receive buffer exists, not that the history is
-        resident in the target KV cache and visible to the restore stream.
+        final delta. Buffered receipts admit a dormant target request, then
+        these exact TP4 readback receipts authorize the final source cutover.
+        A temporary ``INITIAL_HISTORY_GPU_BUFFERED`` receipt is deliberately
+        not enough to freeze the source: it only proves that a receive buffer
+        exists, not that history is resident in the target KV cache.
         """
         binding = self.refresh_binding()
         if binding is None:

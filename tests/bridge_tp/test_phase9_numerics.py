@@ -117,6 +117,18 @@ class TestEvidenceTools(unittest.TestCase):
         self.assertEqual(selected, list(range(100, 112)))
         self.assertNotIn(112, selected)
 
+    def test_pending_tail_block_can_be_allocated_on_first_target_step(self):
+        # The failed O129 smoke had 2048 prompt + 129 output tokens: 2176
+        # computed tokens fill 136 blocks, and the pending token starts block 137.
+        selected = snapshot_target_block_ids(
+            (list(range(136)),),
+            request_num_tokens=2177,
+            block_size=16,
+            snapshot_blocks=136,
+            error_message="bad allocation",
+        )
+        self.assertEqual(selected, list(range(136)))
+
     def test_unexpected_extra_tail_block_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "bad allocation"):
             snapshot_target_block_ids(

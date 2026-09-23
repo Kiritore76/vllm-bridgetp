@@ -231,6 +231,7 @@ def _assert_fresh_run_dir(run_dir: Path) -> None:
         name
         for name in (
             "phase9_audit.jsonl",
+            "earliest_ready_candidate.json",
             "session_manifest.json",
             "staging_manifest.json",
             "takeover_state.json",
@@ -320,10 +321,8 @@ def _start_target_if_ready(
     staging = load_json(path)
     if gpu_resident_shadow:
         if cutover_output_tokens is None:
-            # Earliest-ready Shadow has started the GPU history transfer but
-            # deliberately has not chosen a source freeze boundary yet.  The
-            # target request cannot be admitted until that dynamic boundary
-            # has been atomically published.
+            # Target admission needs a candidate prefix length. The source
+            # freeze boundary is published separately after resident readback.
             return None
         if stop_and_copy:
             cutover_output_tokens = int(staging["snapshot_num_output_tokens"])
@@ -556,7 +555,62 @@ def step_shadow(
     if not dry_run:
         adapter.set_rate(rate.rate_gib_s, note=rate.last_reason)
 
-    if diagnostic_earliest_ready_cutover and record.cutover_output_tokens is None:
+    late_candidate_reason = ""
+    if (
+        diagnostic_earliest_ready_cutover
+        and record.candidate_cutover_output_tokens is None
+    ):
+        buffered, ranks, detail = adapter.poll_initial_history_gpu_buffered()
+        audit.write(
+            {
+                "kind": "earliest_ready_buffered_poll",
+                "ready": buffered,
+                "ranks": sorted(ranks),
+                "detail": detail,
+                "observed_output_tokens": request.output_tokens,
+            }
+        )
+        if buffered:
+            if max_tokens is None:
+                raise RuntimeError("earliest-ready cutover needs source max_tokens")
+            # TP4 needs a concrete prefix length before it can allocate KV
+            # blocks and turn buffered history into exact resident evidence.
+            # Reserve three blocks for target admission and exact readback,
+            # then one block for publishing the source freeze boundary.
+            candidate_lead_tokens = 64
+            candidate = max(
+                int(request.output_tokens) + candidate_lead_tokens,
+                int(record.trigger_output_tokens or 0) + 1,
+            )
+            if candidate >= max_tokens:
+                late_candidate_reason = (
+                    "initial history arrived too late for an earliest-ready "
+                    f"candidate: candidate={candidate}, max_tokens={max_tokens}"
+                )
+            else:
+                atomic_json_dump(
+                    {
+                        "format_version": 1,
+                        "migration_id": record.migration_id,
+                        "cutover_output_tokens": candidate,
+                        "buffered_output_tokens": request.output_tokens,
+                        "published_unix_s": time.time(),
+                    },
+                    adapter.run_dir / "earliest_ready_candidate.json",
+                )
+                recorder.set_cutover(candidate, now)
+                record.candidate_cutover_output_tokens = candidate
+                audit.write(
+                    {
+                        "kind": "earliest_ready_candidate_published",
+                        "cutover_output_tokens": candidate,
+                        "buffered_output_tokens": request.output_tokens,
+                        "candidate_lead_tokens": candidate - request.output_tokens,
+                        "ranks": sorted(ranks),
+                        "detail": detail,
+                    }
+                )
+    elif diagnostic_earliest_ready_cutover and record.cutover_output_tokens is None:
         ready, ranks, detail = adapter.poll_initial_history_gpu_ready()
         audit.write(
             {
@@ -567,47 +621,40 @@ def step_shadow(
                 "observed_output_tokens": request.output_tokens,
             }
         )
+        candidate = record.candidate_cutover_output_tokens
+        assert candidate is not None
         if ready:
-            if max_tokens is None:
-                raise RuntimeError("earliest-ready cutover needs source max_tokens")
-            # The controller and source read the control file asynchronously.
-            # A 16-token lead (one block) is the safe watermark: it gives the
-            # source time to observe the new boundary while the delta stream
-            # catches up.  The commit is therefore not the instant at which
-            # history becomes ready; it is the first safe boundary after the
-            # ready event at which final-delta drain can be completed.
             safe_watermark_lead_tokens = 16
-            cutover = max(
-                int(request.output_tokens) + safe_watermark_lead_tokens,
-                int(record.trigger_output_tokens or 0) + 1,
-            )
-            if cutover >= max_tokens:
-                raise RuntimeError(
-                    "initial history became ready too late for a safe earliest-ready "
-                    f"cutover: selected={cutover}, max_tokens={max_tokens}"
+            if request.output_tokens + safe_watermark_lead_tokens > candidate:
+                late_candidate_reason = (
+                    "initial history became resident too late for the "
+                    f"candidate: output={request.output_tokens}, "
+                    f"candidate={candidate}"
                 )
-            if not dry_run:
-                adapter.set_cutover(
-                    cutover,
-                    note="earliest-ready: four initial GPU-history receipts exact",
+            else:
+                if not dry_run:
+                    adapter.set_cutover(
+                        candidate,
+                        note="earliest-ready: four initial GPU-history receipts exact",
+                    )
+                record.cutover_output_tokens = candidate
+                audit.write(
+                    {
+                        "kind": "earliest_ready_cutover_selected",
+                        "cutover_output_tokens": candidate,
+                        "selection_output_tokens": request.output_tokens,
+                        "safety_lead_tokens": candidate - request.output_tokens,
+                        "safe_watermark_output_tokens": candidate,
+                        "safe_watermark_lead_tokens": safe_watermark_lead_tokens,
+                        "ranks": sorted(ranks),
+                        "detail": detail,
+                    }
                 )
-            recorder.set_cutover(cutover, now)
-            record.cutover_output_tokens = cutover
-            audit.write(
-                {
-                    "kind": "earliest_ready_cutover_selected",
-                    "cutover_output_tokens": cutover,
-                    "selection_output_tokens": request.output_tokens,
-                    "safety_lead_tokens": cutover - request.output_tokens,
-                    "safe_watermark_output_tokens": cutover,
-                    "safe_watermark_lead_tokens": safe_watermark_lead_tokens,
-                    "safe_watermark_reason": (
-                        "initial history resident on all ranks; allow one block "
-                        "of delta catch-up before freeze"
-                    ),
-                    "ranks": sorted(ranks),
-                    "detail": detail,
-                }
+        elif request.output_tokens + 16 > candidate:
+            late_candidate_reason = (
+                "initial history was not resident before the candidate's "
+                f"safe publication point: output={request.output_tokens}, "
+                f"candidate={candidate}"
             )
 
     diagnostic_path = record.trigger_path is TriggerPath.DIAGNOSTIC_FIXED_BOUNDARY
@@ -620,8 +667,8 @@ def step_shadow(
         # the online policy after forcibly entering Shadow would make paired
         # strategy runs follow different state paths and invalidate the
         # comparison.  Safety/readback/commit gates still remain mandatory.
-        abandon = False
-        reason = ""
+        abandon = bool(late_candidate_reason)
+        reason = late_candidate_reason
     elif safety_path:
         abandon = pool4.kv_usage_frac > policy.cfg.max_target_kv_usage_frac + 0.10
         reason = (
@@ -1096,7 +1143,11 @@ def main() -> None:
                         request_timeout_s=args.request_timeout_s,
                         target_future=target_future,
                         gpu_resident_shadow=args.gpu_resident_shadow,
-                        cutover_output_tokens=record.cutover_output_tokens,
+                        cutover_output_tokens=(
+                            record.candidate_cutover_output_tokens
+                            if args.diagnostic_earliest_ready_cutover
+                            else record.cutover_output_tokens
+                        ),
                         stop_and_copy=args.stop_and_copy,
                         target_request_name=(
                             args.migration_id
@@ -1186,6 +1237,32 @@ def main() -> None:
                             args.diagnostic_earliest_ready_cutover,
                             int(source_request["max_tokens"]),
                         )
+                        if (
+                            args.diagnostic_earliest_ready_cutover
+                            and record.state is MigrationState.SHADOW
+                            and target_future is None
+                            and record.candidate_cutover_output_tokens is not None
+                        ):
+                            target_future = _start_target_if_ready(
+                                run_dir=run_dir,
+                                source_request=source_request,
+                                adapter=adapter,
+                                recorder=recorder,
+                                executor=executor,
+                                target_url=config.target_url,
+                                request_timeout_s=args.request_timeout_s,
+                                target_future=target_future,
+                                gpu_resident_shadow=args.gpu_resident_shadow,
+                                cutover_output_tokens=(
+                                    record.candidate_cutover_output_tokens
+                                ),
+                                stop_and_copy=args.stop_and_copy,
+                                target_request_name=(
+                                    args.migration_id
+                                    if args.source_request_id
+                                    else None
+                                ),
+                            )
                 elif record.state is MigrationState.HANDOFF:
                     step_handoff(
                         machine,
