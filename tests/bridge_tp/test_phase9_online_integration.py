@@ -679,6 +679,194 @@ class TestLazyActionBinding(unittest.TestCase):
             self.assertFalse(ready)
             self.assertEqual(ranks, set())
             self.assertIn("0/4", detail)
+            buffered, ranks, _detail = adapter.poll_initial_history_gpu_buffered()
+            self.assertTrue(buffered)
+            self.assertEqual(ranks, {0, 1, 2, 3})
+
+    def test_earliest_ready_admits_target_before_source_cutover(self) -> None:
+        class Policy:
+            cfg = types.SimpleNamespace(max_target_kv_usage_frac=0.85)
+
+            @staticmethod
+            def migration_bytes(_request) -> int:
+                return 1024
+
+        class Rate:
+            rate_bytes_s = 1024.0
+            rate_gib_s = 0.5
+            last_reason = "test"
+
+            @staticmethod
+            def step(*_args, **_kwargs) -> float:
+                return 1024.0
+
+        class Audit:
+            def __init__(self) -> None:
+                self.records: list[dict] = []
+
+            def write(self, value: dict) -> None:
+                self.records.append(value)
+
+        def progress(output_tokens: int) -> SourceRequestView:
+            return SourceRequestView(
+                request_id="r",
+                prompt_tokens=2048,
+                output_tokens=output_tokens,
+                computed_tokens=2048 + output_tokens - 1,
+                pending_tokens=1,
+                arrival_unix_s=0.0,
+                last_token_unix_s=1.0,
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            (run_dir / "session_manifest.json").write_text(
+                json.dumps(
+                    {"migration_id": "m", "session_token": "s", "source_request_id": "r"}
+                ),
+                encoding="utf-8",
+            )
+            receipt_dir = run_dir / "gpu_initial_receipts"
+            receipt_dir.mkdir()
+            for rank in range(4):
+                (receipt_dir / f"tp_rank_{rank}.json").write_text(
+                    json.dumps(
+                        {
+                            "migration_id": "m",
+                            "status": "INITIAL_HISTORY_GPU_BUFFERED",
+                            "gpu_ready": True,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            adapter = ActionAdapter("http://source", run_dir)
+            adapter.arm_shadow(64, 0.5, cutover_output_tokens=1023)
+            audit = Audit()
+            machine = MigrationStateMachine(audit_sink=audit.write)
+            record = machine.create("m", "r")
+            record.trigger_output_tokens = 64
+            record.trigger_path = TriggerPath.DIAGNOSTIC_FIXED_BOUNDARY
+            machine.transition("m", MigrationState.SHADOW, 1.0, "test")
+            recorder = ProxyRecorder("external", ProxyMode.HOLD_BACK)
+
+            def tick(output_tokens: int) -> None:
+                step_shadow(
+                    Policy(), machine, adapter, audit, record,
+                    progress(output_tokens), object(),
+                    types.SimpleNamespace(kv_usage_frac=0.0, p99_tpot_s=0.02),
+                    0.0, Rate(), 2.0, False, recorder,
+                    diagnostic_earliest_ready_cutover=True,
+                    max_tokens=1024,
+                )
+
+            tick(105)
+            candidate = json.loads(
+                (run_dir / "earliest_ready_candidate.json").read_text()
+            )
+            self.assertEqual(candidate["cutover_output_tokens"], 169)
+            self.assertIsNone(record.cutover_output_tokens)
+            self.assertEqual(
+                json.loads((run_dir / "runtime_control.json").read_text())[
+                    "cutover_output_tokens"
+                ],
+                1023,
+            )
+            for rank in range(4):
+                (receipt_dir / f"tp_rank_{rank}.json").write_text(
+                    json.dumps(
+                        {
+                            "migration_id": "m",
+                            "status": "INITIAL_HISTORY_GPU_RESIDENT",
+                            "exact_readback": True,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            tick(121)
+            self.assertEqual(record.cutover_output_tokens, 169)
+            self.assertEqual(
+                json.loads((run_dir / "runtime_control.json").read_text())[
+                    "cutover_output_tokens"
+                ],
+                169,
+            )
+            self.assertTrue(
+                any(
+                    row.get("kind") == "earliest_ready_cutover_selected"
+                    for row in audit.records
+                )
+            )
+
+    def test_earliest_ready_does_not_freeze_after_candidate_becomes_late(self) -> None:
+        class Policy:
+            cfg = types.SimpleNamespace(max_target_kv_usage_frac=0.85)
+
+            @staticmethod
+            def migration_bytes(_request) -> int:
+                return 1024
+
+        class Rate:
+            rate_bytes_s = 1024.0
+            rate_gib_s = 0.5
+            last_reason = "test"
+
+            @staticmethod
+            def step(*_args, **_kwargs) -> float:
+                return 1024.0
+
+        class Adapter:
+            def __init__(self) -> None:
+                self.actions: list[str] = []
+
+            def set_rate(self, _rate: float, note: str) -> None:
+                del note
+
+            def poll_initial_history_gpu_ready(self):
+                return False, set(), "target still restoring"
+
+            def disarm(self, _reason: str) -> None:
+                self.actions.append("disarm")
+
+            def wait_for_preparing_binding(self):
+                return object()
+
+            def cancel(self, _reason: str, *, abort_source: bool):
+                self.actions.append("cancel")
+                self.abort_source = abort_source
+                return {"state": "CANCELLED", "source_abort_dispatched": False}
+
+            def cancel_shadow_target(self, _reason: str):
+                self.actions.append("cancel_target")
+                return {"status": "CANCELLED"}
+
+        class Audit:
+            def write(self, _value: dict) -> None:
+                pass
+
+        machine = MigrationStateMachine()
+        record = machine.create("m", "r")
+        record.trigger_path = TriggerPath.DIAGNOSTIC_FIXED_BOUNDARY
+        record.trigger_output_tokens = 64
+        record.candidate_cutover_output_tokens = 169
+        machine.transition("m", MigrationState.SHADOW, 1.0, "test")
+        adapter = Adapter()
+        step_shadow(
+            Policy(), machine, adapter, Audit(), record,
+            SourceRequestView(
+                request_id="r", prompt_tokens=2048, output_tokens=154,
+                computed_tokens=2201, pending_tokens=1,
+                arrival_unix_s=0.0, last_token_unix_s=1.0,
+            ),
+            object(), types.SimpleNamespace(kv_usage_frac=0.0, p99_tpot_s=0.02),
+            0.0, Rate(), 2.0, False,
+            ProxyRecorder("external", ProxyMode.HOLD_BACK),
+            diagnostic_earliest_ready_cutover=True,
+            max_tokens=1024,
+        )
+        self.assertEqual(record.state, MigrationState.CANCELLED)
+        self.assertIsNone(record.cutover_output_tokens)
+        self.assertFalse(adapter.abort_source)
+        self.assertEqual(adapter.actions, ["disarm", "cancel", "cancel_target"])
 
     def test_waits_for_manifest_and_preparing_takeover_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

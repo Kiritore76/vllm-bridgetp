@@ -595,20 +595,23 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             return int(manifest["num_computed_tokens"]) + 1
         cutover_output_tokens = self.shadow_cutover_output_tokens
         if cutover_output_tokens <= 0:
-            # EARLIEST_READY deliberately leaves the connector boundary
-            # dynamic.  The controller publishes the selected boundary in
-            # runtime_control.json before admitting TP4.  Use that boundary
-            # to allocate/match the target request so the GPU-direct delta
-            # receiver can start; the later cutover manifest remains the
-            # authoritative final consistency check in _live_gpu_load.
+            # EARLIEST_READY admits TP4 using a candidate boundary while the
+            # source still holds its sentinel. This lets TP4 restore history
+            # into scheduler-owned blocks before the controller publishes the
+            # final source freeze boundary. The cutover manifest is the final
+            # consistency check in _live_gpu_load.
             cutover_path = self.manifest_path.parent / "cutover_manifest.json"
             if cutover_path.is_file():
                 cutover = _load_json(cutover_path)
             else:
-                control_path = self.manifest_path.parent / "runtime_control.json"
+                candidate_path = (
+                    self.manifest_path.parent / "earliest_ready_candidate.json"
+                )
                 try:
-                    control = _load_json(control_path)
-                    selected = int(control["cutover_output_tokens"])
+                    candidate = _load_json(candidate_path)
+                    selected = int(candidate["cutover_output_tokens"])
+                    if candidate.get("migration_id") != manifest["migration_id"]:
+                        raise ValueError("candidate migration ID differs")
                 except (
                     FileNotFoundError,
                     KeyError,
@@ -618,7 +621,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     json.JSONDecodeError,
                 ) as error:
                     raise ValueError(
-                        "GPU-resident Shadow requires a selected cutover boundary"
+                        "GPU-resident Shadow requires a candidate cutover boundary"
                     ) from error
                 if selected <= 0:
                     raise ValueError(
