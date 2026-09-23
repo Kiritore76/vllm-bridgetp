@@ -571,10 +571,14 @@ def step_shadow(
             if max_tokens is None:
                 raise RuntimeError("earliest-ready cutover needs source max_tokens")
             # The controller and source read the control file asynchronously.
-            # A 16-token lead (one block) ensures the source cannot run past a
-            # newly lowered boundary before observing the atomic update.
+            # A 16-token lead (one block) is the safe watermark: it gives the
+            # source time to observe the new boundary while the delta stream
+            # catches up.  The commit is therefore not the instant at which
+            # history becomes ready; it is the first safe boundary after the
+            # ready event at which final-delta drain can be completed.
+            safe_watermark_lead_tokens = 16
             cutover = max(
-                int(request.output_tokens) + 16,
+                int(request.output_tokens) + safe_watermark_lead_tokens,
                 int(record.trigger_output_tokens or 0) + 1,
             )
             if cutover >= max_tokens:
@@ -595,6 +599,12 @@ def step_shadow(
                     "cutover_output_tokens": cutover,
                     "selection_output_tokens": request.output_tokens,
                     "safety_lead_tokens": cutover - request.output_tokens,
+                    "safe_watermark_output_tokens": cutover,
+                    "safe_watermark_lead_tokens": safe_watermark_lead_tokens,
+                    "safe_watermark_reason": (
+                        "initial history resident on all ranks; allow one block "
+                        "of delta catch-up before freeze"
+                    ),
                     "ranks": sorted(ranks),
                     "detail": detail,
                 }

@@ -292,13 +292,16 @@ class ActionAdapter:
 
     # ---- readiness evidence -------------------------------------------
     def poll_initial_history_gpu_ready(self) -> tuple[bool, set[int], str]:
-        """Return whether the initial Shadow history is GPU-resident on TP4.
+        """Return whether the initial Shadow history is safely ready on TP4.
 
         This is deliberately *not* the final ``TARGET_READY`` commit gate.
         During an earliest-ready experiment the source still owns generation,
         so final readiness cannot exist until the source freezes and sends its
         final delta.  The only non-circular early signal is the four initial
-        GPU-history receipts emitted after exact TP4 readback.
+        GPU-history receipts emitted after exact TP4 readback. A temporary
+        ``INITIAL_HISTORY_GPU_BUFFERED`` receipt is deliberately not enough:
+        it only proves that a receive buffer exists, not that the history is
+        resident in the target KV cache and visible to the restore stream.
         """
         binding = self.refresh_binding()
         if binding is None:
@@ -317,21 +320,10 @@ class ActionAdapter:
                 continue
             if receipt.get("migration_id") != binding.migration_id:
                 return False, ready, f"rank {rank} initial receipt migration ID differs"
-            if receipt.get("status") not in {
-                "INITIAL_HISTORY_GPU_RESIDENT",
-                "INITIAL_HISTORY_GPU_BUFFERED",
-            }:
+            if receipt.get("status") != "INITIAL_HISTORY_GPU_RESIDENT":
                 continue
-            if (
-                receipt.get("status") == "INITIAL_HISTORY_GPU_RESIDENT"
-                and receipt.get("exact_readback") is not True
-            ):
+            if receipt.get("exact_readback") is not True:
                 return False, ready, f"rank {rank} initial GPU history readback FAILED"
-            if (
-                receipt.get("status") == "INITIAL_HISTORY_GPU_BUFFERED"
-                and receipt.get("gpu_ready") is not True
-            ):
-                return False, ready, f"rank {rank} initial GPU history buffer is not ready"
             ready.add(rank)
         return (
             len(ready) == 4,

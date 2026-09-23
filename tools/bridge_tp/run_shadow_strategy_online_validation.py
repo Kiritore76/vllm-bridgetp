@@ -1734,7 +1734,15 @@ def accept_online(
                             "before connector shutdown"
                         )
     gpu_history_completed = [
-        float(row.get("completed_unix_s", float("inf")))
+        float(
+            row.get(
+                "resident_completed_unix_s",
+                row.get(
+                    "ready_completed_unix_s",
+                    row.get("completed_unix_s", float("inf")),
+                ),
+            )
+        )
         for row in gpu_initial_receipts
     ]
     if (
@@ -1753,9 +1761,27 @@ def accept_online(
         )
     if commit_timing == "EARLIEST_READY" and earliest_ready_selected:
         selected_unix_s = float(earliest_ready_selected[0].get("unix_s", 0.0))
+        # The receipt is rewritten when the temporary receive buffer becomes
+        # resident. Compare against the immutable resident-ready timestamp,
+        # rather than a later mutable ``completed_unix_s`` value.
+        gpu_history_ready = [
+            float(
+                row.get(
+                    "ready_completed_unix_s",
+                    row.get(
+                        "resident_completed_unix_s",
+                        row.get("completed_unix_s", float("inf")),
+                    ),
+                )
+            )
+            for row in gpu_initial_receipts
+        ]
         if (
-            len(gpu_history_completed) != 4
-            or any(value > selected_unix_s for value in gpu_history_completed)
+            len(gpu_history_ready) != 4
+            or any(value > selected_unix_s for value in gpu_history_ready)
+            or not all(
+                row.get("exact_readback") is True for row in gpu_initial_receipts
+            )
         ):
             errors.append(
                 "earliest-ready boundary was selected before all initial GPU "
