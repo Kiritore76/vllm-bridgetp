@@ -1167,6 +1167,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                             str(manifest["migration_id"]),
                             direct,
                         )
+                    buffered_completed_unix_s = time.time()
                     _atomic_json_dump(
                         {
                             "format_version": 1,
@@ -1176,7 +1177,9 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                             "exact_readback": None,
                             "gpu_ready": True,
                             "storage": "TEMPORARY_GPU_BUFFER",
-                            "completed_unix_s": time.time(),
+                            "completed_unix_s": buffered_completed_unix_s,
+                            "buffered_completed_unix_s": buffered_completed_unix_s,
+                            "ready_completed_unix_s": None,
                         },
                         self.manifest_path.parent
                         / "gpu_initial_receipts"
@@ -1623,6 +1626,27 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 )
             current = initial_end
             delta_batches = 0
+            resident_completed_unix_s = time.time()
+            previous_initial_receipt: dict[str, Any] = {}
+            try:
+                previous_initial_receipt = json.loads(
+                    (
+                        self.manifest_path.parent
+                        / "gpu_initial_receipts"
+                        / f"tp_rank_{tp_rank}.json"
+                    ).read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError, TypeError):
+                previous_initial_receipt = {}
+            buffered_completed_unix_s = previous_initial_receipt.get(
+                "buffered_completed_unix_s"
+            )
+            if buffered_completed_unix_s is None and previous_initial_receipt.get(
+                "status"
+            ) == "INITIAL_HISTORY_GPU_BUFFERED":
+                buffered_completed_unix_s = previous_initial_receipt.get(
+                    "completed_unix_s"
+                )
             _atomic_json_dump(
                 {
                     "format_version": 1,
@@ -1633,7 +1657,10 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     "end_token": current,
                     "exact_readback": exact_readback,
                     "transport": manifest.get("history_transport"),
-                    "completed_unix_s": time.time(),
+                    "completed_unix_s": resident_completed_unix_s,
+                    "buffered_completed_unix_s": buffered_completed_unix_s,
+                    "resident_completed_unix_s": resident_completed_unix_s,
+                    "ready_completed_unix_s": resident_completed_unix_s,
                 },
                 self.manifest_path.parent
                 / "gpu_initial_receipts"

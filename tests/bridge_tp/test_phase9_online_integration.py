@@ -648,6 +648,38 @@ class TestLazyActionBinding(unittest.TestCase):
             self.assertTrue(ready)
             self.assertEqual(ranks, {0, 1, 2, 3})
 
+    def test_initial_history_gpu_ready_rejects_temporary_buffer_receipts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            (run_dir / "session_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "migration_id": "m",
+                        "session_token": "s",
+                        "source_request_id": "r",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            receipt_dir = run_dir / "gpu_initial_receipts"
+            receipt_dir.mkdir()
+            for rank in range(4):
+                (receipt_dir / f"tp_rank_{rank}.json").write_text(
+                    json.dumps(
+                        {
+                            "migration_id": "m",
+                            "status": "INITIAL_HISTORY_GPU_BUFFERED",
+                            "gpu_ready": True,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            adapter = ActionAdapter("http://source", run_dir)
+            ready, ranks, detail = adapter.poll_initial_history_gpu_ready()
+            self.assertFalse(ready)
+            self.assertEqual(ranks, set())
+            self.assertIn("0/4", detail)
+
     def test_waits_for_manifest_and_preparing_takeover_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             run_dir = Path(temporary)
