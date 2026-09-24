@@ -488,17 +488,24 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 return self._manifest
             if not self.persistent_channel:
                 return self._manifest
-            # A new request-level session may replace the manifest behind the
-            # stable active-session path only after the process-lifetime
-            # receiver has drained the previous session back to IDLE.
+            # Prebind may already have received the new session's history,
+            # which moves the channel from IDLE to ACTIVE before the target
+            # request loads its manifest.  Reject only a different session
+            # that has not drained back to IDLE.
             with self._persistent_gpu_receiver_lock:
                 receiver = self._persistent_gpu_receiver
                 lifecycle = receiver.lifecycle if receiver is not None else None
                 if lifecycle is not None and lifecycle.state.value != "IDLE":
-                    raise RuntimeError(
-                        "Persistent target channel received a new session "
-                        "before the previous session returned to IDLE"
-                    )
+                    session = lifecycle.active_session
+                    if (
+                        lifecycle.state.value != "ACTIVE"
+                        or session is None
+                        or session.migration_id != expected_migration_id
+                    ):
+                        raise RuntimeError(
+                            "Persistent target channel received a new session "
+                            "before the previous session returned to IDLE"
+                        )
             self._manifest = None
             self._claimed_target_request_id = None
         with self.manifest_path.open(encoding="utf-8") as file:

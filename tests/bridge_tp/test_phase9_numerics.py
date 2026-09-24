@@ -483,6 +483,53 @@ class TestOptInConfiguration(unittest.TestCase):
                     connector._prebind_receiver_thread.join(timeout=2)
 
     @unittest.skipUnless(importlib.util.find_spec("torch"), "requires torch")
+    def test_manifest_switch_accepts_prebound_current_session_only(self):
+        from vllm.bridge_tp.stream_protocol import PROTOCOL_VERSION
+        from vllm.bridge_tp.streaming_connector import BridgeTPStreamingConnector
+
+        connector = _streaming_connector_stub(BridgeTPStreamingConnector)
+        connector.persistent_channel = True
+        connector._manifest = {"migration_id": "first"}
+        connector._persistent_gpu_receiver_lock = threading.Lock()
+        connector._claimed_target_request_id = "old-target"
+        connector.expected_phase = "BridgeTP D3 Phase 7"
+        connector._target_model = "model"
+        connector._target_block_size = 16
+        connector.channel_generation = 1
+        lifecycle = types.SimpleNamespace(
+            state=types.SimpleNamespace(value="ACTIVE"),
+            active_session=types.SimpleNamespace(migration_id="first"),
+        )
+        connector._persistent_gpu_receiver = types.SimpleNamespace(
+            lifecycle=lifecycle
+        )
+        manifest = {
+            "protocol_version": PROTOCOL_VERSION,
+            "source_tp_size": 1,
+            "target_tp_size": 4,
+            "pending_known_tokens": 1,
+            "migration_id": "second",
+            "phase": connector.expected_phase,
+            "model": connector._target_model,
+            "block_size": connector._target_block_size,
+            "ranks": [{"target_tp_rank": rank} for rank in range(4)],
+            "all_known_token_ids": [1, 2],
+            "computed_token_ids": [1],
+            "pending_token_ids": [2],
+            "num_computed_tokens": 1,
+            "persistent_channel": True,
+            "channel_generation": 1,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            connector.manifest_path = Path(directory) / "session_manifest.json"
+            connector.manifest_path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(RuntimeError, "before the previous"):
+                connector._load_manifest("second")
+            lifecycle.active_session.migration_id = "second"
+            self.assertEqual(connector._load_manifest("second"), manifest)
+            self.assertIsNone(connector._claimed_target_request_id)
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "requires torch")
     def test_streaming_connector_rejects_unexpected_extra_tail_blocks(self):
         from vllm.bridge_tp.streaming_connector import BridgeTPStreamingConnector
 
