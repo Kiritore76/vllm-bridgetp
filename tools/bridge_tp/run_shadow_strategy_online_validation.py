@@ -116,8 +116,8 @@ def parse_args() -> argparse.Namespace:
         "--preconnect-persistent-channel",
         action="store_true",
         help=(
-            "open the TP1-to-TP4 persistent NCCL links during service startup "
-            "before the anchor request begins"
+            "open and warm the TP1-to-TP4 persistent NCCL links during "
+            "service startup before the anchor request begins"
         ),
     )
     parser.add_argument(
@@ -1631,15 +1631,16 @@ def accept_online(
                                 else 0.0
                             )
                             if any(
-                                row.get("status") != "CHANNEL_READY"
+                                row.get("status") != "WARMUP_COMPLETE"
                                 or int(row.get("channel_generation", -1))
                                 != int(session.get("channel_generation", -1))
+                                or int(row.get("warmup_payload_bytes", 0)) <= 0
                                 or float(row.get("completed_unix_s", 0.0))
                                 >= anchor_start
                                 for row in preconnect_receipts
                             ):
                                 errors.append(
-                                    "channel preconnect was not ready before anchor"
+                                    "channel warmup was not complete before anchor"
                                 )
                 if direct_sender.get("communicator_lifecycle") != (
                     "PERSISTENT_CHANNEL_IDLE"

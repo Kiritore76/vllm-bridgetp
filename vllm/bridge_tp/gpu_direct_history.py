@@ -37,6 +37,7 @@ from vllm.distributed.device_communicators.pynccl_wrapper import (
 TRANSPORT = "NCCL_P2P_GPU_DIRECT"
 INTEGRITY = "NCCL_COMPLETION_PLUS_GPU_EXACT_READBACK"
 _TIMEOUT_S = 600.0
+_WARMUP_ELEMENTS = 256
 
 
 def _session_message(
@@ -202,6 +203,46 @@ class GpuDirectHistoryReceiver:
         self.buffer_high_water_bytes = 0
         self.last_session_payload_released_bytes = 0
         self.allow_idle_wait = False
+        self.warmup_completed_unix_s: float | None = None
+
+    def warmup_preconnected_channel(self, *, rank: int) -> int:
+        """Verify a tiny NCCL receive before starting any KV session."""
+        if (
+            not self.persistent_channel
+            or self.lifecycle is None
+            or self.lifecycle.state.value != "IDLE"
+            or self.lifecycle.active_session is not None
+            or self.connection is None
+            or self.nccl is None
+            or self.comm is None
+            or self.stream is None
+            or self.warmup_completed_unix_s is not None
+        ):
+            raise ProtocolViolation("warmup requires an idle preconnected channel")
+        header = recv_json(self.connection)
+        if (
+            header.get("op") != "WARMUP"
+            or int(header.get("channel_generation", -1)) != self.channel_generation
+            or int(header.get("target_tp_rank", -1)) != rank
+            or int(header.get("numel", -1)) != _WARMUP_ELEMENTS
+            or header.get("dtype") != "float16"
+        ):
+            raise ProtocolViolation("GPU-direct warmup header differs")
+        with torch.cuda.device(self.device):
+            payload = torch.empty(
+                _WARMUP_ELEMENTS, dtype=torch.float16, device=self.device
+            )
+        send_json(self.connection, {"status": "WARMUP_READY", "target_tp_rank": rank})
+        done = _recv_tensor(self.nccl, self.comm, payload, self.stream)
+        done.synchronize()
+        if not bool(torch.all(payload == rank + 1).item()):
+            raise ProtocolViolation("GPU-direct warmup payload differs")
+        send_json(
+            self.connection,
+            {"status": "WARMUP_COMPLETE", "target_tp_rank": rank},
+        )
+        self.warmup_completed_unix_s = time.time()
+        return payload.numel() * payload.element_size()
 
     def _open(self, *, migration_id: str, rank: int) -> None:
         if self.connection is not None:
@@ -741,6 +782,60 @@ class GpuDirectHistorySender:
         self.buffer_high_water_bytes = 0
         self.last_session_payload_released_bytes = 0
         self.preconnect_completed_unix_s: float | None = None
+        self.warmup_completed_unix_s: float | None = None
+
+    def warmup_preconnected_channel(self) -> int:
+        """Exercise all preconnected ranks with a tiny NCCL payload."""
+        if (
+            not self.persistent_channel
+            or self.lifecycle is None
+            or self.lifecycle.state.value != "IDLE"
+            or self.lifecycle.active_session is not None
+            or self.nccl is None
+            or self.target_tp_size <= 0
+            or len(self.connections) != self.target_tp_size
+            or len(self.comms) != self.target_tp_size
+            or self.warmup_completed_unix_s is not None
+        ):
+            raise ProtocolViolation("warmup requires an idle preconnected channel")
+        with torch.cuda.device(self.device):
+            payloads = [
+                torch.full(
+                    (_WARMUP_ELEMENTS,), rank + 1,
+                    dtype=torch.float16, device=self.device,
+                )
+                for rank in range(self.target_tp_size)
+            ]
+            streams = [
+                torch.cuda.Stream(device=self.device)
+                for _ in range(self.target_tp_size)
+            ]
+            # The test payload is created on the current stream, while NCCL
+            # uses separate streams. Finish the fill before publishing it.
+            torch.cuda.current_stream(self.device).synchronize()
+        for rank, connection in enumerate(self.connections):
+            send_json(
+                connection,
+                {
+                    "op": "WARMUP",
+                    "channel_generation": self.channel_generation,
+                    "target_tp_rank": rank,
+                    "numel": _WARMUP_ELEMENTS,
+                    "dtype": "float16",
+                },
+            )
+        for rank, connection in enumerate(self.connections):
+            ready = recv_json(connection)
+            if ready != {"status": "WARMUP_READY", "target_tp_rank": rank}:
+                raise ProtocolViolation(f"GPU-direct rank {rank} warmup not ready")
+        _send_group(self.nccl, self.comms, payloads, streams)
+        for rank, connection in enumerate(self.connections):
+            complete = recv_json(connection)
+            if complete != {"status": "WARMUP_COMPLETE", "target_tp_rank": rank}:
+                raise ProtocolViolation(f"GPU-direct rank {rank} warmup failed")
+        self.streams = streams
+        self.warmup_completed_unix_s = time.time()
+        return sum(value.numel() * value.element_size() for value in payloads)
 
     def preconnect(
         self,
@@ -1135,6 +1230,7 @@ class GpuDirectHistorySender:
                     "preconnect_completed_unix_s": (
                         self.preconnect_completed_unix_s
                     ),
+                    "warmup_completed_unix_s": self.warmup_completed_unix_s,
                     "channel_setup_ms": channel_setup_ms,
                     "session_handshake_ms": session_handshake_ms,
                     "pack_ms": pack_ms,
