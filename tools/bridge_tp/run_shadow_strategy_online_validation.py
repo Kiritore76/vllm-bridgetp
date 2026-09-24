@@ -236,6 +236,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--background-lead-s", type=float, default=2.0)
     parser.add_argument("--minimum-window-samples", type=int, default=4)
     parser.add_argument(
+        "--source-pressure",
+        action="store_true",
+        help="allow real TP1 peer jobs in the background manifest for A4-P",
+    )
+    parser.add_argument(
+        "--minimum-source-kv-usage-frac",
+        type=float,
+        default=0.0,
+        help="require this observed TP1 KV usage peak for A4-P",
+    )
+    parser.add_argument(
         "--fixed-rate-gib-s",
         type=float,
         default=None,
@@ -485,6 +496,10 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise ValueError("anchor prompt plus output exceeds max model length")
     if args.minimum_ready_target_jobs < 0 or args.minimum_window_samples < 0:
         raise ValueError("online sample thresholds cannot be negative")
+    if not 0 <= args.minimum_source_kv_usage_frac <= 1:
+        raise ValueError("minimum source KV usage fraction must be in [0, 1]")
+    if args.minimum_source_kv_usage_frac and not args.source_pressure:
+        raise ValueError("source KV usage gate requires --source-pressure")
     if (
         min(
             args.slo_tpot_ms,
@@ -536,23 +551,41 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise RuntimeError(f"frozen guard {guard} differs from expected")
     manifest = load_manifest(args.manifest)
     jobs = manifest["jobs"]
-    if any(job.get("pool") != "target" for job in jobs):
+    target_jobs = [job for job in jobs if job.get("pool") == "target"]
+    source_jobs = [job for job in jobs if job.get("pool") == "source"]
+    if source_jobs and not args.source_pressure:
         raise ValueError("online Shadow manifest must contain target jobs only")
-    if len(jobs) < args.minimum_ready_target_jobs:
+    if args.source_pressure and (not source_jobs or not target_jobs):
+        raise ValueError("A4-P requires source peers and target background jobs")
+    if args.source_pressure and not (
+        args.shadow_only_only
+        and args.gpu_direct_history
+        and args.gpu_direct_delta
+        and args.persistent_channel
+    ):
+        raise ValueError("A4-P requires persistent GPU-direct Shadow-only")
+    if len(target_jobs) < args.minimum_ready_target_jobs:
         raise ValueError("manifest has too few target jobs for the readiness gate")
-    for job in jobs:
+    for job in target_jobs:
         prompt = job["request"].get("prompt")
         if not isinstance(prompt, list) or not all(isinstance(x, int) for x in prompt):
             raise ValueError("online target jobs require exact prompt token IDs")
         if len(prompt) + int(job["request"]["max_tokens"]) > args.max_model_len:
             raise ValueError(f"target job {job['job_id']} exceeds max model length")
+    for job in source_jobs:
+        prompt = job["request"].get("prompt")
+        if not isinstance(prompt, list) or not all(isinstance(x, int) for x in prompt):
+            raise ValueError("A4-P source peers require exact prompt token IDs")
+        if len(prompt) + int(job["request"]["max_tokens"]) > args.max_model_len:
+            raise ValueError(f"source job {job['job_id']} exceeds max model length")
     if args.out_root.exists():
         raise FileExistsError(f"refusing to reuse output root {args.out_root}")
     return (
         revision,
         guard,
         {
-            "target_jobs": len(jobs),
+            "target_jobs": len(target_jobs),
+            "source_jobs": len(source_jobs),
             "trigger_output_tokens": args.trigger_output_tokens,
             "commit_timing": args.commit_timing,
             "cutover_output_tokens": (
@@ -1334,6 +1367,8 @@ def accept_online(
     preconnect_persistent_channel: bool = False,
     persistent_expected_session_count: int = 1,
     commit_timing: str = "FIXED",
+    source_pressure_expected_jobs: int = 0,
+    minimum_source_kv_usage_frac: float = 0.0,
 ) -> dict[str, Any]:
     background = common.read_json(background_dir / "background_summary.json")
     session = common.read_json(controller_dir / "session_manifest.json")
@@ -1354,6 +1389,63 @@ def accept_online(
         else {}
     )
     audit = _load_rows(controller_dir / "phase9_audit.jsonl")
+    source_peers = [
+        row for row in background.get("results", [])
+        if row.get("pool") == "source"
+    ]
+    target_background = [
+        row for row in background.get("results", [])
+        if row.get("pool") == "target"
+    ]
+    source_telemetry = [
+        row["tp1"] for row in audit
+        if row.get("kind") == "telemetry"
+        and isinstance(row.get("tp1"), dict)
+    ]
+    source_usage = [
+        float(row["kv_usage_frac"]) for row in source_telemetry
+        if isinstance(row.get("kv_usage_frac"), (int, float))
+    ]
+    source_preemptions = [
+        int(row["preemptions_total"]) for row in source_telemetry
+        if isinstance(row.get("preemptions_total"), (int, float))
+    ]
+    source_pressure_evidence = {
+        "peer_jobs": len(source_peers),
+        "peer_completed": sum(
+            row.get("status") == "COMPLETED" for row in source_peers
+        ),
+        "peer_failed": sum(row.get("status") == "FAILED" for row in source_peers),
+        "peer_output_tokens": sum(
+            int(row.get("output_tokens", 0)) for row in source_peers
+        ),
+        "peer_e2e_ms": [
+            row.get("e2e_ms") for row in source_peers
+            if row.get("status") == "COMPLETED"
+        ],
+        "peer_tpot_p95_ms": [
+            row.get("tpot_p95_ms") for row in source_peers
+            if row.get("status") == "COMPLETED"
+        ],
+        "telemetry_samples": len(source_telemetry),
+        "overlap_samples": sum(
+            int(row.get("num_running", 0)) >= 2 for row in source_telemetry
+        ),
+        "peak_tp1_kv_usage_frac": max(source_usage, default=None),
+        "minimum_free_kv_tokens": min(
+            (
+                int(row["free_kv_blocks"]) * int(row["block_size"])
+                for row in source_telemetry
+                if isinstance(row.get("free_kv_blocks"), (int, float))
+                and isinstance(row.get("block_size"), (int, float))
+            ),
+            default=None,
+        ),
+        "preemption_delta": (
+            max(source_preemptions) - source_preemptions[0]
+            if source_preemptions else None
+        ),
+    }
     earliest_ready_armed = [
         row
         for row in audit
@@ -1513,6 +1605,18 @@ def accept_online(
         errors.append("background job count differs from manifest")
     if background.get("completed") != expected_jobs or background.get("failed") != 0:
         errors.append("target background workload did not complete")
+    if source_pressure_expected_jobs:
+        if len(source_peers) != source_pressure_expected_jobs:
+            errors.append("source pressure peer count differs from manifest")
+        if not source_usage:
+            errors.append("source pressure has no TP1 KV telemetry")
+        elif max(source_usage) < minimum_source_kv_usage_frac:
+            errors.append(
+                "source pressure TP1 KV usage peak below required "
+                f"{minimum_source_kv_usage_frac:.3f}"
+            )
+        if not source_pressure_evidence["overlap_samples"]:
+            errors.append("source peers did not overlap anchor decode")
     if session.get("shadow_strategy") != strategy:
         errors.append("session recorded the wrong Shadow strategy")
     if staging.get("shadow_strategy") != strategy:
@@ -2324,7 +2428,12 @@ def accept_online(
             ),
         },
         "history_copy_order": session.get("history_copy_order"),
-        "target_jobs_completed": background.get("completed"),
+        "target_jobs_completed": sum(
+            row.get("status") == "COMPLETED" for row in target_background
+        ),
+        "source_pressure_evidence": (
+            source_pressure_evidence if source_pressure_expected_jobs else None
+        ),
         "shadow_duration_ms": (bridge_start - shadow_start) * 1000,
         "bridge_to_commit_ms": bridge_to_commit_ms,
         "final_sync_to_commit_ms": (
@@ -2543,6 +2652,8 @@ def main() -> None:
         "commit_timing": args.commit_timing,
         "bridge_output_tokens": args.bridge_output_tokens,
         "repetitions": args.repetitions,
+        "source_pressure": args.source_pressure,
+        "minimum_source_kv_usage_frac": args.minimum_source_kv_usage_frac,
         "fixed_rate_gib_s": args.fixed_rate_gib_s,
         "slo_thresholds": {
             "tpot_ms": args.slo_tpot_ms,
@@ -2756,6 +2867,12 @@ def main() -> None:
                             else 1
                         ),
                         commit_timing=args.commit_timing,
+                        source_pressure_expected_jobs=(
+                            pressure["source_jobs"] if args.source_pressure else 0
+                        ),
+                        minimum_source_kv_usage_frac=(
+                            args.minimum_source_kv_usage_frac
+                        ),
                     )
 
                 source_env_overrides = {"BRIDGETP_SHADOW_STRATEGY": strategy}
