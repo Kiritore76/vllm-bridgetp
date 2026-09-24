@@ -160,15 +160,21 @@ def preconnect_persistent_gpu_sender(device: torch.device) -> None:
                     for rank in range(config.target_tp_size)
                 ],
             )
-        _atomic_json_dump(
-            {
-                "status": "CHANNEL_READY",
-                "channel_generation": config.channel_generation,
-                "target_tp_size": config.target_tp_size,
-                "completed_unix_s": sender.preconnect_completed_unix_s,
-            },
-            config.run_dir / "gpu_channel_preconnect_receipts" / "source.json",
-        )
+        if sender.warmup_completed_unix_s is None:
+            warmup_started = time.perf_counter()
+            warmup_bytes = sender.warmup_preconnected_channel()
+            _atomic_json_dump(
+                {
+                    "status": "WARMUP_COMPLETE",
+                    "channel_generation": config.channel_generation,
+                    "target_tp_size": config.target_tp_size,
+                    "preconnect_completed_unix_s": sender.preconnect_completed_unix_s,
+                    "warmup_payload_bytes": warmup_bytes,
+                    "warmup_ms": (time.perf_counter() - warmup_started) * 1000,
+                    "completed_unix_s": sender.warmup_completed_unix_s,
+                },
+                config.run_dir / "gpu_channel_preconnect_receipts" / "source.json",
+            )
     except BaseException:
         _discard_persistent_gpu_sender(key, sender)
         raise

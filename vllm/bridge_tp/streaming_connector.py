@@ -1164,12 +1164,20 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     assert receiver.connection is not None
                     receiver.allow_idle_wait = True
                     receiver.connection.settimeout(None)
+                    warmup_started = time.perf_counter()
+                    warmup_bytes = receiver.warmup_preconnected_channel(
+                        rank=tp_rank
+                    )
                     _atomic_json_dump(
                         {
-                            "status": "CHANNEL_READY",
+                            "status": "WARMUP_COMPLETE",
                             "target_tp_rank": tp_rank,
                             "channel_generation": self.channel_generation,
-                            "completed_unix_s": time.time(),
+                            "warmup_payload_bytes": warmup_bytes,
+                            "warmup_ms": (
+                                time.perf_counter() - warmup_started
+                            ) * 1000,
+                            "completed_unix_s": receiver.warmup_completed_unix_s,
                         },
                         self.manifest_path.parent
                         / "gpu_channel_preconnect_receipts"

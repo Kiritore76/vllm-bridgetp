@@ -62,6 +62,130 @@ class TestGpuDirectHistoryLifecycle(unittest.TestCase):
         self.assertIsNotNone(sender.preconnect_completed_unix_s)
         self.assertEqual(send.call_count, 4)
 
+    def test_preconnected_sender_warms_each_rank_without_session(self) -> None:
+        import torch
+
+        from vllm.bridge_tp.gpu_direct_history import GpuDirectHistorySender
+        from vllm.bridge_tp.stream_protocol import (
+            ChannelState,
+            PersistentChannelLifecycle,
+        )
+
+        sender = object.__new__(GpuDirectHistorySender)
+        sender.device = torch.device("cuda:0")
+        sender.nccl = Mock()
+        sender.connections = [Mock(), Mock()]
+        sender.comms = [Mock(), Mock()]
+        sender.target_tp_size = 2
+        sender.channel_generation = 7
+        sender.persistent_channel = True
+        sender.warmup_completed_unix_s = None
+        sender.lifecycle = PersistentChannelLifecycle(
+            topology_key="test", expected_ranks=frozenset({0, 1}),
+            channel_generation=7,
+        )
+        sender.lifecycle.mark_open()
+        payloads = [Mock(), Mock()]
+        for payload in payloads:
+            payload.numel.return_value = 256
+            payload.element_size.return_value = 2
+        responses = [
+            {"status": "WARMUP_READY", "target_tp_rank": rank}
+            for rank in range(2)
+        ] + [
+            {"status": "WARMUP_COMPLETE", "target_tp_rank": rank}
+            for rank in range(2)
+        ]
+        with (
+            patch("vllm.bridge_tp.gpu_direct_history.send_json") as send,
+            patch(
+                "vllm.bridge_tp.gpu_direct_history.recv_json",
+                side_effect=responses,
+            ),
+            patch("vllm.bridge_tp.gpu_direct_history._send_group") as transfer,
+            patch(
+                "vllm.bridge_tp.gpu_direct_history.torch.full",
+                side_effect=payloads,
+            ),
+            patch("vllm.bridge_tp.gpu_direct_history.torch.cuda.Stream"),
+            patch("vllm.bridge_tp.gpu_direct_history.torch.cuda.current_stream"),
+            patch(
+                "vllm.bridge_tp.gpu_direct_history.torch.cuda.device",
+                return_value=nullcontext(),
+            ),
+        ):
+            transferred = sender.warmup_preconnected_channel()
+
+        self.assertEqual(transferred, 1024)
+        self.assertEqual(send.call_count, 2)
+        transfer.assert_called_once_with(
+            sender.nccl, sender.comms, payloads, sender.streams,
+        )
+        self.assertEqual(sender.lifecycle.state, ChannelState.IDLE)
+        self.assertIsNone(sender.lifecycle.active_session)
+        self.assertIsNotNone(sender.warmup_completed_unix_s)
+
+    def test_preconnected_receiver_verifies_warmup_without_session(self) -> None:
+        import torch
+
+        from vllm.bridge_tp.gpu_direct_history import GpuDirectHistoryReceiver
+        from vllm.bridge_tp.stream_protocol import (
+            ChannelState,
+            PersistentChannelLifecycle,
+        )
+
+        receiver = object.__new__(GpuDirectHistoryReceiver)
+        receiver.device = torch.device("cuda:0")
+        receiver.connection = Mock()
+        receiver.nccl = Mock()
+        receiver.comm = Mock()
+        receiver.stream = Mock()
+        receiver.channel_generation = 7
+        receiver.persistent_channel = True
+        receiver.warmup_completed_unix_s = None
+        receiver.lifecycle = PersistentChannelLifecycle(
+            topology_key="test", expected_ranks=frozenset({1}),
+            channel_generation=7,
+        )
+        receiver.lifecycle.mark_open()
+        payload = Mock()
+        payload.numel.return_value = 256
+        payload.element_size.return_value = 2
+        equal = Mock()
+        equal.item.return_value = True
+        header = {
+            "op": "WARMUP", "channel_generation": 7,
+            "target_tp_rank": 1, "numel": 256, "dtype": "float16",
+        }
+        with (
+            patch(
+                "vllm.bridge_tp.gpu_direct_history.recv_json",
+                return_value=header,
+            ),
+            patch("vllm.bridge_tp.gpu_direct_history.send_json") as send,
+            patch("vllm.bridge_tp.gpu_direct_history._recv_tensor") as transfer,
+            patch(
+                "vllm.bridge_tp.gpu_direct_history.torch.empty",
+                return_value=payload,
+            ),
+            patch("vllm.bridge_tp.gpu_direct_history.torch.all", return_value=equal),
+            patch(
+                "vllm.bridge_tp.gpu_direct_history.torch.cuda.device",
+                return_value=nullcontext(),
+            ),
+        ):
+            received = receiver.warmup_preconnected_channel(rank=1)
+
+        self.assertEqual(received, 512)
+        transfer.assert_called_once_with(
+            receiver.nccl, receiver.comm, payload, receiver.stream
+        )
+        transfer.return_value.synchronize.assert_called_once_with()
+        self.assertEqual(send.call_count, 2)
+        self.assertEqual(send.call_args.args[1]["status"], "WARMUP_COMPLETE")
+        self.assertEqual(receiver.lifecycle.state, ChannelState.IDLE)
+        self.assertIsNotNone(receiver.warmup_completed_unix_s)
+
     def test_persistent_session_uses_source_request_identity(self) -> None:
         from vllm.bridge_tp.streaming_connector import (
             BridgeTPStreamRequest,
