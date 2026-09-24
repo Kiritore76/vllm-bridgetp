@@ -1161,7 +1161,8 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                                     if self._persistent_gpu_receiver is None:
                                         self._persistent_gpu_receiver = receiver
                         else:
-                            receiver.close()
+                            if receiver is not self._prebound_gpu_receiver:
+                                receiver.close()
                             receiver = self._prebound_gpu_receiver
                     direct = receiver.receive(
                         migration_id=migration_id,

@@ -400,10 +400,16 @@ class TestOptInConfiguration(unittest.TestCase):
         class Receiver:
             def __init__(self, **kwargs):
                 self.calls = []
+                self.closed = False
 
             def receive(self, **kwargs):
+                if self.closed:
+                    raise RuntimeError("receiver was closed before reuse")
                 self.calls.append(kwargs["migration_id"])
                 return object()
+
+            def close(self):
+                self.closed = True
 
         connector = _streaming_connector_stub(BridgeTPStreamingConnector)
         connector.gpu_resident_shadow = True
@@ -471,6 +477,7 @@ class TestOptInConfiguration(unittest.TestCase):
                         connector._prebound_gpu_receiver.calls,
                         ["first", "second"],
                     )
+                    self.assertFalse(connector._prebound_gpu_receiver.closed)
                 finally:
                     connector._prebind_receiver_stop.set()
                     connector._prebind_receiver_thread.join(timeout=2)
