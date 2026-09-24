@@ -489,6 +489,7 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise FileNotFoundError(f"Python executable is missing: {args.python_bin}")
     if not args.model_path.exists():
         raise FileNotFoundError(f"model path is missing: {args.model_path}")
+    common.model_kv_geometry(args.model_path, args.dtype)
     required_files = {
         "manifest": args.manifest,
         "survival table": args.survival_table,

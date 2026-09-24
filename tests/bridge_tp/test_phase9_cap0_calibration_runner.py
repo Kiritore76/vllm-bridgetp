@@ -23,6 +23,45 @@ sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
 
+class TestModelKVGeometry(unittest.TestCase):
+    def test_preserves_14b_and_supports_7b(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            model = Path(temporary)
+            for layers, heads, expected_bytes in (
+                (48, 8, 196608),
+                (28, 4, 57344),
+            ):
+                (model / "config.json").write_text(
+                    json.dumps(
+                        {
+                            "num_hidden_layers": layers,
+                            "num_attention_heads": 40 if heads == 8 else 28,
+                            "num_key_value_heads": heads,
+                            "hidden_size": 5120 if heads == 8 else 3584,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                self.assertEqual(
+                    MODULE.model_kv_geometry(model, "bfloat16"),
+                    (heads, expected_bytes),
+                )
+                env = MODULE.source_environment(
+                    SimpleNamespace(
+                        model_path=model,
+                        dtype="bfloat16",
+                        tp1_gpu="0",
+                        snapshot_port=29800,
+                        delta_port=29900,
+                    ),
+                    "model-geometry-test",
+                    model / "controller",
+                )
+                self.assertEqual(
+                    env["BRIDGETP_STREAM_EXPECTED_KV_HEADS"], str(heads)
+                )
+
+
 class TestGuardCandidate(unittest.TestCase):
     def test_uses_preemption_or_censored_minimum_and_rounds(self) -> None:
         result = MODULE.calculate_guard_candidate(
@@ -247,11 +286,15 @@ class TestSourceSelectionContract(unittest.TestCase):
                 tp1_port=8101,
                 tp4_port=8300,
                 survival_table=survival,
+                model_path=root,
+                dtype="bfloat16",
             )
-            path = MODULE.make_config(args, controller, provenance)
+            with mock.patch.object(MODULE, "model_kv_geometry", return_value=(8, 196608)):
+                path = MODULE.make_config(args, controller, provenance)
             config = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(config["source_url"], "http://127.0.0.1:8101")
         self.assertEqual(config["target_url"], "http://127.0.0.1:8300")
+        self.assertEqual(config["policy"]["kv_bytes_per_token"], 196608)
 
     def test_target_connector_records_ready_sync_mode(self) -> None:
         config = json.loads(
@@ -321,12 +364,15 @@ class TestSourceSelectionContract(unittest.TestCase):
             tp1_gpu="0",
             snapshot_port=29800,
             delta_port=29900,
+            model_path=Path("model"),
+            dtype="bfloat16",
         )
-        environment = MODULE.source_environment(
-            args,
-            "cap0-calibration-smoke-example",
-            Path("batch") / "smoke" / "controller",
-        )
+        with mock.patch.object(MODULE, "model_kv_geometry", return_value=(8, 196608)):
+            environment = MODULE.source_environment(
+                args,
+                "cap0-calibration-smoke-example",
+                Path("batch") / "smoke" / "controller",
+            )
         self.assertEqual(
             environment["BRIDGETP_STREAM_SOURCE_REQUEST_ID_PREFIX"],
             "bridgetp-phase9-controller",
@@ -345,12 +391,15 @@ class TestSourceSelectionContract(unittest.TestCase):
             deferred_comm_destroy=True,
             persistent_channel=True,
             channel_generation=7,
+            model_path=Path("model"),
+            dtype="bfloat16",
         )
-        environment = MODULE.source_environment(
-            args,
-            "gpu-direct-smoke",
-            Path("batch") / "smoke" / "controller",
-        )
+        with mock.patch.object(MODULE, "model_kv_geometry", return_value=(8, 196608)):
+            environment = MODULE.source_environment(
+                args,
+                "gpu-direct-smoke",
+                Path("batch") / "smoke" / "controller",
+            )
         self.assertEqual(environment["BRIDGETP_GPU_DIRECT_HISTORY"], "1")
         self.assertEqual(environment["BRIDGETP_GPU_DIRECT_BASE_PORT"], "30400")
         self.assertEqual(environment["BRIDGETP_GPU_DIRECT_DELTA"], "1")
