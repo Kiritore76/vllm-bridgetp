@@ -22,7 +22,10 @@ from tqdm import tqdm
 
 import vllm.envs as envs
 from vllm.bridge_tp.kv_export import maybe_dump_kv_cache
-from vllm.bridge_tp.kv_stream import maybe_publish_kv_stream
+from vllm.bridge_tp.kv_stream import (
+    maybe_publish_kv_stream,
+    preconnect_persistent_gpu_sender,
+)
 from vllm.bridge_tp.logit_capture import (
     get_logit_capture_config,
     maybe_make_logit_observer,
@@ -7371,6 +7374,8 @@ class GPUModelRunner(
         kv_caches = self.initialize_kv_cache_tensors(
             kv_cache_config, kernel_block_sizes
         )
+        if not is_profiling and kv_caches:
+            preconnect_persistent_gpu_sender(next(iter(kv_caches.values())).device)
 
         if (
             self.speculative_config

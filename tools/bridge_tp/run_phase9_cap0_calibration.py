@@ -374,6 +374,8 @@ def target_connector(
     post_takeover_communicator_destroy: bool = False,
     persistent_channel: bool = False,
     channel_generation: int = 0,
+    preconnect_gpu_direct: bool = False,
+    gpu_direct_base_port: int = 0,
 ) -> str:
     return json.dumps(
         {
@@ -415,6 +417,10 @@ def target_connector(
                 ),
                 "bridgetp_persistent_channel": persistent_channel,
                 "bridgetp_channel_generation": channel_generation,
+                "bridgetp_preconnect_gpu_direct": preconnect_gpu_direct,
+                "bridgetp_preconnect_gpu_direct_base_port": (
+                    gpu_direct_base_port
+                ),
             },
         },
         separators=(",", ":"),
@@ -491,6 +497,8 @@ def source_environment(
         env["BRIDGETP_CHANNEL_GENERATION"] = str(
             int(getattr(args, "channel_generation", 0))
         )
+    if bool(getattr(args, "preconnect_persistent_channel", False)):
+        env["BRIDGETP_GPU_DIRECT_PRECONNECT"] = "1"
     return env
 
 

@@ -113,6 +113,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--channel-generation", type=int, default=0)
     parser.add_argument(
+        "--preconnect-persistent-channel",
+        action="store_true",
+        help=(
+            "open the TP1-to-TP4 persistent NCCL links during service startup "
+            "before the anchor request begins"
+        ),
+    )
+    parser.add_argument(
         "--persistent-sequential-reuse",
         action="store_true",
         help=(
@@ -317,6 +325,10 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
     if args.persistent_sequential_reuse and not args.persistent_channel:
         raise ValueError(
             "persistent sequential reuse requires --persistent-channel"
+        )
+    if args.preconnect_persistent_channel and not args.persistent_channel:
+        raise ValueError(
+            "persistent preconnect requires --persistent-channel"
         )
     if args.persistent_session_gap_s < 0:
         raise ValueError("persistent session gap cannot be negative")
@@ -1319,6 +1331,7 @@ def accept_online(
     deferred_comm_destroy: bool = False,
     post_takeover_comm_destroy: bool = False,
     persistent_channel: bool = False,
+    preconnect_persistent_channel: bool = False,
     persistent_expected_session_count: int = 1,
     commit_timing: str = "FIXED",
 ) -> dict[str, Any]:
@@ -1565,6 +1578,7 @@ def accept_online(
     gpu_direct_delta = staging.get("gpu_direct_delta") is True
     direct_sender: dict[str, Any] = {}
     target_channel_receipts: list[dict[str, Any]] = []
+    preconnect_receipts: list[dict[str, Any]] = []
     if gpu_direct_history:
         direct_sender_path = controller_dir / "gpu_direct_sender.json"
         if not direct_sender_path.is_file():
@@ -1587,6 +1601,46 @@ def accept_online(
                     "process-lifetime pool"
                 )
             if persistent_channel:
+                if preconnect_persistent_channel:
+                    if any(
+                        row.get("channel_reused") is not True
+                        for row in direct_ranks
+                    ):
+                        errors.append(
+                            "GPU-direct sender did not reuse a preconnected channel"
+                        )
+                    if persistent_expected_session_count == 1:
+                        preconnect_dir = (
+                            controller_dir / "gpu_channel_preconnect_receipts"
+                        )
+                        paths = [preconnect_dir / "source.json"] + [
+                            preconnect_dir / f"tp_rank_{rank}.json"
+                            for rank in range(4)
+                        ]
+                        if not all(path.is_file() for path in paths):
+                            errors.append(
+                                "preconnect receipts are incomplete"
+                            )
+                        else:
+                            preconnect_receipts = [
+                                common.read_json(path) for path in paths
+                            ]
+                            anchor_start = (
+                                float(source_response["request_started_unix_s"])
+                                if source_response is not None
+                                else 0.0
+                            )
+                            if any(
+                                row.get("status") != "CHANNEL_READY"
+                                or int(row.get("channel_generation", -1))
+                                != int(session.get("channel_generation", -1))
+                                or float(row.get("completed_unix_s", 0.0))
+                                >= anchor_start
+                                for row in preconnect_receipts
+                            ):
+                                errors.append(
+                                    "channel preconnect was not ready before anchor"
+                                )
                 if direct_sender.get("communicator_lifecycle") != (
                     "PERSISTENT_CHANNEL_IDLE"
                 ):
@@ -2369,6 +2423,9 @@ def accept_online(
         "target_origin_tokens": proxy.get("target_origin_tokens"),
         "receiver_ranks": receipts.get("receiver_ranks"),
         "exact_readback": receipts.get("exact_readback"),
+        "preconnect_evidence": (
+            preconnect_receipts if preconnect_persistent_channel else None
+        ),
         "persistent_channel_evidence": (
             {
                 "source": {
@@ -2458,6 +2515,7 @@ def main() -> None:
         "gpu_direct_history": args.gpu_direct_history,
         "gpu_direct_delta": args.gpu_direct_delta,
         "persistent_channel": args.persistent_channel,
+        "preconnect_persistent_channel": args.preconnect_persistent_channel,
         "channel_generation": args.channel_generation,
         "persistent_sequential_reuse": args.persistent_sequential_reuse,
         "persistent_session_gap_s": args.persistent_session_gap_s,
@@ -2688,6 +2746,9 @@ def main() -> None:
                         deferred_comm_destroy=selected_deferred_destroy,
                         post_takeover_comm_destroy=selected_post_destroy,
                         persistent_channel=args.persistent_channel,
+                        preconnect_persistent_channel=(
+                            args.preconnect_persistent_channel
+                        ),
                         persistent_expected_session_count=(
                             repetition
                             if args.persistent_sequential_reuse

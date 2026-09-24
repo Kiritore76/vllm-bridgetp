@@ -8,6 +8,7 @@ import queue
 import tempfile
 import threading
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -15,6 +16,52 @@ from unittest.mock import Mock, patch
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "requires torch")
 class TestGpuDirectHistoryLifecycle(unittest.TestCase):
+    def test_preconnect_opens_channel_without_starting_session(self) -> None:
+        import torch
+
+        from vllm.bridge_tp.gpu_direct_history import GpuDirectHistorySender
+        from vllm.bridge_tp.stream_protocol import ChannelState
+
+        sender = GpuDirectHistorySender(
+            device=torch.device("cuda:0"), host="127.0.0.1", port=30404
+        )
+        nccl = Mock()
+        nccl.ncclGetUniqueId.return_value = SimpleNamespace(
+            internal=bytearray(b"1" * 128)
+        )
+        nccl.ncclCommInitRank.side_effect = [object() for _ in range(4)]
+        connections = [Mock() for _ in range(4)]
+        ready = [
+            {
+                "status": "CHANNEL_READY",
+                "channel_generation": 3,
+                "target_tp_rank": rank,
+            }
+            for rank in range(4)
+        ]
+        with (
+            patch("vllm.bridge_tp.gpu_direct_history.NCCLLibrary", return_value=nccl),
+            patch(
+                "vllm.bridge_tp.gpu_direct_history._connect",
+                side_effect=connections,
+            ),
+            patch("vllm.bridge_tp.gpu_direct_history.send_json") as send,
+            patch("vllm.bridge_tp.gpu_direct_history.recv_json", side_effect=ready),
+            patch("vllm.bridge_tp.gpu_direct_history.torch.cuda.device", return_value=nullcontext()),
+        ):
+            sender.preconnect(
+                channel_generation=3,
+                target_addresses=[f"127.0.0.1:{30400 + rank}" for rank in range(4)],
+            )
+
+        self.assertIs(sender.nccl, nccl)
+        self.assertEqual(len(sender.connections), 4)
+        self.assertEqual(len(sender.comms), 4)
+        self.assertEqual(sender.lifecycle.state, ChannelState.IDLE)
+        self.assertIsNone(sender.lifecycle.active_session)
+        self.assertIsNotNone(sender.preconnect_completed_unix_s)
+        self.assertEqual(send.call_count, 4)
+
     def test_persistent_session_uses_source_request_identity(self) -> None:
         from vllm.bridge_tp.streaming_connector import (
             BridgeTPStreamRequest,

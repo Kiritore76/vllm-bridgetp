@@ -415,6 +415,29 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 "bridgetp_channel_generation", 0
             )
         )
+        self.preconnect_gpu_direct = bool(
+            self._kv_transfer_config.get_from_extra_config(
+                "bridgetp_preconnect_gpu_direct", False
+            )
+        )
+        self.preconnect_gpu_direct_host = str(
+            self._kv_transfer_config.get_from_extra_config(
+                "bridgetp_preconnect_gpu_direct_host", "127.0.0.1"
+            )
+        )
+        self.preconnect_gpu_direct_base_port = int(
+            self._kv_transfer_config.get_from_extra_config(
+                "bridgetp_preconnect_gpu_direct_base_port", 0
+            )
+        )
+        if self.preconnect_gpu_direct and (
+            not self.persistent_channel
+            or not 1024 <= self.preconnect_gpu_direct_base_port <= 65531
+        ):
+            raise ValueError(
+                "GPU-direct preconnect requires a persistent channel and "
+                "four valid per-rank ports"
+            )
         if self.channel_generation < 0:
             raise ValueError("bridgetp_channel_generation cannot be negative")
         if self.persistent_channel and self.post_takeover_communicator_destroy:
@@ -1119,6 +1142,48 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             )
 
             last_migration_id: str | None = None
+            if self.preconnect_gpu_direct:
+                receiver: Any | None = None
+                try:
+                    tp_rank = get_tp_group().rank_in_group
+                    device = next(iter(self._registered_kv_caches.values())).device
+                    receiver = GpuDirectHistoryReceiver(
+                        device=device,
+                        host=self.preconnect_gpu_direct_host,
+                        port=self.preconnect_gpu_direct_base_port + tp_rank,
+                        defer_communicator_destroy=True,
+                    )
+                    receiver.listener.settimeout(None)
+                    with self._prebound_gpu_receiver_lock:
+                        self._prebound_gpu_receiver = receiver
+                    receiver._open(migration_id="", rank=tp_rank)
+                    if receiver.channel_generation != self.channel_generation:
+                        raise RuntimeError(
+                            "preconnected GPU-direct channel generation differs"
+                        )
+                    assert receiver.connection is not None
+                    receiver.allow_idle_wait = True
+                    receiver.connection.settimeout(None)
+                    _atomic_json_dump(
+                        {
+                            "status": "CHANNEL_READY",
+                            "target_tp_rank": tp_rank,
+                            "channel_generation": self.channel_generation,
+                            "completed_unix_s": time.time(),
+                        },
+                        self.manifest_path.parent
+                        / "gpu_channel_preconnect_receipts"
+                        / f"tp_rank_{tp_rank}.json",
+                    )
+                except BaseException:
+                    logger.exception("GPU-direct target preconnect failed")
+                    with self._prebound_gpu_receiver_lock:
+                        if self._prebound_gpu_receiver is receiver:
+                            self._prebound_gpu_receiver = None
+                    if receiver is not None:
+                        receiver.close()
+                    self._prebind_receiver_ready.set()
+                    return
             while not self._prebind_receiver_stop.is_set():
                 receiver: Any | None = None
                 try:
