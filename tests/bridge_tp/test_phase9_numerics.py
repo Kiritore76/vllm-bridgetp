@@ -394,6 +394,88 @@ class TestOptInConfiguration(unittest.TestCase):
         arm.assert_called_once_with(worker._connector_metadata)
 
     @unittest.skipUnless(importlib.util.find_spec("torch"), "requires torch")
+    def test_persistent_earliest_ready_prebind_receives_second_session(self):
+        from vllm.bridge_tp.streaming_connector import BridgeTPStreamingConnector
+
+        class Receiver:
+            def __init__(self, **kwargs):
+                self.calls = []
+
+            def receive(self, **kwargs):
+                self.calls.append(kwargs["migration_id"])
+                return object()
+
+        connector = _streaming_connector_stub(BridgeTPStreamingConnector)
+        connector.gpu_resident_shadow = True
+        connector.persistent_channel = True
+        connector.shadow_cutover_output_tokens = 0
+        connector.defer_communicator_destroy = False
+        connector.post_takeover_communicator_destroy = False
+        connector._registered_kv_caches = {
+            "layer": types.SimpleNamespace(device="cuda:0")
+        }
+        connector._prebound_gpu_receiver = None
+        connector._prebound_gpu_receiver_lock = threading.Lock()
+        connector._persistent_gpu_receiver = None
+        connector._persistent_gpu_receiver_lock = threading.Lock()
+        connector._prebound_gpu_history = None
+        connector._prebound_gpu_history_lock = threading.Lock()
+        connector._prebind_receiver_thread = None
+        connector._prebind_receiver_stop = threading.Event()
+        connector._prebind_receiver_ready = threading.Event()
+
+        with tempfile.TemporaryDirectory() as directory:
+            connector.manifest_path = Path(directory) / "session_manifest.json"
+
+            def publish(migration_id):
+                connector.manifest_path.write_text(
+                    json.dumps({
+                        "history_transport": "NCCL_P2P_GPU_DIRECT",
+                        "delta_transport": "NCCL_P2P_GPU_DIRECT_PERSISTENT",
+                        "migration_id": migration_id,
+                        "source_request_id": "source",
+                        "ranks": [{"host": "localhost", "port": 30400}],
+                        "layers": [],
+                    }),
+                    encoding="utf-8",
+                )
+
+            def receipt_is(migration_id):
+                path = Path(directory) / "gpu_initial_receipts" / "tp_rank_0.json"
+                return path.is_file() and json.loads(path.read_text())[
+                    "migration_id"
+                ] == migration_id
+
+            publish("first")
+            with (
+                patch(
+                    "vllm.bridge_tp.gpu_direct_history.GpuDirectHistoryReceiver",
+                    Receiver,
+                ),
+                patch(
+                    "vllm.bridge_tp.streaming_connector.get_tp_group",
+                    return_value=types.SimpleNamespace(rank_in_group=0),
+                ),
+            ):
+                connector._start_gpu_direct_receiver_prebind()
+                try:
+                    for migration_id in ("first", "second"):
+                        if migration_id == "second":
+                            publish(migration_id)
+                        for _ in range(200):
+                            if receipt_is(migration_id):
+                                break
+                            connector._prebind_receiver_stop.wait(0.01)
+                        self.assertTrue(receipt_is(migration_id))
+                    self.assertEqual(
+                        connector._prebound_gpu_receiver.calls,
+                        ["first", "second"],
+                    )
+                finally:
+                    connector._prebind_receiver_stop.set()
+                    connector._prebind_receiver_thread.join(timeout=2)
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "requires torch")
     def test_streaming_connector_rejects_unexpected_extra_tail_blocks(self):
         from vllm.bridge_tp.streaming_connector import BridgeTPStreamingConnector
 

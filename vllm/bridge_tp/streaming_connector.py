@@ -1111,6 +1111,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 GpuDirectHistoryReceiver,
             )
 
+            last_migration_id: str | None = None
             while not self._prebind_receiver_stop.is_set():
                 receiver: Any | None = None
                 try:
@@ -1125,21 +1126,29 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     if not isinstance(ranks, list):
                         self._prebind_receiver_ready.set()
                         return
+                    migration_id = str(manifest["migration_id"])
+                    if migration_id == last_migration_id:
+                        time.sleep(0.005)
+                        continue
+                    self._prebind_receiver_ready.clear()
                     tp_rank = get_tp_group().rank_in_group
                     record = ranks[tp_rank]
-                    device = next(
-                        iter(self._registered_kv_caches.values())
-                    ).device
-                    receiver = GpuDirectHistoryReceiver(
-                        device=device,
-                        host=str(record["host"]),
-                        port=int(record["port"]),
-                        defer_communicator_destroy=(
-                            self.defer_communicator_destroy
-                            or self.post_takeover_communicator_destroy
-                            or self.persistent_channel
-                        ),
-                    )
+                    with self._prebound_gpu_receiver_lock:
+                        receiver = self._prebound_gpu_receiver
+                    if receiver is None:
+                        device = next(
+                            iter(self._registered_kv_caches.values())
+                        ).device
+                        receiver = GpuDirectHistoryReceiver(
+                            device=device,
+                            host=str(record["host"]),
+                            port=int(record["port"]),
+                            defer_communicator_destroy=(
+                                self.defer_communicator_destroy
+                                or self.post_takeover_communicator_destroy
+                                or self.persistent_channel
+                            ),
+                        )
                     # Publish the listener before entering receive().  The
                     # receive call may block until TP1 starts sending; live
                     # load must wait on this same object rather than trying
@@ -1155,7 +1164,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                             receiver.close()
                             receiver = self._prebound_gpu_receiver
                     direct = receiver.receive(
-                        migration_id=str(manifest["migration_id"]),
+                        migration_id=migration_id,
                         request_id=str(manifest["source_request_id"]),
                         rank=tp_rank,
                         layer_records=list(manifest["layers"]),
@@ -1167,7 +1176,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     )
                     with self._prebound_gpu_history_lock:
                         self._prebound_gpu_history = (
-                            str(manifest["migration_id"]),
+                            migration_id,
                             direct,
                         )
                     buffered_completed_unix_s = time.time()
@@ -1175,7 +1184,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                         {
                             "format_version": 1,
                             "status": "INITIAL_HISTORY_GPU_BUFFERED",
-                            "migration_id": str(manifest["migration_id"]),
+                            "migration_id": migration_id,
                             "target_tp_rank": tp_rank,
                             "exact_readback": None,
                             "gpu_ready": True,
@@ -1189,7 +1198,12 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                         / f"tp_rank_{tp_rank}.json",
                     )
                     self._prebind_receiver_ready.set()
-                    return
+                    if not (
+                        self.persistent_channel
+                        and self.shadow_cutover_output_tokens == 0
+                    ):
+                        return
+                    last_migration_id = migration_id
                 except (
                     OSError,
                     KeyError,
