@@ -789,6 +789,7 @@ class GpuDirectHistorySender:
         if persistent_channel and not keep_open:
             raise ValueError("persistent GPU-direct history must keep channel open")
 
+        channel_setup_started = time.perf_counter()
         topology_key = "|".join(target_addresses)
         reuse_channel = persistent_channel and self.nccl is not None
         if reuse_channel:
@@ -857,6 +858,10 @@ class GpuDirectHistorySender:
                     )
                     self.lifecycle.mark_open()
 
+            channel_setup_ms = (
+                time.perf_counter() - channel_setup_started
+            ) * 1000
+            session_handshake_started = time.perf_counter()
             if persistent_channel:
                 assert request_id is not None
                 assert self.lifecycle is not None
@@ -887,6 +892,9 @@ class GpuDirectHistorySender:
                         expected=envelope,
                     )
 
+            session_handshake_ms = (
+                time.perf_counter() - session_handshake_started
+            ) * 1000
             started = time.perf_counter()
             block_index = torch.tensor(
                 block_ids, dtype=torch.long, device=self.device
@@ -959,8 +967,10 @@ class GpuDirectHistorySender:
                         ).copy_(flat)
                         offsets[rank] += flat.numel()
             producer_stream.synchronize()
+            pack_ms = (time.perf_counter() - started) * 1000
             if offsets != [rank_elements] * target_tp_size:
                 raise RuntimeError("GPU-direct packed history size differs")
+            receiver_ready_started = time.perf_counter()
             history_envelopes: dict[int, SessionEnvelope] = {}
             if persistent_channel:
                 assert history_end_token is not None
@@ -997,7 +1007,13 @@ class GpuDirectHistorySender:
                         expected_status="READY_TO_RECV",
                         expected=history_envelopes[rank],
                     )
+            receiver_ready_ms = (
+                time.perf_counter() - receiver_ready_started
+            ) * 1000
+            nccl_send_started = time.perf_counter()
             _send_group(nccl, comms, packed_by_rank, send_streams)
+            nccl_send_ms = (time.perf_counter() - nccl_send_started) * 1000
+            completion_ack_started = time.perf_counter()
             for rank, connection in enumerate(connections):
                 received = recv_json(connection)
                 if received.get("status") != "RECEIVED":
@@ -1028,6 +1044,9 @@ class GpuDirectHistorySender:
                             history_envelopes[rank].sequence_number
                         ),
                     )
+            completion_ack_ms = (
+                time.perf_counter() - completion_ack_started
+            ) * 1000
             elapsed_ms = (time.perf_counter() - started) * 1000
             bytes_by_rank = [
                 value.numel() * value.element_size()
@@ -1038,6 +1057,13 @@ class GpuDirectHistorySender:
                     "target_tp_rank": rank,
                     "raw_tensor_bytes": count,
                     "transfer_ms": elapsed_ms,
+                    "channel_reused": reuse_channel,
+                    "channel_setup_ms": channel_setup_ms,
+                    "session_handshake_ms": session_handshake_ms,
+                    "pack_ms": pack_ms,
+                    "receiver_ready_ms": receiver_ready_ms,
+                    "nccl_send_ms": nccl_send_ms,
+                    "completion_ack_ms": completion_ack_ms,
                     "channel_generation": (
                         self.channel_generation if persistent_channel else None
                     ),
