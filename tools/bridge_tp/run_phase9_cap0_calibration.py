@@ -293,6 +293,26 @@ def server_command(args: argparse.Namespace, tp: int, port: int) -> list[str]:
     ]
 
 
+def model_kv_geometry(model_path: Path, dtype: str) -> tuple[int, int]:
+    """Return TP1 KV heads and resident KV bytes per token from model config."""
+    model_config = read_json(model_path / "config.json")
+    kv_heads = int(
+        model_config.get("num_key_value_heads")
+        or model_config["num_attention_heads"]
+    )
+    layers = int(model_config["num_hidden_layers"])
+    head_dim = int(
+        model_config.get("head_dim")
+        or int(model_config["hidden_size"]) // int(model_config["num_attention_heads"])
+    )
+    dtype_bytes = {"float16": 2, "half": 2, "bfloat16": 2, "float32": 4}
+    if dtype not in dtype_bytes:
+        raise ValueError(f"unsupported KV dtype for geometry: {dtype}")
+    if kv_heads <= 0 or kv_heads % 4 or layers <= 0 or head_dim <= 0:
+        raise ValueError("model KV geometry is incompatible with TP4")
+    return kv_heads, 2 * layers * kv_heads * head_dim * dtype_bytes[dtype]
+
+
 def make_config(
     args: argparse.Namespace,
     controller_dir: Path,
@@ -309,6 +329,8 @@ def make_config(
     config["tp1_total_kv_blocks"] = args.tp1_blocks
     config["tp4_total_kv_blocks"] = args.tp4_blocks
     config["survival_table_path"] = str(args.survival_table.resolve())
+    _, kv_bytes_per_token = model_kv_geometry(args.model_path, args.dtype)
+    config["policy"]["kv_bytes_per_token"] = kv_bytes_per_token
     config["platform_note"] = (
         "CAP-0 ENGINEERING PILOT; automated 5x A100 PCIe calibration"
     )
@@ -409,6 +431,7 @@ def source_environment(
     # the surrounding batch/run ID is not part of the request ID when the
     # orchestrator uses the nested <label>/controller layout.
     source_request_id_prefix = f"bridgetp-phase9-{controller_dir.name}"
+    kv_heads, _ = model_kv_geometry(args.model_path, args.dtype)
     env = os.environ.copy()
     env.update(
         {
@@ -422,7 +445,7 @@ def source_environment(
             "BRIDGETP_STREAM_BASE_PORT": str(args.snapshot_port),
             "BRIDGETP_STREAM_TARGET_TP": "4",
             "BRIDGETP_STREAM_HEAD_AXIS": "3",
-            "BRIDGETP_STREAM_EXPECTED_KV_HEADS": "8",
+            "BRIDGETP_STREAM_EXPECTED_KV_HEADS": str(kv_heads),
             "BRIDGETP_STREAM_AFTER_OUTPUT_TOKENS": "128",
             "BRIDGETP_STREAM_CHUNK_BYTES": "1048576",
             "BRIDGETP_STREAM_RATE_GIB_S": "0.50",
