@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -30,6 +31,19 @@ from vllm.bridge_tp.logit_capture import (
     _resolve_target_request_id,
     token_ids_sha256,
 )
+
+
+def _streaming_connector_stub(connector_type):
+    """Initialize the state used by connector methods without starting workers."""
+    connector = object.__new__(connector_type)
+    connector.gpu_resident_shadow = False
+    connector.persistent_channel = False
+    connector._pending_requests = {}
+    connector._active_requests = {}
+    connector._model_wait_pending_requests = set()
+    connector._gpu_restore_quiescence_lock = threading.Lock()
+    connector._gpu_restore_quiescence = {}
+    return connector
 
 
 class TestRecordedDtypeUlp(unittest.TestCase):
@@ -247,7 +261,7 @@ class TestOptInConfiguration(unittest.TestCase):
     def test_streaming_connector_refuses_unmarked_target_recompute(self):
         from vllm.bridge_tp.streaming_connector import BridgeTPStreamingConnector
 
-        connector = object.__new__(BridgeTPStreamingConnector)
+        connector = _streaming_connector_stub(BridgeTPStreamingConnector)
         connector._manifest = {
             "migration_id": "migration",
             "all_known_token_ids": [1, 2, 3],
@@ -268,7 +282,7 @@ class TestOptInConfiguration(unittest.TestCase):
     ) -> None:
         from vllm.bridge_tp.streaming_connector import BridgeTPStreamingConnector
 
-        connector = object.__new__(BridgeTPStreamingConnector)
+        connector = _streaming_connector_stub(BridgeTPStreamingConnector)
         connector._manifest = None
         connector.manifest_path = Path("missing-staging-manifest.json")
         request = types.SimpleNamespace(
@@ -283,7 +297,7 @@ class TestOptInConfiguration(unittest.TestCase):
     def test_streaming_connector_rejects_wrong_migration_id(self):
         from vllm.bridge_tp.streaming_connector import BridgeTPStreamingConnector
 
-        connector = object.__new__(BridgeTPStreamingConnector)
+        connector = _streaming_connector_stub(BridgeTPStreamingConnector)
         connector._manifest = {
             "migration_id": "migration",
             "all_known_token_ids": [1, 2, 3],
@@ -303,7 +317,7 @@ class TestOptInConfiguration(unittest.TestCase):
         from vllm.bridge_tp.stream_protocol import MIGRATION_PARAM
         from vllm.bridge_tp.streaming_connector import BridgeTPStreamingConnector
 
-        connector = object.__new__(BridgeTPStreamingConnector)
+        connector = _streaming_connector_stub(BridgeTPStreamingConnector)
         connector._manifest = {
             "migration_id": "migration",
             "source_request_id": "source",
@@ -349,7 +363,7 @@ class TestOptInConfiguration(unittest.TestCase):
             BridgeTPStreamMetadata,
         )
 
-        connector = object.__new__(BridgeTPStreamingConnector)
+        connector = _streaming_connector_stub(BridgeTPStreamingConnector)
         connector._pending_requests = {}
         connector._model_wait_pending_requests = {"migrated"}
 
@@ -371,7 +385,7 @@ class TestOptInConfiguration(unittest.TestCase):
         )
         self.assertEqual(connector._model_wait_pending_requests, set())
 
-        worker = object.__new__(BridgeTPStreamingConnector)
+        worker = _streaming_connector_stub(BridgeTPStreamingConnector)
         worker._connector_metadata = BridgeTPStreamMetadata(
             model_wait_request_ids=["migrated"]
         )
@@ -383,7 +397,7 @@ class TestOptInConfiguration(unittest.TestCase):
     def test_streaming_connector_rejects_unexpected_extra_tail_blocks(self):
         from vllm.bridge_tp.streaming_connector import BridgeTPStreamingConnector
 
-        connector = object.__new__(BridgeTPStreamingConnector)
+        connector = _streaming_connector_stub(BridgeTPStreamingConnector)
         connector._manifest = {
             "num_blocks": 12,
             "block_size": 16,
