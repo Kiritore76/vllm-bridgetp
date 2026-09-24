@@ -559,6 +559,12 @@ def run(
                         channel_generation=int(
                             getattr(args, "channel_generation", 0)
                         ),
+                        preconnect_gpu_direct=bool(
+                            getattr(args, "preconnect_persistent_channel", False)
+                        ),
+                        gpu_direct_base_port=int(
+                            getattr(args, "gpu_direct_base_port", 0)
+                        ),
                     ),
                 ],
                 target_env,

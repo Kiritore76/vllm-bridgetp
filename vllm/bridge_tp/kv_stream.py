@@ -143,6 +143,39 @@ def _discard_persistent_gpu_sender(key: str, sender: Any) -> None:
 atexit.register(_abort_retained_gpu_senders)
 
 
+def preconnect_persistent_gpu_sender(device: torch.device) -> None:
+    """Open the topology channel before an anchor request starts decoding."""
+    if not _env_bool("BRIDGETP_GPU_DIRECT_PRECONNECT", False):
+        return
+    config = BridgeTPStreamConfig.from_env()
+    if not (config.enabled and config.persistent_channel and config.gpu_direct_history):
+        raise ValueError("GPU-direct preconnect requires persistent streaming")
+    key, sender = _acquire_persistent_gpu_sender(config, device)
+    try:
+        if sender.nccl is None:
+            sender.preconnect(
+                channel_generation=config.channel_generation,
+                target_addresses=[
+                    f"{config.gpu_direct_host}:{config.gpu_direct_base_port + rank}"
+                    for rank in range(config.target_tp_size)
+                ],
+            )
+        _atomic_json_dump(
+            {
+                "status": "CHANNEL_READY",
+                "channel_generation": config.channel_generation,
+                "target_tp_size": config.target_tp_size,
+                "completed_unix_s": sender.preconnect_completed_unix_s,
+            },
+            config.run_dir / "gpu_channel_preconnect_receipts" / "source.json",
+        )
+    except BaseException:
+        _discard_persistent_gpu_sender(key, sender)
+        raise
+    else:
+        _release_persistent_gpu_sender(key)
+
+
 def _env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
     if value is None:

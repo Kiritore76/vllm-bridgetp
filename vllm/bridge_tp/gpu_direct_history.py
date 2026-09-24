@@ -201,6 +201,7 @@ class GpuDirectHistoryReceiver:
         self.buffer_capacity_elements = 0
         self.buffer_high_water_bytes = 0
         self.last_session_payload_released_bytes = 0
+        self.allow_idle_wait = False
 
     def _open(self, *, migration_id: str, rank: int) -> None:
         if self.connection is not None:
@@ -256,6 +257,8 @@ class GpuDirectHistoryReceiver:
         if self.connection is None or self.lifecycle is None:
             raise RuntimeError("persistent GPU-direct channel is not open")
         message = recv_json(self.connection)
+        if self.allow_idle_wait:
+            self.connection.settimeout(_TIMEOUT_S)
         if message.get("op") != "START_SESSION":
             raise ProtocolViolation("expected START_SESSION")
         envelope = SessionEnvelope.from_wire(message)
@@ -490,6 +493,8 @@ class GpuDirectHistoryReceiver:
             self.last_session_payload_released_bytes = (
                 self.release_session_payload_buffer()
             )
+            if self.allow_idle_wait:
+                self.connection.settimeout(None)
             return None
         if header.get("op") == "CLOSE":
             self.terminal_close_received_unix_s = time.time()
@@ -735,6 +740,75 @@ class GpuDirectHistorySender:
         self.buffer_capacity_elements = 0
         self.buffer_high_water_bytes = 0
         self.last_session_payload_released_bytes = 0
+        self.preconnect_completed_unix_s: float | None = None
+
+    def preconnect(
+        self,
+        *,
+        channel_generation: int,
+        target_addresses: list[str],
+    ) -> None:
+        """Open a persistent topology channel without starting a KV session."""
+        if self.nccl is not None:
+            raise RuntimeError("GPU-direct sender channel is already open")
+        if not target_addresses or channel_generation < 0:
+            raise ValueError("invalid GPU-direct preconnect topology")
+        topology_key = "|".join(target_addresses)
+        nccl = NCCLLibrary()
+        connections: list[socket.socket] = []
+        comms: list[Any] = []
+        try:
+            for rank, address in enumerate(target_addresses):
+                connection = _connect(address)
+                connections.append(connection)
+                unique_id = nccl.ncclGetUniqueId()
+                send_json(
+                    connection,
+                    {
+                        "migration_id": "",
+                        "target_tp_rank": rank,
+                        "nccl_unique_id_b64": base64.b64encode(
+                            bytes(unique_id.internal)
+                        ).decode("ascii"),
+                        "persistent_channel": True,
+                        "channel_generation": channel_generation,
+                        "topology_key": topology_key,
+                    },
+                )
+                with torch.cuda.device(self.device):
+                    comm = nccl.ncclCommInitRank(2, unique_id, 0)
+                comms.append(comm)
+                ready = recv_json(connection)
+                if (
+                    ready.get("status") != "CHANNEL_READY"
+                    or int(ready.get("channel_generation", -1))
+                    != channel_generation
+                    or int(ready.get("target_tp_rank", -1)) != rank
+                ):
+                    raise ProtocolViolation(
+                        f"GPU-direct rank {rank} preconnect identity differs"
+                    )
+        except BaseException:
+            for comm in comms:
+                nccl.ncclCommDestroy(comm)
+            for connection in connections:
+                connection.close()
+            raise
+        self.nccl = nccl
+        self.connections = connections
+        self.comms = comms
+        self.target_tp_size = len(target_addresses)
+        self.target_addresses = tuple(target_addresses)
+        self.persistent_channel = True
+        self.channel_generation = channel_generation
+        self.topology_key = topology_key
+        self.lifecycle = PersistentChannelLifecycle(
+            topology_key=topology_key,
+            expected_ranks=frozenset(range(len(target_addresses))),
+            channel_generation=channel_generation,
+        )
+        self.lifecycle.mark_open()
+        self.preconnect_completed_unix_s = time.time()
 
     def _next_envelope(
         self,
@@ -1058,6 +1132,9 @@ class GpuDirectHistorySender:
                     "raw_tensor_bytes": count,
                     "transfer_ms": elapsed_ms,
                     "channel_reused": reuse_channel,
+                    "preconnect_completed_unix_s": (
+                        self.preconnect_completed_unix_s
+                    ),
                     "channel_setup_ms": channel_setup_ms,
                     "session_handshake_ms": session_handshake_ms,
                     "pack_ms": pack_ms,
