@@ -38,6 +38,7 @@ def _streaming_connector_stub(connector_type):
     connector = object.__new__(connector_type)
     connector.gpu_resident_shadow = False
     connector.persistent_channel = False
+    connector.preconnect_gpu_direct = False
     connector._pending_requests = {}
     connector._active_requests = {}
     connector._model_wait_pending_requests = set()

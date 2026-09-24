@@ -252,6 +252,8 @@ class TestGpuDirectHistoryLifecycle(unittest.TestCase):
         sender._active_request_id = "request-1"
         sender._next_sequence_by_rank = {0: 0, 1: 0}
         sender.connections = [Mock(), Mock()]
+        sender._packed_buffers = []
+        sender.buffer_capacity_elements = 0
 
         acknowledgements = [
             {
@@ -325,6 +327,9 @@ class TestGpuDirectHistoryLifecycle(unittest.TestCase):
             )
         receiver._active_request_id = "request-1"
         receiver._last_delta_envelope = None
+        receiver._packed_buffer = None
+        receiver.buffer_capacity_elements = 0
+        receiver.allow_idle_wait = False
         terminal = {
             "op": "END_SESSION",
             **SessionEnvelope(
@@ -413,6 +418,11 @@ class TestGpuDirectHistoryLifecycle(unittest.TestCase):
         connector._retained_gpu_receivers_lock = threading.Lock()
         connector._persistent_gpu_receiver = None
         connector._persistent_gpu_receiver_lock = threading.Lock()
+        connector._prebind_receiver_stop = threading.Event()
+        connector._prebound_gpu_history = None
+        connector._prebound_gpu_history_lock = threading.Lock()
+        connector._prebound_gpu_receiver = None
+        connector._prebound_gpu_receiver_lock = threading.Lock()
         receiver = Mock()
         with tempfile.TemporaryDirectory() as directory:
             connector.manifest_path = Path(directory) / "manifest.json"
@@ -447,6 +457,7 @@ class TestGpuDirectHistoryLifecycle(unittest.TestCase):
 
         connector = object.__new__(BridgeTPStreamingConnector)
         receiver = SimpleNamespace(
+            device="cuda:0",
             lifecycle=SimpleNamespace(
                 state=ChannelState.IDLE,
                 channel_generation=5,
@@ -459,13 +470,18 @@ class TestGpuDirectHistoryLifecycle(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             connector.manifest_path = Path(directory) / "manifest.json"
-            connector._record_persistent_receiver_idle(
-                receiver,
-                target_request_id="target-request-2",
-                session_request_id="source-request-2",
-                migration_id="migration-2",
-                tp_rank=3,
-            )
+            with (
+                patch("torch.cuda.device", return_value=nullcontext()),
+                patch("torch.cuda.memory_allocated", return_value=0),
+                patch("torch.cuda.memory_reserved", return_value=0),
+            ):
+                connector._record_persistent_receiver_idle(
+                    receiver,
+                    target_request_id="target-request-2",
+                    session_request_id="source-request-2",
+                    migration_id="migration-2",
+                    tp_rank=3,
+                )
             receipt = json.loads(
                 (
                     Path(directory)
