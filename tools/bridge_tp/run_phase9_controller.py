@@ -575,9 +575,16 @@ def step_shadow(
                 raise RuntimeError("earliest-ready cutover needs source max_tokens")
             # TP4 needs a concrete prefix length before it can allocate KV
             # blocks and turn buffered history into exact resident evidence.
-            # Reserve three blocks for target admission and exact readback,
-            # then one block for publishing the source freeze boundary.
-            candidate_lead_tokens = 64
+            # Allow more time when source generation has built a large delta
+            # backlog during a throttled history transfer. This estimate does
+            # not prove catch-up; the exact rank watermarks gate selection.
+            initial_end = int(
+                load_json(adapter.run_dir / "session_manifest.json")[
+                    "num_computed_tokens"
+                ]
+            )
+            outstanding_tokens = max(0, request.computed_tokens - initial_end)
+            candidate_lead_tokens = max(64, outstanding_tokens + 16)
             candidate = max(
                 int(request.output_tokens) + candidate_lead_tokens,
                 int(record.trigger_output_tokens or 0) + 1,
@@ -594,6 +601,7 @@ def step_shadow(
                         "migration_id": record.migration_id,
                         "cutover_output_tokens": candidate,
                         "buffered_output_tokens": request.output_tokens,
+                        "outstanding_delta_tokens": outstanding_tokens,
                         "published_unix_s": time.time(),
                     },
                     adapter.run_dir / "earliest_ready_candidate.json",
@@ -606,6 +614,7 @@ def step_shadow(
                         "cutover_output_tokens": candidate,
                         "buffered_output_tokens": request.output_tokens,
                         "candidate_lead_tokens": candidate - request.output_tokens,
+                        "outstanding_delta_tokens": outstanding_tokens,
                         "ranks": sorted(ranks),
                         "detail": detail,
                     }
@@ -632,24 +641,56 @@ def step_shadow(
                     f"candidate={candidate}"
                 )
             else:
-                if not dry_run:
-                    adapter.set_cutover(
-                        candidate,
-                        note="earliest-ready: four initial GPU-history receipts exact",
-                    )
-                record.cutover_output_tokens = candidate
+                progress_ready, progress, progress_detail = (
+                    adapter.poll_delta_gpu_resident_progress()
+                )
+                delta_lag_tokens = (
+                    max(0, request.computed_tokens - min(progress.values()))
+                    if progress_ready else None
+                )
                 audit.write(
                     {
-                        "kind": "earliest_ready_cutover_selected",
-                        "cutover_output_tokens": candidate,
-                        "selection_output_tokens": request.output_tokens,
-                        "safety_lead_tokens": candidate - request.output_tokens,
-                        "safe_watermark_output_tokens": candidate,
-                        "safe_watermark_lead_tokens": safe_watermark_lead_tokens,
-                        "ranks": sorted(ranks),
-                        "detail": detail,
+                        "kind": "earliest_ready_delta_progress",
+                        "observed_output_tokens": request.output_tokens,
+                        "rank_gpu_resident_end_tokens": progress,
+                        "delta_lag_tokens": delta_lag_tokens,
+                        "maximum_delta_lag_tokens": 16,
+                        "detail": progress_detail,
                     }
                 )
+                if delta_lag_tokens is None or delta_lag_tokens > 16:
+                    if request.output_tokens + 16 >= candidate:
+                        late_candidate_reason = (
+                            "delta did not catch up before the candidate's "
+                            f"safe publication point: output={request.output_tokens}, "
+                            f"candidate={candidate}, lag={delta_lag_tokens}"
+                        )
+                    # Continue decoding the source while the four ranks catch up.
+                    # The already admitted target owns this fixed candidate.
+                else:
+                    if not dry_run:
+                        adapter.set_cutover(
+                            candidate,
+                            note=(
+                                "earliest-ready: four initial GPU-history "
+                                "receipts exact"
+                            ),
+                        )
+                    record.cutover_output_tokens = candidate
+                    audit.write(
+                        {
+                            "kind": "earliest_ready_cutover_selected",
+                            "cutover_output_tokens": candidate,
+                            "selection_output_tokens": request.output_tokens,
+                            "safety_lead_tokens": candidate - request.output_tokens,
+                            "safe_watermark_output_tokens": candidate,
+                            "safe_watermark_lead_tokens": safe_watermark_lead_tokens,
+                            "delta_lag_tokens": delta_lag_tokens,
+                            "rank_gpu_resident_end_tokens": progress,
+                            "ranks": sorted(ranks),
+                            "detail": detail,
+                        }
+                    )
         elif request.output_tokens + 16 > candidate:
             late_candidate_reason = (
                 "initial history was not resident before the candidate's "

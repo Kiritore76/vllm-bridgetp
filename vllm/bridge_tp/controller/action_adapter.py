@@ -372,6 +372,62 @@ class ActionAdapter:
             else f"{len(ready)}/4 ranks initial history GPU-ready",
         )
 
+    def poll_delta_gpu_resident_progress(
+        self,
+    ) -> tuple[bool, dict[int, int], str]:
+        """Read each rank's exact GPU-resident delta watermark.
+
+        The initial history receipt is the baseline until that rank applies its
+        first delta. A STREAMING watermark is published only after delta
+        injection and exact readback, before the transport ACK is sent.
+        """
+        binding = self.refresh_binding()
+        if binding is None:
+            return False, {}, "session manifest not created yet"
+        progress: dict[int, int] = {}
+        for rank in range(4):
+            initial_path = (
+                self.run_dir / "gpu_initial_receipts" / f"tp_rank_{rank}.json"
+            )
+            try:
+                initial = json.loads(initial_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return False, progress, f"rank {rank} initial receipt unavailable"
+            if (
+                initial.get("migration_id") != binding.migration_id
+                or initial.get("status") != "INITIAL_HISTORY_GPU_RESIDENT"
+                or initial.get("exact_readback") is not True
+            ):
+                return False, progress, f"rank {rank} initial history not exact"
+            try:
+                initial_end = int(initial["end_token"])
+            except (KeyError, TypeError, ValueError):
+                return False, progress, f"rank {rank} initial end token missing"
+            watermark_path = (
+                self.run_dir / "gpu_watermarks" / f"tp_rank_{rank}.json"
+            )
+            try:
+                watermark = json.loads(watermark_path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                progress[rank] = initial_end
+                continue
+            except (OSError, json.JSONDecodeError):
+                return False, progress, f"rank {rank} delta watermark unreadable"
+            if (
+                watermark.get("migration_id") != binding.migration_id
+                or watermark.get("status") != "STREAMING"
+                or watermark.get("exact_readback") is not True
+            ):
+                return False, progress, f"rank {rank} delta watermark not exact"
+            try:
+                end_token = int(watermark["end_token"])
+            except (KeyError, TypeError, ValueError):
+                return False, progress, f"rank {rank} delta end token missing"
+            if end_token < initial_end:
+                return False, progress, f"rank {rank} delta watermark regressed"
+            progress[rank] = end_token
+        return True, progress, "all four exact GPU-resident watermarks available"
+
     def poll_target_ready(self) -> tuple[bool, set[int], str]:
         """Mirror the server's ``_validate_target_ready`` gate.
 

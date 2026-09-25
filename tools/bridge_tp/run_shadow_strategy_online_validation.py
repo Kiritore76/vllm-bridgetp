@@ -1456,6 +1456,11 @@ def accept_online(
         for row in audit
         if row.get("kind") == "earliest_ready_cutover_selected"
     ]
+    earliest_ready_candidates = [
+        row
+        for row in audit
+        if row.get("kind") == "earliest_ready_candidate_published"
+    ]
     end_rows = [row for row in audit if row.get("kind") == "run_end"]
     transitions = [row.get("to") for row in audit if row.get("kind") == "transition"]
     receipts, receipt_errors = rescue.receipt_evidence(controller_dir)
@@ -1656,6 +1661,14 @@ def accept_online(
             cutover["cutover_num_output_tokens"]
         ):
             errors.append("selected earliest-ready boundary differs from source freeze")
+        if earliest_ready_selected:
+            selected = earliest_ready_selected[0]
+            lag = selected.get("delta_lag_tokens")
+            progress = selected.get("rank_gpu_resident_end_tokens")
+            if not isinstance(lag, int) or lag > 16:
+                errors.append("earliest-ready selected with excessive delta lag")
+            if not isinstance(progress, dict) or len(progress) != 4:
+                errors.append("earliest-ready lacks four-rank delta progress")
     history_completed = [
         float(row.get("completed_unix_s", float("inf")))
         for row in initial_stage_receipts
@@ -2236,6 +2249,21 @@ def accept_online(
         ),
         "earliest_ready_selection_unix_s": (
             earliest_ready_selected[0].get("unix_s")
+            if earliest_ready_selected
+            else None
+        ),
+        "earliest_ready_candidate_outstanding_delta_tokens": (
+            earliest_ready_candidates[0].get("outstanding_delta_tokens")
+            if earliest_ready_candidates
+            else None
+        ),
+        "earliest_ready_selection_delta_lag_tokens": (
+            earliest_ready_selected[0].get("delta_lag_tokens")
+            if earliest_ready_selected
+            else None
+        ),
+        "earliest_ready_selection_rank_gpu_resident_end_tokens": (
+            earliest_ready_selected[0].get("rank_gpu_resident_end_tokens")
             if earliest_ready_selected
             else None
         ),
