@@ -2330,8 +2330,11 @@ def accept_online(
         "gpu_direct_history": gpu_direct_history,
         "gpu_direct_history_pacing": gpu_direct_history_pacing_expected,
         "gpu_direct_history_pacing_evidence": (
-            direct_sender.get("ranks", [{}])[0].get("history_pacing_chunks")
-            if gpu_direct_history_pacing_expected else None
+            next(iter(direct_sender.get("ranks", [])), {}).get(
+                "history_pacing_chunks"
+            )
+            if gpu_direct_history_pacing_expected
+            else None
         ),
         "gpu_direct_delta": gpu_direct_delta,
         "persistent_channel": persistent_channel,

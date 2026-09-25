@@ -1251,7 +1251,9 @@ class GpuDirectHistorySender:
                             - send_ms / 1000,
                         )
                         if sleep_s:
+                            sleep_started = time.perf_counter()
                             time.sleep(sleep_s)
+                            sleep_s = time.perf_counter() - sleep_started
                     pacing_chunks.append(
                         {
                             "aggregate_bytes": chunk_bytes,
