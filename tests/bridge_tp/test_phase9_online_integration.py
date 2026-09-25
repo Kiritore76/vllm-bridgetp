@@ -722,7 +722,12 @@ class TestLazyActionBinding(unittest.TestCase):
             run_dir = Path(temporary)
             (run_dir / "session_manifest.json").write_text(
                 json.dumps(
-                    {"migration_id": "m", "session_token": "s", "source_request_id": "r"}
+                    {
+                        "migration_id": "m",
+                        "session_token": "s",
+                        "source_request_id": "r",
+                        "num_computed_tokens": 2111,
+                    }
                 ),
                 encoding="utf-8",
             )
@@ -778,11 +783,47 @@ class TestLazyActionBinding(unittest.TestCase):
                             "migration_id": "m",
                             "status": "INITIAL_HISTORY_GPU_RESIDENT",
                             "exact_readback": True,
+                            "end_token": 2111,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            watermark_dir = run_dir / "gpu_watermarks"
+            watermark_dir.mkdir()
+            for rank in range(4):
+                (watermark_dir / f"tp_rank_{rank}.json").write_text(
+                    json.dumps(
+                        {
+                            "migration_id": "m",
+                            "status": "STREAMING",
+                            "exact_readback": True,
+                            "end_token": 2120 if rank == 3 else 2130,
                         }
                     ),
                     encoding="utf-8",
                 )
             tick(121)
+            self.assertIsNone(record.cutover_output_tokens)
+            self.assertTrue(
+                any(
+                    row.get("kind") == "earliest_ready_delta_progress"
+                    and row.get("delta_lag_tokens") == 48
+                    for row in audit.records
+                )
+            )
+            for rank in range(4):
+                (watermark_dir / f"tp_rank_{rank}.json").write_text(
+                    json.dumps(
+                        {
+                            "migration_id": "m",
+                            "status": "STREAMING",
+                            "exact_readback": True,
+                            "end_token": 2170,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            tick(130)
             self.assertEqual(record.cutover_output_tokens, 169)
             self.assertEqual(
                 json.loads((run_dir / "runtime_control.json").read_text())[
@@ -796,6 +837,72 @@ class TestLazyActionBinding(unittest.TestCase):
                     for row in audit.records
                 )
             )
+
+    def test_earliest_ready_delayed_history_extends_candidate(self) -> None:
+        class Policy:
+            cfg = types.SimpleNamespace(max_target_kv_usage_frac=0.85)
+
+            @staticmethod
+            def migration_bytes(_request) -> int:
+                return 1024
+
+        class Rate:
+            rate_bytes_s = 1024.0
+            rate_gib_s = 0.5
+            last_reason = "test"
+
+            @staticmethod
+            def step(*_args, **_kwargs) -> float:
+                return 1024.0
+
+        class Audit:
+            def __init__(self) -> None:
+                self.records: list[dict] = []
+
+            def write(self, value: dict) -> None:
+                self.records.append(value)
+
+        class Adapter:
+            def __init__(self, run_dir: Path) -> None:
+                self.run_dir = run_dir
+
+            @staticmethod
+            def set_rate(_rate: float, note: str) -> None:
+                del note
+
+            @staticmethod
+            def poll_initial_history_gpu_buffered():
+                return True, {0, 1, 2, 3}, "history GPU-buffered"
+
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            (run_dir / "session_manifest.json").write_text(
+                json.dumps({"num_computed_tokens": 2111}), encoding="utf-8"
+            )
+            audit = Audit()
+            machine = MigrationStateMachine(audit_sink=audit.write)
+            record = machine.create("m", "r")
+            record.trigger_output_tokens = 64
+            record.trigger_path = TriggerPath.DIAGNOSTIC_FIXED_BOUNDARY
+            machine.transition("m", MigrationState.SHADOW, 1.0, "test")
+            step_shadow(
+                Policy(), machine, Adapter(run_dir), audit, record,
+                SourceRequestView(
+                    request_id="r", prompt_tokens=2048, output_tokens=220,
+                    computed_tokens=2267, pending_tokens=1,
+                    arrival_unix_s=0.0, last_token_unix_s=1.0,
+                ),
+                object(), types.SimpleNamespace(kv_usage_frac=0.0, p99_tpot_s=0.02),
+                0.0, Rate(), 2.0, False,
+                ProxyRecorder("external", ProxyMode.HOLD_BACK),
+                diagnostic_earliest_ready_cutover=True, max_tokens=1024,
+            )
+            candidate = json.loads(
+                (run_dir / "earliest_ready_candidate.json").read_text()
+            )
+            self.assertEqual(candidate["outstanding_delta_tokens"], 156)
+            self.assertEqual(candidate["cutover_output_tokens"], 392)
+            self.assertIsNone(record.cutover_output_tokens)
 
     def test_earliest_ready_does_not_freeze_after_candidate_becomes_late(self) -> None:
         class Policy:
@@ -815,14 +922,18 @@ class TestLazyActionBinding(unittest.TestCase):
                 return 1024.0
 
         class Adapter:
-            def __init__(self) -> None:
+            def __init__(self, run_dir: Path) -> None:
+                self.run_dir = run_dir
                 self.actions: list[str] = []
 
             def set_rate(self, _rate: float, note: str) -> None:
                 del note
 
             def poll_initial_history_gpu_ready(self):
-                return False, set(), "target still restoring"
+                return True, {0, 1, 2, 3}, "history resident"
+
+            def poll_delta_gpu_resident_progress(self):
+                return True, {rank: 2111 for rank in range(4)}, "delta behind"
 
             def disarm(self, _reason: str) -> None:
                 self.actions.append("disarm")
@@ -849,12 +960,14 @@ class TestLazyActionBinding(unittest.TestCase):
         record.trigger_output_tokens = 64
         record.candidate_cutover_output_tokens = 169
         machine.transition("m", MigrationState.SHADOW, 1.0, "test")
-        adapter = Adapter()
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        adapter = Adapter(Path(temporary.name))
         step_shadow(
             Policy(), machine, adapter, Audit(), record,
             SourceRequestView(
-                request_id="r", prompt_tokens=2048, output_tokens=154,
-                computed_tokens=2201, pending_tokens=1,
+                request_id="r", prompt_tokens=2048, output_tokens=153,
+                computed_tokens=2200, pending_tokens=1,
                 arrival_unix_s=0.0, last_token_unix_s=1.0,
             ),
             object(), types.SimpleNamespace(kv_usage_frac=0.0, p99_tpot_s=0.02),
@@ -960,6 +1073,9 @@ class TestRunnerTransitions(unittest.TestCase):
                 raise AssertionError("diagnostic path must not re-enter policy")
 
         class Adapter:
+            def __init__(self, run_dir: Path) -> None:
+                self.run_dir = run_dir
+
             @staticmethod
             def set_rate(_rate: float, note: str) -> None:
                 del note
@@ -983,10 +1099,12 @@ class TestRunnerTransitions(unittest.TestCase):
         record = machine.create("migration", "request")
         record.trigger_path = TriggerPath.DIAGNOSTIC_FIXED_BOUNDARY
         machine.transition("migration", MigrationState.SHADOW, 1.0, "test")
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
         step_shadow(
             Policy(),
             machine,
-            Adapter(),
+            Adapter(Path(temporary.name)),
             Audit(),
             record,
             SourceRequestView(
@@ -1024,7 +1142,8 @@ class TestRunnerTransitions(unittest.TestCase):
                 self.records.append(value)
 
         class Adapter:
-            def __init__(self) -> None:
+            def __init__(self, run_dir: Path) -> None:
+                self.run_dir = run_dir
                 self.actions: list[str] = []
 
             def set_rate(self, _rate: float, note: str) -> None:
@@ -1059,7 +1178,9 @@ class TestRunnerTransitions(unittest.TestCase):
         record = machine.create("migration", "request")
         record.trigger_path = TriggerPath.CAPACITY_PILOT
         machine.transition("migration", MigrationState.SHADOW, 1.0, "test")
-        adapter = Adapter()
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        adapter = Adapter(Path(temporary.name))
         recorder = ProxyRecorder("external", ProxyMode.HOLD_BACK)
         request = SourceRequestView(
             request_id="request",
