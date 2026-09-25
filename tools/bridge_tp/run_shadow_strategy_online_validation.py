@@ -97,6 +97,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--gpu-direct-base-port", type=int, default=30400)
     parser.add_argument(
+        "--gpu-direct-history-pacing",
+        action="store_true",
+        help="pace 16 MiB aggregate NCCL history chunks with background sleeps",
+    )
+    parser.add_argument(
         "--gpu-direct-delta",
         action="store_true",
         help="stream batched Shadow deltas over the retained NCCL session",
@@ -321,6 +326,15 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise ValueError("GPU-direct history requires --gpu-resident-shadow")
     if args.gpu_direct_delta and not args.gpu_direct_history:
         raise ValueError("GPU-direct delta requires --gpu-direct-history")
+    if args.gpu_direct_history_pacing and not (
+        args.gpu_direct_history and args.persistent_channel
+        and args.fixed_rate_gib_s is not None
+        and args.fixed_rate_gib_s > 0
+    ):
+        raise ValueError(
+            "GPU-direct history pacing needs a persistent channel and "
+            "a positive fixed migration rate"
+        )
     if args.gpu_direct_delta and not args.shadow_only_only:
         raise ValueError("GPU-direct delta batch sweep currently requires Shadow-only")
     if args.persistent_channel and not (
@@ -1352,6 +1366,7 @@ def accept_online(
     strategy: str,
     minimum_window_samples: int,
     fixed_rate_gib_s: float | None = None,
+    gpu_direct_history_pacing_expected: bool = False,
     handoff_mode: str = "bridge",
     require_remote_attention: bool = False,
     slo_tpot_ms: float = 50.0,
@@ -1703,6 +1718,33 @@ def accept_online(
         else:
             direct_sender = common.read_json(direct_sender_path)
             direct_ranks = direct_sender.get("ranks", [])
+            if gpu_direct_history_pacing_expected:
+                paced = direct_ranks[0] if direct_ranks else {}
+                chunks = paced.get("history_pacing_chunks", [])
+                if (
+                    len(direct_ranks) != 4
+                    or any(row.get("history_pacing_enabled") is not True
+                           for row in direct_ranks)
+                    or len(chunks) < 2
+                    or len(chunks) != paced.get("history_pacing_chunk_count")
+                    or float(paced.get("history_pacing_sleep_ms") or 0) <= 0
+                    or any(
+                        abs(float(row.get("requested_rate_gib_s", 0))
+                            - float(fixed_rate_gib_s or 0)) > 1e-9
+                        for row in chunks
+                    )
+                ):
+                    errors.append("GPU-direct history pacing was not applied")
+                else:
+                    total_bytes = sum(int(row.get("raw_tensor_bytes", 0))
+                                      for row in direct_ranks)
+                    burst_bytes = int(chunks[-1].get("aggregate_bytes", 0))
+                    minimum_ms = (
+                        (total_bytes - burst_bytes)
+                        / (float(fixed_rate_gib_s) * 1024**3) * 1000
+                    )
+                    if float(paced.get("history_pacing_span_ms", 0)) < minimum_ms * 0.98:
+                        errors.append("GPU-direct history pacing span is too short")
             if (
                 direct_sender.get("status") != "READY"
                 or len(direct_ranks) != 4
@@ -2286,6 +2328,11 @@ def accept_online(
         "history_gpu_ready_before_freeze_ms": history_gpu_ready_before_freeze_ms,
         "gpu_resident_shadow": gpu_resident_shadow,
         "gpu_direct_history": gpu_direct_history,
+        "gpu_direct_history_pacing": gpu_direct_history_pacing_expected,
+        "gpu_direct_history_pacing_evidence": (
+            direct_sender.get("ranks", [{}])[0].get("history_pacing_chunks")
+            if gpu_direct_history_pacing_expected else None
+        ),
         "gpu_direct_delta": gpu_direct_delta,
         "persistent_channel": persistent_channel,
         "channel_generation": direct_sender.get("channel_generation"),
@@ -2651,6 +2698,7 @@ def main() -> None:
         "stop_and_copy_only": args.stop_and_copy_only,
         "gpu_resident_shadow": args.gpu_resident_shadow,
         "gpu_direct_history": args.gpu_direct_history,
+        "gpu_direct_history_pacing": args.gpu_direct_history_pacing,
         "gpu_direct_delta": args.gpu_direct_delta,
         "persistent_channel": args.persistent_channel,
         "preconnect_persistent_channel": args.preconnect_persistent_channel,
@@ -2872,6 +2920,9 @@ def main() -> None:
                         strategy=selected,
                         minimum_window_samples=args.minimum_window_samples,
                         fixed_rate_gib_s=args.fixed_rate_gib_s,
+                        gpu_direct_history_pacing_expected=(
+                            args.gpu_direct_history_pacing
+                        ),
                         handoff_mode=selected_handoff,
                         require_remote_attention=selected_remote,
                         slo_tpot_ms=args.slo_tpot_ms,
@@ -2938,6 +2989,10 @@ def main() -> None:
                     source_env_overrides["BRIDGETP_STREAM_RATE_GIB_S"] = str(
                         args.fixed_rate_gib_s
                     )
+                if args.gpu_direct_history_pacing:
+                    source_env_overrides[
+                        "BRIDGETP_GPU_DIRECT_HISTORY_PACING"
+                    ] = "1"
 
                 controller_extra_args = [
                     "--diagnostic-trigger-output-tokens",
