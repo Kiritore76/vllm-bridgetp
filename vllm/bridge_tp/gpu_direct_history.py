@@ -38,6 +38,7 @@ TRANSPORT = "NCCL_P2P_GPU_DIRECT"
 INTEGRITY = "NCCL_COMPLETION_PLUS_GPU_EXACT_READBACK"
 _TIMEOUT_S = 600.0
 _WARMUP_ELEMENTS = 256
+_HISTORY_PACING_CHUNK_BYTES = 16 * 1024 * 1024
 
 
 def _session_message(
@@ -340,6 +341,7 @@ class GpuDirectHistoryReceiver:
         tensor_key: str,
         synchronize: bool,
         envelope: SessionEnvelope | None = None,
+        history_chunk_elements: int | None = None,
     ) -> tuple[torch.Tensor, float, torch.cuda.Event]:
         if self.connection is None or self.nccl is None:
             raise RuntimeError("GPU-direct receiver is not connected")
@@ -377,7 +379,18 @@ class GpuDirectHistoryReceiver:
             ready.update(_ack_envelope(envelope).to_wire())
         send_json(self.connection, ready)
         started = time.perf_counter()
-        receive_done = _recv_tensor(self.nccl, self.comm, packed, self.stream)
+        if history_chunk_elements is None:
+            receive_done = _recv_tensor(self.nccl, self.comm, packed, self.stream)
+        else:
+            if not 0 < history_chunk_elements <= packed.numel():
+                raise ProtocolViolation("invalid GPU-direct history chunk size")
+            receive_done = None
+            for offset in range(0, packed.numel(), history_chunk_elements):
+                chunk = packed.narrow(
+                    0, offset, min(history_chunk_elements, packed.numel() - offset)
+                )
+                receive_done = _recv_tensor(self.nccl, self.comm, chunk, self.stream)
+            assert receive_done is not None
         if synchronize:
             receive_done.synchronize()
         return (
@@ -437,6 +450,13 @@ class GpuDirectHistoryReceiver:
                 assert self.lifecycle is not None
                 assert self.lifecycle.active_session is not None
                 self.lifecycle.active_session.accept_inbound(history_envelope)
+                history_chunk_elements = history_message.get("history_chunk_elements")
+                if history_chunk_elements is not None:
+                    if not isinstance(history_chunk_elements, int):
+                        raise ProtocolViolation("history chunk size must be an integer")
+                    history_chunk_elements = int(history_chunk_elements)
+            else:
+                history_chunk_elements = None
             if not layer_records:
                 raise ValueError("GPU-direct history has no layer records")
             dtype_names = {
@@ -456,6 +476,7 @@ class GpuDirectHistoryReceiver:
                 tensor_key=tensor_id(migration_id, rank, 0),
                 synchronize=synchronize,
                 envelope=history_envelope,
+                history_chunk_elements=history_chunk_elements,
             )
             assert self.connection is not None
             if history_envelope is None:
@@ -944,6 +965,8 @@ class GpuDirectHistorySender:
         target_tp_size: int,
         target_addresses: list[str],
         keep_open: bool = False,
+        history_pacing: bool = False,
+        history_rate_provider: Callable[[], float] | None = None,
     ) -> list[dict[str, Any]]:
         if len(kv_caches) != len(layer_names):
             raise ValueError("KV cache and layer-name counts differ")
@@ -957,6 +980,10 @@ class GpuDirectHistorySender:
             )
         if persistent_channel and not keep_open:
             raise ValueError("persistent GPU-direct history must keep channel open")
+        if history_pacing and (not persistent_channel or history_rate_provider is None):
+            raise ValueError(
+                "paced GPU-direct history needs a persistent channel and rate"
+            )
 
         channel_setup_started = time.perf_counter()
         topology_key = "|".join(target_addresses)
@@ -1139,6 +1166,18 @@ class GpuDirectHistorySender:
             pack_ms = (time.perf_counter() - started) * 1000
             if offsets != [rank_elements] * target_tp_size:
                 raise RuntimeError("GPU-direct packed history size differs")
+            chunk_elements = (
+                min(
+                    rank_elements,
+                    max(
+                        1,
+                        _HISTORY_PACING_CHUNK_BYTES
+                        // (target_tp_size * packed_by_rank[0].element_size()),
+                    ),
+                )
+                if history_pacing
+                else None
+            )
             receiver_ready_started = time.perf_counter()
             history_envelopes: dict[int, SessionEnvelope] = {}
             if persistent_channel:
@@ -1157,10 +1196,10 @@ class GpuDirectHistorySender:
                         rank=rank,
                         sequence_number=envelope.sequence_number,
                     )
-                    send_json(
-                        connection,
-                        _session_message("HISTORY", envelope),
-                    )
+                    message = _session_message("HISTORY", envelope)
+                    if chunk_elements is not None:
+                        message["history_chunk_elements"] = chunk_elements
+                    send_json(connection, message)
             for rank, connection in enumerate(connections):
                 ready = recv_json(connection)
                 if (
@@ -1180,8 +1219,50 @@ class GpuDirectHistorySender:
                 time.perf_counter() - receiver_ready_started
             ) * 1000
             nccl_send_started = time.perf_counter()
-            _send_group(nccl, comms, packed_by_rank, send_streams)
-            nccl_send_ms = (time.perf_counter() - nccl_send_started) * 1000
+            pacing_chunks: list[dict[str, Any]] = []
+            if chunk_elements is None:
+                _send_group(nccl, comms, packed_by_rank, send_streams)
+                nccl_send_ms = (time.perf_counter() - nccl_send_started) * 1000
+            else:
+                nccl_send_ms = 0.0
+                for offset in range(0, rank_elements, chunk_elements):
+                    length = min(chunk_elements, rank_elements - offset)
+                    chunk_bytes = (
+                        length * packed_by_rank[0].element_size() * target_tp_size
+                    )
+                    rate_gib_s = float(history_rate_provider())
+                    if rate_gib_s <= 0:
+                        raise ValueError(
+                            "GPU-direct history pacing rate must be positive"
+                        )
+                    chunk_started = time.perf_counter()
+                    _send_group(
+                        nccl,
+                        comms,
+                        [value.narrow(0, offset, length) for value in packed_by_rank],
+                        send_streams,
+                    )
+                    send_ms = (time.perf_counter() - chunk_started) * 1000
+                    nccl_send_ms += send_ms
+                    sleep_s = 0.0
+                    if offset + length < rank_elements:
+                        sleep_s = max(
+                            0.0, chunk_bytes / (rate_gib_s * 1024**3)
+                            - send_ms / 1000,
+                        )
+                        if sleep_s:
+                            time.sleep(sleep_s)
+                    pacing_chunks.append(
+                        {
+                            "aggregate_bytes": chunk_bytes,
+                            "requested_rate_gib_s": rate_gib_s,
+                            "send_ms": send_ms,
+                            "sleep_ms": sleep_s * 1000,
+                        }
+                    )
+            history_pacing_span_ms = (
+                time.perf_counter() - nccl_send_started
+            ) * 1000
             completion_ack_started = time.perf_counter()
             for rank, connection in enumerate(connections):
                 received = recv_json(connection)
@@ -1236,6 +1317,21 @@ class GpuDirectHistorySender:
                     "pack_ms": pack_ms,
                     "receiver_ready_ms": receiver_ready_ms,
                     "nccl_send_ms": nccl_send_ms,
+                    "history_pacing_enabled": history_pacing,
+                    "history_pacing_chunk_bytes": (
+                        _HISTORY_PACING_CHUNK_BYTES if history_pacing else None
+                    ),
+                    "history_pacing_chunk_count": len(pacing_chunks),
+                    "history_pacing_sleep_ms": sum(
+                        row["sleep_ms"] for row in pacing_chunks
+                    ),
+                    "history_pacing_span_ms": history_pacing_span_ms,
+                    "history_pacing_observed_gib_s": (
+                        sum(bytes_by_rank) / 1024**3
+                        / (history_pacing_span_ms / 1000)
+                        if history_pacing_span_ms > 0 else None
+                    ),
+                    "history_pacing_chunks": pacing_chunks,
                     "completion_ack_ms": completion_ack_ms,
                     "channel_generation": (
                         self.channel_generation if persistent_channel else None

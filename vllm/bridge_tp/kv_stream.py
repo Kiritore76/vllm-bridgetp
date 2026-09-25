@@ -216,6 +216,7 @@ class BridgeTPStreamConfig:
     pin_memory: bool
     strict: bool
     gpu_direct_history: bool
+    gpu_direct_history_pacing: bool
     gpu_direct_delta: bool
     gpu_direct_delta_batch_tokens: int
     gpu_direct_delta_flush_ms: float
@@ -282,6 +283,9 @@ class BridgeTPStreamConfig:
             gpu_direct_history=_env_bool(
                 "BRIDGETP_GPU_DIRECT_HISTORY", False
             ),
+            gpu_direct_history_pacing=_env_bool(
+                "BRIDGETP_GPU_DIRECT_HISTORY_PACING", False
+            ),
             gpu_direct_delta=_env_bool("BRIDGETP_GPU_DIRECT_DELTA", False),
             gpu_direct_delta_batch_tokens=int(
                 os.getenv("BRIDGETP_GPU_DIRECT_DELTA_BATCH_TOKENS", "16")
@@ -330,6 +334,15 @@ class BridgeTPStreamConfig:
             raise ValueError("BRIDGETP_STREAM_RATE_GIB_S cannot be negative")
         if self.gpu_direct_history and not self.phase8_enabled:
             raise ValueError("GPU-direct history currently requires Phase 8")
+        if self.gpu_direct_history_pacing and not (
+            self.gpu_direct_history
+            and self.persistent_channel
+            and self.aggregate_rate_gib_s > 0
+        ):
+            raise ValueError(
+                "GPU-direct history pacing requires a positive rate and "
+                "a persistent GPU-direct channel"
+            )
         if self.gpu_direct_delta and not self.gpu_direct_history:
             raise ValueError("GPU-direct delta requires GPU-direct history")
         if self.gpu_direct_delta and self.shadow_strategy != "S_NEW_OLD":
@@ -761,6 +774,10 @@ class _GpuDirectHistoryPublisher:
                     for rank in range(self.config.target_tp_size)
                 ],
                 keep_open=self.config.gpu_direct_delta,
+                history_pacing=self.config.gpu_direct_history_pacing,
+                history_rate_provider=(
+                    lambda: get_bridge_tp_stream_config().aggregate_rate_gib_s
+                ),
             )
             if self.config.gpu_direct_delta:
                 receipt.update(
