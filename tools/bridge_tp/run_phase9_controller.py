@@ -657,12 +657,21 @@ def step_shadow(
                 f"candidate={candidate}"
             )
 
+    finalizer_error_path = adapter.run_dir / "cutover_finalize_error.json"
+    if finalizer_error_path.is_file():
+        failure = load_json(finalizer_error_path)
+        late_candidate_reason = (
+            "source final delta failed: " + str(failure.get("error", "unknown"))
+        )
     diagnostic_path = record.trigger_path is TriggerPath.DIAGNOSTIC_FIXED_BOUNDARY
     safety_path = record.trigger_path in {
         TriggerPath.CAPACITY_PILOT,
         TriggerPath.POLICY_OOM_RISK,
     }
-    if diagnostic_path:
+    if late_candidate_reason:
+        abandon = True
+        reason = late_candidate_reason
+    elif diagnostic_path:
         # Fixed-boundary experiments isolate mechanism timing.  Re-evaluating
         # the online policy after forcibly entering Shadow would make paired
         # strategy runs follow different state paths and invalidate the
