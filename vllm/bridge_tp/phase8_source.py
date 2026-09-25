@@ -5,8 +5,8 @@
 
 The Phase 6/7 publisher moves the historical block image once.  This module
 then mirrors only newly-computed token slots to a CPU stager while TP1 keeps
-decoding.  At the configured cutover boundary it waits for every delta ACK and
-publishes an immutable cutover manifest.
+decoding.  At a request-scoped freeze boundary, a background finalizer waits
+for the final delta ACK and publishes an immutable cutover manifest.
 """
 
 from __future__ import annotations
@@ -75,6 +75,7 @@ class _Phase8SourceState:
     d2h_ms: float = 0.0
     last_flush_monotonic: float = field(default_factory=time.monotonic)
     finalized: bool = False
+    finalizing: bool = False
     stopped: bool = False
     lifecycle_lock: threading.RLock = field(
         default_factory=threading.RLock,
@@ -297,6 +298,10 @@ class _Phase8SourceState:
             time.sleep(0.05)
         if not cleanup_path.exists() or self.finalized:
             return
+        if self.finalizing:
+            # The cutover finalizer owns cleanup once the exact boundary has
+            # been published.  Do not drain or stop its delta queue twice.
+            return
         try:
             # Prevent later decode iterations from enqueueing deltas after the
             # worker queues have been drained.  This matters when Phase 9
@@ -422,6 +427,204 @@ def _copy_delta_rank_shards(
     return rank_layers, (time.perf_counter() - started) * 1000
 
 
+def _wait_for_scheduler_freeze(
+    state: _Phase8SourceState,
+    *,
+    output_tokens: int,
+    num_computed_tokens: int,
+) -> None:
+    """Wait until the scheduler excludes the anchor from future model steps."""
+    frozen_path = state.config.run_dir / "request_frozen_receipt.json"
+    cleanup_path = state.config.run_dir / "cleanup_request.json"
+    deadline = time.monotonic() + state.config.socket_timeout_s
+    while time.monotonic() < deadline:
+        if cleanup_path.exists():
+            raise RuntimeError("migration was abandoned before source freeze")
+        if frozen_path.exists():
+            receipt = json.loads(frozen_path.read_text(encoding="utf-8"))
+            if receipt.get("request_id") == state.request_id:
+                if (
+                    receipt.get("status") != "FROZEN"
+                    or receipt.get("num_output_tokens") != output_tokens
+                    or receipt.get("num_computed_tokens") != num_computed_tokens
+                ):
+                    raise RuntimeError("scheduler froze the wrong token boundary")
+                return
+        time.sleep(0.005)
+    raise TimeoutError("scheduler did not confirm the request-scoped freeze")
+
+
+def _finalize_cutover(
+    *,
+    state: _Phase8SourceState,
+    request_id: str,
+    output_tokens: int,
+    num_prompt_tokens: int,
+    num_computed: int,
+    num_known: int,
+    known_token_ids: list[int],
+    pending: int,
+    freeze_request: dict[str, Any] | None,
+    cutover_hook_enter_unix_ns: int | None,
+    cutover_hook_enter_monotonic_ns: int | None,
+    final_delta_enqueued_unix_ns: int,
+    final_delta_enqueued_monotonic_ns: int,
+    delta_drain_started_monotonic_ns: int,
+) -> None:
+    """Publish cutover only after the frozen anchor's final delta is ACKed."""
+    config = state.config
+    if freeze_request is not None:
+        _wait_for_scheduler_freeze(
+            state,
+            output_tokens=output_tokens,
+            num_computed_tokens=num_computed,
+        )
+    state.wait_for_acks()
+    delta_drain_completed_unix_ns = time.time_ns()
+    delta_drain_completed_monotonic_ns = time.monotonic_ns()
+    if (config.run_dir / "cleanup_request.json").exists():
+        raise RuntimeError("migration was abandoned during final delta drain")
+    # S_NEW starts its historical copy only at the irreversible boundary.
+    state.start_history_transfer()
+    with state.lifecycle_lock:
+        state.finalized = True
+    state.stop_workers()
+    _atomic_json_dump(
+        {
+            "format_version": 1,
+            "phase": "BridgeTP D3 Phase 8",
+            "scope": "old-KV snapshot plus acknowledged new-KV deltas",
+            "shadow_strategy": config.shadow_strategy,
+            "protocol_version": PROTOCOL_VERSION,
+            "migration_id": config.migration_id,
+            "session_token": state.session_token,
+            "source_request_id": request_id,
+            "cutover_num_output_tokens": output_tokens,
+            "num_prompt_tokens": num_prompt_tokens,
+            "num_computed_tokens": num_computed,
+            "pending_known_tokens": pending,
+            "computed_token_ids": known_token_ids[:num_computed],
+            "pending_token_ids": known_token_ids[num_computed:],
+            "all_known_token_ids": known_token_ids,
+            "num_blocks": math.ceil(num_computed / state.block_size),
+            "block_size": state.block_size,
+            "block_axis": state.block_axis,
+            "delta_start_token": int(
+                json.loads(
+                    (config.run_dir / "session_manifest.json").read_text(
+                        encoding="utf-8"
+                    )
+                )["num_computed_tokens"]
+            ),
+            "delta_end_token": num_computed,
+            "delta_batches": state.delta_batches,
+            "delta_tokens": state.delta_tokens,
+            "delta_payload_bytes": state.delta_payload_bytes,
+            "delta_d2h_ms": state.d2h_ms,
+            "delta_transport": (
+                "NCCL_P2P_GPU_DIRECT_PERSISTENT"
+                if config.gpu_direct_delta else "CPU_TCP_SERIALIZED"
+            ),
+            "delta_batch_tokens": (
+                config.gpu_direct_delta_batch_tokens
+                if config.gpu_direct_delta else None
+            ),
+            "delta_flush_ms": (
+                config.gpu_direct_delta_flush_ms
+                if config.gpu_direct_delta else None
+            ),
+            "freeze_requested_unix_ns": (
+                freeze_request["requested_unix_ns"] if freeze_request else None
+            ),
+            "cutover_hook_enter_unix_ns": cutover_hook_enter_unix_ns,
+            "final_delta_enqueued_unix_ns": final_delta_enqueued_unix_ns,
+            "delta_drain_completed_unix_ns": delta_drain_completed_unix_ns,
+            "final_delta_finalize_mode": (
+                "BACKGROUND_AFTER_REQUEST_FREEZE"
+                if freeze_request else "MODEL_STEP_SYNCHRONOUS"
+            ),
+            "final_delta_enqueue_ms": (
+                (
+                    final_delta_enqueued_monotonic_ns
+                    - cutover_hook_enter_monotonic_ns
+                ) / 1e6
+                if cutover_hook_enter_monotonic_ns is not None else None
+            ),
+            "final_delta_drain_ms": (
+                delta_drain_completed_monotonic_ns
+                - delta_drain_started_monotonic_ns
+            ) / 1e6,
+            "cutover_hook_to_delta_drain_ms": (
+                (
+                    delta_drain_completed_monotonic_ns
+                    - cutover_hook_enter_monotonic_ns
+                ) / 1e6
+                if cutover_hook_enter_monotonic_ns is not None else None
+            ),
+            "updated_unix_s": time.time(),
+        },
+        config.run_dir / "cutover_manifest.json",
+    )
+    from vllm.bridge_tp.experiment_timeline import emit_event
+
+    try:
+        emit_event(
+            config.run_dir,
+            "source_worker",
+            "FINAL_DELTA_ACKED",
+            request_id=request_id,
+            migration_id=config.migration_id,
+            num_computed_tokens=num_computed,
+            delta_tokens=state.delta_tokens,
+        )
+    except Exception:
+        # The manifest is already authoritative.  A diagnostic timeline
+        # failure must never resume a source request after publication.
+        logger.exception("BridgeTP final delta timeline event failed")
+    logger.warning(
+        "BridgeTP Phase 8 cutover prepared at output=%d, computed=%d, "
+        "delta_tokens=%d",
+        output_tokens,
+        num_computed,
+        state.delta_tokens,
+    )
+
+
+def _background_finalize_cutover(**kwargs: Any) -> None:
+    state: _Phase8SourceState = kwargs["state"]
+    try:
+        _finalize_cutover(**kwargs)
+    except Exception as error:
+        logger.exception("BridgeTP background final delta failed")
+        if (state.config.run_dir / "cutover_manifest.json").exists():
+            # The controller may already be committing this cutover.
+            return
+        # Without a cutover manifest the controller cannot commit.  Resume
+        # only this source request so a failed transfer does not strand it.
+        _atomic_json_dump(
+            {
+                "format_version": 1,
+                "status": "FAILED",
+                "request_id": state.request_id,
+                "error": f"{type(error).__name__}: {error}",
+                "updated_unix_s": time.time(),
+            },
+            state.config.run_dir / "cutover_finalize_error.json",
+        )
+        _atomic_json_dump(
+            {
+                "format_version": 1,
+                "action": "RESUME",
+                "request_id": state.request_id,
+                "reason": "background final delta failed",
+            },
+            state.config.run_dir / "request_freeze_control.json",
+        )
+        with state.lifecycle_lock:
+            state.finalized = True
+        state.stop_workers()
+
+
 def maybe_publish_phase8_delta(
     *,
     config: Any,
@@ -444,6 +647,8 @@ def maybe_publish_phase8_delta(
     num_computed = (
         int(input_batch.num_computed_tokens_cpu[request_index]) + num_scheduled
     )
+    if state.finalizing and num_computed > state.last_computed_token:
+        raise RuntimeError("migration anchor advanced after freeze request")
     if num_computed <= state.last_computed_token:
         return
     if output_tokens > config.phase8_cutover_output_tokens:
@@ -518,108 +723,33 @@ def maybe_publish_phase8_delta(
             output_tokens=output_tokens,
             num_computed_tokens=num_computed,
         )
-    delta_drain_started_monotonic_ns = time.monotonic_ns()
-    state.wait_for_acks()
-    delta_drain_completed_unix_ns = time.time_ns()
-    delta_drain_completed_monotonic_ns = time.monotonic_ns()
-    # S_NEW gives new-KV traffic priority throughout Shadow.  Only after every
-    # delta has reached the stager does the irreversible Bridge boundary start
-    # the historical snapshot transfer.
-    state.start_history_transfer()
-    known_token_ids = [request.get_token_id(i) for i in range(num_known)]
-    state.finalized = True
-    state.stop_workers()
-    _atomic_json_dump(
-        {
-            "format_version": 1,
-            "phase": "BridgeTP D3 Phase 8",
-            "scope": "old-KV snapshot plus acknowledged new-KV deltas",
-            "shadow_strategy": config.shadow_strategy,
-            "protocol_version": PROTOCOL_VERSION,
-            "migration_id": config.migration_id,
-            "session_token": state.session_token,
-            "source_request_id": request_id,
-            "cutover_num_output_tokens": output_tokens,
-            "num_prompt_tokens": int(request.num_prompt_tokens),
-            "num_computed_tokens": num_computed,
-            "pending_known_tokens": pending,
-            "computed_token_ids": known_token_ids[:num_computed],
-            "pending_token_ids": known_token_ids[num_computed:],
-            "all_known_token_ids": known_token_ids,
-            "num_blocks": math.ceil(num_computed / state.block_size),
-            "block_size": state.block_size,
-            "block_axis": state.block_axis,
-            "delta_start_token": int(
-                json.loads(
-                    (config.run_dir / "session_manifest.json").read_text(
-                        encoding="utf-8"
-                    )
-                )["num_computed_tokens"]
-            ),
-            "delta_end_token": num_computed,
-            "delta_batches": state.delta_batches,
-            "delta_tokens": state.delta_tokens,
-            "delta_payload_bytes": state.delta_payload_bytes,
-            "delta_d2h_ms": state.d2h_ms,
-            "delta_transport": (
-                "NCCL_P2P_GPU_DIRECT_PERSISTENT"
-                if config.gpu_direct_delta else "CPU_TCP_SERIALIZED"
-            ),
-            "delta_batch_tokens": (
-                config.gpu_direct_delta_batch_tokens
-                if config.gpu_direct_delta else None
-            ),
-            "delta_flush_ms": (
-                config.gpu_direct_delta_flush_ms
-                if config.gpu_direct_delta else None
-            ),
-            "freeze_requested_unix_ns": (
-                freeze_request["requested_unix_ns"] if freeze_request else None
-            ),
-            "cutover_hook_enter_unix_ns": cutover_hook_enter_unix_ns,
-            "final_delta_enqueued_unix_ns": final_delta_enqueued_unix_ns,
-            "delta_drain_completed_unix_ns": delta_drain_completed_unix_ns,
-            "final_delta_enqueue_ms": (
-                (
-                    final_delta_enqueued_monotonic_ns
-                    - cutover_hook_enter_monotonic_ns
-                )
-                / 1e6
-                if cutover_hook_enter_monotonic_ns is not None
-                else None
-            ),
-            "final_delta_drain_ms": (
-                delta_drain_completed_monotonic_ns
-                - delta_drain_started_monotonic_ns
-            )
-            / 1e6,
-            "cutover_hook_to_delta_drain_ms": (
-                (
-                    delta_drain_completed_monotonic_ns
-                    - cutover_hook_enter_monotonic_ns
-                )
-                / 1e6
-                if cutover_hook_enter_monotonic_ns is not None
-                else None
-            ),
-            "updated_unix_s": time.time(),
-        },
-        config.run_dir / "cutover_manifest.json",
-    )
-    from vllm.bridge_tp.experiment_timeline import emit_event
-
-    emit_event(
-        config.run_dir,
-        "source_worker",
-        "FINAL_DELTA_ACKED",
-        request_id=request_id,
-        migration_id=config.migration_id,
-        num_computed_tokens=num_computed,
-        delta_tokens=state.delta_tokens,
-    )
-    logger.warning(
-        "BridgeTP Phase 8 cutover prepared at output=%d, computed=%d, delta_tokens=%d",
-        output_tokens,
-        num_computed,
-        state.delta_tokens,
-    )
+    # Copy request-owned metadata while the model step still owns the exact
+    # boundary.  The finalizer must not inspect a mutable request later.
+    finalizer_kwargs = {
+        "state": state,
+        "request_id": request_id,
+        "output_tokens": output_tokens,
+        "num_prompt_tokens": int(request.num_prompt_tokens),
+        "num_computed": num_computed,
+        "num_known": num_known,
+        "known_token_ids": [request.get_token_id(i) for i in range(num_known)],
+        "pending": pending,
+        "freeze_request": freeze_request,
+        "cutover_hook_enter_unix_ns": cutover_hook_enter_unix_ns,
+        "cutover_hook_enter_monotonic_ns": cutover_hook_enter_monotonic_ns,
+        "final_delta_enqueued_unix_ns": final_delta_enqueued_unix_ns,
+        "final_delta_enqueued_monotonic_ns": final_delta_enqueued_monotonic_ns,
+        "delta_drain_started_monotonic_ns": time.monotonic_ns(),
+    }
+    if freeze_request is None:
+        # Preserve Bridge mode's existing synchronous cutover semantics.
+        _finalize_cutover(**finalizer_kwargs)
+        return
+    with state.lifecycle_lock:
+        state.finalizing = True
+    threading.Thread(
+        target=_background_finalize_cutover,
+        kwargs=finalizer_kwargs,
+        name="bridgetp-phase8-cutover-finalizer",
+        daemon=True,
+    ).start()
