@@ -78,6 +78,25 @@ class TestRateController(unittest.TestCase):
         self.assertEqual(rc.rate_bytes_s, start)
         self.assertEqual(rc.last_reason, "warmup")
 
+    def test_missing_tpot_holds_rate_and_does_not_finish_warmup(self):
+        rc = RateController(RateConfig(min_samples_before_action=2))
+        start = rc.rate_bytes_s
+        for missing in (None, 0.0, float("nan")):
+            self.assertEqual(rc.step(missing, 10**9), start)
+            self.assertIn("sample unavailable", rc.last_reason)
+        self.assertEqual(rc.step(0.01, 10**9), start)
+        self.assertEqual(rc.last_reason, "warmup")
+        self.assertGreater(rc.step(0.01, 10**9), start)
+
+    def test_deadline_can_override_missing_tpot(self):
+        cfg = self.cfg()
+        rc = RateController(cfg)
+        self.assertGreater(
+            rc.step(None, int(1.5 * GIB), seconds_to_deadline=0.5),
+            cfg.b_max_bytes_s,
+        )
+        self.assertIn("deadline override", rc.last_reason)
+
     def test_gib_conversion_is_exact(self):
         rc = RateController(RateConfig())
         rc.rate_bytes_s = 0.5 * GIB

@@ -20,6 +20,7 @@ interference-heavy bands on the evaluation platform (0.4-0.7 GiB/s and
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 GIB = 1024.0**3
@@ -60,33 +61,43 @@ class RateController:
 
     def step(
         self,
-        native_p99_tpot_s: float,
+        native_p99_tpot_s: float | None,
         remaining_bytes: int,
         seconds_to_deadline: float | None = None,
     ) -> float:
         """Advance one control period and return the new rate in bytes/s.
 
         ``seconds_to_deadline`` is the time until the request's OOM horizon or
-        safety deadline. Pass ``None`` when no deadline is active.
+        safety deadline. Pass ``None`` when no deadline is active. Missing or
+        invalid TPOT holds the feedback rate; an explicit deadline may still
+        override it.
         """
-        self._samples += 1
+        valid_tpot = (
+            native_p99_tpot_s is not None
+            and math.isfinite(native_p99_tpot_s)
+            and native_p99_tpot_s > 0
+        )
         cfg = self.cfg
-
-        if self._samples < cfg.min_samples_before_action:
-            self.last_reason = "warmup"
-        elif native_p99_tpot_s > cfg.slo_p99_tpot_s:
-            self.rate_bytes_s = self._clamp(self.rate_bytes_s * cfg.mult_decrease)
-            self.last_reason = (
-                f"backoff: native p99 {native_p99_tpot_s * 1e3:.1f}ms > "
-                f"slo {cfg.slo_p99_tpot_s * 1e3:.1f}ms"
-            )
-        elif native_p99_tpot_s < cfg.slo_p99_tpot_s * cfg.slack_frac:
-            self.rate_bytes_s = self._clamp(self.rate_bytes_s * cfg.mult_increase)
-            self.last_reason = (
-                f"increase: native p99 {native_p99_tpot_s * 1e3:.1f}ms has slack"
-            )
+        if not valid_tpot:
+            self.last_reason = "hold: native TPOT sample unavailable"
         else:
-            self.last_reason = "hold: inside SLO deadband"
+            assert native_p99_tpot_s is not None
+            self._samples += 1
+            if self._samples < cfg.min_samples_before_action:
+                self.last_reason = "warmup"
+            elif native_p99_tpot_s > cfg.slo_p99_tpot_s:
+                self.rate_bytes_s = self._clamp(self.rate_bytes_s * cfg.mult_decrease)
+                self.last_reason = (
+                    f"backoff: native p99 {native_p99_tpot_s * 1e3:.1f}ms > "
+                    f"slo {cfg.slo_p99_tpot_s * 1e3:.1f}ms"
+                )
+            elif native_p99_tpot_s < cfg.slo_p99_tpot_s * cfg.slack_frac:
+                self.rate_bytes_s = self._clamp(self.rate_bytes_s * cfg.mult_increase)
+                self.last_reason = (
+                    f"increase: native p99 {native_p99_tpot_s * 1e3:.1f}ms has slack"
+                )
+            else:
+                self.last_reason = "hold: inside SLO deadband"
 
         # deadline override, applied after the feedback path
         if seconds_to_deadline is not None and seconds_to_deadline > 0:

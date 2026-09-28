@@ -551,8 +551,9 @@ def step_shadow(
     max_tokens: int | None = None,
 ) -> None:
     remaining = policy.migration_bytes(request)
+    tpot_samples = getattr(pool4, "tpot_samples", 0)
     new_rate = rate.step(
-        pool4.p99_tpot_s,
+        pool4.p99_tpot_s if tpot_samples > 0 else None,
         remaining,
         seconds_to_deadline=None,
     )
@@ -563,6 +564,8 @@ def step_shadow(
             "rate_gib_s": rate.rate_gib_s,
             "reason": rate.last_reason,
             "native_p99_tpot_s": pool4.p99_tpot_s,
+            "native_tpot_samples": tpot_samples,
+            "native_tpot_metric": getattr(pool4, "tpot_metric", None),
         }
     )
     if not dry_run:
@@ -1203,7 +1206,11 @@ def main() -> None:
                         )
                     elif record.state is MigrationState.SHADOW:
                         proposed_rate = copy.deepcopy(rate).step(
-                            pool4.p99_tpot_s,
+                            (
+                                pool4.p99_tpot_s
+                                if getattr(pool4, "tpot_samples", 0) > 0
+                                else None
+                            ),
                             policy.migration_bytes(request),
                             seconds_to_deadline=None,
                         )

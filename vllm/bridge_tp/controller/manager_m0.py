@@ -41,6 +41,7 @@ class RuntimeSnapshot:
     target_running: int | None = None
     target_waiting: int | None = None
     target_p99_tpot_s: float | None = None
+    target_tpot_samples: int | None = None
     history_total_bytes: int | None = None
     history_resident_bytes: int | None = None
     delta_lag_tokens: int | None = None
@@ -246,6 +247,7 @@ def snapshot_from_telemetry(
         return int(blocks) * int(size) if blocks is not None and size else None
 
     p99 = target.get("p99_tpot_s")
+    tpot_samples = target.get("tpot_samples")
     return RuntimeSnapshot(
         unix_s=float(row["unix_s"]),
         migration_id=migration_id,
@@ -273,7 +275,12 @@ def snapshot_from_telemetry(
         target_kv_usage_frac=target.get("kv_usage_frac"),
         target_running=target.get("num_running"),
         target_waiting=target.get("num_waiting"),
-        target_p99_tpot_s=float(p99) if p99 and p99 > 0 else None,
+        target_p99_tpot_s=(
+            float(p99)
+            if p99 and p99 > 0 and (tpot_samples is None or tpot_samples > 0)
+            else None
+        ),
+        target_tpot_samples=tpot_samples,
         current_rate_bytes_s=row.get("rate_bytes_s"),
         expected_remaining_tokens=expected_remaining_tokens,
         capacity_pressure=capacity.get("active"),

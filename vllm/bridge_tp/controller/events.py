@@ -145,6 +145,8 @@ class PoolTelemetry:
     free_kv_blocks: int
     block_size: int
     sampled_unix_s: float = 0.0
+    tpot_samples: int = 0  # observations represented by this TPOT estimate
+    tpot_metric: str | None = None
 
     @property
     def free_kv_tokens(self) -> int:

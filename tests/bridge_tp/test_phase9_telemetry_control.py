@@ -9,7 +9,9 @@ from __future__ import annotations
 import tempfile
 import time
 import unittest
+from io import BytesIO
 from pathlib import Path
+from unittest.mock import patch
 
 from vllm.bridge_tp.controller import telemetry as tel
 from vllm.bridge_tp.runtime_control import (
@@ -207,6 +209,34 @@ vllm:time_per_output_token_seconds_count 40
         self.assertAlmostEqual(pool.kv_usage_frac, 0.63, places=9)
         self.assertEqual(count, 10)
         self.assertAlmostEqual(pool.mean_tpot_s, 0.03, places=9)
+
+    def test_scraper_counts_only_new_request_tpot_observations(self):
+        metric = "vllm:request_time_per_output_token_seconds"
+
+        def scrape(count: int) -> BytesIO:
+            return BytesIO(
+                (
+                    f'{metric}_bucket{{le="0.04"}} {count}\n'
+                    f'{metric}_bucket{{le="+Inf"}} {count}\n'
+                    f"{metric}_sum {count * 0.02}\n"
+                    f"{metric}_count {count}\n"
+                ).encode()
+            )
+
+        scraper = tel.MetricsScraper("http://localhost", 16, 100)
+        with patch.object(
+            tel.urllib.request,
+            "urlopen",
+            side_effect=[scrape(5), scrape(5), scrape(7)],
+        ):
+            first = scraper.scrape()
+            unchanged = scraper.scrape()
+            updated = scraper.scrape()
+        self.assertEqual((first.tpot_samples, unchanged.tpot_samples), (0, 0))
+        self.assertEqual((first.p99_tpot_s, unchanged.p99_tpot_s), (0.0, 0.0))
+        self.assertEqual(updated.tpot_samples, 2)
+        self.assertGreater(updated.p99_tpot_s, 0)
+        self.assertEqual(updated.tpot_metric, metric)
 
 
 class TestRuntimeControl(unittest.TestCase):
