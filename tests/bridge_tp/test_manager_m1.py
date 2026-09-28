@@ -1,0 +1,122 @@
+# SPDX-License-Identifier: Apache-2.0
+"""M1 Start uses only fresh online evidence and keeps safety guards explicit."""
+
+from __future__ import annotations
+
+import unittest
+from contextlib import redirect_stderr
+from dataclasses import replace
+from io import StringIO
+from unittest.mock import patch
+
+from tools.bridge_tp.run_phase9_controller import parse_args
+from vllm.bridge_tp.controller.manager_m0 import RuntimeSnapshot
+from vllm.bridge_tp.controller.manager_m1 import M1StartConfig, M1StartController
+from vllm.bridge_tp.controller.predictor import SurvivalTable
+
+
+def snapshot() -> RuntimeSnapshot:
+    return RuntimeSnapshot(
+        unix_s=100.0,
+        migration_id="migration-1",
+        request_id="request-1",
+        state="LOCAL",
+        generated_tokens=40,
+        current_context_tokens=2088,
+        source_sampled_unix_s=99.9,
+        target_sampled_unix_s=99.9,
+        source_free_kv_tokens=30000,
+        source_guard_free_kv_tokens=8448,
+        source_pool_growth_tokens_s=30.0,
+        target_free_kv_tokens=50000,
+        target_kv_usage_frac=0.1,
+        target_waiting=0,
+        channel_available=True,
+    )
+
+
+class TestM1Start(unittest.TestCase):
+    def test_controller_accepts_only_dynamic_gpu_resident_m1(self) -> None:
+        base = [
+            "run_phase9_controller.py", "--config", "config.json",
+            "--run-dir", "run", "--source-request", "request.json",
+            "--manager-m1-auto-start", "--diagnostic-earliest-ready-cutover",
+            "--handoff-mode", "shadow-only", "--gpu-resident-shadow",
+        ]
+        with patch("sys.argv", base):
+            self.assertTrue(parse_args().manager_m1_auto_start)
+        with patch("sys.argv", base + ["--diagnostic-trigger-output-tokens", "64"]):
+            with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                parse_args()
+
+    def setUp(self) -> None:
+        self.controller = M1StartController(M1StartConfig())
+        self.table = SurvivalTable.from_output_lengths([1024] * 30)
+
+    def decide(self, state: RuntimeSnapshot, table=None):
+        return self.controller.decide(
+            state,
+            self.table if table is None else table,
+            max_output_tokens=1024,
+            rate_bytes_s=0.5 * 1024**3,
+            kv_bytes_per_token=196608,
+        )
+
+    def test_supported_long_request_starts(self) -> None:
+        decision = self.decide(snapshot())
+        self.assertEqual(decision.action, "START_SHADOW")
+        self.assertEqual(decision.survivors, 30)
+        self.assertGreater(
+            decision.source_time_to_guard_s, decision.estimated_preparation_s
+        )
+
+    def test_no_start_without_fresh_capacity_or_channel(self) -> None:
+        cases = (
+            replace(snapshot(), target_sampled_unix_s=95.0),
+            replace(snapshot(), target_free_kv_tokens=None),
+            replace(snapshot(), target_free_kv_tokens=2000),
+            replace(snapshot(), target_kv_usage_frac=0.9),
+            replace(snapshot(), target_waiting=5),
+            replace(snapshot(), channel_available=False),
+            replace(snapshot(), source_free_kv_tokens=8448),
+            replace(snapshot(), source_pool_growth_tokens_s=None),
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                self.assertEqual(self.decide(case).action, "STAY")
+
+    def test_no_start_without_supported_remaining_work(self) -> None:
+        self.assertEqual(
+            self.decide(replace(snapshot(), generated_tokens=10)).action, "STAY"
+        )
+        self.assertEqual(
+            self.decide(
+                snapshot(), SurvivalTable.from_output_lengths([1024] * 5)
+            ).action,
+            "STAY",
+        )
+        self.assertEqual(
+            self.decide(
+                snapshot(), SurvivalTable.from_output_lengths([120] * 30)
+            ).action,
+            "STAY",
+        )
+        self.assertEqual(
+            self.decide(replace(snapshot(), generated_tokens=1024)).action,
+            "STAY",
+        )
+
+    def test_invalid_rate_and_geometry_do_not_start(self) -> None:
+        for rate, geometry in ((0.0, 196608), (0.5 * 1024**3, 0)):
+            with self.subTest(rate=rate, geometry=geometry):
+                decision = self.controller.decide(
+                    snapshot(), self.table,
+                    max_output_tokens=1024,
+                    rate_bytes_s=rate,
+                    kv_bytes_per_token=geometry,
+                )
+                self.assertEqual(decision.action, "STAY")
+
+
+if __name__ == "__main__":
+    unittest.main()

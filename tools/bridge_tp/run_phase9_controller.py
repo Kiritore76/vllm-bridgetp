@@ -39,6 +39,11 @@ from vllm.bridge_tp.controller.manager_m0 import (  # noqa: E402
     MigrationManagerM0,
     RuntimeStateCollector,
 )
+from vllm.bridge_tp.controller.manager_m1 import (  # noqa: E402
+    M1StartConfig,
+    M1StartController,
+    M1StartDecision,
+)
 from vllm.bridge_tp.controller.events import (  # noqa: E402
     Action,
     MigrationState,
@@ -126,6 +131,11 @@ def parse_args() -> argparse.Namespace:
         help="record advisory M0 decisions alongside the existing controller",
     )
     parser.add_argument(
+        "--manager-m1-auto-start",
+        action="store_true",
+        help="start GPU-resident Shadow from online M1 evidence",
+    )
+    parser.add_argument(
         "--handoff-mode",
         choices=("bridge", "shadow-only"),
         default="bridge",
@@ -182,7 +192,8 @@ def parse_args() -> argparse.Namespace:
     cutover = args.diagnostic_cutover_output_tokens
     bridge = args.diagnostic_bridge_output_tokens
     if args.diagnostic_earliest_ready_cutover and (
-        trigger is None or cutover is not None
+        (trigger is None and not args.manager_m1_auto_start)
+        or cutover is not None
     ):
         parser.error(
             "earliest-ready cutover requires a trigger and forbids a fixed cutover"
@@ -205,6 +216,15 @@ def parse_args() -> argparse.Namespace:
         or not trigger < bridge < cutover
     ):
         parser.error("diagnostic Bridge boundary must be between trigger and cutover")
+    if args.manager_m1_auto_start:
+        if trigger is not None or cutover is not None or bridge is not None:
+            parser.error("M1 auto-start forbids diagnostic fixed boundaries")
+        if not args.diagnostic_earliest_ready_cutover:
+            parser.error("M1 auto-start requires earliest-ready cutover")
+        if args.handoff_mode != "shadow-only" or not args.gpu_resident_shadow:
+            parser.error("M1 auto-start requires GPU-resident Shadow-only mode")
+        if args.stop_and_copy:
+            parser.error("M1 auto-start does not support Stop-and-Copy")
     if (
         args.gpu_resident_shadow
         and cutover is None
@@ -389,6 +409,7 @@ def step_local(
     diagnostic_earliest_ready_cutover: bool = False,
     capacity_signal: CapacitySignal | None = None,
     stop_and_copy: bool = False,
+    m1_start_decision: M1StartDecision | None = None,
 ) -> None:
     decision = policy.evaluate(
         request,
@@ -429,15 +450,23 @@ def step_local(
         config.capacity_pilot.enabled and config.capacity_pilot.exclusive_trigger_path
     )
     should_start = (
-        diagnostic_boundary
-        or capacity_allowed
-        or (performance_allowed and decision.action is Action.START_SHADOW)
+        m1_start_decision.action == "START_SHADOW"
+        if m1_start_decision is not None
+        else (
+            diagnostic_boundary
+            or capacity_allowed
+            or (performance_allowed and decision.action is Action.START_SHADOW)
+        )
     )
     if dry_run or not should_start:
         return
     if diagnostic_trigger_output_tokens is None:
         trigger = request.output_tokens + 1
-        cutover = trigger + config.handoff_output_tokens
+        cutover = (
+            max_tokens - 1
+            if diagnostic_earliest_ready_cutover
+            else trigger + config.handoff_output_tokens
+        )
     else:
         if (
             diagnostic_cutover_output_tokens is None
@@ -487,7 +516,10 @@ def step_local(
         return
     if not diagnostic_earliest_ready_cutover:
         recorder.set_cutover(trigger if stop_and_copy else cutover, now)
-    if diagnostic_boundary:
+    if m1_start_decision is not None:
+        trigger_path = TriggerPath.MANAGER_M1_START
+        trigger_reason = m1_start_decision.reason
+    elif diagnostic_boundary:
         trigger_path = TriggerPath.DIAGNOSTIC_FIXED_BOUNDARY
         trigger_reason = "diagnostic fixed boundary"
     elif capacity_allowed:
@@ -518,7 +550,11 @@ def step_local(
     if diagnostic_earliest_ready_cutover:
         audit.write(
             {
-                "kind": "diagnostic_earliest_ready_armed",
+                "kind": (
+                    "manager_m1_earliest_ready_armed"
+                    if m1_start_decision is not None
+                    else "diagnostic_earliest_ready_armed"
+                ),
                 "trigger_output_tokens": trigger,
                 "initial_cutover_sentinel": cutover,
                 "reason": "wait for four initial GPU-history exact receipts",
@@ -724,6 +760,7 @@ def step_shadow(
     safety_path = record.trigger_path in {
         TriggerPath.CAPACITY_PILOT,
         TriggerPath.POLICY_OOM_RISK,
+        TriggerPath.MANAGER_M1_START,
     }
     if late_candidate_reason:
         abandon = True
@@ -1079,8 +1116,30 @@ def main() -> None:
         )
         rate = RateController(config.rate)
         manager_m0 = MigrationManagerM0() if args.manager_m0_shadow else None
-        m0_collector = RuntimeStateCollector() if manager_m0 else None
-        m0_registry = ChannelRegistry() if manager_m0 else None
+        manager_m1 = (
+            M1StartController(
+                M1StartConfig(
+                    min_output_tokens=config.policy.min_output_tokens_before_eligible,
+                    min_survivors=config.policy.min_survivors_for_confidence,
+                    max_target_kv_usage_frac=(
+                        config.policy.max_target_kv_usage_frac
+                    ),
+                    max_target_waiting=config.policy.max_target_waiting,
+                )
+            )
+            if args.manager_m1_auto_start
+            else None
+        )
+        m0_collector = (
+            RuntimeStateCollector()
+            if manager_m0 is not None or manager_m1 is not None
+            else None
+        )
+        m0_registry = (
+            ChannelRegistry()
+            if manager_m0 is not None or manager_m1 is not None
+            else None
+        )
         m0_history_total_bytes: int | None = None
         risk = RiskTracker(alpha=config.slow.ewma_alpha)
         capacity = CapacityHeadroomTracker(config.capacity_pilot)
@@ -1105,6 +1164,7 @@ def main() -> None:
                     else None
                 ),
                 "handoff_mode": args.handoff_mode,
+                "manager_m1_auto_start": args.manager_m1_auto_start,
                 "stop_and_copy": args.stop_and_copy,
                 "ready_notification_mode": args.ready_notification_mode,
                 "ready_latch_poll_ms": args.ready_latch_poll_ms,
@@ -1179,6 +1239,37 @@ def main() -> None:
                     "unix_s": time.time(),
                 }
                 audit.write(telemetry_row)
+                m1_start_decision: M1StartDecision | None = None
+                if manager_m1 is not None and record.state is MigrationState.LOCAL:
+                    assert m0_collector is not None
+                    assert m0_registry is not None
+                    m1_snapshot = m0_collector.collect(
+                        telemetry_row,
+                        migration_id=record.migration_id,
+                        request_id=request.request_id,
+                        channel_available=m0_registry.available(
+                            "tp4", record.migration_id
+                        ),
+                        current_context_tokens=(
+                            request.computed_tokens + request.pending_tokens
+                        ),
+                        request_age_s=max(0.0, now - request.arrival_unix_s),
+                    )
+                    m1_start_decision = manager_m1.decide(
+                        m1_snapshot,
+                        table,
+                        max_output_tokens=int(source_request["max_tokens"]),
+                        rate_bytes_s=rate.rate_bytes_s,
+                        kv_bytes_per_token=config.policy.kv_bytes_per_token,
+                    )
+                    audit.write(
+                        {
+                            "kind": "manager_m1_start_decision",
+                            "tick": tick,
+                            "snapshot": m1_snapshot.to_json(),
+                            "decision": m1_start_decision.to_json(),
+                        }
+                    )
                 if manager_m0 is not None:
                     assert m0_collector is not None
                     assert m0_registry is not None
@@ -1323,6 +1414,7 @@ def main() -> None:
                         args.diagnostic_earliest_ready_cutover,
                         capacity_signal,
                         args.stop_and_copy,
+                        m1_start_decision,
                     )
                 elif record.state is MigrationState.SHADOW:
                     target_future = _start_target_if_ready(

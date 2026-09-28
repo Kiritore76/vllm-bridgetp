@@ -29,6 +29,7 @@ from vllm.bridge_tp.controller.events import (
     SourceRequestView,
     TriggerPath,
 )
+from vllm.bridge_tp.controller.manager_m1 import M1StartDecision
 from vllm.bridge_tp.controller.online_io import (
     ProxyRecorder,
     build_gpu_resident_shadow_target_request,
@@ -1326,6 +1327,72 @@ class TestRunnerTransitions(unittest.TestCase):
         self.assertEqual(record.state, MigrationState.TAKEOVER)
         self.assertEqual(record.ranks_ready, {0, 1, 2, 3})
         self.assertEqual(recorder.stats()["target_origin_tokens"], 1)
+
+    def test_m1_start_arms_dynamic_cutover_without_fixed_boundary(self) -> None:
+        class Decision:
+            action = Action.STAY
+            reason = "legacy policy stays"
+
+            @staticmethod
+            def to_json() -> dict:
+                return {"action": "STAY"}
+
+        class Policy:
+            @staticmethod
+            def evaluate(*_args, **_kwargs) -> Decision:
+                return Decision()
+
+        class Audit:
+            def __init__(self) -> None:
+                self.records: list[dict] = []
+
+            def write(self, value: dict) -> None:
+                self.records.append(value)
+
+        class Adapter:
+            def __init__(self) -> None:
+                self.armed: tuple[int, float, int] | None = None
+
+            def arm_shadow(
+                self, trigger: int, rate: float,
+                cutover_output_tokens: int, note: str,
+            ) -> None:
+                del note
+                self.armed = (trigger, rate, cutover_output_tokens)
+
+        class Rate:
+            rate_bytes_s = 0.5 * 1024**3
+            rate_gib_s = 0.5
+
+        audit = Audit()
+        machine = MigrationStateMachine(audit_sink=audit.write)
+        record = machine.create("migration", "request")
+        adapter = Adapter()
+        request = SourceRequestView(
+            request_id="request", prompt_tokens=2048, output_tokens=40,
+            computed_tokens=2087, pending_tokens=1,
+            arrival_unix_s=0.0, last_token_unix_s=1.0,
+        )
+        step_local(
+            Policy(), machine, adapter, audit, record, request,
+            object(), object(), 0.1, Rate(), 10.0, False,
+            ControllerConfig(handoff_output_tokens=64),
+            ProxyRecorder("external", ProxyMode.HOLD_BACK),
+            100,
+            diagnostic_earliest_ready_cutover=True,
+            m1_start_decision=M1StartDecision("START_SHADOW", "M1 admitted"),
+        )
+        self.assertEqual(adapter.armed, (41, 0.5, 99))
+        self.assertIsNone(record.cutover_output_tokens)
+        self.assertEqual(record.trigger_path, TriggerPath.MANAGER_M1_START)
+        self.assertTrue(any(
+            row.get("kind") == "manager_m1_earliest_ready_armed"
+            for row in audit.records
+        ))
+        self.assertFalse(any(
+            row.get("kind") == "diagnostic_boundary_forced"
+            for row in audit.records
+        ))
 
     def test_step_local_uses_fixed_diagnostic_boundary(self) -> None:
         class Decision:
