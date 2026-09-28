@@ -297,6 +297,12 @@ def pool_from_samples(
         free_kv_blocks=free_blocks,
         block_size=block_size,
         sampled_unix_s=now_unix_s if now_unix_s is not None else time.time(),
+        tpot_samples=(
+            int(first_value(samples, f"{selected_tpot_metric}_count", 0.0))
+            if selected_tpot_metric is not None
+            else 0
+        ),
+        tpot_metric=selected_tpot_metric,
     )
 
 
@@ -346,6 +352,8 @@ def interval_pool_from_samples(
             free_kv_blocks=pool.free_kv_blocks,
             block_size=pool.block_size,
             sampled_unix_s=pool.sampled_unix_s,
+            tpot_samples=count,
+            tpot_metric=selected_tpot_metric,
         ),
         count,
     )
@@ -369,6 +377,7 @@ class MetricsScraper:
         self.block_size = block_size
         self.total_kv_blocks = total_kv_blocks
         self.timeout_s = timeout_s
+        self._previous_samples: list[Sample] | None = None
 
     def scrape(self) -> PoolTelemetry:
         try:
@@ -376,6 +385,16 @@ class MetricsScraper:
                 text = response.read().decode("utf-8", errors="replace")
         except OSError as error:  # pragma: no cover - network path
             raise TelemetryError(f"failed to scrape {self.url}: {error}") from error
-        return pool_from_samples(
-            parse_prometheus(text), self.block_size, self.total_kv_blocks
+        samples = parse_prometheus(text)
+        # The first scrape establishes a counter baseline; historical request
+        # completions must not masquerade as fresh control feedback.
+        previous = (
+            self._previous_samples
+            if self._previous_samples is not None
+            else samples
         )
+        pool, _ = interval_pool_from_samples(
+            previous, samples, self.block_size, self.total_kv_blocks
+        )
+        self._previous_samples = samples
+        return pool

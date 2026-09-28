@@ -18,6 +18,7 @@ from vllm.bridge_tp.controller.manager_m0 import (
     M0Proposal,
     MigrationManagerM0,
     RuntimeSnapshot,
+    snapshot_from_telemetry,
 )
 
 
@@ -123,6 +124,25 @@ class TestManagerM0(unittest.TestCase):
         self.assertEqual(
             manager.decide(pressured, M0Proposal(cancel=True)).action,
             "WOULD_WAIT",
+        )
+
+    def test_zero_interval_samples_hide_stale_tpot(self) -> None:
+        telemetry = {
+            "unix_s": 100.0,
+            "state": "SHADOW",
+            "tp1": {"sampled_unix_s": 99.9},
+            "tp4": {
+                "sampled_unix_s": 99.9,
+                "p99_tpot_s": 0.02,
+                "tpot_samples": 0,
+            },
+        }
+        result = snapshot_from_telemetry(telemetry)
+        self.assertEqual(result.target_tpot_samples, 0)
+        self.assertIsNone(result.target_p99_tpot_s)
+        telemetry["tp4"]["tpot_samples"] = 2
+        self.assertEqual(
+            snapshot_from_telemetry(telemetry).target_p99_tpot_s, 0.02
         )
 
     def test_replay_keeps_historical_evidence_gaps(self) -> None:
