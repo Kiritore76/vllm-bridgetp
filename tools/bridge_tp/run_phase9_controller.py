@@ -10,6 +10,7 @@ already be running with the same run directory and migration ID.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import signal
@@ -31,6 +32,13 @@ from vllm.bridge_tp.controller.capacity_signal import (  # noqa: E402
     CapacitySignal,
 )
 from vllm.bridge_tp.controller.config import ControllerConfig  # noqa: E402
+from vllm.bridge_tp.controller.manager_m0 import (  # noqa: E402
+    ChannelRegistry,
+    M0ExecutorAdapter,
+    M0Proposal,
+    MigrationManagerM0,
+    RuntimeStateCollector,
+)
 from vllm.bridge_tp.controller.events import (  # noqa: E402
     Action,
     MigrationState,
@@ -112,6 +120,11 @@ def parse_args() -> argparse.Namespace:
         help="fixed output-token boundary for SHADOW -> HANDOFF",
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--manager-m0-shadow",
+        action="store_true",
+        help="record advisory M0 decisions alongside the existing controller",
+    )
     parser.add_argument(
         "--handoff-mode",
         choices=("bridge", "shadow-only"),
@@ -1062,6 +1075,10 @@ def main() -> None:
             config.interference,
         )
         rate = RateController(config.rate)
+        manager_m0 = MigrationManagerM0() if args.manager_m0_shadow else None
+        m0_collector = RuntimeStateCollector() if manager_m0 else None
+        m0_registry = ChannelRegistry() if manager_m0 else None
+        m0_history_total_bytes: int | None = None
         risk = RiskTracker(alpha=config.slow.ewma_alpha)
         capacity = CapacityHeadroomTracker(config.capacity_pilot)
         audit = AuditLog(
@@ -1090,6 +1107,7 @@ def main() -> None:
                 "ready_latch_poll_ms": args.ready_latch_poll_ms,
             },
         )
+        m0_executor = M0ExecutorAdapter(audit.write) if manager_m0 else None
         machine = MigrationStateMachine(
             audit_sink=audit.write,
             allow_shadow_takeover=args.handoff_mode == "shadow-only",
@@ -1145,19 +1163,136 @@ def main() -> None:
                 if request is None:
                     time.sleep(config.tick_s)
                     continue
-                audit.write(
-                    {
-                        "kind": "telemetry",
-                        "tick": tick,
-                        "state": record.state.value,
-                        "output_tokens": request.output_tokens,
-                        "risk_tp1": risk_value,
-                        "tp1": pool1.__dict__,
-                        "tp4": pool4.__dict__,
-                        "rate_bytes_s": rate.rate_bytes_s,
-                        "capacity_signal": capacity_signal.to_json(),
-                    }
-                )
+                telemetry_row = {
+                    "kind": "telemetry",
+                    "tick": tick,
+                    "state": record.state.value,
+                    "output_tokens": request.output_tokens,
+                    "risk_tp1": risk_value,
+                    "tp1": pool1.__dict__,
+                    "tp4": pool4.__dict__,
+                    "rate_bytes_s": rate.rate_bytes_s,
+                    "capacity_signal": capacity_signal.to_json(),
+                    "unix_s": time.time(),
+                }
+                audit.write(telemetry_row)
+                if manager_m0 is not None:
+                    assert m0_collector is not None
+                    assert m0_registry is not None
+                    assert m0_executor is not None
+                    if record.state is MigrationState.LOCAL:
+                        m0_registry.observe_idle("tp4", record.migration_id)
+                    elif record.state is MigrationState.SHADOW:
+                        m0_registry.observe_active("tp4", record.migration_id)
+                    start = None
+                    proposed_rate = None
+                    proposed_cancel = None
+                    if record.state is MigrationState.LOCAL:
+                        start = (
+                            policy.evaluate(
+                                request,
+                                MigrationState.LOCAL,
+                                pool1,
+                                pool4,
+                                risk_value,
+                                rate.rate_bytes_s,
+                                now_unix_s=now,
+                                active_migrations=0,
+                            ).action
+                            is Action.START_SHADOW
+                        )
+                    elif record.state is MigrationState.SHADOW:
+                        proposed_rate = copy.deepcopy(rate).step(
+                            pool4.p99_tpot_s,
+                            policy.migration_bytes(request),
+                            seconds_to_deadline=None,
+                        )
+                        proposed_cancel = (
+                            False
+                            if capacity_signal.active
+                            else policy.should_abandon(
+                                request,
+                                pool1,
+                                pool4,
+                                rate.rate_bytes_s,
+                                risk_value,
+                            )[0]
+                        )
+                    progress: dict[str, Any] = {}
+                    if record.state is MigrationState.SHADOW:
+                        try:
+                            manifest_path = run_dir / "session_manifest.json"
+                            if (
+                                m0_history_total_bytes is None
+                                and manifest_path.is_file()
+                            ):
+                                manifest = load_json(manifest_path)
+                                ranks = manifest.get("ranks") or []
+                                if len(ranks) == 4 and all(
+                                    "payload_bytes" in rank for rank in ranks
+                                ):
+                                    m0_history_total_bytes = sum(
+                                        int(rank["payload_bytes"])
+                                        for rank in ranks
+                                    )
+                            progress["history_total_bytes"] = (
+                                m0_history_total_bytes
+                            )
+                            history_ready, _, _ = (
+                                adapter.poll_initial_history_gpu_ready()
+                            )
+                            progress["all_ranks_history_resident"] = history_ready
+                            if history_ready:
+                                progress["history_resident_bytes"] = (
+                                    m0_history_total_bytes
+                                )
+                                watermarks_ready, watermarks, _ = (
+                                    adapter.poll_delta_gpu_resident_progress()
+                                )
+                                if watermarks_ready:
+                                    progress["delta_lag_tokens"] = max(
+                                        0,
+                                        request.computed_tokens
+                                        - min(watermarks.values()),
+                                    )
+                        except (OSError, ValueError, ActionError) as error:
+                            audit.write(
+                                {
+                                    "kind": "manager_m0_observation_error",
+                                    "tick": tick,
+                                    "detail": str(error),
+                                }
+                            )
+                    snapshot = m0_collector.collect(
+                        telemetry_row,
+                        migration_id=record.migration_id,
+                        request_id=request.request_id,
+                        channel_available=m0_registry.available(
+                            "tp4", record.migration_id
+                        ),
+                        expected_remaining_tokens=(
+                            table.expected_remaining(request.output_tokens)
+                            if table.in_support(request.output_tokens)
+                            else None
+                        ),
+                        current_context_tokens=(
+                            request.computed_tokens + request.pending_tokens
+                        ),
+                        request_age_s=max(0.0, now - request.arrival_unix_s),
+                        progress=progress,
+                    )
+                    proposal = M0Proposal(
+                        start=start,
+                        rate_bytes_s=proposed_rate,
+                        cancel=proposed_cancel,
+                        origin="existing_controller_preview",
+                    )
+                    m0_executor.publish(
+                        tick,
+                        snapshot,
+                        proposal,
+                        manager_m0.decide(snapshot, proposal),
+                    )
 
                 if record.state is MigrationState.LOCAL:
                     step_local(
