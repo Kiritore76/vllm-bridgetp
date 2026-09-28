@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import unittest
 from argparse import Namespace
 from pathlib import Path
@@ -13,6 +14,7 @@ from tools.bridge_tp.run_shadow_rate_load_matrix import (
     resolve_design,
 )
 from tools.bridge_tp.run_shadow_strategy_online_validation import (
+    accept_m1_stay,
     build_controller_config_overrides,
     controller_completion_errors,
     emitted_boundary_gap_ms,
@@ -44,6 +46,41 @@ class TestOnlineShadowManifest(unittest.TestCase):
 
 
 class TestOnlineStrategyTiming(unittest.TestCase):
+    def test_m1_short_request_stay_acceptance(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            controller = root / "controller"
+            background = root / "background"
+            controller.mkdir()
+            background.mkdir()
+            (controller / "source_response.json").write_text(
+                json.dumps({"token_ids": list(range(96)), "finish_reason": "length"}),
+                encoding="utf-8",
+            )
+            (background / "background_summary.json").write_text(
+                json.dumps({"jobs": 2, "completed": 2, "failed": 0}),
+                encoding="utf-8",
+            )
+            rows = [
+                {"kind": "manager_m1_start_decision", "decision": {
+                    "action": "STAY", "reason": "insufficient target output budget"}},
+                {"kind": "transition", "to": "COMPLETED_ON_TP1"},
+                {"kind": "run_end", "final_state": "COMPLETED_ON_TP1",
+                 "trigger_path": None},
+            ]
+            (controller / "phase9_audit.jsonl").write_text(
+                "\n".join(json.dumps(row) for row in rows), encoding="utf-8"
+            )
+            result = accept_m1_stay(controller, background, 2, 96)
+            self.assertEqual(result["status"], "PASS")
+            rows[0]["decision"]["action"] = "START_SHADOW"
+            (controller / "phase9_audit.jsonl").write_text(
+                "\n".join(json.dumps(row) for row in rows), encoding="utf-8"
+            )
+            self.assertEqual(
+                accept_m1_stay(controller, background, 2, 96)["status"], "FAIL"
+            )
+
     def test_controller_completion_accepts_m1_only_when_selected(self) -> None:
         m1_end = [{"final_state": "TAKEOVER", "trigger_path": "MANAGER_M1_START"}]
         fixed_end = [
