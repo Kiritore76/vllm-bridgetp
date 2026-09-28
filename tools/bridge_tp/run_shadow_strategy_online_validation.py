@@ -240,6 +240,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="record M0 advisory decisions in each controller audit",
     )
+    parser.add_argument(
+        "--manager-m1-auto-start",
+        action="store_true",
+        help="let M1 select Shadow start from live evidence",
+    )
     parser.add_argument("--anchor-max-tokens", type=int, default=1024)
     parser.add_argument("--anchor-prompt-tokens", type=int, default=None)
     parser.add_argument("--minimum-ready-target-jobs", type=int, default=2)
@@ -531,6 +536,20 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise ValueError("SLO thresholds must be positive")
     if args.fixed_rate_gib_s is not None and args.fixed_rate_gib_s < 0:
         raise ValueError("fixed migration rate cannot be negative")
+    if args.manager_m1_auto_start and not (
+        args.shadow_only_only
+        and args.gpu_resident_shadow
+        and args.gpu_direct_history
+        and args.gpu_direct_delta
+        and args.gpu_direct_history_pacing
+        and args.fixed_rate_gib_s is not None
+        and args.fixed_rate_gib_s > 0
+        and args.commit_timing == "EARLIEST_READY"
+    ):
+        raise ValueError(
+            "M1 requires paced GPU-direct Shadow-only, a positive fixed rate, "
+            "and EARLIEST_READY cutover"
+        )
     if not args.python_bin.is_file():
         raise FileNotFoundError(f"Python executable is missing: {args.python_bin}")
     if not args.model_path.exists():
@@ -1387,6 +1406,7 @@ def accept_online(
     preconnect_persistent_channel: bool = False,
     persistent_expected_session_count: int = 1,
     commit_timing: str = "FIXED",
+    manager_m1_auto_start: bool = False,
     source_pressure_expected_jobs: int = 0,
     minimum_source_kv_usage_frac: float = 0.0,
 ) -> dict[str, Any]:
@@ -1469,7 +1489,16 @@ def accept_online(
     earliest_ready_armed = [
         row
         for row in audit
-        if row.get("kind") == "diagnostic_earliest_ready_armed"
+        if row.get("kind") == (
+            "manager_m1_earliest_ready_armed"
+            if manager_m1_auto_start
+            else "diagnostic_earliest_ready_armed"
+        )
+    ]
+    m1_starts = [
+        row for row in audit
+        if row.get("kind") == "manager_m1_start_decision"
+        and row.get("decision", {}).get("action") == "START_SHADOW"
     ]
     earliest_ready_selected = [
         row
@@ -1665,6 +1694,13 @@ def accept_online(
     )
     if transitions[-len(expected_transitions) :] != expected_transitions:
         errors.append(f"unexpected migration transitions: {transitions!r}")
+    if manager_m1_auto_start:
+        if len(m1_starts) != 1:
+            errors.append("M1 did not choose exactly one autonomous Shadow start")
+        if any(row.get("kind") == "diagnostic_boundary_forced" for row in audit):
+            errors.append("M1 run used a diagnostic fixed start")
+        if not end_rows or end_rows[-1].get("trigger_path") != "MANAGER_M1_START":
+            errors.append("M1 trigger path was not recorded")
     if handoff_mode == "shadow-only" and not stop_and_copy:
         if frozen_receipt is None:
             errors.append("scheduler did not acknowledge the Shadow-only freeze")
@@ -2735,6 +2771,7 @@ def main() -> None:
         "remote_attention_base_port": args.remote_attention_base_port,
         "commit_timing": args.commit_timing,
         "manager_m0_shadow": args.manager_m0_shadow,
+        "manager_m1_auto_start": args.manager_m1_auto_start,
         "bridge_output_tokens": args.bridge_output_tokens,
         "repetitions": args.repetitions,
         "source_pressure": args.source_pressure,
@@ -2955,6 +2992,7 @@ def main() -> None:
                             else 1
                         ),
                         commit_timing=args.commit_timing,
+                        manager_m1_auto_start=args.manager_m1_auto_start,
                         source_pressure_expected_jobs=(
                             pressure["source_jobs"] if args.source_pressure else 0
                         ),
@@ -2994,6 +3032,11 @@ def main() -> None:
                     cutover_output_tokens=args.cutover_output_tokens,
                     fixed_rate_gib_s=args.fixed_rate_gib_s,
                 )
+                if args.manager_m1_auto_start:
+                    controller_config_overrides["capacity_pilot"] = {
+                        "enabled": True,
+                        "guard_free_kv_tokens": guard,
+                    }
                 if args.fixed_rate_gib_s is not None:
                     source_env_overrides["BRIDGETP_STREAM_RATE_GIB_S"] = str(
                         args.fixed_rate_gib_s
@@ -3003,10 +3046,14 @@ def main() -> None:
                         "BRIDGETP_GPU_DIRECT_HISTORY_PACING"
                     ] = "1"
 
-                controller_extra_args = [
-                    "--diagnostic-trigger-output-tokens",
-                    str(args.trigger_output_tokens),
-                ]
+                controller_extra_args = (
+                    ["--manager-m1-auto-start"]
+                    if args.manager_m1_auto_start
+                    else [
+                        "--diagnostic-trigger-output-tokens",
+                        str(args.trigger_output_tokens),
+                    ]
+                )
                 if args.manager_m0_shadow:
                     controller_extra_args.append("--manager-m0-shadow")
                 if args.commit_timing == "EARLIEST_READY":
