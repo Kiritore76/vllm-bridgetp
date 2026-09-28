@@ -80,6 +80,32 @@ class TestOnlineStrategyTiming(unittest.TestCase):
             self.assertEqual(
                 accept_m1_stay(controller, background, 2, 96)["status"], "FAIL"
             )
+            rows[0]["decision"] = {
+                "action": "STAY", "reason": "target load exceeds admission guard"
+            }
+            rows[0]["snapshot"] = {
+                "target_waiting": 8,
+                "source_free_kv_tokens": 29000,
+                "source_guard_free_kv_tokens": 8448,
+            }
+            (controller / "phase9_audit.jsonl").write_text(
+                "\n".join(json.dumps(row) for row in rows), encoding="utf-8"
+            )
+            result = accept_m1_stay(
+                controller, background, 2, 96, "target-load"
+            )
+            self.assertEqual(result["status"], "PASS")
+            self.assertEqual(result["peak_target_waiting"], 8)
+            rows[0]["snapshot"]["target_waiting"] = 2
+            (controller / "phase9_audit.jsonl").write_text(
+                "\n".join(json.dumps(row) for row in rows), encoding="utf-8"
+            )
+            self.assertEqual(
+                accept_m1_stay(
+                    controller, background, 2, 96, "target-load"
+                )["status"],
+                "FAIL",
+            )
 
     def test_controller_completion_accepts_m1_only_when_selected(self) -> None:
         m1_end = [{"final_state": "TAKEOVER", "trigger_path": "MANAGER_M1_START"}]

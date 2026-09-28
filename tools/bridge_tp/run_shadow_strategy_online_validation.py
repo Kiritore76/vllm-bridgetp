@@ -248,7 +248,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--manager-m1-expect-stay",
         action="store_true",
-        help="accept a capped short request completed entirely on TP1",
+        help="accept an M1 request completed entirely on TP1",
+    )
+    parser.add_argument(
+        "--manager-m1-stay-reason",
+        choices=("short-budget", "target-load"),
+        default="short-budget",
+        help="the specific M1 refusal that the STAY smoke must observe",
     )
     parser.add_argument("--anchor-max-tokens", type=int, default=1024)
     parser.add_argument("--anchor-prompt-tokens", type=int, default=None)
@@ -277,6 +283,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--tp1-gpu", default="0")
     parser.add_argument("--tp4-gpus", default="1,2,3,4")
+    parser.add_argument("--tp4-max-num-seqs", type=int, default=None)
     parser.add_argument("--tp1-port", type=int, default=8001)
     parser.add_argument("--tp4-port", type=int, default=8200)
     parser.add_argument("--snapshot-port", type=int, default=29800)
@@ -555,16 +562,24 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
             "M1 requires paced GPU-direct Shadow-only, a positive fixed rate, "
             "and EARLIEST_READY cutover"
         )
+    if args.tp4_max_num_seqs is not None and args.tp4_max_num_seqs <= 0:
+        raise ValueError("TP4 max-num-seqs must be positive")
     if args.manager_m1_expect_stay and not (
         args.manager_m1_auto_start
-        and args.anchor_max_tokens == 96
         and args.shadow_only_only
         and not args.persistent_sequential_reuse
     ):
         raise ValueError(
-            "M1 STAY smoke requires M1, 96 output tokens, Shadow-only, "
-            "and no sequential reuse"
+            "M1 STAY smoke requires M1 Shadow-only without sequential reuse"
         )
+    if args.manager_m1_expect_stay:
+        if args.manager_m1_stay_reason == "short-budget":
+            if args.anchor_max_tokens != 96 or args.tp4_max_num_seqs is not None:
+                raise ValueError("short-budget STAY requires 96 output tokens")
+        elif args.anchor_max_tokens != 1024 or args.tp4_max_num_seqs != 2:
+            raise ValueError(
+                "target-load STAY requires 1024 output tokens and TP4 max-num-seqs 2"
+            )
     if not args.python_bin.is_file():
         raise FileNotFoundError(f"Python executable is missing: {args.python_bin}")
     if not args.model_path.exists():
@@ -619,6 +634,12 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise ValueError("A4-P requires persistent GPU-direct Shadow-only")
     if len(target_jobs) < args.minimum_ready_target_jobs:
         raise ValueError("manifest has too few target jobs for the readiness gate")
+    if (
+        args.manager_m1_expect_stay
+        and args.manager_m1_stay_reason == "target-load"
+        and len(target_jobs) < 16
+    ):
+        raise ValueError("target-load STAY requires at least 16 target jobs")
     for job in target_jobs:
         prompt = job["request"].get("prompt")
         if not isinstance(prompt, list) or not all(isinstance(x, int) for x in prompt):
@@ -1417,15 +1438,17 @@ def accept_m1_stay(
     background_dir: Path,
     expected_jobs: int,
     expected_anchor_tokens: int,
+    stay_reason: str = "short-budget",
 ) -> dict[str, Any]:
-    """Accept only a fully observed short request that never entered Shadow."""
+    """Accept a fully observed M1 refusal that never entered Shadow."""
     background = common.read_json(background_dir / "background_summary.json")
     source = common.read_json(controller_dir / "source_response.json")
     audit = _load_rows(controller_dir / "phase9_audit.jsonl")
-    decisions = [
-        row["decision"] for row in audit
+    decision_rows = [
+        row for row in audit
         if row.get("kind") == "manager_m1_start_decision"
     ]
+    decisions = [row["decision"] for row in decision_rows]
     endings = [row for row in audit if row.get("kind") == "run_end"]
     transitions = [row.get("to") for row in audit if row.get("kind") == "transition"]
     tokens = source.get("token_ids") or []
@@ -1447,11 +1470,26 @@ def accept_m1_stay(
         errors.append("controller entered a migration state")
     if not decisions or any(row.get("action") != "STAY" for row in decisions):
         errors.append("M1 did not consistently choose STAY")
-    if not any(
-        row.get("reason") == "insufficient target output budget"
-        for row in decisions
+    expected_reason = {
+        "short-budget": "insufficient target output budget",
+        "target-load": "target load exceeds admission guard",
+    }[stay_reason]
+    guarded = [
+        row for row in decision_rows
+        if row["decision"].get("reason") == expected_reason
+    ]
+    if not guarded:
+        errors.append(f"M1 never observed the {stay_reason} guard")
+    if stay_reason == "target-load" and not any(
+        (
+            (row.get("snapshot", {}).get("target_waiting") or 0) > 4
+            or (row.get("snapshot", {}).get("target_kv_usage_frac") or 0) > 0.85
+        )
+        and (row.get("snapshot", {}).get("source_free_kv_tokens") or 0)
+        > (row.get("snapshot", {}).get("source_guard_free_kv_tokens") or 0)
+        for row in guarded
     ):
-        errors.append("M1 never observed the short-request budget guard")
+        errors.append("target-load refusal lacked live load and source slack")
     if (controller_dir / "session_manifest.json").exists():
         errors.append("a Shadow session was created")
     if (controller_dir / "cutover_manifest.json").exists():
@@ -1466,6 +1504,12 @@ def accept_m1_stay(
         "target_origin_tokens": 0,
         "m1_decisions": len(decisions),
         "m1_reasons": sorted({str(row.get("reason")) for row in decisions}),
+        "stay_reason": stay_reason,
+        "guarded_decisions": len(guarded),
+        "peak_target_waiting": max(
+            (row.get("snapshot", {}).get("target_waiting") or 0)
+            for row in decision_rows
+        ) if decision_rows else None,
         "final_state": endings[0].get("final_state") if endings else None,
         "errors": errors,
     }
@@ -1498,12 +1542,14 @@ def accept_online(
     commit_timing: str = "FIXED",
     manager_m1_auto_start: bool = False,
     manager_m1_expect_stay: bool = False,
+    manager_m1_stay_reason: str = "short-budget",
     source_pressure_expected_jobs: int = 0,
     minimum_source_kv_usage_frac: float = 0.0,
 ) -> dict[str, Any]:
     if manager_m1_expect_stay:
         return accept_m1_stay(
-            controller_dir, background_dir, expected_jobs, expected_anchor_tokens
+            controller_dir, background_dir, expected_jobs, expected_anchor_tokens,
+            manager_m1_stay_reason,
         )
     background = common.read_json(background_dir / "background_summary.json")
     session = common.read_json(controller_dir / "session_manifest.json")
@@ -2863,6 +2909,8 @@ def main() -> None:
         "manager_m0_shadow": args.manager_m0_shadow,
         "manager_m1_auto_start": args.manager_m1_auto_start,
         "manager_m1_expect_stay": args.manager_m1_expect_stay,
+        "manager_m1_stay_reason": args.manager_m1_stay_reason,
+        "tp4_max_num_seqs": args.tp4_max_num_seqs,
         "bridge_output_tokens": args.bridge_output_tokens,
         "repetitions": args.repetitions,
         "source_pressure": args.source_pressure,
@@ -3085,6 +3133,7 @@ def main() -> None:
                         commit_timing=args.commit_timing,
                         manager_m1_auto_start=args.manager_m1_auto_start,
                         manager_m1_expect_stay=args.manager_m1_expect_stay,
+                        manager_m1_stay_reason=args.manager_m1_stay_reason,
                         source_pressure_expected_jobs=(
                             pressure["source_jobs"] if args.source_pressure else 0
                         ),
