@@ -5,9 +5,11 @@ import unittest
 from argparse import Namespace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import MagicMock
 
 from tools.bridge_tp.build_shadow_strategy_online_manifest import build_manifest
 from tools.bridge_tp.run_phase9_capacity_background import percentile
+from tools.bridge_tp.run_phase9_cap0_noop import wait_for_background_first_tokens
 from tools.bridge_tp.run_shadow_rate_load_matrix import (
     parse_load_profiles,
     rate_label,
@@ -18,6 +20,7 @@ from tools.bridge_tp.run_shadow_strategy_online_validation import (
     build_controller_config_overrides,
     controller_completion_errors,
     emitted_boundary_gap_ms,
+    has_measured_source_high,
     summarize_emitted_intervals,
     summarize_slo,
     write_measurements,
@@ -46,6 +49,58 @@ class TestOnlineShadowManifest(unittest.TestCase):
 
 
 class TestOnlineStrategyTiming(unittest.TestCase):
+    def test_source_readiness_requires_active_source_tokens(self) -> None:
+        with TemporaryDirectory() as temp:
+            event_path = Path(temp) / "events.jsonl"
+            process = MagicMock()
+            process.process.poll.return_value = None
+            process.log_path = Path(temp) / "background.log"
+            rows = [
+                {"kind": "job_first_token", "job_id": "target-1", "pool": "target"},
+                {"kind": "job_first_token", "job_id": "source-1", "pool": "source"},
+                {"kind": "job_end", "job_id": "source-1", "pool": "source"},
+            ]
+            event_path.write_text(
+                "\n".join(json.dumps(row) for row in rows), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(TimeoutError, "remain active"):
+                wait_for_background_first_tokens(
+                    event_path, process, 1, 0.01,
+                    pool="source", require_active=True,
+                )
+            rows.append({
+                "kind": "job_first_token", "job_id": "source-2", "pool": "source",
+            })
+            event_path.write_text(
+                "\n".join(json.dumps(row) for row in rows), encoding="utf-8"
+            )
+            wait_for_background_first_tokens(
+                event_path, process, 1, 0.01,
+                pool="source", require_active=True,
+            )
+
+    def test_measured_source_high_rejects_forced_or_post_guard_high(self) -> None:
+        decision = {
+            "action": "SET_RATE", "profile": "HIGH",
+            "reason": "source guard horizon is short",
+            "source_time_to_guard_s": 8.0,
+        }
+        snapshot = {
+            "source_free_kv_tokens": 9000,
+            "source_guard_free_kv_tokens": 8448,
+        }
+        audit = [{
+            "kind": "manager_m2_initial_rate",
+            "decision": decision,
+            "snapshot": snapshot,
+        }]
+        self.assertTrue(has_measured_source_high(audit))
+        decision["reason"] = "diagnostic HIGH transfer smoke"
+        self.assertFalse(has_measured_source_high(audit))
+        decision["reason"] = "source guard horizon is short"
+        snapshot["source_free_kv_tokens"] = 8000
+        self.assertFalse(has_measured_source_high(audit))
+
     def test_m1_short_request_stay_acceptance(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)

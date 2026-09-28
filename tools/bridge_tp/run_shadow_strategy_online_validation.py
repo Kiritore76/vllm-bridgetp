@@ -248,6 +248,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--manager-m2-rate", action="store_true")
     parser.add_argument("--manager-m2-force-initial-high", action="store_true")
+    parser.add_argument("--manager-m2-require-source-high", action="store_true")
     parser.add_argument("--m2-low-gib-s", type=float)
     parser.add_argument("--m2-medium-gib-s", type=float)
     parser.add_argument("--m2-high-gib-s", type=float)
@@ -272,6 +273,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--anchor-max-tokens", type=int, default=1024)
     parser.add_argument("--anchor-prompt-tokens", type=int, default=None)
     parser.add_argument("--minimum-ready-target-jobs", type=int, default=2)
+    parser.add_argument("--minimum-ready-source-jobs", type=int, default=0)
     parser.add_argument("--background-lead-s", type=float, default=2.0)
     parser.add_argument("--minimum-window-samples", type=int, default=4)
     parser.add_argument(
@@ -595,6 +597,15 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         and args.manager_m2_expected_profile == "HIGH"
     ):
         raise ValueError("forced initial HIGH is only for M2 HIGH smoke")
+    if args.manager_m2_require_source_high and not (
+        args.manager_m2_rate
+        and args.source_pressure
+        and not args.manager_m2_force_initial_high
+        and args.manager_m2_expected_profile == "HIGH"
+    ):
+        raise ValueError(
+            "source-driven HIGH requires M2, source peers, and no force flag"
+        )
     if args.manager_m1_auto_start and not (
         args.shadow_only_only
         and args.gpu_resident_shadow
@@ -683,6 +694,12 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise ValueError("A4-P requires persistent GPU-direct Shadow-only")
     if len(target_jobs) < args.minimum_ready_target_jobs:
         raise ValueError("manifest has too few target jobs for the readiness gate")
+    if not 0 <= args.minimum_ready_source_jobs <= len(source_jobs):
+        raise ValueError("source readiness count exceeds manifest source jobs")
+    if args.manager_m2_require_source_high and (
+        args.minimum_ready_source_jobs < 1
+    ):
+        raise ValueError("source-driven HIGH requires a source readiness gate")
     if (
         args.manager_m1_expect_stay
         and args.manager_m1_stay_reason == "target-load"
@@ -701,6 +718,18 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
             raise ValueError("A4-P source peers require exact prompt token IDs")
         if len(prompt) + int(job["request"]["max_tokens"]) > args.max_model_len:
             raise ValueError(f"source job {job['job_id']} exceeds max model length")
+    if args.manager_m2_require_source_high:
+        if args.anchor_prompt_tokens is None:
+            raise ValueError("source-driven HIGH needs an explicit anchor prompt")
+        capped_source_tokens = sum(
+            len(job["request"]["prompt"])
+            + int(job["request"]["max_tokens"])
+            for job in source_jobs
+        ) + args.anchor_prompt_tokens + args.anchor_max_tokens
+        if capped_source_tokens >= args.tp1_blocks * 16:
+            raise ValueError(
+                "source-driven HIGH peers plus anchor exceed TP1 KV capacity"
+            )
     if args.out_root.exists():
         raise FileExistsError(f"refusing to reuse output root {args.out_root}")
     return (
@@ -1573,6 +1602,34 @@ def accept_m1_stay(
     }
 
 
+def has_measured_source_high(audit: list[dict[str, Any]]) -> bool:
+    """Check that an M2 HIGH action used live pre-guard source telemetry."""
+    for row in audit:
+        if row.get("kind") == "manager_m2_initial_rate":
+            decision = row.get("decision") or {}
+            snapshot = row.get("snapshot") or {}
+        elif row.get("kind") == "rate":
+            decision = row.get("manager_m2_decision") or {}
+            snapshot = row.get("manager_m2_snapshot") or {}
+        else:
+            continue
+        horizon = decision.get("source_time_to_guard_s")
+        free = snapshot.get("source_free_kv_tokens")
+        guard = snapshot.get("source_guard_free_kv_tokens")
+        if (
+            decision.get("action") == "SET_RATE"
+            and decision.get("profile") == "HIGH"
+            and decision.get("reason") == "source guard horizon is short"
+            and isinstance(horizon, (int, float))
+            and 0 < horizon <= 30.0
+            and isinstance(free, (int, float))
+            and isinstance(guard, (int, float))
+            and free > guard
+        ):
+            return True
+    return False
+
+
 def accept_online(
     controller_dir: Path,
     background_dir: Path,
@@ -1586,6 +1643,7 @@ def accept_online(
     m2_profiles_gib_s: tuple[float, float, float] | None = None,
     manager_m2_expected_profile: str | None = None,
     manager_m2_min_history_byte_frac: float = 0.0,
+    manager_m2_require_source_high: bool = False,
     gpu_direct_history_pacing_expected: bool = False,
     handoff_mode: str = "bridge",
     require_remote_attention: bool = False,
@@ -2425,6 +2483,11 @@ def accept_online(
             for row in m2_rows
         ):
             errors.append("M2 used a rate outside the three configured profiles")
+        if manager_m2_require_source_high:
+            if not has_measured_source_high(audit):
+                errors.append(
+                    "M2 HIGH was not caused by measured pre-guard source pressure"
+                )
     slo = summarize_slo(
         background.get("results", []),
         tpot_ms=slo_tpot_ms,
@@ -3048,6 +3111,7 @@ def main() -> None:
         "manager_m1_auto_start": args.manager_m1_auto_start,
         "manager_m2_rate": args.manager_m2_rate,
         "manager_m2_force_initial_high": args.manager_m2_force_initial_high,
+        "manager_m2_require_source_high": args.manager_m2_require_source_high,
         "manager_m2_expected_profile": args.manager_m2_expected_profile,
         "manager_m2_min_history_byte_frac": (
             args.manager_m2_min_history_byte_frac
@@ -3062,6 +3126,7 @@ def main() -> None:
         "bridge_output_tokens": args.bridge_output_tokens,
         "repetitions": args.repetitions,
         "source_pressure": args.source_pressure,
+        "minimum_ready_source_jobs": args.minimum_ready_source_jobs,
         "minimum_source_kv_usage_frac": args.minimum_source_kv_usage_frac,
         "fixed_rate_gib_s": args.fixed_rate_gib_s,
         "slo_thresholds": {
@@ -3260,6 +3325,9 @@ def main() -> None:
                         manager_m2_min_history_byte_frac=(
                             args.manager_m2_min_history_byte_frac
                         ),
+                        manager_m2_require_source_high=(
+                            args.manager_m2_require_source_high
+                        ),
                         m2_profiles_gib_s=(
                             (args.m2_low_gib_s, args.m2_medium_gib_s,
                              args.m2_high_gib_s)
@@ -3444,6 +3512,9 @@ def main() -> None:
                     background_before_controller=True,
                     background_lead_s=args.background_lead_s,
                     background_ready_jobs=args.minimum_ready_target_jobs,
+                    background_ready_source_jobs=(
+                        args.minimum_ready_source_jobs
+                    ),
                     service_pool=service_pool,
                 )
                 memory_snapshot = None
