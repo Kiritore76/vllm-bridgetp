@@ -638,6 +638,9 @@ def step_shadow(
             "manager_m2_decision": (
                 m2_decision.to_json() if m2_decision is not None else None
             ),
+            "manager_m2_snapshot": (
+                m2_snapshot.to_json() if m2_decision is not None else None
+            ),
         }
     )
     if not dry_run:

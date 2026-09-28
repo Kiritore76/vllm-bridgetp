@@ -178,6 +178,8 @@ def wait_for_background_first_tokens(
     process: common.ManagedProcess,
     minimum_jobs: int,
     timeout_s: float,
+    pool: str | None = None,
+    require_active: bool = False,
 ) -> None:
     if minimum_jobs <= 0:
         return
@@ -189,18 +191,25 @@ def wait_for_background_first_tokens(
                 f"see {process.log_path}"
             )
         jobs: set[str] = set()
+        ended: set[str] = set()
         try:
             for line in event_path.read_text(encoding="utf-8").splitlines():
                 row = json.loads(line)
+                if pool is not None and row.get("pool") != pool:
+                    continue
                 if row.get("kind") == "job_first_token":
                     jobs.add(str(row.get("job_id")))
+                elif row.get("kind") == "job_end":
+                    ended.add(str(row.get("job_id")))
         except (FileNotFoundError, json.JSONDecodeError):
             pass
-        if len(jobs) >= minimum_jobs:
+        if len(jobs - ended if require_active else jobs) >= minimum_jobs:
             return
         time.sleep(0.1)
     raise TimeoutError(
-        f"timed out waiting for {minimum_jobs} target jobs to emit a token"
+        f"timed out waiting for {minimum_jobs} {pool or 'background'} "
+        "jobs to emit a token"
+        + (" and remain active" if require_active else "")
     )
 
 
@@ -412,6 +421,7 @@ def run(
     background_before_controller: bool = False,
     background_lead_s: float = 0.0,
     background_ready_jobs: int = 0,
+    background_ready_source_jobs: int = 0,
     service_pool: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if phase not in {"bringup", "formal"}:
@@ -681,6 +691,15 @@ def run(
                 background,
                 background_ready_jobs,
                 min(args.run_timeout_s, args.server_start_timeout_s),
+                pool="target",
+            )
+            wait_for_background_first_tokens(
+                background_dir / "background_events.jsonl",
+                background,
+                background_ready_source_jobs,
+                min(args.run_timeout_s, args.server_start_timeout_s),
+                pool="source",
+                require_active=True,
             )
             if background_lead_s > 0:
                 time.sleep(background_lead_s)
