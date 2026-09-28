@@ -245,6 +245,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="let M1 select Shadow start from live evidence",
     )
+    parser.add_argument(
+        "--manager-m1-expect-stay",
+        action="store_true",
+        help="accept a capped short request completed entirely on TP1",
+    )
     parser.add_argument("--anchor-max-tokens", type=int, default=1024)
     parser.add_argument("--anchor-prompt-tokens", type=int, default=None)
     parser.add_argument("--minimum-ready-target-jobs", type=int, default=2)
@@ -549,6 +554,16 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise ValueError(
             "M1 requires paced GPU-direct Shadow-only, a positive fixed rate, "
             "and EARLIEST_READY cutover"
+        )
+    if args.manager_m1_expect_stay and not (
+        args.manager_m1_auto_start
+        and args.anchor_max_tokens == 96
+        and args.shadow_only_only
+        and not args.persistent_sequential_reuse
+    ):
+        raise ValueError(
+            "M1 STAY smoke requires M1, 96 output tokens, Shadow-only, "
+            "and no sequential reuse"
         )
     if not args.python_bin.is_file():
         raise FileNotFoundError(f"Python executable is missing: {args.python_bin}")
@@ -1397,6 +1412,65 @@ def controller_completion_errors(
     return []
 
 
+def accept_m1_stay(
+    controller_dir: Path,
+    background_dir: Path,
+    expected_jobs: int,
+    expected_anchor_tokens: int,
+) -> dict[str, Any]:
+    """Accept only a fully observed short request that never entered Shadow."""
+    background = common.read_json(background_dir / "background_summary.json")
+    source = common.read_json(controller_dir / "source_response.json")
+    audit = _load_rows(controller_dir / "phase9_audit.jsonl")
+    decisions = [
+        row["decision"] for row in audit
+        if row.get("kind") == "manager_m1_start_decision"
+    ]
+    endings = [row for row in audit if row.get("kind") == "run_end"]
+    transitions = [row.get("to") for row in audit if row.get("kind") == "transition"]
+    tokens = source.get("token_ids") or []
+    errors: list[str] = []
+    if background.get("jobs") != expected_jobs or (
+        background.get("completed") != expected_jobs
+        or background.get("failed") != 0
+    ):
+        errors.append("background jobs did not all complete")
+    if len(tokens) != expected_anchor_tokens:
+        errors.append("source did not emit the full capped output")
+    if source.get("finish_reason") != "length":
+        errors.append("source did not finish at the output cap")
+    if len(endings) != 1 or endings[0].get("final_state") != "COMPLETED_ON_TP1":
+        errors.append("controller did not complete on TP1")
+    elif endings[0].get("trigger_path") is not None:
+        errors.append("controller recorded a migration trigger")
+    if transitions != ["COMPLETED_ON_TP1"]:
+        errors.append("controller entered a migration state")
+    if not decisions or any(row.get("action") != "STAY" for row in decisions):
+        errors.append("M1 did not consistently choose STAY")
+    if not any(
+        row.get("reason") == "insufficient target output budget"
+        for row in decisions
+    ):
+        errors.append("M1 never observed the short-request budget guard")
+    if (controller_dir / "session_manifest.json").exists():
+        errors.append("a Shadow session was created")
+    if (controller_dir / "cutover_manifest.json").exists():
+        errors.append("a migration cutover was recorded")
+    if (controller_dir / "target_response.json").exists():
+        errors.append("a target response was recorded")
+    return {
+        "format_version": 1,
+        "status": "PASS" if not errors else "FAIL",
+        "expected_anchor_tokens": expected_anchor_tokens,
+        "source_origin_tokens": len(tokens),
+        "target_origin_tokens": 0,
+        "m1_decisions": len(decisions),
+        "m1_reasons": sorted({str(row.get("reason")) for row in decisions}),
+        "final_state": endings[0].get("final_state") if endings else None,
+        "errors": errors,
+    }
+
+
 def accept_online(
     controller_dir: Path,
     background_dir: Path,
@@ -1423,9 +1497,14 @@ def accept_online(
     persistent_expected_session_count: int = 1,
     commit_timing: str = "FIXED",
     manager_m1_auto_start: bool = False,
+    manager_m1_expect_stay: bool = False,
     source_pressure_expected_jobs: int = 0,
     minimum_source_kv_usage_frac: float = 0.0,
 ) -> dict[str, Any]:
+    if manager_m1_expect_stay:
+        return accept_m1_stay(
+            controller_dir, background_dir, expected_jobs, expected_anchor_tokens
+        )
     background = common.read_json(background_dir / "background_summary.json")
     session = common.read_json(controller_dir / "session_manifest.json")
     cutover = common.read_json(controller_dir / "cutover_manifest.json")
@@ -2783,6 +2862,7 @@ def main() -> None:
         "commit_timing": args.commit_timing,
         "manager_m0_shadow": args.manager_m0_shadow,
         "manager_m1_auto_start": args.manager_m1_auto_start,
+        "manager_m1_expect_stay": args.manager_m1_expect_stay,
         "bridge_output_tokens": args.bridge_output_tokens,
         "repetitions": args.repetitions,
         "source_pressure": args.source_pressure,
@@ -3004,6 +3084,7 @@ def main() -> None:
                         ),
                         commit_timing=args.commit_timing,
                         manager_m1_auto_start=args.manager_m1_auto_start,
+                        manager_m1_expect_stay=args.manager_m1_expect_stay,
                         source_pressure_expected_jobs=(
                             pressure["source_jobs"] if args.source_pressure else 0
                         ),
@@ -3288,7 +3369,8 @@ def main() -> None:
             "persistent_channel_summary": persistent_summary,
             "errors": errors,
         }
-        write_measurements(out_root, batch["runs"])
+        if not args.manager_m1_expect_stay:
+            write_measurements(out_root, batch["runs"])
         common.write_json(out_root / "acceptance.json", final)
         if errors:
             raise RuntimeError("; ".join(errors))
