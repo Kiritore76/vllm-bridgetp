@@ -80,6 +80,40 @@ class TestM2RateController(unittest.TestCase):
         )
         self.assertEqual((decision.action, decision.profile), ("SET_RATE", "LOW"))
 
+    def test_initial_rate_is_selected_before_shadow_copy(self) -> None:
+        initial = self.controller.decide(
+            sample(state="LOCAL", target_running=4), before_start=True
+        )
+        self.assertEqual((initial.action, initial.profile), ("SET_RATE", "LOW"))
+        ongoing = self.controller.decide(
+            sample(unix_s=100.2, target_running=4)
+        )
+        self.assertEqual((ongoing.action, ongoing.profile), ("HOLD", "LOW"))
+
+    def test_initial_low_is_rejected_when_preparation_misses_guard(self) -> None:
+        decision = self.controller.decide(
+            sample(
+                state="LOCAL", target_running=4,
+                source_free_kv_tokens=14448,
+                source_pool_growth_tokens_s=100,
+                history_total_bytes=20 * 1024**3,
+            ),
+            before_start=True,
+        )
+        self.assertEqual((decision.action, decision.profile),
+                         ("SET_RATE", "HIGH"))
+
+    def test_diagnostic_high_arms_before_first_history_chunk(self) -> None:
+        controller = M2RateController(
+            self.controller.config, force_initial_high=True
+        )
+        decision = controller.decide(
+            sample(state="LOCAL", target_running=4), before_start=True
+        )
+        self.assertEqual((decision.action, decision.profile),
+                         ("SET_RATE", "HIGH"))
+        self.assertEqual(decision.reason, "diagnostic HIGH transfer smoke")
+
     def test_missing_or_stale_evidence_holds_rate(self) -> None:
         for state in (
             sample(target_waiting=None),

@@ -247,12 +247,16 @@ def parse_args() -> argparse.Namespace:
         help="let M1 select Shadow start from live evidence",
     )
     parser.add_argument("--manager-m2-rate", action="store_true")
+    parser.add_argument("--manager-m2-force-initial-high", action="store_true")
     parser.add_argument("--m2-low-gib-s", type=float)
     parser.add_argument("--m2-medium-gib-s", type=float)
     parser.add_argument("--m2-high-gib-s", type=float)
     parser.add_argument(
         "--manager-m2-expected-profile",
         choices=("LOW", "MEDIUM", "HIGH"),
+    )
+    parser.add_argument(
+        "--manager-m2-min-history-byte-frac", type=float, default=0.0
     )
     parser.add_argument(
         "--manager-m1-expect-stay",
@@ -579,6 +583,18 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise ValueError("M2 profiles require --manager-m2-rate")
     if args.manager_m2_expected_profile and not args.manager_m2_rate:
         raise ValueError("M2 expected profile requires --manager-m2-rate")
+    if not 0 <= args.manager_m2_min_history_byte_frac <= 1:
+        raise ValueError("M2 history byte fraction must be in [0, 1]")
+    if args.manager_m2_min_history_byte_frac and not (
+        args.manager_m2_rate and args.manager_m2_expected_profile
+    ):
+        raise ValueError("M2 history fraction requires an expected profile")
+    if args.manager_m2_force_initial_high and not (
+        args.manager_m2_rate
+        and args.phase == "smoke"
+        and args.manager_m2_expected_profile == "HIGH"
+    ):
+        raise ValueError("forced initial HIGH is only for M2 HIGH smoke")
     if args.manager_m1_auto_start and not (
         args.shadow_only_only
         and args.gpu_resident_shadow
@@ -1569,6 +1585,7 @@ def accept_online(
     manager_m2_rate: bool = False,
     m2_profiles_gib_s: tuple[float, float, float] | None = None,
     manager_m2_expected_profile: str | None = None,
+    manager_m2_min_history_byte_frac: float = 0.0,
     gpu_direct_history_pacing_expected: bool = False,
     handoff_mode: str = "bridge",
     require_remote_attention: bool = False,
@@ -1934,6 +1951,7 @@ def accept_online(
     gpu_direct_history = staging.get("gpu_direct_history") is True
     gpu_direct_delta = staging.get("gpu_direct_delta") is True
     direct_sender: dict[str, Any] = {}
+    m2_history_profile_byte_fraction: float | None = None
     target_channel_receipts: list[dict[str, Any]] = []
     preconnect_receipts: list[dict[str, Any]] = []
     if gpu_direct_history:
@@ -1990,6 +2008,26 @@ def accept_online(
                     ):
                         errors.append(
                             "M2 expected rate was not used by paced GPU history"
+                        )
+                    total_paced_bytes = sum(
+                        int(row.get("aggregate_bytes", 0)) for row in chunks
+                    )
+                    expected_paced_bytes = sum(
+                        int(row.get("aggregate_bytes", 0))
+                        for row in chunks
+                        if abs(float(row.get("requested_rate_gib_s", 0))
+                               - profile_rate) <= 1e-9
+                    )
+                    actual_fraction = (
+                        expected_paced_bytes / total_paced_bytes
+                        if total_paced_bytes else 0.0
+                    )
+                    m2_history_profile_byte_fraction = actual_fraction
+                    if actual_fraction < manager_m2_min_history_byte_frac:
+                        errors.append(
+                            "M2 expected profile paced too few history bytes: "
+                            f"{actual_fraction:.3f} < "
+                            f"{manager_m2_min_history_byte_frac:.3f}"
                         )
             if (
                 direct_sender.get("status") != "READY"
@@ -2358,21 +2396,27 @@ def accept_online(
             errors.append("controller deviated from the requested fixed rate")
     if manager_m2_rate:
         assert m2_profiles_gib_s is not None
+        initial_rows = [
+            row for row in audit
+            if row.get("kind") == "manager_m2_initial_rate"
+        ]
         m2_rows = [
             row for row in audit
             if row.get("kind") == "rate"
             and row.get("manager_m2_decision") is not None
         ]
+        changes = [row["decision"] for row in initial_rows] + [
+            row["manager_m2_decision"] for row in m2_rows
+        ]
         if not m2_rows:
             errors.append("M2 did not record active Shadow rate decisions")
         elif not any(
-            row["manager_m2_decision"]["action"] == "SET_RATE"
+            decision.get("action") == "SET_RATE"
             and (
                 manager_m2_expected_profile is None
-                or row["manager_m2_decision"]["profile"]
-                == manager_m2_expected_profile
+                or decision.get("profile") == manager_m2_expected_profile
             )
-            for row in m2_rows
+            for decision in changes
         ):
             errors.append("M2 did not actuate the expected profile change")
         if any(
@@ -2597,6 +2641,9 @@ def accept_online(
         "gpu_resident_shadow": gpu_resident_shadow,
         "gpu_direct_history": gpu_direct_history,
         "gpu_direct_history_pacing": gpu_direct_history_pacing_expected,
+        "m2_history_profile_byte_fraction": (
+            m2_history_profile_byte_fraction
+        ),
         "gpu_direct_history_pacing_evidence": (
             next(iter(direct_sender.get("ranks", [])), {}).get(
                 "history_pacing_chunks"
@@ -3000,7 +3047,11 @@ def main() -> None:
         "manager_m0_shadow": args.manager_m0_shadow,
         "manager_m1_auto_start": args.manager_m1_auto_start,
         "manager_m2_rate": args.manager_m2_rate,
+        "manager_m2_force_initial_high": args.manager_m2_force_initial_high,
         "manager_m2_expected_profile": args.manager_m2_expected_profile,
+        "manager_m2_min_history_byte_frac": (
+            args.manager_m2_min_history_byte_frac
+        ),
         "m2_profiles_gib_s": (
             [args.m2_low_gib_s, args.m2_medium_gib_s, args.m2_high_gib_s]
             if args.manager_m2_rate else None
@@ -3206,6 +3257,9 @@ def main() -> None:
                         manager_m2_expected_profile=(
                             args.manager_m2_expected_profile
                         ),
+                        manager_m2_min_history_byte_frac=(
+                            args.manager_m2_min_history_byte_frac
+                        ),
                         m2_profiles_gib_s=(
                             (args.m2_low_gib_s, args.m2_medium_gib_s,
                              args.m2_high_gib_s)
@@ -3314,6 +3368,10 @@ def main() -> None:
                     controller_extra_args.append("--manager-m0-shadow")
                 if args.manager_m2_rate:
                     controller_extra_args.append("--manager-m2-rate")
+                if args.manager_m2_force_initial_high:
+                    controller_extra_args.append(
+                        "--manager-m2-force-initial-high"
+                    )
                 if args.commit_timing == "EARLIEST_READY":
                     controller_extra_args.append(
                         "--diagnostic-earliest-ready-cutover"
