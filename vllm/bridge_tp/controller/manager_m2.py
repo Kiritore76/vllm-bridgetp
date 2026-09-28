@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Three-profile migration rate decisions from observable runtime state.
 
-This is the policy layer for M2. It does not change transport settings; callers
-can replay its decisions before enabling rate actuation in the live controller.
+The policy is transport-independent. The online controller applies its selected
+rate before arming Shadow and on subsequent ticks; replay uses the same rules.
 """
 
 from __future__ import annotations
@@ -76,18 +76,25 @@ class M2RateController:
 
     _ORDER = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
 
-    def __init__(self, config: M2RateConfig) -> None:
+    def __init__(
+        self, config: M2RateConfig, *, force_initial_high: bool = False
+    ) -> None:
         config.validate()
         self.config = config
+        self.force_initial_high = force_initial_high
         self.profile = "MEDIUM"
         self._last_change_s: float | None = None
         self._candidate: str | None = None
         self._candidate_ticks = 0
 
-    def decide(self, snapshot: RuntimeSnapshot) -> M2RateDecision:
+    def decide(
+        self, snapshot: RuntimeSnapshot, *, before_start: bool = False
+    ) -> M2RateDecision:
         cfg = self.config
         current_rate = cfg.rate(self.profile)
-        if snapshot.state not in {"SHADOW", "READY_NOT_COMMITTED"}:
+        if snapshot.state not in {"SHADOW", "READY_NOT_COMMITTED"} and not (
+            before_start and snapshot.state == "LOCAL"
+        ):
             return M2RateDecision("HOLD", self.profile, current_rate,
                                   "no active Shadow")
         missing = snapshot.freshness_errors(cfg.max_sample_age_s)
@@ -156,6 +163,15 @@ class M2RateController:
             desired, reason = "LOW", "target is busy and source is safe"
         else:
             desired, reason = "MEDIUM", "balanced source and target state"
+        if before_start and desired == "LOW" and remaining_history is not None:
+            low_preparation_s = (
+                cfg.preparation_margin_s
+                + remaining_history / cfg.low_bytes_s
+            )
+            if horizon <= low_preparation_s:
+                desired, reason = "HIGH", "LOW cannot finish before source guard"
+        if before_start and self.force_initial_high:
+            desired, reason = "HIGH", "diagnostic HIGH transfer smoke"
 
         if desired == self.profile:
             self._candidate = None
@@ -164,7 +180,7 @@ class M2RateController:
                 "HOLD", self.profile, current_rate, reason,
                 source_time_to_guard_s=None if math.isinf(horizon) else horizon,
             )
-        if self._ORDER[desired] < self._ORDER[self.profile]:
+        if not before_start and self._ORDER[desired] < self._ORDER[self.profile]:
             if self._candidate == desired:
                 self._candidate_ticks += 1
             else:

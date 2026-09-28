@@ -17,6 +17,7 @@ import signal
 import sys
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -146,6 +147,11 @@ def parse_args() -> argparse.Namespace:
         help="apply three-profile M2 rates during active Shadow",
     )
     parser.add_argument(
+        "--manager-m2-force-initial-high",
+        action="store_true",
+        help="diagnostic smoke: arm HIGH before the first history chunk",
+    )
+    parser.add_argument(
         "--handoff-mode",
         choices=("bridge", "shadow-only"),
         default="bridge",
@@ -239,6 +245,8 @@ def parse_args() -> argparse.Namespace:
         args.manager_m1_auto_start and args.manager_m0_shadow
     ):
         parser.error("M2 rate requires M1 auto-start and M0 snapshots")
+    if args.manager_m2_force_initial_high and not args.manager_m2_rate:
+        parser.error("M2 forced HIGH requires --manager-m2-rate")
     if (
         args.gpu_resident_shadow
         and cutover is None
@@ -1164,7 +1172,8 @@ def main() -> None:
                     low_bytes_s=config.rate.b_min_bytes_s,
                     medium_bytes_s=config.rate.b_start_bytes_s,
                     high_bytes_s=config.rate.b_max_bytes_s,
-                )
+                ),
+                force_initial_high=args.manager_m2_force_initial_high,
             )
             if args.manager_m2_rate
             else None
@@ -1310,6 +1319,32 @@ def main() -> None:
                             "decision": m1_start_decision.to_json(),
                         }
                     )
+                    if (
+                        manager_m2 is not None
+                        and m1_start_decision.action == "START_SHADOW"
+                    ):
+                        assert m1_snapshot.current_context_tokens is not None
+                        initial_snapshot = replace(
+                            m1_snapshot,
+                            history_total_bytes=(
+                                m1_snapshot.current_context_tokens
+                                * config.policy.kv_bytes_per_token
+                            ),
+                            history_resident_bytes=0,
+                        )
+                        initial_rate = manager_m2.decide(
+                            initial_snapshot, before_start=True
+                        )
+                        rate.rate_bytes_s = initial_rate.rate_bytes_s
+                        rate.last_reason = initial_rate.reason
+                        audit.write(
+                            {
+                                "kind": "manager_m2_initial_rate",
+                                "tick": tick,
+                                "snapshot": initial_snapshot.to_json(),
+                                "decision": initial_rate.to_json(),
+                            }
+                        )
                 if manager_m0 is not None:
                     assert m0_collector is not None
                     assert m0_registry is not None
