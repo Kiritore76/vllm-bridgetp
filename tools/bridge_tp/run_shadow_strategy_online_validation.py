@@ -1978,6 +1978,19 @@ def accept_online(
                     )
                     if float(paced.get("history_pacing_span_ms", 0)) < minimum_ms * 0.98:
                         errors.append("GPU-direct history pacing span is too short")
+                if manager_m2_rate and manager_m2_expected_profile is not None:
+                    assert m2_profiles_gib_s is not None
+                    profile_rate = dict(zip(
+                        ("LOW", "MEDIUM", "HIGH"), m2_profiles_gib_s
+                    ))[manager_m2_expected_profile]
+                    if not any(
+                        abs(float(row.get("requested_rate_gib_s", 0))
+                            - profile_rate) <= 1e-9
+                        for row in chunks
+                    ):
+                        errors.append(
+                            "M2 expected rate was not used by paced GPU history"
+                        )
             if (
                 direct_sender.get("status") != "READY"
                 or len(direct_ranks) != 4
