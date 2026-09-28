@@ -523,6 +523,11 @@ def run(
             target = common.start_process(
                 "target TP4",
                 common.server_command(args, 4, args.tp4_port)
+                + (
+                    ["--max-num-seqs", str(args.tp4_max_num_seqs)]
+                    if getattr(args, "tp4_max_num_seqs", None) is not None
+                    else []
+                )
                 + [
                     "--kv-transfer-config",
                     common.target_connector(
