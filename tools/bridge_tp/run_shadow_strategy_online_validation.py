@@ -15,6 +15,7 @@ import argparse
 import copy
 import csv
 import json
+import math
 import os
 import subprocess
 import sys
@@ -245,6 +246,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="let M1 select Shadow start from live evidence",
     )
+    parser.add_argument("--manager-m2-rate", action="store_true")
+    parser.add_argument("--m2-low-gib-s", type=float)
+    parser.add_argument("--m2-medium-gib-s", type=float)
+    parser.add_argument("--m2-high-gib-s", type=float)
+    parser.add_argument(
+        "--manager-m2-expected-profile",
+        choices=("LOW", "MEDIUM", "HIGH"),
+    )
     parser.add_argument(
         "--manager-m1-expect-stay",
         action="store_true",
@@ -350,8 +359,10 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise ValueError("GPU-direct delta requires --gpu-direct-history")
     if args.gpu_direct_history_pacing and not (
         args.gpu_direct_history and args.persistent_channel
-        and args.fixed_rate_gib_s is not None
-        and args.fixed_rate_gib_s > 0
+        and (
+            (args.fixed_rate_gib_s is not None and args.fixed_rate_gib_s > 0)
+            or args.manager_m2_rate
+        )
     ):
         raise ValueError(
             "GPU-direct history pacing needs a persistent channel and "
@@ -548,18 +559,40 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise ValueError("SLO thresholds must be positive")
     if args.fixed_rate_gib_s is not None and args.fixed_rate_gib_s < 0:
         raise ValueError("fixed migration rate cannot be negative")
+    if args.manager_m2_rate:
+        profiles = (args.m2_low_gib_s, args.m2_medium_gib_s, args.m2_high_gib_s)
+        if not (
+            args.manager_m1_auto_start
+            and args.manager_m0_shadow
+            and args.fixed_rate_gib_s is None
+            and all(value is not None and math.isfinite(value) for value in profiles)
+            and 0 < profiles[0] < profiles[1] < profiles[2]
+        ):
+            raise ValueError(
+                "M2 requires M1/M0, no fixed rate, and explicit LOW < MEDIUM "
+                "< HIGH positive profiles"
+            )
+    elif any(
+        value is not None
+        for value in (args.m2_low_gib_s, args.m2_medium_gib_s, args.m2_high_gib_s)
+    ):
+        raise ValueError("M2 profiles require --manager-m2-rate")
+    if args.manager_m2_expected_profile and not args.manager_m2_rate:
+        raise ValueError("M2 expected profile requires --manager-m2-rate")
     if args.manager_m1_auto_start and not (
         args.shadow_only_only
         and args.gpu_resident_shadow
         and args.gpu_direct_history
         and args.gpu_direct_delta
         and args.gpu_direct_history_pacing
-        and args.fixed_rate_gib_s is not None
-        and args.fixed_rate_gib_s > 0
+        and (
+            args.manager_m2_rate
+            or (args.fixed_rate_gib_s is not None and args.fixed_rate_gib_s > 0)
+        )
         and args.commit_timing == "EARLIEST_READY"
     ):
         raise ValueError(
-            "M1 requires paced GPU-direct Shadow-only, a positive fixed rate, "
+            "M1 requires paced GPU-direct Shadow-only, a positive rate, "
             "and EARLIEST_READY cutover"
         )
     if args.tp4_max_num_seqs is not None and args.tp4_max_num_seqs <= 0:
@@ -684,6 +717,7 @@ def build_controller_config_overrides(
     trigger_output_tokens: int,
     cutover_output_tokens: int,
     fixed_rate_gib_s: float | None,
+    m2_profiles_gib_s: tuple[float, float, float] | None = None,
 ) -> dict[str, Any]:
     """Keep the controller's configured Shadow window equal to the CLI design."""
     overrides: dict[str, Any] = {
@@ -696,6 +730,14 @@ def build_controller_config_overrides(
             "b_max_bytes_s": fixed_rate_bytes_s,
             "b_start_bytes_s": fixed_rate_bytes_s,
             "b_hard_max_bytes_s": fixed_rate_bytes_s,
+        }
+    if m2_profiles_gib_s is not None:
+        low, medium, high = m2_profiles_gib_s
+        overrides["rate"] = {
+            "b_min_bytes_s": low * 1024**3,
+            "b_start_bytes_s": medium * 1024**3,
+            "b_max_bytes_s": high * 1024**3,
+            "b_hard_max_bytes_s": high * 1024**3,
         }
     return overrides
 
@@ -1524,6 +1566,9 @@ def accept_online(
     strategy: str,
     minimum_window_samples: int,
     fixed_rate_gib_s: float | None = None,
+    manager_m2_rate: bool = False,
+    m2_profiles_gib_s: tuple[float, float, float] | None = None,
+    manager_m2_expected_profile: str | None = None,
     gpu_direct_history_pacing_expected: bool = False,
     handoff_mode: str = "bridge",
     require_remote_attention: bool = False,
@@ -1901,6 +1946,10 @@ def accept_online(
             if gpu_direct_history_pacing_expected:
                 paced = direct_ranks[0] if direct_ranks else {}
                 chunks = paced.get("history_pacing_chunks", [])
+                allowed_rates = (
+                    m2_profiles_gib_s if manager_m2_rate
+                    else (fixed_rate_gib_s,)
+                )
                 if (
                     len(direct_ranks) != 4
                     or any(row.get("history_pacing_enabled") is not True
@@ -1909,8 +1958,11 @@ def accept_online(
                     or len(chunks) != paced.get("history_pacing_chunk_count")
                     or float(paced.get("history_pacing_sleep_ms") or 0) <= 0
                     or any(
-                        abs(float(row.get("requested_rate_gib_s", 0))
-                            - float(fixed_rate_gib_s or 0)) > 1e-9
+                        all(
+                            abs(float(row.get("requested_rate_gib_s", 0))
+                                - float(profile or 0)) > 1e-9
+                            for profile in allowed_rates
+                        )
                         for row in chunks
                     )
                 ):
@@ -1921,7 +1973,8 @@ def accept_online(
                     burst_bytes = int(chunks[-1].get("aggregate_bytes", 0))
                     minimum_ms = (
                         (total_bytes - burst_bytes)
-                        / (float(fixed_rate_gib_s) * 1024**3) * 1000
+                        / (max(float(rate) for rate in allowed_rates) * 1024**3)
+                        * 1000
                     )
                     if float(paced.get("history_pacing_span_ms", 0)) < minimum_ms * 0.98:
                         errors.append("GPU-direct history pacing span is too short")
@@ -2290,6 +2343,31 @@ def accept_online(
             errors.append("controller did not record fixed-rate actuation")
         elif any(abs(value - fixed_rate_gib_s) > 1e-9 for value in observed_rates):
             errors.append("controller deviated from the requested fixed rate")
+    if manager_m2_rate:
+        assert m2_profiles_gib_s is not None
+        m2_rows = [
+            row for row in audit
+            if row.get("kind") == "rate"
+            and row.get("manager_m2_decision") is not None
+        ]
+        if not m2_rows:
+            errors.append("M2 did not record active Shadow rate decisions")
+        elif not any(
+            row["manager_m2_decision"]["action"] == "SET_RATE"
+            and (
+                manager_m2_expected_profile is None
+                or row["manager_m2_decision"]["profile"]
+                == manager_m2_expected_profile
+            )
+            for row in m2_rows
+        ):
+            errors.append("M2 did not actuate the expected profile change")
+        if any(
+            all(abs(float(row["rate_gib_s"]) - profile) > 1e-9
+                for profile in m2_profiles_gib_s)
+            for row in m2_rows
+        ):
+            errors.append("M2 used a rate outside the three configured profiles")
     slo = summarize_slo(
         background.get("results", []),
         tpot_ms=slo_tpot_ms,
@@ -2908,6 +2986,12 @@ def main() -> None:
         "commit_timing": args.commit_timing,
         "manager_m0_shadow": args.manager_m0_shadow,
         "manager_m1_auto_start": args.manager_m1_auto_start,
+        "manager_m2_rate": args.manager_m2_rate,
+        "manager_m2_expected_profile": args.manager_m2_expected_profile,
+        "m2_profiles_gib_s": (
+            [args.m2_low_gib_s, args.m2_medium_gib_s, args.m2_high_gib_s]
+            if args.manager_m2_rate else None
+        ),
         "manager_m1_expect_stay": args.manager_m1_expect_stay,
         "manager_m1_stay_reason": args.manager_m1_stay_reason,
         "tp4_max_num_seqs": args.tp4_max_num_seqs,
@@ -3105,6 +3189,15 @@ def main() -> None:
                         strategy=selected,
                         minimum_window_samples=args.minimum_window_samples,
                         fixed_rate_gib_s=args.fixed_rate_gib_s,
+                        manager_m2_rate=args.manager_m2_rate,
+                        manager_m2_expected_profile=(
+                            args.manager_m2_expected_profile
+                        ),
+                        m2_profiles_gib_s=(
+                            (args.m2_low_gib_s, args.m2_medium_gib_s,
+                             args.m2_high_gib_s)
+                            if args.manager_m2_rate else None
+                        ),
                         gpu_direct_history_pacing_expected=(
                             args.gpu_direct_history_pacing
                         ),
@@ -3172,6 +3265,11 @@ def main() -> None:
                     trigger_output_tokens=args.trigger_output_tokens,
                     cutover_output_tokens=args.cutover_output_tokens,
                     fixed_rate_gib_s=args.fixed_rate_gib_s,
+                    m2_profiles_gib_s=(
+                        (args.m2_low_gib_s, args.m2_medium_gib_s,
+                         args.m2_high_gib_s)
+                        if args.manager_m2_rate else None
+                    ),
                 )
                 if args.manager_m1_auto_start:
                     controller_config_overrides["capacity_pilot"] = {
@@ -3181,6 +3279,10 @@ def main() -> None:
                 if args.fixed_rate_gib_s is not None:
                     source_env_overrides["BRIDGETP_STREAM_RATE_GIB_S"] = str(
                         args.fixed_rate_gib_s
+                    )
+                elif args.manager_m2_rate:
+                    source_env_overrides["BRIDGETP_STREAM_RATE_GIB_S"] = str(
+                        args.m2_medium_gib_s
                     )
                 if args.gpu_direct_history_pacing:
                     source_env_overrides[
@@ -3197,6 +3299,8 @@ def main() -> None:
                 )
                 if args.manager_m0_shadow:
                     controller_extra_args.append("--manager-m0-shadow")
+                if args.manager_m2_rate:
+                    controller_extra_args.append("--manager-m2-rate")
                 if args.commit_timing == "EARLIEST_READY":
                     controller_extra_args.append(
                         "--diagnostic-earliest-ready-cutover"

@@ -37,12 +37,17 @@ from vllm.bridge_tp.controller.manager_m0 import (  # noqa: E402
     M0ExecutorAdapter,
     M0Proposal,
     MigrationManagerM0,
+    RuntimeSnapshot,
     RuntimeStateCollector,
 )
 from vllm.bridge_tp.controller.manager_m1 import (  # noqa: E402
     M1StartConfig,
     M1StartController,
     M1StartDecision,
+)
+from vllm.bridge_tp.controller.manager_m2 import (  # noqa: E402
+    M2RateConfig,
+    M2RateController,
 )
 from vllm.bridge_tp.controller.events import (  # noqa: E402
     Action,
@@ -136,6 +141,11 @@ def parse_args() -> argparse.Namespace:
         help="start GPU-resident Shadow from online M1 evidence",
     )
     parser.add_argument(
+        "--manager-m2-rate",
+        action="store_true",
+        help="apply three-profile M2 rates during active Shadow",
+    )
+    parser.add_argument(
         "--handoff-mode",
         choices=("bridge", "shadow-only"),
         default="bridge",
@@ -225,6 +235,10 @@ def parse_args() -> argparse.Namespace:
             parser.error("M1 auto-start requires GPU-resident Shadow-only mode")
         if args.stop_and_copy:
             parser.error("M1 auto-start does not support Stop-and-Copy")
+    if args.manager_m2_rate and not (
+        args.manager_m1_auto_start and args.manager_m0_shadow
+    ):
+        parser.error("M2 rate requires M1 auto-start and M0 snapshots")
     if (
         args.gpu_resident_shadow
         and cutover is None
@@ -585,14 +599,25 @@ def step_shadow(
     capacity_signal: CapacitySignal | None = None,
     diagnostic_earliest_ready_cutover: bool = False,
     max_tokens: int | None = None,
+    manager_m2: M2RateController | None = None,
+    m2_snapshot: RuntimeSnapshot | None = None,
 ) -> None:
     remaining = policy.migration_bytes(request)
     tpot_samples = getattr(pool4, "tpot_samples", 0)
-    new_rate = rate.step(
-        pool4.p99_tpot_s if tpot_samples > 0 else None,
-        remaining,
-        seconds_to_deadline=None,
-    )
+    m2_decision = None
+    if manager_m2 is not None:
+        if m2_snapshot is None:
+            raise RuntimeError("M2 rate requires a current runtime snapshot")
+        m2_decision = manager_m2.decide(m2_snapshot)
+        rate.rate_bytes_s = m2_decision.rate_bytes_s
+        rate.last_reason = m2_decision.reason
+        new_rate = rate.rate_bytes_s
+    else:
+        new_rate = rate.step(
+            pool4.p99_tpot_s if tpot_samples > 0 else None,
+            remaining,
+            seconds_to_deadline=None,
+        )
     audit.write(
         {
             "kind": "rate",
@@ -602,6 +627,9 @@ def step_shadow(
             "native_p99_tpot_s": pool4.p99_tpot_s,
             "native_tpot_samples": tpot_samples,
             "native_tpot_metric": getattr(pool4, "tpot_metric", None),
+            "manager_m2_decision": (
+                m2_decision.to_json() if m2_decision is not None else None
+            ),
         }
     )
     if not dry_run:
@@ -1130,6 +1158,17 @@ def main() -> None:
             if args.manager_m1_auto_start
             else None
         )
+        manager_m2 = (
+            M2RateController(
+                M2RateConfig(
+                    low_bytes_s=config.rate.b_min_bytes_s,
+                    medium_bytes_s=config.rate.b_start_bytes_s,
+                    high_bytes_s=config.rate.b_max_bytes_s,
+                )
+            )
+            if args.manager_m2_rate
+            else None
+        )
         m0_collector = (
             RuntimeStateCollector()
             if manager_m0 is not None or manager_m1 is not None
@@ -1240,6 +1279,7 @@ def main() -> None:
                 }
                 audit.write(telemetry_row)
                 m1_start_decision: M1StartDecision | None = None
+                m2_snapshot: RuntimeSnapshot | None = None
                 if manager_m1 is not None and record.state is MigrationState.LOCAL:
                     assert m0_collector is not None
                     assert m0_registry is not None
@@ -1379,6 +1419,8 @@ def main() -> None:
                         request_age_s=max(0.0, now - request.arrival_unix_s),
                         progress=progress,
                     )
+                    if manager_m2 is not None and record.state is MigrationState.SHADOW:
+                        m2_snapshot = snapshot
                     proposal = M0Proposal(
                         start=start,
                         rate_bytes_s=proposed_rate,
@@ -1520,6 +1562,8 @@ def main() -> None:
                             capacity_signal,
                             args.diagnostic_earliest_ready_cutover,
                             int(source_request["max_tokens"]),
+                            manager_m2,
+                            m2_snapshot,
                         )
                         if (
                             args.diagnostic_earliest_ready_cutover
