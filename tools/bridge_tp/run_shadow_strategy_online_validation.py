@@ -235,6 +235,11 @@ def parse_args() -> argparse.Namespace:
             "publishes the first safe dynamic cutover."
         ),
     )
+    parser.add_argument(
+        "--manager-m0-shadow",
+        action="store_true",
+        help="record M0 advisory decisions in each controller audit",
+    )
     parser.add_argument("--anchor-max-tokens", type=int, default=1024)
     parser.add_argument("--anchor-prompt-tokens", type=int, default=None)
     parser.add_argument("--minimum-ready-target-jobs", type=int, default=2)
@@ -2729,6 +2734,7 @@ def main() -> None:
         "online_remote_attention": args.online_remote_attention,
         "remote_attention_base_port": args.remote_attention_base_port,
         "commit_timing": args.commit_timing,
+        "manager_m0_shadow": args.manager_m0_shadow,
         "bridge_output_tokens": args.bridge_output_tokens,
         "repetitions": args.repetitions,
         "source_pressure": args.source_pressure,
@@ -3001,6 +3007,8 @@ def main() -> None:
                     "--diagnostic-trigger-output-tokens",
                     str(args.trigger_output_tokens),
                 ]
+                if args.manager_m0_shadow:
+                    controller_extra_args.append("--manager-m0-shadow")
                 if args.commit_timing == "EARLIEST_READY":
                     controller_extra_args.append(
                         "--diagnostic-earliest-ready-cutover"
