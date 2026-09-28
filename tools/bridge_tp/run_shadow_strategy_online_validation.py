@@ -1381,6 +1381,22 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             writer.writerows(paired)
 
 
+def controller_completion_errors(
+    end_rows: list[dict[str, Any]], manager_m1_auto_start: bool
+) -> list[str]:
+    """Check takeover and the trigger path selected for this run."""
+    if len(end_rows) != 1 or end_rows[0].get("final_state") != "TAKEOVER":
+        return ["controller did not finish in TAKEOVER"]
+    expected = (
+        "MANAGER_M1_START"
+        if manager_m1_auto_start
+        else "DIAGNOSTIC_FIXED_BOUNDARY"
+    )
+    if end_rows[0].get("trigger_path") != expected:
+        return [f"controller trigger path differs from {expected}"]
+    return []
+
+
 def accept_online(
     controller_dir: Path,
     background_dir: Path,
@@ -1699,8 +1715,6 @@ def accept_online(
             errors.append("M1 did not choose exactly one autonomous Shadow start")
         if any(row.get("kind") == "diagnostic_boundary_forced" for row in audit):
             errors.append("M1 run used a diagnostic fixed start")
-        if not end_rows or end_rows[-1].get("trigger_path") != "MANAGER_M1_START":
-            errors.append("M1 trigger path was not recorded")
     if handoff_mode == "shadow-only" and not stop_and_copy:
         if frozen_receipt is None:
             errors.append("scheduler did not acknowledge the Shadow-only freeze")
@@ -2086,10 +2100,7 @@ def accept_online(
         if len(gpu_history_completed) == 4
         else None
     )
-    if len(end_rows) != 1 or end_rows[0].get("final_state") != "TAKEOVER":
-        errors.append("controller did not finish in TAKEOVER")
-    elif end_rows[0].get("trigger_path") != "DIAGNOSTIC_FIXED_BOUNDARY":
-        errors.append("controller did not use the fixed experimental boundary")
+    errors.extend(controller_completion_errors(end_rows, manager_m1_auto_start))
     if takeover.get("state") != "COMMITTED":
         errors.append("takeover state is not COMMITTED")
     if handoff_mode == "shadow-only":

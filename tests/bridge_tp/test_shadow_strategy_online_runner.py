@@ -14,6 +14,7 @@ from tools.bridge_tp.run_shadow_rate_load_matrix import (
 )
 from tools.bridge_tp.run_shadow_strategy_online_validation import (
     build_controller_config_overrides,
+    controller_completion_errors,
     emitted_boundary_gap_ms,
     summarize_emitted_intervals,
     summarize_slo,
@@ -43,6 +44,16 @@ class TestOnlineShadowManifest(unittest.TestCase):
 
 
 class TestOnlineStrategyTiming(unittest.TestCase):
+    def test_controller_completion_accepts_m1_only_when_selected(self) -> None:
+        m1_end = [{"final_state": "TAKEOVER", "trigger_path": "MANAGER_M1_START"}]
+        fixed_end = [
+            {"final_state": "TAKEOVER", "trigger_path": "DIAGNOSTIC_FIXED_BOUNDARY"}
+        ]
+        self.assertEqual(controller_completion_errors(m1_end, True), [])
+        self.assertEqual(controller_completion_errors(fixed_end, False), [])
+        self.assertTrue(controller_completion_errors(m1_end, False))
+        self.assertTrue(controller_completion_errors(fixed_end, True))
+
     def test_controller_window_tracks_cli_boundaries(self) -> None:
         overrides = build_controller_config_overrides(
             trigger_output_tokens=64,
