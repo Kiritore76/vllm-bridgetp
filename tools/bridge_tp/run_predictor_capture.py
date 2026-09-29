@@ -9,11 +9,27 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+
+_INTERNAL_ID_SUFFIX = re.compile(r"[0-9a-fA-F]{8}")
+
+
+def label_for_engine_request(
+    request_id: str, labels: dict[str, dict[str, Any]]
+) -> dict[str, Any] | None:
+    """Join worker's randomized ID to the externally returned request ID."""
+    if request_id in labels:
+        return labels[request_id]
+    external_id, separator, suffix = request_id.rpartition("-")
+    if separator and _INTERNAL_ID_SUFFIX.fullmatch(suffix):
+        return labels.get(external_id)
+    return None
 
 
 def load_requests(path: Path, limit: int | None) -> list[dict[str, Any]]:
@@ -81,7 +97,7 @@ def audit_capture(
                 request_id = str(request_id)
                 count = int(count)
                 stage = str(stage)
-                label = labels.get(request_id)
+                label = label_for_engine_request(request_id, labels)
                 if label is None:
                     raise ValueError(f"feature has no final response: {request_id}")
                 if count > label["output_tokens"] or count < 0:
