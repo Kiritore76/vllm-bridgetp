@@ -15,6 +15,7 @@ run_m2_low_to_high_a100_smoke() {
   local mode=event-low-high
   local m2_requirement=()
   local m3_requirement=()
+  local m3_tpot_requirement=()
   if [[ "$require_low_to_high" == 0 ]]; then
     mode=split-capacity
   elif [[ "$require_low_to_high" == 1 ]]; then
@@ -32,6 +33,27 @@ run_m2_low_to_high_a100_smoke() {
       --m3-gain-margin-s "$m3_gain_margin_s"
       --m3-defer-tokens "${BRIDGETP_M3_DEFER_TOKENS:-64}"
     )
+    if [[ -n "${BRIDGETP_M3_TPOT_MODEL_PATH:-}" ]]; then
+      local m3_tpot_path="$BRIDGETP_M3_TPOT_MODEL_PATH"
+      local m3_tpot_sha="${BRIDGETP_M3_TPOT_MODEL_SHA256:?set measured model SHA256}"
+      [[ -f "$m3_tpot_path" ]] || {
+        echo "Missing M3 TPOT model: $m3_tpot_path"
+        return 1
+      }
+      [[ "$(sha256sum "$m3_tpot_path" | cut -d' ' -f1)" == "$m3_tpot_sha" ]] || {
+        echo "M3 TPOT model SHA256 mismatch; no run"
+        return 1
+      }
+      m3_tpot_requirement=(
+        --m3-tpot-model "$m3_tpot_path"
+        --expected-m3-tpot-sha256 "$m3_tpot_sha"
+      )
+    fi
+    if [[ -n "${BRIDGETP_M3_EXPECTED_ACTION:-}" ]]; then
+      m3_tpot_requirement+=(
+        --m3-expected-action "$BRIDGETP_M3_EXPECTED_ACTION"
+      )
+    fi
     mode=m3-commit
   elif [[ "$m3_commit" != 0 ]]; then
     echo "BRIDGETP_M3_COMMIT must be 0 or 1"
@@ -117,6 +139,11 @@ run_m2_low_to_high_a100_smoke() {
       echo "m3_handoff_s=$m3_handoff_s"
       echo "m3_gain_margin_s=$m3_gain_margin_s"
       echo "m3_defer_tokens=${BRIDGETP_M3_DEFER_TOKENS:-64}"
+      if [[ ${#m3_tpot_requirement[@]} -gt 0 ]]; then
+        echo "m3_tpot_model_path=${BRIDGETP_M3_TPOT_MODEL_PATH:-}"
+        echo "m3_tpot_model_sha256=${BRIDGETP_M3_TPOT_MODEL_SHA256:-}"
+        echo "m3_expected_action=${BRIDGETP_M3_EXPECTED_ACTION:-}"
+      fi
     fi
   } | tee "$run/preflight.txt"
 
@@ -140,6 +167,7 @@ run_m2_low_to_high_a100_smoke() {
     --m1-min-output-tokens "$m1_min_output_tokens" \
     "${m2_requirement[@]}" \
     "${m3_requirement[@]}" \
+    "${m3_tpot_requirement[@]}" \
     --m2-low-gib-s "$low_gib_s" --m2-medium-gib-s 2.4 --m2-high-gib-s 8.0 \
     --source-pressure --minimum-ready-source-jobs 0 \
     --trigger-output-tokens 64 --bridge-output-tokens 96 \

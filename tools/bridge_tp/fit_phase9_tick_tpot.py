@@ -19,6 +19,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-len", type=int, required=True)
     parser.add_argument("--output-len", type=int, required=True)
     parser.add_argument(
+        "--fit-load-model", action="store_true",
+        help="fit measured KV-load knots without a Section 7.2 inventory",
+    )
+    parser.add_argument(
         "--tp4-baseline-inventory",
         type=Path,
         help=(
@@ -212,10 +216,13 @@ def main() -> None:
     args = parse_args()
     tp1_rows = read_rows(args.tp1)
     tp4_rows = read_rows(args.tp4)
-    if args.tp4_baseline_inventory:
+    if args.tp4_baseline_inventory or args.fit_load_model:
         tp1_observations = read_condition_observations(args.tp1)
         tp4_observations = read_condition_observations(args.tp4)
-        tp4_observations.extend(read_tp4_baselines(args.tp4_baseline_inventory))
+        if args.tp4_baseline_inventory:
+            tp4_observations.extend(
+                read_tp4_baselines(args.tp4_baseline_inventory)
+            )
         tp1_model = monotone_load_fit(tp1_observations)
         tp4_model = monotone_load_fit(tp4_observations)
         status = "WORKLOAD_SCOPED_LOAD_TPOT_CANDIDATE"

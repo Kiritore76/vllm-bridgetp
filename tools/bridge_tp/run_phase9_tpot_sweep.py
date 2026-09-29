@@ -40,6 +40,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reps", type=int, nargs="+", default=(1, 2, 3))
     parser.add_argument("--input-len", type=int, default=128)
     parser.add_argument("--output-len", type=int, default=512)
+    parser.add_argument(
+        "--fit-load-model", action="store_true",
+        help="fit workload-scoped KV-load TPOT knots after the sweep",
+    )
     parser.add_argument("--num-prompts", type=int, default=100)
     parser.add_argument("--num-warmups", type=int, default=10)
     parser.add_argument("--telemetry-interval-s", type=float, default=1.0)
@@ -530,6 +534,8 @@ def main() -> None:
         "--out",
         str(fit_out),
     ]
+    if args.fit_load_model:
+        fit_command.append("--fit-load-model")
     return_code = stream_command(
         fit_command,
         args.out_root / "tick_tpot_fit.log",
