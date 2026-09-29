@@ -105,7 +105,7 @@ class TestCapacityHeadroomTracker(unittest.TestCase):
         self.assertEqual(signal.transition, "NORMAL")
 
     def test_sustained_rate_ignores_isolated_prefill_allocation(self) -> None:
-        tracker = CapacityHeadroomTracker(self.config())
+        tracker = CapacityHeadroomTracker(self.config(ewma_alpha=0.35))
         tracker.update(20000, 1.0)
         tracker.update(18000, 2.0)
         tracker.update(18000, 3.0)
