@@ -12,6 +12,7 @@ from unittest.mock import patch
 from tools.bridge_tp.run_phase9_controller import parse_args
 from tools.bridge_tp.run_shadow_strategy_online_validation import (
     build_controller_config_overrides,
+    m2_expected_profile_used,
 )
 from vllm.bridge_tp.controller.manager_m0 import RuntimeSnapshot
 from vllm.bridge_tp.controller.manager_m2 import M2RateConfig, M2RateController
@@ -50,6 +51,24 @@ class TestM2RateController(unittest.TestCase):
                 stable_ticks=2,
             )
         )
+
+    def test_expected_medium_accepts_effective_initial_hold(self) -> None:
+        profiles = (0.5, 2.4, 8.0)
+        initial = [{"decision": {
+            "action": "HOLD", "profile": "MEDIUM",
+            "rate_bytes_s": 2.4 * 1024**3,
+        }}]
+        active = [{
+            "manager_m2_decision": {"action": "HOLD", "profile": "MEDIUM"},
+            "rate_gib_s": 2.4,
+        }]
+        self.assertTrue(m2_expected_profile_used(
+            initial, active, "MEDIUM", profiles,
+        ))
+        self.assertFalse(m2_expected_profile_used(
+            initial, [{**active[0], "rate_gib_s": 0.5}],
+            "MEDIUM", profiles,
+        ))
 
     def test_busy_target_downshifts_only_after_stable_samples(self) -> None:
         first = self.controller.decide(sample(target_waiting=3))
