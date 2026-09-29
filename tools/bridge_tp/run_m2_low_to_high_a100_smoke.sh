@@ -8,6 +8,7 @@ run_m2_low_to_high_a100_smoke() {
   set -o pipefail
 
   local expected_revision="${BRIDGETP_EXPECTED_REVISION:?set BRIDGETP_EXPECTED_REVISION}"
+  local low_gib_s="${BRIDGETP_M2_LOW_GIB_S:-0.1}"
   local model=/root/autodl-tmp/models/models/Qwen--Qwen2.5-14B-Instruct/snapshots/master
   local base=/root/autodl-tmp/bridgetp/a1d_manifests/working/a1d-full-smoke-20260922T153543Z-output-1024.json
   local survival=/root/autodl-tmp/bridgetp/phase9_cap0_inputs/survival_table_m1_v1.json
@@ -66,9 +67,11 @@ run_m2_low_to_high_a100_smoke() {
     nvidia-smi -L
     sha256sum "$base" "$manifest" "$survival" "$guard"
     echo "guard=$(cat "$guard")"
+    echo "m2_low_gib_s=$low_gib_s"
   } | tee "$run/preflight.txt"
 
-  # LOW=0.1 only stretches this diagnostic copy. Production LOW remains 0.5.
+  # Default LOW=0.1 stretches a diagnostic copy; set the measured 0.5 for
+  # the calibrated-profile transition check.
   python tools/bridge_tp/run_shadow_strategy_online_validation.py \
     --phase smoke --repetitions 1 \
     --model-path "$model" --manifest "$manifest" \
@@ -85,7 +88,7 @@ run_m2_low_to_high_a100_smoke() {
     --persistent-channel --preconnect-persistent-channel --channel-generation 1 \
     --manager-m0-shadow --manager-m1-auto-start --manager-m2-rate \
     --manager-m2-require-low-to-high \
-    --m2-low-gib-s 0.1 --m2-medium-gib-s 2.4 --m2-high-gib-s 8.0 \
+    --m2-low-gib-s "$low_gib_s" --m2-medium-gib-s 2.4 --m2-high-gib-s 8.0 \
     --source-pressure --minimum-ready-source-jobs 0 \
     --trigger-output-tokens 64 --bridge-output-tokens 96 \
     --commit-timing EARLIEST_READY \

@@ -104,6 +104,25 @@ class TestCapacityHeadroomTracker(unittest.TestCase):
         self.assertFalse(signal.active)
         self.assertEqual(signal.transition, "NORMAL")
 
+    def test_sustained_rate_ignores_isolated_prefill_allocation(self) -> None:
+        tracker = CapacityHeadroomTracker(self.config())
+        tracker.update(20000, 1.0)
+        tracker.update(18000, 2.0)
+        tracker.update(18000, 3.0)
+        spike = tracker.update(16000, 4.0)
+        settled = tracker.update(16000, 5.0)
+        self.assertEqual(spike.sustained_decline_rate_tokens_s, 2000.0)
+        self.assertEqual(settled.sustained_decline_rate_tokens_s, 0.0)
+        self.assertGreater(settled.decline_rate_tokens_s, 0)
+
+    def test_sustained_rate_tracks_repeated_peer_allocations(self) -> None:
+        tracker = CapacityHeadroomTracker(self.config())
+        tracker.update(20000, 1.0)
+        tracker.update(18000, 2.0)
+        tracker.update(16000, 3.0)
+        signal = tracker.update(14000, 4.0)
+        self.assertEqual(signal.sustained_decline_rate_tokens_s, 2000.0)
+
     def test_enabled_config_requires_measured_guard(self) -> None:
         with self.assertRaisesRegex(ValueError, "guard_free_kv_tokens"):
             CapacityHeadroomTracker(CapacityPilotConfig(enabled=True))
