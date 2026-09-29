@@ -675,7 +675,10 @@ def step_shadow(
                 ]
             )
             outstanding_tokens = max(0, request.computed_tokens - initial_end)
-            candidate_lead_tokens = max(64, outstanding_tokens + 16)
+            # The outstanding delta is only the backlog at this snapshot.
+            # Keep another 64 output tokens for TP4 admission, exact GPU
+            # readback, delta catch-up, and source-control propagation.
+            candidate_lead_tokens = max(64, outstanding_tokens + 64)
             candidate = max(
                 int(request.output_tokens) + candidate_lead_tokens,
                 int(record.trigger_output_tokens or 0) + 1,
