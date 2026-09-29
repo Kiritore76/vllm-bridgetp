@@ -254,6 +254,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--manager-m2-rate", action="store_true")
     parser.add_argument("--manager-m3-commit", action="store_true")
+    parser.add_argument("--manager-m4-cancel", action="store_true")
+    parser.add_argument("--manager-m4-expect-cancel", action="store_true")
     parser.add_argument("--manager-m2-force-initial-high", action="store_true")
     parser.add_argument("--manager-m2-require-source-high", action="store_true")
     parser.add_argument("--manager-m2-require-low-to-high", action="store_true")
@@ -599,6 +601,10 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise ValueError(
             "M3 requires M2 Shadow-only EARLIEST_READY"
         )
+    if args.manager_m4_cancel and not args.manager_m3_commit:
+        raise ValueError("M4 requires M3 earliest-ready commit")
+    if args.manager_m4_expect_cancel and not args.manager_m4_cancel:
+        raise ValueError("M4 cancellation smoke requires M4 enabled")
     if args.manager_m2_expected_profile and not args.manager_m2_rate:
         raise ValueError("M2 expected profile requires --manager-m2-rate")
     if not 0 <= args.manager_m2_min_history_byte_frac <= 1:
@@ -1740,6 +1746,84 @@ def m2_expected_profile_used(
         abs(float(row.get("rate_gib_s", 0)) - expected_rate) <= 1e-9
         for row in rate_rows
     )
+
+
+def accept_m4_cancel(
+    controller_dir: Path,
+    _background_dir: Path,
+    _expected_jobs: int,
+    expected_anchor_tokens: int,
+) -> dict[str, Any]:
+    """Check that pre-freeze cancel retains the complete TP1 response."""
+    errors: list[str] = []
+    audit_path = controller_dir / "phase9_audit.jsonl"
+    source_path = controller_dir / "source_response.json"
+    unified_path = controller_dir / "unified_response.jsonl"
+    if not all(path.is_file() for path in (
+        audit_path, source_path, unified_path
+    )):
+        return {
+            "status": "FAIL",
+            "errors": ["M4 cancellation evidence is incomplete"],
+        }
+    audit = [json.loads(line) for line in audit_path.read_text(
+        encoding="utf-8"
+    ).splitlines() if line.strip()]
+    source = common.read_json(source_path)
+    unified = [json.loads(line) for line in unified_path.read_text(
+        encoding="utf-8"
+    ).splitlines() if line.strip()]
+    decisions = [row for row in audit if (
+        row.get("kind") == "manager_m4_cancel_decision"
+        and (row.get("decision") or {}).get("action") == "CANCEL_SHADOW"
+    )]
+    end = [row for row in audit if row.get("kind") == "run_end"]
+    cleanup = [row for row in audit if row.get("kind") == "manager_m4_source_cleanup"]
+    if not decisions or not any(
+        row.get("kind") == "manager_m4_cancelled" for row in audit
+    ):
+        errors.append("M4 did not cancel Shadow")
+    if not end or end[-1].get("final_state") != "CANCELLED":
+        errors.append("M4 did not reach CANCELLED")
+    if controller_dir.joinpath("request_frozen_receipt.json").exists():
+        errors.append("M4 cancelled after source freeze")
+    if any(row.get("to") == "TAKEOVER" for row in audit):
+        errors.append("M4 committed after cancellation")
+    if not cleanup or cleanup[-1].get("source_abort_dispatched") is not False:
+        errors.append("M4 did not preserve TP1 ownership")
+    takeover_path = controller_dir / "takeover_state.json"
+    takeover = (
+        common.read_json(takeover_path) if takeover_path.is_file() else {}
+    )
+    if (
+        takeover.get("state") != "CANCELLED"
+        or takeover.get("source_continues_on_tp1") is not True
+    ):
+        errors.append("M4 source cleanup state is incomplete")
+    control_path = controller_dir / "runtime_control.json"
+    control = common.read_json(control_path) if control_path.is_file() else {}
+    if control.get("target_request_admitted"):
+        target_path = controller_dir / "target_cleanup_receipt.json"
+        target = common.read_json(target_path) if target_path.is_file() else {}
+        if target.get("status") != "CLEANED":
+            errors.append("M4 did not release the dormant TP4 request")
+    source_ids = source.get("token_ids") or []
+    unified_ids = [row.get("token_id") for row in unified]
+    if len(source_ids) != expected_anchor_tokens:
+        errors.append("TP1 did not complete its output budget")
+    if source_ids != unified_ids or any(
+        row.get("origin") != "source" for row in unified
+    ):
+        errors.append("unified response differs from TP1 output")
+    return {
+        "status": "PASS" if not errors else "FAIL",
+        "errors": errors,
+        "m4_cancel_output_tokens": (
+            decisions[0]["decision"].get("output_tokens") if decisions else None
+        ),
+        "source_output_tokens": len(source_ids),
+        "unified_output_tokens": len(unified_ids),
+    }
 
 
 def accept_online(
@@ -3314,6 +3398,8 @@ def main() -> None:
         "manager_m1_auto_start": args.manager_m1_auto_start,
         "manager_m2_rate": args.manager_m2_rate,
         "manager_m3_commit": args.manager_m3_commit,
+        "manager_m4_cancel": args.manager_m4_cancel,
+        "manager_m4_expect_cancel": args.manager_m4_expect_cancel,
         "m3_policy": (
             "COMMIT_EARLIEST_WHEN_READY" if args.manager_m3_commit else None
         ),
@@ -3518,6 +3604,11 @@ def main() -> None:
                         selected_post_takeover_destroy
                     ),
                 ) -> dict[str, Any]:
+                    if args.manager_m4_expect_cancel:
+                        return accept_m4_cancel(
+                            controller_dir, background_dir,
+                            expected_jobs, expected_anchor_tokens,
+                        )
                     return accept_online(
                         controller_dir,
                         background_dir,
@@ -3656,6 +3747,8 @@ def main() -> None:
                     controller_extra_args.append("--manager-m2-rate")
                 if args.manager_m3_commit:
                     controller_extra_args.append("--manager-m3-commit")
+                if args.manager_m4_cancel:
+                    controller_extra_args.append("--manager-m4-cancel")
                 if args.manager_m2_force_initial_high:
                     controller_extra_args.append(
                         "--manager-m2-force-initial-high"
