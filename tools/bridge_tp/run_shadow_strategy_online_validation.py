@@ -1654,6 +1654,42 @@ def has_measured_source_high(
     return False
 
 
+def m2_expected_profile_used(
+    initial_rows: list[dict[str, Any]],
+    rate_rows: list[dict[str, Any]],
+    expected_profile: str | None,
+    profiles_gib_s: tuple[float, float, float],
+) -> bool:
+    """Accept an effective initial profile without requiring a transition."""
+    if not rate_rows:
+        return False
+    decisions = [row.get("decision") or {} for row in initial_rows] + [
+        row.get("manager_m2_decision") or {} for row in rate_rows
+    ]
+    if any(
+        decision.get("action") == "SET_RATE"
+        and (expected_profile is None
+             or decision.get("profile") == expected_profile)
+        for decision in decisions
+    ):
+        return True
+    if expected_profile is None:
+        return False
+    expected_rate = dict(zip(
+        ("LOW", "MEDIUM", "HIGH"), profiles_gib_s
+    ))[expected_profile]
+    return any(
+        (row.get("decision") or {}).get("action") == "HOLD"
+        and row["decision"].get("profile") == expected_profile
+        and abs(float(row["decision"].get("rate_bytes_s", 0))
+                / 1024**3 - expected_rate) <= 1e-9
+        for row in initial_rows
+    ) and any(
+        abs(float(row.get("rate_gib_s", 0)) - expected_rate) <= 1e-9
+        for row in rate_rows
+    )
+
+
 def accept_online(
     controller_dir: Path,
     background_dir: Path,
@@ -2495,20 +2531,13 @@ def accept_online(
             if row.get("kind") == "rate"
             and row.get("manager_m2_decision") is not None
         ]
-        changes = [row["decision"] for row in initial_rows] + [
-            row["manager_m2_decision"] for row in m2_rows
-        ]
         if not m2_rows:
             errors.append("M2 did not record active Shadow rate decisions")
-        elif not any(
-            decision.get("action") == "SET_RATE"
-            and (
-                manager_m2_expected_profile is None
-                or decision.get("profile") == manager_m2_expected_profile
-            )
-            for decision in changes
+        elif not m2_expected_profile_used(
+            initial_rows, m2_rows, manager_m2_expected_profile,
+            m2_profiles_gib_s,
         ):
-            errors.append("M2 did not actuate the expected profile change")
+            errors.append("M2 did not use the expected profile")
         if any(
             all(abs(float(row["rate_gib_s"]) - profile) > 1e-9
                 for profile in m2_profiles_gib_s)
