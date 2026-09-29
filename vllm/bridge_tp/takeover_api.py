@@ -131,6 +131,11 @@ def _external_request_id(source_request_id: str) -> str:
     return source_request_id.rsplit("-", 1)[0]
 
 
+def _target_completion_engine_request_id(target_request_id: str) -> str:
+    """Map a single-prompt completion payload ID to its engine request ID."""
+    return f"cmpl-{target_request_id}-0"
+
+
 @router.post("/bridge_tp/v1/cleanup")
 async def cleanup(raw_request: Request) -> dict[str, Any]:
     """Cancel pre-cutover staging, optionally aborting the source request.
@@ -188,6 +193,19 @@ async def cleanup(raw_request: Request) -> dict[str, Any]:
                 str(manifest["source_request_id"])
             )
             await raw_request.app.state.engine_client.abort(source_external_request_id)
+        elif (run_dir / "cutover_manifest.json").exists():
+            # A previously frozen source must resume if TP4 cannot take over.
+            # Before manifest publication the background finalizer owns this
+            # transition and writes RESUME after its delta worker has stopped.
+            _atomic_json_dump(
+                {
+                    "format_version": 1,
+                    "action": "RESUME",
+                    "request_id": manifest["source_request_id"],
+                    "reason": "migration cancelled before commit",
+                },
+                run_dir / "request_freeze_control.json",
+            )
         cancelled = {
             **state,
             "state": "CANCELLED",
@@ -337,7 +355,12 @@ async def shadow_target_cleanup(raw_request: Request) -> dict[str, Any]:
             status_code=HTTPStatus.FORBIDDEN,
             detail="Shadow target request ID differs from configured session",
         )
-    await raw_request.app.state.engine_client.abort(target_request_id)
+    # OpenAI completions prefixes the supplied request_id and appends the
+    # prompt index before handing it to the engine. Aborting the bare payload
+    # ID leaves the dormant target request in the scheduler indefinitely.
+    await raw_request.app.state.engine_client.abort(
+        _target_completion_engine_request_id(target_request_id)
+    )
     receipt = {
         "format_version": 1,
         "phase": "BridgeTP D3 Phase 8",

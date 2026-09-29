@@ -45,6 +45,7 @@ class MigrationRecord:
     trigger_output_tokens: int | None = None
     candidate_cutover_output_tokens: int | None = None
     cutover_output_tokens: int | None = None
+    urgent_cutover_prearmed_unix_s: float | None = None
     trigger_path: TriggerPath | None = None
 
     # timings, unix seconds

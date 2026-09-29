@@ -65,6 +65,10 @@ run_m2_low_to_high_a100_smoke() {
   python -m unittest \
     tests.bridge_tp.test_shadow_strategy_online_runner.TestOnlineStrategyTiming \
     || return 1
+  python -m unittest \
+    tests.bridge_tp.test_phase9_online_integration.TestLazyActionBinding.test_urgent_source_waits_at_prearmed_candidate_for_history \
+    tests.bridge_tp.test_phase9_online_integration.TestProxyRecorder.test_target_cleanup_maps_openai_completion_request_id \
+    || return 1
   mkdir -p "$run/inputs" || return 1
   python tools/bridge_tp/build_experiment_a4_pressure_manifest.py \
     --base-target-manifest "$base" --out "$manifest" \
@@ -134,6 +138,7 @@ sender = run / "controller" / "gpu_direct_sender.json"
 if accept.is_file():
     data = json.loads(accept.read_text())
     print("acceptance:", data.get("status"), data.get("errors"))
+    print("urgent history wait ms:", data.get("urgent_history_wait_ms"))
 models = []
 prefill_totals = []
 decode_totals = []

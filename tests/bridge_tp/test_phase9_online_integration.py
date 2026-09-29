@@ -29,6 +29,7 @@ from vllm.bridge_tp.controller.events import (
     SourceRequestView,
     TriggerPath,
 )
+from vllm.bridge_tp.controller.manager_m2 import M2RateDecision
 from vllm.bridge_tp.controller.manager_m1 import M1StartDecision
 from vllm.bridge_tp.controller.online_io import (
     ProxyRecorder,
@@ -51,6 +52,22 @@ from vllm.bridge_tp.controller.token_equivalence import (
 
 
 class TestProxyRecorder(unittest.TestCase):
+    def test_target_cleanup_maps_openai_completion_request_id(self) -> None:
+        try:
+            from vllm.bridge_tp.takeover_api import (
+                _target_completion_engine_request_id,
+            )
+        except ModuleNotFoundError as error:
+            if error.name != "fastapi":
+                raise
+            self.skipTest("FastAPI is not installed locally")
+        self.assertEqual(
+            _target_completion_engine_request_id(
+                "bridgetp-phase9-target-controller"
+            ),
+            "cmpl-bridgetp-phase9-target-controller-0",
+        )
+
     def test_holdback_buffers_target_acknowledgement_race(self) -> None:
         externally_visible: list[dict] = []
         recorder = ProxyRecorder(
@@ -838,6 +855,157 @@ class TestLazyActionBinding(unittest.TestCase):
                     for row in audit.records
                 )
             )
+
+    def test_urgent_source_waits_at_prearmed_candidate_for_history(self) -> None:
+        class Policy:
+            cfg = types.SimpleNamespace(max_target_kv_usage_frac=0.85)
+
+            @staticmethod
+            def migration_bytes(_request) -> int:
+                return 1024
+
+        class Rate:
+            rate_bytes_s = 1024.0
+            rate_gib_s = 8.0
+            last_reason = "test"
+
+        class Manager:
+            @staticmethod
+            def decide(_snapshot) -> M2RateDecision:
+                return M2RateDecision(
+                    "HOLD", "HIGH", 8.0 * 1024**3,
+                    "source guard horizon is short",
+                    source_time_to_guard_s=20.0,
+                )
+
+        class Audit:
+            def __init__(self) -> None:
+                self.records: list[dict] = []
+
+            def write(self, value: dict) -> None:
+                self.records.append(value)
+
+        class Adapter:
+            def __init__(self, run_dir: Path) -> None:
+                self.run_dir = run_dir
+                self.ready = False
+                self.cutovers: list[int] = []
+
+            @staticmethod
+            def set_rate(_rate: float, note: str) -> None:
+                del note
+
+            @staticmethod
+            def poll_initial_history_gpu_buffered():
+                return True, {0, 1, 2, 3}, "history buffered"
+
+            def poll_initial_history_gpu_ready(self):
+                return self.ready, ({0, 1, 2, 3} if self.ready else set()), ""
+
+            @staticmethod
+            def poll_delta_gpu_resident_progress():
+                return True, {rank: 2178 for rank in range(4)}, ""
+
+            def set_cutover(self, candidate: int, note: str) -> None:
+                del note
+                self.cutovers.append(candidate)
+
+            @staticmethod
+            def disarm(_reason: str) -> None:
+                pass
+
+            @staticmethod
+            def wait_for_preparing_binding():
+                return object()
+
+            @staticmethod
+            def cancel(_reason: str, *, abort_source: bool):
+                assert not abort_source
+                return {"state": "CANCELLED", "source_abort_dispatched": False}
+
+            @staticmethod
+            def cancel_shadow_target(_reason: str):
+                return {"status": "CLEANED"}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            (run_dir / "session_manifest.json").write_text(
+                json.dumps({"num_computed_tokens": 2114}), encoding="utf-8"
+            )
+            adapter = Adapter(run_dir)
+            audit = Audit()
+            machine = MigrationStateMachine(audit_sink=audit.write)
+            record = machine.create("m", "r")
+            record.trigger_output_tokens = 64
+            record.trigger_path = TriggerPath.MANAGER_M1_START
+            machine.transition("m", MigrationState.SHADOW, 1.0, "test")
+            recorder = ProxyRecorder("external", ProxyMode.HOLD_BACK)
+
+            def tick(output_tokens: int) -> None:
+                step_shadow(
+                    Policy(), machine, adapter, audit, record,
+                    SourceRequestView(
+                        request_id="r", prompt_tokens=2048,
+                        output_tokens=output_tokens,
+                        computed_tokens=2048 + output_tokens - 1,
+                        pending_tokens=1, arrival_unix_s=0.0,
+                        last_token_unix_s=1.0,
+                    ),
+                    object(),
+                    types.SimpleNamespace(kv_usage_frac=0.0, p99_tpot_s=0.02),
+                    0.0, Rate(), time.time(), False, recorder,
+                    diagnostic_earliest_ready_cutover=True,
+                    max_tokens=1024, manager_m2=Manager(),
+                    m2_snapshot=types.SimpleNamespace(to_json=lambda: {}),
+                )
+
+            tick(67)
+            self.assertEqual(adapter.cutovers, [131])
+            self.assertIsNotNone(record.urgent_cutover_prearmed_unix_s)
+            tick(119)
+            self.assertEqual(record.state, MigrationState.SHADOW)
+            adapter.ready = True
+            (run_dir / "request_frozen_receipt.json").write_text(
+                json.dumps({"frozen_unix_ns": time.time_ns()}),
+                encoding="utf-8",
+            )
+            tick(131)
+            self.assertEqual(record.cutover_output_tokens, 131)
+            self.assertEqual(record.state, MigrationState.SHADOW)
+
+            stalled = machine.create("m-stalled", "r-stalled")
+            stalled.trigger_output_tokens = 64
+            stalled.trigger_path = TriggerPath.MANAGER_M1_START
+            stalled.candidate_cutover_output_tokens = 131
+            stalled.urgent_cutover_prearmed_unix_s = time.time() - 7
+            machine.transition("m-stalled", MigrationState.SHADOW, 1.0, "test")
+            adapter.ready = False
+            (run_dir / "request_frozen_receipt.json").write_text(
+                json.dumps({"frozen_unix_ns": time.time_ns() - 6_000_000_000}),
+                encoding="utf-8",
+            )
+            step_shadow(
+                Policy(), machine, adapter, audit, stalled,
+                SourceRequestView(
+                    request_id="r-stalled", prompt_tokens=2048,
+                    output_tokens=131, computed_tokens=2178,
+                    pending_tokens=1, arrival_unix_s=0.0,
+                    last_token_unix_s=1.0,
+                ),
+                object(),
+                types.SimpleNamespace(kv_usage_frac=0.0, p99_tpot_s=0.02),
+                0.0, Rate(), time.time(), False,
+                ProxyRecorder("external-stalled", ProxyMode.HOLD_BACK),
+                diagnostic_earliest_ready_cutover=True,
+                max_tokens=1024, manager_m2=Manager(),
+                m2_snapshot=types.SimpleNamespace(to_json=lambda: {}),
+            )
+            self.assertEqual(stalled.state, MigrationState.CANCELLED)
+            self.assertTrue(any(
+                row.get("kind") == "abandon"
+                and "exceeded 5 seconds" in row.get("reason", "")
+                for row in audit.records
+            ))
 
     def test_earliest_ready_delayed_history_extends_candidate(self) -> None:
         class Policy:
