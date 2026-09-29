@@ -25,7 +25,10 @@ from tools.bridge_tp.run_shadow_strategy_online_validation import (
     build_controller_config_overrides,
     m2_expected_profile_used,
 )
-from vllm.bridge_tp.controller.manager_m0 import RuntimeSnapshot
+from vllm.bridge_tp.controller.manager_m0 import (
+    RuntimeSnapshot,
+    snapshot_from_telemetry,
+)
 from vllm.bridge_tp.controller.manager_m2 import M2RateConfig, M2RateController
 
 
@@ -130,6 +133,47 @@ class TestM2RateController(unittest.TestCase):
         self.assertEqual(
             self.controller.decide(sample(unix_s=100.4)).profile, "HIGH"
         )
+
+    def test_prefill_ewma_spike_does_not_force_initial_high(self) -> None:
+        decision = self.controller.decide(
+            sample(
+                state="LOCAL",
+                target_running=4,
+                source_pool_growth_tokens_s=1448.0,
+                source_pool_sustained_growth_tokens_s=32.0,
+                capacity_pressure=True,
+                history_total_bytes=1024**3,
+            ),
+            before_start=True,
+        )
+        self.assertEqual((decision.action, decision.profile), ("SET_RATE", "LOW"))
+
+    def test_snapshot_retains_sustained_source_growth(self) -> None:
+        snapshot = snapshot_from_telemetry({
+            "unix_s": 100.0,
+            "state": "LOCAL",
+            "tp1": {"sampled_unix_s": 100.0},
+            "tp4": {"sampled_unix_s": 100.0},
+            "capacity_signal": {
+                "transition": "HOLD",
+                "decline_rate_tokens_s": 1448.0,
+                "sustained_decline_rate_tokens_s": 67.0,
+            },
+        })
+        self.assertEqual(snapshot.source_pool_growth_tokens_s, 1448.0)
+        self.assertEqual(snapshot.source_pool_sustained_growth_tokens_s, 67.0)
+
+    def test_sustained_pressure_overrides_busy_target(self) -> None:
+        decision = self.controller.decide(
+            sample(
+                state="LOCAL",
+                target_running=4,
+                source_pool_growth_tokens_s=32.0,
+                source_pool_sustained_growth_tokens_s=2400.0,
+            ),
+            before_start=True,
+        )
+        self.assertEqual((decision.action, decision.profile), ("SET_RATE", "HIGH"))
 
     def test_delta_backlog_upshifts(self) -> None:
         decision = self.controller.decide(sample(delta_lag_tokens=64))

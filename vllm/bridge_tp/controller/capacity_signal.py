@@ -10,6 +10,8 @@ future arrival manifest.
 from __future__ import annotations
 
 import math
+import statistics
+from collections import deque
 from dataclasses import asdict, dataclass
 
 
@@ -65,6 +67,7 @@ class CapacitySignal:
     transition: str
     samples: int
     reason: str
+    sustained_decline_rate_tokens_s: float | None = None
 
     def to_json(self) -> dict:
         value = asdict(self)
@@ -86,6 +89,7 @@ class CapacityHeadroomTracker:
         self._decline_rate = 0.0
         self._samples = 0
         self._active = False
+        self._recent_declines: deque[float] = deque(maxlen=3)
 
     @property
     def active(self) -> bool:
@@ -102,6 +106,7 @@ class CapacityHeadroomTracker:
             dt = now - self._previous_unix_s
             if 0 < dt <= cfg.maximum_observation_gap_s:
                 instantaneous = max(0.0, (self._previous_free - free) / dt)
+                self._recent_declines.append(instantaneous)
                 if self._samples <= 1:
                     self._decline_rate = instantaneous
                 else:
@@ -112,6 +117,7 @@ class CapacityHeadroomTracker:
             else:
                 # A stale or reordered sample must not manufacture urgency.
                 self._decline_rate = 0.0
+                self._recent_declines.clear()
 
         self._previous_free = free
         self._previous_unix_s = now
@@ -157,4 +163,9 @@ class CapacityHeadroomTracker:
             transition=transition,
             samples=self._samples,
             reason=reason,
+            sustained_decline_rate_tokens_s=(
+                statistics.median(self._recent_declines)
+                if len(self._recent_declines) == self._recent_declines.maxlen
+                else None
+            ),
         )

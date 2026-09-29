@@ -125,7 +125,14 @@ class M2RateController:
             snapshot.source_free_kv_tokens
             - snapshot.source_guard_free_kv_tokens
         )
-        growth = snapshot.source_pool_growth_tokens_s
+        # The CAP-0 EWMA includes one-off prompt prefill allocations. A median
+        # of recent free-KV declines avoids treating that spike as sustained
+        # source-pool growth while retaining the EWMA for older replay traces.
+        growth = (
+            snapshot.source_pool_sustained_growth_tokens_s
+            if snapshot.source_pool_sustained_growth_tokens_s is not None
+            else snapshot.source_pool_growth_tokens_s
+        )
         if not math.isfinite(growth) or growth < 0:
             return M2RateDecision(
                 "HOLD", self.profile, current_rate, "source growth invalid",
@@ -145,8 +152,7 @@ class M2RateController:
             + (remaining_history or 0) / cfg.high_bytes_s
         )
         if (
-            snapshot.capacity_pressure is True
-            or headroom <= 0
+            headroom <= 0
             or horizon <= max(cfg.source_safe_horizon_s, preparation_s)
         ):
             desired, reason = "HIGH", "source guard horizon is short"
