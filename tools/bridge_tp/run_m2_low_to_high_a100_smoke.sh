@@ -75,6 +75,9 @@ run_m2_low_to_high_a100_smoke() {
   [[ "$(sha256sum "$guard" | cut -d' ' -f1)" == 0e86c353044f9610be1b5511ff21e870823b7f259c40ccde24188d84164b545b ]] || return 1
 
   python -m unittest discover -s tests/bridge_tp -p test_manager_m2.py || return 1
+  if [[ "$m3_commit" == 1 ]]; then
+    python -m unittest tests.bridge_tp.test_manager_m3 || return 1
+  fi
   python -m unittest discover -s tests/bridge_tp \
     -p test_phase9_capacity_pilot.py || return 1
   python -m unittest discover -s tests/bridge_tp \
