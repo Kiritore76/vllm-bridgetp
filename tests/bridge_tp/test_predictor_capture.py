@@ -75,6 +75,14 @@ class TestPredictorCapture(unittest.TestCase):
             self.assertIsNone(rows[1]["remaining_tokens"])
             self.assertEqual(rows[1]["observed_remaining_lower_bound"], 12)
 
+    def test_randomized_worker_id_joins_external_response_id(self):
+        labels = {"0": {"input_id": "prompt-0"}}
+        self.assertIs(
+            runner.label_for_engine_request("0-ac718888", labels), labels["0"]
+        )
+        self.assertIsNone(runner.label_for_engine_request("0-invalid", labels))
+        self.assertIsNone(runner.label_for_engine_request("1-ac718888", labels))
+
     def test_prompt_loader_rejects_duplicate_request_ids(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "requests.jsonl"
