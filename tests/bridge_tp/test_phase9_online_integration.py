@@ -786,7 +786,7 @@ class TestLazyActionBinding(unittest.TestCase):
             candidate = json.loads(
                 (run_dir / "earliest_ready_candidate.json").read_text()
             )
-            self.assertEqual(candidate["cutover_output_tokens"], 169)
+            self.assertEqual(candidate["cutover_output_tokens"], 210)
             self.assertIsNone(record.cutover_output_tokens)
             self.assertEqual(
                 json.loads((run_dir / "runtime_control.json").read_text())[
@@ -842,12 +842,12 @@ class TestLazyActionBinding(unittest.TestCase):
                     encoding="utf-8",
                 )
             tick(130)
-            self.assertEqual(record.cutover_output_tokens, 169)
+            self.assertEqual(record.cutover_output_tokens, 210)
             self.assertEqual(
                 json.loads((run_dir / "runtime_control.json").read_text())[
                     "cutover_output_tokens"
                 ],
-                169,
+                210,
             )
             self.assertTrue(
                 any(
@@ -904,7 +904,7 @@ class TestLazyActionBinding(unittest.TestCase):
 
             @staticmethod
             def poll_delta_gpu_resident_progress():
-                return True, {rank: 2178 for rank in range(4)}, ""
+                return True, {rank: 2208 for rank in range(4)}, ""
 
             def set_cutover(self, candidate: int, note: str) -> None:
                 del note
@@ -930,7 +930,7 @@ class TestLazyActionBinding(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             run_dir = Path(temporary)
             (run_dir / "session_manifest.json").write_text(
-                json.dumps({"num_computed_tokens": 2114}), encoding="utf-8"
+                json.dumps({"num_computed_tokens": 2084}), encoding="utf-8"
             )
             adapter = Adapter(run_dir)
             audit = Audit()
@@ -960,23 +960,23 @@ class TestLazyActionBinding(unittest.TestCase):
                 )
 
             tick(67)
-            self.assertEqual(adapter.cutovers, [131])
+            self.assertEqual(adapter.cutovers, [161])
             self.assertIsNotNone(record.urgent_cutover_prearmed_unix_s)
-            tick(119)
+            tick(149)
             self.assertEqual(record.state, MigrationState.SHADOW)
             adapter.ready = True
             (run_dir / "request_frozen_receipt.json").write_text(
                 json.dumps({"frozen_unix_ns": time.time_ns()}),
                 encoding="utf-8",
             )
-            tick(131)
-            self.assertEqual(record.cutover_output_tokens, 131)
+            tick(161)
+            self.assertEqual(record.cutover_output_tokens, 161)
             self.assertEqual(record.state, MigrationState.SHADOW)
 
             stalled = machine.create("m-stalled", "r-stalled")
             stalled.trigger_output_tokens = 64
             stalled.trigger_path = TriggerPath.MANAGER_M1_START
-            stalled.candidate_cutover_output_tokens = 131
+            stalled.candidate_cutover_output_tokens = 161
             stalled.urgent_cutover_prearmed_unix_s = time.time() - 7
             machine.transition("m-stalled", MigrationState.SHADOW, 1.0, "test")
             adapter.ready = False
@@ -988,7 +988,7 @@ class TestLazyActionBinding(unittest.TestCase):
                 Policy(), machine, adapter, audit, stalled,
                 SourceRequestView(
                     request_id="r-stalled", prompt_tokens=2048,
-                    output_tokens=131, computed_tokens=2178,
+                    output_tokens=161, computed_tokens=2208,
                     pending_tokens=1, arrival_unix_s=0.0,
                     last_token_unix_s=1.0,
                 ),
@@ -1070,7 +1070,7 @@ class TestLazyActionBinding(unittest.TestCase):
                 (run_dir / "earliest_ready_candidate.json").read_text()
             )
             self.assertEqual(candidate["outstanding_delta_tokens"], 156)
-            self.assertEqual(candidate["cutover_output_tokens"], 392)
+            self.assertEqual(candidate["cutover_output_tokens"], 440)
             self.assertIsNone(record.cutover_output_tokens)
 
     def test_earliest_ready_does_not_freeze_after_candidate_becomes_late(self) -> None:
