@@ -47,6 +47,8 @@ class MigrationRecord:
     cutover_output_tokens: int | None = None
     urgent_cutover_prearmed_unix_s: float | None = None
     trigger_path: TriggerPath | None = None
+    m4_source_cleanup_done: bool = False
+    m4_cancel_reason: str | None = None
 
     # timings, unix seconds
     t_decision: float | None = None

@@ -12,6 +12,10 @@ run_m2_low_to_high_a100_smoke() {
   local m1_min_output_tokens="${BRIDGETP_M1_MIN_OUTPUT_TOKENS:-32}"
   local require_low_to_high="${BRIDGETP_M2_REQUIRE_LOW_TO_HIGH:-1}"
   local m3_commit="${BRIDGETP_M3_COMMIT:-0}"
+  local m4_cancel="${BRIDGETP_M4_CANCEL:-0}"
+  local m4_expect_cancel="${BRIDGETP_M4_EXPECT_CANCEL:-0}"
+  local anchor_max_tokens=1024 trigger_output_tokens=64
+  local source_jobs=8 source_prompt_tokens=1920 source_output_tokens=1024
   local mode=event-low-high
   local m2_requirement=()
   local m3_requirement=()
@@ -28,6 +32,28 @@ run_m2_low_to_high_a100_smoke() {
     mode=m3-commit
   elif [[ "$m3_commit" != 0 ]]; then
     echo "BRIDGETP_M3_COMMIT must be 0 or 1"
+    return 1
+  fi
+  if [[ "$m4_cancel" == 1 && "$m3_commit" == 1 ]]; then
+    m3_requirement+=(--manager-m4-cancel)
+    mode=m4-cancel
+  elif [[ "$m4_cancel" != 0 ]]; then
+    echo "BRIDGETP_M4_CANCEL requires BRIDGETP_M3_COMMIT=1"
+    return 1
+  fi
+  if [[ "$m4_expect_cancel" == 1 && "$m4_cancel" == 1 ]]; then
+    [[ "$require_low_to_high" == 0 ]] || {
+      echo "M4 cancellation smoke requires BRIDGETP_M2_REQUIRE_LOW_TO_HIGH=0"
+      return 1
+    }
+    m3_requirement+=(--manager-m4-expect-cancel)
+    anchor_max_tokens=128
+    trigger_output_tokens=32
+    source_jobs=1
+    source_prompt_tokens=128
+    source_output_tokens=192
+  elif [[ "$m4_expect_cancel" != 0 ]]; then
+    echo "BRIDGETP_M4_EXPECT_CANCEL requires BRIDGETP_M4_CANCEL=1"
     return 1
   fi
   local model=/root/autodl-tmp/models/models/Qwen--Qwen2.5-14B-Instruct/snapshots/master
@@ -71,6 +97,9 @@ run_m2_low_to_high_a100_smoke() {
   if [[ "$m3_commit" == 1 ]]; then
     python -m unittest tests.bridge_tp.test_manager_m3 || return 1
   fi
+  if [[ "$m4_cancel" == 1 ]]; then
+    python -m unittest tests.bridge_tp.test_manager_m4 || return 1
+  fi
   python -m unittest discover -s tests/bridge_tp \
     -p test_phase9_capacity_pilot.py || return 1
   python -m unittest discover -s tests/bridge_tp \
@@ -85,8 +114,8 @@ run_m2_low_to_high_a100_smoke() {
   mkdir -p "$run/inputs" || return 1
   python tools/bridge_tp/build_experiment_a4_pressure_manifest.py \
     --base-target-manifest "$base" --out "$manifest" \
-    --source-jobs 8 --source-prompt-tokens 1920 \
-    --source-output-tokens 1024 --source-start-after-s 0 \
+    --source-jobs "$source_jobs" --source-prompt-tokens "$source_prompt_tokens" \
+    --source-output-tokens "$source_output_tokens" --source-start-after-s 0 \
     --source-start-interval-s 0.05 \
     --source-start-after-m2-initial || return 1
   python tools/bridge_tp/run_phase9_capacity_background.py \
@@ -106,6 +135,10 @@ run_m2_low_to_high_a100_smoke() {
     echo "m1_min_output_tokens=$m1_min_output_tokens"
     echo "m2_require_low_to_high=$require_low_to_high"
     echo "m3_commit=$m3_commit"
+    echo "m4_cancel=$m4_cancel"
+    echo "m4_expect_cancel=$m4_expect_cancel"
+    echo "anchor_max_tokens=$anchor_max_tokens"
+    echo "trigger_output_tokens=$trigger_output_tokens"
     if [[ "$m3_commit" == 1 ]]; then
       echo "m3_policy=COMMIT_EARLIEST_WHEN_READY"
     fi
@@ -133,9 +166,9 @@ run_m2_low_to_high_a100_smoke() {
     "${m3_requirement[@]}" \
     --m2-low-gib-s "$low_gib_s" --m2-medium-gib-s 2.4 --m2-high-gib-s 8.0 \
     --source-pressure --minimum-ready-source-jobs 0 \
-    --trigger-output-tokens 64 --bridge-output-tokens 96 \
+    --trigger-output-tokens "$trigger_output_tokens" --bridge-output-tokens 96 \
     --commit-timing EARLIEST_READY \
-    --anchor-prompt-tokens 2048 --anchor-max-tokens 1024 \
+    --anchor-prompt-tokens 2048 --anchor-max-tokens "$anchor_max_tokens" \
     --minimum-ready-target-jobs 2 \
     --tp1-gpu 0 --tp4-gpus 1,2,3,4 \
     --tp1-port 8001 --tp4-port 8200 \

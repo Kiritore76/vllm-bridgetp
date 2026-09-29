@@ -53,6 +53,9 @@ from vllm.bridge_tp.controller.manager_m2 import (  # noqa: E402
 from vllm.bridge_tp.controller.manager_m3 import (  # noqa: E402
     M3CommitController,
 )
+from vllm.bridge_tp.controller.manager_m4 import (  # noqa: E402
+    M4CancelController,
+)
 from vllm.bridge_tp.controller.events import (  # noqa: E402
     Action,
     MigrationState,
@@ -153,6 +156,11 @@ def parse_args() -> argparse.Namespace:
         "--manager-m3-commit",
         action="store_true",
         help="commit at the first safe boundary after TP4 history readiness",
+    )
+    parser.add_argument(
+        "--manager-m4-cancel",
+        action="store_true",
+        help="cancel pre-freeze Shadow if TP1 will likely finish soon",
     )
     parser.add_argument(
         "--manager-m2-force-initial-high",
@@ -265,6 +273,8 @@ def parse_args() -> argparse.Namespace:
             parser.error(
                 "M3 requires M1/M2 GPU-resident Shadow-only earliest-ready"
             )
+    if args.manager_m4_cancel and not args.manager_m3_commit:
+        parser.error("M4 cancel requires M3 earliest-ready commit")
     if (
         args.gpu_resident_shadow
         and cutover is None
@@ -605,6 +615,118 @@ def step_local(
         MigrationState.SHADOW,
         now,
         trigger_reason,
+    )
+
+
+def _complete_m4_cancel(
+    machine: MigrationStateMachine,
+    adapter: ActionAdapter,
+    audit: AuditLog,
+    record: MigrationRecord,
+    now: float,
+    recorder: ProxyRecorder,
+) -> bool:
+    """Complete target cleanup after TP1 ownership has been preserved."""
+    assert record.m4_source_cleanup_done
+    assert record.m4_cancel_reason is not None
+    try:
+        target_cleanup = adapter.cancel_shadow_target(record.m4_cancel_reason)
+    except ActionError as error:
+        audit.write({"kind": "manager_m4_cancel_error", "detail": str(error)})
+        return True
+    audit.write({
+        "kind": "manager_m4_target_cleanup",
+        "status": (
+            target_cleanup.get("status") if target_cleanup is not None else None
+        ),
+    })
+    audit.write({"kind": "manager_m4_cancelled", "reason": record.m4_cancel_reason})
+    recorder.on_rollback(now, record.m4_cancel_reason)
+    machine.transition(
+        record.migration_id, MigrationState.CANCELLED,
+        now, record.m4_cancel_reason,
+    )
+    return True
+
+
+def step_m4_cancel(
+    manager: M4CancelController,
+    table: SurvivalTable,
+    machine: MigrationStateMachine,
+    adapter: ActionAdapter,
+    audit: AuditLog,
+    record: MigrationRecord,
+    request: SourceRequestView,
+    *,
+    max_output_tokens: int,
+    ignore_eos: bool,
+    source_free_kv_tokens: int,
+    source_guard_free_kv_tokens: int,
+    source_capacity_pressure: bool,
+    now: float,
+    dry_run: bool,
+    recorder: ProxyRecorder,
+) -> bool:
+    """Try pre-freeze cancellation; leave TP1 as the request owner."""
+    if record.m4_source_cleanup_done:
+        return _complete_m4_cancel(
+            machine, adapter, audit, record, now, recorder
+        )
+    frozen_path = adapter.run_dir / "request_frozen_receipt.json"
+    freeze_started = (
+        frozen_path.is_file()
+        or record.urgent_cutover_prearmed_unix_s is not None
+        or (
+            record.cutover_output_tokens is not None
+            and request.output_tokens + 16 >= record.cutover_output_tokens
+        )
+    )
+    decision = manager.decide(
+        request, table,
+        max_output_tokens=max_output_tokens,
+        ignore_eos=ignore_eos,
+        source_free_kv_tokens=source_free_kv_tokens,
+        source_guard_free_kv_tokens=source_guard_free_kv_tokens,
+        source_capacity_pressure=source_capacity_pressure,
+        freeze_started=freeze_started or now - request.last_token_unix_s > 2.0,
+    )
+    audit.write({"kind": "manager_m4_cancel_decision", "decision": decision.to_json()})
+    if decision.action != "CANCEL_SHADOW":
+        return False
+    if not dry_run:
+        # The source can advance while the controller makes its decision.
+        # Never cancel after its freeze receipt becomes visible.
+        if frozen_path.is_file():
+            audit.write({"kind": "manager_m4_cancel_blocked", "reason": "frozen"})
+            return False
+        try:
+            if adapter.refresh_binding() is None:
+                audit.write({
+                    "kind": "manager_m4_cancel_blocked",
+                    "reason": "cleanup binding unavailable",
+                })
+                return True
+            adapter.disarm(decision.reason)
+            cleanup = adapter.cancel(decision.reason, abort_source=False)
+            if cleanup.get("source_abort_dispatched") is not False:
+                raise ActionError(
+                    "M4 cleanup did not confirm continued TP1 ownership"
+                )
+            audit.write({
+                "kind": "manager_m4_source_cleanup",
+                "state": cleanup.get("state"),
+                "source_abort_dispatched": cleanup.get("source_abort_dispatched"),
+            })
+            record.m4_source_cleanup_done = True
+            record.m4_cancel_reason = decision.reason
+        except ActionError as error:
+            audit.write({"kind": "manager_m4_cancel_error", "detail": str(error)})
+            return True
+    else:
+        record.m4_source_cleanup_done = True
+        record.m4_cancel_reason = decision.reason
+    return _complete_m4_cancel(
+        machine, adapter, audit, record, now, recorder
     )
 
 
@@ -1308,6 +1430,7 @@ def main() -> None:
             if args.manager_m3_commit
             else None
         )
+        manager_m4 = M4CancelController() if args.manager_m4_cancel else None
         m0_collector = (
             RuntimeStateCollector()
             if manager_m0 is not None or manager_m1 is not None
@@ -1344,6 +1467,7 @@ def main() -> None:
                 "handoff_mode": args.handoff_mode,
                 "manager_m1_auto_start": args.manager_m1_auto_start,
                 "manager_m3_commit": args.manager_m3_commit,
+                "manager_m4_cancel": args.manager_m4_cancel,
                 "m3_policy": (
                     "COMMIT_EARLIEST_WHEN_READY"
                     if args.manager_m3_commit else None
@@ -1380,6 +1504,14 @@ def main() -> None:
                 ready_notification_waited = False
                 if source_future.done():
                     source_result = source_future.result()
+                    if record.m4_source_cleanup_done:
+                        _complete_m4_cancel(
+                            machine, adapter, audit, record, now, recorder
+                        )
+                        if not record.is_terminal:
+                            time.sleep(config.tick_s)
+                            continue
+                        break
                     _finish_source_without_commit(
                         machine,
                         adapter,
@@ -1747,6 +1879,26 @@ def main() -> None:
                             and record.state is not MigrationState.TAKEOVER
                         )
                     else:
+                        if manager_m4 is not None and step_m4_cancel(
+                            manager_m4,
+                            table,
+                            machine,
+                            adapter,
+                            audit,
+                            record,
+                            request,
+                            max_output_tokens=int(source_request["max_tokens"]),
+                            ignore_eos=bool(source_request["ignore_eos"]),
+                            source_free_kv_tokens=pool1.free_kv_tokens,
+                            source_guard_free_kv_tokens=(
+                                config.capacity_pilot.guard_free_kv_tokens
+                            ),
+                            source_capacity_pressure=capacity_signal.active,
+                            now=now,
+                            dry_run=args.dry_run,
+                            recorder=recorder,
+                        ):
+                            continue
                         step_shadow(
                             policy,
                             machine,
