@@ -249,6 +249,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manager-m2-rate", action="store_true")
     parser.add_argument("--manager-m2-force-initial-high", action="store_true")
     parser.add_argument("--manager-m2-require-source-high", action="store_true")
+    parser.add_argument("--manager-m2-require-low-to-high", action="store_true")
     parser.add_argument("--m2-low-gib-s", type=float)
     parser.add_argument("--m2-medium-gib-s", type=float)
     parser.add_argument("--m2-high-gib-s", type=float)
@@ -606,6 +607,17 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise ValueError(
             "source-driven HIGH requires M2, source peers, and no force flag"
         )
+    if args.manager_m2_require_low_to_high and not (
+        args.manager_m2_rate
+        and args.source_pressure
+        and args.phase == "smoke"
+        and args.manager_m2_expected_profile is None
+        and args.minimum_ready_source_jobs == 0
+    ):
+        raise ValueError(
+            "M2 LOW-to-HIGH smoke requires M2, delayed source peers, "
+            "and no fixed expected profile"
+        )
     if args.manager_m1_auto_start and not (
         args.shadow_only_only
         and args.gpu_resident_shadow
@@ -681,6 +693,12 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
     jobs = manifest["jobs"]
     target_jobs = [job for job in jobs if job.get("pool") == "target"]
     source_jobs = [job for job in jobs if job.get("pool") == "source"]
+    if args.manager_m2_require_low_to_high and (
+        not source_jobs
+        or any(job.get("start_after_event") != "M2_INITIAL_RATE"
+               for job in source_jobs)
+    ):
+        raise ValueError("M2 LOW-to-HIGH smoke requires event-start source peers")
     if source_jobs and not args.source_pressure:
         raise ValueError("online Shadow manifest must contain target jobs only")
     if args.source_pressure and (not source_jobs or not target_jobs):
@@ -1704,6 +1722,7 @@ def accept_online(
     manager_m2_expected_profile: str | None = None,
     manager_m2_min_history_byte_frac: float = 0.0,
     manager_m2_require_source_high: bool = False,
+    manager_m2_require_low_to_high: bool = False,
     gpu_direct_history_pacing_expected: bool = False,
     handoff_mode: str = "bridge",
     require_remote_attention: bool = False,
@@ -2550,6 +2569,40 @@ def accept_online(
                     "M2 HIGH lacked measured pre-guard pressure with active "
                     "source peers"
                 )
+        if manager_m2_require_low_to_high:
+            initial_low = (
+                len(initial_rows) == 1
+                and initial_rows[0].get("decision", {}).get("profile") == "LOW"
+            )
+            if not initial_low:
+                errors.append("M2 did not start Shadow at LOW")
+            if not has_measured_source_high(audit, source_peers):
+                errors.append("M2 did not upshift on measured source pressure")
+            first_initial_s = (
+                float(initial_rows[0]["unix_s"]) if initial_rows else None
+            )
+            if first_initial_s is not None and any(
+                peer.get("request_started_unix_s", 0) < first_initial_s
+                for peer in source_peers
+            ):
+                errors.append("source peers started before M2 initial decision")
+            ranks = direct_sender.get("ranks") or []
+            paced_chunks = (
+                ranks[0].get("history_pacing_chunks") or [] if ranks else []
+            )
+            chunk_rates = [
+                float(row.get("requested_rate_gib_s", 0))
+                for row in paced_chunks
+            ]
+            low, _, high = m2_profiles_gib_s
+            low_before_high = any(
+                abs(rate - low) <= 1e-9
+                and any(abs(later - high) <= 1e-9
+                        for later in chunk_rates[index + 1:])
+                for index, rate in enumerate(chunk_rates)
+            )
+            if not low_before_high:
+                errors.append("M2 LOW-to-HIGH did not reach paced history bytes")
     slo = summarize_slo(
         background.get("results", []),
         tpot_ms=slo_tpot_ms,
@@ -3174,6 +3227,7 @@ def main() -> None:
         "manager_m2_rate": args.manager_m2_rate,
         "manager_m2_force_initial_high": args.manager_m2_force_initial_high,
         "manager_m2_require_source_high": args.manager_m2_require_source_high,
+        "manager_m2_require_low_to_high": args.manager_m2_require_low_to_high,
         "manager_m2_expected_profile": args.manager_m2_expected_profile,
         "manager_m2_min_history_byte_frac": (
             args.manager_m2_min_history_byte_frac
@@ -3389,6 +3443,9 @@ def main() -> None:
                         ),
                         manager_m2_require_source_high=(
                             args.manager_m2_require_source_high
+                        ),
+                        manager_m2_require_low_to_high=(
+                            args.manager_m2_require_low_to_high
                         ),
                         m2_profiles_gib_s=(
                             (args.m2_low_gib_s, args.m2_medium_gib_s,

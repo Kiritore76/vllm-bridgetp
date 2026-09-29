@@ -48,6 +48,10 @@ def load_manifest(path: Path) -> dict[str, Any]:
             raise ValueError(f"job {job_id} pool must be source or target")
         if float(job.get("start_after_s", -1)) < 0:
             raise ValueError(f"job {job_id} start_after_s must be non-negative")
+        if job.get("start_after_event") not in {None, "M2_INITIAL_RATE"}:
+            raise ValueError(f"job {job_id} has an unknown start event")
+        if job.get("start_after_event") and job["pool"] != "source":
+            raise ValueError(f"job {job_id} event start requires a source job")
         request = job.get("request")
         if not isinstance(request, dict):
             raise ValueError(f"job {job_id} request must be an object")
@@ -77,8 +81,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-url", default="http://127.0.0.1:8200")
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--request-timeout-s", type=float, default=1800.0)
+    parser.add_argument("--controller-audit-path", type=Path)
     parser.add_argument("--validate-only", action="store_true")
     return parser.parse_args()
+
+
+def wait_for_m2_initial_rate(path: Path, timeout_s: float) -> float:
+    """Release diagnostic source arrivals after M2's initial decision."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if path.is_file():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("kind") == "manager_m2_initial_rate":
+                    return time.monotonic()
+        time.sleep(0.02)
+    raise TimeoutError("M2 initial rate event was not observed")
 
 
 def main() -> None:
@@ -87,6 +108,9 @@ def main() -> None:
     if args.validate_only:
         print(f"valid CAP-0 background manifest: {len(manifest['jobs'])} jobs")
         return
+    if any(job.get("start_after_event") for job in manifest["jobs"]):
+        if args.controller_audit_path is None:
+            raise ValueError("event-start jobs require --controller-audit-path")
 
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -105,7 +129,12 @@ def main() -> None:
     def run_job(job: dict[str, Any]) -> dict[str, Any]:
         job_id = str(job["job_id"])
         start_after_s = float(job["start_after_s"])
-        remaining = start_monotonic + start_after_s - time.monotonic()
+        anchor = (
+            wait_for_m2_initial_rate(args.controller_audit_path, 120.0)
+            if job.get("start_after_event") == "M2_INITIAL_RATE"
+            else start_monotonic
+        )
+        remaining = anchor + start_after_s - time.monotonic()
         if remaining > 0:
             time.sleep(remaining)
         base_url = args.source_url if job["pool"] == "source" else args.target_url
