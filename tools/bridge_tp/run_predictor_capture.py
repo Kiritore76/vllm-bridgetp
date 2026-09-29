@@ -204,6 +204,7 @@ def main() -> None:
     llm = LLM(
         model=args.model,
         tensor_parallel_size=1,
+        async_scheduling=False,
         enforce_eager=True,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,

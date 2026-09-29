@@ -5,6 +5,8 @@ opt-in capture flag, the GPU runner saves the final-layer state of the token
 used for logits once at request-level prefill completion and then every `k`
 generated tokens. It does not load or train a prediction head and does not
 change the migration controller.
+The pilot explicitly disables asynchronous scheduling because the feature
+index is taken from the synchronous request batch.
 
 Input is local JSONL, one request per line, with a unique string `id` and
 either a text `prompt` or chat-template-compatible `messages`. The bundled
