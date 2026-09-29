@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import signal
@@ -56,7 +57,11 @@ def main() -> None:
     parser.add_argument("--reps", nargs="+", type=int, default=[1])
     parser.add_argument("--num-prompts", type=int, default=30)
     parser.add_argument("--num-warmups", type=int, default=3)
+    parser.add_argument("--fixed-concurrency-validation", action="store_true")
     args = parser.parse_args()
+    if args.fixed_concurrency_validation:
+        args.qps = [1000.0]
+        args.reps = [1, 2, 3]
     if os.name == "nt":
         raise RuntimeError("A100 TPOT calibration must run on the Linux host")
     if any(value <= 0 for value in args.qps + args.reps):
@@ -99,7 +104,11 @@ def main() -> None:
             except OSError as error:
                 raise RuntimeError(f"port {port} is already in use") from error
 
-    run = args.result_root / time.strftime("a100-m3-tpot-%Y%m%dT%H%M%SZ")
+    prefix = (
+        "a100-m3-fixed-tpot" if args.fixed_concurrency_validation
+        else "a100-m3-tpot"
+    )
+    run = args.result_root / time.strftime(prefix + "-%Y%m%dT%H%M%SZ")
     run.mkdir(parents=True, exist_ok=False)
     common.write_json(run / "preflight.json", {
         "revision": revision,
@@ -113,7 +122,13 @@ def main() -> None:
         "workload": {"input_len": 2048, "output_len": 1024,
                      "qps": args.qps, "reps": args.reps,
                      "num_prompts": args.num_prompts,
-                     "num_warmups": args.num_warmups},
+                     "num_warmups": args.num_warmups,
+                     "tp1_max_concurrency": (
+                         6 if args.fixed_concurrency_validation else None
+                     ),
+                     "tp4_max_concurrency": (
+                         4 if args.fixed_concurrency_validation else None
+                     )},
         "data_source": (
             "vllm bench random tokens; original manifest verified but unused"
         ),
@@ -148,13 +163,25 @@ def main() -> None:
             "--input-len", "2048", "--output-len", "1024",
             "--num-prompts", str(args.num_prompts),
             "--num-warmups", str(args.num_warmups),
-            "--fit-load-model", "--qps", *(str(value) for value in args.qps),
+            "--qps", *(str(value) for value in args.qps),
             "--reps", *(str(value) for value in args.reps),
         ]
+        if args.fixed_concurrency_validation:
+            command.extend([
+                "--skip-fit", "--tp1-max-concurrency", "6",
+                "--tp4-max-concurrency", "4",
+            ])
+        else:
+            command.append("--fit-load-model")
+        duration_note = (
+            "fixed concurrency TP1=6 TP4=4"
+            if args.fixed_concurrency_validation
+            else f"first arrival window about "
+                 f"{args.num_prompts / args.qps[0]:.0f}s"
+        )
         print(
             f"starting {2 * len(args.qps) * len(args.reps)} TPOT pilot "
-            f"conditions; first arrival window about "
-            f"{args.num_prompts / args.qps[0]:.0f}s",
+            f"conditions; {duration_note}",
             flush=True,
         )
         with (run / "sweep.console.txt").open("w", encoding="utf-8") as log:
@@ -181,12 +208,42 @@ def main() -> None:
                 raise
         if sweep_rc != 0:
             raise RuntimeError(f"TPOT sweep failed: {sweep_rc}")
-        model = run / "sweep" / "tick_tpot_candidate.json"
-        if not model.is_file():
-            raise RuntimeError("TPOT sweep did not create a fitted model")
+        if args.fixed_concurrency_validation:
+            occupancy = []
+            for condition in sorted((run / "sweep").glob("tpot_*")):
+                if not condition.is_dir():
+                    continue
+                manifest = common.read_json(
+                    condition / "condition_manifest.json"
+                )
+                expected_cap = 6 if manifest["side"] == "tp1" else 4
+                with (condition / "telemetry.csv").open(
+                    newline="", encoding="utf-8"
+                ) as handle:
+                    rows = list(csv.DictReader(handle))
+                at_cap = sum(
+                    int(float(row["num_running"])) == expected_cap
+                    for row in rows
+                )
+                occupancy.append({
+                    "condition": condition.name,
+                    "expected_concurrency": expected_cap,
+                    "intervals_at_cap": at_cap,
+                    "telemetry_intervals": len(rows),
+                })
+            common.write_json(run / "fixed_concurrency_observed.json", occupancy)
+            if len(occupancy) != 6 or any(
+                row["intervals_at_cap"] < 5 for row in occupancy
+            ):
+                raise RuntimeError("fixed concurrency was not sustained")
+            print("fixed-concurrency validation data complete", flush=True)
+        else:
+            model = run / "sweep" / "tick_tpot_candidate.json"
+            if not model.is_file():
+                raise RuntimeError("TPOT sweep did not create a fitted model")
+            print(f"model={model}")
+            print(f"model_sha256={common.sha256(model)}")
         status = "COMPLETE"
-        print(f"model={model}")
-        print(f"model_sha256={common.sha256(model)}")
     except KeyboardInterrupt:
         status = "INTERRUPTED"
         raise
