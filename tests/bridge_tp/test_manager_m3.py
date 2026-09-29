@@ -1,33 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M3 candidate timing and provisional-ready safety behavior."""
+"""M3 earliest-safe commit and provisional-ready safety behavior."""
 
 from __future__ import annotations
 
-import unittest
 import json
-import hashlib
+import unittest
 from contextlib import redirect_stderr
 from io import StringIO
-from types import SimpleNamespace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from tools.bridge_tp.run_phase9_controller import (
-    _m3_tpot_evidence, parse_args, step_shadow,
-)
-from tools.bridge_tp.run_shadow_strategy_online_validation import (
-    load_m3_tpot_models,
-)
+from tools.bridge_tp.run_phase9_controller import parse_args, step_shadow
 from vllm.bridge_tp.controller.events import (
-    MigrationState, SourceRequestView, TriggerPath,
+    MigrationState,
+    SourceRequestView,
+    TriggerPath,
 )
+from vllm.bridge_tp.controller.manager_m3 import M3CommitController
 from vllm.bridge_tp.controller.online_io import ProxyRecorder
 from vllm.bridge_tp.controller.response_proxy import ProxyMode
-from vllm.bridge_tp.controller.manager_m3 import (
-    M3CommitConfig,
-    M3CommitController,
-)
 from vllm.bridge_tp.controller.state_machine import (
     IllegalTransition,
     MigrationStateMachine,
@@ -36,28 +29,24 @@ from vllm.bridge_tp.controller.state_machine import (
 
 class TestM3Commit(unittest.TestCase):
     def setUp(self) -> None:
-        self.controller = M3CommitController(M3CommitConfig(
-            handoff_s=0.5, gain_margin_s=0.5, defer_tokens=64,
-        ))
-        self.inputs = dict(
-            output_tokens=100,
-            base_candidate=164,
-            max_output_tokens=1024,
-            expected_remaining_tokens=400.0,
-            source_tpot_s=0.030,
-            target_tpot_s=0.020,
-            target_waiting=0,
-            source_time_to_guard_s=60.0,
-            capacity_emergency=False,
-        )
+        self.controller = M3CommitController()
 
-    def test_positive_gain_keeps_earliest_boundary(self) -> None:
-        decision = self.controller.plan_candidate(**self.inputs)
+    def test_ready_candidate_is_never_deferred(self) -> None:
+        decision = self.controller.plan_candidate(
+            output_tokens=100, base_candidate=164, max_output_tokens=1024,
+        )
         self.assertEqual(decision.action, "COMMIT_EARLIEST")
         self.assertEqual(decision.candidate_output_tokens, 164)
-        self.assertGreater(decision.expected_gain_s, 0.5)
 
-    def test_cli_requires_m2_and_explicit_calibration(self) -> None:
+    def test_candidate_must_leave_output_for_target(self) -> None:
+        for candidate in (100, 1024):
+            with self.assertRaises(ValueError):
+                self.controller.plan_candidate(
+                    output_tokens=100, base_candidate=candidate,
+                    max_output_tokens=1024,
+                )
+
+    def test_cli_requires_m2_and_earliest_ready(self) -> None:
         base = [
             "run_phase9_controller.py", "--config", "config.json",
             "--run-dir", "run", "--source-request", "request.json",
@@ -66,43 +55,13 @@ class TestM3Commit(unittest.TestCase):
             "--handoff-mode", "shadow-only", "--gpu-resident-shadow",
             "--manager-m3-commit",
         ]
-        with patch("sys.argv", base), redirect_stderr(StringIO()):
+        with patch("sys.argv", base):
+            self.assertTrue(parse_args().manager_m3_commit)
+        with patch("sys.argv", base[:9] + base[10:]), redirect_stderr(
+            StringIO()
+        ):
             with self.assertRaises(SystemExit):
                 parse_args()
-        with patch("sys.argv", base + [
-            "--m3-handoff-s", "0.5", "--m3-gain-margin-s", "0.5",
-        ]):
-            self.assertTrue(parse_args().manager_m3_commit)
-
-    def test_busy_target_defers_only_while_source_safe(self) -> None:
-        busy = self.inputs | {"target_waiting": 4}
-        decision = self.controller.plan_candidate(**busy)
-        self.assertEqual((decision.action, decision.candidate_output_tokens),
-                         ("DEFER", 228))
-        urgent = self.controller.plan_candidate(
-            **(busy | {"capacity_emergency": True})
-        )
-        self.assertEqual(urgent.candidate_output_tokens, 164)
-        close_guard = self.controller.plan_candidate(
-            **(busy | {"source_time_to_guard_s": 1.0})
-        )
-        self.assertEqual(close_guard.candidate_output_tokens, 164)
-
-    def test_missing_tpot_does_not_invent_gain(self) -> None:
-        decision = self.controller.plan_candidate(
-            **(self.inputs | {"source_tpot_s": None})
-        )
-        self.assertEqual(decision.action, "COMMIT_EARLIEST")
-        self.assertIsNone(decision.expected_gain_s)
-
-    def test_no_remaining_output_for_deferral(self) -> None:
-        decision = self.controller.plan_candidate(**(
-            self.inputs | {
-                "output_tokens": 800, "base_candidate": 900,
-                "target_waiting": 4,
-            }
-        ))
-        self.assertEqual(decision.candidate_output_tokens, 900)
 
     def test_provisional_ready_requires_four_rank_commit_gate(self) -> None:
         machine = MigrationStateMachine(allow_shadow_takeover=True)
@@ -116,57 +75,7 @@ class TestM3Commit(unittest.TestCase):
         machine.transition("m", MigrationState.TAKEOVER, 3.0)
         self.assertEqual(record.state, MigrationState.TAKEOVER)
 
-    def test_uncalibrated_tpot_is_not_used_as_gain_evidence(self) -> None:
-        pool = SimpleNamespace(
-            p99_tpot_s=None, tpot_samples=0, num_running=4,
-            kv_usage_frac=0.2,
-        )
-        model = SimpleNamespace(
-            calibration_source="CAP-0 placeholder",
-            in_support=lambda *_args: True,
-            tpot_s=lambda *_args: 0.02,
-        )
-        self.assertEqual(_m3_tpot_evidence(pool, model),
-                         (None, "unavailable"))
-        model.calibration_source = "A100 measured target TPOT"
-        self.assertEqual(_m3_tpot_evidence(pool, model),
-                         (0.02, "calibrated_model"))
-
-    def test_measured_tpot_input_requires_exact_scope_and_hash(self) -> None:
-        payload = {
-            "status": "WORKLOAD_SCOPED_LOAD_TPOT_CANDIDATE",
-            "platform": "NVIDIA A100 PCIe",
-            "scope": {
-                "input_len": 2048, "output_len": 1024,
-                "predictor": "runtime vLLM kv_usage_frac",
-            },
-            "tpot_tp1": {
-                "base_s": 0.03, "per_running_s": 0.0,
-                "model_kind": "load_piecewise_monotone",
-                "load_knots": [0.1, 0.6],
-                "tpot_knots_s": [0.03, 0.05],
-                "min_load_frac": 0.1, "max_load_frac": 0.6,
-            },
-            "tpot_tp4": {
-                "base_s": 0.02, "per_running_s": 0.0,
-                "model_kind": "load_piecewise_monotone",
-                "load_knots": [0.01, 0.5],
-                "tpot_knots_s": [0.02, 0.04],
-                "min_load_frac": 0.01, "max_load_frac": 0.5,
-            },
-        }
-        with TemporaryDirectory() as temporary:
-            path = Path(temporary) / "model.json"
-            path.write_text(json.dumps(payload), encoding="utf-8")
-            sha = hashlib.sha256(path.read_bytes()).hexdigest()
-            models = load_m3_tpot_models(path, sha, 2048, 1024)
-            self.assertIn(sha, models["tpot_tp1"]["calibration_source"])
-            with self.assertRaisesRegex(ValueError, "SHA256"):
-                load_m3_tpot_models(path, "0" * 64, 2048, 1024)
-            with self.assertRaisesRegex(ValueError, "scope"):
-                load_m3_tpot_models(path, sha, 256, 2048)
-
-    def test_candidate_is_deferred_before_target_admission(self) -> None:
+    def test_candidate_equals_base_before_target_admission(self) -> None:
         class Adapter:
             def __init__(self, root: Path) -> None:
                 self.run_dir = root
@@ -193,31 +102,15 @@ class TestM3Commit(unittest.TestCase):
                     to_json=lambda: {"profile": "LOW"},
                 )
 
-        table = SimpleNamespace(
-            in_support=lambda _tokens: True,
-            expected_remaining=lambda _tokens: 400.0,
-        )
         policy = SimpleNamespace(
-            table=table,
             cfg=SimpleNamespace(max_target_kv_usage_frac=0.85),
             migration_bytes=lambda _request: 1024,
-            tpot_tp1=SimpleNamespace(
-                calibration_source="A100 source calibration",
-                in_support=lambda *_args: True,
-                tpot_s=lambda *_args: 0.030,
-            ),
-            tpot_tp4=SimpleNamespace(
-                calibration_source="A100 target calibration",
-                in_support=lambda *_args: True,
-                tpot_s=lambda *_args: 0.020,
-            ),
         )
-        rate = SimpleNamespace(rate_bytes_s=0.5 * 1024**3,
-                               rate_gib_s=0.5, last_reason="LOW")
-        source_pool = SimpleNamespace(
-            p99_tpot_s=0.030, tpot_samples=1, num_running=1,
-            kv_usage_frac=0.2,
+        rate = SimpleNamespace(
+            rate_bytes_s=0.5 * 1024**3, rate_gib_s=0.5,
+            last_reason="LOW",
         )
+        source_pool = SimpleNamespace(num_running=1, kv_usage_frac=0.2)
         target_pool = SimpleNamespace(
             p99_tpot_s=0.020, tpot_samples=1, num_running=4,
             num_waiting=4, kv_usage_frac=0.2,
@@ -251,9 +144,11 @@ class TestM3Commit(unittest.TestCase):
                 (root / "earliest_ready_candidate.json").read_text()
             )
             # Base: output 100 + max(64, backlog 48 + 64) = 212.
-            self.assertEqual(candidate["cutover_output_tokens"], 276)
+            self.assertEqual(candidate["cutover_output_tokens"], 212)
             self.assertTrue(any(
                 row.get("kind") == "manager_m3_candidate_decision"
-                and row["decision"]["action"] == "DEFER"
+                and row["decision"]["action"] == "COMMIT_EARLIEST"
+                and row["decision"]["candidate_output_tokens"] == 212
+                and row["base_candidate_output_tokens"] == 212
                 for row in audit.rows
             ))
