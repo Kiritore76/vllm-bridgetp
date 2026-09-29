@@ -1,0 +1,6 @@
+{"id":"pilot-short-cn-1","messages":[{"role":"user","content":"用一句话解释什么是 KV cache。"}]}
+{"id":"pilot-short-en-1","messages":[{"role":"user","content":"What is the difference between latency and throughput? Answer in two sentences."}]}
+{"id":"pilot-medium-cn-1","messages":[{"role":"user","content":"解释 prefill 和 decode 的计算特点，并举一个推理服务中的调度例子。"}]}
+{"id":"pilot-medium-en-1","messages":[{"role":"user","content":"Compare TCP congestion control and application-level rate limiting. Give a concrete example of each."}]}
+{"id":"pilot-code-1","messages":[{"role":"user","content":"Write a Python function that merges overlapping integer intervals. Explain its time complexity."}]}
+{"id":"pilot-long-cn-1","messages":[{"role":"user","content":"请写一份技术设计说明：在多 GPU 推理服务中迁移单个请求的 KV cache 时，如何保证请求输出连续、源端不提前释放、目标端只在数据就绪后接管。分为目标、状态机、故障恢复、监控四节。"}]}
