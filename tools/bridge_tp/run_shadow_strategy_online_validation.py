@@ -3993,7 +3993,9 @@ def main() -> None:
             "persistent_channel_summary": persistent_summary,
             "errors": errors,
         }
-        if not args.manager_m1_expect_stay:
+        # Cancellation has no freeze, commit, or target TPOT windows.  Its
+        # acceptance record is the measurement for this diagnostic run.
+        if not args.manager_m1_expect_stay and not args.manager_m4_expect_cancel:
             write_measurements(out_root, batch["runs"])
         common.write_json(out_root / "acceptance.json", final)
         if errors:
