@@ -68,6 +68,10 @@ class CapacitySignal:
     samples: int
     reason: str
     sustained_decline_rate_tokens_s: float | None = None
+    prefill_pending_kv_tokens: int | None = None
+    prefill_scheduled_tokens_total: int | None = None
+    decode_scheduled_tokens_total: int | None = None
+    decode_growth_tokens_s: float | None = None
 
     def to_json(self) -> dict:
         value = asdict(self)
@@ -90,20 +94,52 @@ class CapacityHeadroomTracker:
         self._samples = 0
         self._active = False
         self._recent_declines: deque[float] = deque(maxlen=3)
+        self._previous_decode_tokens: int | None = None
+        self._decode_growth: float | None = None
 
     @property
     def active(self) -> bool:
         return self._active
 
-    def update(self, free_kv_tokens: int, sampled_unix_s: float) -> CapacitySignal:
+    def update(
+        self,
+        free_kv_tokens: int,
+        sampled_unix_s: float,
+        *,
+        prefill_pending_kv_tokens: int | None = None,
+        prefill_scheduled_tokens_total: int | None = None,
+        decode_scheduled_tokens_total: int | None = None,
+    ) -> CapacitySignal:
         cfg = self.config
         free = max(0, int(free_kv_tokens))
         now = float(sampled_unix_s)
         transition = "DISABLED" if not cfg.enabled else "WARMUP"
         reason = "capacity pilot disabled" if not cfg.enabled else "warming up"
+        dt = (
+            now - self._previous_unix_s
+            if self._previous_unix_s is not None else None
+        )
+        if (
+            decode_scheduled_tokens_total is not None
+            and self._previous_decode_tokens is not None
+            and dt is not None
+            and 0 < dt <= cfg.maximum_observation_gap_s
+            and decode_scheduled_tokens_total >= self._previous_decode_tokens
+        ):
+            observed = (
+                decode_scheduled_tokens_total - self._previous_decode_tokens
+            ) / dt
+            self._decode_growth = (
+                observed if self._decode_growth is None
+                else cfg.ewma_alpha * observed
+                + (1.0 - cfg.ewma_alpha) * self._decode_growth
+            )
+        else:
+            self._decode_growth = None
+        self._previous_decode_tokens = decode_scheduled_tokens_total
 
         if self._previous_free is not None and self._previous_unix_s is not None:
-            dt = now - self._previous_unix_s
+            assert dt is not None
             if 0 < dt <= cfg.maximum_observation_gap_s:
                 instantaneous = max(0.0, (self._previous_free - free) / dt)
                 self._recent_declines.append(instantaneous)
@@ -168,4 +204,8 @@ class CapacityHeadroomTracker:
                 if len(self._recent_declines) == self._recent_declines.maxlen
                 else None
             ),
+            prefill_pending_kv_tokens=prefill_pending_kv_tokens,
+            prefill_scheduled_tokens_total=prefill_scheduled_tokens_total,
+            decode_scheduled_tokens_total=decode_scheduled_tokens_total,
+            decode_growth_tokens_s=self._decode_growth,
         )

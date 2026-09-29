@@ -526,6 +526,32 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             gauge_kv_cache_usage, per_engine_labelvalues
         )
 
+        pending_prefill = self._gauge_cls(
+            name="vllm:bridgetp_prefill_pending_kv_tokens",
+            documentation="Upper-bound KV tokens for admitted unfinished prompts.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_bridgetp_prefill_pending = create_metric_per_engine(
+            pending_prefill, per_engine_labelvalues
+        )
+        prefill_scheduled = self._counter_cls(
+            name="vllm:bridgetp_prefill_scheduled_tokens",
+            documentation="Prompt tokens scheduled by the engine.",
+            labelnames=labelnames,
+        )
+        self.counter_bridgetp_prefill_scheduled = create_metric_per_engine(
+            prefill_scheduled, per_engine_labelvalues
+        )
+        decode_scheduled = self._counter_cls(
+            name="vllm:bridgetp_decode_scheduled_tokens",
+            documentation="Decode tokens scheduled by the engine.",
+            labelnames=labelnames,
+        )
+        self.counter_bridgetp_decode_scheduled = create_metric_per_engine(
+            decode_scheduled, per_engine_labelvalues
+        )
+
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             counter_corrupted_requests = self._counter_cls(
                 name="vllm:corrupted_requests",
@@ -1079,6 +1105,16 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 scheduler_stats.num_skipped_waiting_reqs
             )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+            if scheduler_stats.bridgetp_prefill_pending_kv_tokens is not None:
+                self.gauge_bridgetp_prefill_pending[engine_idx].set(
+                    scheduler_stats.bridgetp_prefill_pending_kv_tokens
+                )
+            self.counter_bridgetp_prefill_scheduled[engine_idx].inc(
+                scheduler_stats.bridgetp_prefill_scheduled_tokens
+            )
+            self.counter_bridgetp_decode_scheduled[engine_idx].inc(
+                scheduler_stats.bridgetp_decode_scheduled_tokens
+            )
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries

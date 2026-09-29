@@ -151,6 +151,18 @@ class TestPrometheusParsing(unittest.TestCase):
         pool = tel.pool_from_samples(samples, block_size=16, total_kv_blocks=100)
         self.assertAlmostEqual(pool.kv_usage_frac, 0.75, places=9)
 
+    def test_bridgetp_prefill_and_decode_metrics_are_separate(self):
+        samples = tel.parse_prometheus(
+            "vllm:kv_cache_usage_perc 0.25\n"
+            "vllm:bridgetp_prefill_pending_kv_tokens 4096\n"
+            "vllm:bridgetp_prefill_scheduled_tokens_total 8192\n"
+            "vllm:bridgetp_decode_scheduled_tokens_total 128\n"
+        )
+        pool = tel.pool_from_samples(samples, block_size=16, total_kv_blocks=100)
+        self.assertEqual(pool.prefill_pending_kv_tokens, 4096)
+        self.assertEqual(pool.prefill_scheduled_tokens_total, 8192)
+        self.assertEqual(pool.decode_scheduled_tokens_total, 128)
+
     def test_interval_histogram_uses_counter_deltas(self):
         previous = tel.parse_prometheus(
             """

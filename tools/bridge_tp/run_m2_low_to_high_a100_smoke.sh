@@ -9,12 +9,23 @@ run_m2_low_to_high_a100_smoke() {
 
   local expected_revision="${BRIDGETP_EXPECTED_REVISION:?set BRIDGETP_EXPECTED_REVISION}"
   local low_gib_s="${BRIDGETP_M2_LOW_GIB_S:-0.1}"
+  local require_low_to_high="${BRIDGETP_M2_REQUIRE_LOW_TO_HIGH:-1}"
+  local mode=event-low-high
+  local m2_requirement=()
+  if [[ "$require_low_to_high" == 0 ]]; then
+    mode=split-capacity
+  elif [[ "$require_low_to_high" == 1 ]]; then
+    m2_requirement+=(--manager-m2-require-low-to-high)
+  else
+    echo "BRIDGETP_M2_REQUIRE_LOW_TO_HIGH must be 0 or 1"
+    return 1
+  fi
   local model=/root/autodl-tmp/models/models/Qwen--Qwen2.5-14B-Instruct/snapshots/master
   local base=/root/autodl-tmp/bridgetp/a1d_manifests/working/a1d-full-smoke-20260922T153543Z-output-1024.json
   local survival=/root/autodl-tmp/bridgetp/phase9_cap0_inputs/survival_table_m1_v1.json
   local guard=/root/autodl-tmp/bridgetp/phase9_cap0_manifests/frozen/guard_free_kv_tokens.txt
   local root=/root/autodl-tmp/bridgetp/results/migration_manager_m2
-  local run="$root/a100-m2-event-low-high-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  local run="$root/a100-m2-$mode-$(date -u +%Y%m%dT%H%M%SZ)-$$"
   local manifest="$run/inputs/event_source_pressure.json"
   local out="$run/online"
   local manifest_sha runner_rc
@@ -49,6 +60,11 @@ run_m2_low_to_high_a100_smoke() {
   python -m unittest discover -s tests/bridge_tp -p test_manager_m2.py || return 1
   python -m unittest discover -s tests/bridge_tp \
     -p test_phase9_capacity_pilot.py || return 1
+  python -m unittest discover -s tests/bridge_tp \
+    -p test_phase9_telemetry_control.py || return 1
+  python -m unittest \
+    tests.bridge_tp.test_shadow_strategy_online_runner.TestOnlineStrategyTiming \
+    || return 1
   mkdir -p "$run/inputs" || return 1
   python tools/bridge_tp/build_experiment_a4_pressure_manifest.py \
     --base-target-manifest "$base" --out "$manifest" \
@@ -70,6 +86,7 @@ run_m2_low_to_high_a100_smoke() {
     sha256sum "$base" "$manifest" "$survival" "$guard"
     echo "guard=$(cat "$guard")"
     echo "m2_low_gib_s=$low_gib_s"
+    echo "m2_require_low_to_high=$require_low_to_high"
   } | tee "$run/preflight.txt"
 
   # Default LOW=0.1 stretches a diagnostic copy; set the measured 0.5 for
@@ -89,7 +106,7 @@ run_m2_low_to_high_a100_smoke() {
     --ready-sync-mode STREAM_EVENT --ready-notification-mode UDP \
     --persistent-channel --preconnect-persistent-channel --channel-generation 1 \
     --manager-m0-shadow --manager-m1-auto-start --manager-m2-rate \
-    --manager-m2-require-low-to-high \
+    "${m2_requirement[@]}" \
     --m2-low-gib-s "$low_gib_s" --m2-medium-gib-s 2.4 --m2-high-gib-s 8.0 \
     --source-pressure --minimum-ready-source-jobs 0 \
     --trigger-output-tokens 64 --bridge-output-tokens 96 \
@@ -117,13 +134,28 @@ sender = run / "controller" / "gpu_direct_sender.json"
 if accept.is_file():
     data = json.loads(accept.read_text())
     print("acceptance:", data.get("status"), data.get("errors"))
+models = []
+prefill_totals = []
+decode_totals = []
 if audit.is_file():
     rows = [json.loads(line) for line in audit.read_text().splitlines()]
     for row in rows:
+        if row.get("kind") == "telemetry":
+            signal = row.get("capacity_signal") or {}
+            if signal.get("prefill_scheduled_tokens_total") is not None:
+                prefill_totals.append(signal["prefill_scheduled_tokens_total"])
+            if signal.get("decode_scheduled_tokens_total") is not None:
+                decode_totals.append(signal["decode_scheduled_tokens_total"])
         if row.get("kind") == "manager_m2_initial_rate":
             print("initial rate:", row.get("decision"))
+            models.append((row.get("decision") or {}).get("source_capacity_model"))
         elif row.get("kind") == "rate" and (row.get("manager_m2_decision") or {}).get("action") == "SET_RATE":
             print("rate change:", row.get("manager_m2_decision"))
+            models.append(row["manager_m2_decision"].get("source_capacity_model"))
+print("M2 capacity models:", models)
+print("prefill/decode counter ranges:",
+      (min(prefill_totals), max(prefill_totals)) if prefill_totals else None,
+      (min(decode_totals), max(decode_totals)) if decode_totals else None)
 if sender.is_file():
     data = json.loads(sender.read_text())
     ranks = data.get("ranks") or []
@@ -133,11 +165,22 @@ if sender.is_file():
         rate = chunk["requested_rate_gib_s"]
         by_rate[rate] = by_rate.get(rate, 0) + chunk["aggregate_bytes"]
     print("paced history bytes by rate:", by_rate)
+if not models or any(
+    model != "prefill_reservation_plus_decode_growth" for model in models
+):
+    raise SystemExit("M2 did not use separated prefill/decode evidence")
+if (not prefill_totals or max(prefill_totals) == min(prefill_totals)
+        or not decode_totals or max(decode_totals) == min(decode_totals)):
+    raise SystemExit("source prefill/decode counters did not both advance")
 PY
+  local summary_rc=$?
   cat "$run/transition_summary.txt"
   tar -czf "$run.tar.gz" -C "$root" "$(basename "$run")" || return 1
   echo "raw result directory: $run"
   echo "archive to retrieve: $run.tar.gz"
+  if [[ "$runner_rc" -eq 0 && "$summary_rc" -ne 0 ]]; then
+    return "$summary_rc"
+  fi
   return "$runner_rc"
 }
 

@@ -131,6 +131,14 @@ def first_value_for_names(
     return default
 
 
+def optional_counter(samples: list[Sample], name: str) -> int | None:
+    """Read a counter across Prometheus client suffix conventions."""
+    for candidate in (name, f"{name}_total"):
+        if has_metric(samples, candidate):
+            return int(first_value(samples, candidate))
+    return None
+
+
 def has_metric(samples: list[Sample], name: str) -> bool:
     """Return whether a scrape contains at least one sample with ``name``."""
     return any(sample.name == name for sample in samples)
@@ -303,6 +311,17 @@ def pool_from_samples(
             else 0
         ),
         tpot_metric=selected_tpot_metric,
+        prefill_pending_kv_tokens=(
+            int(first_value(samples, "vllm:bridgetp_prefill_pending_kv_tokens"))
+            if has_metric(samples, "vllm:bridgetp_prefill_pending_kv_tokens")
+            else None
+        ),
+        prefill_scheduled_tokens_total=optional_counter(
+            samples, "vllm:bridgetp_prefill_scheduled_tokens"
+        ),
+        decode_scheduled_tokens_total=optional_counter(
+            samples, "vllm:bridgetp_decode_scheduled_tokens"
+        ),
     )
 
 
@@ -354,6 +373,9 @@ def interval_pool_from_samples(
             sampled_unix_s=pool.sampled_unix_s,
             tpot_samples=count,
             tpot_metric=selected_tpot_metric,
+            prefill_pending_kv_tokens=pool.prefill_pending_kv_tokens,
+            prefill_scheduled_tokens_total=pool.prefill_scheduled_tokens_total,
+            decode_scheduled_tokens_total=pool.decode_scheduled_tokens_total,
         ),
         count,
     )

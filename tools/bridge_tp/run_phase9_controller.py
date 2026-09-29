@@ -1272,6 +1272,13 @@ def main() -> None:
                 capacity_signal = capacity.update(
                     pool1.free_kv_tokens,
                     pool1.sampled_unix_s or now,
+                    prefill_pending_kv_tokens=pool1.prefill_pending_kv_tokens,
+                    prefill_scheduled_tokens_total=(
+                        pool1.prefill_scheduled_tokens_total
+                    ),
+                    decode_scheduled_tokens_total=(
+                        pool1.decode_scheduled_tokens_total
+                    ),
                 )
                 request = read_source_progress(run_dir, source_request, now)
                 if request is None:

@@ -66,6 +66,7 @@ class M2RateDecision:
     reason: str
     missing: tuple[str, ...] = ()
     source_time_to_guard_s: float | None = None
+    source_capacity_model: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -101,13 +102,21 @@ class M2RateController:
         for name in (
             "source_free_kv_tokens",
             "source_guard_free_kv_tokens",
-            "source_pool_growth_tokens_s",
             "target_waiting",
             "target_running",
             "target_kv_usage_frac",
         ):
             if getattr(snapshot, name) is None:
                 missing.append(name)
+        if (
+            (
+                snapshot.source_decode_growth_tokens_s is None
+                or snapshot.source_prefill_pending_kv_tokens is None
+            )
+            and snapshot.source_pool_growth_tokens_s is None
+            and snapshot.source_pool_sustained_growth_tokens_s is None
+        ):
+            missing.append("source growth")
         if missing:
             self._candidate = None
             self._candidate_ticks = 0
@@ -117,26 +126,43 @@ class M2RateController:
             )
         assert snapshot.source_free_kv_tokens is not None
         assert snapshot.source_guard_free_kv_tokens is not None
-        assert snapshot.source_pool_growth_tokens_s is not None
         assert snapshot.target_waiting is not None
         assert snapshot.target_running is not None
         assert snapshot.target_kv_usage_frac is not None
+        separated = (
+            snapshot.source_prefill_pending_kv_tokens is not None
+            and snapshot.source_decode_growth_tokens_s is not None
+        )
+        reserved_prefill = (
+            snapshot.source_prefill_pending_kv_tokens if separated else 0
+        )
+        assert reserved_prefill is not None
         headroom = (
             snapshot.source_free_kv_tokens
             - snapshot.source_guard_free_kv_tokens
+            - reserved_prefill
         )
-        # The CAP-0 EWMA includes one-off prompt prefill allocations. A median
-        # of recent free-KV declines avoids treating that spike as sustained
-        # source-pool growth while retaining the EWMA for older replay traces.
-        growth = (
-            snapshot.source_pool_sustained_growth_tokens_s
-            if snapshot.source_pool_sustained_growth_tokens_s is not None
-            else snapshot.source_pool_growth_tokens_s
-        )
+        if separated:
+            growth = snapshot.source_decode_growth_tokens_s
+            capacity_model = "prefill_reservation_plus_decode_growth"
+        else:
+            # Older traces do not distinguish prompt allocation from decode.
+            growth = (
+                snapshot.source_pool_sustained_growth_tokens_s
+                if snapshot.source_pool_sustained_growth_tokens_s is not None
+                else snapshot.source_pool_growth_tokens_s
+            )
+            capacity_model = "net_kv_growth_fallback"
+        assert growth is not None
         if not math.isfinite(growth) or growth < 0:
             return M2RateDecision(
                 "HOLD", self.profile, current_rate, "source growth invalid",
-                ("source_pool_growth_tokens_s",),
+                ("source growth",),
+            )
+        if reserved_prefill < 0:
+            return M2RateDecision(
+                "HOLD", self.profile, current_rate, "prefill reservation invalid",
+                ("source_prefill_pending_kv_tokens",),
             )
         horizon = math.inf if growth == 0 else max(0.0, headroom / growth)
         remaining_history = None
@@ -185,6 +211,7 @@ class M2RateController:
             return M2RateDecision(
                 "HOLD", self.profile, current_rate, reason,
                 source_time_to_guard_s=None if math.isinf(horizon) else horizon,
+                source_capacity_model=capacity_model,
             )
         if not before_start and self._ORDER[desired] < self._ORDER[self.profile]:
             if self._candidate == desired:
@@ -203,6 +230,7 @@ class M2RateController:
                     source_time_to_guard_s=(
                         None if math.isinf(horizon) else horizon
                     ),
+                    source_capacity_model=capacity_model,
                 )
         self.profile = desired
         self._last_change_s = snapshot.unix_s
@@ -211,4 +239,5 @@ class M2RateController:
         return M2RateDecision(
             "SET_RATE", desired, cfg.rate(desired), reason,
             source_time_to_guard_s=None if math.isinf(horizon) else horizon,
+            source_capacity_model=capacity_model,
         )

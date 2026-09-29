@@ -111,6 +111,30 @@ class TestOnlineStrategyTiming(unittest.TestCase):
         peers[1]["request_ended_unix_s"] = 99.0
         self.assertFalse(has_measured_source_high(audit, peers))
 
+    def test_measured_source_high_accepts_known_prefill_reservation(self) -> None:
+        audit = [{
+            "kind": "rate", "unix_s": 100.0,
+            "manager_m2_decision": {
+                "action": "SET_RATE", "profile": "HIGH",
+                "reason": "source guard horizon is short",
+                "source_time_to_guard_s": 0.0,
+                "source_capacity_model": (
+                    "prefill_reservation_plus_decode_growth"
+                ),
+            },
+            "manager_m2_snapshot": {
+                "source_free_kv_tokens": 12000,
+                "source_guard_free_kv_tokens": 8448,
+                "source_prefill_pending_kv_tokens": 4000,
+                "source_running": 3,
+            },
+        }]
+        peers = [
+            {"request_started_unix_s": 90.0, "request_ended_unix_s": 110.0},
+            {"request_started_unix_s": 91.0, "request_ended_unix_s": 111.0},
+        ]
+        self.assertTrue(has_measured_source_high(audit, peers))
+
     def test_m1_short_request_stay_acceptance(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
