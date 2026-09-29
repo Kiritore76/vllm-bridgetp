@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -53,11 +54,15 @@ def main() -> None:
     parser.add_argument("--qps", nargs="+", type=float,
                         default=[0.1, 0.3, 0.7, 1.15])
     parser.add_argument("--reps", nargs="+", type=int, default=[1])
+    parser.add_argument("--num-prompts", type=int, default=30)
+    parser.add_argument("--num-warmups", type=int, default=3)
     args = parser.parse_args()
     if os.name == "nt":
         raise RuntimeError("A100 TPOT calibration must run on the Linux host")
     if any(value <= 0 for value in args.qps + args.reps):
         raise ValueError("QPS and repetitions must be positive")
+    if args.num_prompts < 3 or args.num_warmups < 0:
+        raise ValueError("pilot prompt and warmup counts are invalid")
     revision = common.git("rev-parse", "HEAD")
     if revision != args.expected_revision:
         raise RuntimeError(f"HEAD {revision} differs from expected revision")
@@ -98,7 +103,8 @@ def main() -> None:
         },
         "workload": {"input_len": 2048, "output_len": 1024,
                      "qps": args.qps, "reps": args.reps,
-                     "num_prompts": 100},
+                     "num_prompts": args.num_prompts,
+                     "num_warmups": args.num_warmups},
         "data_source": (
             "vllm bench random tokens; original manifest verified but unused"
         ),
@@ -114,6 +120,7 @@ def main() -> None:
             ("tp4", 4, "1,2,3,4", 8200),
             ("tp1", 1, "0", 8001),
         ):
+            print(f"starting {name} on GPU {gpu_set}", flush=True)
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = gpu_set
             env["OMP_NUM_THREADS"] = "1"
@@ -123,26 +130,57 @@ def main() -> None:
             )
             servers.append(item)
             common.wait_healthy(f"http://127.0.0.1:{port}", item, 900)
+            print(f"{name} healthy", flush=True)
         command = [
-            sys.executable, str(ROOT / "tools/bridge_tp/run_phase9_tpot_sweep.py"),
+            sys.executable, "-u",
+            str(ROOT / "tools/bridge_tp/run_phase9_tpot_sweep.py"),
             "--out-root", str(run / "sweep"), "--model", str(MODEL),
             "--tp1-blocks", "1968", "--tp4-blocks", "35739",
             "--input-len", "2048", "--output-len", "1024",
-            "--num-prompts", "100", "--num-warmups", "10",
+            "--num-prompts", str(args.num_prompts),
+            "--num-warmups", str(args.num_warmups),
             "--fit-load-model", "--qps", *(str(value) for value in args.qps),
             "--reps", *(str(value) for value in args.reps),
         ]
+        print(
+            f"starting {2 * len(args.qps) * len(args.reps)} TPOT pilot "
+            f"conditions; first arrival window about "
+            f"{args.num_prompts / args.qps[0]:.0f}s",
+            flush=True,
+        )
         with (run / "sweep.console.txt").open("w", encoding="utf-8") as log:
-            completed = subprocess.run(command, cwd=ROOT, stdout=log,
-                                       stderr=subprocess.STDOUT, check=False)
-        if completed.returncode != 0:
-            raise RuntimeError(f"TPOT sweep failed: {completed.returncode}")
+            process = subprocess.Popen(
+                command, cwd=ROOT, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, bufsize=1,
+                start_new_session=True,
+            )
+            if process.stdout is None:
+                raise RuntimeError("TPOT sweep stdout pipe was not created")
+            try:
+                for line in process.stdout:
+                    print(line, end="", flush=True)
+                    log.write(line)
+                    log.flush()
+                sweep_rc = process.wait()
+            except KeyboardInterrupt:
+                os.killpg(process.pid, signal.SIGINT)
+                try:
+                    process.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=10)
+                raise
+        if sweep_rc != 0:
+            raise RuntimeError(f"TPOT sweep failed: {sweep_rc}")
         model = run / "sweep" / "tick_tpot_candidate.json"
         if not model.is_file():
             raise RuntimeError("TPOT sweep did not create a fitted model")
         status = "COMPLETE"
         print(f"model={model}")
         print(f"model_sha256={common.sha256(model)}")
+    except KeyboardInterrupt:
+        status = "INTERRUPTED"
+        raise
     finally:
         common.stop_processes(servers)
         common.write_json(run / "status.json", {"status": status})

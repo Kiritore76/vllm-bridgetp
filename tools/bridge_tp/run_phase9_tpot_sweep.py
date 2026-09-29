@@ -469,11 +469,20 @@ def main() -> None:
         if key in accepted:
             print(f"reusing accepted condition: {side} qps={qps:g} rep={rep}")
             continue
+        print(
+            f"starting condition {side} qps={qps:g} rep={rep}; "
+            f"arrival window about {args.num_prompts / qps:.0f}s",
+            flush=True,
+        )
         for attempt in range(1, args.max_attempts + 1):
             before = set(args.out_root.glob("tpot_*"))
             try:
                 accepted[key] = run_condition(
                     args, side, base_url, blocks, qps, rep
+                )
+                print(
+                    f"completed condition {side} qps={qps:g} rep={rep}",
+                    flush=True,
                 )
                 break
             except Exception as error:
