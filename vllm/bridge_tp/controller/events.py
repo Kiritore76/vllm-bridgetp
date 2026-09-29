@@ -148,6 +148,9 @@ class PoolTelemetry:
     sampled_unix_s: float = 0.0
     tpot_samples: int = 0  # observations represented by this TPOT estimate
     tpot_metric: str | None = None
+    prefill_pending_kv_tokens: int | None = None
+    prefill_scheduled_tokens_total: int | None = None
+    decode_scheduled_tokens_total: int | None = None
 
     @property
     def free_kv_tokens(self) -> int:

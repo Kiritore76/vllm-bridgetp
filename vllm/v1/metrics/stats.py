@@ -181,6 +181,11 @@ class SchedulerStats:
     current_wave: int = 0
 
     kv_cache_usage: float = 0.0
+    # BridgeTP source-capacity telemetry. Pending prefill is an upper-bound
+    # reservation; scheduled counts describe work since the previous report.
+    bridgetp_prefill_pending_kv_tokens: int | None = None
+    bridgetp_prefill_scheduled_tokens: int = 0
+    bridgetp_decode_scheduled_tokens: int = 0
 
     prefix_cache_stats: PrefixCacheStats = field(default_factory=PrefixCacheStats)
     connector_prefix_cache_stats: PrefixCacheStats | None = None

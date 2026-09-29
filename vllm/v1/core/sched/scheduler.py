@@ -105,6 +105,8 @@ class Scheduler(SchedulerInterface):
         from vllm.bridge_tp.request_freeze import RequestFreezeGate
 
         self._bridgetp_request_freeze = RequestFreezeGate.from_env()
+        self._bridgetp_prefill_scheduled_tokens = 0
+        self._bridgetp_decode_scheduled_tokens = 0
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
@@ -1021,6 +1023,15 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
+            if self._bridgetp_request_freeze is not None:
+                prefill_tokens = min(
+                    num_scheduled_token,
+                    max(0, request.num_prompt_tokens - request.num_computed_tokens),
+                )
+                self._bridgetp_prefill_scheduled_tokens += prefill_tokens
+                self._bridgetp_decode_scheduled_tokens += (
+                    num_scheduled_token - prefill_tokens
+                )
             request.num_computed_tokens += num_scheduled_token
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
@@ -2060,11 +2071,31 @@ class Scheduler(SchedulerInterface):
         connector_stats_payload = (
             kv_connector_stats.data if kv_connector_stats else None
         )
-        return SchedulerStats(
+        pending_prefill = None
+        if self._bridgetp_request_freeze is not None:
+            pending_prefill = sum(
+                (
+                    (remaining + self.block_size - 1) // self.block_size
+                ) * self.block_size
+                for request in self.requests.values()
+                if (remaining := max(
+                    0,
+                    min(request.num_prompt_tokens, self.max_model_len)
+                    - request.num_computed_tokens,
+                )) > 0
+            )
+        stats = SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             num_skipped_waiting_reqs=len(self.skipped_waiting),
             kv_cache_usage=self.kv_cache_manager.usage,
+            bridgetp_prefill_pending_kv_tokens=pending_prefill,
+            bridgetp_prefill_scheduled_tokens=(
+                self._bridgetp_prefill_scheduled_tokens
+            ),
+            bridgetp_decode_scheduled_tokens=(
+                self._bridgetp_decode_scheduled_tokens
+            ),
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             kv_cache_eviction_events=eviction_events,
@@ -2073,6 +2104,9 @@ class Scheduler(SchedulerInterface):
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
         )
+        self._bridgetp_prefill_scheduled_tokens = 0
+        self._bridgetp_decode_scheduled_tokens = 0
+        return stats
 
     def make_spec_decoding_stats(
         self,

@@ -158,10 +158,40 @@ class TestM2RateController(unittest.TestCase):
                 "transition": "HOLD",
                 "decline_rate_tokens_s": 1448.0,
                 "sustained_decline_rate_tokens_s": 67.0,
+                "prefill_pending_kv_tokens": 1024,
+                "decode_growth_tokens_s": 32.0,
             },
         })
         self.assertEqual(snapshot.source_pool_growth_tokens_s, 1448.0)
         self.assertEqual(snapshot.source_pool_sustained_growth_tokens_s, 67.0)
+        self.assertEqual(snapshot.source_prefill_pending_kv_tokens, 1024)
+        self.assertEqual(snapshot.source_decode_growth_tokens_s, 32.0)
+
+    def test_prefill_and_decode_use_separate_capacity_terms(self) -> None:
+        burst = self.controller.decide(
+            sample(
+                state="LOCAL", target_running=4,
+                source_pool_growth_tokens_s=8000.0,
+                source_pool_sustained_growth_tokens_s=8000.0,
+                source_prefill_pending_kv_tokens=0,
+                source_decode_growth_tokens_s=32.0,
+            ),
+            before_start=True,
+        )
+        self.assertEqual(burst.profile, "LOW")
+        self.assertEqual(
+            burst.source_capacity_model,
+            "prefill_reservation_plus_decode_growth",
+        )
+        reserved = self.controller.decide(
+            sample(
+                unix_s=100.2, target_running=4,
+                source_prefill_pending_kv_tokens=20000,
+                source_decode_growth_tokens_s=100.0,
+            )
+        )
+        self.assertEqual((reserved.action, reserved.profile),
+                         ("SET_RATE", "HIGH"))
 
     def test_sustained_pressure_overrides_busy_target(self) -> None:
         decision = self.controller.decide(

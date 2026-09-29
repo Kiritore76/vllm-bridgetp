@@ -1650,6 +1650,15 @@ def has_measured_source_high(
         horizon = decision.get("source_time_to_guard_s")
         free = snapshot.get("source_free_kv_tokens")
         guard = snapshot.get("source_guard_free_kv_tokens")
+        reserved = snapshot.get("source_prefill_pending_kv_tokens")
+        reserved_guard_risk = (
+            decision.get("source_capacity_model")
+            == "prefill_reservation_plus_decode_growth"
+            and isinstance(reserved, (int, float))
+            and isinstance(free, (int, float))
+            and isinstance(guard, (int, float))
+            and reserved >= free - guard
+        )
         decision_time = row.get("unix_s")
         active_peers = active_source_peer_count(
             decision_time if isinstance(decision_time, (int, float)) else None,
@@ -1660,7 +1669,10 @@ def has_measured_source_high(
             and decision.get("profile") == "HIGH"
             and decision.get("reason") == "source guard horizon is short"
             and isinstance(horizon, (int, float))
-            and 0 < horizon <= 30.0
+            and (
+                0 < horizon <= 30.0
+                or (horizon == 0 and reserved_guard_risk)
+            )
             and isinstance(free, (int, float))
             and isinstance(guard, (int, float))
             and free > guard

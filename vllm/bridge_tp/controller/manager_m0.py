@@ -35,6 +35,8 @@ class RuntimeSnapshot:
     source_guard_free_kv_tokens: int | None = None
     source_pool_growth_tokens_s: float | None = None
     source_pool_sustained_growth_tokens_s: float | None = None
+    source_prefill_pending_kv_tokens: int | None = None
+    source_decode_growth_tokens_s: float | None = None
     source_running: int | None = None
     source_waiting: int | None = None
     target_free_kv_tokens: int | None = None
@@ -274,6 +276,12 @@ def snapshot_from_telemetry(
             capacity.get("sustained_decline_rate_tokens_s")
             if capacity.get("transition") not in {"WARMUP", "DISABLED", None}
             else None
+        ),
+        source_prefill_pending_kv_tokens=(
+            capacity.get("prefill_pending_kv_tokens")
+        ),
+        source_decode_growth_tokens_s=(
+            capacity.get("decode_growth_tokens_s")
         ),
         source_running=source.get("num_running"),
         source_waiting=source.get("num_waiting"),

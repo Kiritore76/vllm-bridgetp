@@ -123,6 +123,25 @@ class TestCapacityHeadroomTracker(unittest.TestCase):
         signal = tracker.update(14000, 4.0)
         self.assertEqual(signal.sustained_decline_rate_tokens_s, 2000.0)
 
+    def test_prefill_burst_does_not_become_decode_growth(self) -> None:
+        tracker = CapacityHeadroomTracker(self.config())
+        tracker.update(
+            20000, 1.0, prefill_pending_kv_tokens=0,
+            decode_scheduled_tokens_total=100,
+        )
+        signal = tracker.update(
+            18000, 2.0, prefill_pending_kv_tokens=4000,
+            decode_scheduled_tokens_total=120,
+        )
+        self.assertEqual(signal.prefill_pending_kv_tokens, 4000)
+        self.assertEqual(signal.decode_growth_tokens_s, 20.0)
+        self.assertEqual(signal.decline_rate_tokens_s, 2000.0)
+        reset = tracker.update(
+            16000, 3.0, prefill_pending_kv_tokens=2000,
+            decode_scheduled_tokens_total=5,
+        )
+        self.assertIsNone(reset.decode_growth_tokens_s)
+
     def test_enabled_config_requires_measured_guard(self) -> None:
         with self.assertRaisesRegex(ValueError, "guard_free_kv_tokens"):
             CapacityHeadroomTracker(CapacityPilotConfig(enabled=True))
