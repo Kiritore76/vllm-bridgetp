@@ -226,6 +226,14 @@ class TestM2RateController(unittest.TestCase):
         )
         self.assertEqual((ongoing.action, ongoing.profile), ("HOLD", "LOW"))
 
+    def test_initial_preview_does_not_change_rate_before_m1_admission(self) -> None:
+        state = sample(state="LOCAL", target_running=4)
+        preview = self.controller.preview_initial(state)
+        self.assertEqual((preview.action, preview.profile), ("SET_RATE", "LOW"))
+        self.assertEqual(self.controller.profile, "MEDIUM")
+        self.assertIsNone(self.controller._last_change_s)
+        self.assertEqual(preview, self.controller.decide(state, before_start=True))
+
     def test_initial_low_is_rejected_when_preparation_misses_guard(self) -> None:
         decision = self.controller.decide(
             sample(

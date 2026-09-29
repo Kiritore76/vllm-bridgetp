@@ -1375,11 +1375,31 @@ def main() -> None:
                         ),
                         request_age_s=max(0.0, now - request.arrival_unix_s),
                     )
+                    initial_snapshot = None
+                    initial_rate_preview = None
+                    if manager_m2 is not None:
+                        initial_snapshot = replace(
+                            m1_snapshot,
+                            history_total_bytes=(
+                                m1_snapshot.current_context_tokens
+                                * config.policy.kv_bytes_per_token
+                                if m1_snapshot.current_context_tokens is not None
+                                else None
+                            ),
+                            history_resident_bytes=0,
+                        )
+                        initial_rate_preview = manager_m2.preview_initial(
+                            initial_snapshot
+                        )
                     m1_start_decision = manager_m1.decide(
                         m1_snapshot,
                         table,
                         max_output_tokens=int(source_request["max_tokens"]),
-                        rate_bytes_s=rate.rate_bytes_s,
+                        rate_bytes_s=(
+                            initial_rate_preview.rate_bytes_s
+                            if initial_rate_preview is not None
+                            else rate.rate_bytes_s
+                        ),
                         kv_bytes_per_token=config.policy.kv_bytes_per_token,
                     )
                     audit.write(
@@ -1387,6 +1407,11 @@ def main() -> None:
                             "kind": "manager_m1_start_decision",
                             "tick": tick,
                             "snapshot": m1_snapshot.to_json(),
+                            "initial_rate_preview": (
+                                initial_rate_preview.to_json()
+                                if initial_rate_preview is not None
+                                else None
+                            ),
                             "decision": m1_start_decision.to_json(),
                         }
                     )
@@ -1394,18 +1419,14 @@ def main() -> None:
                         manager_m2 is not None
                         and m1_start_decision.action == "START_SHADOW"
                     ):
-                        assert m1_snapshot.current_context_tokens is not None
-                        initial_snapshot = replace(
-                            m1_snapshot,
-                            history_total_bytes=(
-                                m1_snapshot.current_context_tokens
-                                * config.policy.kv_bytes_per_token
-                            ),
-                            history_resident_bytes=0,
-                        )
+                        assert initial_snapshot is not None
                         initial_rate = manager_m2.decide(
                             initial_snapshot, before_start=True
                         )
+                        if initial_rate != initial_rate_preview:
+                            raise RuntimeError(
+                                "M2 initial rate changed between M1 preview and start"
+                            )
                         rate.rate_bytes_s = initial_rate.rate_bytes_s
                         rate.last_reason = initial_rate.reason
                         audit.write(

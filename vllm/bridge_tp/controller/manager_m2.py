@@ -8,6 +8,7 @@ rate before arming Shadow and on subsequent ticks; replay uses the same rules.
 from __future__ import annotations
 
 import math
+from copy import copy
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -87,6 +88,10 @@ class M2RateController:
         self._last_change_s: float | None = None
         self._candidate: str | None = None
         self._candidate_ticks = 0
+
+    def preview_initial(self, snapshot: RuntimeSnapshot) -> M2RateDecision:
+        """Choose the start rate without changing M2 state before M1 admits it."""
+        return copy(self).decide(snapshot, before_start=True)
 
     def decide(
         self, snapshot: RuntimeSnapshot, *, before_start: bool = False
