@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import os
 import signal
 import sys
@@ -49,6 +50,10 @@ from vllm.bridge_tp.controller.manager_m1 import (  # noqa: E402
 from vllm.bridge_tp.controller.manager_m2 import (  # noqa: E402
     M2RateConfig,
     M2RateController,
+)
+from vllm.bridge_tp.controller.manager_m3 import (  # noqa: E402
+    M3CommitConfig,
+    M3CommitController,
 )
 from vllm.bridge_tp.controller.events import (  # noqa: E402
     Action,
@@ -146,6 +151,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="apply three-profile M2 rates during active Shadow",
     )
+    parser.add_argument(
+        "--manager-m3-commit",
+        action="store_true",
+        help="choose a bounded commit boundary before TP4 admission",
+    )
+    parser.add_argument("--m3-handoff-s", type=float)
+    parser.add_argument("--m3-gain-margin-s", type=float)
+    parser.add_argument("--m3-defer-tokens", type=int, default=64)
     parser.add_argument(
         "--manager-m2-force-initial-high",
         action="store_true",
@@ -247,6 +260,24 @@ def parse_args() -> argparse.Namespace:
         parser.error("M2 rate requires M1 auto-start and M0 snapshots")
     if args.manager_m2_force_initial_high and not args.manager_m2_rate:
         parser.error("M2 forced HIGH requires --manager-m2-rate")
+    if args.manager_m3_commit:
+        if not (
+            args.manager_m2_rate
+            and args.diagnostic_earliest_ready_cutover
+            and args.handoff_mode == "shadow-only"
+            and args.gpu_resident_shadow
+            and args.m3_handoff_s is not None
+            and args.m3_gain_margin_s is not None
+        ):
+            parser.error(
+                "M3 requires M1/M2 GPU-resident Shadow-only and explicit "
+                "handoff/gain calibration"
+            )
+        M3CommitConfig(
+            handoff_s=args.m3_handoff_s,
+            gain_margin_s=args.m3_gain_margin_s,
+            defer_tokens=args.m3_defer_tokens,
+        ).validate()
     if (
         args.gpu_resident_shadow
         and cutover is None
@@ -590,6 +621,22 @@ def step_local(
     )
 
 
+def _m3_tpot_evidence(pool: Any, model: Any) -> tuple[float | None, str]:
+    # Native request TPOT histograms are cumulative across completed requests.
+    # Their positive sample count does not establish a recent load-matched
+    # estimate, so they cannot drive a delayed commit boundary on their own.
+    provenance = str(model.calibration_source).lower()
+    if (
+        provenance
+        and "placeholder" not in provenance
+        and model.in_support(pool.num_running, pool.kv_usage_frac)
+    ):
+        estimate = model.tpot_s(pool.num_running, pool.kv_usage_frac)
+        if math.isfinite(estimate) and estimate > 0:
+            return estimate, "calibrated_model"
+    return None, "unavailable"
+
+
 def step_shadow(
     policy: FastPolicy,
     machine: MigrationStateMachine,
@@ -609,6 +656,7 @@ def step_shadow(
     max_tokens: int | None = None,
     manager_m2: M2RateController | None = None,
     m2_snapshot: RuntimeSnapshot | None = None,
+    manager_m3: M3CommitController | None = None,
 ) -> None:
     remaining = policy.migration_bytes(request)
     tpot_samples = getattr(pool4, "tpot_samples", 0)
@@ -683,6 +731,46 @@ def step_shadow(
                 int(request.output_tokens) + candidate_lead_tokens,
                 int(record.trigger_output_tokens or 0) + 1,
             )
+            if manager_m3 is not None and candidate < max_tokens:
+                source_tpot_s, source_tpot_source = _m3_tpot_evidence(
+                    pool1, policy.tpot_tp1
+                )
+                target_tpot_s, target_tpot_source = _m3_tpot_evidence(
+                    pool4, policy.tpot_tp4
+                )
+                expected_remaining = (
+                    policy.table.expected_remaining(request.output_tokens)
+                    if policy.table.in_support(request.output_tokens)
+                    else None
+                )
+                m3_decision = manager_m3.plan_candidate(
+                    output_tokens=request.output_tokens,
+                    base_candidate=candidate,
+                    max_output_tokens=max_tokens,
+                    expected_remaining_tokens=expected_remaining,
+                    source_tpot_s=source_tpot_s,
+                    target_tpot_s=target_tpot_s,
+                    target_waiting=pool4.num_waiting,
+                    source_time_to_guard_s=(
+                        m2_decision.source_time_to_guard_s
+                        if m2_decision is not None else None
+                    ),
+                    capacity_emergency=(
+                        m2_decision is not None
+                        and m2_decision.profile == "HIGH"
+                        and m2_decision.reason == "source guard horizon is short"
+                    ),
+                )
+                candidate = m3_decision.candidate_output_tokens
+                audit.write({
+                    "kind": "manager_m3_candidate_decision",
+                    "decision": m3_decision.to_json(),
+                    "source_tpot_s": source_tpot_s,
+                    "source_tpot_source": source_tpot_source,
+                    "target_tpot_s": target_tpot_s,
+                    "target_tpot_source": target_tpot_source,
+                    "target_waiting": pool4.num_waiting,
+                })
             if candidate >= max_tokens:
                 late_candidate_reason = (
                     "initial history arrived too late for an earliest-ready "
@@ -739,6 +827,24 @@ def step_shadow(
                     }
                 )
     elif diagnostic_earliest_ready_cutover and record.cutover_output_tokens is None:
+        if (
+            manager_m3 is not None
+            and record.urgent_cutover_prearmed_unix_s is None
+            and m2_decision is not None
+            and m2_decision.profile == "HIGH"
+            and m2_decision.reason == "source guard horizon is short"
+            and not dry_run
+        ):
+            adapter.set_cutover(
+                record.candidate_cutover_output_tokens,
+                note="urgent source pressure after M3 candidate publication",
+            )
+            record.urgent_cutover_prearmed_unix_s = time.time()
+            audit.write({
+                "kind": "urgent_cutover_prearmed",
+                "cutover_output_tokens": record.candidate_cutover_output_tokens,
+                "source_time_to_guard_s": m2_decision.source_time_to_guard_s,
+            })
         ready, ranks, detail = adapter.poll_initial_history_gpu_ready()
         audit.write(
             {
@@ -806,6 +912,14 @@ def step_shadow(
                             ),
                         )
                     record.cutover_output_tokens = candidate
+                    if manager_m3 is not None:
+                        machine.transition(
+                            record.migration_id,
+                            MigrationState.READY_NOT_COMMITTED,
+                            now,
+                            "four-rank initial history and live delta ready; "
+                            "future cutover scheduled",
+                        )
                     audit.write(
                         {
                             "kind": "earliest_ready_cutover_selected",
@@ -1049,7 +1163,7 @@ def step_shadow_only_takeover(
         {
             "kind": "shadow_only_commit",
             "server_state": result,
-            "direct_transition": "SHADOW->TAKEOVER",
+            "direct_transition": f"{record.state.value}->TAKEOVER",
             "controller_wakeup_unix_s": controller_wakeup_at,
             "commit_dispatched_unix_s": commit_dispatched_at,
             "commit_completed_unix_s": committed_at,
@@ -1080,7 +1194,10 @@ def _finish_source_without_commit(
             "source reached EOS before migration",
         )
         return
-    if record.state is MigrationState.SHADOW:
+    if record.state in {
+        MigrationState.SHADOW,
+        MigrationState.READY_NOT_COMMITTED,
+    }:
         binding = adapter.refresh_binding()
         if binding is not None:
             try:
@@ -1242,6 +1359,15 @@ def main() -> None:
             if args.manager_m2_rate
             else None
         )
+        manager_m3 = (
+            M3CommitController(M3CommitConfig(
+                handoff_s=args.m3_handoff_s,
+                gain_margin_s=args.m3_gain_margin_s,
+                defer_tokens=args.m3_defer_tokens,
+            ))
+            if args.manager_m3_commit
+            else None
+        )
         m0_collector = (
             RuntimeStateCollector()
             if manager_m0 is not None or manager_m1 is not None
@@ -1277,6 +1403,15 @@ def main() -> None:
                 ),
                 "handoff_mode": args.handoff_mode,
                 "manager_m1_auto_start": args.manager_m1_auto_start,
+                "manager_m3_commit": args.manager_m3_commit,
+                "m3_config": (
+                    {
+                        "handoff_s": args.m3_handoff_s,
+                        "gain_margin_s": args.m3_gain_margin_s,
+                        "defer_tokens": args.m3_defer_tokens,
+                    }
+                    if args.manager_m3_commit else None
+                ),
                 "stop_and_copy": args.stop_and_copy,
                 "ready_notification_mode": args.ready_notification_mode,
                 "ready_latch_poll_ms": args.ready_latch_poll_ms,
@@ -1437,13 +1572,17 @@ def main() -> None:
                                 "decision": initial_rate.to_json(),
                             }
                         )
+                shadow_active = record.state in {
+                    MigrationState.SHADOW,
+                    MigrationState.READY_NOT_COMMITTED,
+                }
                 if manager_m0 is not None:
                     assert m0_collector is not None
                     assert m0_registry is not None
                     assert m0_executor is not None
                     if record.state is MigrationState.LOCAL:
                         m0_registry.observe_idle("tp4", record.migration_id)
-                    elif record.state is MigrationState.SHADOW:
+                    elif shadow_active:
                         m0_registry.observe_active("tp4", record.migration_id)
                     start = None
                     proposed_rate = None
@@ -1462,7 +1601,7 @@ def main() -> None:
                             ).action
                             is Action.START_SHADOW
                         )
-                    elif record.state is MigrationState.SHADOW:
+                    elif shadow_active:
                         proposed_rate = copy.deepcopy(rate).step(
                             (
                                 pool4.p99_tpot_s
@@ -1484,7 +1623,7 @@ def main() -> None:
                             )[0]
                         )
                     progress: dict[str, Any] = {}
-                    if record.state is MigrationState.SHADOW:
+                    if shadow_active:
                         try:
                             manifest_path = run_dir / "session_manifest.json"
                             if (
@@ -1546,7 +1685,7 @@ def main() -> None:
                         request_age_s=max(0.0, now - request.arrival_unix_s),
                         progress=progress,
                     )
-                    if manager_m2 is not None and record.state is MigrationState.SHADOW:
+                    if manager_m2 is not None and shadow_active:
                         m2_snapshot = snapshot
                     proposal = M0Proposal(
                         start=start,
@@ -1585,7 +1724,7 @@ def main() -> None:
                         args.stop_and_copy,
                         m1_start_decision,
                     )
-                elif record.state is MigrationState.SHADOW:
+                elif shadow_active:
                     target_future = _start_target_if_ready(
                         run_dir=run_dir,
                         source_request=source_request,
@@ -1691,10 +1830,14 @@ def main() -> None:
                             int(source_request["max_tokens"]),
                             manager_m2,
                             m2_snapshot,
+                            manager_m3,
                         )
                         if (
                             args.diagnostic_earliest_ready_cutover
-                            and record.state is MigrationState.SHADOW
+                            and record.state in {
+                                MigrationState.SHADOW,
+                                MigrationState.READY_NOT_COMMITTED,
+                            }
                             and target_future is None
                             and record.candidate_cutover_output_tokens is not None
                         ):

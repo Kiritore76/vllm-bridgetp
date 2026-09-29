@@ -28,6 +28,8 @@ class MigrationState(str, Enum):
 
         LOCAL     -> (no takeover state file yet)
         SHADOW    -> "PREPARING"
+        READY_NOT_COMMITTED -> "PREPARING" with a future cutover selected;
+                               final frozen delta is not yet committed
         HANDOFF   -> "PREPARING" with all four TARGET_READY receipts present
         TAKEOVER  -> "COMMITTING" then "COMMITTED"
         ROLLED_BACK -> "ROLLED_BACK"
@@ -36,6 +38,7 @@ class MigrationState(str, Enum):
 
     LOCAL = "LOCAL"
     SHADOW = "SHADOW"
+    READY_NOT_COMMITTED = "READY_NOT_COMMITTED"
     HANDOFF = "HANDOFF"
     TAKEOVER = "TAKEOVER"
 
@@ -70,7 +73,15 @@ LEGAL_TRANSITIONS: dict[MigrationState, frozenset[MigrationState]] = {
     ),
     MigrationState.SHADOW: frozenset(
         {
+            MigrationState.READY_NOT_COMMITTED,
             MigrationState.HANDOFF,
+            MigrationState.CANCELLED,
+            MigrationState.FAILED,
+            MigrationState.COMPLETED_ON_TP1,
+        }
+    ),
+    MigrationState.READY_NOT_COMMITTED: frozenset(
+        {
             MigrationState.CANCELLED,
             MigrationState.FAILED,
             MigrationState.COMPLETED_ON_TP1,
