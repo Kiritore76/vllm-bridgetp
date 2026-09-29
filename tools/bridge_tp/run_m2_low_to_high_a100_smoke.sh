@@ -47,6 +47,8 @@ run_m2_low_to_high_a100_smoke() {
   [[ "$(sha256sum "$guard" | cut -d' ' -f1)" == 0e86c353044f9610be1b5511ff21e870823b7f259c40ccde24188d84164b545b ]] || return 1
 
   python -m unittest discover -s tests/bridge_tp -p test_manager_m2.py || return 1
+  python -m unittest discover -s tests/bridge_tp \
+    -p test_phase9_capacity_pilot.py || return 1
   mkdir -p "$run/inputs" || return 1
   python tools/bridge_tp/build_experiment_a4_pressure_manifest.py \
     --base-target-manifest "$base" --out "$manifest" \
