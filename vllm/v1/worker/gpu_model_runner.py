@@ -30,6 +30,7 @@ from vllm.bridge_tp.logit_capture import (
     get_logit_capture_config,
     maybe_make_logit_observer,
 )
+from vllm.bridge_tp.predictor_capture import PredictorFeatureCapture
 from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
@@ -644,6 +645,18 @@ class GPUModelRunner(
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
+        self.predictor_feature_capture = PredictorFeatureCapture.from_environment()
+        if self.predictor_feature_capture is not None and (
+            self.is_pooling_model
+            or self.use_async_scheduling
+            or self.speculative_config is not None
+            or self.parallel_config.tensor_parallel_size != 1
+            or self.parallel_config.pipeline_parallel_size != 1
+        ):
+            raise ValueError(
+                "predictor feature capture requires a single-rank text model "
+                "without async scheduling or speculative decoding"
+            )
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
@@ -4371,6 +4384,20 @@ class GPUModelRunner(
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
+
+        if self.predictor_feature_capture is not None:
+            active_req_ids = req_ids[:num_reqs]
+            self.predictor_feature_capture.capture(
+                sample_hidden_states,
+                active_req_ids,
+                [
+                    len(self.requests[req_id].output_token_ids)
+                    for req_id in active_req_ids
+                ],
+                self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                num_scheduled_tokens_np,
+                self.input_batch.num_prompt_tokens[:num_reqs],
+            )
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
