@@ -75,6 +75,15 @@ def main() -> None:
     )
     if gpu_list.count("A100-PCIE-40GB") != 5:
         raise RuntimeError("expected five A100-PCIE-40GB GPUs")
+    active_gpu_pids = subprocess.check_output(
+        ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+        text=True,
+    ).strip()
+    if active_gpu_pids:
+        raise RuntimeError(
+            "GPU compute processes are still active; wait for prior cleanup: "
+            + active_gpu_pids.replace("\n", ", ")
+        )
     if not (MODEL / "config.json").is_file():
         raise FileNotFoundError(MODEL / "config.json")
     for path, expected in EXPECTED_INPUTS.items():
