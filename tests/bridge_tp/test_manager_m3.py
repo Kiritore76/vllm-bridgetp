@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import unittest
 import json
+import hashlib
 from contextlib import redirect_stderr
 from io import StringIO
 from types import SimpleNamespace
@@ -14,6 +15,9 @@ from unittest.mock import patch
 
 from tools.bridge_tp.run_phase9_controller import (
     _m3_tpot_evidence, parse_args, step_shadow,
+)
+from tools.bridge_tp.run_shadow_strategy_online_validation import (
+    load_m3_tpot_models,
 )
 from vllm.bridge_tp.controller.events import (
     MigrationState, SourceRequestView, TriggerPath,
@@ -127,6 +131,40 @@ class TestM3Commit(unittest.TestCase):
         model.calibration_source = "A100 measured target TPOT"
         self.assertEqual(_m3_tpot_evidence(pool, model),
                          (0.02, "calibrated_model"))
+
+    def test_measured_tpot_input_requires_exact_scope_and_hash(self) -> None:
+        payload = {
+            "status": "WORKLOAD_SCOPED_LOAD_TPOT_CANDIDATE",
+            "platform": "NVIDIA A100 PCIe",
+            "scope": {
+                "input_len": 2048, "output_len": 1024,
+                "predictor": "runtime vLLM kv_usage_frac",
+            },
+            "tpot_tp1": {
+                "base_s": 0.03, "per_running_s": 0.0,
+                "model_kind": "load_piecewise_monotone",
+                "load_knots": [0.1, 0.6],
+                "tpot_knots_s": [0.03, 0.05],
+                "min_load_frac": 0.1, "max_load_frac": 0.6,
+            },
+            "tpot_tp4": {
+                "base_s": 0.02, "per_running_s": 0.0,
+                "model_kind": "load_piecewise_monotone",
+                "load_knots": [0.01, 0.5],
+                "tpot_knots_s": [0.02, 0.04],
+                "min_load_frac": 0.01, "max_load_frac": 0.5,
+            },
+        }
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "model.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            sha = hashlib.sha256(path.read_bytes()).hexdigest()
+            models = load_m3_tpot_models(path, sha, 2048, 1024)
+            self.assertIn(sha, models["tpot_tp1"]["calibration_source"])
+            with self.assertRaisesRegex(ValueError, "SHA256"):
+                load_m3_tpot_models(path, "0" * 64, 2048, 1024)
+            with self.assertRaisesRegex(ValueError, "scope"):
+                load_m3_tpot_models(path, sha, 256, 2048)
 
     def test_candidate_is_deferred_before_target_admission(self) -> None:
         class Adapter:
