@@ -254,14 +254,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--manager-m2-rate", action="store_true")
     parser.add_argument("--manager-m3-commit", action="store_true")
-    parser.add_argument("--m3-handoff-s", type=float)
-    parser.add_argument("--m3-gain-margin-s", type=float)
-    parser.add_argument("--m3-defer-tokens", type=int, default=64)
-    parser.add_argument("--m3-tpot-model", type=Path)
-    parser.add_argument("--expected-m3-tpot-sha256")
-    parser.add_argument(
-        "--m3-expected-action", choices=("COMMIT_EARLIEST", "DEFER")
-    )
     parser.add_argument("--manager-m2-force-initial-high", action="store_true")
     parser.add_argument("--manager-m2-require-source-high", action="store_true")
     parser.add_argument("--manager-m2-require-low-to-high", action="store_true")
@@ -603,26 +595,10 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         args.manager_m2_rate
         and args.commit_timing == "EARLIEST_READY"
         and args.shadow_only_only
-        and args.m3_handoff_s is not None
-        and args.m3_gain_margin_s is not None
-        and math.isfinite(args.m3_handoff_s)
-        and math.isfinite(args.m3_gain_margin_s)
-        and args.m3_handoff_s >= 0
-        and args.m3_gain_margin_s >= 0
-        and args.m3_defer_tokens > 0
     ):
         raise ValueError(
-            "M3 requires M2 Shadow-only EARLIEST_READY and explicit "
-            "non-negative handoff/gain estimates"
+            "M3 requires M2 Shadow-only EARLIEST_READY"
         )
-    if args.m3_tpot_model is not None and not (
-        args.manager_m3_commit and args.expected_m3_tpot_sha256
-    ):
-        raise ValueError("M3 TPOT model requires M3 and its expected SHA256")
-    if args.expected_m3_tpot_sha256 and args.m3_tpot_model is None:
-        raise ValueError("M3 expected TPOT SHA256 requires a model path")
-    if args.m3_expected_action and not args.manager_m3_commit:
-        raise ValueError("M3 expected action requires M3 commit mode")
     if args.manager_m2_expected_profile and not args.manager_m2_rate:
         raise ValueError("M2 expected profile requires --manager-m2-rate")
     if not 0 <= args.manager_m2_min_history_byte_frac <= 1:
@@ -849,56 +825,6 @@ def build_controller_config_overrides(
             "b_hard_max_bytes_s": high * 1024**3,
         }
     return overrides
-
-
-def load_m3_tpot_models(
-    path: Path, expected_sha256: str, input_len: int, output_len: int
-) -> dict[str, dict[str, Any]]:
-    """Load a measured fit only for its exact A100 workload scope."""
-    actual_sha256 = common.sha256(path)
-    if actual_sha256 != expected_sha256.lower():
-        raise ValueError("M3 TPOT model SHA256 differs from expected input")
-    payload = common.read_json(path)
-    if (
-        payload.get("status") != "WORKLOAD_SCOPED_LOAD_TPOT_CANDIDATE"
-        or payload.get("platform") != "NVIDIA A100 PCIe"
-        or payload.get("scope", {}).get("input_len") != input_len
-        or payload.get("scope", {}).get("output_len") != output_len
-        or payload.get("scope", {}).get("predictor")
-        != "runtime vLLM kv_usage_frac"
-    ):
-        raise ValueError("M3 TPOT model platform, workload, or fit scope differs")
-    models = {}
-    for side in ("tpot_tp1", "tpot_tp4"):
-        model = payload.get(side)
-        if not isinstance(model, dict):
-            raise ValueError(f"M3 TPOT model missing {side}")
-        if model.get("model_kind") != "load_piecewise_monotone":
-            raise ValueError(f"M3 {side} must be load-aware")
-        knots = model.get("load_knots", [])
-        values = model.get("tpot_knots_s", [])
-        if (
-            len(knots) < 2 or len(knots) != len(values)
-            or any(not math.isfinite(float(x)) for x in knots + values)
-            or any(float(x) <= 0 for x in values)
-            or any(float(b) <= float(a) for a, b in zip(knots, knots[1:]))
-            or any(float(b) < float(a) for a, b in zip(values, values[1:]))
-            or float(model.get("min_load_frac", -1)) != float(knots[0])
-            or float(model.get("max_load_frac", -1)) != float(knots[-1])
-        ):
-            raise ValueError(f"M3 {side} has invalid measured knots")
-        models[side] = {
-            key: value for key, value in model.items()
-            if key in {
-                "base_s", "per_running_s", "num_running_min",
-                "num_running_max", "model_kind", "load_knots",
-                "tpot_knots_s", "min_load_frac", "max_load_frac",
-            }
-        }
-        models[side]["calibration_source"] = (
-            f"A100 load TPOT {path.name} sha256:{actual_sha256}"
-        )
-    return models
 
 
 def _load_rows(path: Path) -> list[dict[str, Any]]:
@@ -1827,7 +1753,6 @@ def accept_online(
     fixed_rate_gib_s: float | None = None,
     manager_m2_rate: bool = False,
     manager_m3_commit: bool = False,
-    m3_expected_action: str | None = None,
     m2_profiles_gib_s: tuple[float, float, float] | None = None,
     manager_m2_expected_profile: str | None = None,
     manager_m2_min_history_byte_frac: float = 0.0,
@@ -1990,12 +1915,18 @@ def accept_online(
         ):
             errors.append("M3 planned candidate differs from admitted target")
         if (
-            m3_expected_action is not None
-            and m3_candidates
+            m3_candidates
             and m3_candidates[0].get("decision", {}).get("action")
-            != m3_expected_action
+            != "COMMIT_EARLIEST"
         ):
-            errors.append(f"M3 did not choose {m3_expected_action}")
+            errors.append("M3 did not choose the earliest safe boundary")
+        if (
+            m3_candidates
+            and m3_candidates[0].get("decision", {}).get(
+                "candidate_output_tokens"
+            ) != m3_candidates[0].get("base_candidate_output_tokens")
+        ):
+            errors.append("M3 added a delay to the safe base candidate")
     end_rows = [row for row in audit if row.get("kind") == "run_end"]
     transitions = [row.get("to") for row in audit if row.get("kind") == "transition"]
     receipts, receipt_errors = rescue.receipt_evidence(controller_dir)
@@ -3334,15 +3265,6 @@ def accept_online(
 def main() -> None:
     args = parse_args()
     revision, guard, pressure = validate_inputs(args)
-    m3_tpot_models = (
-        load_m3_tpot_models(
-            args.m3_tpot_model,
-            args.expected_m3_tpot_sha256,
-            args.anchor_prompt_tokens,
-            args.anchor_max_tokens,
-        )
-        if args.m3_tpot_model is not None else None
-    )
     contract = {
         "format_version": 1,
         "phase": args.phase,
@@ -3392,10 +3314,9 @@ def main() -> None:
         "manager_m1_auto_start": args.manager_m1_auto_start,
         "manager_m2_rate": args.manager_m2_rate,
         "manager_m3_commit": args.manager_m3_commit,
-        "m3_tpot_model_sha256": (
-            args.expected_m3_tpot_sha256 if m3_tpot_models else None
+        "m3_policy": (
+            "COMMIT_EARLIEST_WHEN_READY" if args.manager_m3_commit else None
         ),
-        "m3_expected_action": args.m3_expected_action,
         "manager_m2_force_initial_high": args.manager_m2_force_initial_high,
         "manager_m2_require_source_high": args.manager_m2_require_source_high,
         "manager_m2_require_low_to_high": args.manager_m2_require_low_to_high,
@@ -3435,10 +3356,6 @@ def main() -> None:
 
     out_root = args.out_root.resolve()
     out_root.mkdir(parents=True, exist_ok=False)
-    if m3_tpot_models is not None:
-        (out_root / "m3_tpot_model.json").write_bytes(
-            args.m3_tpot_model.read_bytes()
-        )
     common.write_json(out_root / "contract.json", contract)
     batch: dict[str, Any] = {
         "format_version": 1,
@@ -3611,7 +3528,6 @@ def main() -> None:
                         fixed_rate_gib_s=args.fixed_rate_gib_s,
                         manager_m2_rate=args.manager_m2_rate,
                         manager_m3_commit=args.manager_m3_commit,
-                        m3_expected_action=args.m3_expected_action,
                         manager_m2_expected_profile=(
                             args.manager_m2_expected_profile
                         ),
@@ -3702,8 +3618,6 @@ def main() -> None:
                         if args.manager_m2_rate else None
                     ),
                 )
-                if m3_tpot_models is not None:
-                    controller_config_overrides.update(m3_tpot_models)
                 if args.manager_m1_auto_start:
                     controller_config_overrides["capacity_pilot"] = {
                         "enabled": True,
@@ -3741,12 +3655,7 @@ def main() -> None:
                 if args.manager_m2_rate:
                     controller_extra_args.append("--manager-m2-rate")
                 if args.manager_m3_commit:
-                    controller_extra_args.extend([
-                        "--manager-m3-commit",
-                        "--m3-handoff-s", str(args.m3_handoff_s),
-                        "--m3-gain-margin-s", str(args.m3_gain_margin_s),
-                        "--m3-defer-tokens", str(args.m3_defer_tokens),
-                    ])
+                    controller_extra_args.append("--manager-m3-commit")
                 if args.manager_m2_force_initial_high:
                     controller_extra_args.append(
                         "--manager-m2-force-initial-high"

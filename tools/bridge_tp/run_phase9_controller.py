@@ -12,7 +12,6 @@ from __future__ import annotations
 import argparse
 import copy
 import json
-import math
 import os
 import signal
 import sys
@@ -52,7 +51,6 @@ from vllm.bridge_tp.controller.manager_m2 import (  # noqa: E402
     M2RateController,
 )
 from vllm.bridge_tp.controller.manager_m3 import (  # noqa: E402
-    M3CommitConfig,
     M3CommitController,
 )
 from vllm.bridge_tp.controller.events import (  # noqa: E402
@@ -154,11 +152,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--manager-m3-commit",
         action="store_true",
-        help="choose a bounded commit boundary before TP4 admission",
+        help="commit at the first safe boundary after TP4 history readiness",
     )
-    parser.add_argument("--m3-handoff-s", type=float)
-    parser.add_argument("--m3-gain-margin-s", type=float)
-    parser.add_argument("--m3-defer-tokens", type=int, default=64)
     parser.add_argument(
         "--manager-m2-force-initial-high",
         action="store_true",
@@ -266,18 +261,10 @@ def parse_args() -> argparse.Namespace:
             and args.diagnostic_earliest_ready_cutover
             and args.handoff_mode == "shadow-only"
             and args.gpu_resident_shadow
-            and args.m3_handoff_s is not None
-            and args.m3_gain_margin_s is not None
         ):
             parser.error(
-                "M3 requires M1/M2 GPU-resident Shadow-only and explicit "
-                "handoff/gain calibration"
+                "M3 requires M1/M2 GPU-resident Shadow-only earliest-ready"
             )
-        M3CommitConfig(
-            handoff_s=args.m3_handoff_s,
-            gain_margin_s=args.m3_gain_margin_s,
-            defer_tokens=args.m3_defer_tokens,
-        ).validate()
     if (
         args.gpu_resident_shadow
         and cutover is None
@@ -621,22 +608,6 @@ def step_local(
     )
 
 
-def _m3_tpot_evidence(pool: Any, model: Any) -> tuple[float | None, str]:
-    # Native request TPOT histograms are cumulative across completed requests.
-    # Their positive sample count does not establish a recent load-matched
-    # estimate, so they cannot drive a delayed commit boundary on their own.
-    provenance = str(model.calibration_source).lower()
-    if (
-        provenance
-        and "placeholder" not in provenance
-        and model.in_support(pool.num_running, pool.kv_usage_frac)
-    ):
-        estimate = model.tpot_s(pool.num_running, pool.kv_usage_frac)
-        if math.isfinite(estimate) and estimate > 0:
-            return estimate, "calibrated_model"
-    return None, "unavailable"
-
-
 def step_shadow(
     policy: FastPolicy,
     machine: MigrationStateMachine,
@@ -732,44 +703,17 @@ def step_shadow(
                 int(record.trigger_output_tokens or 0) + 1,
             )
             if manager_m3 is not None and candidate < max_tokens:
-                source_tpot_s, source_tpot_source = _m3_tpot_evidence(
-                    pool1, policy.tpot_tp1
-                )
-                target_tpot_s, target_tpot_source = _m3_tpot_evidence(
-                    pool4, policy.tpot_tp4
-                )
-                expected_remaining = (
-                    policy.table.expected_remaining(request.output_tokens)
-                    if policy.table.in_support(request.output_tokens)
-                    else None
-                )
+                base_candidate = candidate
                 m3_decision = manager_m3.plan_candidate(
                     output_tokens=request.output_tokens,
                     base_candidate=candidate,
                     max_output_tokens=max_tokens,
-                    expected_remaining_tokens=expected_remaining,
-                    source_tpot_s=source_tpot_s,
-                    target_tpot_s=target_tpot_s,
-                    target_waiting=pool4.num_waiting,
-                    source_time_to_guard_s=(
-                        m2_decision.source_time_to_guard_s
-                        if m2_decision is not None else None
-                    ),
-                    capacity_emergency=(
-                        m2_decision is not None
-                        and m2_decision.profile == "HIGH"
-                        and m2_decision.reason == "source guard horizon is short"
-                    ),
                 )
                 candidate = m3_decision.candidate_output_tokens
                 audit.write({
                     "kind": "manager_m3_candidate_decision",
+                    "base_candidate_output_tokens": base_candidate,
                     "decision": m3_decision.to_json(),
-                    "source_tpot_s": source_tpot_s,
-                    "source_tpot_source": source_tpot_source,
-                    "target_tpot_s": target_tpot_s,
-                    "target_tpot_source": target_tpot_source,
-                    "target_waiting": pool4.num_waiting,
                 })
             if candidate >= max_tokens:
                 late_candidate_reason = (
@@ -1360,11 +1304,7 @@ def main() -> None:
             else None
         )
         manager_m3 = (
-            M3CommitController(M3CommitConfig(
-                handoff_s=args.m3_handoff_s,
-                gain_margin_s=args.m3_gain_margin_s,
-                defer_tokens=args.m3_defer_tokens,
-            ))
+            M3CommitController()
             if args.manager_m3_commit
             else None
         )
@@ -1404,12 +1344,8 @@ def main() -> None:
                 "handoff_mode": args.handoff_mode,
                 "manager_m1_auto_start": args.manager_m1_auto_start,
                 "manager_m3_commit": args.manager_m3_commit,
-                "m3_config": (
-                    {
-                        "handoff_s": args.m3_handoff_s,
-                        "gain_margin_s": args.m3_gain_margin_s,
-                        "defer_tokens": args.m3_defer_tokens,
-                    }
+                "m3_policy": (
+                    "COMMIT_EARLIEST_WHEN_READY"
                     if args.manager_m3_commit else None
                 ),
                 "stop_and_copy": args.stop_and_copy,
