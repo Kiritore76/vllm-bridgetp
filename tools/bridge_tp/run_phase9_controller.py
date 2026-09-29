@@ -699,6 +699,31 @@ def step_shadow(
                 )
                 recorder.set_cutover(candidate, now)
                 record.candidate_cutover_output_tokens = candidate
+                # Under measured source pressure, arm the exact source
+                # boundary while there is still room for control propagation.
+                # The source may then freeze at this boundary until TP4 has
+                # finished restoring history and the delta watermark.
+                urgent_wait = (
+                    not dry_run
+                    and m2_decision is not None
+                    and m2_decision.profile == "HIGH"
+                    and m2_decision.reason == "source guard horizon is short"
+                )
+                if urgent_wait:
+                    adapter.set_cutover(
+                        candidate,
+                        note="urgent source pressure: wait for resident history",
+                    )
+                    record.urgent_cutover_prearmed_unix_s = time.time()
+                    audit.write(
+                        {
+                            "kind": "urgent_cutover_prearmed",
+                            "cutover_output_tokens": candidate,
+                            "source_time_to_guard_s": (
+                                m2_decision.source_time_to_guard_s
+                            ),
+                        }
+                    )
                 audit.write(
                     {
                         "kind": "earliest_ready_candidate_published",
@@ -725,7 +750,14 @@ def step_shadow(
         assert candidate is not None
         if ready:
             safe_watermark_lead_tokens = 16
-            if request.output_tokens + safe_watermark_lead_tokens > candidate:
+            if (
+                request.output_tokens > candidate
+                or (
+                    record.urgent_cutover_prearmed_unix_s is None
+                    and request.output_tokens + safe_watermark_lead_tokens
+                    > candidate
+                )
+            ):
                 late_candidate_reason = (
                     "initial history became resident too late for the "
                     f"candidate: output={request.output_tokens}, "
@@ -750,7 +782,10 @@ def step_shadow(
                     }
                 )
                 if delta_lag_tokens is None or delta_lag_tokens > 16:
-                    if request.output_tokens + 16 >= candidate:
+                    if (
+                        record.urgent_cutover_prearmed_unix_s is None
+                        and request.output_tokens + 16 >= candidate
+                    ):
                         late_candidate_reason = (
                             "delta did not catch up before the candidate's "
                             f"safe publication point: output={request.output_tokens}, "
@@ -782,12 +817,35 @@ def step_shadow(
                             "detail": detail,
                         }
                     )
-        elif request.output_tokens + 16 > candidate:
+        elif request.output_tokens > candidate or (
+            record.urgent_cutover_prearmed_unix_s is None
+            and request.output_tokens + 16 > candidate
+        ):
             late_candidate_reason = (
                 "initial history was not resident before the candidate's "
                 f"safe publication point: output={request.output_tokens}, "
                 f"candidate={candidate}"
             )
+
+        if record.urgent_cutover_prearmed_unix_s is not None:
+            frozen_path = adapter.run_dir / "request_frozen_receipt.json"
+            if frozen_path.is_file() and record.cutover_output_tokens is None:
+                frozen = load_json(frozen_path)
+                frozen_s = float(frozen["frozen_unix_ns"]) / 1e9
+                wait_s = max(0.0, now - frozen_s)
+                audit.write(
+                    {
+                        "kind": "urgent_history_wait",
+                        "cutover_output_tokens": candidate,
+                        "wait_s": wait_s,
+                        "history_ready": ready,
+                    }
+                )
+                if wait_s > 5.0:
+                    late_candidate_reason = (
+                        "urgent history wait exceeded 5 seconds at the "
+                        f"frozen candidate {candidate}"
+                    )
 
     finalizer_error_path = adapter.run_dir / "cutover_finalize_error.json"
     if finalizer_error_path.is_file():

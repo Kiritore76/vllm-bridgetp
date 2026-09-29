@@ -1865,6 +1865,15 @@ def accept_online(
         for row in audit
         if row.get("kind") == "earliest_ready_cutover_selected"
     ]
+    urgent_prearmed = [
+        row for row in audit
+        if row.get("kind") == "urgent_cutover_prearmed"
+    ]
+    urgent_history_wait_allowed = (
+        len(urgent_prearmed) == 1
+        and manager_m2_rate
+        and commit_timing == "EARLIEST_READY"
+    )
     earliest_ready_candidates = [
         row
         for row in audit
@@ -1966,6 +1975,8 @@ def accept_online(
     )
 
     errors: list[str] = []
+    if len(urgent_prearmed) > 1:
+        errors.append("urgent source cutover was prearmed more than once")
     if require_remote_attention:
         if not remote_attention_rows:
             errors.append("online Bridge recorded no remote-attention data-path calls")
@@ -2092,7 +2103,10 @@ def accept_online(
         and not stop_and_copy
         and (
             len(history_completed) != 4
-            or any(value > freeze_unix_s for value in history_completed)
+            or (
+                not urgent_history_wait_allowed
+                and any(value > freeze_unix_s for value in history_completed)
+            )
         )
     ):
         errors.append(
@@ -2406,7 +2420,10 @@ def accept_online(
         and not stop_and_copy
         and (
             len(gpu_history_completed) != 4
-            or any(value > freeze_unix_s for value in gpu_history_completed)
+            or (
+                not urgent_history_wait_allowed
+                and any(value > freeze_unix_s for value in gpu_history_completed)
+            )
             or not all(
                 row.get("exact_readback") is True for row in gpu_initial_receipts
             )
@@ -2486,6 +2503,14 @@ def accept_online(
         if len(gpu_history_completed) == 4
         else None
     )
+    urgent_history_wait_ms = (
+        max(0.0, -history_gpu_ready_before_freeze_ms)
+        if urgent_history_wait_allowed
+        and history_gpu_ready_before_freeze_ms is not None
+        else None
+    )
+    if urgent_history_wait_ms is not None and urgent_history_wait_ms > 5000:
+        errors.append("urgent source freeze waited over 5 seconds for history")
     errors.extend(controller_completion_errors(end_rows, manager_m1_auto_start))
     if takeover.get("state") != "COMMITTED":
         errors.append("takeover state is not COMMITTED")
@@ -2828,6 +2853,7 @@ def accept_online(
         ),
         "history_ready_before_freeze_ms": history_ready_before_freeze_ms,
         "history_gpu_ready_before_freeze_ms": history_gpu_ready_before_freeze_ms,
+        "urgent_history_wait_ms": urgent_history_wait_ms,
         "gpu_resident_shadow": gpu_resident_shadow,
         "gpu_direct_history": gpu_direct_history,
         "gpu_direct_history_pacing": gpu_direct_history_pacing_expected,
