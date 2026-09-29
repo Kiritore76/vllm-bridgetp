@@ -44,6 +44,9 @@ def parse_args() -> argparse.Namespace:
         "--fit-load-model", action="store_true",
         help="fit workload-scoped KV-load TPOT knots after the sweep",
     )
+    parser.add_argument("--skip-fit", action="store_true")
+    parser.add_argument("--tp1-max-concurrency", type=int)
+    parser.add_argument("--tp4-max-concurrency", type=int)
     parser.add_argument("--num-prompts", type=int, default=100)
     parser.add_argument("--num-warmups", type=int, default=10)
     parser.add_argument("--telemetry-interval-s", type=float, default=1.0)
@@ -77,6 +80,13 @@ def parse_args() -> argparse.Namespace:
         parser.error("prompt counts are invalid")
     if args.max_attempts <= 0:
         parser.error("--max-attempts must be positive")
+    if any(
+        value is not None and value <= 0
+        for value in (args.tp1_max_concurrency, args.tp4_max_concurrency)
+    ):
+        parser.error("maximum concurrency must be positive")
+    if args.skip_fit and args.fit_load_model:
+        parser.error("select either --skip-fit or --fit-load-model")
     return args
 
 
@@ -98,8 +108,9 @@ def benchmark_command(
     rep: int,
     condition_id: str,
     condition_dir: Path,
+    max_concurrency: int | None = None,
 ) -> list[str]:
-    return [
+    command = [
         args.vllm_bin,
         "bench",
         "serve",
@@ -141,6 +152,9 @@ def benchmark_command(
         "--label",
         condition_id,
     ]
+    if max_concurrency is not None:
+        command.extend(["--max-concurrency", str(max_concurrency)])
+    return command
 
 
 def wait_endpoint(base_url: str, timeout_s: float = 30.0) -> None:
@@ -328,6 +342,10 @@ def run_condition(
     qps: float,
     rep: int,
 ) -> Path:
+    max_concurrency = (
+        args.tp1_max_concurrency if side == "tp1"
+        else args.tp4_max_concurrency
+    )
     condition_id = (
         f"tpot_{side}_qps{qps:g}_r{rep}_{uuid.uuid4()}"
     )
@@ -368,6 +386,7 @@ def run_condition(
         rep,
         condition_id,
         condition_dir,
+        max_concurrency,
     )
     manifest = {
         "format_version": 1,
@@ -380,6 +399,7 @@ def run_condition(
         "input_len": args.input_len,
         "output_len": args.output_len,
         "num_prompts": args.num_prompts,
+        "max_concurrency": max_concurrency,
         "block_size": args.block_size,
         "total_kv_blocks": blocks,
         "recorder_command": recorder_command,
@@ -469,9 +489,12 @@ def main() -> None:
         if key in accepted:
             print(f"reusing accepted condition: {side} qps={qps:g} rep={rep}")
             continue
+        cap = (args.tp1_max_concurrency if side == "tp1"
+               else args.tp4_max_concurrency)
         print(
             f"starting condition {side} qps={qps:g} rep={rep}; "
-            f"arrival window about {args.num_prompts / qps:.0f}s",
+            + (f"max concurrency {cap}" if cap is not None
+               else f"arrival window about {args.num_prompts / qps:.0f}s"),
             flush=True,
         )
         for attempt in range(1, args.max_attempts + 1):
@@ -523,6 +546,10 @@ def main() -> None:
             f"sweep incomplete after retries: accepted={len(accepted)}/"
             f"{len(expected)}; wrote {progress}"
         )
+        return
+
+    if args.skip_fit:
+        print(f"completed {len(expected)} conditions without fitting")
         return
 
     tp1_paths = [accepted[key] for key in expected if key[0] == "tp1"]
