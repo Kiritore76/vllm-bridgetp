@@ -100,6 +100,11 @@ run_m2_low_to_high_a100_smoke() {
   if [[ "$m4_cancel" == 1 ]]; then
     python -m unittest tests.bridge_tp.test_manager_m4 || return 1
   fi
+  if [[ "$m4_expect_cancel" == 1 ]]; then
+    python -m unittest \
+      tests.bridge_tp.test_gpu_direct_history_lifecycle.TestGpuDirectHistoryLifecycle.test_cancelled_prebound_history_releases_unadmitted_payload \
+      || return 1
+  fi
   python -m unittest discover -s tests/bridge_tp \
     -p test_phase9_capacity_pilot.py || return 1
   python -m unittest discover -s tests/bridge_tp \
