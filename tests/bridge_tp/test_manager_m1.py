@@ -12,6 +12,7 @@ from unittest.mock import patch
 from tools.bridge_tp.run_phase9_controller import parse_args
 from vllm.bridge_tp.controller.manager_m0 import RuntimeSnapshot
 from vllm.bridge_tp.controller.manager_m1 import M1StartConfig, M1StartController
+from vllm.bridge_tp.controller.manager_m2 import M2RateConfig, M2RateController
 from vllm.bridge_tp.controller.predictor import SurvivalTable
 
 
@@ -68,6 +69,31 @@ class TestM1Start(unittest.TestCase):
         self.assertEqual(decision.survivors, 30)
         self.assertGreater(
             decision.source_time_to_guard_s, decision.estimated_preparation_s
+        )
+
+    def test_preparation_uses_previewed_m2_initial_low_rate(self) -> None:
+        state = replace(snapshot(), target_running=4)
+        m2 = M2RateController(M2RateConfig(
+            low_bytes_s=0.5 * 1024**3,
+            medium_bytes_s=2.4 * 1024**3,
+            high_bytes_s=8.0 * 1024**3,
+        ))
+        initial = replace(
+            state,
+            history_total_bytes=state.current_context_tokens * 196608,
+            history_resident_bytes=0,
+        )
+        preview = m2.preview_initial(initial)
+        self.assertEqual(preview.profile, "LOW")
+        decision = self.controller.decide(
+            state, self.table, max_output_tokens=1024,
+            rate_bytes_s=preview.rate_bytes_s,
+            kv_bytes_per_token=196608,
+        )
+        self.assertEqual(decision.action, "START_SHADOW")
+        self.assertAlmostEqual(
+            decision.estimated_preparation_s,
+            state.current_context_tokens * 196608 / (0.5 * 1024**3) + 2.0,
         )
 
     def test_no_start_without_fresh_capacity_or_channel(self) -> None:
