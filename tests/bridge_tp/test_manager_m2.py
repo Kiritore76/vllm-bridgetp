@@ -3,12 +3,23 @@
 
 from __future__ import annotations
 
+import json
+import tempfile
+import threading
+import time
 import unittest
 from contextlib import redirect_stderr
 from dataclasses import replace
 from io import StringIO
+from pathlib import Path
 from unittest.mock import patch
 
+from tools.bridge_tp.build_experiment_a4_pressure_manifest import (
+    build_manifest as build_pressure_manifest,
+)
+from tools.bridge_tp.run_phase9_capacity_background import (
+    wait_for_m2_initial_rate,
+)
 from tools.bridge_tp.run_phase9_controller import parse_args
 from tools.bridge_tp.run_shadow_strategy_online_validation import (
     build_controller_config_overrides,
@@ -69,6 +80,38 @@ class TestM2RateController(unittest.TestCase):
             initial, [{**active[0], "rate_gib_s": 0.5}],
             "MEDIUM", profiles,
         ))
+
+    def test_source_peer_event_start_waits_for_initial_rate(self) -> None:
+        base = {"scenario": "target load", "jobs": [{
+            "job_id": "target_000", "pool": "target",
+            "start_after_s": 0.0,
+            "request": {"model": "model", "prompt": [100], "max_tokens": 1},
+        }]}
+        manifest = build_pressure_manifest(
+            base, source_jobs=2, source_prompt_tokens=1,
+            source_output_tokens=1, source_start_after_s=0.0,
+            source_start_interval_s=0.05, source_prompt_token_id=100,
+            max_model_len=8192, source_start_after_m2_initial=True,
+        )
+        peers = [job for job in manifest["jobs"] if job["pool"] == "source"]
+        self.assertEqual([job["start_after_event"] for job in peers],
+                         ["M2_INITIAL_RATE", "M2_INITIAL_RATE"])
+        with tempfile.TemporaryDirectory() as directory:
+            audit = Path(directory) / "audit.jsonl"
+
+            def publish() -> None:
+                time.sleep(0.05)
+                audit.write_text(json.dumps({
+                    "kind": "manager_m2_initial_rate",
+                    "decision": {"profile": "LOW"},
+                }) + "\n", encoding="utf-8")
+
+            writer = threading.Thread(target=publish)
+            writer.start()
+            started = time.monotonic()
+            observed = wait_for_m2_initial_rate(audit, 1.0)
+            writer.join()
+            self.assertGreaterEqual(observed - started, 0.04)
 
     def test_busy_target_downshifts_only_after_stable_samples(self) -> None:
         first = self.controller.decide(sample(target_waiting=3))

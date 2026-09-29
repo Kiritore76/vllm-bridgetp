@@ -26,6 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-prompt-tokens", type=int, default=4096)
     parser.add_argument("--source-output-tokens", type=int, default=3500)
     parser.add_argument("--source-start-after-s", type=float, default=2.0)
+    parser.add_argument("--source-start-after-m2-initial", action="store_true")
     parser.add_argument("--source-start-interval-s", type=float, default=0.1)
     parser.add_argument("--source-prompt-token-id", type=int, default=100)
     parser.add_argument("--max-model-len", type=int, default=8192)
@@ -42,6 +43,7 @@ def build_manifest(
     source_start_interval_s: float,
     source_prompt_token_id: int,
     max_model_len: int,
+    source_start_after_m2_initial: bool = False,
 ) -> dict[str, Any]:
     if not base["jobs"] or any(job["pool"] != "target" for job in base["jobs"]):
         raise ValueError("base manifest must contain target jobs only")
@@ -62,7 +64,7 @@ def build_manifest(
         job_id = f"a4_source_{index:03d}"
         if job_id in existing:
             raise ValueError(f"duplicate job ID: {job_id}")
-        jobs.append({
+        job = {
             "job_id": job_id,
             "pool": "source",
             "start_after_s": source_start_after_s
@@ -73,7 +75,10 @@ def build_manifest(
                 "max_tokens": source_output_tokens,
                 "ignore_eos": True,
             },
-        })
+        }
+        if source_start_after_m2_initial:
+            job["start_after_event"] = "M2_INITIAL_RATE"
+        jobs.append(job)
     return {
         "format_version": 1,
         "scenario": "Experiment A4-P source KV pressure smoke",
@@ -84,6 +89,7 @@ def build_manifest(
             "source_prompt_tokens": source_prompt_tokens,
             "source_output_tokens": source_output_tokens,
             "source_start_after_s": source_start_after_s,
+            "source_start_after_m2_initial": source_start_after_m2_initial,
             "source_start_interval_s": source_start_interval_s,
             "max_model_len": max_model_len,
         },
@@ -104,6 +110,7 @@ def main() -> None:
         source_prompt_tokens=args.source_prompt_tokens,
         source_output_tokens=args.source_output_tokens,
         source_start_after_s=args.source_start_after_s,
+        source_start_after_m2_initial=args.source_start_after_m2_initial,
         source_start_interval_s=args.source_start_interval_s,
         source_prompt_token_id=args.source_prompt_token_id,
         max_model_len=args.max_model_len,
