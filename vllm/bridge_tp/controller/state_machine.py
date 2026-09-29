@@ -127,7 +127,10 @@ class MigrationStateMachine:
             allowed = LEGAL_TRANSITIONS.get(record.state, frozenset())
             if (
                 self._allow_shadow_takeover
-                and record.state is MigrationState.SHADOW
+                and record.state in {
+                    MigrationState.SHADOW,
+                    MigrationState.READY_NOT_COMMITTED,
+                }
             ):
                 allowed = allowed | {
                     MigrationState.TAKEOVER,

@@ -11,14 +11,30 @@ run_m2_low_to_high_a100_smoke() {
   local low_gib_s="${BRIDGETP_M2_LOW_GIB_S:-0.1}"
   local m1_min_output_tokens="${BRIDGETP_M1_MIN_OUTPUT_TOKENS:-32}"
   local require_low_to_high="${BRIDGETP_M2_REQUIRE_LOW_TO_HIGH:-1}"
+  local m3_commit="${BRIDGETP_M3_COMMIT:-0}"
   local mode=event-low-high
   local m2_requirement=()
+  local m3_requirement=()
   if [[ "$require_low_to_high" == 0 ]]; then
     mode=split-capacity
   elif [[ "$require_low_to_high" == 1 ]]; then
     m2_requirement+=(--manager-m2-require-low-to-high)
   else
     echo "BRIDGETP_M2_REQUIRE_LOW_TO_HIGH must be 0 or 1"
+    return 1
+  fi
+  if [[ "$m3_commit" == 1 ]]; then
+    local m3_handoff_s="${BRIDGETP_M3_HANDOFF_S:?set measured M3 handoff seconds}"
+    local m3_gain_margin_s="${BRIDGETP_M3_GAIN_MARGIN_S:?set M3 gain margin seconds}"
+    m3_requirement=(
+      --manager-m3-commit
+      --m3-handoff-s "$m3_handoff_s"
+      --m3-gain-margin-s "$m3_gain_margin_s"
+      --m3-defer-tokens "${BRIDGETP_M3_DEFER_TOKENS:-64}"
+    )
+    mode=m3-commit
+  elif [[ "$m3_commit" != 0 ]]; then
+    echo "BRIDGETP_M3_COMMIT must be 0 or 1"
     return 1
   fi
   local model=/root/autodl-tmp/models/models/Qwen--Qwen2.5-14B-Instruct/snapshots/master
@@ -93,6 +109,12 @@ run_m2_low_to_high_a100_smoke() {
     echo "m2_low_gib_s=$low_gib_s"
     echo "m1_min_output_tokens=$m1_min_output_tokens"
     echo "m2_require_low_to_high=$require_low_to_high"
+    echo "m3_commit=$m3_commit"
+    if [[ "$m3_commit" == 1 ]]; then
+      echo "m3_handoff_s=$m3_handoff_s"
+      echo "m3_gain_margin_s=$m3_gain_margin_s"
+      echo "m3_defer_tokens=${BRIDGETP_M3_DEFER_TOKENS:-64}"
+    fi
   } | tee "$run/preflight.txt"
 
   # Default LOW=0.1 stretches a diagnostic copy; set the measured 0.5 for
@@ -114,6 +136,7 @@ run_m2_low_to_high_a100_smoke() {
     --manager-m0-shadow --manager-m1-auto-start --manager-m2-rate \
     --m1-min-output-tokens "$m1_min_output_tokens" \
     "${m2_requirement[@]}" \
+    "${m3_requirement[@]}" \
     --m2-low-gib-s "$low_gib_s" --m2-medium-gib-s 2.4 --m2-high-gib-s 8.0 \
     --source-pressure --minimum-ready-source-jobs 0 \
     --trigger-output-tokens 64 --bridge-output-tokens 96 \
@@ -157,6 +180,10 @@ if audit.is_file():
         if row.get("kind") == "manager_m2_initial_rate":
             print("initial rate:", row.get("decision"))
             models.append((row.get("decision") or {}).get("source_capacity_model"))
+        elif row.get("kind") == "manager_m3_candidate_decision":
+            print("M3 candidate:", row.get("decision"))
+            print("M3 TPOT sources:", row.get("source_tpot_source"),
+                  row.get("target_tpot_source"))
         elif row.get("kind") == "rate" and (row.get("manager_m2_decision") or {}).get("action") == "SET_RATE":
             print("rate change:", row.get("manager_m2_decision"))
             models.append(row["manager_m2_decision"].get("source_capacity_model"))

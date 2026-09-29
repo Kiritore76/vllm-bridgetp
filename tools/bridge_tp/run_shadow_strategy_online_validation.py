@@ -253,6 +253,10 @@ def parse_args() -> argparse.Namespace:
         help="experimental earliest M1 Shadow start; M1 safety gates still apply",
     )
     parser.add_argument("--manager-m2-rate", action="store_true")
+    parser.add_argument("--manager-m3-commit", action="store_true")
+    parser.add_argument("--m3-handoff-s", type=float)
+    parser.add_argument("--m3-gain-margin-s", type=float)
+    parser.add_argument("--m3-defer-tokens", type=int, default=64)
     parser.add_argument("--manager-m2-force-initial-high", action="store_true")
     parser.add_argument("--manager-m2-require-source-high", action="store_true")
     parser.add_argument("--manager-m2-require-low-to-high", action="store_true")
@@ -590,6 +594,22 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         for value in (args.m2_low_gib_s, args.m2_medium_gib_s, args.m2_high_gib_s)
     ):
         raise ValueError("M2 profiles require --manager-m2-rate")
+    if args.manager_m3_commit and not (
+        args.manager_m2_rate
+        and args.commit_timing == "EARLIEST_READY"
+        and args.shadow_only_only
+        and args.m3_handoff_s is not None
+        and args.m3_gain_margin_s is not None
+        and math.isfinite(args.m3_handoff_s)
+        and math.isfinite(args.m3_gain_margin_s)
+        and args.m3_handoff_s >= 0
+        and args.m3_gain_margin_s >= 0
+        and args.m3_defer_tokens > 0
+    ):
+        raise ValueError(
+            "M3 requires M2 Shadow-only EARLIEST_READY and explicit "
+            "non-negative handoff/gain estimates"
+        )
     if args.manager_m2_expected_profile and not args.manager_m2_rate:
         raise ValueError("M2 expected profile requires --manager-m2-rate")
     if not 0 <= args.manager_m2_min_history_byte_frac <= 1:
@@ -1743,6 +1763,7 @@ def accept_online(
     minimum_window_samples: int,
     fixed_rate_gib_s: float | None = None,
     manager_m2_rate: bool = False,
+    manager_m3_commit: bool = False,
     m2_profiles_gib_s: tuple[float, float, float] | None = None,
     manager_m2_expected_profile: str | None = None,
     manager_m2_min_history_byte_frac: float = 0.0,
@@ -1892,6 +1913,18 @@ def accept_online(
         for row in audit
         if row.get("kind") == "earliest_ready_candidate_published"
     ]
+    if manager_m3_commit:
+        m3_candidates = [
+            row for row in audit
+            if row.get("kind") == "manager_m3_candidate_decision"
+        ]
+        if len(m3_candidates) != 1 or len(earliest_ready_candidates) != 1:
+            errors.append("M3 did not plan exactly one candidate before admission")
+        elif (
+            m3_candidates[0].get("decision", {}).get("candidate_output_tokens")
+            != earliest_ready_candidates[0].get("cutover_output_tokens")
+        ):
+            errors.append("M3 planned candidate differs from admitted target")
     end_rows = [row for row in audit if row.get("kind") == "run_end"]
     transitions = [row.get("to") for row in audit if row.get("kind") == "transition"]
     receipts, receipt_errors = rescue.receipt_evidence(controller_dir)
@@ -2072,7 +2105,9 @@ def accept_online(
             )
         )
     expected_transitions = (
-        ["SHADOW", "TAKEOVER"]
+        ["SHADOW", "READY_NOT_COMMITTED", "TAKEOVER"]
+        if manager_m3_commit
+        else ["SHADOW", "TAKEOVER"]
         if handoff_mode == "shadow-only"
         else ["SHADOW", "HANDOFF", "TAKEOVER"]
     )
@@ -3276,6 +3311,7 @@ def main() -> None:
         "manager_m0_shadow": args.manager_m0_shadow,
         "manager_m1_auto_start": args.manager_m1_auto_start,
         "manager_m2_rate": args.manager_m2_rate,
+        "manager_m3_commit": args.manager_m3_commit,
         "manager_m2_force_initial_high": args.manager_m2_force_initial_high,
         "manager_m2_require_source_high": args.manager_m2_require_source_high,
         "manager_m2_require_low_to_high": args.manager_m2_require_low_to_high,
@@ -3486,6 +3522,7 @@ def main() -> None:
                         minimum_window_samples=args.minimum_window_samples,
                         fixed_rate_gib_s=args.fixed_rate_gib_s,
                         manager_m2_rate=args.manager_m2_rate,
+                        manager_m3_commit=args.manager_m3_commit,
                         manager_m2_expected_profile=(
                             args.manager_m2_expected_profile
                         ),
@@ -3612,6 +3649,13 @@ def main() -> None:
                     controller_extra_args.append("--manager-m0-shadow")
                 if args.manager_m2_rate:
                     controller_extra_args.append("--manager-m2-rate")
+                if args.manager_m3_commit:
+                    controller_extra_args.extend([
+                        "--manager-m3-commit",
+                        "--m3-handoff-s", str(args.m3_handoff_s),
+                        "--m3-gain-margin-s", str(args.m3_gain_margin_s),
+                        "--m3-defer-tokens", str(args.m3_defer_tokens),
+                    ])
                 if args.manager_m2_force_initial_high:
                     controller_extra_args.append(
                         "--manager-m2-force-initial-high"
