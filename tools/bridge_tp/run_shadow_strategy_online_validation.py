@@ -1807,6 +1807,22 @@ def accept_m4_cancel(
         target = common.read_json(target_path) if target_path.is_file() else {}
         if target.get("status") != "CLEANED":
             errors.append("M4 did not release the dormant TP4 request")
+    elif (controller_dir / "session_manifest.json").is_file():
+        for rank in range(4):
+            path = (controller_dir / "gpu_cancel_cleanup_receipts"
+                    / f"tp_rank_{rank}.json")
+            receipt = common.read_json(path) if path.is_file() else {}
+            if (
+                receipt.get("status") != "CANCELLED_PREBOUND_HISTORY_RELEASED"
+                or receipt.get("channel_state") != "IDLE"
+            ):
+                errors.append(f"M4 rank {rank} kept prebound GPU history")
+        sender_path = controller_dir / "gpu_direct_sender.json"
+        sender = (
+            common.read_json(sender_path) if sender_path.is_file() else {}
+        )
+        if sender.get("communicator_lifecycle") != "PERSISTENT_CHANNEL_IDLE":
+            errors.append("M4 source GPU channel did not return to IDLE")
     source_ids = source.get("token_ids") or []
     unified_ids = [row.get("token_id") for row in unified]
     if len(source_ids) != expected_anchor_tokens:

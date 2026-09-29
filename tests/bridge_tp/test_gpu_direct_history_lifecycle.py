@@ -621,6 +621,44 @@ class TestGpuDirectHistoryLifecycle(unittest.TestCase):
         self.assertEqual(receipt["channel_destroy_count"], 0)
         self.assertEqual(receipt["channel_session_count"], 2)
 
+    def test_cancelled_prebound_history_releases_unadmitted_payload(self) -> None:
+        from vllm.bridge_tp.streaming_connector import BridgeTPStreamingConnector
+
+        connector = object.__new__(BridgeTPStreamingConnector)
+        connector._prebound_gpu_history = ("migration", object())
+        connector._prebound_gpu_history_lock = threading.Lock()
+        connector._prebound_gpu_receiver_lock = threading.Lock()
+        receiver = Mock()
+        receiver.receive_delta.side_effect = [
+            SimpleNamespace(start_token=10, end_token=12), None,
+        ]
+        receiver.last_session_payload_released_bytes = 4096
+        connector._prebound_gpu_receiver = receiver
+        connector._record_persistent_receiver_idle = Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connector.manifest_path = root / "manifest.json"
+            (root / "takeover_state.json").write_text(
+                json.dumps({"state": "CANCELLED"}), encoding="utf-8"
+            )
+            (root / "runtime_control.json").write_text(
+                json.dumps({"target_request_admitted": False}),
+                encoding="utf-8",
+            )
+            self.assertTrue(connector._cleanup_cancelled_prebound_history(
+                migration_id="migration", source_request_id="source",
+                tp_rank=2,
+            ))
+            self.assertIsNone(connector._prebound_gpu_history)
+            receiver.acknowledge_delta.assert_called_once_with(
+                start_token=10, end_token=12,
+            )
+            connector._record_persistent_receiver_idle.assert_called_once()
+            receipt = json.loads((root / "gpu_cancel_cleanup_receipts"
+                                  / "tp_rank_2.json").read_text())
+            self.assertEqual(receipt["released_payload_bytes"], 4096)
+            self.assertEqual(receipt["channel_state"], "IDLE")
+
     def test_post_takeover_destroy_records_commit_ordering(self) -> None:
         from vllm.bridge_tp.streaming_connector import (
             BridgeTPStreamingConnector,

@@ -1125,6 +1125,71 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         if self.gpu_resident_shadow:
             self._start_gpu_direct_receiver_prebind()
 
+    def _cleanup_cancelled_prebound_history(
+        self,
+        *,
+        migration_id: str,
+        source_request_id: str,
+        tp_rank: int,
+    ) -> bool:
+        """Drain an unadmitted cancelled session and release its GPU buffer."""
+        run_dir = self.manifest_path.parent
+        state_path = run_dir / "takeover_state.json"
+        control_path = run_dir / "runtime_control.json"
+        if not state_path.is_file() or not control_path.is_file():
+            return False
+        if _load_json(state_path).get("state") != "CANCELLED":
+            return False
+        if _load_json(control_path).get("target_request_admitted"):
+            # The admitted target request owns the receiver and its cleanup.
+            return False
+        with self._prebound_gpu_history_lock:
+            prebound = self._prebound_gpu_history
+            if prebound is None or prebound[0] != migration_id:
+                return False
+            self._prebound_gpu_history = None
+        prebound = None
+        with self._prebound_gpu_receiver_lock:
+            receiver = self._prebound_gpu_receiver
+        if receiver is None:
+            raise RuntimeError("cancelled prebound history has no receiver")
+        discarded_deltas = 0
+        while True:
+            delta = receiver.receive_delta(
+                migration_id=migration_id, rank=tp_rank,
+            )
+            if delta is None:
+                break
+            receiver.acknowledge_delta(
+                start_token=delta.start_token,
+                end_token=delta.end_token,
+            )
+            discarded_deltas += 1
+            del delta
+        self._record_persistent_receiver_idle(
+            receiver,
+            target_request_id="NOT_ADMITTED",
+            session_request_id=source_request_id,
+            migration_id=migration_id,
+            tp_rank=tp_rank,
+        )
+        _atomic_json_dump(
+            {
+                "format_version": 1,
+                "status": "CANCELLED_PREBOUND_HISTORY_RELEASED",
+                "migration_id": migration_id,
+                "target_tp_rank": tp_rank,
+                "discarded_delta_batches": discarded_deltas,
+                "released_payload_bytes": (
+                    receiver.last_session_payload_released_bytes
+                ),
+                "channel_state": "IDLE",
+                "completed_unix_s": time.time(),
+            },
+            run_dir / "gpu_cancel_cleanup_receipts" / f"tp_rank_{tp_rank}.json",
+        )
+        return True
+
     def _start_gpu_direct_receiver_prebind(self) -> None:
         """Bind the GPU-direct listener before dynamic cutover is known.
 
@@ -1208,6 +1273,11 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                         return
                     migration_id = str(manifest["migration_id"])
                     if migration_id == last_migration_id:
+                        self._cleanup_cancelled_prebound_history(
+                            migration_id=migration_id,
+                            source_request_id=str(manifest["source_request_id"]),
+                            tp_rank=get_tp_group().rank_in_group,
+                        )
                         time.sleep(0.005)
                         continue
                     self._prebind_receiver_ready.clear()
@@ -1260,6 +1330,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                             migration_id,
                             direct,
                         )
+                    direct = None
                     buffered_completed_unix_s = time.time()
                     _atomic_json_dump(
                         {

@@ -1991,7 +1991,10 @@ def main() -> None:
             if target_future is None:
                 raise RuntimeError("takeover committed without a target request")
             target_result = target_result or target_future.result()
-        elif source_future.done():
+        elif record.state in {
+            MigrationState.CANCELLED,
+            MigrationState.COMPLETED_ON_TP1,
+        } or source_future.done():
             source_result = source_result or source_future.result()
 
     if source_result is not None:
