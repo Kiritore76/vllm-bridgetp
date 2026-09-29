@@ -54,7 +54,8 @@ run_m2_low_to_high_a100_smoke() {
     --source-start-interval-s 0.05 \
     --source-start-after-m2-initial || return 1
   python tools/bridge_tp/run_phase9_capacity_background.py \
-    --manifest "$manifest" --validate-only || return 1
+    --manifest "$manifest" --out-dir "$run/background_validate" \
+    --validate-only || return 1
   manifest_sha="$(sha256sum "$manifest" | cut -d' ' -f1)"
   cp "$base" "$survival" "$guard" "$run/inputs/" || return 1
   {
