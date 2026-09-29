@@ -246,6 +246,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="let M1 select Shadow start from live evidence",
     )
+    parser.add_argument(
+        "--m1-min-output-tokens",
+        type=int,
+        default=None,
+        help="experimental earliest M1 Shadow start; M1 safety gates still apply",
+    )
     parser.add_argument("--manager-m2-rate", action="store_true")
     parser.add_argument("--manager-m2-force-initial-high", action="store_true")
     parser.add_argument("--manager-m2-require-source-high", action="store_true")
@@ -633,6 +639,13 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise ValueError(
             "M1 requires paced GPU-direct Shadow-only, a positive rate, "
             "and EARLIEST_READY cutover"
+        )
+    if args.m1_min_output_tokens is not None and (
+        not args.manager_m1_auto_start
+        or not 0 <= args.m1_min_output_tokens < args.anchor_max_tokens - 64
+    ):
+        raise ValueError(
+            "M1 minimum output requires auto-start and at least 64 remaining tokens"
         )
     if args.tp4_max_num_seqs is not None and args.tp4_max_num_seqs <= 0:
         raise ValueError("TP4 max-num-seqs must be positive")
@@ -3568,6 +3581,12 @@ def main() -> None:
                         "enabled": True,
                         "guard_free_kv_tokens": guard,
                     }
+                    if args.m1_min_output_tokens is not None:
+                        controller_config_overrides["policy"] = {
+                            "min_output_tokens_before_eligible": (
+                                args.m1_min_output_tokens
+                            ),
+                        }
                 if args.fixed_rate_gib_s is not None:
                     source_env_overrides["BRIDGETP_STREAM_RATE_GIB_S"] = str(
                         args.fixed_rate_gib_s

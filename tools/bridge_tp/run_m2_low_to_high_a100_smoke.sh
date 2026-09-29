@@ -9,6 +9,7 @@ run_m2_low_to_high_a100_smoke() {
 
   local expected_revision="${BRIDGETP_EXPECTED_REVISION:?set BRIDGETP_EXPECTED_REVISION}"
   local low_gib_s="${BRIDGETP_M2_LOW_GIB_S:-0.1}"
+  local m1_min_output_tokens="${BRIDGETP_M1_MIN_OUTPUT_TOKENS:-32}"
   local require_low_to_high="${BRIDGETP_M2_REQUIRE_LOW_TO_HIGH:-1}"
   local mode=event-low-high
   local m2_requirement=()
@@ -90,6 +91,7 @@ run_m2_low_to_high_a100_smoke() {
     sha256sum "$base" "$manifest" "$survival" "$guard"
     echo "guard=$(cat "$guard")"
     echo "m2_low_gib_s=$low_gib_s"
+    echo "m1_min_output_tokens=$m1_min_output_tokens"
     echo "m2_require_low_to_high=$require_low_to_high"
   } | tee "$run/preflight.txt"
 
@@ -110,6 +112,7 @@ run_m2_low_to_high_a100_smoke() {
     --ready-sync-mode STREAM_EVENT --ready-notification-mode UDP \
     --persistent-channel --preconnect-persistent-channel --channel-generation 1 \
     --manager-m0-shadow --manager-m1-auto-start --manager-m2-rate \
+    --m1-min-output-tokens "$m1_min_output_tokens" \
     "${m2_requirement[@]}" \
     --m2-low-gib-s "$low_gib_s" --m2-medium-gib-s 2.4 --m2-high-gib-s 8.0 \
     --source-pressure --minimum-ready-source-jobs 0 \
