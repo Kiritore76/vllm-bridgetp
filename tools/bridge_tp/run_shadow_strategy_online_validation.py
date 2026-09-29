@@ -1602,7 +1602,23 @@ def accept_m1_stay(
     }
 
 
-def has_measured_source_high(audit: list[dict[str, Any]]) -> bool:
+def active_source_peer_count(
+    unix_s: float | None, source_peers: list[dict[str, Any]]
+) -> int:
+    if unix_s is None:
+        return 0
+    return sum(
+        isinstance(peer.get("request_started_unix_s"), (int, float))
+        and isinstance(peer.get("request_ended_unix_s"), (int, float))
+        and peer["request_started_unix_s"] <= unix_s
+        < peer["request_ended_unix_s"]
+        for peer in source_peers
+    )
+
+
+def has_measured_source_high(
+    audit: list[dict[str, Any]], source_peers: list[dict[str, Any]]
+) -> bool:
     """Check that an M2 HIGH action used live pre-guard source telemetry."""
     for row in audit:
         if row.get("kind") == "manager_m2_initial_rate":
@@ -1616,6 +1632,11 @@ def has_measured_source_high(audit: list[dict[str, Any]]) -> bool:
         horizon = decision.get("source_time_to_guard_s")
         free = snapshot.get("source_free_kv_tokens")
         guard = snapshot.get("source_guard_free_kv_tokens")
+        decision_time = row.get("unix_s")
+        active_peers = active_source_peer_count(
+            decision_time if isinstance(decision_time, (int, float)) else None,
+            source_peers,
+        )
         if (
             decision.get("action") == "SET_RATE"
             and decision.get("profile") == "HIGH"
@@ -1625,6 +1646,9 @@ def has_measured_source_high(audit: list[dict[str, Any]]) -> bool:
             and isinstance(free, (int, float))
             and isinstance(guard, (int, float))
             and free > guard
+            and isinstance(snapshot.get("source_running"), (int, float))
+            and snapshot["source_running"] >= 2
+            and active_peers >= 2
         ):
             return True
     return False
@@ -1731,6 +1755,14 @@ def accept_online(
         "telemetry_samples": len(source_telemetry),
         "overlap_samples": sum(
             int(row.get("num_running", 0)) >= 2 for row in source_telemetry
+        ),
+        "active_peers_at_m2_initial_rate": max(
+            (
+                active_source_peer_count(row.get("unix_s"), source_peers)
+                for row in audit
+                if row.get("kind") == "manager_m2_initial_rate"
+            ),
+            default=0,
         ),
         "peak_tp1_kv_usage_frac": max(source_usage, default=None),
         "minimum_free_kv_tokens": min(
@@ -2484,9 +2516,10 @@ def accept_online(
         ):
             errors.append("M2 used a rate outside the three configured profiles")
         if manager_m2_require_source_high:
-            if not has_measured_source_high(audit):
+            if not has_measured_source_high(audit, source_peers):
                 errors.append(
-                    "M2 HIGH was not caused by measured pre-guard source pressure"
+                    "M2 HIGH lacked measured pre-guard pressure with active "
+                    "source peers"
                 )
     slo = summarize_slo(
         background.get("results", []),

@@ -88,18 +88,28 @@ class TestOnlineStrategyTiming(unittest.TestCase):
         snapshot = {
             "source_free_kv_tokens": 9000,
             "source_guard_free_kv_tokens": 8448,
+            "source_running": 3,
         }
         audit = [{
             "kind": "manager_m2_initial_rate",
+            "unix_s": 100.0,
             "decision": decision,
             "snapshot": snapshot,
         }]
-        self.assertTrue(has_measured_source_high(audit))
+        peers = [
+            {"request_started_unix_s": 90.0, "request_ended_unix_s": 110.0},
+            {"request_started_unix_s": 91.0, "request_ended_unix_s": 111.0},
+        ]
+        self.assertTrue(has_measured_source_high(audit, peers))
         decision["reason"] = "diagnostic HIGH transfer smoke"
-        self.assertFalse(has_measured_source_high(audit))
+        self.assertFalse(has_measured_source_high(audit, peers))
         decision["reason"] = "source guard horizon is short"
         snapshot["source_free_kv_tokens"] = 8000
-        self.assertFalse(has_measured_source_high(audit))
+        self.assertFalse(has_measured_source_high(audit, peers))
+        snapshot["source_free_kv_tokens"] = 9000
+        peers[0]["request_ended_unix_s"] = 99.0
+        peers[1]["request_ended_unix_s"] = 99.0
+        self.assertFalse(has_measured_source_high(audit, peers))
 
     def test_m1_short_request_stay_acceptance(self) -> None:
         with TemporaryDirectory() as temp:
