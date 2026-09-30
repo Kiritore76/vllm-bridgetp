@@ -1,0 +1,49 @@
+# 剩余长度分布训练
+
+复用已审计的 hidden states 和长度标签，保留两层 MLP，输入为最后一层
+hidden state 加已生成长度，默认结构为 `5121 → 256 → 68`。
+
+输出是剩余长度分段概率：上界为 0、8、16、32、64……2048，最后一类为
+超过 2048 的开放尾部。自然结束样本用类别负对数似然训练；达到生成上限的
+样本用兼容尾部概率训练，不把上限当成真实长度。截断下限会向下放宽到所在
+区间的起点，默认最多放宽 31 token。长请求的多个快照按请求均衡加权。
+
+原始请求树划分保持不变。验证集按树分成两半：一半选择训练轮次，另一半拟合
+一个温度参数用于概率校准。测试集只做最终评估。1000 条现有数据中验证集约
+50/50 条，足以验证流程，不能证明极低概率风险已校准。
+
+`predictor_distribution.probability_gt_bounds(pmf, edges, H)` 返回
+`P(N_remaining > H)` 的下界和上界。H 在分段边界时两者相等；在段内不假设
+段内均匀分布。`probability_remaining_gt` 返回保守上界。超过 2048 时上界
+仍包含开放尾部，不能直接视为零风险。模型不能从现有截断数据辨识尾部内的
+具体长度分布；需要更多长响应后再细化。
+
+动态容量门槛 H 由控制器结合当前可用 KV、其他请求和预留量计算。
+这个概率表示给定 H 下的容量超限风险；实际 CUDA OOM 还依赖容量模型和
+运行时行为。此阶段训练与离线评估，控制器接入另行验证。
+
+## 输出与评估
+
+- `predictor_distribution.pt`：权重、标准化参数、分段边界、温度及来源 SHA。
+- `report.json`：类别 NLL、多个容量门槛下的 Brier、二元 log loss、ECE、
+  可靠性分箱、低风险样本实际超限率，以及训练集 Kaplan–Meier 条件生存基线。
+- `distribution_predictions.npz`：全部快照的校准概率和标签，便于离线回放。
+- `runner.log`：训练日志。
+
+所有指标按请求均衡加权。快照相关，不能把快照数当成独立风险事件数。
+高门槛下正例太少时，即使 ECE 小也不能证明稀有超限事件可靠；需要更多长请求
+和独立测试数据。训练基线不对尚未观测的尾部外推，报告缺乏支持的样本数。
+
+## A100 运行
+
+更新并核对 HEAD 后，设置 `BRIDGETP_EXPECTED_REVISION`，运行
+`bash tools/bridge_tp/run_predictor_distribution_a100.sh`。
+默认使用 `/root/autodl-tmp/bridgetp/results/length_predictor/oasst1-train1000-20260930T030435Z-1173`。
+可通过 `BRIDGETP_CAPTURE_DIR` 指定同一采集包的其他解压目录。
+默认核对当前机器为 `autodl-container-db401188fa-e7ef73f0`，换机器时设置
+`BRIDGETP_EXPECTED_HOSTNAME` 为核对过的新 hostname。
+训练入口会核对当前 HEAD、工作区、旧采集 revision、归档输入 SHA、模型配置、
+GPU 名称及数量，并重新审计采集数据。不重新加载或运行大模型。
+
+结果保存在新的 `原采集目录-distribution-时间戳-PID` 目录，不覆盖旧回归权重。
+拿回脚本打印的一个分布训练压缩包即可，原采集数据无需重复拿回。
