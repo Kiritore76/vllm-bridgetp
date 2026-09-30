@@ -141,6 +141,7 @@ class TestPredictorDistribution(unittest.TestCase):
                 epochs=2,
                 hidden_width=8,
                 batch_size=4,
+                known_test_ids={"request-8"},
             )
             checkpoint = torch.load(
                 out / "predictor_distribution.pt", weights_only=True
@@ -148,6 +149,8 @@ class TestPredictorDistribution(unittest.TestCase):
             self.assertEqual(checkpoint["model_type"], "remaining_length_categorical")
             self.assertEqual(report["censored_training_requests"], 1)
             self.assertEqual(report["results"]["test"]["requests"], 2)
+            self.assertEqual(report["results"]["test_previous_stage"]["requests"], 1)
+            self.assertEqual(report["results"]["test_new_stage"]["requests"], 1)
             self.assertFalse(
                 set(report["selection_validation_request_ids"])
                 & set(report["calibration_validation_request_ids"])

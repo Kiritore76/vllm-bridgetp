@@ -116,6 +116,20 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def choose_staged_pilot(roots: list[dict], total: int) -> list[dict]:
+    """Keep the first 2000 requests/batches identical when expanding to 10000."""
+    if total not in (2000, 10000):
+        raise ValueError("staged total must be 2000 or 10000")
+    initial = choose_pilot(roots, 1800, 200)
+    if total == 2000:
+        return initial
+    initial_ids = {row["id"] for row in initial}
+    full = choose_pilot(roots, 9800, 200)
+    if not initial_ids <= {row["id"] for row in full}:
+        raise ValueError("initial stage is not contained in the full input")
+    return initial + [row for row in full if row["id"] not in initial_ids]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True)
@@ -126,6 +140,7 @@ def main() -> None:
     parser.add_argument("--pilot-zh", type=int, default=40)
     parser.add_argument("--exclude-legacy-train1000", action="store_true")
     parser.add_argument("--shard-size", type=int, default=0)
+    parser.add_argument("--staged-requests", type=int, choices=(2000, 10000))
     args = parser.parse_args()
     if (
         args.min_chars < 1
@@ -144,7 +159,11 @@ def main() -> None:
             row["source_tree_id"] for row in choose_pilot(roots, 800, 200)
         }
     eligible = [row for row in roots if row["source_tree_id"] not in excluded_trees]
-    pilot = choose_pilot(eligible, args.pilot_en, args.pilot_zh)
+    pilot = (
+        choose_staged_pilot(eligible, args.staged_requests)
+        if args.staged_requests
+        else choose_pilot(eligible, args.pilot_en, args.pilot_zh)
+    )
     args.out_dir.mkdir(parents=True, exist_ok=True)
     full_path = args.out_dir / "oasst1_root_requests.jsonl"
     pilot_path = args.out_dir / "oasst1_pilot_requests.jsonl"
@@ -154,6 +173,7 @@ def main() -> None:
         "format_version": 1,
         "source_sha256": SOURCE_SHA256,
         "excluded_legacy_trees": len(excluded_trees),
+        "staged_requests": args.staged_requests,
         "filters": {
             "root_prompter": True,
             "deleted": False,
