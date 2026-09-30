@@ -188,6 +188,10 @@ def fit_distribution(
                     "capture_revision": preflight["revision"],
                     "capture_input_sha256": preflight["input_sha256"],
                     "model_config_sha256": preflight["model_config_sha256"],
+                    "feature_layer": preflight.get("feature_layer", "final"),
+                    "feature_semantics": preflight.get(
+                        "feature_semantics", "last token after final model norm"
+                    ),
                     "query_rule": "P(N>H) upper bound; open tail is not forced to zero",
                 },
                 checkpoint_path,
@@ -363,6 +367,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--bin-step", type=int, default=32)
     parser.add_argument("--known-test-input", type=Path)
+    parser.add_argument("--expected-feature-layer", default="final")
     args = parser.parse_args()
     if (
         min(
@@ -387,6 +392,8 @@ def main() -> None:
     preflight = json.loads(
         (args.run_dir / "preflight.json").read_text(encoding="utf-8")
     )
+    if preflight.get("feature_layer", "final") != args.expected_feature_layer:
+        parser.error("capture feature layer differs from expected")
     if (
         preflight["revision"] != args.expected_capture_revision
         or preflight["input_sha256"] != args.expected_input_sha256
@@ -441,6 +448,7 @@ def main() -> None:
         "input_sha256": preflight["input_sha256"],
         "model_path": preflight["model_path"],
         "model_config_sha256": preflight["model_config_sha256"],
+        "feature_layer": preflight.get("feature_layer", "final"),
         "gpu_names": names,
         "torch_version": str(torch.__version__),
         "arguments": {

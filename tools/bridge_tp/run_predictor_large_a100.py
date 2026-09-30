@@ -31,14 +31,18 @@ COMMON_FIELDS = (
     "max_tokens",
     "max_model_len",
     "temperature",
+    "feature_layer",
 )
 
 
-def validate_shard(run: Path, input_path: Path, revision: str) -> dict:
+def validate_shard(
+    run: Path, input_path: Path, revision: str, feature_layer: str = "final"
+) -> dict:
     """Reuse a batch only when inputs, protocol and independent audit agree."""
     preflight = json.loads((run / "preflight.json").read_text())
     if (
         preflight["revision"] != revision
+        or preflight.get("feature_layer", "final") != feature_layer
         or preflight["input_sha256"] != sha256_file(input_path)
         or preflight["model_config_sha256"] != MODEL_SHA
         or preflight["max_tokens"] != 4096
@@ -93,7 +97,11 @@ def merge_shards(runs: list[Path], full_input: Path, out: Path) -> dict:
             meta = json.loads((run / "preflight.json").read_text())
             if preflight is None:
                 preflight = meta.copy()
-            if any(meta[key] != preflight[key] for key in COMMON_FIELDS):
+            if any(
+                meta.get(key, "final" if key == "feature_layer" else None)
+                != preflight.get(key, "final" if key == "feature_layer" else None)
+                for key in COMMON_FIELDS
+            ):
                 raise ValueError("capture protocol changed between batches")
             prefix = f"shard{number:03d}:"
             source_labels = read_jsonl(run / "labels.jsonl")
@@ -204,12 +212,10 @@ def main() -> None:
     parser.add_argument("--expected-revision", required=True)
     parser.add_argument("--expected-hostname", required=True)
     parser.add_argument("--requests", type=int, choices=(2000, 10000), default=2000)
+    parser.add_argument("--feature-layer", default="final")
     parser.add_argument(
         "--data-root",
         type=Path,
-        default=Path(
-            "/root/autodl-tmp/bridgetp/results/length_predictor/oasst1-staged-v2"
-        ),
     )
     parser.add_argument(
         "--source",
@@ -226,6 +232,20 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    if args.feature_layer != "final":
+        prefix, separator, value = args.feature_layer.partition(":")
+        if prefix != "decoder" or not separator or not value.isdecimal():
+            parser.error("feature-layer must be final or decoder:<zero-based index>")
+    if args.data_root is None:
+        suffix = (
+            ""
+            if args.feature_layer == "final"
+            else "-" + args.feature_layer.replace(":", "")
+        )
+        args.data_root = Path(
+            "/root/autodl-tmp/bridgetp/results/length_predictor/oasst1-staged-v2"
+            + suffix
+        )
     expected_input_sha = INPUT_SHAS[args.requests]
     batch_count = args.requests // 500
     revision = subprocess.check_output(
@@ -250,6 +270,12 @@ def main() -> None:
         or sha256_file(args.model / "config.json") != MODEL_SHA
     ):
         parser.error("raw dataset or model config SHA differs")
+    model_config = json.loads((args.model / "config.json").read_text())
+    if args.feature_layer != "final" and (
+        model_config.get("model_type") != "qwen2"
+        or int(args.feature_layer.split(":")[1]) >= model_config["num_hidden_layers"]
+    ):
+        parser.error("decoder index is outside this Qwen2 model")
     args.data_root.mkdir(parents=True, exist_ok=True)
     # Hold this lock through capture and training; concurrent resumptions must stop.
     import fcntl
@@ -272,6 +298,7 @@ def main() -> None:
                 "source": str(args.source.resolve()),
                 "model": str(args.model.resolve()),
                 "data_root": str(args.data_root.resolve()),
+                "feature_layer": args.feature_layer,
                 "disk_free_gib": shutil.disk_usage(args.data_root).free / 2**30,
             }
         ),
@@ -316,7 +343,7 @@ def main() -> None:
         print(f"batch={number + 1}/{batch_count} directory={run}", flush=True)
         if run.exists():
             try:
-                meta = validate_shard(run, input_path, revision)
+                meta = validate_shard(run, input_path, revision, args.feature_layer)
                 if meta["model_path"] != str(args.model.resolve()):
                     raise ValueError("model path changed")
                 print("completed batch audit PASS; reusing", flush=True)
@@ -349,6 +376,8 @@ def main() -> None:
             "4096",
             "--max-model-len",
             "6144",
+            "--feature-layer",
+            args.feature_layer,
         ]
         try:
             run_logged(command, log)
@@ -356,12 +385,12 @@ def main() -> None:
             if run.exists():
                 shutil.copyfile(log, run / "runner.log")
                 shutil.copyfile(input_path, run / "input_requests.jsonl")
-        validate_shard(run, input_path, revision)
+        validate_shard(run, input_path, revision, args.feature_layer)
         runs.append(run)
     merged = args.data_root / f"capture-{args.requests}"
     if merged.exists():
         try:
-            meta = validate_shard(merged, full_input, revision)
+            meta = validate_shard(merged, full_input, revision, args.feature_layer)
             if meta.get("source_shards") is None:
                 raise ValueError("merged provenance missing")
         except (OSError, ValueError, KeyError, sqlite3.Error):
@@ -392,6 +421,8 @@ def main() -> None:
         "1",
         "--learning-rate",
         "0.0003",
+        "--expected-feature-layer",
+        args.feature_layer,
     ]
     previous_input = args.data_root / "inputs-2000/oasst1_pilot_requests.jsonl"
     if args.requests == 10000 and previous_input.exists():

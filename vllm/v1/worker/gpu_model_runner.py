@@ -657,6 +657,12 @@ class GPUModelRunner(
                 "predictor feature capture requires a single-rank text model "
                 "without async scheduling or speculative decoding"
             )
+        if (
+            self.predictor_feature_capture is not None
+            and self.predictor_feature_capture.layer_index is not None
+            and not self.model_config.enforce_eager
+        ):
+            raise ValueError("intermediate predictor capture requires enforce_eager")
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
@@ -3774,6 +3780,8 @@ class GPUModelRunner(
         Returns:
             Model output tensor
         """
+        if self.predictor_feature_capture is not None:
+            self.predictor_feature_capture.begin_forward()
         return self.model(
             input_ids=input_ids,
             positions=positions,
@@ -4388,7 +4396,9 @@ class GPUModelRunner(
         if self.predictor_feature_capture is not None:
             active_req_ids = req_ids[:num_reqs]
             self.predictor_feature_capture.capture(
-                sample_hidden_states,
+                self.predictor_feature_capture.sample_states(
+                    sample_hidden_states, logits_indices
+                ),
                 active_req_ids,
                 [
                     len(self.requests[req_id].output_token_ids)
@@ -5190,6 +5200,8 @@ class GPUModelRunner(
                 self.model = model_loader.load_model(
                     vllm_config=self.vllm_config, model_config=self.model_config
                 )
+                if self.predictor_feature_capture is not None:
+                    self.predictor_feature_capture.attach_model(self.model)
                 if self.lora_config:
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device

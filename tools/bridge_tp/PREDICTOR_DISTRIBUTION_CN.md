@@ -94,3 +94,49 @@ Brier、ECE和低风险超限情况，尤其关注Prefill完成时的256/512门�
 
 旧v1输入（提交f61a956，SHA `75c5be8a5f9eeb99d52e0a869529c7f8ba9f09a44f25938bbb0baa5017700955`）
 与v2的批次排序不同，不应混用。用户确认旧10000条任务尚未启动，本轮从v2开始。
+
+## 先用300条请求筛选特征层
+
+TRAIL（ICLR 2025，*Don't Stop Me Now: Embedding Based Scheduling for LLMs*）
+在32层 Llama3-8B 上报告索引10～15的中间层较好，实际使用索引11。
+论文：<https://proceedings.iclr.cc/paper_files/paper/2025/file/9eb8b5ccb0de594a16548f7c058fdadf-Paper-Conference.pdf>。
+Qwen2.5-14B 有48个 Transformer block；按相对深度换算，索引17是起始候选，
+并非已经验证的最佳层。层号使用从0开始的索引。
+
+`run_predictor_layer_probe_a100.py` 一次生成同时采集 `decoder:17`、
+`decoder:23`、`decoder:31` 和 `final`，即第18、24、32个 block 输出和最后归一化输出。
+中间层记录 vLLM Qwen2DecoderLayer 的 hidden+residual 完整残差流。
+所有位置均取当前 token 的表征，保持最后 token 池化规则一致；这次不复现
+TRAIL 的 Prefill 平均池化或贝叶斯平滑，以便只比较表征位置。
+采集 hook 仅复制特征，不修改生成使用的 hidden states、logits 或 token。
+
+先自动跑8条 smoke，检查每层均有 Prefill 快照且所有采样位置配对一致，
+再采集300条：270英文、30中文，局部划分为180训练、80验证、40测试。
+这300条均取自未来2000条正式实验的1600条训练请求池；重新赋予局部划分，
+不会使用正式验证或测试请求选层。输入 SHA：
+`6903df497a1603e32ab67589ab5217d826f555ba9df93a8711aa304728e62c24`。
+这批小试特征不自动并入正式批次，避免局部 split 与正式 split 混用。
+
+每层独立从随机初始化训练相同的两层预测头，种子42、宽度256、学习率0.0003。
+验证集再按树拆成模型选择和温度校准两组；所有层使用相同请求分组。
+`layer_ranking.json` 用模型选择验证组在 Prefill 完成时的128/256/512容量门槛下
+平均 Brier 排名，类别 NLL 用于同分排序；测试组不参与选层。
+同时保留各层所有阶段的 NLL、风险指标和预测，便于检查 Decode 的表现。
+小试约40个选择验证请求，只能筛选候选，不能证明全局最佳层或极低 OOM 风险校准。
+若结果接近，应保留最后一层和一个中间层进入相同2000条正式训练对比。
+
+新服务器只需要同一大模型、原始 OASST1 文件和更新后的代码，不需要旧预测器权重。
+启动前检查 hostname、HEAD、工作区、单张 A100、原始数据 SHA、模型配置 SHA 和路径。
+默认输出目录：
+`/root/autodl-tmp/bridgetp/results/length_predictor/qwen14b-layer-probe300-v1`。
+流程日志会打印阶段与子进程日志路径；同一 HEAD 重跑时会重新审计完整采集并复用。
+完成后拿回 `qwen14b-layer-probe300-v1.tar.gz` 一个包，包含四组特征、四个预测头、
+报告、排名与日志；采集或训练失败时也会尝试打包已保留的数据和日志。
+按旧采集耗时推算生成约75分钟，加上加载和训练可预留1～2小时；
+这是估计，实际取决于响应长度。建议预留10 GiB磁盘空间用于特征和压缩包。
+
+已经在旧服务器运行的最后一层2000条采集可以继续，无需中途更新代码。
+选层后用 `run_predictor_large_a100.py --requests 2000 --feature-layer decoder:索引`
+在新服务器采集并训练；默认输出目录带层索引，避免混入最后一层数据。
+正式输入和训练参数与最后一层实验一致，随后在相同测试请求上比较。
+权重文件记录 feature_layer；不同层的采集批次拒绝复用或合并。
