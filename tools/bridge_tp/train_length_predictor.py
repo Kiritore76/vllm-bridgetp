@@ -32,8 +32,8 @@ def read_jsonl(path: Path) -> list[dict]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
-def load_examples(run_dir: Path) -> dict:
-    """Verify SQLite samples and load exact labels without split leakage."""
+def load_examples(run_dir: Path, include_censored: bool = False) -> dict:
+    """Verify SQLite samples and preserve censoring for distribution training."""
     labels = read_jsonl(run_dir / "labels.jsonl")
     index = read_jsonl(run_dir / "sample_index.jsonl")
     label_by_id = {}
@@ -54,6 +54,8 @@ def load_examples(run_dir: Path) -> dict:
     existing = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
     if audit != existing:
         raise ValueError("capture summary differs from independent audit")
+    if len(index) != audit["samples"]:
+        raise ValueError("sample index does not cover every captured feature")
     database_path = run_dir / "features" / "features.sqlite3"
     if not database_path.is_file():
         raise ValueError("formal training requires SQLite features")
@@ -64,6 +66,8 @@ def load_examples(run_dir: Path) -> dict:
     splits = []
     requests = []
     phases = []
+    languages = []
+    censored = []
     seen_rows = set()
     with closing(sqlite3.connect(database_path)) as database:
         for row in index:
@@ -80,7 +84,9 @@ def load_examples(run_dir: Path) -> dict:
                 raise ValueError(f"missing response label: {row['request_id']}")
             if row.get("split") != label["split"]:
                 raise ValueError("sample split differs from response label")
-            if row["censored"]:
+            if row["censored"] == label["natural_finish"]:
+                raise ValueError("sample censoring differs from response label")
+            if row["censored"] and not include_censored:
                 continue
             result = database.execute(
                 """SELECT request_id, generated_tokens, phase, hidden_size,
@@ -97,14 +103,22 @@ def load_examples(run_dir: Path) -> dict:
                 or len(blob) != width * 2
             ):
                 raise ValueError(f"feature/index mismatch at row {sample_id}")
-            if row["remaining_tokens"] != label["output_tokens"] - count:
+            observed_remaining = label["output_tokens"] - count
+            if not row["censored"] and row["remaining_tokens"] != observed_remaining:
                 raise ValueError(f"remaining length mismatch at row {sample_id}")
+            if row["censored"] and (
+                row["remaining_tokens"] is not None
+                or row["observed_remaining_lower_bound"] != observed_remaining
+            ):
+                raise ValueError(f"censored length mismatch at row {sample_id}")
             states.append(np.frombuffer(blob, dtype=np.float16).copy())
-            remaining.append(row["remaining_tokens"])
+            remaining.append(observed_remaining)
             generated.append(count)
             splits.append(label["split"])
             requests.append(label["input_id"])
             phases.append(phase)
+            languages.append(label.get("lang", "unknown"))
+            censored.append(row["censored"])
     if not states:
         raise ValueError("no exact-length samples")
     hidden = np.stack(states)
@@ -117,6 +131,8 @@ def load_examples(run_dir: Path) -> dict:
         "splits": np.asarray(splits),
         "requests": np.asarray(requests),
         "phases": np.asarray(phases),
+        "languages": np.asarray(languages),
+        "censored": np.asarray(censored, dtype=bool),
         "audit": audit,
         "labels": labels,
     }
