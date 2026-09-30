@@ -193,6 +193,8 @@ def main() -> None:
     ):
         parser.error(f"GPU inventory differs: {gpu_names}")
     data = load_examples(run_dir)
+    if data["audit"]["censored_requests"] / data["audit"]["requests"] > 0.2:
+        parser.error("more than 20% of requests were capped; inspect capture")
     masks = {
         split: data["splits"] == split for split in ("train", "validation", "test")
     }
