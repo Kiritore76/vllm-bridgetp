@@ -10,12 +10,13 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import subprocess
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-
 
 _INTERNAL_ID_SUFFIX = re.compile(r"[0-9a-fA-F]{8}")
 
@@ -73,8 +74,87 @@ def audit_capture(
     natural_samples = 0
     phases: dict[str, int] = {}
     seen: set[tuple[str, int]] = set()
-    index_rows: list[dict[str, Any]] = []
     hidden_size = None
+    index_handle = index_path.open("w", encoding="utf-8") if index_path else None
+    try:
+        for filename, row_number, state, request_id, count, stage in iter_feature_rows(
+            feature_dir
+        ):
+            if hidden_size is None:
+                hidden_size = len(state)
+            elif hidden_size != len(state):
+                raise ValueError("hidden width changed within one collection")
+            if not np.isfinite(state).all():
+                raise ValueError(f"nonfinite hidden state in {filename}")
+            label = label_for_engine_request(request_id, labels)
+            if label is None:
+                raise ValueError(f"feature has no final response: {request_id}")
+            if count > label["output_tokens"] or count < 0:
+                raise ValueError(f"invalid generated count for {request_id}")
+            if (request_id, count) in seen:
+                raise ValueError(f"duplicate capture for {request_id} at {count}")
+            seen.add((request_id, count))
+            if stage not in ("PREFILL_COMPLETE", "DECODE"):
+                raise ValueError(f"unknown capture stage {stage}")
+            phases[stage] = phases.get(stage, 0) + 1
+            sample_count += 1
+            natural_samples += int(label["natural_finish"])
+            observed_remaining = label["output_tokens"] - count
+            index_row = {
+                "request_id": request_id,
+                "input_id": label.get("input_id"),
+                "split": label.get("split"),
+                "lang": label.get("lang"),
+                "feature_file": filename,
+                "feature_row": row_number,
+                "phase": stage,
+                "generated_tokens": count,
+                "remaining_tokens": (
+                    observed_remaining if label["natural_finish"] else None
+                ),
+                "observed_remaining_lower_bound": observed_remaining,
+                "censored": not label["natural_finish"],
+            }
+            if index_handle is not None:
+                index_handle.write(json.dumps(index_row, ensure_ascii=False) + "\n")
+    finally:
+        if index_handle is not None:
+            index_handle.close()
+    if not sample_count:
+        raise ValueError("no hidden-state samples were captured")
+    return {
+        "format_version": 1,
+        "requests": len(labels),
+        "naturally_finished_requests": sum(
+            row["natural_finish"] for row in labels.values()
+        ),
+        "censored_requests": sum(not row["natural_finish"] for row in labels.values()),
+        "samples": sample_count,
+        "samples_with_exact_remaining_length": natural_samples,
+        "hidden_size": hidden_size,
+        "phases": phases,
+    }
+
+
+def iter_feature_rows(feature_dir: Path):
+    """Yield both the new SQLite format and legacy pilot NPZ features."""
+    database_path = feature_dir / "features.sqlite3"
+    if database_path.exists():
+        with closing(sqlite3.connect(database_path)) as database:
+            for sample_id, request_id, count, stage, width, blob in database.execute(
+                """SELECT sample_id, request_id, generated_tokens, phase,
+                          hidden_size, hidden_fp16 FROM samples ORDER BY sample_id"""
+            ):
+                if width <= 0 or len(blob) != 2 * width:
+                    raise ValueError(f"invalid hidden-state bytes at row {sample_id}")
+                yield (
+                    database_path.name,
+                    sample_id,
+                    np.frombuffer(blob, dtype=np.float16),
+                    request_id,
+                    count,
+                    stage,
+                )
     for path in sorted(feature_dir.glob("*.npz")):
         with np.load(path, allow_pickle=False) as data:
             states = data["hidden_states"]
@@ -85,65 +165,17 @@ def audit_capture(
                 raise ValueError(f"invalid state shape in {path}")
             if not (len(request_ids) == len(generated) == len(phase)):
                 raise ValueError(f"metadata shape mismatch in {path}")
-            if not np.isfinite(states).all():
-                raise ValueError(f"nonfinite hidden state in {path}")
-            if hidden_size is None:
-                hidden_size = states.shape[1]
-            elif hidden_size != states.shape[1]:
-                raise ValueError("hidden width changed within one collection")
-            for row_number, (request_id, count, stage) in enumerate(
-                zip(request_ids, generated, phase)
+            for row_number, (state, request_id, count, stage) in enumerate(
+                zip(states, request_ids, generated, phase)
             ):
-                request_id = str(request_id)
-                count = int(count)
-                stage = str(stage)
-                label = label_for_engine_request(request_id, labels)
-                if label is None:
-                    raise ValueError(f"feature has no final response: {request_id}")
-                if count > label["output_tokens"] or count < 0:
-                    raise ValueError(f"invalid generated count for {request_id}")
-                if (request_id, count) in seen:
-                    raise ValueError(f"duplicate capture for {request_id} at {count}")
-                seen.add((request_id, count))
-                if stage not in ("PREFILL_COMPLETE", "DECODE"):
-                    raise ValueError(f"unknown capture stage {stage}")
-                phases[stage] = phases.get(stage, 0) + 1
-                sample_count += 1
-                natural_samples += int(label["natural_finish"])
-                observed_remaining = label["output_tokens"] - count
-                index_rows.append({
-                    "request_id": request_id,
-                    "input_id": label.get("input_id"),
-                    "feature_file": path.name,
-                    "feature_row": row_number,
-                    "phase": stage,
-                    "generated_tokens": count,
-                    "remaining_tokens": (
-                        observed_remaining if label["natural_finish"] else None
-                    ),
-                    "observed_remaining_lower_bound": observed_remaining,
-                    "censored": not label["natural_finish"],
-                })
-    if not sample_count:
-        raise ValueError("no hidden-state samples were captured")
-    if index_path is not None:
-        with index_path.open("w", encoding="utf-8") as handle:
-            for row in index_rows:
-                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-    return {
-        "format_version": 1,
-        "requests": len(labels),
-        "naturally_finished_requests": sum(
-            row["natural_finish"] for row in labels.values()
-        ),
-        "censored_requests": sum(
-            not row["natural_finish"] for row in labels.values()
-        ),
-        "samples": sample_count,
-        "samples_with_exact_remaining_length": natural_samples,
-        "hidden_size": hidden_size,
-        "phases": phases,
-    }
+                yield (
+                    path.name,
+                    row_number,
+                    state,
+                    str(request_id),
+                    int(count),
+                    str(stage),
+                )
 
 
 def main() -> None:
@@ -168,9 +200,7 @@ def main() -> None:
         parser.error("gpu-memory-utilization must be between 0 and 1")
     if args.out_dir.exists() and any(args.out_dir.iterdir()):
         parser.error("out-dir must be new or empty")
-    revision = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], text=True
-    ).strip()
+    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     if revision != args.expected_revision:
         parser.error("HEAD differs from expected revision")
     if subprocess.check_output(["git", "status", "--porcelain"], text=True).strip():
@@ -185,9 +215,8 @@ def main() -> None:
         ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
         text=True,
     ).splitlines()
-    if (
-        len(gpu_names) != args.expected_gpu_count
-        or any(name.strip() != args.expected_gpu_name for name in gpu_names)
+    if len(gpu_names) != args.expected_gpu_count or any(
+        name.strip() != args.expected_gpu_name for name in gpu_names
     ):
         parser.error(f"GPU inventory differs: {gpu_names}")
     requests = load_requests(args.input, args.limit)
@@ -235,17 +264,34 @@ def main() -> None:
     labels: dict[str, dict[str, Any]] = {}
     label_path = args.out_dir / "labels.jsonl"
     with label_path.open("w", encoding="utf-8") as handle:
-        for row in requests:
+        for request_number, row in enumerate(requests, 1):
+            if request_number == 1 or request_number % 10 == 0:
+                print(
+                    f"capture request {request_number}/{len(requests)} id={row['id']}",
+                    flush=True,
+                )
             prompt = (
-                row["prompt"] if "prompt" in row else
-                tokenizer.apply_chat_template(
+                row["prompt"]
+                if "prompt" in row
+                else tokenizer.apply_chat_template(
                     row["messages"], tokenize=False, add_generation_prompt=True
                 )
             )
+            prompt_tokens = len(tokenizer.encode(prompt))
+            if prompt_tokens + args.max_tokens > args.max_model_len:
+                raise ValueError(
+                    f"request {row['id']} needs {prompt_tokens} prompt tokens "
+                    f"plus {args.max_tokens} output tokens, exceeding "
+                    f"max-model-len {args.max_model_len}"
+                )
             result = llm.generate([prompt], sampling, use_tqdm=False)[0]
             completion = result.outputs[0]
             label = {
                 "input_id": row["id"],
+                "split": row.get("split"),
+                "lang": row.get("lang"),
+                "source": row.get("source"),
+                "source_tree_id": row.get("source_tree_id"),
                 "request_id": result.request_id,
                 "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
                 "prompt_tokens": len(result.prompt_token_ids),
