@@ -124,18 +124,27 @@ def main() -> None:
     parser.add_argument("--max-chars", type=int, default=1500)
     parser.add_argument("--pilot-en", type=int, default=120)
     parser.add_argument("--pilot-zh", type=int, default=40)
+    parser.add_argument("--exclude-legacy-train1000", action="store_true")
+    parser.add_argument("--shard-size", type=int, default=0)
     args = parser.parse_args()
     if (
         args.min_chars < 1
         or args.max_chars < args.min_chars
         or args.pilot_en < 0
         or args.pilot_zh < 0
+        or args.shard_size < 0
     ):
         parser.error("invalid character range or pilot counts")
     if args.out_dir.exists() and any(args.out_dir.iterdir()):
         parser.error("out-dir must be new or empty")
     roots = load_roots(args.source, args.min_chars, args.max_chars)
-    pilot = choose_pilot(roots, args.pilot_en, args.pilot_zh)
+    excluded_trees = set()
+    if args.exclude_legacy_train1000:
+        excluded_trees = {
+            row["source_tree_id"] for row in choose_pilot(roots, 800, 200)
+        }
+    eligible = [row for row in roots if row["source_tree_id"] not in excluded_trees]
+    pilot = choose_pilot(eligible, args.pilot_en, args.pilot_zh)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     full_path = args.out_dir / "oasst1_root_requests.jsonl"
     pilot_path = args.out_dir / "oasst1_pilot_requests.jsonl"
@@ -144,6 +153,7 @@ def main() -> None:
     summary = {
         "format_version": 1,
         "source_sha256": SOURCE_SHA256,
+        "excluded_legacy_trees": len(excluded_trees),
         "filters": {
             "root_prompter": True,
             "deleted": False,
@@ -174,6 +184,19 @@ def main() -> None:
             ),
         },
     }
+    summary["shards"] = []
+    if args.shard_size:
+        for number, start in enumerate(range(0, len(pilot), args.shard_size)):
+            shard_path = args.out_dir / f"shard_{number:03d}.jsonl"
+            rows = pilot[start : start + args.shard_size]
+            write_jsonl(shard_path, rows)
+            summary["shards"].append(
+                {
+                    "filename": shard_path.name,
+                    "count": len(rows),
+                    "sha256": sha256_file(shard_path),
+                }
+            )
     (args.out_dir / "manifest.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
