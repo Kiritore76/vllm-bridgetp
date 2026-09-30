@@ -217,7 +217,9 @@ def fit_distribution(
     calibrated_p = softmax(all_logits, temperature)
     raw_p = softmax(all_logits)
     horizons = [
-        int(h) for h in (32, 64, 128, 256, 512, 768, 1024, 1536, 2048) if h in edges
+        int(h)
+        for h in (32, 64, 128, 256, 512, 768, 1024, 1536, 2048, 3072, 4096)
+        if h in edges
     ]
     train_labels = [label for label in data["labels"] if label["split"] == "train"]
     lengths = np.asarray([label["output_tokens"] for label in train_labels])
