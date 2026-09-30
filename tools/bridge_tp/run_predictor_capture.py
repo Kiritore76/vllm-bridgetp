@@ -1,4 +1,4 @@
-"""Collect request-level labels and final-layer states for a length predictor.
+"""Collect response labels and chosen hidden states for a length predictor.
 
 Input is local JSONL with a unique ``id`` and either ``prompt`` or ``messages``
 per row. Feature capture is opt-in and runs on a single GPU. This script does
@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 from contextlib import closing
@@ -193,6 +194,10 @@ def main() -> None:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--feature-layer", default="final")
+    parser.add_argument(
+        "--feature-layers", help="paired layer probe, e.g. decoder:17,final"
+    )
     args = parser.parse_args()
     if args.interval <= 0 or args.max_tokens <= 0 or args.max_model_len <= 0:
         parser.error("interval, max-tokens, and max-model-len must be positive")
@@ -211,6 +216,24 @@ def main() -> None:
     model_config = Path(args.model) / "config.json"
     if not model_config.is_file():
         parser.error(f"model config missing: {model_config}")
+    config = json.loads(model_config.read_text())
+    layers = (
+        args.feature_layers.split(",") if args.feature_layers else [args.feature_layer]
+    )
+    if len(set(layers)) != len(layers):
+        parser.error("duplicate feature layers")
+    for feature_layer in layers:
+        if feature_layer == "final":
+            continue
+        prefix, separator, value = feature_layer.partition(":")
+        if (
+            prefix != "decoder"
+            or not separator
+            or not value.isdecimal()
+            or config.get("model_type") != "qwen2"
+            or int(value) >= config["num_hidden_layers"]
+        ):
+            parser.error("intermediate capture needs decoder:<valid Qwen2 layer index>")
     gpu_names = subprocess.check_output(
         ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
         text=True,
@@ -221,9 +244,14 @@ def main() -> None:
         parser.error(f"GPU inventory differs: {gpu_names}")
     requests = load_requests(args.input, args.limit)
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    features = args.out_dir / "features"
+    features = args.out_dir / ("layers" if args.feature_layers else "features")
     os.environ["BRIDGETP_PREDICTOR_CAPTURE_DIR"] = str(features.resolve())
     os.environ["BRIDGETP_PREDICTOR_CAPTURE_INTERVAL"] = str(args.interval)
+    os.environ["BRIDGETP_PREDICTOR_CAPTURE_LAYER"] = args.feature_layer
+    if args.feature_layers:
+        os.environ["BRIDGETP_PREDICTOR_CAPTURE_LAYERS"] = args.feature_layers
+    else:
+        os.environ.pop("BRIDGETP_PREDICTOR_CAPTURE_LAYERS", None)
     preflight = {
         "format_version": 1,
         "revision": revision,
@@ -236,6 +264,14 @@ def main() -> None:
         "max_tokens": args.max_tokens,
         "max_model_len": args.max_model_len,
         "temperature": args.temperature,
+        "feature_layer": args.feature_layer,
+        "feature_semantics": (
+            "last token after final model norm"
+            if args.feature_layer == "final"
+            else "last token of decoder hidden+residual before final norm"
+        ),
+        "num_hidden_layers": config.get("num_hidden_layers"),
+        "feature_layers": layers,
         "requests": len(requests),
     }
     (args.out_dir / "preflight.json").write_text(
@@ -305,6 +341,47 @@ def main() -> None:
             labels[result.request_id] = label
             handle.write(json.dumps(label, ensure_ascii=False) + "\n")
             handle.flush()
+    if args.feature_layers:
+        summaries = {}
+        first_index_sha = None
+        for feature_layer in layers:
+            layer_dir = features / feature_layer.replace(":", "")
+            summary = audit_capture(
+                layer_dir / "features", labels, layer_dir / "sample_index.jsonl"
+            )
+            if summary["phases"].get("PREFILL_COMPLETE") != len(labels):
+                raise RuntimeError("missing prefill feature in paired layer capture")
+            index_sha = hashlib.sha256(
+                (layer_dir / "sample_index.jsonl").read_bytes()
+            ).hexdigest()
+            if first_index_sha is not None and index_sha != first_index_sha:
+                raise RuntimeError(
+                    "layer captures are not paired at identical token positions"
+                )
+            first_index_sha = index_sha
+            layer_preflight = {
+                **preflight,
+                "feature_layer": feature_layer,
+                "feature_semantics": (
+                    "last token after final model norm"
+                    if feature_layer == "final"
+                    else "last token of decoder hidden+residual before final norm"
+                ),
+            }
+            (layer_dir / "preflight.json").write_text(
+                json.dumps(layer_preflight, indent=2) + "\n"
+            )
+            (layer_dir / "summary.json").write_text(
+                json.dumps(summary, indent=2) + "\n"
+            )
+            shutil.copyfile(label_path, layer_dir / "labels.jsonl")
+            shutil.copyfile(args.input, layer_dir / "input_requests.jsonl")
+            summaries[feature_layer] = summary
+        (args.out_dir / "summary.json").write_text(
+            json.dumps(summaries, indent=2) + "\n"
+        )
+        print(json.dumps(summaries), flush=True)
+        return
     summary = audit_capture(features, labels, args.out_dir / "sample_index.jsonl")
     if summary["phases"].get("PREFILL_COMPLETE") != len(labels):
         raise RuntimeError("not every request produced a prefill feature")

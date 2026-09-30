@@ -145,6 +145,21 @@ class TestPredictorLarge(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "coverage"):
                 validate_shard(run, path, "test-revision")
 
+    def test_feature_layers_cannot_be_reused_or_merged_as_each_other(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            a, ia, ca = self.make_shard(root, 0, "train")
+            b, _, cb = self.make_shard(root, 1, "test")
+            with self.assertRaisesRegex(ValueError, "protocol/input"):
+                validate_shard(a, ia, "test-revision", "decoder:17")
+            preflight = json.loads((b / "preflight.json").read_text())
+            preflight["feature_layer"] = "decoder:17"
+            (b / "preflight.json").write_text(json.dumps(preflight))
+            full = root / "full.jsonl"
+            full.write_text(ca + cb, encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "protocol changed"):
+                merge_shards([a, b], full, root / "mixed")
+
 
 if __name__ == "__main__":
     unittest.main()

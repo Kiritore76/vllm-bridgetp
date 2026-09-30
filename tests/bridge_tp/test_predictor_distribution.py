@@ -129,6 +129,7 @@ class TestPredictorDistribution(unittest.TestCase):
             "revision": "capture-revision",
             "input_sha256": "input-sha",
             "model_config_sha256": "model-sha",
+            "feature_layer": "decoder:17",
         }
         with tempfile.TemporaryDirectory() as directory:
             out = Path(directory)
@@ -147,6 +148,7 @@ class TestPredictorDistribution(unittest.TestCase):
                 out / "predictor_distribution.pt", weights_only=True
             )
             self.assertEqual(checkpoint["model_type"], "remaining_length_categorical")
+            self.assertEqual(checkpoint["feature_layer"], "decoder:17")
             self.assertEqual(report["censored_training_requests"], 1)
             self.assertEqual(report["results"]["test"]["requests"], 2)
             self.assertEqual(report["results"]["test_previous_stage"]["requests"], 1)

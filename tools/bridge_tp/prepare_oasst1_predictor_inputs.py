@@ -130,6 +130,29 @@ def choose_staged_pilot(roots: list[dict], total: int) -> list[dict]:
     return initial + [row for row in full if row["id"] not in initial_ids]
 
 
+def choose_layer_probe(roots: list[dict]) -> list[dict]:
+    """Use future training trees for an independent 300-request layer probe."""
+    pool = [row for row in choose_staged_pilot(roots, 2000) if row["split"] == "train"]
+    selected = []
+    for language, quotas in (("en", (162, 72, 36)), ("zh", (18, 8, 4))):
+        ranked = sorted(
+            (row for row in pool if row["lang"] == language),
+            key=lambda row: hashlib.sha256(
+                ("layer-probe-v1:" + row["id"]).encode()
+            ).digest(),
+        )
+        if len(ranked) < sum(quotas):
+            raise ValueError("not enough stage-training roots for the layer probe")
+        start = 0
+        for split, quota in zip(SPLITS, quotas):
+            selected += [
+                {**row, "parent_split": "train", "split": split}
+                for row in ranked[start : start + quota]
+            ]
+            start += quota
+    return sorted(selected, key=lambda row: row["id"])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True)
@@ -141,6 +164,7 @@ def main() -> None:
     parser.add_argument("--exclude-legacy-train1000", action="store_true")
     parser.add_argument("--shard-size", type=int, default=0)
     parser.add_argument("--staged-requests", type=int, choices=(2000, 10000))
+    parser.add_argument("--layer-probe", action="store_true")
     args = parser.parse_args()
     if (
         args.min_chars < 1
@@ -164,6 +188,8 @@ def main() -> None:
         if args.staged_requests
         else choose_pilot(eligible, args.pilot_en, args.pilot_zh)
     )
+    if args.layer_probe:
+        pilot = choose_layer_probe(eligible)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     full_path = args.out_dir / "oasst1_root_requests.jsonl"
     pilot_path = args.out_dir / "oasst1_pilot_requests.jsonl"
@@ -174,6 +200,7 @@ def main() -> None:
         "source_sha256": SOURCE_SHA256,
         "excluded_legacy_trees": len(excluded_trees),
         "staged_requests": args.staged_requests,
+        "layer_probe": args.layer_probe,
         "filters": {
             "root_prompter": True,
             "deleted": False,
