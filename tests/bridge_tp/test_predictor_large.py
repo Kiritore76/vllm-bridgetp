@@ -5,6 +5,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from collections import Counter
 from contextlib import closing
 from pathlib import Path
 
@@ -12,6 +13,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools/bridge_tp"))
+from prepare_oasst1_predictor_inputs import choose_staged_pilot  # noqa: E402
 from run_predictor_capture import audit_capture  # noqa: E402
 from run_predictor_large_a100 import (  # noqa: E402
     MODEL_SHA,
@@ -22,6 +24,38 @@ from train_length_predictor import load_examples, sha256_file  # noqa: E402
 
 
 class TestPredictorLarge(unittest.TestCase):
+    def test_stage_expansion_reuses_first_batches_and_preserves_splits(self):
+        roots = [
+            {
+                "id": f"{language}-{split}-{i}",
+                "lang": language,
+                "split": split,
+                "source_tree_id": f"{language}-{split}-{i}",
+            }
+            for language, counts in (("en", (9000, 1200, 1200)), ("zh", (250, 30, 30)))
+            for split, count in zip(("train", "validation", "test"), counts)
+            for i in range(count)
+        ]
+        small = choose_staged_pilot(roots, 2000)
+        large = choose_staged_pilot(roots, 10000)
+        self.assertEqual(small, large[:2000])
+        self.assertEqual(
+            Counter(row["split"] for row in small),
+            {"train": 1600, "validation": 200, "test": 200},
+        )
+        self.assertEqual(
+            Counter(row["split"] for row in large),
+            {"train": 8000, "validation": 1000, "test": 1000},
+        )
+        self.assertEqual(len({row["id"] for row in large}), 10000)
+        self.assertTrue(
+            {
+                row["source_tree_id"] for row in small if row["split"] == "test"
+            }.isdisjoint(
+                {row["source_tree_id"] for row in large if row["split"] == "train"}
+            )
+        )
+
     def make_shard(self, root, number, split):
         run = root / f"shard_{number}"
         (run / "features").mkdir(parents=True)

@@ -24,7 +24,7 @@ from predictor_distribution import (
     request_weights,
     softmax,
 )
-from train_length_predictor import load_examples, sha256_file
+from train_length_predictor import load_examples, read_jsonl, sha256_file
 
 
 def validation_groups(data: dict) -> tuple[np.ndarray, np.ndarray]:
@@ -62,6 +62,7 @@ def fit_distribution(
     patience: int = 6,
     seed: int = 42,
     bin_step: int = 32,
+    known_test_ids: set[str] | None = None,
 ) -> dict:
     """Fit on train, select on one validation half, calibrate on the other."""
     import torch
@@ -257,6 +258,12 @@ def fit_distribution(
         "calibration_validation": calibration,
         "test": test,
     }
+    if known_test_ids:
+        known = np.isin(data["requests"], sorted(known_test_ids))
+        if (test & known).any():
+            groups["test_previous_stage"] = test & known
+        if (test & ~known).any():
+            groups["test_new_stage"] = test & ~known
     for name, mask in groups.items():
         results[name] = {
             "requests": len(set(data["requests"][mask])),
@@ -302,6 +309,7 @@ def fit_distribution(
         "temperature": temperature,
         "calibration_curve": calibration_curve,
         "metric_weighting": "each request has equal total sample weight",
+        "previous_stage_test_request_ids": sorted(known_test_ids or set()),
         "horizon_note": "capacity-exceedance probability, not physical CUDA OOM",
         "results": results,
         "test_stratified": stratified,
@@ -354,6 +362,7 @@ def main() -> None:
     parser.add_argument("--patience", type=int, default=6)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--bin-step", type=int, default=32)
+    parser.add_argument("--known-test-input", type=Path)
     args = parser.parse_args()
     if (
         min(
@@ -402,6 +411,15 @@ def main() -> None:
     ):
         parser.error(f"GPU inventory differs: {names}")
     data = load_examples(args.run_dir, include_censored=True)
+    known_test_ids = set()
+    if args.known_test_input:
+        known_test_ids = {
+            row["id"]
+            for row in read_jsonl(args.known_test_input)
+            if row.get("split") == "test"
+        }
+        if not known_test_ids <= set(data["requests"][data["splits"] == "test"]):
+            parser.error("previous-stage test IDs must remain in the test split")
     if data["audit"]["censored_requests"] / data["audit"]["requests"] > 0.2:
         parser.error("more than 20% of requests were capped; inspect capture")
     counts = {
@@ -445,6 +463,7 @@ def main() -> None:
         patience=args.patience,
         seed=args.seed,
         bin_step=args.bin_step,
+        known_test_ids=known_test_ids,
     )
 
 

@@ -1,4 +1,4 @@
-"""Capture 10,000 new OASST1 requests in resumable batches, then train."""
+"""Capture 2000 or 10000 new OASST1 requests in shared batches, then train."""
 
 import argparse
 import json
@@ -16,7 +16,10 @@ from prepare_oasst1_predictor_inputs import SOURCE_SHA256
 from run_predictor_capture import audit_capture, load_requests
 from train_length_predictor import read_jsonl, sha256_file
 
-INPUT_SHA = "75c5be8a5f9eeb99d52e0a869529c7f8ba9f09a44f25938bbb0baa5017700955"
+INPUT_SHAS = {
+    2000: "8dc77e63c2b93d8448466f9ee2fbaa4f24489678c9049c52e8d1fd81c3c9424b",
+    10000: "02ed1206ff67e59ee704c47492d894a9d178a35c07540516f2444710737972c3",
+}
 MODEL_SHA = "0f2085dbbe2ee251bd6a6a0797d84a6ce34436044d629aa3cba793b43d311a9e"
 REPO = Path(__file__).resolve().parents[2]
 COMMON_FIELDS = (
@@ -200,11 +203,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--expected-revision", required=True)
     parser.add_argument("--expected-hostname", required=True)
+    parser.add_argument("--requests", type=int, choices=(2000, 10000), default=2000)
     parser.add_argument(
         "--data-root",
         type=Path,
         default=Path(
-            "/root/autodl-tmp/bridgetp/results/length_predictor/oasst1-new10000-v1"
+            "/root/autodl-tmp/bridgetp/results/length_predictor/oasst1-staged-v2"
         ),
     )
     parser.add_argument(
@@ -222,6 +226,8 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    expected_input_sha = INPUT_SHAS[args.requests]
+    batch_count = args.requests // 500
     revision = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=REPO, text=True
     ).strip()
@@ -271,7 +277,7 @@ def main() -> None:
         ),
         flush=True,
     )
-    inputs = args.data_root / "inputs"
+    inputs = args.data_root / f"inputs-{args.requests}"
     if not inputs.exists():
         run_logged(
             [
@@ -281,10 +287,8 @@ def main() -> None:
                 str(args.source),
                 "--out-dir",
                 str(inputs),
-                "--pilot-en",
-                "9800",
-                "--pilot-zh",
-                "200",
+                "--staged-requests",
+                str(args.requests),
                 "--exclude-legacy-train1000",
                 "--shard-size",
                 "500",
@@ -292,13 +296,16 @@ def main() -> None:
             args.data_root / "prepare.log",
         )
     full_input = inputs / "oasst1_pilot_requests.jsonl"
-    if sha256_file(full_input) != INPUT_SHA:
+    if sha256_file(full_input) != expected_input_sha:
         parser.error("prepared full input SHA differs")
     manifest = json.loads((inputs / "manifest.json").read_text())
     concatenated = b"".join(
         (inputs / x["filename"]).read_bytes() for x in manifest["shards"]
     )
-    if concatenated != full_input.read_bytes() or len(manifest["shards"]) != 20:
+    if (
+        concatenated != full_input.read_bytes()
+        or len(manifest["shards"]) != batch_count
+    ):
         parser.error("batch inputs do not match the pinned full input")
     runs = []
     for number, shard in enumerate(manifest["shards"]):
@@ -306,7 +313,7 @@ def main() -> None:
         if sha256_file(input_path) != shard["sha256"]:
             parser.error("batch SHA differs")
         run = args.data_root / f"shard_{number:03d}"
-        print(f"batch={number + 1}/20 directory={run}", flush=True)
+        print(f"batch={number + 1}/{batch_count} directory={run}", flush=True)
         if run.exists():
             try:
                 meta = validate_shard(run, input_path, revision)
@@ -351,7 +358,7 @@ def main() -> None:
                 shutil.copyfile(input_path, run / "input_requests.jsonl")
         validate_shard(run, input_path, revision)
         runs.append(run)
-    merged = args.data_root / "capture"
+    merged = args.data_root / f"capture-{args.requests}"
     if merged.exists():
         try:
             meta = validate_shard(merged, full_input, revision)
@@ -365,7 +372,7 @@ def main() -> None:
         shutil.copyfile(inputs / "manifest.json", merged / "input_manifest.json")
     archive(merged)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    trained = args.data_root / ("trained-" + stamp)
+    trained = args.data_root / (f"trained-{args.requests}-" + stamp)
     train_command = [
         sys.executable,
         "tools/bridge_tp/train_predictor_distribution.py",
@@ -378,7 +385,7 @@ def main() -> None:
         "--expected-capture-revision",
         revision,
         "--expected-input-sha256",
-        INPUT_SHA,
+        expected_input_sha,
         "--expected-gpu-name",
         names[0],
         "--expected-gpu-count",
@@ -386,6 +393,11 @@ def main() -> None:
         "--learning-rate",
         "0.0003",
     ]
+    previous_input = args.data_root / "inputs-2000/oasst1_pilot_requests.jsonl"
+    if args.requests == 10000 and previous_input.exists():
+        if sha256_file(previous_input) != INPUT_SHAS[2000]:
+            raise ValueError("previous-stage input SHA differs")
+        train_command += ["--known-test-input", str(previous_input)]
     log = args.data_root / (trained.name + ".runner.log")
     try:
         run_logged(train_command, log)
