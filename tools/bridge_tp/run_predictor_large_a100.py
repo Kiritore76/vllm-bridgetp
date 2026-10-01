@@ -36,7 +36,13 @@ COMMON_FIELDS = (
 
 
 def validate_shard(
-    run: Path, input_path: Path, revision: str, feature_layer: str = "final"
+    run: Path,
+    input_path: Path,
+    revision: str,
+    feature_layer: str = "final",
+    *,
+    max_tokens: int = 4096,
+    max_model_len: int = 6144,
 ) -> dict:
     """Reuse a batch only when inputs, protocol and independent audit agree."""
     preflight = json.loads((run / "preflight.json").read_text())
@@ -45,8 +51,8 @@ def validate_shard(
         or preflight.get("feature_layer", "final") != feature_layer
         or preflight["input_sha256"] != sha256_file(input_path)
         or preflight["model_config_sha256"] != MODEL_SHA
-        or preflight["max_tokens"] != 4096
-        or preflight["max_model_len"] != 6144
+        or preflight["max_tokens"] != max_tokens
+        or preflight["max_model_len"] != max_model_len
         or preflight["interval"] != 20
         or preflight["temperature"] != 0
         or preflight["gpu_names"] != ["NVIDIA A100-PCIE-40GB"]
