@@ -291,6 +291,16 @@ def fit_distribution(
         for value in sorted(set(data[field][test])):
             mask = test & (data[field] == value)
             stratified[f"{field}/{value}"] = risk_report(mask)
+    validation_stratified = {}
+    for name, group in (
+        ("selection_validation", selection),
+        ("calibration_validation", calibration),
+    ):
+        validation_stratified[name] = {
+            phase: risk_report(group & (data["phases"] == phase))
+            for phase in ("PREFILL_COMPLETE", "DECODE")
+            if (group & (data["phases"] == phase)).any()
+        }
     report = {
         "format_version": 2,
         "objective": "remaining_length_distribution",
@@ -299,6 +309,17 @@ def fit_distribution(
         "capture_audit": data["audit"],
         "best_epoch": best_epoch,
         "seed": seed,
+        "training_parameters": {
+            "hidden_width": hidden_width,
+            "bin_step": bin_step,
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "learning_rate": learning_rate,
+            "patience": patience,
+            "dropout": 0.1,
+            "weight_decay": 0.01,
+            "parameter_count": sum(p.numel() for p in model.parameters()),
+        },
         "device": str(device),
         "category_upper_edges": edges.tolist(),
         "overflow_category": True,
@@ -317,6 +338,7 @@ def fit_distribution(
         "horizon_note": "capacity-exceedance probability, not physical CUDA OOM",
         "results": results,
         "test_stratified": stratified,
+        "validation_stratified": validation_stratified,
         "history": history,
         "checkpoint_sha256": sha256_file(checkpoint_path),
     }
