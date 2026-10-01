@@ -161,6 +161,43 @@ class TestPredictorDistribution(unittest.TestCase):
                 np.testing.assert_allclose(
                     predictions["probabilities"].sum(axis=1), 1, atol=1e-6
                 )
+            variant = out / "regularized"
+            variant_report = fit_distribution(
+                data,
+                preflight,
+                variant,
+                revision="test-revision",
+                device_name="cpu",
+                epochs=2,
+                batch_size=4,
+                hidden_width=8,
+                dropout=0.25,
+                weight_decay=0.05,
+            )
+            variant_checkpoint = torch.load(
+                variant / "predictor_distribution.pt", weights_only=True
+            )
+            self.assertEqual(variant_checkpoint["dropout"], 0.25)
+            self.assertEqual(variant_checkpoint["weight_decay"], 0.05)
+            self.assertEqual(variant_report["training_parameters"]["dropout"], 0.25)
+            self.assertEqual(
+                variant_report["training_parameters"]["weight_decay"], 0.05
+            )
+            self.assertFalse(
+                torch.equal(
+                    checkpoint["state_dict"]["0.weight"],
+                    variant_checkpoint["state_dict"]["0.weight"],
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "dropout must"):
+                fit_distribution(
+                    data,
+                    preflight,
+                    out / "bad",
+                    revision="test-revision",
+                    device_name="cpu",
+                    dropout=1,
+                )
 
 
 if __name__ == "__main__":
