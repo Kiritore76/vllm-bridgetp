@@ -22,6 +22,15 @@ import numpy as np
 _INTERNAL_ID_SUFFIX = re.compile(r"[0-9a-fA-F]{8}")
 
 
+def feature_semantics(feature_layer: str) -> str:
+    """Record whether a sample contains the branch or the full residual stream."""
+    if feature_layer == "final":
+        return "last token after final model norm"
+    if feature_layer.startswith("mlp:"):
+        return "last token of decoder MLP branch before residual addition"
+    return "last token of decoder hidden+residual before final norm"
+
+
 def label_for_engine_request(
     request_id: str, labels: dict[str, dict[str, Any]]
 ) -> dict[str, Any] | None:
@@ -195,9 +204,7 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--feature-layer", default="final")
-    parser.add_argument(
-        "--feature-layers", help="paired layer probe, e.g. decoder:17,final"
-    )
+    parser.add_argument("--feature-layers", help="paired probe, e.g. decoder:31,mlp:31")
     args = parser.parse_args()
     if args.interval <= 0 or args.max_tokens <= 0 or args.max_model_len <= 0:
         parser.error("interval, max-tokens, and max-model-len must be positive")
@@ -227,13 +234,13 @@ def main() -> None:
             continue
         prefix, separator, value = feature_layer.partition(":")
         if (
-            prefix != "decoder"
+            prefix not in ("decoder", "mlp")
             or not separator
             or not value.isdecimal()
             or config.get("model_type") != "qwen2"
             or int(value) >= config["num_hidden_layers"]
         ):
-            parser.error("intermediate capture needs decoder:<valid Qwen2 layer index>")
+            parser.error("intermediate capture needs decoder:<index> or mlp:<index>")
     gpu_names = subprocess.check_output(
         ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
         text=True,
@@ -265,11 +272,7 @@ def main() -> None:
         "max_model_len": args.max_model_len,
         "temperature": args.temperature,
         "feature_layer": args.feature_layer,
-        "feature_semantics": (
-            "last token after final model norm"
-            if args.feature_layer == "final"
-            else "last token of decoder hidden+residual before final norm"
-        ),
+        "feature_semantics": feature_semantics(args.feature_layer),
         "num_hidden_layers": config.get("num_hidden_layers"),
         "feature_layers": layers,
         "requests": len(requests),
@@ -362,11 +365,7 @@ def main() -> None:
             layer_preflight = {
                 **preflight,
                 "feature_layer": feature_layer,
-                "feature_semantics": (
-                    "last token after final model norm"
-                    if feature_layer == "final"
-                    else "last token of decoder hidden+residual before final norm"
-                ),
+                "feature_semantics": feature_semantics(feature_layer),
             }
             (layer_dir / "preflight.json").write_text(
                 json.dumps(layer_preflight, indent=2) + "\n"
