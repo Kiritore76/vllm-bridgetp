@@ -59,6 +59,8 @@ def fit_distribution(
     batch_size: int = 256,
     hidden_width: int = 256,
     learning_rate: float = 0.001,
+    dropout: float = 0.1,
+    weight_decay: float = 0.01,
     patience: int = 6,
     seed: int = 42,
     bin_step: int = 32,
@@ -68,6 +70,13 @@ def fit_distribution(
     import torch
     from torch import nn
 
+    if (
+        not math.isfinite(dropout)
+        or not 0 <= dropout < 1
+        or not math.isfinite(weight_decay)
+        or weight_decay < 0
+    ):
+        raise ValueError("dropout must be in [0, 1); weight decay must be nonnegative")
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     device = torch.device(device_name)
@@ -93,7 +102,7 @@ def fit_distribution(
     model = nn.Sequential(
         nn.Linear(features.shape[1], hidden_width),
         nn.GELU(),
-        nn.Dropout(0.1),
+        nn.Dropout(dropout),
         nn.Linear(hidden_width, len(edges) + 1),
     ).to(device)
     exact_train = train & ~data["censored"]
@@ -109,7 +118,7 @@ def fit_distribution(
     with torch.no_grad():
         model[-1].bias.copy_(torch.from_numpy(np.log(prior)).to(device))
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=learning_rate, weight_decay=0.01
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay
     )
     train_indices = np.flatnonzero(train)
     weight = np.zeros(len(features), dtype=np.float32)
@@ -177,7 +186,8 @@ def fit_distribution(
                     "input_width": features.shape[1],
                     "hidden_width": hidden_width,
                     "activation": "GELU",
-                    "dropout": 0.1,
+                    "dropout": dropout,
+                    "weight_decay": weight_decay,
                     "feature_mean": torch.from_numpy(feature_mean),
                     "feature_std": torch.from_numpy(feature_std),
                     "position_log_scale": position_scale,
@@ -316,8 +326,8 @@ def fit_distribution(
             "batch_size": batch_size,
             "learning_rate": learning_rate,
             "patience": patience,
-            "dropout": 0.1,
-            "weight_decay": 0.01,
+            "dropout": dropout,
+            "weight_decay": weight_decay,
             "parameter_count": sum(p.numel() for p in model.parameters()),
         },
         "device": str(device),
@@ -385,6 +395,8 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--hidden-width", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=0.001)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--patience", type=int, default=6)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--bin-step", type=int, default=32)
@@ -401,7 +413,12 @@ def main() -> None:
             args.expected_gpu_count,
         )
         <= 0
+        or not math.isfinite(args.learning_rate)
         or args.learning_rate <= 0
+        or not math.isfinite(args.dropout)
+        or not 0 <= args.dropout < 1
+        or not math.isfinite(args.weight_decay)
+        or args.weight_decay < 0
     ):
         parser.error("training dimensions and learning-rate must be positive")
     if args.out_dir.exists() and any(args.out_dir.iterdir()):
@@ -490,6 +507,8 @@ def main() -> None:
         batch_size=args.batch_size,
         hidden_width=args.hidden_width,
         learning_rate=args.learning_rate,
+        dropout=args.dropout,
+        weight_decay=args.weight_decay,
         patience=args.patience,
         seed=args.seed,
         bin_step=args.bin_step,
