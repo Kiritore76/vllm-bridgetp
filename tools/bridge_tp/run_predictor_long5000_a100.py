@@ -155,10 +155,6 @@ def execute(args, revision, names):
     lock.truncate()
     lock.write(str(os.getpid()) + "\n")
     lock.flush()
-    if shutil.disk_usage(root).free < 30 * 2**30:
-        raise ValueError(
-            "less than 30 GiB free; preserve room for captures and archives"
-        )
     inputs = root / "inputs-5000"
     if not inputs.exists():
         prepare(args.source, inputs)
