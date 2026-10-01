@@ -25,12 +25,12 @@ class CaptureRow:
 
 
 def decoder_layer_index(feature_layer: str) -> int | None:
-    """Parse an explicit zero-based decoder index, or final normalized states."""
+    """Parse a zero-based residual/MLP layer index, or final normalized states."""
     if feature_layer == "final":
         return None
     prefix, separator, value = feature_layer.partition(":")
-    if prefix != "decoder" or not separator or not value.isdecimal():
-        raise ValueError("feature layer must be final or decoder:<zero-based index>")
+    if prefix not in ("decoder", "mlp") or not separator or not value.isdecimal():
+        raise ValueError("feature layer must be final, decoder:<index> or mlp:<index>")
     return int(value)
 
 
@@ -146,7 +146,12 @@ class PredictorFeatureCapture:
         hidden, residual = output
         if residual is None or hidden.ndim != 2 or hidden.shape != residual.shape:
             raise ValueError("invalid Qwen2 residual-stream shape")
-        self._intermediate_states = (hidden.detach() + residual.detach()).detach()
+        if self.feature_layer.startswith("mlp:"):
+            # Keep only the branch returned by the decoder, before residual add.
+            # Clone because a later forward operation may reuse its storage.
+            self._intermediate_states = hidden.detach().clone()
+        else:
+            self._intermediate_states = (hidden.detach() + residual.detach()).detach()
 
     def begin_forward(self) -> None:
         """Discard any state from profiling/dummy or preceding forward passes."""

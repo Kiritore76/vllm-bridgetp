@@ -234,8 +234,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.feature_layer != "final":
         prefix, separator, value = args.feature_layer.partition(":")
-        if prefix != "decoder" or not separator or not value.isdecimal():
-            parser.error("feature-layer must be final or decoder:<zero-based index>")
+        if prefix not in ("decoder", "mlp") or not separator or not value.isdecimal():
+            parser.error("feature-layer must be final, decoder:<index> or mlp:<index>")
     if args.data_root is None:
         suffix = (
             ""
