@@ -4,7 +4,7 @@
 run_predictor_long5000() {
   cd /root/autodl-tmp/bridgetp/vllm_bridge || return 1
   source /root/autodl-tmp/bridgetp/.venv_bridge/bin/activate || return 1
-  local machine=autodl-container-6eb54ead64-389e397a
+  local machine="${BRIDGETP_EXPECTED_HOSTNAME:-autodl-container-6eb54ead64-389e397a}"
   local revision="${BRIDGETP_EXPECTED_REVISION:-}"
   local runner_python=/root/autodl-tmp/bridgetp/.venv_bridge/bin/python
   local raw=/root/autodl-tmp/bridgetp/length_predictor/inputs/2023-04-12_oasst_prompts.messages.jsonl.gz
