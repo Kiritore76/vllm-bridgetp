@@ -63,6 +63,18 @@ def _number(value: Any) -> float | None:
     return result if math.isfinite(result) else None
 
 
+def _percentile(values: list[float], fraction: float) -> float | None:
+    """Match the online background runner's interpolated percentile."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = fraction * (len(ordered) - 1)
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
 def _positive_thresholds(contract: dict[str, Any], errors: list[str]) -> dict[str, float]:
     raw = contract.get("slo_thresholds") or {}
     values: dict[str, float] = {}
@@ -93,6 +105,7 @@ def _score_request(
         "request_id": request_id, "pool": pool, "status": status,
         "output_tokens": expected_tokens,
         "good_tokens": None, "bad_intervals": None,
+        "request_slo_success_p99": None,
         "strict_slo_success": None,
     }
     start, end = _number(started), _number(ended)
@@ -108,6 +121,7 @@ def _score_request(
             and not isinstance(expected_tokens, bool) and expected_tokens >= 0 else 0,
             "started_unix_s": start, "ended_unix_s": end,
             "good_tokens": 0, "bad_intervals": 0,
+            "request_slo_success_p99": False,
             "strict_slo_success": False,
         })
         return row
@@ -134,6 +148,7 @@ def _score_request(
     e2e_ms = (end - start) * 1000
     gaps_ms = [(b - a) * 1000 for a, b in zip(token_times, token_times[1:])]
     bad_intervals = sum(gap > thresholds["tpot_ms"] for gap in gaps_ms)
+    p99_itl_ms = _percentile(gaps_ms, 0.99)
     request_valid = ttft_ms <= thresholds["ttft_ms"] and e2e_ms <= thresholds["e2e_ms"]
     if pool == "anchor":
         handoff = _number(handoff_ms)
@@ -152,8 +167,13 @@ def _score_request(
         "ttft_violation": ttft_ms > thresholds["ttft_ms"],
         "e2e_violation": e2e_ms > thresholds["e2e_ms"],
         "max_itl_ms": max(gaps_ms) if gaps_ms else None,
+        "p99_itl_ms": p99_itl_ms,
         "bad_intervals": bad_intervals,
         "good_tokens": expected_tokens - bad_intervals if request_valid else 0,
+        "request_slo_success_p99": (
+            request_valid and handoff_valid
+            and (p99_itl_ms is None or p99_itl_ms <= thresholds["tpot_ms"])
+        ),
         "strict_slo_success": request_valid and bad_intervals == 0 and handoff_valid,
     })
     return row
@@ -256,14 +276,26 @@ def audit_payload(values: dict[str, Any]) -> dict[str, Any]:
                 raw = sum(row["output_tokens"] for row in subset)
                 good = sum(row["good_tokens"] for row in subset)
                 strict = sum(row["output_tokens"] for row in subset if row["strict_slo_success"])
+                request_slo = sum(
+                    row["output_tokens"] for row in subset
+                    if row["request_slo_success_p99"]
+                )
                 intervals = sum(max(0, row["output_tokens"] - 1) for row in subset
                                 if row["status"] == "COMPLETED")
                 bad = sum(row["bad_intervals"] for row in subset)
                 strict_requests = sum(bool(row["strict_slo_success"]) for row in subset)
+                request_slo_successes = sum(
+                    bool(row["request_slo_success_p99"]) for row in subset
+                )
                 by_pool[pool] = {
                     "requests": len(subset), "output_tokens": raw,
                     "good_tokens": good,
                     "strict_request_good_tokens": strict,
+                    "request_slo_p99_good_tokens": request_slo,
+                    "request_slo_p99_success_requests": request_slo_successes,
+                    "request_slo_p99_success_rate": (
+                        request_slo_successes / len(subset) if subset else None
+                    ),
                     "strict_success_requests": strict_requests,
                     "strict_success_rate": strict_requests / len(subset) if subset else None,
                     "token_intervals": intervals,
@@ -276,6 +308,7 @@ def audit_payload(values: dict[str, Any]) -> dict[str, Any]:
                          if row.get("max_itl_ms") is not None), default=None,
                     ),
                     "goodoutput_tokens_s": good / wall_s,
+                    "request_slo_p99_goodput_tokens_s": request_slo / wall_s,
                     "strict_request_goodput_tokens_s": strict / wall_s,
                 }
             metrics = {"start_unix_s": started, "end_unix_s": ended,
@@ -283,6 +316,7 @@ def audit_payload(values: dict[str, Any]) -> dict[str, Any]:
     return {
         "format_version": 1,
         "metric_definition": "completed_request_ttft_e2e_and_per_token_itl_v1",
+        "request_slo_definition": "ttft_e2e_p99_itl_handoff_v2",
         "computable": computable,
         "slo_thresholds": thresholds,
         "errors": errors,
