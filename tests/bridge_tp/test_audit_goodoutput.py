@@ -106,6 +106,41 @@ class TestGoodOutputAudit(unittest.TestCase):
         self.assertEqual(source["good_tokens"], 100)
         self.assertEqual(source["strict_request_good_tokens"], 0)
         self.assertEqual(source["request_slo_p99_good_tokens"], 101)
+        self.assertEqual(source["goodoutput_v5_success_requests"], 1)
+
+    def test_one_second_gap_fails_v5_even_when_mean_passes(self) -> None:
+        value = payload()
+        peer = value["background/background_summary.json"]["results"][0]
+        times = [0.1 + index * 0.001 for index in range(100)]
+        times.append(times[-1] + 1.001)
+        peer.update({
+            "output_tokens": len(times),
+            "token_times_unix_s": times,
+            "request_ended_unix_s": 1.3,
+        })
+        report = audit_payload(value)
+        self.assertTrue(report["computable"], report["errors"])
+        row = report["request_rows"][0]
+        self.assertTrue(row["goodoutput_v4_success"])
+        self.assertFalse(row["goodoutput_v5_success"])
+        self.assertAlmostEqual(row["bad_interval_rate"], 0.01)
+
+    def test_too_many_slow_intervals_fail_v5(self) -> None:
+        value = payload()
+        peer = value["background/background_summary.json"]["results"][0]
+        times = [0.1 + index * 0.001 for index in range(99)]
+        times.extend([times[-1] + 0.1, times[-1] + 0.2])
+        peer.update({
+            "output_tokens": len(times),
+            "token_times_unix_s": times,
+            "request_ended_unix_s": 0.5,
+        })
+        report = audit_payload(value)
+        self.assertTrue(report["computable"], report["errors"])
+        row = report["request_rows"][0]
+        self.assertTrue(row["goodoutput_v4_success"])
+        self.assertFalse(row["goodoutput_v5_success"])
+        self.assertAlmostEqual(row["bad_interval_rate"], 0.02)
 
     def test_candidate_allows_one_slow_gap_if_mean_tpot_is_below_limit(self) -> None:
         value = payload()
