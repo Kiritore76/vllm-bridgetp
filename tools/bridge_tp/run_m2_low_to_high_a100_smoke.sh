@@ -11,6 +11,7 @@ run_m2_low_to_high_a100_smoke() {
   local low_gib_s="${BRIDGETP_M2_LOW_GIB_S:-0.1}"
   local m1_min_output_tokens="${BRIDGETP_M1_MIN_OUTPUT_TOKENS:-32}"
   local require_low_to_high="${BRIDGETP_M2_REQUIRE_LOW_TO_HIGH:-1}"
+  local force_initial_high="${BRIDGETP_M2_FORCE_INITIAL_HIGH:-0}"
   local m3_commit="${BRIDGETP_M3_COMMIT:-0}"
   local m4_cancel="${BRIDGETP_M4_CANCEL:-0}"
   local m4_expect_cancel="${BRIDGETP_M4_EXPECT_CANCEL:-0}"
@@ -25,6 +26,7 @@ run_m2_low_to_high_a100_smoke() {
   local minimum_source_kv_usage_frac="${BRIDGETP_MIN_SOURCE_KV_USAGE_FRAC:-0}"
   local mode=event-low-high
   local m2_requirement=()
+  local initial_high_requirement=()
   local m3_requirement=()
   local m5_requirement=()
   if [[ "$require_low_to_high" == 0 ]]; then
@@ -79,6 +81,23 @@ run_m2_low_to_high_a100_smoke() {
     mode=m5-shadow
   elif [[ "$m5_shadow" != 0 ]]; then
     echo "BRIDGETP_M5_SHADOW must be 0 or 1"
+    return 1
+  fi
+  if [[ "$force_initial_high" == 1 ]]; then
+    [[ "$require_low_to_high" == 0 ]] || {
+      echo "Forced initial HIGH requires BRIDGETP_M2_REQUIRE_LOW_TO_HIGH=0"
+      return 1
+    }
+    initial_high_requirement=(--manager-m2-force-initial-high
+      --manager-m2-expected-profile HIGH
+      --manager-m2-min-history-byte-frac 0.9)
+    if [[ "$m5_shadow" == 1 ]]; then
+      mode=m5-high-ready
+    else
+      mode=initial-high
+    fi
+  elif [[ "$force_initial_high" != 0 ]]; then
+    echo "BRIDGETP_M2_FORCE_INITIAL_HIGH must be 0 or 1"
     return 1
   fi
   local model=/root/autodl-tmp/models/models/Qwen--Qwen2.5-14B-Instruct/snapshots/master
@@ -190,6 +209,7 @@ run_m2_low_to_high_a100_smoke() {
     echo "source_prompt_tokens=$source_prompt_tokens"
     echo "minimum_source_kv_usage_frac=$minimum_source_kv_usage_frac"
     echo "m2_require_low_to_high=$require_low_to_high"
+    echo "m2_force_initial_high=$force_initial_high"
     echo "m3_commit=$m3_commit"
     echo "m4_cancel=$m4_cancel"
     echo "m4_expect_cancel=$m4_expect_cancel"
@@ -223,6 +243,7 @@ run_m2_low_to_high_a100_smoke() {
     --manager-m0-shadow --manager-m1-auto-start --manager-m2-rate \
     --m1-min-output-tokens "$m1_min_output_tokens" \
     "${m2_requirement[@]}" \
+    "${initial_high_requirement[@]}" \
     "${m3_requirement[@]}" \
     "${m5_requirement[@]}" \
     --m2-low-gib-s "$low_gib_s" --m2-medium-gib-s 2.4 --m2-high-gib-s 8.0 \
