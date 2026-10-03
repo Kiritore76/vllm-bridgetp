@@ -13,7 +13,8 @@ from tools.bridge_tp.audit_m5_late_start import audit
 
 class TestM5LateStartAudit(unittest.TestCase):
     def make_run(self, root: Path, *, source_start: float = 101.0,
-                 output: int = 96, minimum_free: int = 9000) -> Path:
+                 output: int = 96, minimum_free: int = 9000,
+                 pending_prefill: int = 0) -> Path:
         result = root / "online" / "r01_shadow_only"
         controller = result / "controller"
         background = result / "background"
@@ -27,7 +28,10 @@ class TestM5LateStartAudit(unittest.TestCase):
                           "source_guard_free_kv_tokens": 8448},
              "decision": {"action": "START_SHADOW"}},
             {"kind": "telemetry", "unix_s": 102.5,
-             "capacity_signal": {"free_kv_tokens": minimum_free}},
+             "capacity_signal": {
+                 "free_kv_tokens": minimum_free,
+                 "prefill_pending_kv_tokens": pending_prefill,
+             }, "tp1": {"preemptions_total": 0}},
         ]
         events = [
             {"kind": "job_start", "pool": "source", "job_id": "peer",
@@ -66,6 +70,14 @@ class TestM5LateStartAudit(unittest.TestCase):
             root = self.make_run(Path(directory), source_start=103.0)
             self.assertIn("no source peer was active before M1 started",
                           audit(root, 96)["errors"])
+
+    def test_pending_prefill_consumes_guard_headroom(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.make_run(Path(directory), pending_prefill=600)
+            self.assertIn(
+                "source KV headroom reached the guard before TP1 KV release",
+                audit(root, 96)["errors"],
+            )
 
 
 if __name__ == "__main__":
