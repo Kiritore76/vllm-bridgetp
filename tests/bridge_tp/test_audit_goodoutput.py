@@ -107,6 +107,37 @@ class TestGoodOutputAudit(unittest.TestCase):
         self.assertEqual(source["strict_request_good_tokens"], 0)
         self.assertEqual(source["request_slo_p99_good_tokens"], 101)
 
+    def test_candidate_allows_one_slow_gap_if_mean_tpot_is_below_limit(self) -> None:
+        value = payload()
+        peer = value["background/background_summary.json"]["results"][0]
+        times = [0.1 + index * 0.001 for index in range(100)]
+        times.append(times[-1] + 0.1)
+        peer.update({
+            "output_tokens": len(times),
+            "token_times_unix_s": times,
+            "request_ended_unix_s": 0.35,
+            "request_started_unix_s": -1.5,
+        })
+        report = audit_payload(value)
+        self.assertTrue(report["computable"], report["errors"])
+        source = report["metrics"]["by_pool"]["source"]
+        self.assertEqual(source["good_tokens"], 0)
+        self.assertEqual(source["goodoutput_v3_success_requests"], 1)
+        self.assertEqual(source["goodoutput_v3_tokens"], 101)
+        self.assertLess(report["request_rows"][0]["mean_itl_ms"], 50)
+
+    def test_candidate_fails_high_mean_tpot_or_ttft(self) -> None:
+        value = payload()
+        peer = value["background/background_summary.json"]["results"][0]
+        peer["token_times_unix_s"] = [0.1, 0.2, 0.3]
+        peer["request_ended_unix_s"] = 0.35
+        report = audit_payload(value)
+        self.assertFalse(report["request_rows"][0]["goodoutput_v3_success"])
+        peer["token_times_unix_s"] = [3.1, 3.12, 3.14]
+        peer["request_ended_unix_s"] = 3.2
+        report = audit_payload(value)
+        self.assertFalse(report["request_rows"][0]["goodoutput_v3_success"])
+
 
 if __name__ == "__main__":
     unittest.main()

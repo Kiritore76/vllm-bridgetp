@@ -97,6 +97,8 @@ def _score_request(
     ended: Any,
     times: Any,
     thresholds: dict[str, float],
+    v3_ttft_ms: float,
+    v3_mean_tpot_ms: float,
     errors: list[str],
     handoff_ms: Any = None,
 ) -> dict[str, Any]:
@@ -105,6 +107,7 @@ def _score_request(
         "request_id": request_id, "pool": pool, "status": status,
         "output_tokens": expected_tokens,
         "good_tokens": None, "bad_intervals": None,
+        "goodoutput_v3_success": None,
         "request_slo_success_p99": None,
         "strict_slo_success": None,
     }
@@ -121,6 +124,7 @@ def _score_request(
             and not isinstance(expected_tokens, bool) and expected_tokens >= 0 else 0,
             "started_unix_s": start, "ended_unix_s": end,
             "good_tokens": 0, "bad_intervals": 0,
+            "goodoutput_v3_success": False,
             "request_slo_success_p99": False,
             "strict_slo_success": False,
         })
@@ -148,6 +152,7 @@ def _score_request(
     e2e_ms = (end - start) * 1000
     gaps_ms = [(b - a) * 1000 for a, b in zip(token_times, token_times[1:])]
     bad_intervals = sum(gap > thresholds["tpot_ms"] for gap in gaps_ms)
+    mean_itl_ms = sum(gaps_ms) / len(gaps_ms) if gaps_ms else None
     p99_itl_ms = _percentile(gaps_ms, 0.99)
     request_valid = ttft_ms <= thresholds["ttft_ms"] and e2e_ms <= thresholds["e2e_ms"]
     if pool == "anchor":
@@ -167,9 +172,16 @@ def _score_request(
         "ttft_violation": ttft_ms > thresholds["ttft_ms"],
         "e2e_violation": e2e_ms > thresholds["e2e_ms"],
         "max_itl_ms": max(gaps_ms) if gaps_ms else None,
+        "mean_itl_ms": mean_itl_ms,
         "p99_itl_ms": p99_itl_ms,
         "bad_intervals": bad_intervals,
         "good_tokens": expected_tokens - bad_intervals if request_valid else 0,
+        "goodoutput_v3_success": (
+            ttft_ms <= v3_ttft_ms
+            and e2e_ms <= thresholds["e2e_ms"]
+            and (mean_itl_ms is None or mean_itl_ms <= v3_mean_tpot_ms)
+            and handoff_valid
+        ),
         "request_slo_success_p99": (
             request_valid and handoff_valid
             and (p99_itl_ms is None or p99_itl_ms <= thresholds["tpot_ms"])
@@ -179,7 +191,14 @@ def _score_request(
     return row
 
 
-def audit_payload(values: dict[str, Any]) -> dict[str, Any]:
+def audit_payload(
+    values: dict[str, Any], *,
+    v3_ttft_ms: float = 3000.0,
+    v3_mean_tpot_ms: float = 50.0,
+) -> dict[str, Any]:
+    if any(not math.isfinite(value) or value <= 0
+           for value in (v3_ttft_ms, v3_mean_tpot_ms)):
+        raise ValueError("v3 SLO thresholds must be positive and finite")
     errors: list[str] = []
     missing = [name for name in NEEDED if name not in values]
     if missing:
@@ -226,7 +245,8 @@ def audit_payload(values: dict[str, Any]) -> dict[str, Any]:
             started=result.get("request_started_unix_s"),
             ended=result.get("request_ended_unix_s"),
             times=result.get("token_times_unix_s"),
-            thresholds=thresholds, errors=errors,
+            thresholds=thresholds, v3_ttft_ms=v3_ttft_ms,
+            v3_mean_tpot_ms=v3_mean_tpot_ms, errors=errors,
         ))
     emitted = proxy.get("emitted")
     anchor_times: list[Any] | None = None
@@ -254,7 +274,9 @@ def audit_payload(values: dict[str, Any]) -> dict[str, Any]:
         pool="anchor", status=anchor_status,
         expected_tokens=proxy.get("emitted_tokens"),
         started=source.get("request_started_unix_s"), ended=anchor_end,
-        times=anchor_times, thresholds=thresholds, errors=errors,
+        times=anchor_times, thresholds=thresholds,
+        v3_ttft_ms=v3_ttft_ms, v3_mean_tpot_ms=v3_mean_tpot_ms,
+        errors=errors,
         handoff_ms=(
             _number(proxy.get("handoff_stall_s")) * 1000
             if _number(proxy.get("handoff_stall_s")) is not None else None
@@ -280,6 +302,10 @@ def audit_payload(values: dict[str, Any]) -> dict[str, Any]:
                     row["output_tokens"] for row in subset
                     if row["request_slo_success_p99"]
                 )
+                v3_good = sum(
+                    row["output_tokens"] for row in subset
+                    if row["goodoutput_v3_success"]
+                )
                 intervals = sum(max(0, row["output_tokens"] - 1) for row in subset
                                 if row["status"] == "COMPLETED")
                 bad = sum(row["bad_intervals"] for row in subset)
@@ -287,9 +313,17 @@ def audit_payload(values: dict[str, Any]) -> dict[str, Any]:
                 request_slo_successes = sum(
                     bool(row["request_slo_success_p99"]) for row in subset
                 )
+                v3_successes = sum(
+                    bool(row["goodoutput_v3_success"]) for row in subset
+                )
                 by_pool[pool] = {
                     "requests": len(subset), "output_tokens": raw,
                     "good_tokens": good,
+                    "goodoutput_v3_tokens": v3_good,
+                    "goodoutput_v3_success_requests": v3_successes,
+                    "goodoutput_v3_success_rate": (
+                        v3_successes / len(subset) if subset else None
+                    ),
                     "strict_request_good_tokens": strict,
                     "request_slo_p99_good_tokens": request_slo,
                     "request_slo_p99_success_requests": request_slo_successes,
@@ -308,6 +342,7 @@ def audit_payload(values: dict[str, Any]) -> dict[str, Any]:
                          if row.get("max_itl_ms") is not None), default=None,
                     ),
                     "goodoutput_tokens_s": good / wall_s,
+                    "goodoutput_v3_tokens_s": v3_good / wall_s,
                     "request_slo_p99_goodput_tokens_s": request_slo / wall_s,
                     "strict_request_goodput_tokens_s": strict / wall_s,
                 }
@@ -316,6 +351,17 @@ def audit_payload(values: dict[str, Any]) -> dict[str, Any]:
     return {
         "format_version": 1,
         "metric_definition": "completed_request_ttft_e2e_and_per_token_itl_v1",
+        "candidate_metric": "goodoutput_v3_tokens_s",
+        "candidate_metric_definition": "completed_request_ttft_mean_tpot_e2e_handoff_v3",
+        "candidate_note": (
+            "3 s TTFT is a sensitivity threshold; the formal SLO requires "
+            "normal-arrival workload and service-objective validation"
+        ),
+        "v3_thresholds": {
+            "ttft_ms": v3_ttft_ms, "mean_tpot_ms": v3_mean_tpot_ms,
+            "e2e_ms": thresholds.get("e2e_ms"),
+            "handoff_ms": thresholds.get("handoff_ms"),
+        },
         "request_slo_definition": "ttft_e2e_p99_itl_handoff_v2",
         "computable": computable,
         "slo_thresholds": thresholds,
@@ -332,9 +378,14 @@ def main() -> None:
     parser.add_argument("--input", type=Path, required=True,
                         help="one online result .tar.gz or extracted run directory")
     parser.add_argument("--out-json", type=Path, required=True)
+    parser.add_argument("--v3-ttft-ms", type=float, default=3000.0)
+    parser.add_argument("--v3-mean-tpot-ms", type=float, default=50.0)
     args = parser.parse_args()
     values, locations = _read_members(args.input)
-    report = audit_payload(values)
+    report = audit_payload(
+        values, v3_ttft_ms=args.v3_ttft_ms,
+        v3_mean_tpot_ms=args.v3_mean_tpot_ms,
+    )
     report["input"] = str(args.input.resolve())
     report["member_locations"] = locations
     if args.input.is_file():
