@@ -133,10 +133,22 @@ class TestGoodOutputAudit(unittest.TestCase):
         peer["request_ended_unix_s"] = 0.35
         report = audit_payload(value)
         self.assertFalse(report["request_rows"][0]["goodoutput_v3_success"])
+        self.assertFalse(report["request_rows"][0]["goodoutput_v4_success"])
         peer["token_times_unix_s"] = [3.1, 3.12, 3.14]
         peer["request_ended_unix_s"] = 3.2
         report = audit_payload(value)
         self.assertFalse(report["request_rows"][0]["goodoutput_v3_success"])
+        self.assertTrue(report["request_rows"][0]["goodoutput_v4_success"])
+        self.assertEqual(
+            report["metrics"]["by_pool"]["source"]["goodoutput_v4_tokens"], 3,
+        )
+
+    def test_tpot_primary_keeps_e2e_as_starvation_guard(self) -> None:
+        value = payload()
+        peer = value["background/background_summary.json"]["results"][0]
+        peer["request_started_unix_s"] = -61.0
+        report = audit_payload(value)
+        self.assertFalse(report["request_rows"][0]["goodoutput_v4_success"])
 
 
 if __name__ == "__main__":
