@@ -60,7 +60,7 @@ def compare(stay_root: Path, migrate_root: Path) -> dict[str, Any]:
     ):
         if stay_contract.get(key) != migrate_contract.get(key):
             raise ValueError(f"paired contract differs in {key}")
-    for field in ("v4_thresholds",):
+    for field in ("v5_thresholds",):
         if stay[field] != migrate[field]:
             raise ValueError(f"paired audit differs in {field}")
     stay_pool = stay["metrics"]["by_pool"]["system"]
@@ -81,6 +81,10 @@ def compare(stay_root: Path, migrate_root: Path) -> dict[str, Any]:
         "delta_goodoutput_v4_tokens_s": (
             migrate_pool["goodoutput_v4_tokens_s"]
             - stay_pool["goodoutput_v4_tokens_s"]
+        ),
+        "delta_goodoutput_v5_tokens_s": (
+            migrate_pool["goodoutput_v5_tokens_s"]
+            - stay_pool["goodoutput_v5_tokens_s"]
         ),
         "note": (
             "one pilot pair has no uncertainty estimate; repeat interleaved "
@@ -105,6 +109,7 @@ def main() -> None:
     )
     print(json.dumps({
         "status": result["status"],
+        "delta_goodoutput_v5_tokens_s": result["delta_goodoutput_v5_tokens_s"],
         "delta_goodoutput_v4_tokens_s": result["delta_goodoutput_v4_tokens_s"],
         "out_json": str(args.out_json.resolve()),
     }))

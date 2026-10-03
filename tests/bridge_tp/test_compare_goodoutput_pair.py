@@ -21,10 +21,14 @@ class TestCompareGoodOutputPair(unittest.TestCase):
         }
         def report(rate: float) -> dict:
             return {
-                "computable": True, "v4_thresholds": {"mean_tpot_ms": 50},
+                "computable": True, "v5_thresholds": {
+                    "mean_tpot_ms": 50, "max_bad_interval_rate": 0.01,
+                    "max_visible_interval_ms": 1000,
+                },
                 "metrics": {"by_pool": {"system": {
                     "requests": 13, "output_tokens": 13312,
                     "goodoutput_v4_tokens_s": rate,
+                    "goodoutput_v5_tokens_s": rate,
                 }}},
             }
         with patch(
@@ -33,6 +37,7 @@ class TestCompareGoodOutputPair(unittest.TestCase):
         ):
             result = compare(Path("stay"), Path("migrate"))
         self.assertEqual(result["delta_goodoutput_v4_tokens_s"], 20)
+        self.assertEqual(result["delta_goodoutput_v5_tokens_s"], 20)
         self.assertEqual(result["status"], "PILOT_COMPARABLE_NOT_STATISTICAL")
 
     def test_rejects_different_manifest(self) -> None:

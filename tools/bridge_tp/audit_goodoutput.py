@@ -109,6 +109,7 @@ def _score_request(
         "good_tokens": None, "bad_intervals": None,
         "goodoutput_v3_success": None,
         "goodoutput_v4_success": None,
+        "goodoutput_v5_success": None,
         "request_slo_success_p99": None,
         "strict_slo_success": None,
     }
@@ -127,6 +128,7 @@ def _score_request(
             "good_tokens": 0, "bad_intervals": 0,
             "goodoutput_v3_success": False,
             "goodoutput_v4_success": False,
+            "goodoutput_v5_success": False,
             "request_slo_success_p99": False,
             "strict_slo_success": False,
         })
@@ -154,6 +156,7 @@ def _score_request(
     e2e_ms = (end - start) * 1000
     gaps_ms = [(b - a) * 1000 for a, b in zip(token_times, token_times[1:])]
     bad_intervals = sum(gap > thresholds["tpot_ms"] for gap in gaps_ms)
+    bad_interval_rate = bad_intervals / len(gaps_ms) if gaps_ms else 0.0
     mean_itl_ms = sum(gaps_ms) / len(gaps_ms) if gaps_ms else None
     p99_itl_ms = _percentile(gaps_ms, 0.99)
     request_valid = ttft_ms <= thresholds["ttft_ms"] and e2e_ms <= thresholds["e2e_ms"]
@@ -177,6 +180,7 @@ def _score_request(
         "mean_itl_ms": mean_itl_ms,
         "p99_itl_ms": p99_itl_ms,
         "bad_intervals": bad_intervals,
+        "bad_interval_rate": bad_interval_rate,
         "good_tokens": expected_tokens - bad_intervals if request_valid else 0,
         "goodoutput_v3_success": (
             ttft_ms <= v3_ttft_ms
@@ -187,6 +191,13 @@ def _score_request(
         "goodoutput_v4_success": (
             e2e_ms <= thresholds["e2e_ms"]
             and (mean_itl_ms is None or mean_itl_ms <= v3_mean_tpot_ms)
+            and handoff_valid
+        ),
+        "goodoutput_v5_success": (
+            e2e_ms <= thresholds["e2e_ms"]
+            and (mean_itl_ms is None or mean_itl_ms <= v3_mean_tpot_ms)
+            and bad_interval_rate <= 0.01
+            and (not gaps_ms or max(gaps_ms) <= thresholds["handoff_ms"])
             and handoff_valid
         ),
         "request_slo_success_p99": (
@@ -323,6 +334,10 @@ def audit_payload(
                     row["output_tokens"] for row in subset
                     if row["goodoutput_v4_success"]
                 )
+                v5_good = sum(
+                    row["output_tokens"] for row in subset
+                    if row["goodoutput_v5_success"]
+                )
                 intervals = sum(max(0, row["output_tokens"] - 1) for row in subset
                                 if row["status"] == "COMPLETED")
                 bad = sum(row["bad_intervals"] for row in subset)
@@ -336,6 +351,9 @@ def audit_payload(
                 v4_successes = sum(
                     bool(row["goodoutput_v4_success"]) for row in subset
                 )
+                v5_successes = sum(
+                    bool(row["goodoutput_v5_success"]) for row in subset
+                )
                 by_pool[pool] = {
                     "requests": len(subset), "output_tokens": raw,
                     "good_tokens": good,
@@ -348,6 +366,11 @@ def audit_payload(
                     "goodoutput_v4_success_requests": v4_successes,
                     "goodoutput_v4_success_rate": (
                         v4_successes / len(subset) if subset else None
+                    ),
+                    "goodoutput_v5_tokens": v5_good,
+                    "goodoutput_v5_success_requests": v5_successes,
+                    "goodoutput_v5_success_rate": (
+                        v5_successes / len(subset) if subset else None
                     ),
                     "strict_request_good_tokens": strict,
                     "request_slo_p99_good_tokens": request_slo,
@@ -369,6 +392,7 @@ def audit_payload(
                     "goodoutput_tokens_s": good / wall_s,
                     "goodoutput_v3_tokens_s": v3_good / wall_s,
                     "goodoutput_v4_tokens_s": v4_good / wall_s,
+                    "goodoutput_v5_tokens_s": v5_good / wall_s,
                     "request_slo_p99_goodput_tokens_s": request_slo / wall_s,
                     "strict_request_goodput_tokens_s": strict / wall_s,
                 }
@@ -383,10 +407,17 @@ def audit_payload(
             "3 s TTFT is a sensitivity threshold; the formal SLO requires "
             "normal-arrival workload and service-objective validation"
         ),
-        "primary_metric": "goodoutput_v4_tokens_s",
+        "primary_metric": "goodoutput_v5_tokens_s",
         "primary_metric_definition": (
-            "completed_request_mean_tpot_e2e_handoff_without_ttft_v4"
+            "completed_request_mean_tpot_bad_interval_rate_max_gap_e2e_handoff_without_ttft_v5"
         ),
+        "v5_thresholds": {
+            "mean_tpot_ms": v3_mean_tpot_ms,
+            "max_bad_interval_rate": 0.01,
+            "max_visible_interval_ms": thresholds.get("handoff_ms"),
+            "e2e_ms": thresholds.get("e2e_ms"),
+            "handoff_ms": thresholds.get("handoff_ms"),
+        },
         "v4_thresholds": {
             "mean_tpot_ms": v3_mean_tpot_ms,
             "e2e_ms": thresholds.get("e2e_ms"),
