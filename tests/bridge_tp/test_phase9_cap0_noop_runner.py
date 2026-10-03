@@ -4,6 +4,7 @@ import importlib.util
 import json
 import sys
 import tempfile
+import time
 import unittest
 from argparse import Namespace
 from pathlib import Path
@@ -94,6 +95,69 @@ class TestNoopManifest(unittest.TestCase):
             self.assertEqual(rate["b_min_bytes_s"], 123.0)
             self.assertEqual(rate["b_hard_max_bytes_s"], 123.0)
             self.assertEqual(rate["control_period_s"], 0.2)
+
+    def test_measured_source_kv_capacity_replaces_configured_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "controller_config.json"
+            log = root / "source_tp1.log"
+            config.write_text(
+                json.dumps({"block_size": 16, "tp1_total_kv_blocks": 1968}),
+                encoding="utf-8",
+            )
+            log.write_text("GPU KV cache size: 31,408 tokens\n", encoding="utf-8")
+            measured = RUNNER.apply_measured_source_kv_capacity(config, root, log)
+            self.assertEqual(measured, 1963)
+            self.assertEqual(
+                json.loads(config.read_text(encoding="utf-8"))["tp1_total_kv_blocks"],
+                1963,
+            )
+            evidence = json.loads(
+                (root / "source_kv_capacity.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(evidence["configured_blocks"], 1968)
+            self.assertEqual(evidence["measured_tokens"], 31408)
+
+    def test_measured_source_kv_capacity_rejects_missing_or_ambiguous_log(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "source_tp1.log"
+            log.write_text("engine healthy\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "unambiguous"):
+                RUNNER.measured_source_kv_blocks(log, 16)
+            log.write_text(
+                "GPU KV cache size: 31,408 tokens\n"
+                "GPU KV cache size: 31,488 tokens\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "unambiguous"):
+                RUNNER.measured_source_kv_blocks(log, 16)
+
+    def test_source_gpu_memory_sample_parser(self) -> None:
+        used, total = RUNNER.SourceGpuMemorySampler.parse_sample(
+            "0, 39000, 40960\n1, 1000, 40960\n", 0
+        )
+        self.assertEqual((used, total), (39000, 40960))
+        with self.assertRaisesRegex(ValueError, "unavailable"):
+            RUNNER.SourceGpuMemorySampler.parse_sample("1, 1000, 40960\n", 0)
+
+    def test_source_gpu_memory_sampler_writes_peak_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sampler = RUNNER.SourceGpuMemorySampler(0, root / "samples.jsonl")
+            with mock.patch.object(
+                RUNNER.subprocess,
+                "run",
+                return_value=mock.Mock(stdout="0, 39000, 40960\n"),
+            ):
+                sampler.start()
+                deadline = time.monotonic() + 2
+                while not sampler.samples and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                summary = sampler.stop(root / "summary.json")
+            self.assertGreaterEqual(summary["sample_count"], 1)
+            self.assertEqual(summary["sampled_peak_used_mib"], 39000)
+            self.assertEqual(summary["sampled_min_free_mib"], 1960)
+            self.assertTrue((root / "samples.jsonl").read_text(encoding="utf-8"))
 
     def test_default_manifest_exceeds_both_pool_pressure_floors(self) -> None:
         manifest = BUILDER.build_manifest()

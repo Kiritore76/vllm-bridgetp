@@ -1769,6 +1769,8 @@ def accept_m5_shadow(
     audit_path = controller_dir / "phase9_audit.jsonl"
     predictions = 0
     available = 0
+    measured_blocks = None
+    sampled_peak_mib = None
     source_log = controller_dir / "source_tp1.log"
     if not source_log.is_file():
         errors.append("M5 source server log is missing")
@@ -1783,6 +1785,24 @@ def accept_m5_shadow(
             errors.append(
                 "M5 source did not retain uncached compilation and CUDA graphs"
             )
+    provenance = controller_dir.parent / "provenance"
+    try:
+        capacity = common.read_json(provenance / "source_kv_capacity.json")
+        config = common.read_json(provenance / "controller_config.json")
+        memory = common.read_json(provenance / "source_gpu_memory_summary.json")
+        measured_blocks = int(capacity["measured_blocks"])
+        sampled_peak_mib = int(memory["sampled_peak_used_mib"])
+        if (
+            measured_blocks <= 0
+            or measured_blocks != int(config["tp1_total_kv_blocks"])
+            or measured_blocks * int(config["block_size"])
+            != int(capacity["measured_tokens"])
+        ):
+            errors.append("M5 controller did not use measured TP1 KV capacity")
+        if int(memory["sample_count"]) < 5:
+            errors.append("M5 TP1 runtime GPU memory samples are incomplete")
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        errors.append(f"M5 capacity or runtime GPU memory evidence is missing: {exc}")
     if not event_path.is_file() or not audit_path.is_file():
         errors.append("M5 source events or manager audit are missing")
     else:
@@ -1834,6 +1854,8 @@ def accept_m5_shadow(
         "errors": errors,
         "m5_source_predictions": predictions,
         "m5_manager_available_ticks": available,
+        "m5_measured_source_kv_blocks": measured_blocks,
+        "m5_sampled_tp1_gpu_peak_mib": sampled_peak_mib,
     }
 
 
