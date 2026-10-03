@@ -1590,7 +1590,9 @@ def main() -> None:
                     )
                     try:
                         m5_row = manager_m5.advisory(
-                            request.request_id, request.output_tokens, headroom_tokens
+                            request.request_id, request.output_tokens, headroom_tokens,
+                            max_output_tokens=int(source_request["max_tokens"]),
+                            ignore_eos=bool(source_request["ignore_eos"]),
                         )
                     except (OSError, ValueError, TypeError, KeyError) as error:
                         m5_row = {
@@ -1603,6 +1605,9 @@ def main() -> None:
                         }
                     m5_row["survival_table_in_support"] = table.in_support(
                         request.output_tokens
+                    )
+                    m5_row["survival_table_applicable_to_runtime_stop_rule"] = (
+                        not bool(source_request["ignore_eos"])
                     )
                     if m5_row["survival_table_in_support"]:
                         m5_row["survival_table_p_remaining_gt_headroom"] = (
