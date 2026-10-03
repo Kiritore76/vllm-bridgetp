@@ -1769,6 +1769,17 @@ def accept_m5_shadow(
     audit_path = controller_dir / "phase9_audit.jsonl"
     predictions = 0
     available = 0
+    source_log = controller_dir / "source_tp1.log"
+    if not source_log.is_file():
+        errors.append("M5 source server log is missing")
+    else:
+        source_config = source_log.read_text(encoding="utf-8", errors="replace")
+        if (
+            "enforce_eager=False" not in source_config
+            or "CompilationMode.VLLM_COMPILE" not in source_config
+            or "CUDAGraphMode.FULL_AND_PIECEWISE" not in source_config
+        ):
+            errors.append("M5 source did not retain compilation and CUDA graphs")
     if not event_path.is_file() or not audit_path.is_file():
         errors.append("M5 source events or manager audit are missing")
     else:
@@ -3673,9 +3684,7 @@ def main() -> None:
                     # connector boundary enables that manifest-driven lookup;
                     # it is not used as a runtime cutover value.
                     rep_args.cutover_output_tokens = 0
-                rep_args.force_source_eager = bool(
-                    args.online_remote_attention or args.manager_m5_predictor_shadow
-                )
+                rep_args.force_source_eager = bool(args.online_remote_attention)
                 rep_args.out_root = out_root / label
                 run_id = f"{out_root.name}-{label}"
                 predictor_event_path = rep_args.out_root / "predictor_events.jsonl"

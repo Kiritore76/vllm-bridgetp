@@ -270,9 +270,9 @@ class MultiLayerFeatureCapture:
 class PredictorLiveObserver(PredictorFeatureCapture):
     """Opt-in GPU inference with bounded asynchronous event publication.
 
-    The decoder hook is shared with the offline capture. A CUDA copy stream
-    moves only category probabilities to pinned host memory; later forwards
-    publish completed copies without waiting for the device in the hot path.
+    The live path reads Qwen2's graph-returned auxiliary state at decoder:31.
+    A CUDA copy stream moves only category probabilities to pinned host memory;
+    later forwards publish completed copies without waiting in the hot path.
     """
 
     def __init__(
@@ -333,6 +333,30 @@ class PredictorLiveObserver(PredictorFeatureCapture):
             )
             + "\n"
         )
+
+    def attach_model(self, model: "torch.nn.Module") -> None:
+        """Check the exact Qwen2 layer contract; do not install a Python hook."""
+        if (
+            model.__class__.__name__ != "Qwen2ForCausalLM"
+            or model.model.__class__.__name__ != "Qwen2Model"
+            or not hasattr(model, "set_aux_hidden_state_layers")
+            or self.layer_index >= model.model.config.num_hidden_layers
+        ):
+            raise ValueError("live predictor requires Qwen2 decoder:31 aux output")
+
+    def sample_aux_states(
+        self,
+        final_states: "torch.Tensor",
+        logits_indices: "torch.Tensor",
+        aux_hidden_states: list["torch.Tensor"] | None,
+    ) -> "torch.Tensor":
+        """Use the same hidden + residual state as the offline decoder hook."""
+        if aux_hidden_states is None or len(aux_hidden_states) != 1:
+            raise RuntimeError("decoder:31 auxiliary output is missing")
+        selected = aux_hidden_states[0][logits_indices]
+        if selected.shape != final_states.shape:
+            raise ValueError("decoder:31 and final sample positions differ")
+        return selected
 
     def begin_forward(self) -> None:
         self.poll_ready()

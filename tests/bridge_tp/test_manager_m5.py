@@ -31,6 +31,25 @@ EDGES = [0, 8, 16]
 
 
 class TestM5(unittest.TestCase):
+    def test_live_aux_state_matches_offline_decoder31_residual(self):
+        hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+        residual = torch.tensor([[0.5, 0.5], [1.0, 1.0], [1.5, 1.5]])
+        logits_indices = torch.tensor([0, 2])
+        final_states = torch.zeros((2, 2))
+        offline = object.__new__(capture.PredictorFeatureCapture)
+        offline.feature_layer = "decoder:31"
+        offline.layer_index = 31
+        offline._intermediate_states = None
+        offline._observe_decoder(None, (), (hidden, residual))
+        expected = offline.sample_states(final_states, logits_indices)
+        live = object.__new__(capture.PredictorLiveObserver)
+        actual = live.sample_aux_states(
+            final_states, logits_indices, [hidden + residual]
+        )
+        torch.testing.assert_close(actual, expected)
+        with self.assertRaisesRegex(RuntimeError, "auxiliary output is missing"):
+            live.sample_aux_states(final_states, logits_indices, None)
+
     def test_bounds_include_unresolved_bucket(self):
         probabilities = (0.1, 0.2, 0.3, 0.4)
         edges = tuple(EDGES)
