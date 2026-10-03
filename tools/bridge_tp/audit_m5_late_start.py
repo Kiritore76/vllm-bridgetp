@@ -64,6 +64,21 @@ def audit(run_dir: Path, minimum_output_tokens: int) -> dict[str, Any]:
         errors.append("source jobs did not start after anchor first output")
     if active_at_start < 1:
         errors.append("no source peer was active before M1 started")
+    before_start = [row for row in audit_rows
+                    if row.get("kind") == "telemetry"
+                    and started_s is not None
+                    and row.get("unix_s", 0) <= started_s]
+    prefill_totals = [
+        (row.get("capacity_signal") or {}).get("prefill_scheduled_tokens_total")
+        for row in before_start
+    ]
+    prefill_totals = [value for value in prefill_totals if value is not None]
+    source_prefill_advanced = (
+        len(prefill_totals) >= 2
+        and max(prefill_totals) > min(prefill_totals)
+    )
+    if not source_prefill_advanced:
+        errors.append("source prefill did not reach TP1 before M1 started")
     release_s = acceptance.get("source_kv_released_unix_s")
     if release_s is None or started_s is None or release_s <= started_s:
         errors.append("TP1 KV release was not observed after M1 start")
@@ -109,6 +124,7 @@ def audit(run_dir: Path, minimum_output_tokens: int) -> dict[str, Any]:
         "anchor_first_output_unix_s": first_output_s,
         "m1_start_unix_s": started_s,
         "active_source_peers_at_start": active_at_start,
+        "source_prefill_advanced_before_start": source_prefill_advanced,
         "source_kv_released_unix_s": release_s,
         "start_to_source_kv_release_s": (
             release_s - started_s if release_s is not None
