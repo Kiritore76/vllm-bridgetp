@@ -56,6 +56,9 @@ from vllm.bridge_tp.controller.manager_m3 import (  # noqa: E402
 from vllm.bridge_tp.controller.manager_m4 import (  # noqa: E402
     M4CancelController,
 )
+from vllm.bridge_tp.controller.manager_m5 import (  # noqa: E402
+    PredictorEventReader,
+)
 from vllm.bridge_tp.controller.events import (  # noqa: E402
     Action,
     MigrationState,
@@ -162,6 +165,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="cancel pre-freeze Shadow if TP1 will likely finish soon",
     )
+    parser.add_argument(
+        "--manager-m5-predictor-shadow", action="store_true",
+        help="audit frozen predictor events without changing M1-M4 decisions",
+    )
+    parser.add_argument("--predictor-event-path", type=Path)
+    parser.add_argument("--predictor-checkpoint-sha256")
     parser.add_argument(
         "--manager-m2-force-initial-high",
         action="store_true",
@@ -275,6 +284,11 @@ def parse_args() -> argparse.Namespace:
             )
     if args.manager_m4_cancel and not args.manager_m3_commit:
         parser.error("M4 cancel requires M3 earliest-ready commit")
+    if args.manager_m5_predictor_shadow and (
+        args.predictor_event_path is None
+        or args.predictor_checkpoint_sha256 is None
+    ):
+        parser.error("M5 shadow requires predictor event path and checkpoint SHA")
     if (
         args.gpu_resident_shadow
         and cutover is None
@@ -1431,6 +1445,12 @@ def main() -> None:
             else None
         )
         manager_m4 = M4CancelController() if args.manager_m4_cancel else None
+        manager_m5 = (
+            PredictorEventReader(
+                args.predictor_event_path, args.predictor_checkpoint_sha256
+            )
+            if args.manager_m5_predictor_shadow else None
+        )
         m0_collector = (
             RuntimeStateCollector()
             if manager_m0 is not None or manager_m1 is not None
@@ -1468,6 +1488,8 @@ def main() -> None:
                 "manager_m1_auto_start": args.manager_m1_auto_start,
                 "manager_m3_commit": args.manager_m3_commit,
                 "manager_m4_cancel": args.manager_m4_cancel,
+                "manager_m5_predictor_shadow": args.manager_m5_predictor_shadow,
+                "predictor_checkpoint_sha256": args.predictor_checkpoint_sha256,
                 "m3_policy": (
                     "COMMIT_EARLIEST_WHEN_READY"
                     if args.manager_m3_commit else None
@@ -1561,6 +1583,40 @@ def main() -> None:
                     "unix_s": time.time(),
                 }
                 audit.write(telemetry_row)
+                if manager_m5 is not None:
+                    headroom_tokens = (
+                        pool1.free_kv_tokens
+                        - config.capacity_pilot.guard_free_kv_tokens
+                    )
+                    try:
+                        m5_row = manager_m5.advisory(
+                            request.request_id, request.output_tokens, headroom_tokens
+                        )
+                    except (OSError, ValueError, TypeError, KeyError) as error:
+                        m5_row = {
+                            "kind": "manager_m5_predictor_shadow",
+                            "status": "UNAVAILABLE",
+                            "reason": f"invalid event stream: {error}",
+                            "request_id": request.request_id,
+                            "output_tokens": request.output_tokens,
+                            "headroom_tokens": headroom_tokens,
+                        }
+                    m5_row["survival_table_in_support"] = table.in_support(
+                        request.output_tokens
+                    )
+                    if m5_row["survival_table_in_support"]:
+                        m5_row["survival_table_p_remaining_gt_headroom"] = (
+                            table.p_remaining_gt(
+                                request.output_tokens, headroom_tokens
+                            )
+                        )
+                        m5_row["survival_table_p_remaining_gt_short_window"] = (
+                            table.p_remaining_gt(request.output_tokens, 64)
+                        )
+                    m5_row["prefill_pending_kv_tokens"] = (
+                        pool1.prefill_pending_kv_tokens
+                    )
+                    audit.write(m5_row)
                 m1_start_decision: M1StartDecision | None = None
                 m2_snapshot: RuntimeSnapshot | None = None
                 if manager_m1 is not None and record.state is MigrationState.LOCAL:

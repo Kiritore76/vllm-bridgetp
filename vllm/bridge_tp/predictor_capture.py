@@ -1,12 +1,16 @@
-"""Opt-in final or intermediate layer capture for an offline length predictor.
+"""Opt-in offline feature capture or live remaining-length observation.
 
 The GPU runner calls this only after selecting the last state used for logits.
-No predictor is trained or invoked in the serving path.
+Live inference is enabled only by an explicit frozen-checkpoint environment.
 """
 
+import hashlib
+import json
+import math
 import os
 import sqlite3
 import time
+from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -261,3 +265,206 @@ class MultiLayerFeatureCapture:
         self._logits_indices = None
         for writer in self.writers:
             writer.capture(writer.sample_states(final_states, indices), *metadata)
+
+
+class PredictorLiveObserver(PredictorFeatureCapture):
+    """Opt-in GPU inference with bounded asynchronous event publication.
+
+    The decoder hook is shared with the offline capture. A CUDA copy stream
+    moves only category probabilities to pinned host memory; later forwards
+    publish completed copies without waiting for the device in the hot path.
+    """
+
+    def __init__(
+        self,
+        checkpoint: Path,
+        checkpoint_sha256: str,
+        event_path: Path,
+        model_path: Path,
+        device: "torch.device",
+        *,
+        interval: int = 20,
+        max_pending: int = 256,
+    ) -> None:
+        import torch
+
+        from vllm.bridge_tp.controller.distribution_predictor import (
+            DistributionPredictor,
+        )
+
+        if interval != 20 or max_pending <= 0:
+            raise ValueError("live predictor requires interval=20 and a queue")
+        config_path = model_path / "config.json"
+        digest = hashlib.sha256(config_path.read_bytes()).hexdigest()
+        self.predictor = DistributionPredictor(
+            checkpoint,
+            checkpoint_sha256=checkpoint_sha256,
+            model_config_sha256=digest,
+            feature_layer="decoder:31",
+            device=device,
+        )
+        self.feature_layer = "decoder:31"
+        self.layer_index = 31
+        self._intermediate_states = None
+        self._layer_hook = None
+        self.interval = interval
+        self.max_pending = max_pending
+        self._pending = deque()
+        self._latest_generated: dict[str, int] = {}
+        self._copy_stream = (
+            torch.cuda.Stream(device=device) if device.type == "cuda" else None
+        )
+        event_path.parent.mkdir(parents=True, exist_ok=True)
+        self._events = event_path.open("x", encoding="utf-8", buffering=1)
+        self._events.write(
+            json.dumps(
+                {
+                    "kind": "predictor_header",
+                    "format_version": 1,
+                    "checkpoint_sha256": checkpoint_sha256,
+                    "capture_input_sha256": self.predictor.capture_input_sha256,
+                    "model_config_sha256": digest,
+                    "feature_layer": self.feature_layer,
+                    "interval": interval,
+                    "category_upper_edges": (
+                        self.predictor.category_upper_edges.cpu().tolist()
+                    ),
+                }
+            )
+            + "\n"
+        )
+
+    def begin_forward(self) -> None:
+        self.poll_ready()
+        super().begin_forward()
+
+    def capture(
+        self,
+        hidden_states: "torch.Tensor",
+        request_ids: Sequence[str],
+        generated_tokens: Sequence[int],
+        computed_prompt_tokens: Sequence[int],
+        scheduled_tokens: Sequence[int],
+        prompt_tokens: Sequence[int],
+    ) -> None:
+        import torch
+
+        self.poll_ready()
+        rows = select_capture_rows(
+            request_ids,
+            generated_tokens,
+            computed_prompt_tokens,
+            scheduled_tokens,
+            prompt_tokens,
+            self.interval,
+        )
+        rows = [
+            row
+            for row in rows
+            if row.generated_tokens > self._latest_generated.get(row.request_id, -1)
+        ]
+        if not rows:
+            return
+        if hidden_states.ndim != 2 or hidden_states.shape[0] != len(request_ids):
+            raise ValueError("live predictor states must align with requests")
+        if len(self._pending) >= self.max_pending:
+            raise RuntimeError("live predictor event queue is full")
+        captured_unix_ns = time.time_ns()
+        counts = torch.tensor(
+            [row.generated_tokens for row in rows], dtype=torch.float32
+        )
+        with torch.no_grad():
+            probabilities = self.predictor.probabilities(
+                hidden_states[[row.batch_index for row in rows]],
+                counts,
+                validate_inputs=False,
+            )
+            if self._copy_stream is None:
+                host = probabilities.detach().cpu()
+                event = None
+            else:
+                host = torch.empty(
+                    probabilities.shape,
+                    dtype=torch.float32,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                self._copy_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self._copy_stream):
+                    host.copy_(probabilities, non_blocking=True)
+                    event = torch.cuda.Event()
+                    event.record(self._copy_stream)
+                probabilities.record_stream(self._copy_stream)
+        for row in rows:
+            self._latest_generated[row.request_id] = row.generated_tokens
+        self._pending.append((event, host, rows, captured_unix_ns))
+        self.poll_ready()
+
+    def poll_ready(self) -> None:
+        """Write completed prediction events without synchronizing CUDA."""
+        while self._pending:
+            event, host, rows, captured_unix_ns = self._pending[0]
+            if event is not None and not event.query():
+                break
+            self._pending.popleft()
+            published_unix_ns = time.time_ns()
+            for row, probabilities in zip(rows, host.tolist()):
+                if (
+                    not all(
+                        math.isfinite(value) and value >= 0
+                        for value in probabilities
+                    )
+                    or abs(sum(probabilities) - 1.0) > 1e-4
+                ):
+                    result = {
+                        "kind": "predictor_unavailable",
+                        "reason": "nonfinite or unnormalized probabilities",
+                    }
+                else:
+                    result = {
+                        "kind": "predictor_prediction",
+                        "probabilities": probabilities,
+                    }
+                self._events.write(
+                    json.dumps(
+                        {
+                            **result,
+                            "request_id": row.request_id,
+                            "generated_tokens": row.generated_tokens,
+                            "phase": row.phase,
+                            "checkpoint_sha256": self.predictor.checkpoint_sha256,
+                            "captured_unix_ns": captured_unix_ns,
+                            "published_unix_ns": published_unix_ns,
+                        }
+                    )
+                    + "\n"
+                )
+
+    def close(self) -> None:
+        """Drain at shutdown; no per-forward CUDA synchronization is added."""
+        while self._pending:
+            event = self._pending[0][0]
+            if event is not None:
+                event.synchronize()
+            self.poll_ready()
+        self._events.close()
+
+
+def predictor_observer_from_environment(
+    model_path: Path, device: "torch.device", tensor_parallel_size: int
+) -> PredictorFeatureCapture | MultiLayerFeatureCapture | PredictorLiveObserver | None:
+    """Select exactly one opt-in predictor observer for this model runner."""
+    checkpoint = os.environ.get("BRIDGETP_PREDICTOR_LIVE_CHECKPOINT")
+    if not checkpoint:
+        return PredictorFeatureCapture.from_environment()
+    if os.environ.get("BRIDGETP_PREDICTOR_CAPTURE_DIR"):
+        raise ValueError("live prediction and offline capture cannot run together")
+    if tensor_parallel_size != 1:
+        return None  # The current experiment observes source TP1 only.
+    sha = os.environ.get("BRIDGETP_PREDICTOR_LIVE_SHA256")
+    events = os.environ.get("BRIDGETP_PREDICTOR_LIVE_EVENTS")
+    if not sha or not events:
+        raise ValueError("live predictor requires checkpoint SHA and event path")
+    return PredictorLiveObserver(
+        Path(checkpoint), sha, Path(events), model_path, device
+    )
