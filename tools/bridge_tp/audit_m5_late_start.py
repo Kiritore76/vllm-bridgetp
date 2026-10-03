@@ -73,14 +73,32 @@ def audit(run_dir: Path, minimum_output_tokens: int) -> dict[str, Any]:
                       if row.get("kind") == "telemetry"
                       and started_s is not None and release_s is not None
                       and started_s <= row.get("unix_s", 0) < release_s]
-    free_values = [(row.get("capacity_signal") or {}).get("free_kv_tokens")
+    signals = [row.get("capacity_signal") or {} for row in before_release]
+    free_values = [signal.get("free_kv_tokens") for signal in signals]
+    minimum_free = (min(free_values) if free_values
+                    and all(value is not None for value in free_values)
+                    else None)
+    headrooms = [
+        signal["free_kv_tokens"] - guard - signal["prefill_pending_kv_tokens"]
+        for signal in signals
+        if guard is not None and signal.get("free_kv_tokens") is not None
+        and signal.get("prefill_pending_kv_tokens") is not None
+    ]
+    minimum_headroom = (min(headrooms) if len(headrooms) == len(signals)
+                        and headrooms else None)
+    preemptions = [((row.get("tp1") or {}).get("preemptions_total"))
                    for row in before_release]
-    free_values = [value for value in free_values if value is not None]
-    minimum_free = min(free_values) if free_values else None
-    if guard is None or minimum_free is None:
+    max_preemptions = (max(preemptions) if preemptions
+                       and all(value is not None for value in preemptions)
+                       else None)
+    if guard is None or minimum_headroom is None:
         errors.append("source KV samples during preparation are missing")
-    elif minimum_free <= guard:
-        errors.append("source free KV reached the guard before TP1 KV release")
+    elif minimum_headroom <= 0:
+        errors.append("source KV headroom reached the guard before TP1 KV release")
+    if max_preemptions is None:
+        errors.append("source preemption samples during preparation are missing")
+    elif max_preemptions > 0:
+        errors.append("source preemption occurred before TP1 KV release")
     if acceptance.get("status") != "PASS":
         errors.append("online migration acceptance did not pass")
     return {
@@ -98,6 +116,8 @@ def audit(run_dir: Path, minimum_output_tokens: int) -> dict[str, Any]:
         ),
         "source_guard_tokens": guard,
         "minimum_sampled_source_free_tokens_before_release": minimum_free,
+        "minimum_reserved_headroom_tokens_before_release": minimum_headroom,
+        "maximum_source_preemptions_before_release": max_preemptions,
         "errors": errors,
     }
 
