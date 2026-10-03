@@ -19,7 +19,10 @@ run_m2_low_to_high_a100_smoke() {
   local predictor_checkpoint="${BRIDGETP_M5_CHECKPOINT:-}"
   local predictor_sha="${BRIDGETP_M5_CHECKPOINT_SHA256:-}"
   local anchor_max_tokens=1024 trigger_output_tokens=64
-  local source_jobs=8 source_prompt_tokens=1920 source_output_tokens=1024
+  local source_jobs=8
+  local source_prompt_tokens="${BRIDGETP_SOURCE_PROMPT_TOKENS:-1920}"
+  local source_output_tokens=1024
+  local minimum_source_kv_usage_frac="${BRIDGETP_MIN_SOURCE_KV_USAGE_FRAC:-0}"
   local mode=event-low-high
   local m2_requirement=()
   local m3_requirement=()
@@ -87,6 +90,23 @@ run_m2_low_to_high_a100_smoke() {
   local manifest="$run/inputs/event_source_pressure.json"
   local out="$run/online"
   local manifest_sha runner_rc
+
+  [[ "$m4_expect_cancel" == 1 || "$source_prompt_tokens" == 1920 ||
+     "$source_prompt_tokens" == 2304 ]] || {
+    echo "Only the default and bounded 2304-token source pressure are supported"
+    return 1
+  }
+  [[ "$minimum_source_kv_usage_frac" == 0 ||
+     "$minimum_source_kv_usage_frac" == 0.65 ]] || {
+    echo "Source KV usage gate must be 0 or 0.65"
+    return 1
+  }
+  if [[ "$m4_expect_cancel" != 1 &&
+        "$minimum_source_kv_usage_frac" == 0.65 &&
+        "$source_prompt_tokens" != 2304 ]]; then
+    echo "The 0.65 KV usage gate requires 2304-token source prompts"
+    return 1
+  fi
 
   [[ "$(git rev-parse HEAD)" == "$expected_revision" ]] || {
     echo "HEAD differs from BRIDGETP_EXPECTED_REVISION; no run"
@@ -164,6 +184,8 @@ run_m2_low_to_high_a100_smoke() {
     echo "guard=$(cat "$guard")"
     echo "m2_low_gib_s=$low_gib_s"
     echo "m1_min_output_tokens=$m1_min_output_tokens"
+    echo "source_prompt_tokens=$source_prompt_tokens"
+    echo "minimum_source_kv_usage_frac=$minimum_source_kv_usage_frac"
     echo "m2_require_low_to_high=$require_low_to_high"
     echo "m3_commit=$m3_commit"
     echo "m4_cancel=$m4_cancel"
@@ -202,6 +224,7 @@ run_m2_low_to_high_a100_smoke() {
     "${m5_requirement[@]}" \
     --m2-low-gib-s "$low_gib_s" --m2-medium-gib-s 2.4 --m2-high-gib-s 8.0 \
     --source-pressure --minimum-ready-source-jobs 0 \
+    --minimum-source-kv-usage-frac "$minimum_source_kv_usage_frac" \
     --trigger-output-tokens "$trigger_output_tokens" --bridge-output-tokens 96 \
     --commit-timing EARLIEST_READY \
     --anchor-prompt-tokens 2048 --anchor-max-tokens "$anchor_max_tokens" \
