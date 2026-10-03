@@ -48,7 +48,9 @@ def load_manifest(path: Path) -> dict[str, Any]:
             raise ValueError(f"job {job_id} pool must be source or target")
         if float(job.get("start_after_s", -1)) < 0:
             raise ValueError(f"job {job_id} start_after_s must be non-negative")
-        if job.get("start_after_event") not in {None, "M2_INITIAL_RATE"}:
+        if job.get("start_after_event") not in {
+            None, "M2_INITIAL_RATE", "ANCHOR_FIRST_OUTPUT"
+        }:
             raise ValueError(f"job {job_id} has an unknown start event")
         if job.get("start_after_event") and job["pool"] != "source":
             raise ValueError(f"job {job_id} event start requires a source job")
@@ -86,8 +88,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def wait_for_m2_initial_rate(path: Path, timeout_s: float) -> float:
-    """Release diagnostic source arrivals after M2's initial decision."""
+def wait_for_controller_event(path: Path, event: str, timeout_s: float) -> float:
+    """Release diagnostic source arrivals after an observed controller event."""
+    if event not in {"M2_INITIAL_RATE", "ANCHOR_FIRST_OUTPUT"}:
+        raise ValueError(f"unknown controller event: {event}")
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if path.is_file():
@@ -96,10 +100,22 @@ def wait_for_m2_initial_rate(path: Path, timeout_s: float) -> float:
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if row.get("kind") == "manager_m2_initial_rate":
+                if event == "M2_INITIAL_RATE" and (
+                    row.get("kind") == "manager_m2_initial_rate"
+                ):
+                    return time.monotonic()
+                if event == "ANCHOR_FIRST_OUTPUT" and (
+                    row.get("kind") == "telemetry"
+                    and int(row.get("output_tokens") or 0) > 0
+                ):
                     return time.monotonic()
         time.sleep(0.02)
-    raise TimeoutError("M2 initial rate event was not observed")
+    raise TimeoutError(f"{event} event was not observed")
+
+
+def wait_for_m2_initial_rate(path: Path, timeout_s: float) -> float:
+    """Retain the existing M2 event helper for callers of this module."""
+    return wait_for_controller_event(path, "M2_INITIAL_RATE", timeout_s)
 
 
 def main() -> None:
@@ -129,10 +145,10 @@ def main() -> None:
     def run_job(job: dict[str, Any]) -> dict[str, Any]:
         job_id = str(job["job_id"])
         start_after_s = float(job["start_after_s"])
+        start_event = job.get("start_after_event")
         anchor = (
-            wait_for_m2_initial_rate(args.controller_audit_path, 120.0)
-            if job.get("start_after_event") == "M2_INITIAL_RATE"
-            else start_monotonic
+            wait_for_controller_event(args.controller_audit_path, start_event, 120.0)
+            if start_event else start_monotonic
         )
         remaining = anchor + start_after_s - time.monotonic()
         if remaining > 0:

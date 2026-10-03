@@ -16,6 +16,7 @@ run_m2_low_to_high_a100_smoke() {
   local m4_cancel="${BRIDGETP_M4_CANCEL:-0}"
   local m4_expect_cancel="${BRIDGETP_M4_EXPECT_CANCEL:-0}"
   local m5_shadow="${BRIDGETP_M5_SHADOW:-0}"
+  local late_start_audit="${BRIDGETP_M5_LATE_START_AUDIT:-0}"
   local expected_branch="${BRIDGETP_EXPECTED_BRANCH:-bridgetp/runtime-controller}"
   local predictor_checkpoint="${BRIDGETP_M5_CHECKPOINT:-}"
   local predictor_sha="${BRIDGETP_M5_CHECKPOINT_SHA256:-}"
@@ -23,15 +24,35 @@ run_m2_low_to_high_a100_smoke() {
   local source_jobs=8
   local source_prompt_tokens="${BRIDGETP_SOURCE_PROMPT_TOKENS:-1920}"
   local source_output_tokens=1024
+  local source_start_event="${BRIDGETP_SOURCE_START_EVENT:-M2_INITIAL_RATE}"
+  local source_start_after_s="${BRIDGETP_SOURCE_START_AFTER_S:-0}"
   local minimum_source_kv_usage_frac="${BRIDGETP_MIN_SOURCE_KV_USAGE_FRAC:-0}"
   local mode=event-low-high
   local m2_requirement=()
   local initial_high_requirement=()
   local m3_requirement=()
   local m5_requirement=()
+  local source_start_requirement=()
+  case "$source_start_event" in
+    M2_INITIAL_RATE)
+      source_start_requirement=(--source-start-after-m2-initial) ;;
+    ANCHOR_FIRST_OUTPUT)
+      source_start_requirement=(--source-start-after-anchor-first-output) ;;
+    *)
+      echo "BRIDGETP_SOURCE_START_EVENT must be M2_INITIAL_RATE or ANCHOR_FIRST_OUTPUT"
+      return 1 ;;
+  esac
+  if ! [[ "$source_start_after_s" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "BRIDGETP_SOURCE_START_AFTER_S must be nonnegative seconds"
+    return 1
+  fi
   if [[ "$require_low_to_high" == 0 ]]; then
     mode=split-capacity
   elif [[ "$require_low_to_high" == 1 ]]; then
+    [[ "$source_start_event" == M2_INITIAL_RATE ]] || {
+      echo "LOW-to-HIGH requires source jobs after M2 initial rate"
+      return 1
+    }
     m2_requirement+=(--manager-m2-require-low-to-high)
   else
     echo "BRIDGETP_M2_REQUIRE_LOW_TO_HIGH must be 0 or 1"
@@ -100,6 +121,18 @@ run_m2_low_to_high_a100_smoke() {
     echo "BRIDGETP_M2_FORCE_INITIAL_HIGH must be 0 or 1"
     return 1
   fi
+  if [[ "$late_start_audit" == 1 ]]; then
+    if [[ "$m5_shadow" != 1 || "$force_initial_high" != 1 ||
+          "$source_start_event" != ANCHOR_FIRST_OUTPUT ||
+          ! "$m1_min_output_tokens" =~ ^[0-9]+$ ]]; then
+      echo "M5 late-start audit requires M5, initial HIGH, anchor-gated source peers and a nonnegative M1 output boundary"
+      return 1
+    fi
+    mode=m5-high-late-start
+  elif [[ "$late_start_audit" != 0 ]]; then
+    echo "BRIDGETP_M5_LATE_START_AUDIT must be 0 or 1"
+    return 1
+  fi
   local model=/root/autodl-tmp/models/models/Qwen--Qwen2.5-14B-Instruct/snapshots/master
   local base=/root/autodl-tmp/bridgetp/a1d_manifests/working/a1d-full-smoke-20260922T153543Z-output-1024.json
   local survival=/root/autodl-tmp/bridgetp/phase9_cap0_inputs/survival_table_m1_v1.json
@@ -155,6 +188,11 @@ run_m2_low_to_high_a100_smoke() {
   [[ "$(sha256sum "$guard" | cut -d' ' -f1)" == 0e86c353044f9610be1b5511ff21e870823b7f259c40ccde24188d84164b545b ]] || return 1
 
   python -m unittest discover -s tests/bridge_tp -p test_manager_m2.py || return 1
+  if [[ "$late_start_audit" == 1 ]]; then
+    python -m unittest \
+      tests.bridge_tp.test_experiment_a4_pressure_manifest \
+      tests.bridge_tp.test_m5_late_start_audit -q || return 1
+  fi
   if [[ "$m3_commit" == 1 ]]; then
     python -m unittest tests.bridge_tp.test_manager_m3 || return 1
   fi
@@ -188,9 +226,10 @@ run_m2_low_to_high_a100_smoke() {
   python tools/bridge_tp/build_experiment_a4_pressure_manifest.py \
     --base-target-manifest "$base" --out "$manifest" \
     --source-jobs "$source_jobs" --source-prompt-tokens "$source_prompt_tokens" \
-    --source-output-tokens "$source_output_tokens" --source-start-after-s 0 \
+    --source-output-tokens "$source_output_tokens" \
+    --source-start-after-s "$source_start_after_s" \
     --source-start-interval-s 0.05 \
-    --source-start-after-m2-initial || return 1
+    "${source_start_requirement[@]}" || return 1
   python tools/bridge_tp/run_phase9_capacity_background.py \
     --manifest "$manifest" --out-dir "$run/background_validate" \
     --validate-only || return 1
@@ -207,6 +246,8 @@ run_m2_low_to_high_a100_smoke() {
     echo "m2_low_gib_s=$low_gib_s"
     echo "m1_min_output_tokens=$m1_min_output_tokens"
     echo "source_prompt_tokens=$source_prompt_tokens"
+    echo "source_start_event=$source_start_event"
+    echo "source_start_after_s=$source_start_after_s"
     echo "minimum_source_kv_usage_frac=$minimum_source_kv_usage_frac"
     echo "m2_require_low_to_high=$require_low_to_high"
     echo "m2_force_initial_high=$force_initial_high"
@@ -214,6 +255,7 @@ run_m2_low_to_high_a100_smoke() {
     echo "m4_cancel=$m4_cancel"
     echo "m4_expect_cancel=$m4_expect_cancel"
     echo "m5_shadow=$m5_shadow"
+    echo "m5_late_start_audit=$late_start_audit"
     if [[ "$m5_shadow" == 1 ]]; then
       sha256sum "$predictor_checkpoint" "$model/config.json"
     fi
@@ -320,11 +362,22 @@ if (not prefill_totals or max(prefill_totals) == min(prefill_totals)
 PY
   local summary_rc=$?
   cat "$run/transition_summary.txt"
+  local late_audit_rc=0
+  if [[ "$late_start_audit" == 1 && "$runner_rc" -eq 0 ]]; then
+    python tools/bridge_tp/audit_m5_late_start.py \
+      --run-dir "$run" \
+      --minimum-output-tokens "$m1_min_output_tokens" \
+      2>&1 | tee "$run/late_start_audit.console.txt"
+    late_audit_rc=${PIPESTATUS[0]}
+  fi
   tar -czf "$run.tar.gz" -C "$root" "$(basename "$run")" || return 1
   echo "raw result directory: $run"
   echo "archive to retrieve: $run.tar.gz"
   if [[ "$runner_rc" -eq 0 && "$summary_rc" -ne 0 ]]; then
     return "$summary_rc"
+  fi
+  if [[ "$runner_rc" -eq 0 && "$late_audit_rc" -ne 0 ]]; then
+    return "$late_audit_rc"
   fi
   return "$runner_rc"
 }

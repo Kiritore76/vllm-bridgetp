@@ -27,6 +27,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-output-tokens", type=int, default=3500)
     parser.add_argument("--source-start-after-s", type=float, default=2.0)
     parser.add_argument("--source-start-after-m2-initial", action="store_true")
+    parser.add_argument(
+        "--source-start-after-anchor-first-output", action="store_true"
+    )
     parser.add_argument("--source-start-interval-s", type=float, default=0.1)
     parser.add_argument("--source-prompt-token-id", type=int, default=100)
     parser.add_argument("--max-model-len", type=int, default=8192)
@@ -44,6 +47,7 @@ def build_manifest(
     source_prompt_token_id: int,
     max_model_len: int,
     source_start_after_m2_initial: bool = False,
+    source_start_after_anchor_first_output: bool = False,
 ) -> dict[str, Any]:
     if not base["jobs"] or any(job["pool"] != "target" for job in base["jobs"]):
         raise ValueError("base manifest must contain target jobs only")
@@ -55,6 +59,8 @@ def build_manifest(
         raise ValueError("source request exceeds max model length")
     if source_start_after_s < 0 or source_start_interval_s < 0:
         raise ValueError("source start offsets must be nonnegative")
+    if source_start_after_m2_initial and source_start_after_anchor_first_output:
+        raise ValueError("source start events are mutually exclusive")
     if not 0 <= source_prompt_token_id <= 2_000_000:
         raise ValueError("source prompt token ID is invalid")
     existing = {str(job["job_id"]) for job in base["jobs"]}
@@ -78,6 +84,8 @@ def build_manifest(
         }
         if source_start_after_m2_initial:
             job["start_after_event"] = "M2_INITIAL_RATE"
+        elif source_start_after_anchor_first_output:
+            job["start_after_event"] = "ANCHOR_FIRST_OUTPUT"
         jobs.append(job)
     return {
         "format_version": 1,
@@ -90,6 +98,9 @@ def build_manifest(
             "source_output_tokens": source_output_tokens,
             "source_start_after_s": source_start_after_s,
             "source_start_after_m2_initial": source_start_after_m2_initial,
+            "source_start_after_anchor_first_output": (
+                source_start_after_anchor_first_output
+            ),
             "source_start_interval_s": source_start_interval_s,
             "max_model_len": max_model_len,
         },
@@ -111,6 +122,9 @@ def main() -> None:
         source_output_tokens=args.source_output_tokens,
         source_start_after_s=args.source_start_after_s,
         source_start_after_m2_initial=args.source_start_after_m2_initial,
+        source_start_after_anchor_first_output=(
+            args.source_start_after_anchor_first_output
+        ),
         source_start_interval_s=args.source_start_interval_s,
         source_prompt_token_id=args.source_prompt_token_id,
         max_model_len=args.max_model_len,
