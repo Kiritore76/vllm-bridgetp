@@ -1783,12 +1783,37 @@ def accept_m5_shadow(
         audit = [json.loads(line) for line in audit_path.read_text(
             encoding="utf-8"
         ).splitlines() if line]
-        available = sum(
-            row.get("kind") == "manager_m5_predictor_shadow"
-            and row.get("status") == "AVAILABLE" for row in audit
-        )
+        available_rows = [
+            row for row in audit
+            if row.get("kind") == "manager_m5_predictor_shadow"
+            and row.get("status") == "AVAILABLE"
+        ]
+        available = len(available_rows)
         if predictions == 0 or available == 0:
             errors.append("M5 did not produce and consume an online prediction")
+        for row in available_rows:
+            cap = row.get("max_remaining_output_tokens")
+            headroom = row.get("headroom_tokens")
+            runtime_bounds = row.get("p_remaining_gt_headroom_runtime_bounds")
+            if (
+                not isinstance(cap, int)
+                or not isinstance(headroom, int)
+                or not isinstance(runtime_bounds, list)
+                or len(runtime_bounds) != 2
+            ):
+                errors.append("M5 runtime output-cap audit is missing")
+                break
+            if row.get("ignore_eos") is True:
+                expected = float(cap > headroom)
+                if not all(abs(float(value) - expected) <= 1e-6
+                           for value in runtime_bounds):
+                    errors.append("M5 forced-output cap risk bound differs")
+                    break
+            elif headroom >= cap and any(
+                abs(float(value)) > 1e-6 for value in runtime_bounds
+            ):
+                errors.append("M5 output-cap risk bound differs")
+                break
     return {
         **accepted,
         "status": "PASS" if not errors else "FAIL",
