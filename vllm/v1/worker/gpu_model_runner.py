@@ -5402,6 +5402,11 @@ class GPUModelRunner(
                 aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
 
         self.model.set_aux_hidden_state_layers(aux_layers)
+        if self.predictor_live_aux_output:
+            active_layers = self.get_model().model.aux_hidden_state_layers
+            if active_layers != aux_layers:
+                raise RuntimeError("M5 decoder auxiliary layer selection failed")
+            logger.info("M5 compiled auxiliary decoder layers: %s", active_layers)
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.
@@ -6015,6 +6020,12 @@ class GPUModelRunner(
                 )
 
             if self.use_aux_hidden_state_outputs:
+                if self.predictor_live_aux_output and (
+                    not isinstance(outputs, tuple) or len(outputs) != 2
+                ):
+                    raise RuntimeError(
+                        "M5 compiled model did not return decoder auxiliary state"
+                    )
                 hidden_states, _ = outputs
             else:
                 hidden_states = outputs
