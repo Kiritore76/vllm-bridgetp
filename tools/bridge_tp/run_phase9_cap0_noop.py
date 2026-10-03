@@ -14,8 +14,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -27,6 +29,129 @@ from tools.bridge_tp import run_phase9_cap0_calibration as common  # noqa: E402
 from tools.bridge_tp.run_phase9_capacity_background import (  # noqa: E402
     load_manifest,
 )
+
+KV_CACHE_SIZE = re.compile(r"GPU KV cache size:\s*([\d,]+)\s+tokens")
+
+
+def measured_source_kv_blocks(log_path: Path, block_size: int) -> int:
+    """Read the initialized TP1 cache capacity, failing on ambiguous evidence."""
+    if block_size <= 0:
+        raise ValueError("KV block size must be positive")
+    capacities = {
+        int(value.replace(",", ""))
+        for value in KV_CACHE_SIZE.findall(
+            log_path.read_text(encoding="utf-8", errors="replace")
+        )
+    }
+    if len(capacities) != 1:
+        raise ValueError("source log needs one unambiguous GPU KV cache size")
+    tokens = capacities.pop()
+    if tokens <= 0 or tokens % block_size:
+        raise ValueError("source GPU KV cache size is not whole KV blocks")
+    return tokens // block_size
+
+
+def apply_measured_source_kv_capacity(
+    config_path: Path, provenance_dir: Path, source_log: Path
+) -> int:
+    """Use the TP1 engine's measured blocks before launching the controller."""
+    config = common.read_json(config_path)
+    block_size = int(config["block_size"])
+    measured = measured_source_kv_blocks(source_log, block_size)
+    configured = int(config["tp1_total_kv_blocks"])
+    config["tp1_total_kv_blocks"] = measured
+    common.write_json(config_path, config)
+    common.write_json(
+        provenance_dir / "source_kv_capacity.json",
+        {
+            "format_version": 1,
+            "source_log": str(source_log.resolve()),
+            "configured_blocks": configured,
+            "measured_blocks": measured,
+            "block_size": block_size,
+            "measured_tokens": measured * block_size,
+        },
+    )
+    return measured
+
+
+class SourceGpuMemorySampler:
+    """Sample physical TP1 GPU memory during an online M5 run."""
+
+    def __init__(self, gpu_index: int, samples_path: Path) -> None:
+        self.gpu_index = gpu_index
+        self.samples_path = samples_path
+        self.stop_event = threading.Event()
+        self.samples: list[dict[str, float | int]] = []
+        self.errors: list[str] = []
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    @staticmethod
+    def parse_sample(output: str, gpu_index: int) -> tuple[int, int]:
+        for line in output.splitlines():
+            fields = [field.strip() for field in line.split(",")]
+            if len(fields) != 3:
+                continue
+            try:
+                index, used, total = (int(value) for value in fields)
+            except ValueError:
+                continue
+            if index == gpu_index and 0 <= used <= total:
+                return used, total
+        raise ValueError(f"GPU {gpu_index} memory sample is unavailable")
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def _run(self) -> None:
+        with self.samples_path.open("x", encoding="utf-8", buffering=1) as sink:
+            while not self.stop_event.is_set():
+                try:
+                    result = subprocess.run(
+                        [
+                            "nvidia-smi",
+                            "--query-gpu=index,memory.used,memory.total",
+                            "--format=csv,noheader,nounits",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                        timeout=5,
+                    )
+                    used, total = self.parse_sample(result.stdout, self.gpu_index)
+                    sample = {
+                        "unix_s": time.time(),
+                        "gpu_index": self.gpu_index,
+                        "used_mib": used,
+                        "total_mib": total,
+                    }
+                    self.samples.append(sample)
+                    sink.write(json.dumps(sample) + "\n")
+                except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                    self.errors.append(str(exc))
+                self.stop_event.wait(0.5)
+
+    def stop(self, summary_path: Path) -> dict[str, Any]:
+        self.stop_event.set()
+        self.thread.join(timeout=10)
+        if self.thread.is_alive():
+            raise RuntimeError("GPU memory sampler did not stop")
+        summary = {
+            "format_version": 1,
+            "gpu_index": self.gpu_index,
+            "sample_count": len(self.samples),
+            "sample_errors": len(self.errors),
+            "sampled_peak_used_mib": max(
+                (row["used_mib"] for row in self.samples), default=None
+            ),
+            "sampled_min_free_mib": min(
+                (row["total_mib"] - row["used_mib"] for row in self.samples),
+                default=None,
+            ),
+            "note": "nvidia-smi samples every ~0.5 s; short spikes may be missed",
+        }
+        common.write_json(summary_path, summary)
+        return summary
 
 
 def parse_args() -> argparse.Namespace:
@@ -496,6 +621,7 @@ def run(
     base_env["OMP_NUM_THREADS"] = "1"
     processes: list[common.ManagedProcess] = []
     background: common.ManagedProcess | None = None
+    memory_sampler: SourceGpuMemorySampler | None = None
     status: dict[str, Any] = {
         "format_version": 1,
         "status": "RUNNING",
@@ -666,6 +792,19 @@ def run(
             args.server_start_timeout_s,
         )
         print(f"[{run_id}] source TP1 healthy", flush=True)
+        if bool(getattr(args, "manager_m5_predictor_shadow", False)):
+            measured_blocks = apply_measured_source_kv_capacity(
+                config_path, provenance_dir, source.log_path
+            )
+            print(
+                f"[{run_id}] source TP1 measured KV blocks: {measured_blocks}",
+                flush=True,
+            )
+            sampler = SourceGpuMemorySampler(
+                int(args.tp1_gpu), controller_dir / "source_gpu_memory_samples.jsonl"
+            )
+            sampler.start()
+            memory_sampler = sampler
 
         if background_before_controller and background is None:
             background = common.start_process(
@@ -792,6 +931,13 @@ def run(
             )
             processes.append(background)
         common.wait_pair(controller, background, args.run_timeout_s)
+        if memory_sampler is not None:
+            memory_summary = memory_sampler.stop(
+                provenance_dir / "source_gpu_memory_summary.json"
+            )
+            memory_sampler = None
+            if memory_summary["sample_count"] < 5:
+                raise RuntimeError("too few TP1 GPU memory samples")
         for service in (target, source):
             if service.process.poll() is not None:
                 raise RuntimeError(
@@ -854,7 +1000,11 @@ def run(
         common.write_json(out_root / "status.json", status)
         raise
     finally:
-        common.stop_processes(processes)
+        try:
+            if memory_sampler is not None:
+                memory_sampler.stop(provenance_dir / "source_gpu_memory_summary.json")
+        finally:
+            common.stop_processes(processes)
         common.write_json(
             out_root / "process_lifetimes.json",
             {
