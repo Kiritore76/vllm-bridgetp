@@ -8,9 +8,10 @@ import hashlib
 import json
 import math
 import os
+import queue
 import sqlite3
+import threading
 import time
-from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -268,11 +269,11 @@ class MultiLayerFeatureCapture:
 
 
 class PredictorLiveObserver(PredictorFeatureCapture):
-    """Opt-in GPU inference with bounded asynchronous event publication.
+    """Opt-in GPU inference outside the token sampling stream.
 
     The live path reads Qwen2's graph-returned auxiliary state at decoder:31.
-    A CUDA copy stream moves only category probabilities to pinned host memory;
-    later forwards publish completed copies without waiting in the hot path.
+    The runner snapshots only selected rows. A worker executes the predictor on
+    a separate CUDA stream and publishes probabilities after its copy completes.
     """
 
     def __init__(
@@ -309,11 +310,14 @@ class PredictorLiveObserver(PredictorFeatureCapture):
         self._layer_hook = None
         self.interval = interval
         self.max_pending = max_pending
-        self._pending = deque()
+        self._pending: queue.Queue = queue.Queue(maxsize=max_pending)
         self._latest_generated: dict[str, int] = {}
-        self._copy_stream = (
-            torch.cuda.Stream(device=device) if device.type == "cuda" else None
+        self._compute_stream = (
+            torch.cuda.Stream(device=device, priority=1)
+            if device.type == "cuda"
+            else None
         )
+        self._worker_error: BaseException | None = None
         event_path.parent.mkdir(parents=True, exist_ok=True)
         self._events = event_path.open("x", encoding="utf-8", buffering=1)
         self._events.write(
@@ -333,6 +337,10 @@ class PredictorLiveObserver(PredictorFeatureCapture):
             )
             + "\n"
         )
+        self._worker = threading.Thread(
+            target=self._run_predictions, name="bridgetp-predictor", daemon=True
+        )
+        self._worker.start()
 
     def attach_model(self, model: "torch.nn.Module") -> None:
         """Check the exact Qwen2 layer contract; do not install a Python hook."""
@@ -359,7 +367,7 @@ class PredictorLiveObserver(PredictorFeatureCapture):
         return selected
 
     def begin_forward(self) -> None:
-        self.poll_ready()
+        self._check_worker()
         super().begin_forward()
 
     def capture(
@@ -373,7 +381,7 @@ class PredictorLiveObserver(PredictorFeatureCapture):
     ) -> None:
         import torch
 
-        self.poll_ready()
+        self._check_worker()
         rows = select_capture_rows(
             request_ids,
             generated_tokens,
@@ -391,87 +399,106 @@ class PredictorLiveObserver(PredictorFeatureCapture):
             return
         if hidden_states.ndim != 2 or hidden_states.shape[0] != len(request_ids):
             raise ValueError("live predictor states must align with requests")
-        if len(self._pending) >= self.max_pending:
-            raise RuntimeError("live predictor event queue is full")
         captured_unix_ns = time.time_ns()
-        counts = torch.tensor(
-            [row.generated_tokens for row in rows], dtype=torch.float32
-        )
-        with torch.no_grad():
-            probabilities = self.predictor.probabilities(
-                hidden_states[[row.batch_index for row in rows]],
-                counts,
-                validate_inputs=False,
-            )
-            if self._copy_stream is None:
-                host = probabilities.detach().cpu()
-                event = None
-            else:
-                host = torch.empty(
-                    probabilities.shape,
-                    dtype=torch.float32,
-                    device="cpu",
-                    pin_memory=True,
-                )
-                self._copy_stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(self._copy_stream):
-                    host.copy_(probabilities, non_blocking=True)
-                    event = torch.cuda.Event()
-                    event.record(self._copy_stream)
-                probabilities.record_stream(self._copy_stream)
+        # Advanced indexing makes a private snapshot. Graph-returned model
+        # buffers may be reused by the next forward before the worker runs.
+        snapshot = hidden_states[[row.batch_index for row in rows]].detach()
+        ready = None
+        if self._compute_stream is not None:
+            ready = torch.cuda.Event()
+            ready.record(torch.cuda.current_stream())
+        try:
+            self._pending.put_nowait((snapshot, ready, rows, captured_unix_ns))
+        except queue.Full as exc:
+            raise RuntimeError("live predictor event queue is full") from exc
         for row in rows:
             self._latest_generated[row.request_id] = row.generated_tokens
-        self._pending.append((event, host, rows, captured_unix_ns))
-        self.poll_ready()
 
-    def poll_ready(self) -> None:
-        """Write completed prediction events without synchronizing CUDA."""
-        while self._pending:
-            event, host, rows, captured_unix_ns = self._pending[0]
-            if event is not None and not event.query():
-                break
-            self._pending.popleft()
-            published_unix_ns = time.time_ns()
-            for row, probabilities in zip(rows, host.tolist()):
-                if (
-                    not all(
-                        math.isfinite(value) and value >= 0
-                        for value in probabilities
-                    )
-                    or abs(sum(probabilities) - 1.0) > 1e-4
-                ):
-                    result = {
-                        "kind": "predictor_unavailable",
-                        "reason": "nonfinite or unnormalized probabilities",
-                    }
-                else:
-                    result = {
-                        "kind": "predictor_prediction",
-                        "probabilities": probabilities,
-                    }
-                self._events.write(
-                    json.dumps(
-                        {
-                            **result,
-                            "request_id": row.request_id,
-                            "generated_tokens": row.generated_tokens,
-                            "phase": row.phase,
-                            "checkpoint_sha256": self.predictor.checkpoint_sha256,
-                            "captured_unix_ns": captured_unix_ns,
-                            "published_unix_ns": published_unix_ns,
-                        }
-                    )
-                    + "\n"
+    def _check_worker(self) -> None:
+        if self._worker_error is not None:
+            raise RuntimeError("live predictor worker failed") from self._worker_error
+
+    def _run_predictions(self) -> None:
+        import torch
+
+        while True:
+            item = self._pending.get()
+            try:
+                if item is None:
+                    return
+                snapshot, ready, rows, captured_unix_ns = item
+                counts = torch.tensor(
+                    [row.generated_tokens for row in rows], dtype=torch.float32
                 )
+                with torch.no_grad():
+                    if self._compute_stream is None:
+                        probabilities = self.predictor.probabilities(
+                            snapshot, counts, validate_inputs=False
+                        )
+                        host = probabilities.detach().cpu()
+                    else:
+                        with torch.cuda.stream(self._compute_stream):
+                            self._compute_stream.wait_event(ready)
+                            probabilities = self.predictor.probabilities(
+                                snapshot, counts, validate_inputs=False
+                            )
+                            host = torch.empty(
+                                probabilities.shape,
+                                dtype=torch.float32,
+                                device="cpu",
+                                pin_memory=True,
+                            )
+                            host.copy_(probabilities, non_blocking=True)
+                            done = torch.cuda.Event()
+                            done.record(self._compute_stream)
+                        done.synchronize()
+                self._publish(rows, host.tolist(), captured_unix_ns)
+            except BaseException as exc:
+                self._worker_error = exc
+                return
+            finally:
+                self._pending.task_done()
+
+    def _publish(self, rows, probability_rows, captured_unix_ns: int) -> None:
+        published_unix_ns = time.time_ns()
+        for row, probabilities in zip(rows, probability_rows):
+            if (
+                not all(math.isfinite(value) and value >= 0 for value in probabilities)
+                or abs(sum(probabilities) - 1.0) > 1e-4
+            ):
+                result = {
+                    "kind": "predictor_unavailable",
+                    "reason": "nonfinite or unnormalized probabilities",
+                }
+            else:
+                result = {
+                    "kind": "predictor_prediction",
+                    "probabilities": probabilities,
+                }
+            self._events.write(
+                json.dumps(
+                    {
+                        **result,
+                        "request_id": row.request_id,
+                        "generated_tokens": row.generated_tokens,
+                        "phase": row.phase,
+                        "checkpoint_sha256": self.predictor.checkpoint_sha256,
+                        "captured_unix_ns": captured_unix_ns,
+                        "published_unix_ns": published_unix_ns,
+                    }
+                )
+                + "\n"
+            )
 
     def close(self) -> None:
-        """Drain at shutdown; no per-forward CUDA synchronization is added."""
-        while self._pending:
-            event = self._pending[0][0]
-            if event is not None:
-                event.synchronize()
-            self.poll_ready()
-        self._events.close()
+        """Drain predictions when the runner shuts down."""
+        if self._worker.is_alive():
+            self._pending.put(None)
+            self._worker.join()
+        try:
+            self._check_worker()
+        finally:
+            self._events.close()
 
 
 def predictor_observer_from_environment(

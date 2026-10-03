@@ -5,6 +5,7 @@ import importlib.util
 import json
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -136,6 +137,48 @@ class TestM5(unittest.TestCase):
                 lines[0]["model_config_sha256"],
                 hashlib.sha256(b"{}").hexdigest(),
             )
+
+    def test_live_capture_does_not_wait_for_prediction_and_snapshots_state(self):
+        entered = threading.Event()
+        release = threading.Event()
+        observed = []
+
+        class FakePredictor:
+            def __init__(self, *args, **kwargs):
+                self.capture_input_sha256 = "input"
+                self.checkpoint_sha256 = SHA
+                self.category_upper_edges = torch.tensor(EDGES)
+
+            def probabilities(self, hidden, counts, **kwargs):
+                entered.set()
+                if not release.wait(timeout=5):
+                    raise TimeoutError("prediction was not released")
+                observed.append(hidden[0, 0].item())
+                return torch.tensor([[0.1, 0.2, 0.3, 0.4]])
+
+        fake_module = types.SimpleNamespace(DistributionPredictor=FakePredictor)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = root / "model"
+            model.mkdir()
+            (model / "config.json").write_text("{}")
+            events = root / "events.jsonl"
+            with patch.dict(sys.modules, {
+                "vllm.bridge_tp.controller.distribution_predictor": fake_module
+            }):
+                observer = capture.PredictorLiveObserver(
+                    root / "checkpoint.pt", SHA, events, model, torch.device("cpu")
+                )
+            hidden = torch.ones((1, 5120))
+            try:
+                observer.capture(hidden, ["r"], [0], [10], [10], [20])
+                self.assertTrue(entered.wait(timeout=5))
+                hidden.fill_(9)
+            finally:
+                release.set()
+                observer.close()
+            self.assertEqual(observed, [1.0])
+            self.assertEqual(len(events.read_text().splitlines()), 2)
 
 
 if __name__ == "__main__":
