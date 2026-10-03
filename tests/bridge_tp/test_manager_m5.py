@@ -63,6 +63,15 @@ class TestM5(unittest.TestCase):
             row = reader.advisory("r", 20, 4)
             self.assertEqual(row["status"], "AVAILABLE")
             self.assertAlmostEqual(row["p_remaining_gt_headroom_bounds"][1], 0.9)
+            capped = reader.advisory(
+                "r", 20, 40, max_output_tokens=32, ignore_eos=False
+            )
+            self.assertEqual(capped["p_remaining_gt_headroom_runtime_bounds"], (0.0, 0.0))
+            forced = reader.advisory(
+                "r", 20, 4, max_output_tokens=32, ignore_eos=True
+            )
+            self.assertEqual(forced["p_remaining_gt_headroom_runtime_bounds"], (1.0, 1.0))
+            self.assertFalse(forced["model_applicable_to_runtime_stop_rule"])
             self.assertEqual(reader.advisory("r", 61, 4)["status"], "STALE")
             with self.assertRaisesRegex(ValueError, "header differs"):
                 m5.PredictorEventReader(path, "b" * 64).poll()

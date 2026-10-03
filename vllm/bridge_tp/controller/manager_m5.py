@@ -118,15 +118,25 @@ class PredictorEventReader:
     def advisory(
         self, request_id: str, output_tokens: int, headroom_tokens: int,
         short_window_tokens: int = 64, *, now_ns: int | None = None,
+        max_output_tokens: int | None = None, ignore_eos: bool = False,
     ) -> dict:
-        """Report model risk at current KV headroom and short EOS window."""
+        """Report raw model risk and bounds under the actual output stop rule."""
         self.poll()
+        if max_output_tokens is not None and max_output_tokens < 0:
+            raise ValueError("M5 output cap cannot be negative")
+        remaining_cap = (
+            max(0, max_output_tokens - output_tokens)
+            if max_output_tokens is not None else None
+        )
         result: dict = {
             "kind": "manager_m5_predictor_shadow",
             "request_id": request_id,
             "output_tokens": output_tokens,
             "headroom_tokens": headroom_tokens,
             "checkpoint_sha256": self.checkpoint_sha256,
+            "max_remaining_output_tokens": remaining_cap,
+            "ignore_eos": ignore_eos,
+            "model_applicable_to_runtime_stop_rule": not ignore_eos,
         }
         if self._header is None:
             return {**result, "status": "NO_HEADER"}
@@ -149,16 +159,33 @@ class PredictorEventReader:
             }
         probabilities = tuple(float(v) for v in row["probabilities"])
         edges = tuple(self._header["category_upper_edges"])
+        headroom_bounds = probability_gt_bounds(
+            probabilities, edges, headroom_tokens
+        )
+        short_bounds = probability_gt_bounds(
+            probabilities, edges, short_window_tokens
+        )
+
+        def cap_aware(bounds: tuple[float, float], horizon: int) -> tuple[float, float]:
+            if remaining_cap is None:
+                return bounds
+            if ignore_eos:
+                forced = float(remaining_cap > horizon)
+                return forced, forced
+            return (0.0, 0.0) if horizon >= remaining_cap else bounds
+
         return {
             **result,
             "status": "AVAILABLE",
             "prediction_output_tokens": position,
             "age_s": age_s,
-            "p_remaining_gt_headroom_bounds": probability_gt_bounds(
-                probabilities, edges, headroom_tokens
+            "p_remaining_gt_headroom_bounds": headroom_bounds,
+            "p_remaining_gt_short_window_bounds": short_bounds,
+            "p_remaining_gt_headroom_runtime_bounds": cap_aware(
+                headroom_bounds, headroom_tokens
             ),
-            "p_remaining_gt_short_window_bounds": probability_gt_bounds(
-                probabilities, edges, short_window_tokens
+            "p_remaining_gt_short_window_runtime_bounds": cap_aware(
+                short_bounds, short_window_tokens
             ),
             "short_window_tokens": short_window_tokens,
         }
