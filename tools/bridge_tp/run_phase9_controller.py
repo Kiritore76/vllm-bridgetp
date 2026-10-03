@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import os
 import signal
 import sys
@@ -151,6 +152,10 @@ def parse_args() -> argparse.Namespace:
         help="start GPU-resident Shadow from online M1 evidence",
     )
     parser.add_argument(
+        "--m1-source-release-tail-s", type=float,
+        help="diagnostic tail allowance after estimated history copy until TP1 KV release",
+    )
+    parser.add_argument(
         "--manager-m2-rate",
         action="store_true",
         help="apply three-profile M2 rates during active Shadow",
@@ -266,6 +271,14 @@ def parse_args() -> argparse.Namespace:
             parser.error("M1 auto-start requires GPU-resident Shadow-only mode")
         if args.stop_and_copy:
             parser.error("M1 auto-start does not support Stop-and-Copy")
+        if args.m1_source_release_tail_s is None:
+            parser.error("M1 auto-start requires source KV release tail allowance")
+    if args.m1_source_release_tail_s is not None and (
+        not args.manager_m1_auto_start
+        or not math.isfinite(args.m1_source_release_tail_s)
+        or args.m1_source_release_tail_s <= 0
+    ):
+        parser.error("M1 source release tail requires a positive finite value")
     if args.manager_m2_rate and not (
         args.manager_m1_auto_start and args.manager_m0_shadow
     ):
@@ -1422,6 +1435,7 @@ def main() -> None:
                         config.policy.max_target_kv_usage_frac
                     ),
                     max_target_waiting=config.policy.max_target_waiting,
+                    source_release_tail_s=args.m1_source_release_tail_s,
                 )
             )
             if args.manager_m1_auto_start

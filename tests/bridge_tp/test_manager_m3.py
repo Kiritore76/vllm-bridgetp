@@ -51,6 +51,7 @@ class TestM3Commit(unittest.TestCase):
             "run_phase9_controller.py", "--config", "config.json",
             "--run-dir", "run", "--source-request", "request.json",
             "--manager-m1-auto-start", "--manager-m0-shadow",
+            "--m1-source-release-tail-s", "5.0",
             "--manager-m2-rate", "--diagnostic-earliest-ready-cutover",
             "--handoff-mode", "shadow-only", "--gpu-resident-shadow",
             "--manager-m3-commit",

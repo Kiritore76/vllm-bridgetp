@@ -29,6 +29,8 @@ def snapshot() -> RuntimeSnapshot:
         source_free_kv_tokens=30000,
         source_guard_free_kv_tokens=8448,
         source_pool_growth_tokens_s=30.0,
+        source_decode_growth_tokens_s=30.0,
+        source_prefill_pending_kv_tokens=0,
         target_free_kv_tokens=50000,
         target_kv_usage_frac=0.1,
         target_waiting=0,
@@ -42,16 +44,25 @@ class TestM1Start(unittest.TestCase):
             "run_phase9_controller.py", "--config", "config.json",
             "--run-dir", "run", "--source-request", "request.json",
             "--manager-m1-auto-start", "--diagnostic-earliest-ready-cutover",
+            "--m1-source-release-tail-s", "5.0",
             "--handoff-mode", "shadow-only", "--gpu-resident-shadow",
         ]
         with patch("sys.argv", base):
             self.assertTrue(parse_args().manager_m1_auto_start)
+        without_floor = base[:]
+        index = without_floor.index("--m1-source-release-tail-s")
+        del without_floor[index:index + 2]
+        with patch("sys.argv", without_floor):
+            with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                parse_args()
         with patch("sys.argv", base + ["--diagnostic-trigger-output-tokens", "64"]):
             with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
                 parse_args()
 
     def setUp(self) -> None:
-        self.controller = M1StartController(M1StartConfig())
+        self.controller = M1StartController(
+            M1StartConfig(source_release_tail_s=5.0)
+        )
         self.table = SurvivalTable.from_output_lengths([1024] * 30)
 
     def decide(self, state: RuntimeSnapshot, table=None):
@@ -93,7 +104,7 @@ class TestM1Start(unittest.TestCase):
         self.assertEqual(decision.action, "START_SHADOW")
         self.assertAlmostEqual(
             decision.estimated_preparation_s,
-            state.current_context_tokens * 196608 / (0.5 * 1024**3) + 2.0,
+            state.current_context_tokens * 196608 / (0.5 * 1024**3) + 5.0,
         )
 
     def test_no_start_without_fresh_capacity_or_channel(self) -> None:
@@ -105,11 +116,45 @@ class TestM1Start(unittest.TestCase):
             replace(snapshot(), target_waiting=5),
             replace(snapshot(), channel_available=False),
             replace(snapshot(), source_free_kv_tokens=8448),
-            replace(snapshot(), source_pool_growth_tokens_s=None),
+            replace(snapshot(), source_decode_growth_tokens_s=None),
+            replace(snapshot(), source_prefill_pending_kv_tokens=None),
         )
         for case in cases:
             with self.subTest(case=case):
                 self.assertEqual(self.decide(case).action, "STAY")
+
+    def test_prefill_ewma_does_not_override_decode_growth(self) -> None:
+        state = replace(
+            snapshot(), source_free_kv_tokens=10288,
+            source_pool_growth_tokens_s=700.6,
+            source_decode_growth_tokens_s=283.8,
+        )
+        decision = self.decide(state)
+        self.assertEqual(decision.action, "START_SHADOW")
+        self.assertEqual(decision.source_safe_headroom_tokens, 1840)
+        self.assertAlmostEqual(decision.source_time_to_guard_s, 1840 / 283.8)
+        self.assertAlmostEqual(
+            decision.estimated_preparation_s,
+            state.current_context_tokens * 196608 / (0.5 * 1024**3) + 5.0,
+        )
+        self.assertEqual(
+            decision.source_capacity_model,
+            "prefill_reservation_plus_decode_growth",
+        )
+        reserved = self.decide(replace(
+            state, source_prefill_pending_kv_tokens=600,
+        ))
+        self.assertEqual(reserved.action, "STAY")
+        self.assertEqual(reserved.source_safe_headroom_tokens, 1240)
+
+    def test_missing_release_calibration_fails_closed(self) -> None:
+        controller = M1StartController(M1StartConfig())
+        decision = controller.decide(
+            snapshot(), self.table, max_output_tokens=1024,
+            rate_bytes_s=0.5 * 1024**3, kv_bytes_per_token=196608,
+        )
+        self.assertEqual(decision.action, "STAY")
+        self.assertIn("source_release_tail_s", decision.missing)
 
     def test_no_start_without_supported_remaining_work(self) -> None:
         self.assertEqual(

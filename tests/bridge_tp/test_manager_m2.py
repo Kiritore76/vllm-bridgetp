@@ -306,6 +306,7 @@ class TestM2RateController(unittest.TestCase):
             "run_phase9_controller.py", "--config", "config.json",
             "--run-dir", "run", "--source-request", "request.json",
             "--manager-m2-rate", "--manager-m1-auto-start",
+            "--m1-source-release-tail-s", "5.0",
             "--diagnostic-earliest-ready-cutover", "--handoff-mode",
             "shadow-only", "--gpu-resident-shadow",
         ]

@@ -10,6 +10,8 @@ run_m2_low_to_high_a100_smoke() {
   local expected_revision="${BRIDGETP_EXPECTED_REVISION:?set BRIDGETP_EXPECTED_REVISION}"
   local low_gib_s="${BRIDGETP_M2_LOW_GIB_S:-0.1}"
   local m1_min_output_tokens="${BRIDGETP_M1_MIN_OUTPUT_TOKENS:-32}"
+  # Diagnostic allowance from three A100 HIGH smokes; not a p95/p99 bound.
+  local m1_source_release_tail_s="${BRIDGETP_M1_SOURCE_RELEASE_TAIL_S:-5.0}"
   local require_low_to_high="${BRIDGETP_M2_REQUIRE_LOW_TO_HIGH:-1}"
   local force_initial_high="${BRIDGETP_M2_FORCE_INITIAL_HIGH:-0}"
   local m3_commit="${BRIDGETP_M3_COMMIT:-0}"
@@ -44,6 +46,12 @@ run_m2_low_to_high_a100_smoke() {
   esac
   if ! [[ "$source_start_after_s" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     echo "BRIDGETP_SOURCE_START_AFTER_S must be nonnegative seconds"
+    return 1
+  fi
+  if ! [[ "$m1_source_release_tail_s" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+     [[ "$m1_source_release_tail_s" == 0 ||
+        "$m1_source_release_tail_s" == 0.0 ]]; then
+    echo "BRIDGETP_M1_SOURCE_RELEASE_TAIL_S must be positive seconds"
     return 1
   fi
   if [[ "$require_low_to_high" == 0 ]]; then
@@ -245,6 +253,7 @@ run_m2_low_to_high_a100_smoke() {
     echo "guard=$(cat "$guard")"
     echo "m2_low_gib_s=$low_gib_s"
     echo "m1_min_output_tokens=$m1_min_output_tokens"
+    echo "m1_source_release_tail_s=$m1_source_release_tail_s"
     echo "source_prompt_tokens=$source_prompt_tokens"
     echo "source_start_event=$source_start_event"
     echo "source_start_after_s=$source_start_after_s"
@@ -284,6 +293,7 @@ run_m2_low_to_high_a100_smoke() {
     --persistent-channel --preconnect-persistent-channel --channel-generation 1 \
     --manager-m0-shadow --manager-m1-auto-start --manager-m2-rate \
     --m1-min-output-tokens "$m1_min_output_tokens" \
+    --m1-source-release-tail-s "$m1_source_release_tail_s" \
     "${m2_requirement[@]}" \
     "${initial_high_requirement[@]}" \
     "${m3_requirement[@]}" \
