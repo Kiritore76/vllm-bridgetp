@@ -252,6 +252,10 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="experimental earliest M1 Shadow start; M1 safety gates still apply",
     )
+    parser.add_argument(
+        "--m1-source-release-tail-s", type=float,
+        help="diagnostic tail allowance after estimated history copy until TP1 KV release",
+    )
     parser.add_argument("--manager-m2-rate", action="store_true")
     parser.add_argument("--manager-m3-commit", action="store_true")
     parser.add_argument("--manager-m4-cancel", action="store_true")
@@ -674,6 +678,14 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise ValueError(
             "M1 minimum output requires auto-start and at least 64 remaining tokens"
         )
+    if args.manager_m1_auto_start and (
+        args.m1_source_release_tail_s is None
+        or not math.isfinite(args.m1_source_release_tail_s)
+        or args.m1_source_release_tail_s <= 0
+    ):
+        raise ValueError("M1 requires a positive TP1 KV release tail allowance")
+    if not args.manager_m1_auto_start and args.m1_source_release_tail_s is not None:
+        raise ValueError("M1 release tail allowance requires auto-start")
     if args.tp4_max_num_seqs is not None and args.tp4_max_num_seqs <= 0:
         raise ValueError("TP4 max-num-seqs must be positive")
     if args.manager_m1_expect_stay and not (
@@ -3523,6 +3535,7 @@ def main() -> None:
         "commit_timing": args.commit_timing,
         "manager_m0_shadow": args.manager_m0_shadow,
         "manager_m1_auto_start": args.manager_m1_auto_start,
+        "m1_source_release_tail_s": args.m1_source_release_tail_s,
         "manager_m2_rate": args.manager_m2_rate,
         "manager_m3_commit": args.manager_m3_commit,
         "manager_m4_cancel": args.manager_m4_cancel,
@@ -3887,7 +3900,11 @@ def main() -> None:
                     ] = "1"
 
                 controller_extra_args = (
-                    ["--manager-m1-auto-start"]
+                    [
+                        "--manager-m1-auto-start",
+                        "--m1-source-release-tail-s",
+                        str(args.m1_source_release_tail_s),
+                    ]
                     if args.manager_m1_auto_start
                     else [
                         "--diagnostic-trigger-output-tokens",
