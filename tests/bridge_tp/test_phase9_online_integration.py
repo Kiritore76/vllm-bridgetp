@@ -16,6 +16,7 @@ from pathlib import Path
 
 from tools.bridge_tp.run_phase9_controller import (
     _prepare_source_request,
+    effective_m1_start_decision,
     step_handoff,
     step_local,
     step_shadow,
@@ -49,6 +50,15 @@ from vllm.bridge_tp.controller.token_equivalence import (
     classify_token_equivalence,
     first_divergence,
 )
+
+
+class TestPairedStayDecision(unittest.TestCase):
+    def test_preserves_natural_decision_but_suppresses_actuation(self) -> None:
+        natural = M1StartDecision("START_SHADOW", "source risk")
+        self.assertIs(effective_m1_start_decision(natural, False), natural)
+        held = effective_m1_start_decision(natural, True)
+        self.assertEqual(held.action, "STAY")
+        self.assertEqual(natural.action, "START_SHADOW")
 
 
 class TestProxyRecorder(unittest.TestCase):

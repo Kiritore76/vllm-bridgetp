@@ -150,6 +150,23 @@ class TestGoodOutputAudit(unittest.TestCase):
         report = audit_payload(value)
         self.assertFalse(report["request_rows"][0]["goodoutput_v4_success"])
 
+    def test_paired_stay_anchor_has_no_handoff(self) -> None:
+        value = payload()
+        value["online/contract.json"]["paired_stay"] = True
+        proxy = value["controller/response_proxy_stats.json"]
+        proxy["committed"] = False
+        proxy["target_origin_tokens"] = 0
+        proxy["handoff_stall_s"] = None
+        value.pop("controller/target_response.json")
+        source = value["controller/source_response.json"]
+        source["finish_reason"] = "length"
+        source["completed_unix_s"] = 0.2
+        report = audit_payload(value)
+        self.assertTrue(report["computable"], report["errors"])
+        anchor = report["metrics"]["by_pool"]["anchor"]
+        self.assertEqual(anchor["goodoutput_v4_success_requests"], 1)
+        self.assertEqual(report["request_rows"][-1]["handoff_ms"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
