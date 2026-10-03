@@ -2,6 +2,8 @@
 
 日期：2026-10-03。用途：为下一步同机 STAY/MIGRATE 配对实验预先固定离线指标。此文件只审计**已完成的迁移样本**，不推断迁移收益。
 
+后续请求级 SLO 定义已在 [v2 修订](GOODOUTPUT_REQUEST_SLO_V2_20261003_CN.md)中更新为 p99 TPOT；本文件保留 v1 逐 token GoodOutput 与旧严格口径的历史审计。
+
 ## 1. v1 计数规则
 
 从每个在线实验包的 `online/contract.json` 读取 SLO 阈值。目前四个样本均为 ITL/TPOT 50 ms、TTFT 1000 ms、E2E 60000 ms、handoff 1000 ms。不从一次结果的好坏反向调整阈值。

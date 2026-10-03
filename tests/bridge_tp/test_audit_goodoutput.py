@@ -51,6 +51,7 @@ class TestGoodOutputAudit(unittest.TestCase):
         self.assertEqual(system["output_tokens"], 6)
         self.assertEqual(system["good_tokens"], 5)
         self.assertEqual(system["strict_request_good_tokens"], 3)
+        self.assertEqual(system["request_slo_p99_good_tokens"], 3)
         self.assertEqual(system["bad_intervals"], 1)
         self.assertAlmostEqual(system["goodoutput_tokens_s"], 20.0)
         self.assertIsNone(report["benefit_vs_stay"])
@@ -89,6 +90,22 @@ class TestGoodOutputAudit(unittest.TestCase):
         system = report["metrics"]["by_pool"]["system"]
         self.assertEqual(system["requests"], 2)
         self.assertEqual(system["good_tokens"], 3)
+
+    def test_one_tail_gap_can_fail_legacy_strict_but_pass_p99(self) -> None:
+        value = payload()
+        peer = value["background/background_summary.json"]["results"][0]
+        times = [0.1 + index * 0.001 for index in range(100)]
+        times.append(times[-1] + 0.1)
+        peer["output_tokens"] = len(times)
+        peer["token_times_unix_s"] = times
+        peer["request_ended_unix_s"] = 0.35
+        report = audit_payload(value)
+        self.assertTrue(report["computable"], report["errors"])
+        source = report["metrics"]["by_pool"]["source"]
+        self.assertEqual(source["bad_intervals"], 1)
+        self.assertEqual(source["good_tokens"], 100)
+        self.assertEqual(source["strict_request_good_tokens"], 0)
+        self.assertEqual(source["request_slo_p99_good_tokens"], 101)
 
 
 if __name__ == "__main__":
