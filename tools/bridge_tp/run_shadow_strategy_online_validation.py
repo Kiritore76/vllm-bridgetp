@@ -1778,8 +1778,11 @@ def accept_m5_shadow(
             "enforce_eager=False" not in source_config
             or "CompilationMode.VLLM_COMPILE" not in source_config
             or "CUDAGraphMode.FULL_AND_PIECEWISE" not in source_config
+            or "vLLM's torch.compile cache is disabled" not in source_config
         ):
-            errors.append("M5 source did not retain compilation and CUDA graphs")
+            errors.append(
+                "M5 source did not retain uncached compilation and CUDA graphs"
+            )
     if not event_path.is_file() or not audit_path.is_file():
         errors.append("M5 source events or manager audit are missing")
     else:
@@ -3790,6 +3793,10 @@ def main() -> None:
                 source_env_overrides = {"BRIDGETP_SHADOW_STRATEGY": strategy}
                 if args.manager_m5_predictor_shadow:
                     source_env_overrides.update({
+                        # The auxiliary-layer selection is set after model
+                        # construction and is absent from vLLM's compile-cache
+                        # key. A normal cached graph can otherwise be reused.
+                        "VLLM_DISABLE_COMPILE_CACHE": "1",
                         "BRIDGETP_PREDICTOR_LIVE_CHECKPOINT": str(
                             args.predictor_checkpoint
                         ),
