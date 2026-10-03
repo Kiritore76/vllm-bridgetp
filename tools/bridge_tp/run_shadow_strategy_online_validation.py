@@ -260,6 +260,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manager-m3-commit", action="store_true")
     parser.add_argument("--manager-m4-cancel", action="store_true")
     parser.add_argument("--manager-m5-predictor-shadow", action="store_true")
+    parser.add_argument(
+        "--paired-stay", action="store_true",
+        help="paired GoodOutput control arm: retain M1/M5 observation but suppress migration",
+    )
     parser.add_argument("--predictor-checkpoint", type=Path)
     parser.add_argument("--predictor-checkpoint-sha256")
     parser.add_argument("--manager-m4-expect-cancel", action="store_true")
@@ -621,6 +625,15 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
             raise ValueError("M5 predictor checkpoint SHA-256 differs")
     if args.manager_m4_expect_cancel and not args.manager_m4_cancel:
         raise ValueError("M4 cancellation smoke requires M4 enabled")
+    if args.paired_stay and not (
+        args.manager_m1_auto_start
+        and args.shadow_only_only
+        and args.repetitions == 1
+        and not args.manager_m1_expect_stay
+        and not args.manager_m4_expect_cancel
+        and not args.persistent_sequential_reuse
+    ):
+        raise ValueError("paired STAY requires one fresh M1 Shadow-only run")
     if args.manager_m2_expected_profile and not args.manager_m2_rate:
         raise ValueError("M2 expected profile requires --manager-m2-rate")
     if not 0 <= args.manager_m2_min_history_byte_frac <= 1:
@@ -1668,6 +1681,67 @@ def accept_m1_stay(
             for row in decision_rows
         ) if decision_rows else None,
         "final_state": endings[0].get("final_state") if endings else None,
+        "errors": errors,
+    }
+
+
+def accept_paired_stay(
+    controller_dir: Path,
+    background_dir: Path,
+    expected_jobs: int,
+    expected_anchor_tokens: int,
+) -> dict[str, Any]:
+    """Require a complete TP1 response with M1 evidence and no migration actuation."""
+    background = common.read_json(background_dir / "background_summary.json")
+    source = common.read_json(controller_dir / "source_response.json")
+    proxy = common.read_json(controller_dir / "response_proxy_stats.json")
+    audit = _load_rows(controller_dir / "phase9_audit.jsonl")
+    decisions = [row for row in audit if row.get("kind") == "manager_m1_start_decision"]
+    interventions = [row for row in audit if row.get("kind") == "paired_stay_intervention"]
+    endings = [row for row in audit if row.get("kind") == "run_end"]
+    transitions = [row.get("to") for row in audit if row.get("kind") == "transition"]
+    errors: list[str] = []
+    if (background.get("jobs") != expected_jobs
+            or background.get("completed") != expected_jobs
+            or background.get("failed") != 0):
+        errors.append("background jobs did not all complete")
+    if (source.get("finish_reason") != "length"
+            or len(source.get("token_ids") or []) != expected_anchor_tokens):
+        errors.append("source did not finish its full capped output")
+    if (proxy.get("emitted_tokens") != expected_anchor_tokens
+            or proxy.get("source_origin_tokens") != expected_anchor_tokens
+            or proxy.get("target_origin_tokens") != 0
+            or proxy.get("committed") is not False):
+        errors.append("visible response was not entirely from TP1")
+    if len(endings) != 1 or endings[0].get("final_state") != "COMPLETED_ON_TP1":
+        errors.append("controller did not complete on TP1")
+    elif endings[0].get("trigger_path") is not None:
+        errors.append("paired STAY recorded a migration trigger")
+    if transitions != ["COMPLETED_ON_TP1"]:
+        errors.append("controller entered a migration state")
+    if not decisions:
+        errors.append("M1 did not produce online decisions")
+    natural_starts = sum(
+        row.get("decision", {}).get("action") == "START_SHADOW"
+        for row in decisions
+    )
+    if natural_starts != len(interventions):
+        errors.append("paired STAY intervention did not cover M1 starts")
+    if any((controller_dir / name).exists() for name in (
+        "session_manifest.json", "cutover_manifest.json", "target_response.json",
+    )):
+        errors.append("migration artifact exists in paired STAY arm")
+    return {
+        "format_version": 1,
+        "status": "PASS" if not errors else "FAIL",
+        "expected_anchor_tokens": expected_anchor_tokens,
+        "source_origin_tokens": proxy.get("source_origin_tokens"),
+        "target_origin_tokens": proxy.get("target_origin_tokens"),
+        "m1_decisions": len(decisions),
+        "natural_start_decisions": natural_starts,
+        "interventions": len(interventions),
+        "final_state": endings[0].get("final_state") if endings else None,
+        "background_completed": background.get("completed"),
         "errors": errors,
     }
 
@@ -3535,6 +3609,7 @@ def main() -> None:
         "commit_timing": args.commit_timing,
         "manager_m0_shadow": args.manager_m0_shadow,
         "manager_m1_auto_start": args.manager_m1_auto_start,
+        "paired_stay": args.paired_stay,
         "m1_source_release_tail_s": args.m1_source_release_tail_s,
         "manager_m2_rate": args.manager_m2_rate,
         "manager_m3_commit": args.manager_m3_commit,
@@ -3558,6 +3633,8 @@ def main() -> None:
         ),
         "manager_m1_expect_stay": args.manager_m1_expect_stay,
         "manager_m1_stay_reason": args.manager_m1_stay_reason,
+        "anchor_max_tokens": args.anchor_max_tokens,
+        "anchor_prompt_tokens": args.anchor_prompt_tokens,
         "tp4_max_num_seqs": args.tp4_max_num_seqs,
         "bridge_output_tokens": args.bridge_output_tokens,
         "repetitions": args.repetitions,
@@ -3748,7 +3825,12 @@ def main() -> None:
                     ),
                     selected_predictor_events: Path = predictor_event_path,
                 ) -> dict[str, Any]:
-                    if args.manager_m4_expect_cancel:
+                    if args.paired_stay:
+                        accepted = accept_paired_stay(
+                            controller_dir, background_dir,
+                            expected_jobs, expected_anchor_tokens,
+                        )
+                    elif args.manager_m4_expect_cancel:
                         accepted = accept_m4_cancel(
                             controller_dir, background_dir,
                             expected_jobs, expected_anchor_tokens,
@@ -3926,6 +4008,8 @@ def main() -> None:
                         "--predictor-checkpoint-sha256",
                         args.predictor_checkpoint_sha256,
                     ])
+                if args.paired_stay:
+                    controller_extra_args.append("--paired-stay")
                 if args.manager_m2_force_initial_high:
                     controller_extra_args.append(
                         "--manager-m2-force-initial-high"
@@ -4156,7 +4240,8 @@ def main() -> None:
         }
         # Cancellation has no freeze, commit, or target TPOT windows.  Its
         # acceptance record is the measurement for this diagnostic run.
-        if not args.manager_m1_expect_stay and not args.manager_m4_expect_cancel:
+        if not (args.manager_m1_expect_stay or args.manager_m4_expect_cancel
+                or args.paired_stay):
             write_measurements(out_root, batch["runs"])
         common.write_json(out_root / "acceptance.json", final)
         if errors:

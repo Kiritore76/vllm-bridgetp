@@ -17,6 +17,7 @@ from tools.bridge_tp.run_shadow_rate_load_matrix import (
 )
 from tools.bridge_tp.run_shadow_strategy_online_validation import (
     accept_m1_stay,
+    accept_paired_stay,
     build_controller_config_overrides,
     controller_completion_errors,
     emitted_boundary_gap_ms,
@@ -49,6 +50,45 @@ class TestOnlineShadowManifest(unittest.TestCase):
 
 
 class TestOnlineStrategyTiming(unittest.TestCase):
+    def test_paired_stay_requires_full_tp1_output_and_suppressed_start(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            controller, background = root / "controller", root / "background"
+            controller.mkdir()
+            background.mkdir()
+            (controller / "source_response.json").write_text(json.dumps({
+                "token_ids": [10, 11, 12], "finish_reason": "length",
+            }), encoding="utf-8")
+            (controller / "response_proxy_stats.json").write_text(json.dumps({
+                "emitted_tokens": 3, "source_origin_tokens": 3,
+                "target_origin_tokens": 0, "committed": False,
+            }), encoding="utf-8")
+            (background / "background_summary.json").write_text(json.dumps({
+                "jobs": 1, "completed": 1, "failed": 0,
+            }), encoding="utf-8")
+            rows = [
+                {"kind": "manager_m1_start_decision", "decision": {
+                    "action": "START_SHADOW", "reason": "source risk",
+                }},
+                {"kind": "paired_stay_intervention", "action": "STAY"},
+                {"kind": "transition", "to": "COMPLETED_ON_TP1"},
+                {"kind": "run_end", "final_state": "COMPLETED_ON_TP1"},
+            ]
+            audit = controller / "phase9_audit.jsonl"
+            audit.write_text("\n".join(map(json.dumps, rows)), encoding="utf-8")
+            self.assertEqual(
+                accept_paired_stay(controller, background, 1, 3)["status"],
+                "PASS",
+            )
+            audit.write_text(
+                "\n".join(map(json.dumps, rows[:1] + rows[2:])),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                accept_paired_stay(controller, background, 1, 3)["status"],
+                "FAIL",
+            )
+
     def test_source_readiness_requires_active_source_tokens(self) -> None:
         with TemporaryDirectory() as temp:
             event_path = Path(temp) / "events.jsonl"

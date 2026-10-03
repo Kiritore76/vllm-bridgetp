@@ -285,8 +285,14 @@ def audit_payload(
         v3_ttft_ms=v3_ttft_ms, v3_mean_tpot_ms=v3_mean_tpot_ms,
         errors=errors,
         handoff_ms=(
-            _number(proxy.get("handoff_stall_s")) * 1000
-            if _number(proxy.get("handoff_stall_s")) is not None else None
+            0.0
+            if (contract.get("paired_stay") is True
+                and proxy.get("committed") is False
+                and proxy.get("target_origin_tokens") == 0)
+            else (
+                _number(proxy.get("handoff_stall_s")) * 1000
+                if _number(proxy.get("handoff_stall_s")) is not None else None
+            )
         ),
     ))
     computable = not errors and all(row["good_tokens"] is not None for row in rows)
