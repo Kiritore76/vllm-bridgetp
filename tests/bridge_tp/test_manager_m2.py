@@ -18,6 +18,7 @@ from tools.bridge_tp.build_experiment_a4_pressure_manifest import (
     build_manifest as build_pressure_manifest,
 )
 from tools.bridge_tp.run_phase9_capacity_background import (
+    wait_for_controller_event,
     wait_for_m2_initial_rate,
 )
 from tools.bridge_tp.run_phase9_controller import parse_args
@@ -113,6 +114,29 @@ class TestM2RateController(unittest.TestCase):
             writer.start()
             started = time.monotonic()
             observed = wait_for_m2_initial_rate(audit, 1.0)
+            writer.join()
+            self.assertGreaterEqual(observed - started, 0.04)
+
+    def test_source_arrival_waits_for_anchor_output_not_m2_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            audit = Path(directory) / "audit.jsonl"
+
+            def publish() -> None:
+                audit.write_text(json.dumps({
+                    "kind": "telemetry", "output_tokens": 0,
+                }) + "\n", encoding="utf-8")
+                time.sleep(0.05)
+                with audit.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps({
+                        "kind": "telemetry", "output_tokens": 1,
+                    }) + "\n")
+
+            writer = threading.Thread(target=publish)
+            writer.start()
+            started = time.monotonic()
+            observed = wait_for_controller_event(
+                audit, "ANCHOR_FIRST_OUTPUT", 1.0,
+            )
             writer.join()
             self.assertGreaterEqual(observed - started, 0.04)
 

@@ -63,6 +63,34 @@ class TestA4PressureManifest(unittest.TestCase):
                 max_model_len=8192,
             )
 
+    def test_anchor_event_releases_source_jobs_independently_of_m2(self) -> None:
+        base = {
+            "format_version": 1,
+            "jobs": [{
+                "job_id": "target_000", "pool": "target", "request": {
+                    "model": "bridgetp-model", "prompt": [100], "max_tokens": 1,
+                },
+            }],
+        }
+        common = dict(
+            source_jobs=2, source_prompt_tokens=1920,
+            source_output_tokens=1024, source_start_after_s=1.0,
+            source_start_interval_s=0.05, source_prompt_token_id=100,
+            max_model_len=8192,
+        )
+        manifest = build_manifest(
+            base, **common, source_start_after_anchor_first_output=True,
+        )
+        self.assertEqual(
+            [job["start_after_event"] for job in manifest["jobs"][1:]],
+            ["ANCHOR_FIRST_OUTPUT"] * 2,
+        )
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            build_manifest(
+                base, **common, source_start_after_anchor_first_output=True,
+                source_start_after_m2_initial=True,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
