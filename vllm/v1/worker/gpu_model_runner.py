@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import reduce
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
 
 import numpy as np
@@ -30,7 +31,7 @@ from vllm.bridge_tp.logit_capture import (
     get_logit_capture_config,
     maybe_make_logit_observer,
 )
-from vllm.bridge_tp.predictor_capture import PredictorFeatureCapture
+from vllm.bridge_tp.predictor_capture import predictor_observer_from_environment
 from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
@@ -645,7 +646,11 @@ class GPUModelRunner(
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
-        self.predictor_feature_capture = PredictorFeatureCapture.from_environment()
+        self.predictor_feature_capture = predictor_observer_from_environment(
+            Path(self.model_config.model),
+            self.device,
+            self.parallel_config.tensor_parallel_size,
+        )
         if self.predictor_feature_capture is not None and (
             self.is_pooling_model
             or self.use_async_scheduling
@@ -6377,6 +6382,11 @@ class GPUModelRunner(
         memory is reclaimable when running in the same process."""
         from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
         from vllm.v1.worker.workspace import reset_workspace_manager
+
+        if self.predictor_feature_capture is not None and hasattr(
+            self.predictor_feature_capture, "close"
+        ):
+            self.predictor_feature_capture.close()
 
         # Calls torch.accelerator.synchronize()
         self._cleanup_profiling_kv_cache()

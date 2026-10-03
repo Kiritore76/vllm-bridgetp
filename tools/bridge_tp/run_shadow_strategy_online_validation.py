@@ -255,6 +255,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manager-m2-rate", action="store_true")
     parser.add_argument("--manager-m3-commit", action="store_true")
     parser.add_argument("--manager-m4-cancel", action="store_true")
+    parser.add_argument("--manager-m5-predictor-shadow", action="store_true")
+    parser.add_argument("--predictor-checkpoint", type=Path)
+    parser.add_argument("--predictor-checkpoint-sha256")
     parser.add_argument("--manager-m4-expect-cancel", action="store_true")
     parser.add_argument("--manager-m2-force-initial-high", action="store_true")
     parser.add_argument("--manager-m2-require-source-high", action="store_true")
@@ -603,6 +606,15 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         )
     if args.manager_m4_cancel and not args.manager_m3_commit:
         raise ValueError("M4 requires M3 earliest-ready commit")
+    if args.manager_m5_predictor_shadow:
+        if args.predictor_checkpoint is None or not args.predictor_checkpoint_sha256:
+            raise ValueError("M5 requires checkpoint path and SHA-256")
+        if args.repetitions != 1 or args.persistent_sequential_reuse:
+            raise ValueError("M5 smoke requires one fresh source server session")
+        if not args.predictor_checkpoint.is_file():
+            raise FileNotFoundError(args.predictor_checkpoint)
+        if common.sha256(args.predictor_checkpoint) != args.predictor_checkpoint_sha256:
+            raise ValueError("M5 predictor checkpoint SHA-256 differs")
     if args.manager_m4_expect_cancel and not args.manager_m4_cancel:
         raise ValueError("M4 cancellation smoke requires M4 enabled")
     if args.manager_m2_expected_profile and not args.manager_m2_rate:
@@ -1746,6 +1758,44 @@ def m2_expected_profile_used(
         abs(float(row.get("rate_gib_s", 0)) - expected_rate) <= 1e-9
         for row in rate_rows
     )
+
+
+def accept_m5_shadow(
+    accepted: dict[str, Any], controller_dir: Path,
+    event_path: Path, checkpoint_sha256: str,
+) -> dict[str, Any]:
+    """Require real source inference and manager consumption in M5 smoke."""
+    errors = list(accepted.get("errors", []))
+    audit_path = controller_dir / "phase9_audit.jsonl"
+    predictions = 0
+    available = 0
+    if not event_path.is_file() or not audit_path.is_file():
+        errors.append("M5 source events or manager audit are missing")
+    else:
+        events = [json.loads(line) for line in event_path.read_text(
+            encoding="utf-8"
+        ).splitlines() if line]
+        if not events or events[0].get("checkpoint_sha256") != checkpoint_sha256:
+            errors.append("M5 source event header has wrong checkpoint SHA")
+        predictions = sum(
+            row.get("kind") == "predictor_prediction" for row in events
+        )
+        audit = [json.loads(line) for line in audit_path.read_text(
+            encoding="utf-8"
+        ).splitlines() if line]
+        available = sum(
+            row.get("kind") == "manager_m5_predictor_shadow"
+            and row.get("status") == "AVAILABLE" for row in audit
+        )
+        if predictions == 0 or available == 0:
+            errors.append("M5 did not produce and consume an online prediction")
+    return {
+        **accepted,
+        "status": "PASS" if not errors else "FAIL",
+        "errors": errors,
+        "m5_source_predictions": predictions,
+        "m5_manager_available_ticks": available,
+    }
 
 
 def accept_m4_cancel(
@@ -3415,6 +3465,8 @@ def main() -> None:
         "manager_m2_rate": args.manager_m2_rate,
         "manager_m3_commit": args.manager_m3_commit,
         "manager_m4_cancel": args.manager_m4_cancel,
+        "manager_m5_predictor_shadow": args.manager_m5_predictor_shadow,
+        "predictor_checkpoint_sha256": args.predictor_checkpoint_sha256,
         "manager_m4_expect_cancel": args.manager_m4_expect_cancel,
         "m3_policy": (
             "COMMIT_EARLIEST_WHEN_READY" if args.manager_m3_commit else None
@@ -3596,9 +3648,12 @@ def main() -> None:
                     # connector boundary enables that manifest-driven lookup;
                     # it is not used as a runtime cutover value.
                     rep_args.cutover_output_tokens = 0
-                rep_args.force_source_eager = bool(args.online_remote_attention)
+                rep_args.force_source_eager = bool(
+                    args.online_remote_attention or args.manager_m5_predictor_shadow
+                )
                 rep_args.out_root = out_root / label
                 run_id = f"{out_root.name}-{label}"
+                predictor_event_path = rep_args.out_root / "predictor_events.jsonl"
 
                 def acceptance(
                     controller_dir: Path,
@@ -3619,77 +3674,96 @@ def main() -> None:
                     selected_post_destroy: bool = (
                         selected_post_takeover_destroy
                     ),
+                    selected_predictor_events: Path = predictor_event_path,
                 ) -> dict[str, Any]:
                     if args.manager_m4_expect_cancel:
-                        return accept_m4_cancel(
+                        accepted = accept_m4_cancel(
                             controller_dir, background_dir,
                             expected_jobs, expected_anchor_tokens,
                         )
-                    return accept_online(
-                        controller_dir,
-                        background_dir,
-                        expected_jobs,
-                        expected_anchor_tokens,
-                        strategy=selected,
-                        minimum_window_samples=args.minimum_window_samples,
-                        fixed_rate_gib_s=args.fixed_rate_gib_s,
-                        manager_m2_rate=args.manager_m2_rate,
-                        manager_m3_commit=args.manager_m3_commit,
-                        manager_m2_expected_profile=(
-                            args.manager_m2_expected_profile
-                        ),
-                        manager_m2_min_history_byte_frac=(
-                            args.manager_m2_min_history_byte_frac
-                        ),
-                        manager_m2_require_source_high=(
-                            args.manager_m2_require_source_high
-                        ),
-                        manager_m2_require_low_to_high=(
-                            args.manager_m2_require_low_to_high
-                        ),
-                        m2_profiles_gib_s=(
-                            (args.m2_low_gib_s, args.m2_medium_gib_s,
-                             args.m2_high_gib_s)
-                            if args.manager_m2_rate else None
-                        ),
-                        gpu_direct_history_pacing_expected=(
-                            args.gpu_direct_history_pacing
-                        ),
-                        handoff_mode=selected_handoff,
-                        require_remote_attention=selected_remote,
-                        slo_tpot_ms=args.slo_tpot_ms,
-                        slo_ttft_ms=args.slo_ttft_ms,
-                        slo_e2e_ms=args.slo_e2e_ms,
-                        slo_handoff_ms=args.slo_handoff_ms,
-                        stop_and_copy=selected_stop,
-                        ready_sync_mode=selected_ready_sync,
-                        ready_notification_mode=(
-                            selected_ready_notification
-                        ),
-                        deferred_comm_destroy=selected_deferred_destroy,
-                        post_takeover_comm_destroy=selected_post_destroy,
-                        persistent_channel=args.persistent_channel,
-                        preconnect_persistent_channel=(
-                            args.preconnect_persistent_channel
-                        ),
-                        persistent_expected_session_count=(
-                            repetition
-                            if args.persistent_sequential_reuse
-                            else 1
-                        ),
-                        commit_timing=args.commit_timing,
-                        manager_m1_auto_start=args.manager_m1_auto_start,
-                        manager_m1_expect_stay=args.manager_m1_expect_stay,
-                        manager_m1_stay_reason=args.manager_m1_stay_reason,
-                        source_pressure_expected_jobs=(
-                            pressure["source_jobs"] if args.source_pressure else 0
-                        ),
-                        minimum_source_kv_usage_frac=(
-                            args.minimum_source_kv_usage_frac
-                        ),
-                    )
+                    else:
+                        accepted = accept_online(
+                            controller_dir,
+                            background_dir,
+                            expected_jobs,
+                            expected_anchor_tokens,
+                            strategy=selected,
+                            minimum_window_samples=args.minimum_window_samples,
+                            fixed_rate_gib_s=args.fixed_rate_gib_s,
+                            manager_m2_rate=args.manager_m2_rate,
+                            manager_m3_commit=args.manager_m3_commit,
+                            manager_m2_expected_profile=(
+                                args.manager_m2_expected_profile
+                            ),
+                            manager_m2_min_history_byte_frac=(
+                                args.manager_m2_min_history_byte_frac
+                            ),
+                            manager_m2_require_source_high=(
+                                args.manager_m2_require_source_high
+                            ),
+                            manager_m2_require_low_to_high=(
+                                args.manager_m2_require_low_to_high
+                            ),
+                            m2_profiles_gib_s=(
+                                (args.m2_low_gib_s, args.m2_medium_gib_s,
+                                 args.m2_high_gib_s)
+                                if args.manager_m2_rate else None
+                            ),
+                            gpu_direct_history_pacing_expected=(
+                                args.gpu_direct_history_pacing
+                            ),
+                            handoff_mode=selected_handoff,
+                            require_remote_attention=selected_remote,
+                            slo_tpot_ms=args.slo_tpot_ms,
+                            slo_ttft_ms=args.slo_ttft_ms,
+                            slo_e2e_ms=args.slo_e2e_ms,
+                            slo_handoff_ms=args.slo_handoff_ms,
+                            stop_and_copy=selected_stop,
+                            ready_sync_mode=selected_ready_sync,
+                            ready_notification_mode=(
+                                selected_ready_notification
+                            ),
+                            deferred_comm_destroy=selected_deferred_destroy,
+                            post_takeover_comm_destroy=selected_post_destroy,
+                            persistent_channel=args.persistent_channel,
+                            preconnect_persistent_channel=(
+                                args.preconnect_persistent_channel
+                            ),
+                            persistent_expected_session_count=(
+                                repetition
+                                if args.persistent_sequential_reuse
+                                else 1
+                            ),
+                            commit_timing=args.commit_timing,
+                            manager_m1_auto_start=args.manager_m1_auto_start,
+                            manager_m1_expect_stay=args.manager_m1_expect_stay,
+                            manager_m1_stay_reason=args.manager_m1_stay_reason,
+                            source_pressure_expected_jobs=(
+                                pressure["source_jobs"] if args.source_pressure else 0
+                            ),
+                            minimum_source_kv_usage_frac=(
+                                args.minimum_source_kv_usage_frac
+                            ),
+                        )
+                    if args.manager_m5_predictor_shadow:
+                        accepted = accept_m5_shadow(
+                            accepted, controller_dir,
+                            selected_predictor_events,
+                            args.predictor_checkpoint_sha256,
+                        )
+                    return accepted
 
                 source_env_overrides = {"BRIDGETP_SHADOW_STRATEGY": strategy}
+                if args.manager_m5_predictor_shadow:
+                    source_env_overrides.update({
+                        "BRIDGETP_PREDICTOR_LIVE_CHECKPOINT": str(
+                            args.predictor_checkpoint
+                        ),
+                        "BRIDGETP_PREDICTOR_LIVE_SHA256": (
+                            args.predictor_checkpoint_sha256
+                        ),
+                        "BRIDGETP_PREDICTOR_LIVE_EVENTS": str(predictor_event_path),
+                    })
                 if handoff_mode == "shadow-only":
                     source_env_overrides["BRIDGETP_REQUEST_FREEZE_ENABLED"] = "1"
                 if selected_stop_and_copy:
@@ -3765,6 +3839,13 @@ def main() -> None:
                     controller_extra_args.append("--manager-m3-commit")
                 if args.manager_m4_cancel:
                     controller_extra_args.append("--manager-m4-cancel")
+                if args.manager_m5_predictor_shadow:
+                    controller_extra_args.extend([
+                        "--manager-m5-predictor-shadow",
+                        "--predictor-event-path", str(predictor_event_path),
+                        "--predictor-checkpoint-sha256",
+                        args.predictor_checkpoint_sha256,
+                    ])
                 if args.manager_m2_force_initial_high:
                     controller_extra_args.append(
                         "--manager-m2-force-initial-high"

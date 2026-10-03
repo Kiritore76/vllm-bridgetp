@@ -14,11 +14,16 @@ run_m2_low_to_high_a100_smoke() {
   local m3_commit="${BRIDGETP_M3_COMMIT:-0}"
   local m4_cancel="${BRIDGETP_M4_CANCEL:-0}"
   local m4_expect_cancel="${BRIDGETP_M4_EXPECT_CANCEL:-0}"
+  local m5_shadow="${BRIDGETP_M5_SHADOW:-0}"
+  local expected_branch="${BRIDGETP_EXPECTED_BRANCH:-bridgetp/runtime-controller}"
+  local predictor_checkpoint="${BRIDGETP_M5_CHECKPOINT:-}"
+  local predictor_sha="${BRIDGETP_M5_CHECKPOINT_SHA256:-}"
   local anchor_max_tokens=1024 trigger_output_tokens=64
   local source_jobs=8 source_prompt_tokens=1920 source_output_tokens=1024
   local mode=event-low-high
   local m2_requirement=()
   local m3_requirement=()
+  local m5_requirement=()
   if [[ "$require_low_to_high" == 0 ]]; then
     mode=split-capacity
   elif [[ "$require_low_to_high" == 1 ]]; then
@@ -56,6 +61,23 @@ run_m2_low_to_high_a100_smoke() {
     echo "BRIDGETP_M4_EXPECT_CANCEL requires BRIDGETP_M4_CANCEL=1"
     return 1
   fi
+  if [[ "$m5_shadow" == 1 ]]; then
+    [[ -f "$predictor_checkpoint" && -n "$predictor_sha" ]] || {
+      echo "M5 requires a local checkpoint and expected SHA-256"
+      return 1
+    }
+    [[ "$(sha256sum "$predictor_checkpoint" | cut -d' ' -f1)" == "$predictor_sha" ]] || {
+      echo "M5 checkpoint SHA-256 differs"
+      return 1
+    }
+    m5_requirement=(--manager-m5-predictor-shadow
+      --predictor-checkpoint "$predictor_checkpoint"
+      --predictor-checkpoint-sha256 "$predictor_sha")
+    mode=m5-shadow
+  elif [[ "$m5_shadow" != 0 ]]; then
+    echo "BRIDGETP_M5_SHADOW must be 0 or 1"
+    return 1
+  fi
   local model=/root/autodl-tmp/models/models/Qwen--Qwen2.5-14B-Instruct/snapshots/master
   local base=/root/autodl-tmp/bridgetp/a1d_manifests/working/a1d-full-smoke-20260922T153543Z-output-1024.json
   local survival=/root/autodl-tmp/bridgetp/phase9_cap0_inputs/survival_table_m1_v1.json
@@ -70,7 +92,7 @@ run_m2_low_to_high_a100_smoke() {
     echo "HEAD differs from BRIDGETP_EXPECTED_REVISION; no run"
     return 1
   }
-  [[ "$(git branch --show-current)" == bridgetp/runtime-controller ]] || {
+  [[ "$(git branch --show-current)" == "$expected_branch" ]] || {
     echo "Wrong branch; no run"
     return 1
   }
@@ -104,6 +126,10 @@ run_m2_low_to_high_a100_smoke() {
     python -m unittest \
       tests.bridge_tp.test_gpu_direct_history_lifecycle.TestGpuDirectHistoryLifecycle.test_cancelled_prebound_history_releases_unadmitted_payload \
       || return 1
+  fi
+  if [[ "$m5_shadow" == 1 ]]; then
+    python -m unittest tests.bridge_tp.test_distribution_predictor_runtime \
+      tests.bridge_tp.test_manager_m5 || return 1
   fi
   python -m unittest discover -s tests/bridge_tp \
     -p test_phase9_capacity_pilot.py || return 1
@@ -142,6 +168,10 @@ run_m2_low_to_high_a100_smoke() {
     echo "m3_commit=$m3_commit"
     echo "m4_cancel=$m4_cancel"
     echo "m4_expect_cancel=$m4_expect_cancel"
+    echo "m5_shadow=$m5_shadow"
+    if [[ "$m5_shadow" == 1 ]]; then
+      sha256sum "$predictor_checkpoint" "$model/config.json"
+    fi
     echo "anchor_max_tokens=$anchor_max_tokens"
     echo "trigger_output_tokens=$trigger_output_tokens"
     if [[ "$m3_commit" == 1 ]]; then
@@ -169,6 +199,7 @@ run_m2_low_to_high_a100_smoke() {
     --m1-min-output-tokens "$m1_min_output_tokens" \
     "${m2_requirement[@]}" \
     "${m3_requirement[@]}" \
+    "${m5_requirement[@]}" \
     --m2-low-gib-s "$low_gib_s" --m2-medium-gib-s 2.4 --m2-high-gib-s 8.0 \
     --source-pressure --minimum-ready-source-jobs 0 \
     --trigger-output-tokens "$trigger_output_tokens" --bridge-output-tokens 96 \
