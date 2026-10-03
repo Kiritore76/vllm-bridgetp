@@ -22,7 +22,10 @@ class TestM5LateStartAudit(unittest.TestCase):
         for path in (controller, background, provenance):
             path.mkdir(parents=True)
         rows = [
-            {"kind": "telemetry", "unix_s": 100.0, "output_tokens": 1},
+            {"kind": "telemetry", "unix_s": 100.0, "output_tokens": 1,
+             "capacity_signal": {"prefill_scheduled_tokens_total": 2048}},
+            {"kind": "telemetry", "unix_s": 101.5, "output_tokens": 80,
+             "capacity_signal": {"prefill_scheduled_tokens_total": 4352}},
             {"kind": "manager_m1_start_decision", "unix_s": 102.0,
              "snapshot": {"generated_tokens": output,
                           "source_guard_free_kv_tokens": 8448},
