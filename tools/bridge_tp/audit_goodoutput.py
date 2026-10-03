@@ -108,6 +108,7 @@ def _score_request(
         "output_tokens": expected_tokens,
         "good_tokens": None, "bad_intervals": None,
         "goodoutput_v3_success": None,
+        "goodoutput_v4_success": None,
         "request_slo_success_p99": None,
         "strict_slo_success": None,
     }
@@ -125,6 +126,7 @@ def _score_request(
             "started_unix_s": start, "ended_unix_s": end,
             "good_tokens": 0, "bad_intervals": 0,
             "goodoutput_v3_success": False,
+            "goodoutput_v4_success": False,
             "request_slo_success_p99": False,
             "strict_slo_success": False,
         })
@@ -179,6 +181,11 @@ def _score_request(
         "goodoutput_v3_success": (
             ttft_ms <= v3_ttft_ms
             and e2e_ms <= thresholds["e2e_ms"]
+            and (mean_itl_ms is None or mean_itl_ms <= v3_mean_tpot_ms)
+            and handoff_valid
+        ),
+        "goodoutput_v4_success": (
+            e2e_ms <= thresholds["e2e_ms"]
             and (mean_itl_ms is None or mean_itl_ms <= v3_mean_tpot_ms)
             and handoff_valid
         ),
@@ -306,6 +313,10 @@ def audit_payload(
                     row["output_tokens"] for row in subset
                     if row["goodoutput_v3_success"]
                 )
+                v4_good = sum(
+                    row["output_tokens"] for row in subset
+                    if row["goodoutput_v4_success"]
+                )
                 intervals = sum(max(0, row["output_tokens"] - 1) for row in subset
                                 if row["status"] == "COMPLETED")
                 bad = sum(row["bad_intervals"] for row in subset)
@@ -316,6 +327,9 @@ def audit_payload(
                 v3_successes = sum(
                     bool(row["goodoutput_v3_success"]) for row in subset
                 )
+                v4_successes = sum(
+                    bool(row["goodoutput_v4_success"]) for row in subset
+                )
                 by_pool[pool] = {
                     "requests": len(subset), "output_tokens": raw,
                     "good_tokens": good,
@@ -323,6 +337,11 @@ def audit_payload(
                     "goodoutput_v3_success_requests": v3_successes,
                     "goodoutput_v3_success_rate": (
                         v3_successes / len(subset) if subset else None
+                    ),
+                    "goodoutput_v4_tokens": v4_good,
+                    "goodoutput_v4_success_requests": v4_successes,
+                    "goodoutput_v4_success_rate": (
+                        v4_successes / len(subset) if subset else None
                     ),
                     "strict_request_good_tokens": strict,
                     "request_slo_p99_good_tokens": request_slo,
@@ -343,6 +362,7 @@ def audit_payload(
                     ),
                     "goodoutput_tokens_s": good / wall_s,
                     "goodoutput_v3_tokens_s": v3_good / wall_s,
+                    "goodoutput_v4_tokens_s": v4_good / wall_s,
                     "request_slo_p99_goodput_tokens_s": request_slo / wall_s,
                     "strict_request_goodput_tokens_s": strict / wall_s,
                 }
@@ -357,6 +377,15 @@ def audit_payload(
             "3 s TTFT is a sensitivity threshold; the formal SLO requires "
             "normal-arrival workload and service-objective validation"
         ),
+        "primary_metric": "goodoutput_v4_tokens_s",
+        "primary_metric_definition": (
+            "completed_request_mean_tpot_e2e_handoff_without_ttft_v4"
+        ),
+        "v4_thresholds": {
+            "mean_tpot_ms": v3_mean_tpot_ms,
+            "e2e_ms": thresholds.get("e2e_ms"),
+            "handoff_ms": thresholds.get("handoff_ms"),
+        },
         "v3_thresholds": {
             "ttft_ms": v3_ttft_ms, "mean_tpot_ms": v3_mean_tpot_ms,
             "e2e_ms": thresholds.get("e2e_ms"),
@@ -379,12 +408,13 @@ def main() -> None:
                         help="one online result .tar.gz or extracted run directory")
     parser.add_argument("--out-json", type=Path, required=True)
     parser.add_argument("--v3-ttft-ms", type=float, default=3000.0)
-    parser.add_argument("--v3-mean-tpot-ms", type=float, default=50.0)
+    parser.add_argument("--mean-tpot-ms", "--v3-mean-tpot-ms",
+                        dest="mean_tpot_ms", type=float, default=50.0)
     args = parser.parse_args()
     values, locations = _read_members(args.input)
     report = audit_payload(
         values, v3_ttft_ms=args.v3_ttft_ms,
-        v3_mean_tpot_ms=args.v3_mean_tpot_ms,
+        v3_mean_tpot_ms=args.mean_tpot_ms,
     )
     report["input"] = str(args.input.resolve())
     report["member_locations"] = locations
