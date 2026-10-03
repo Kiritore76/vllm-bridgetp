@@ -31,7 +31,10 @@ from vllm.bridge_tp.logit_capture import (
     get_logit_capture_config,
     maybe_make_logit_observer,
 )
-from vllm.bridge_tp.predictor_capture import predictor_observer_from_environment
+from vllm.bridge_tp.predictor_capture import (
+    PredictorLiveObserver,
+    predictor_observer_from_environment,
+)
 from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
@@ -651,6 +654,13 @@ class GPUModelRunner(
             self.device,
             self.parallel_config.tensor_parallel_size,
         )
+        self.predictor_live_aux_output = isinstance(
+            self.predictor_feature_capture, PredictorLiveObserver
+        )
+        if self.predictor_live_aux_output:
+            # Qwen2's existing EAGLE auxiliary-output path is compiled and
+            # CUDA-graph compatible; it returns the full decoder residual state.
+            self.use_aux_hidden_state_outputs = True
         if self.predictor_feature_capture is not None and (
             self.is_pooling_model
             or self.use_async_scheduling
@@ -666,6 +676,7 @@ class GPUModelRunner(
             self.predictor_feature_capture is not None
             and self.predictor_feature_capture.layer_index is not None
             and not self.model_config.enforce_eager
+            and not self.predictor_live_aux_output
         ):
             raise ValueError("intermediate predictor capture requires enforce_eager")
         # NOTE(rob): num_prompt_logprobs only includes reqs
@@ -4400,10 +4411,17 @@ class GPUModelRunner(
 
         if self.predictor_feature_capture is not None:
             active_req_ids = req_ids[:num_reqs]
-            self.predictor_feature_capture.capture(
-                self.predictor_feature_capture.sample_states(
+            predictor_states = (
+                self.predictor_feature_capture.sample_aux_states(
+                    sample_hidden_states, logits_indices, aux_hidden_states
+                )
+                if self.predictor_live_aux_output
+                else self.predictor_feature_capture.sample_states(
                     sample_hidden_states, logits_indices
-                ),
+                )
+            )
+            self.predictor_feature_capture.capture(
+                predictor_states,
                 active_req_ids,
                 [
                     len(self.requests[req_id].output_token_ids)
@@ -5369,15 +5387,19 @@ class GPUModelRunner(
                 "Model does not support EAGLE3 interface but "
                 "aux_hidden_state_outputs was requested"
             )
-        # Try to get auxiliary layers from speculative config,
-        # otherwise use model's default layers
-        aux_layers = self._get_eagle3_aux_layers_from_config()
-        if aux_layers:
-            logger.info(
-                "Using auxiliary layers from speculative config: %s", aux_layers
-            )
+        if self.predictor_live_aux_output:
+            assert isinstance(self.predictor_feature_capture, PredictorLiveObserver)
+            # Qwen2Model passes idx + 1 to EagleModelMixin after each block.
+            aux_layers = (self.predictor_feature_capture.layer_index + 1,)
         else:
-            aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
+            # Try speculative config, then the model's default layers.
+            aux_layers = self._get_eagle3_aux_layers_from_config()
+            if aux_layers:
+                logger.info(
+                    "Using auxiliary layers from speculative config: %s", aux_layers
+                )
+            else:
+                aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
 
         self.model.set_aux_hidden_state_layers(aux_layers)
 
