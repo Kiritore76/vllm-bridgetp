@@ -13,6 +13,7 @@ from unittest import mock
 from tools.bridge_tp.run_goodoutput_gates_a100 import (
     build_natural_pressure,
     configure_late_command,
+    configure_pressure_command,
     pressure_evidence,
 )
 
@@ -78,6 +79,8 @@ class TestNaturalPressure(unittest.TestCase):
                                     for job in source))
                 self.assertTrue(all(job["request"]["ignore_eos"] is False
                                     for job in source))
+                self.assertTrue(all(job["start_after_event"]
+                                    == "ANCHOR_FIRST_OUTPUT" for job in source))
 
     def test_guard_requires_safe_minimum(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -91,9 +94,20 @@ class TestNaturalPressure(unittest.TestCase):
                 {"kind": "telemetry", "output_tokens": 2,
                  "tp1": {"free_kv_blocks": 600, "block_size": 16,
                          "preemptions_total": 0}},
+                {"kind": "manager_m1_start_decision", "unix_s": 10.0,
+                 "decision": {"action": "START_SHADOW"},
+                 "snapshot": {"source_free_kv_tokens": 9600,
+                              "generated_tokens": 192}},
             ]
+            background_path = root / "background" / "background_summary.json"
+            background_path.parent.mkdir()
+            background_path.write_text(json.dumps({
+                "results": [{"pool": "source", "first_token_unix_s": 9.0,
+                             "request_ended_unix_s": 11.0}] * 3}))
             audit.write_text("".join(json.dumps(row) + "\n" for row in rows))
             self.assertTrue(pressure_evidence(root)["valid"])
+            self.assertEqual(
+                pressure_evidence(root)["m1_start_output_tokens"], 192)
             rows[1]["tp1"]["free_kv_blocks"] = 500
             audit.write_text("".join(json.dumps(row) + "\n" for row in rows))
             self.assertFalse(pressure_evidence(root)["valid"])
@@ -108,6 +122,13 @@ class TestNaturalPressure(unittest.TestCase):
             int(command[command.index("--cutover-output-tokens") + 1]),
             int(command[command.index("--trigger-output-tokens") + 1]),
         )
+
+    def test_pressure_starts_only_after_anchor_and_near_guard(self) -> None:
+        command = ["--minimum-ready-source-jobs", "3",
+                   "--m1-min-output-tokens", "96",
+                   "--cutover-output-tokens", "160"]
+        configure_pressure_command(command)
+        self.assertEqual(command[1::2], ["0", "192", "320", "0", "14000"])
 
 
 if __name__ == "__main__":
