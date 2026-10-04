@@ -2531,7 +2531,6 @@ def accept_online(
                            for row in direct_ranks)
                     or len(chunks) < 2
                     or len(chunks) != paced.get("history_pacing_chunk_count")
-                    or float(paced.get("history_pacing_sleep_ms") or 0) <= 0
                     or any(
                         all(
                             abs(float(row.get("requested_rate_gib_s", 0))
@@ -2546,6 +2545,7 @@ def accept_online(
                     total_bytes = sum(int(row.get("raw_tensor_bytes", 0))
                                       for row in direct_ranks)
                     burst_bytes = int(chunks[-1].get("aggregate_bytes", 0))
+                    # Slow sends can satisfy the rate cap without sleeping.
                     minimum_ms = (
                         (total_bytes - burst_bytes)
                         / (max(float(rate) for rate in allowed_rates) * 1024**3)
