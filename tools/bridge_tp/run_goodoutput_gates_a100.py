@@ -130,8 +130,8 @@ def configure_late_command(command: list[str]) -> None:
 def configure_pressure_command(command: list[str]) -> None:
     replace_option(command, "--minimum-ready-source-jobs", "0")
     replace_option(command, "--m1-min-output-tokens", "192")
-    replace_option(command, "--cutover-output-tokens", "320")
     command += [
+        "--cutover-output-tokens", "320",
         "--background-lead-s", "0",
         "--diagnostic-m1-max-source-free-kv-tokens",
         str(PRESSURE_START_FREE_LIMIT),

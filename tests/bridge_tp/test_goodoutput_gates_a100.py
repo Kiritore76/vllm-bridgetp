@@ -125,8 +125,7 @@ class TestNaturalPressure(unittest.TestCase):
 
     def test_pressure_starts_only_after_anchor_and_near_guard(self) -> None:
         command = ["--minimum-ready-source-jobs", "3",
-                   "--m1-min-output-tokens", "96",
-                   "--cutover-output-tokens", "160"]
+                   "--m1-min-output-tokens", "96"]
         configure_pressure_command(command)
         self.assertEqual(command[1::2], ["0", "192", "320", "0", "14000"])
 
