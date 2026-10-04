@@ -157,6 +157,10 @@ def parse_args() -> argparse.Namespace:
         help="paired counterfactual: audit M1/M5 but keep the anchor on TP1",
     )
     parser.add_argument(
+        "--diagnostic-m1-max-source-free-kv-tokens", type=int,
+        help="experiment-only: defer M1 Shadow until TP1 free KV is at most this",
+    )
+    parser.add_argument(
         "--m1-source-release-tail-s", type=float,
         help="diagnostic tail allowance after estimated history copy until TP1 KV release",
     )
@@ -304,6 +308,11 @@ def parse_args() -> argparse.Namespace:
             )
     if args.manager_m4_cancel and not args.manager_m3_commit:
         parser.error("M4 cancel requires M3 earliest-ready commit")
+    if args.diagnostic_m1_max_source_free_kv_tokens is not None and (
+        not args.manager_m1_auto_start
+        or args.diagnostic_m1_max_source_free_kv_tokens <= 0
+    ):
+        parser.error("diagnostic M1 source-free gate requires M1 and a positive limit")
     if args.manager_m5_predictor_shadow and (
         args.predictor_event_path is None
         or args.predictor_checkpoint_sha256 is None
@@ -1697,6 +1706,17 @@ def main() -> None:
                         ),
                         kv_bytes_per_token=config.policy.kv_bytes_per_token,
                     )
+                    if (
+                        m1_start_decision.action == "START_SHADOW"
+                        and args.diagnostic_m1_max_source_free_kv_tokens is not None
+                        and m1_snapshot.source_free_kv_tokens is not None
+                        and m1_snapshot.source_free_kv_tokens
+                        > args.diagnostic_m1_max_source_free_kv_tokens
+                    ):
+                        m1_start_decision = replace(
+                            m1_start_decision, action="STAY",
+                            reason="diagnostic source pressure gate not reached",
+                        )
                     audit.write(
                         {
                             "kind": "manager_m1_start_decision",

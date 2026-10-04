@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 import statistics
 import sys
 import tarfile
@@ -28,8 +29,8 @@ from tools.bridge_tp.run_goodoutput_matrix_a100 import (
 )
 
 GUARD_TOKENS = 8448
-GUARD_BAND_UPPER = 14000
 REPEATS = 3
+PRESSURE_START_FREE_LIMIT = 14000
 
 
 def build_natural_pressure(
@@ -84,6 +85,7 @@ def build_natural_pressure(
             pressure_jobs.append({
                 "job_id": f"source_{index:03d}", "pool": "source",
                 "start_after_s": index * 0.1,
+                "start_after_event": "ANCHOR_FIRST_OUTPUT",
                 "request": {"model": "bridgetp-model", "prompt": prompt,
                             "max_tokens": 768, "ignore_eos": False},
                 "input_id": row["id"],
@@ -97,6 +99,9 @@ def build_natural_pressure(
             "pressure_prompt_tokens": 3584,
             "pressure_request_max_tokens": 768,
             "natural_eos_required": True,
+            "pressure_start_event": "ANCHOR_FIRST_OUTPUT",
+            "diagnostic_m1_max_source_free_kv_tokens": (
+                PRESSURE_START_FREE_LIMIT),
             "jobs": target_jobs + pressure_jobs,
         }
         path = run_dir / "inputs" / f"{name}.json"
@@ -120,6 +125,17 @@ def configure_late_command(command: list[str]) -> None:
     # The controller still validates this configured window when the runtime
     # cutover is EARLIEST_READY. Its upper boundary must exceed the trigger.
     command += ["--cutover-output-tokens", "1120"]
+
+
+def configure_pressure_command(command: list[str]) -> None:
+    replace_option(command, "--minimum-ready-source-jobs", "0")
+    replace_option(command, "--m1-min-output-tokens", "192")
+    replace_option(command, "--cutover-output-tokens", "320")
+    command += [
+        "--background-lead-s", "0",
+        "--diagnostic-m1-max-source-free-kv-tokens",
+        str(PRESSURE_START_FREE_LIMIT),
+    ]
 
 
 def pressure_evidence(root: Path) -> dict[str, Any]:
@@ -149,14 +165,38 @@ def pressure_evidence(root: Path) -> dict[str, Any]:
         return {"valid": False, "reason": "missing anchor output telemetry"}
     preemptions = [int(row["tp1"].get("preemptions_total") or 0)
                    for row in samples]
+    starts = [row for row in rows
+              if row.get("kind") == "manager_m1_start_decision"
+              and row.get("decision", {}).get("action") == "START_SHADOW"]
+    start = starts[0] if starts else None
+    start_free = (start.get("snapshot", {}).get("source_free_kv_tokens")
+                  if start else None)
+    start_output = (start.get("snapshot", {}).get("generated_tokens")
+                    if start else None)
+    start_unix_s = start.get("unix_s") if start else None
+    background_path = root / "background" / "background_summary.json"
+    if background_path.is_file() and start_unix_s is not None:
+        background = json.loads(background_path.read_text(encoding="utf-8"))
+        active_sources = sum(
+            row.get("pool") == "source"
+            and (row.get("first_token_unix_s") or float("inf"))
+            <= start_unix_s < (row.get("request_ended_unix_s") or 0)
+            for row in background.get("results", []))
+    else:
+        active_sources = 0
     return {
         "free_at_first_output": free[first_output],
         "minimum_free_kv_tokens": min(free),
         "samples_below_guard": sum(value < GUARD_TOKENS for value in free),
         "preemption_delta": max(preemptions) - preemptions[0],
-        "valid": (GUARD_TOKENS <= free[first_output] <= GUARD_BAND_UPPER
-                  and min(free) >= GUARD_TOKENS
-                  and max(preemptions) == preemptions[0]),
+        "m1_start_free_kv_tokens": start_free,
+        "m1_start_output_tokens": start_output,
+        "active_source_jobs_at_m1_start": active_sources,
+        "valid": (min(free) >= GUARD_TOKENS
+                  and max(preemptions) == preemptions[0]
+                  and start_free is not None
+                  and GUARD_TOKENS < start_free <= PRESSURE_START_FREE_LIMIT
+                  and active_sources >= 3),
     }
 
 
@@ -282,6 +322,9 @@ def summarize(run_dir: Path, outcomes: dict[str, Any]) -> dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
+    scope = os.environ.get("BRIDGETP_GOODOUTPUT_GATE_SCOPE", "all")
+    if scope not in {"all", "pressure"}:
+        raise ValueError(f"unknown GoodOutput gate scope: {scope}")
     preflight = verify(args)
     run_dir = args.out_dir.resolve()
     if run_dir.exists():
@@ -292,12 +335,13 @@ def main() -> None:
     build_natural_pressure(args, run_dir, setup)
     write_json(run_dir / "inputs" / "gate_setup.json", setup)
     plan = []
-    for repetition in range(1, REPEATS + 1):
-        for name in ("A_safe_light", "B_safe_busy"):
-            order = (("stay", "migrate") if
-                     (repetition + (name.startswith("B_"))) % 2
-                     else ("migrate", "stay"))
-            plan.append((f"{name}/r{repetition:02d}", name, order, False))
+    if scope == "all":
+        for repetition in range(1, REPEATS + 1):
+            for name in ("A_safe_light", "B_safe_busy"):
+                order = (("stay", "migrate") if
+                         (repetition + (name.startswith("B_"))) % 2
+                         else ("migrate", "stay"))
+                plan.append((f"{name}/r{repetition:02d}", name, order, False))
     for name in ("C_guard_light", "D_guard_busy"):
         plan.append((f"{name}/r01", name, ("stay", "migrate"), False))
     plan.append(("L_late_light/r01", "A_safe_light",
@@ -325,7 +369,7 @@ def main() -> None:
                 if late:
                     configure_late_command(command)
                 if name.startswith(("C_", "D_")):
-                    command += ["--background-lead-s", "0"]
+                    configure_pressure_command(command)
                 outcome[f"{arm}_runner_rc"] = execute(
                     command, pair_dir / f"{arm}.console.log")
                 audit = [
@@ -343,6 +387,8 @@ def main() -> None:
         for key, *_ in plan:
             outcomes.setdefault(key, {"status": "NOT_STARTED"})
         report = summarize(run_dir, outcomes)
+        report["scope"] = scope
+        write_json(run_dir / "gate_summary.json", report)
         archive = run_dir.with_suffix(".tar.gz")
         with tarfile.open(archive, "w:gz") as handle:
             handle.add(run_dir, arcname=run_dir.name)

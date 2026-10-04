@@ -253,6 +253,10 @@ def parse_args() -> argparse.Namespace:
         help="experimental earliest M1 Shadow start; M1 safety gates still apply",
     )
     parser.add_argument(
+        "--diagnostic-m1-max-source-free-kv-tokens", type=int,
+        help="experiment-only M1 start gate for observed TP1 free KV",
+    )
+    parser.add_argument(
         "--m1-source-release-tail-s", type=float,
         help="diagnostic tail allowance after estimated history copy until TP1 KV release",
     )
@@ -703,6 +707,16 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
     ):
         raise ValueError(
             "M1 minimum output requires auto-start and at least 64 remaining tokens"
+        )
+    if args.diagnostic_m1_max_source_free_kv_tokens is not None and (
+        not args.manager_m1_auto_start
+        or not args.source_pressure
+        or not args.expected_guard
+        < args.diagnostic_m1_max_source_free_kv_tokens
+    ):
+        raise ValueError(
+            "diagnostic M1 source-free gate requires source pressure "
+            "and a limit above guard"
         )
     if args.manager_m1_auto_start and (
         args.m1_source_release_tail_s is None
@@ -3659,6 +3673,10 @@ def main() -> None:
         "commit_timing": args.commit_timing,
         "manager_m0_shadow": args.manager_m0_shadow,
         "manager_m1_auto_start": args.manager_m1_auto_start,
+        "m1_min_output_tokens": args.m1_min_output_tokens,
+        "diagnostic_m1_max_source_free_kv_tokens": (
+            args.diagnostic_m1_max_source_free_kv_tokens
+        ),
         "paired_stay": args.paired_stay,
         "m1_source_release_tail_s": args.m1_source_release_tail_s,
         "manager_m2_rate": args.manager_m2_rate,
@@ -4064,6 +4082,11 @@ def main() -> None:
                     ])
                 if args.paired_stay:
                     controller_extra_args.append("--paired-stay")
+                if args.diagnostic_m1_max_source_free_kv_tokens is not None:
+                    controller_extra_args.extend([
+                        "--diagnostic-m1-max-source-free-kv-tokens",
+                        str(args.diagnostic_m1_max_source_free_kv_tokens),
+                    ])
                 if args.manager_m2_force_initial_high:
                     controller_extra_args.append(
                         "--manager-m2-force-initial-high"
