@@ -12,7 +12,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from tools.bridge_tp.audit_goodoutput import _read_members, audit_payload  # noqa: E402
+from tools.bridge_tp.audit_goodoutput import audit_payload  # noqa: E402
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -23,14 +23,17 @@ def read_json(path: Path) -> dict[str, Any]:
 
 
 def load_arm(root: Path, paired_stay: bool) -> tuple[dict[str, Any], dict[str, Any]]:
-    online = root / "online"
-    contract = read_json(online / "contract.json")
-    acceptance = read_json(online / "acceptance.json")
+    contract = read_json(root / "contract.json")
+    acceptance = read_json(root / "acceptance.json")
     if contract.get("paired_stay") is not paired_stay:
         raise ValueError(f"wrong paired_stay arm: {root}")
     if acceptance.get("status") != "PASS" or len(acceptance.get("runs", [])) != 1:
         raise ValueError(f"online acceptance is not a single PASS: {root}")
     accepted = acceptance["runs"][0]["acceptance"]
+    run_name = Path(acceptance["runs"][0]["root"]).name
+    if run_name != "r01_shadow_only":
+        raise ValueError(f"unexpected online run directory: {run_name}")
+    run_root = root / run_name
     if accepted.get("status") != "PASS":
         raise ValueError(f"arm acceptance failed: {root}")
     if paired_stay and accepted.get("final_state") != "COMPLETED_ON_TP1":
@@ -39,7 +42,16 @@ def load_arm(root: Path, paired_stay: bool) -> tuple[dict[str, Any], dict[str, A
         raise ValueError("STAY arm never observed an M1 START opportunity")
     if not paired_stay and accepted.get("target_origin_tokens", 0) <= 0:
         raise ValueError("MIGRATE arm produced no TP4-owned output")
-    values, _ = _read_members(root)
+    values = {"online/contract.json": contract}
+    for name in (
+        "background/background_summary.json",
+        "controller/response_proxy_stats.json",
+        "controller/source_response.json",
+    ):
+        values[name] = read_json(run_root / name)
+    target = run_root / "controller/target_response.json"
+    if target.is_file():
+        values["controller/target_response.json"] = read_json(target)
     report = audit_payload(values)
     if not report["computable"]:
         raise ValueError(f"GoodOutput audit failed: {report['errors']}")

@@ -4,13 +4,48 @@
 from __future__ import annotations
 
 import unittest
+import json
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-from tools.bridge_tp.compare_goodoutput_pair import compare
+from tools.bridge_tp.compare_goodoutput_pair import compare, load_arm
+from tests.bridge_tp.test_audit_goodoutput import payload
 
 
 class TestCompareGoodOutputPair(unittest.TestCase):
+    def test_load_arm_uses_actual_online_runner_layout(self) -> None:
+        value = payload()
+        value["online/contract.json"]["paired_stay"] = True
+        proxy = value["controller/response_proxy_stats.json"]
+        proxy.update({"committed": False, "target_origin_tokens": 0,
+                      "handoff_stall_s": None})
+        value.pop("controller/target_response.json")
+        source = value["controller/source_response.json"]
+        source.update({"finish_reason": "length", "completed_unix_s": 0.2})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = root / "r01_shadow_only"
+            run.mkdir()
+            (root / "contract.json").write_text(
+                json.dumps(value.pop("online/contract.json")), encoding="utf-8")
+            (root / "acceptance.json").write_text(json.dumps({
+                "status": "PASS", "runs": [{
+                    "root": "/server/results/stay/r01_shadow_only",
+                    "acceptance": {"status": "PASS",
+                                   "final_state": "COMPLETED_ON_TP1",
+                                   "natural_start_decisions": 1},
+                }],
+            }), encoding="utf-8")
+            for name, contents in value.items():
+                path = run / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(contents), encoding="utf-8")
+            contract, report = load_arm(root, True)
+        self.assertTrue(contract["paired_stay"])
+        self.assertTrue(report["computable"])
+        self.assertEqual(report["metrics"]["by_pool"]["anchor"]["requests"], 1)
+
     def test_matching_pair_reports_direction_without_significance_claim(self) -> None:
         contract = {
             "revision": "a", "manifest_sha256": "b",
