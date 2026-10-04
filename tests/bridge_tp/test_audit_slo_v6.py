@@ -54,6 +54,19 @@ class TestSloV6Audit(unittest.TestCase):
         self.assertEqual(report["request_rows"][0]["prompt_tokens"], 320)
         self.assertEqual(report["request_rows"][0]["ttft_limit_ms"], 1200)
 
+    def test_natural_eos_before_migration_has_zero_handoff(self) -> None:
+        value = test_payload()
+        value.pop("controller/target_response.json")
+        proxy = value["controller/response_proxy_stats.json"]
+        proxy.update({"committed": False, "source_origin_tokens": 3,
+                      "target_origin_tokens": 0, "handoff_stall_s": None})
+        source = value["controller/source_response.json"]
+        source.update({"finish_reason": "stop", "token_ids": [1, 2, 3],
+                       "completed_unix_s": 0.2})
+        report = audit_v6_payload(value, REFERENCE)
+        self.assertTrue(report["computable"], report["errors"])
+        self.assertEqual(report["request_rows"][-1]["handoff_ms"], 0)
+
     def test_long_visible_pause_fails_despite_low_average(self) -> None:
         value = test_payload()
         peer = value["background/background_summary.json"]["results"][0]

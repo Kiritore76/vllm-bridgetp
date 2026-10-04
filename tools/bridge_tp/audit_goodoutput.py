@@ -297,9 +297,13 @@ def audit_payload(
         errors=errors,
         handoff_ms=(
             0.0
-            if (contract.get("paired_stay") is True
-                and proxy.get("committed") is False
-                and proxy.get("target_origin_tokens") == 0)
+            if (proxy.get("committed") is False
+                and proxy.get("target_origin_tokens") == 0
+                and target is None
+                and ((contract.get("paired_stay") is True)
+                     or (proxy.get("source_origin_tokens") == len(
+                         source.get("token_ids") or [])
+                         and source.get("finish_reason") in ("stop", "length"))))
             else (
                 _number(proxy.get("handoff_stall_s")) * 1000
                 if _number(proxy.get("handoff_stall_s")) is not None else None

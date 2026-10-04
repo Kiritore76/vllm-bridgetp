@@ -3908,6 +3908,15 @@ def main() -> None:
                             expected_jobs, expected_anchor_tokens,
                             natural_eos_anchor=args.natural_eos_anchor,
                         )
+                    elif (args.natural_eos_anchor
+                          and args.manager_m1_auto_start
+                          and not (controller_dir / "session_manifest.json").exists()):
+                        accepted = accept_paired_stay(
+                            controller_dir, background_dir,
+                            expected_jobs, expected_anchor_tokens,
+                            natural_eos_anchor=True,
+                        )
+                        accepted["outcome"] = "NATURAL_EOS_BEFORE_MIGRATION"
                     elif args.manager_m4_expect_cancel:
                         accepted = accept_m4_cancel(
                             controller_dir, background_dir,
