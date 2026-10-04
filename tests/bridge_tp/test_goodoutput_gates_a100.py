@@ -16,6 +16,7 @@ from tools.bridge_tp.run_goodoutput_gates_a100 import (
     configure_late_command,
     configure_pressure_command,
     pressure_evidence,
+    summarize,
 )
 
 
@@ -80,11 +81,11 @@ class TestNaturalPressure(unittest.TestCase):
                                     for job in source))
                 self.assertTrue(all(job["request"]["ignore_eos"] is False
                                     for job in source))
-                self.assertTrue(all(job["start_after_event"]
-                                    == "ANCHOR_FIRST_OUTPUT" for job in source))
+                self.assertTrue(all("start_after_event" not in job
+                                    for job in source))
                 self.assertEqual(
                     [job["start_after_s"] for job in source],
-                    [0.0, 0.6, 1.2, 1.8, 2.4],
+                    [0.0] * 5,
                 )
                 self.assertEqual(manifest["requested_response_words"], 350)
 
@@ -102,7 +103,18 @@ class TestNaturalPressure(unittest.TestCase):
                     for index in range(2)
                 ],
             }))
-            setup = {"manifests": {"A_safe_light": {"path": str(base_path)}}}
+            busy_path = root / "busy.json"
+            busy_path.write_text(json.dumps({"jobs": [
+                {"job_id": job_id, "pool": "target",
+                 "start_after_s": 10.0,
+                 "request": {"prompt": [3, 4], "max_tokens": 4096},
+                 "input_id": f"input-{job_id}"}
+                for job_id in ("target_018", "target_026")
+            ]}))
+            setup = {"manifests": {
+                "A_safe_light": {"path": str(base_path)},
+                "B_safe_busy": {"path": str(busy_path)},
+            }}
             build_late_target_load(root, setup)
             manifest = json.loads(Path(
                 setup["manifests"]["L_late_light"]["path"]
@@ -116,6 +128,11 @@ class TestNaturalPressure(unittest.TestCase):
                 [job["job_id"] for job in manifest["jobs"]],
                 [f"target_{index:03d}" for index in range(4)],
             )
+            self.assertEqual(
+                [job["input_id"] for job in manifest["jobs"][2:]],
+                ["input-target_018", "input-target_026"],
+            )
+            self.assertFalse(manifest.get("late_target_reuses_warm_prompts"))
 
     def test_guard_requires_safe_minimum(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -158,11 +175,46 @@ class TestNaturalPressure(unittest.TestCase):
             int(command[command.index("--trigger-output-tokens") + 1]),
         )
 
-    def test_pressure_starts_only_after_anchor_and_near_guard(self) -> None:
+    def test_pressure_waits_for_five_prefills_and_near_guard(self) -> None:
         command = ["--minimum-ready-source-jobs", "3",
                    "--m1-min-output-tokens", "96"]
         configure_pressure_command(command)
-        self.assertEqual(command[1::2], ["0", "192", "320", "0", "14000"])
+        self.assertEqual(command[1::2], ["5", "96", "320", "0", "14000"])
+
+    def test_late_repeatability_requires_three_valid_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outcomes = {f"L_late_light/r{index:02d}": {}
+                        for index in range(1, 4)}
+
+            def fake_pair(_root: Path, key: str, _arms: object,
+                          **_kwargs: object) -> dict[str, object]:
+                return {"valid": True, "delta_goodoutput_tokens_s":
+                        float(int(key[-2:]))}
+
+            with mock.patch(
+                "tools.bridge_tp.run_goodoutput_gates_a100.pair_report",
+                side_effect=fake_pair,
+            ):
+                report = summarize(root, outcomes)
+            self.assertTrue(report["late_cutover_gate_pass"])
+            self.assertTrue(report["late_direction_gate_pass"])
+            self.assertEqual(report["late_repeatability"]["deltas"],
+                             [1.0, 2.0, 3.0])
+
+            def mixed_pair(_root: Path, key: str, _arms: object,
+                           **_kwargs: object) -> dict[str, object]:
+                value = float(int(key[-2:]))
+                return {"valid": True, "delta_goodoutput_tokens_s":
+                        -value if key.endswith("03") else value}
+
+            with mock.patch(
+                "tools.bridge_tp.run_goodoutput_gates_a100.pair_report",
+                side_effect=mixed_pair,
+            ):
+                mixed = summarize(root, outcomes)
+            self.assertTrue(mixed["late_cutover_gate_pass"])
+            self.assertFalse(mixed["late_direction_gate_pass"])
 
 
 if __name__ == "__main__":

@@ -31,8 +31,9 @@ from tools.bridge_tp.run_goodoutput_matrix_a100 import (
 GUARD_TOKENS = 8448
 REPEATS = 3
 PRESSURE_START_FREE_LIMIT = 14000
-PRESSURE_SOURCE_SPACING_S = 0.6
+PRESSURE_SOURCE_SPACING_S = 0.0
 LATE_TARGET_START_EVENT = "ANCHOR_OUTPUT_800"
+LATE_TARGET_BASE_JOB_IDS = ("target_018", "target_026")
 
 
 def build_natural_pressure(
@@ -87,7 +88,6 @@ def build_natural_pressure(
             pressure_jobs.append({
                 "job_id": f"source_{index:03d}", "pool": "source",
                 "start_after_s": round(index * PRESSURE_SOURCE_SPACING_S, 3),
-                "start_after_event": "ANCHOR_FIRST_OUTPUT",
                 "request": {"model": "bridgetp-model", "prompt": prompt,
                             "max_tokens": 768, "ignore_eos": False},
                 "input_id": row["id"],
@@ -103,7 +103,7 @@ def build_natural_pressure(
             "pressure_source_spacing_s": PRESSURE_SOURCE_SPACING_S,
             "requested_response_words": 350,
             "natural_eos_required": True,
-            "pressure_start_event": "ANCHOR_FIRST_OUTPUT",
+            "pressure_start_event": "BEFORE_ANCHOR_SOURCE_READY",
             "diagnostic_m1_max_source_free_kv_tokens": (
                 PRESSURE_START_FREE_LIMIT),
             "jobs": target_jobs + pressure_jobs,
@@ -124,8 +124,14 @@ def build_late_target_load(run_dir: Path, setup: dict[str, Any]) -> None:
     warm_targets = [job for job in base["jobs"] if job["pool"] == "target"]
     if len(warm_targets) != 2:
         raise ValueError("late-light scenario needs exactly two warm targets")
+    busy = json.loads(Path(
+        setup["manifests"]["B_safe_busy"]["path"]
+    ).read_text(encoding="utf-8"))
+    busy_targets = {job["job_id"]: job for job in busy["jobs"]
+                    if job["pool"] == "target"}
     late_targets = []
-    for index, original in enumerate(warm_targets, start=2):
+    for index, job_id in enumerate(LATE_TARGET_BASE_JOB_IDS, start=2):
+        original = busy_targets[job_id]
         job = copy.deepcopy(original)
         job["job_id"] = f"target_{index:03d}"
         job["start_after_event"] = LATE_TARGET_START_EVENT
@@ -136,7 +142,7 @@ def build_late_target_load(run_dir: Path, setup: dict[str, Any]) -> None:
         "scenario": "L_late_light",
         "status": "GATE_VALIDATION_LATE_TARGET_ARRIVALS",
         "late_target_start_event": LATE_TARGET_START_EVENT,
-        "late_target_reuses_warm_prompts": True,
+        "late_target_base_job_ids": LATE_TARGET_BASE_JOB_IDS,
         "jobs": base["jobs"] + late_targets,
     }
     path = run_dir / "inputs" / "L_late_light.json"
@@ -164,8 +170,8 @@ def configure_late_command(command: list[str]) -> None:
 
 
 def configure_pressure_command(command: list[str]) -> None:
-    replace_option(command, "--minimum-ready-source-jobs", "0")
-    replace_option(command, "--m1-min-output-tokens", "192")
+    replace_option(command, "--minimum-ready-source-jobs", "5")
+    replace_option(command, "--m1-min-output-tokens", "96")
     command += [
         "--cutover-output-tokens", "320",
         "--background-lead-s", "0",
@@ -333,16 +339,33 @@ def summarize(run_dir: Path, outcomes: dict[str, Any]) -> dict[str, Any]:
         }
     guard_pass = all(pairs.get(name, {}).get("valid", False) for name in (
         "C_guard_light/r01", "D_guard_busy/r01"))
-    late_pass = pairs.get("L_late_light/r01", {}).get("valid", False)
+    late_rows = [pairs.get(f"L_late_light/r{index:02d}", {})
+                 for index in range(1, REPEATS + 1)]
+    late_deltas = [row["delta_goodoutput_tokens_s"] for row in late_rows
+                   if row.get("valid")]
+    late_same_sign = (len(late_deltas) == REPEATS and (
+        all(delta > 0 for delta in late_deltas)
+        or all(delta < 0 for delta in late_deltas)))
+    late_pass = all(row.get("valid", False) for row in late_rows)
     report = {
         "format_version": 1,
         "status": "EXPLORATORY_GATE_VALIDATION",
         "repeatability": repeatability,
         "guard_natural_eos_gate_pass": guard_pass,
         "late_cutover_gate_pass": late_pass,
+        "late_direction_gate_pass": late_same_sign,
+        "late_repeatability": {
+            "complete_pairs": len(late_deltas),
+            "required_pairs": REPEATS,
+            "deltas": late_deltas,
+            "mean_delta": statistics.mean(late_deltas) if late_deltas else None,
+            "range": [min(late_deltas), max(late_deltas)]
+            if late_deltas else None,
+            "same_sign": late_same_sign,
+        },
         "ready_for_large_paired_capture": (
             all(row["gate_pass"] for row in repeatability.values())
-            and guard_pass and late_pass),
+            and guard_pass and late_pass and late_same_sign),
         "notes": [
             "Guard prompts are augmented from frozen OASST1 inputs; natural EOS "
             "and guard safety must pass the reported gates; representativeness "
@@ -381,8 +404,11 @@ def main() -> None:
                 plan.append((f"{name}/r{repetition:02d}", name, order, False))
     for name in ("C_guard_light", "D_guard_busy"):
         plan.append((f"{name}/r01", name, ("stay", "migrate"), False))
-    plan.append(("L_late_light/r01", "L_late_light",
-                 ("migrate", "stay"), True))
+    for repetition in range(1, REPEATS + 1):
+        order = (("migrate", "stay") if repetition % 2
+                 else ("stay", "migrate"))
+        plan.append((f"L_late_light/r{repetition:02d}",
+                     "L_late_light", order, True))
     outcomes: dict[str, Any] = {}
     try:
         for key, name, order, late in plan:
