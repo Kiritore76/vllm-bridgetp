@@ -31,7 +31,7 @@ from tools.bridge_tp.run_goodoutput_matrix_a100 import (
 GUARD_TOKENS = 8448
 REPEATS = 3
 PRESSURE_START_FREE_LIMIT = 14000
-PRESSURE_SOURCE_SPACING_S = 0.0
+PRESSURE_SOURCE_SPACING_S = 0.6
 LATE_TARGET_START_EVENT = "ANCHOR_OUTPUT_800"
 LATE_TARGET_BASE_JOB_IDS = ("target_018", "target_026")
 
@@ -256,12 +256,13 @@ def pair_report(run_dir: Path, key: str, arms: dict[str, Any],
             details[arm] = {"valid": False, "reason": "missing arm evidence"}
             continue
         slo = json.loads(slo_path.read_text(encoding="utf-8"))
+        slo_metrics = slo.get("metrics") or {}
         background = json.loads(background_path.read_text(encoding="utf-8"))
         acceptance = json.loads(acceptance_path.read_text(encoding="utf-8"))
         natural = all(row.get("finish_reason") == "stop"
                       for row in background["results"])
         pressure = pressure_evidence(root) if guard_pressure else None
-        arm_valid = (
+        mechanism_valid = (
             arms.get(f"{arm}_runner_rc") == 0
             and arms.get(f"{arm}_audit_rc") == 0
             and acceptance.get("status") == "PASS"
@@ -273,15 +274,17 @@ def pair_report(run_dir: Path, key: str, arms: dict[str, Any],
             and background["failed"] == 0
             and background["completed"] == background["jobs"]
             and natural
-            and slo["metrics"]["slo_attainment"] >= 0.95
             and (not guard_pressure or pressure["valid"])
             and (arm == "stay" or (
                 acceptance.get("handoff_stall_ms") is not None
                 and acceptance["handoff_stall_ms"] <= 1000))
         )
         details[arm] = {
-            "valid": bool(arm_valid),
-            "slo_metrics": slo.get("metrics"),
+            "valid": bool(mechanism_valid and
+                          slo_metrics.get("slo_attainment", 0) >= 0.95),
+            "mechanism_valid": bool(mechanism_valid),
+            "slo_qualified": slo_metrics.get("slo_attainment", 0) >= 0.95,
+            "slo_metrics": slo_metrics,
             "request_ids": sorted(row["request_id"]
                                   for row in slo.get("request_rows", [])),
             "all_background_natural_eos": natural,
@@ -304,8 +307,21 @@ def pair_report(run_dir: Path, key: str, arms: dict[str, Any],
         cutover = details.get("migrate", {}).get(
             "anchor_cutover_output_tokens")
         pair_valid = bool(pair_valid and cutover is not None and cutover >= 1000)
+    mechanism_pair_valid = (
+        len(details) == 2 and all(details[arm].get("mechanism_valid", False)
+                                  for arm in ("stay", "migrate"))
+        and details["stay"]["request_ids"]
+        == details["migrate"]["request_ids"])
+    if late:
+        mechanism_pair_valid = bool(
+            mechanism_pair_valid and cutover is not None and cutover >= 1000)
     return {
         "valid": pair_valid, "arms": arms, "details": details,
+        "mechanism_valid": mechanism_pair_valid,
+        "observed_delta_goodoutput_tokens_s": (
+            details["migrate"]["slo_metrics"]["goodoutput_tokens_s"]
+            - details["stay"]["slo_metrics"]["goodoutput_tokens_s"]
+            if mechanism_pair_valid else None),
         "delta_goodoutput_tokens_s": (
             details["migrate"]["slo_metrics"]["goodoutput_tokens_s"]
             - details["stay"]["slo_metrics"]["goodoutput_tokens_s"]
@@ -313,7 +329,8 @@ def pair_report(run_dir: Path, key: str, arms: dict[str, Any],
     }
 
 
-def summarize(run_dir: Path, outcomes: dict[str, Any]) -> dict[str, Any]:
+def summarize(run_dir: Path, outcomes: dict[str, Any],
+              *, guard_required_repeats: int = 1) -> dict[str, Any]:
     pairs = {}
     for name, result in outcomes.items():
         pairs[name] = pair_report(
@@ -337,8 +354,28 @@ def summarize(run_dir: Path, outcomes: dict[str, Any]) -> dict[str, Any]:
             "same_sign": same_sign,
             "gate_pass": len(deltas) == REPEATS and same_sign,
         }
-    guard_pass = all(pairs.get(name, {}).get("valid", False) for name in (
-        "C_guard_light/r01", "D_guard_busy/r01"))
+    guard_keys = [f"{name}/r{index:02d}"
+                  for name in ("C_guard_light", "D_guard_busy")
+                  for index in range(1, guard_required_repeats + 1)]
+    guard_pass = all(pairs.get(name, {}).get("mechanism_valid", False)
+                     for name in guard_keys)
+    guard_slo_pass = all(pairs.get(name, {}).get("valid", False)
+                         for name in guard_keys)
+    guard_repeatability = {}
+    for scenario in ("C_guard_light", "D_guard_busy"):
+        rows = [pairs.get(f"{scenario}/r{index:02d}", {})
+                for index in range(1, guard_required_repeats + 1)]
+        deltas = [row["observed_delta_goodoutput_tokens_s"]
+                  for row in rows if row.get("mechanism_valid")]
+        guard_repeatability[scenario] = {
+            "mechanism_valid_pairs": len(deltas),
+            "required_pairs": guard_required_repeats,
+            "slo_qualified_pairs": sum(bool(row.get("valid")) for row in rows),
+            "observed_deltas": deltas,
+            "mean_observed_delta": (
+                statistics.mean(deltas) if deltas else None),
+            "range": [min(deltas), max(deltas)] if deltas else None,
+        }
     late_rows = [pairs.get(f"L_late_light/r{index:02d}", {})
                  for index in range(1, REPEATS + 1)]
     late_deltas = [row["delta_goodoutput_tokens_s"] for row in late_rows
@@ -352,6 +389,8 @@ def summarize(run_dir: Path, outcomes: dict[str, Any]) -> dict[str, Any]:
         "status": "EXPLORATORY_GATE_VALIDATION",
         "repeatability": repeatability,
         "guard_natural_eos_gate_pass": guard_pass,
+        "guard_slo_gate_pass": guard_slo_pass,
+        "guard_repeatability": guard_repeatability,
         "late_cutover_gate_pass": late_pass,
         "late_direction_gate_pass": late_same_sign,
         "late_repeatability": {
@@ -365,7 +404,8 @@ def summarize(run_dir: Path, outcomes: dict[str, Any]) -> dict[str, Any]:
         },
         "ready_for_large_paired_capture": (
             all(row["gate_pass"] for row in repeatability.values())
-            and guard_pass and late_pass and late_same_sign),
+            and guard_pass and guard_slo_pass
+            and late_pass and late_same_sign),
         "notes": [
             "Guard prompts are augmented from frozen OASST1 inputs; natural EOS "
             "and guard safety must pass the reported gates; representativeness "
@@ -382,7 +422,7 @@ def summarize(run_dir: Path, outcomes: dict[str, Any]) -> dict[str, Any]:
 def main() -> None:
     args = parse_args()
     scope = os.environ.get("BRIDGETP_GOODOUTPUT_GATE_SCOPE", "all")
-    if scope not in {"all", "pressure"}:
+    if scope not in {"all", "pressure", "guard"}:
         raise ValueError(f"unknown GoodOutput gate scope: {scope}")
     preflight = verify(args)
     run_dir = args.out_dir.resolve()
@@ -402,13 +442,19 @@ def main() -> None:
                          (repetition + (name.startswith("B_"))) % 2
                          else ("migrate", "stay"))
                 plan.append((f"{name}/r{repetition:02d}", name, order, False))
-    for name in ("C_guard_light", "D_guard_busy"):
-        plan.append((f"{name}/r01", name, ("stay", "migrate"), False))
-    for repetition in range(1, REPEATS + 1):
-        order = (("migrate", "stay") if repetition % 2
-                 else ("stay", "migrate"))
-        plan.append((f"L_late_light/r{repetition:02d}",
-                     "L_late_light", order, True))
+    guard_repeats = REPEATS if scope == "guard" else 1
+    for repetition in range(1, guard_repeats + 1):
+        order = (("stay", "migrate") if repetition % 2
+                 else ("migrate", "stay"))
+        for name in ("C_guard_light", "D_guard_busy"):
+            plan.append((f"{name}/r{repetition:02d}",
+                         name, order, False))
+    if scope != "guard":
+        for repetition in range(1, REPEATS + 1):
+            order = (("migrate", "stay") if repetition % 2
+                     else ("stay", "migrate"))
+            plan.append((f"L_late_light/r{repetition:02d}",
+                         "L_late_light", order, True))
     outcomes: dict[str, Any] = {}
     try:
         for key, name, order, late in plan:
@@ -449,13 +495,21 @@ def main() -> None:
     finally:
         for key, *_ in plan:
             outcomes.setdefault(key, {"status": "NOT_STARTED"})
-        report = summarize(run_dir, outcomes)
+        report = summarize(run_dir, outcomes,
+                           guard_required_repeats=guard_repeats)
         report["scope"] = scope
-        if scope == "pressure":
+        if scope in {"pressure", "guard"}:
             report["ready_for_large_paired_capture"] = None
             report["notes"].append(
-                "Pressure-only retest omits A/B repeats; overall scale-up "
-                "readiness must combine this result with separate A/B evidence."
+                "Focused retest omits A/B repeats; overall scale-up readiness "
+                "must combine this result with separate A/B evidence."
+            )
+        if scope == "guard":
+            report["late_cutover_gate_pass"] = None
+            report["late_direction_gate_pass"] = None
+            report["notes"].append(
+                "Guard-only repeats omit L. SLO failures remain in observed "
+                "GoodOutput; mechanism validity does not imply SLO attainment."
             )
         write_json(run_dir / "gate_summary.json", report)
         archive = run_dir.with_suffix(".tar.gz")
