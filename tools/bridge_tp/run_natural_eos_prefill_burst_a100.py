@@ -215,7 +215,9 @@ def run(args: argparse.Namespace) -> None:
             or args.max_tokens < 2 or args.burst_max_tokens < 1
             or any(rate <= 0 for rate in args.rates)
             or len(set(args.rates)) != 2):
-        raise ValueError("expected two positive rates and >=50 requests divisible by five")
+        raise ValueError(
+            "expected two positive rates and >=50 requests divisible by five"
+        )
     provenance = preflight(args)
     victims = prepare_victims(args)
     bursts = prepare_bursts(args)
