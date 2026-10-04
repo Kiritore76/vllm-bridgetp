@@ -13,6 +13,9 @@ import tarfile
 from pathlib import Path
 from typing import Any
 
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
 from tools.bridge_tp.run_goodoutput_matrix_a100 import (
     EXPECTED_SHAS,
     execute,
