@@ -1882,7 +1882,14 @@ def m2_expected_profile_used(
     ):
         return True
     if expected_profile is None:
-        return False
+        configured = dict(zip(("LOW", "MEDIUM", "HIGH"), profiles_gib_s))
+        return any(
+            (row.get("manager_m2_decision") or {}).get("action") == "HOLD"
+            and (row["manager_m2_decision"].get("profile") in configured)
+            and abs(float(row.get("rate_gib_s", 0)) - configured[
+                row["manager_m2_decision"]["profile"]]) <= 1e-9
+            for row in rate_rows
+        )
     expected_rate = dict(zip(
         ("LOW", "MEDIUM", "HIGH"), profiles_gib_s
     ))[expected_profile]

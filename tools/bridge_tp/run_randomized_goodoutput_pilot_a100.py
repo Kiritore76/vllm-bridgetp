@@ -193,6 +193,9 @@ def configure_action(command: list[str], action: str) -> None:
     }
     for flag, value in replacements.items():
         command[command.index(flag) + 1] = value
+    # Natural EOS and earliest-ready can leave no BRIDGE-window tokens.
+    # Keep the measured windows but do not require a fixed sample count.
+    command += ["--minimum-window-samples", "0"]
     command += ["--cutover-output-tokens",
                 "1120" if threshold == 1024 else "320"]
 

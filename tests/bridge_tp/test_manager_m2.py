@@ -82,9 +82,16 @@ class TestM2RateController(unittest.TestCase):
         self.assertTrue(m2_expected_profile_used(
             initial, active, "MEDIUM", profiles,
         ))
+        self.assertTrue(m2_expected_profile_used(
+            initial, active, None, profiles,
+        ))
         self.assertFalse(m2_expected_profile_used(
             initial, [{**active[0], "rate_gib_s": 0.5}],
             "MEDIUM", profiles,
+        ))
+        self.assertFalse(m2_expected_profile_used(
+            initial, [{**active[0], "rate_gib_s": 0.5}],
+            None, profiles,
         ))
 
     def test_source_peer_event_start_waits_for_initial_rate(self) -> None:

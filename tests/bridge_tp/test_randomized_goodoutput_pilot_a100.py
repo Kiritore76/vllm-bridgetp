@@ -87,6 +87,8 @@ class TestRandomizedPilot(unittest.TestCase):
             self.assertNotIn("--manager-m2-force-initial-high", command)
             self.assertNotIn("--manager-m2-expected-profile", command)
             self.assertNotIn("--manager-m2-min-history-byte-frac", command)
+            self.assertEqual(command[command.index(
+                "--minimum-window-samples") + 1], "0")
             expected = "1024" if action == "late1024" else "128"
             self.assertEqual(command[command.index(
                 "--m1-min-output-tokens") + 1], expected)
