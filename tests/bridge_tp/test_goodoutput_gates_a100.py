@@ -1,6 +1,7 @@
 """Checks for the A100 GoodOutput scale-up gates."""
 
 import json
+import subprocess
 import sys
 import tempfile
 import types
@@ -17,6 +18,15 @@ from tools.bridge_tp.run_goodoutput_gates_a100 import (
 
 
 class TestNaturalPressure(unittest.TestCase):
+    def test_direct_script_entrypoint_resolves_tools_package(self) -> None:
+        repo = Path(__file__).resolve().parents[2]
+        script = repo / "tools/bridge_tp/run_goodoutput_gates_a100.py"
+        completed = subprocess.run(
+            [sys.executable, str(script), "--help"], cwd=repo,
+            capture_output=True, text=True, check=False)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("--expected-revision", completed.stdout)
+
     def test_builds_natural_eos_five_peer_pressure(self) -> None:
         class Tokenizer:
             @staticmethod
