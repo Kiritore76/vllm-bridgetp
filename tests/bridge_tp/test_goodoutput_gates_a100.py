@@ -12,8 +12,8 @@ from unittest import mock
 
 from tools.bridge_tp.run_goodoutput_gates_a100 import (
     build_natural_pressure,
+    configure_late_command,
     pressure_evidence,
-    replace_option,
 )
 
 
@@ -98,15 +98,16 @@ class TestNaturalPressure(unittest.TestCase):
             audit.write_text("".join(json.dumps(row) + "\n" for row in rows))
             self.assertFalse(pressure_evidence(root)["valid"])
 
-    def test_late_cutover_changes_all_three_thresholds(self) -> None:
+    def test_late_cutover_has_positive_controller_window(self) -> None:
         command = ["--m1-min-output-tokens", "96",
                    "--trigger-output-tokens", "64",
                    "--bridge-output-tokens", "96"]
-        for option, value in (("--m1-min-output-tokens", "1024"),
-                              ("--trigger-output-tokens", "1000"),
-                              ("--bridge-output-tokens", "1024")):
-            replace_option(command, option, value)
-        self.assertEqual(command[1::2], ["1024", "1000", "1024"])
+        configure_late_command(command)
+        self.assertEqual(command[1::2], ["1024", "1000", "1024", "1120"])
+        self.assertGreater(
+            int(command[command.index("--cutover-output-tokens") + 1]),
+            int(command[command.index("--trigger-output-tokens") + 1]),
+        )
 
 
 if __name__ == "__main__":
