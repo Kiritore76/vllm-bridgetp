@@ -15,6 +15,7 @@ from tools.bridge_tp.run_goodoutput_gates_a100 import (
     build_natural_pressure,
     configure_late_command,
     configure_pressure_command,
+    pair_report,
     pressure_evidence,
     summarize,
 )
@@ -85,7 +86,7 @@ class TestNaturalPressure(unittest.TestCase):
                                     for job in source))
                 self.assertEqual(
                     [job["start_after_s"] for job in source],
-                    [0.0] * 5,
+                    [0.0, 0.6, 1.2, 1.8, 2.4],
                 )
                 self.assertEqual(manifest["requested_response_words"], 350)
 
@@ -215,6 +216,76 @@ class TestNaturalPressure(unittest.TestCase):
                 mixed = summarize(root, outcomes)
             self.assertTrue(mixed["late_cutover_gate_pass"])
             self.assertFalse(mixed["late_direction_gate_pass"])
+
+    def test_guard_repeats_keep_slo_failure_as_observed_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outcomes = {
+                f"{scenario}/r{index:02d}": {}
+                for scenario in ("C_guard_light", "D_guard_busy")
+                for index in range(1, 4)
+            }
+
+            def fake_pair(_root: Path, key: str, _arms: object,
+                          **_kwargs: object) -> dict[str, object]:
+                return {
+                    "valid": False, "mechanism_valid": True,
+                    "observed_delta_goodoutput_tokens_s":
+                    float(int(key[-2:])),
+                }
+
+            with mock.patch(
+                "tools.bridge_tp.run_goodoutput_gates_a100.pair_report",
+                side_effect=fake_pair,
+            ):
+                report = summarize(root, outcomes, guard_required_repeats=3)
+            self.assertTrue(report["guard_natural_eos_gate_pass"])
+            self.assertFalse(report["guard_slo_gate_pass"])
+            self.assertEqual(
+                report["guard_repeatability"]["C_guard_light"]
+                ["observed_deltas"], [1.0, 2.0, 3.0],
+            )
+
+    def test_pair_retains_goodoutput_when_slo_attainment_is_low(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key = "C_guard_light/r01"
+            arms = {}
+            for arm, goodoutput in (("stay", 100.0), ("migrate", 120.0)):
+                pair = root / key
+                run = pair / arm / "r01_shadow_only"
+                (run / "background").mkdir(parents=True)
+                (run / "provenance").mkdir(parents=True)
+                (pair / f"{arm}.slo_v6.json").write_text(json.dumps({
+                    "computable": True,
+                    "reference_applicability":
+                    "VERIFIED_GPU_AND_MODEL_CONFIG",
+                    "errors": [],
+                    "metrics": {"slo_attainment": 0.9,
+                                "goodoutput_tokens_s": goodoutput},
+                    "request_rows": [{"request_id": "anchor"}],
+                }))
+                (run / "background" / "background_summary.json").write_text(
+                    json.dumps({"jobs": 1, "completed": 1, "failed": 0,
+                                "results": [{"finish_reason": "stop"}]}))
+                (run / "provenance" /
+                 "shadow_online_acceptance.json").write_text(json.dumps({
+                     "status": "PASS", "errors": [],
+                     "handoff_stall_ms": 200.0,
+                 }))
+                arms[f"{arm}_runner_rc"] = 0
+                arms[f"{arm}_audit_rc"] = 0
+            with mock.patch(
+                "tools.bridge_tp.run_goodoutput_gates_a100.pressure_evidence",
+                return_value={"valid": True},
+            ):
+                result = pair_report(root, key, arms,
+                                     guard_pressure=True, late=False)
+            self.assertTrue(result["mechanism_valid"])
+            self.assertFalse(result["valid"])
+            self.assertEqual(result["observed_delta_goodoutput_tokens_s"],
+                             20.0)
+            self.assertIsNone(result["delta_goodoutput_tokens_s"])
 
 
 if __name__ == "__main__":
