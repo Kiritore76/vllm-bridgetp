@@ -85,6 +85,13 @@ def inspect_inputs(args: argparse.Namespace) -> tuple[dict[str, Any], list[int]]
     uuids = subprocess.check_output(
         ["nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader"], text=True,
     ).strip().splitlines()
+    active = subprocess.check_output(
+        ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader"],
+        text=True,
+    ).strip().splitlines()
+    target_uuids = set(uuids[1:5])
+    if any(line.split(",", 1)[0].strip() in target_uuids for line in active):
+        raise RuntimeError("TP4 GPUs 1-4 already have compute processes; no run")
     inputs = {
         "model_config": (args.model_path / "config.json", args.expected_model_config_sha256),
         "base_manifest": (args.base_target_manifest, args.expected_base_sha256),
