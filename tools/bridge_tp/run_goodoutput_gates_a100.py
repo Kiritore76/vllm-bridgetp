@@ -53,7 +53,8 @@ def build_natural_pressure(
     prefix = tokenizer.encode(
         start + "Read the following context.\n", add_special_tokens=False)
     suffix = tokenizer.encode(
-        "\nSummarize the main point in exactly three short sentences." + end,
+        "\nWrite a detailed synthesis of about 250 words. Explain the main "
+        "points and end with a brief conclusion." + end,
         add_special_tokens=False)
     budget = 3584 - len(prefix) - len(suffix)
     if budget < 3000:
@@ -110,6 +111,15 @@ def build_natural_pressure(
 def replace_option(command: list[str], name: str, value: str) -> None:
     index = command.index(name)
     command[index + 1] = value
+
+
+def configure_late_command(command: list[str]) -> None:
+    replace_option(command, "--m1-min-output-tokens", "1024")
+    replace_option(command, "--trigger-output-tokens", "1000")
+    replace_option(command, "--bridge-output-tokens", "1024")
+    # The controller still validates this configured window when the runtime
+    # cutover is EARLIEST_READY. Its upper boundary must exceed the trigger.
+    command += ["--cutover-output-tokens", "1120"]
 
 
 def pressure_evidence(root: Path) -> dict[str, Any]:
@@ -234,16 +244,16 @@ def summarize(run_dir: Path, outcomes: dict[str, Any]) -> dict[str, Any]:
                 if key.startswith(scenario + "/")]
         deltas = [row["delta_goodoutput_tokens_s"] for row in rows
                   if row["valid"]]
+        same_sign = (all(x > 0 for x in deltas)
+                     or all(x < 0 for x in deltas)) if len(deltas) == REPEATS else False
         repeatability[scenario] = {
             "complete_pairs": len(deltas),
             "required_pairs": REPEATS,
             "deltas": deltas,
             "mean_delta": statistics.mean(deltas) if deltas else None,
             "range": [min(deltas), max(deltas)] if deltas else None,
-            "same_sign": (all(x > 0 for x in deltas)
-                          or all(x < 0 for x in deltas))
-            if len(deltas) == REPEATS else False,
-            "gate_pass": len(deltas) == REPEATS,
+            "same_sign": same_sign,
+            "gate_pass": len(deltas) == REPEATS and same_sign,
         }
     guard_pass = all(pairs.get(name, {}).get("valid", False) for name in (
         "C_guard_light/r01", "D_guard_busy/r01"))
@@ -259,7 +269,8 @@ def summarize(run_dir: Path, outcomes: dict[str, Any]) -> dict[str, Any]:
             and guard_pass and late_pass),
         "notes": [
             "Guard prompts are augmented from frozen OASST1 inputs; natural EOS "
-            "and guard safety are verified, representativeness requires review.",
+            "and guard safety must pass the reported gates; representativeness "
+            "requires review.",
             "A/B repeats estimate run-to-run variation; no benefit function is "
             "fitted in this batch.",
         ],
@@ -312,9 +323,9 @@ def main() -> None:
                 root = pair_dir / arm
                 command = online_command(args, setup, name, arm, root)
                 if late:
-                    replace_option(command, "--m1-min-output-tokens", "1024")
-                    replace_option(command, "--trigger-output-tokens", "1000")
-                    replace_option(command, "--bridge-output-tokens", "1024")
+                    configure_late_command(command)
+                if name.startswith(("C_", "D_")):
+                    command += ["--background-lead-s", "0"]
                 outcome[f"{arm}_runner_rc"] = execute(
                     command, pair_dir / f"{arm}.console.log")
                 audit = [
