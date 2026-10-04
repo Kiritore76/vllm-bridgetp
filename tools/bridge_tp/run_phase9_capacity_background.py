@@ -10,6 +10,7 @@ is exported through controller telemetry or placed in the controller run dir.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import threading
@@ -196,6 +197,10 @@ def main() -> None:
                 "response_id": result["response_id"],
                 "finish_reason": result["finish_reason"],
                 "output_tokens": len(result["token_ids"]),
+                "token_ids_sha256": hashlib.sha256(
+                    json.dumps(result["token_ids"], separators=(",", ":"))
+                    .encode("ascii")
+                ).hexdigest(),
                 "request_started_unix_s": request_started_unix_s,
                 "first_token_unix_s": token_times[0] if token_times else None,
                 "last_token_unix_s": token_times[-1] if token_times else None,
