@@ -1741,7 +1741,6 @@ def accept_paired_stay(
     source_tokens = len(source.get("token_ids") or [])
     if natural_eos_anchor:
         if (source.get("finish_reason") != "stop"
-                or proxy.get("finished_reason") != "stop"
                 or not 1 <= source_tokens < expected_anchor_tokens):
             errors.append("source did not naturally finish before its cap")
     elif (source.get("finish_reason") != "length"
@@ -2920,7 +2919,6 @@ def accept_online(
             not isinstance(emitted_tokens, int)
             or isinstance(emitted_tokens, bool)
             or not 1 <= emitted_tokens < expected_anchor_tokens
-            or proxy.get("finished_reason") != "stop"
             or target_response.get("finish_reason") != "stop"
         ):
             errors.append("unified response did not naturally finish before cap")

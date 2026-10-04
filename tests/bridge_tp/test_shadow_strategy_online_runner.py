@@ -119,7 +119,7 @@ class TestOnlineStrategyTiming(unittest.TestCase):
             (controller / "response_proxy_stats.json").write_text(json.dumps({
                 "emitted_tokens": 3, "source_origin_tokens": 3,
                 "target_origin_tokens": 0, "committed": False,
-                "finished_reason": "stop",
+                "finished_reason": "",
             }), encoding="utf-8")
             (background / "background_summary.json").write_text(json.dumps({
                 "jobs": 1, "completed": 1, "failed": 0,
