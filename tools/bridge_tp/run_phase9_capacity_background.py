@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 import threading
 import time
@@ -28,6 +29,11 @@ from vllm.bridge_tp.controller.online_io import (  # noqa: E402
 from vllm.bridge_tp.controller.sampling_contract import (  # noqa: E402
     freeze_strict_greedy_sampling,
 )
+
+
+def anchor_output_threshold(event: str) -> int | None:
+    match = re.fullmatch(r"ANCHOR_OUTPUT_([1-9][0-9]*)", event)
+    return int(match.group(1)) if match else None
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
@@ -49,12 +55,21 @@ def load_manifest(path: Path) -> dict[str, Any]:
             raise ValueError(f"job {job_id} pool must be source or target")
         if float(job.get("start_after_s", -1)) < 0:
             raise ValueError(f"job {job_id} start_after_s must be non-negative")
-        if job.get("start_after_event") not in {
-            None, "M2_INITIAL_RATE", "ANCHOR_FIRST_OUTPUT"
-        }:
+        start_event = job.get("start_after_event")
+        if start_event is not None and not isinstance(start_event, str):
             raise ValueError(f"job {job_id} has an unknown start event")
-        if job.get("start_after_event") and job["pool"] != "source":
+        if start_event not in (
+            None, "M2_INITIAL_RATE", "ANCHOR_FIRST_OUTPUT"
+        ) and anchor_output_threshold(start_event) is None:
+            raise ValueError(f"job {job_id} has an unknown start event")
+        if start_event in ("M2_INITIAL_RATE", "ANCHOR_FIRST_OUTPUT") and (
+            job["pool"] != "source"
+        ):
             raise ValueError(f"job {job_id} event start requires a source job")
+        if (isinstance(start_event, str)
+                and anchor_output_threshold(start_event) is not None
+                and job["pool"] != "target"):
+            raise ValueError(f"job {job_id} anchor-output start requires target")
         request = job.get("request")
         if not isinstance(request, dict):
             raise ValueError(f"job {job_id} request must be an object")
@@ -90,8 +105,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def wait_for_controller_event(path: Path, event: str, timeout_s: float) -> float:
-    """Release diagnostic source arrivals after an observed controller event."""
-    if event not in {"M2_INITIAL_RATE", "ANCHOR_FIRST_OUTPUT"}:
+    """Release diagnostic arrivals after observed controller progress."""
+    output_threshold = anchor_output_threshold(event)
+    if event not in {"M2_INITIAL_RATE", "ANCHOR_FIRST_OUTPUT"} and (
+        output_threshold is None
+    ):
         raise ValueError(f"unknown controller event: {event}")
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -108,6 +126,12 @@ def wait_for_controller_event(path: Path, event: str, timeout_s: float) -> float
                 if event == "ANCHOR_FIRST_OUTPUT" and (
                     row.get("kind") == "telemetry"
                     and int(row.get("output_tokens") or 0) > 0
+                ):
+                    return time.monotonic()
+                if output_threshold is not None and (
+                    row.get("kind") == "telemetry"
+                    and int(row.get("output_tokens") or 0)
+                    >= output_threshold
                 ):
                     return time.monotonic()
         time.sleep(0.02)
