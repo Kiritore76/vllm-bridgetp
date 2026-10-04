@@ -388,6 +388,12 @@ def main() -> None:
             outcomes.setdefault(key, {"status": "NOT_STARTED"})
         report = summarize(run_dir, outcomes)
         report["scope"] = scope
+        if scope == "pressure":
+            report["ready_for_large_paired_capture"] = None
+            report["notes"].append(
+                "Pressure-only retest omits A/B repeats; overall scale-up "
+                "readiness must combine this result with separate A/B evidence."
+            )
         write_json(run_dir / "gate_summary.json", report)
         archive = run_dir.with_suffix(".tar.gz")
         with tarfile.open(archive, "w:gz") as handle:
