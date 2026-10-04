@@ -61,6 +61,38 @@ run_goodoutput_pair_a100() {
     nvidia-smi -L
     sha256sum "$model/config.json" "$checkpoint" "$base" "$manifest" "$survival" "$guard"
   } > "$run/preflight.txt" || return 1
+  /root/autodl-tmp/bridgetp/.venv_bridge/bin/python - \
+    "$model/config.json" "$base" "$manifest" "$checkpoint" \
+    "$run/preflight.json" <<'PY' || return 1
+import hashlib
+import json
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+model, base, manifest, checkpoint, output = map(Path, sys.argv[1:])
+uuid_output = subprocess.run(
+    ["nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader"],
+    check=True, capture_output=True, text=True, timeout=15,
+).stdout
+uuids = [line.strip() for line in uuid_output.splitlines() if line.strip()]
+if len(uuids) != 5 or len(set(uuids)) != 5:
+    raise ValueError("expected five distinct GPU UUIDs")
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+output.write_text(json.dumps({
+    "format_version": 1,
+    "hostname": socket.gethostname(),
+    "gpu_uuids": uuids,
+    "model_config_sha256": sha(model),
+    "base_manifest_sha256": sha(base),
+    "manifest_sha256": sha(manifest),
+    "predictor_checkpoint_sha256": sha(checkpoint),
+}, indent=2) + "\n", encoding="utf-8")
+PY
 
   for arm in stay migrate; do
     local paired_arg=()
@@ -110,6 +142,19 @@ run_goodoutput_pair_a100() {
       --out-json "$run/pair_comparison.json" \
       > "$run/compare.console.log" 2>&1
     rc=$?
+  fi
+  if [[ "$rc" -eq 0 && "${BRIDGETP_SLO_V6_REFERENCE:-}" != "" ]]; then
+    for arm in stay migrate; do
+      python tools/bridge_tp/audit_slo_v6.py \
+        --run-root "$run/$arm/r01_shadow_only" \
+        --reference "$BRIDGETP_SLO_V6_REFERENCE" \
+        --preflight-json "$run/preflight.json" \
+        --require-reference-match \
+        --out-json "$run/$arm.slo_v6.json" \
+        > "$run/$arm.slo_v6.console.log" 2>&1
+      rc=$?
+      [[ "$rc" -eq 0 ]] || break
+    done
   fi
   tar -czf "$run.tar.gz" -C "$root" "$(basename "$run")" || return 1
   echo "配对退出码：$rc"

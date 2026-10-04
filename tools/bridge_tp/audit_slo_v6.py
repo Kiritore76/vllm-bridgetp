@@ -253,6 +253,7 @@ def main() -> None:
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--preflight-json", type=Path)
+    parser.add_argument("--require-reference-match", action="store_true")
     parser.add_argument("--out-json", type=Path, required=True)
     args = parser.parse_args()
     if args.out_json.exists():
@@ -296,6 +297,12 @@ def main() -> None:
     print(json.dumps({"computable": report["computable"],
                       "reference_applicability": report["reference_applicability"],
                       "errors": report["errors"], "metrics": report["metrics"]}))
+    if not report["computable"]:
+        raise RuntimeError("v6 SLO audit is not computable; inspect out-json")
+    if (args.require_reference_match
+            and report["reference_applicability"]
+            != "VERIFIED_GPU_AND_MODEL_CONFIG"):
+        raise RuntimeError("v6 reference does not match this run; inspect out-json")
 
 
 if __name__ == "__main__":
