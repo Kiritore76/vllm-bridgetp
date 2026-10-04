@@ -283,7 +283,7 @@ def collect_arm(args: argparse.Namespace, root: Path,
     }
     observed = observed_action(run)
     natural_noop = (
-        action != "stay" and runner_rc != 0 and audit_rc == 0
+        action != "stay" and audit_rc == 0
         and slo.get("computable") is True
         and observed.get("audit_available") is True
         and observed.get("start_count") == 0
