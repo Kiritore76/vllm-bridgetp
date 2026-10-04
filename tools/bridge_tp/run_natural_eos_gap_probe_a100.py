@@ -130,8 +130,8 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
     revision = common.git("rev-parse", "HEAD")
     branch = common.git("branch", "--show-current")
     if (revision != args.expected_revision or branch != args.expected_branch
-            or common.git("status", "--porcelain")):
-        raise RuntimeError("HEAD, branch or worktree differs; no GPU run")
+            or common.git("status", "--porcelain", "--untracked-files=no")):
+        raise RuntimeError("HEAD, branch or tracked worktree differs; no GPU run")
     hostname = socket.gethostname()
     if hostname != args.expected_hostname:
         raise RuntimeError(f"hostname differs: {hostname}")
@@ -164,6 +164,9 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
         probe.bind(("127.0.0.1", args.port))
     return {
         "revision": revision, "branch": branch, "hostname": hostname,
+        "untracked_repo_files": common.git(
+            "ls-files", "--others", "--exclude-standard",
+        ).splitlines(),
         "gpu_inventory": gpu_csv, "gpu_uuids": uuids,
         "input_path": str(args.input.resolve()),
         "input_sha256": args.expected_input_sha256,
