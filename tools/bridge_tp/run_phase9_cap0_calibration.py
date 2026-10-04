@@ -345,9 +345,21 @@ def make_source_request(
     args: argparse.Namespace,
     provenance_dir: Path,
 ) -> Path:
-    request = read_json(SOURCE_REQUEST)
+    anchor_request_file = getattr(args, "anchor_request_file", None)
+    request = read_json(anchor_request_file or SOURCE_REQUEST)
     anchor_prompt_tokens = getattr(args, "anchor_prompt_tokens", None)
-    if anchor_prompt_tokens is not None:
+    if anchor_request_file is not None:
+        prompt = request.get("prompt")
+        if (
+            not isinstance(prompt, list)
+            or not prompt
+            or any(not isinstance(token, int) or isinstance(token, bool)
+                   for token in prompt)
+            or anchor_prompt_tokens != len(prompt)
+            or request.get("ignore_eos") is not False
+        ):
+            raise ValueError("natural anchor request has invalid prompt or EOS rule")
+    elif anchor_prompt_tokens is not None:
         if int(anchor_prompt_tokens) <= 0:
             raise ValueError("anchor_prompt_tokens must be positive")
         # A fixed valid vocabulary ID keeps all four modes byte-for-byte

@@ -293,6 +293,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--anchor-max-tokens", type=int, default=1024)
     parser.add_argument("--anchor-prompt-tokens", type=int, default=None)
+    parser.add_argument("--anchor-request-file", type=Path)
+    parser.add_argument("--expected-anchor-request-sha256")
+    parser.add_argument("--natural-eos-anchor", action="store_true")
     parser.add_argument("--minimum-ready-target-jobs", type=int, default=2)
     parser.add_argument("--minimum-ready-source-jobs", type=int, default=0)
     parser.add_argument("--background-lead-s", type=float, default=2.0)
@@ -568,6 +571,16 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         and args.anchor_prompt_tokens + args.anchor_max_tokens > args.max_model_len
     ):
         raise ValueError("anchor prompt plus output exceeds max model length")
+    if args.natural_eos_anchor and (
+        args.anchor_request_file is None
+        or not args.expected_anchor_request_sha256
+        or args.anchor_prompt_tokens is None
+    ):
+        raise ValueError(
+            "natural EOS anchor requires a pinned request and prompt length"
+        )
+    if args.anchor_request_file is not None and not args.natural_eos_anchor:
+        raise ValueError("custom anchor request requires natural EOS mode")
     if args.minimum_ready_target_jobs < 0 or args.minimum_window_samples < 0:
         raise ValueError("online sample thresholds cannot be negative")
     if not 0 <= args.minimum_source_kv_usage_frac <= 1:
@@ -751,6 +764,25 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
     for path, expected_sha, label in expected_hashes:
         if common.sha256(path) != expected_sha:
             raise RuntimeError(f"{label} SHA-256 differs from expected")
+    if args.natural_eos_anchor:
+        assert args.anchor_request_file is not None
+        if (
+            not args.anchor_request_file.is_file()
+            or common.sha256(args.anchor_request_file)
+            != args.expected_anchor_request_sha256
+        ):
+            raise RuntimeError("natural anchor request SHA-256 differs")
+        anchor_request = common.read_json(args.anchor_request_file)
+        prompt = anchor_request.get("prompt")
+        if (
+            not isinstance(prompt, list)
+            or len(prompt) != args.anchor_prompt_tokens
+            or not all(isinstance(token, int) and not isinstance(token, bool)
+                       for token in prompt)
+            or anchor_request.get("ignore_eos") is not False
+            or anchor_request.get("max_tokens") != args.anchor_max_tokens
+        ):
+            raise ValueError("natural anchor request differs from pinned contract")
     guard = int(args.guard_file.read_text(encoding="utf-8").strip())
     if guard != args.expected_guard:
         raise RuntimeError(f"frozen guard {guard} differs from expected")
@@ -1690,6 +1722,7 @@ def accept_paired_stay(
     background_dir: Path,
     expected_jobs: int,
     expected_anchor_tokens: int,
+    natural_eos_anchor: bool = False,
 ) -> dict[str, Any]:
     """Require a complete TP1 response with M1 evidence and no migration actuation."""
     background = common.read_json(background_dir / "background_summary.json")
@@ -1705,11 +1738,17 @@ def accept_paired_stay(
             or background.get("completed") != expected_jobs
             or background.get("failed") != 0):
         errors.append("background jobs did not all complete")
-    if (source.get("finish_reason") != "length"
-            or len(source.get("token_ids") or []) != expected_anchor_tokens):
+    source_tokens = len(source.get("token_ids") or [])
+    if natural_eos_anchor:
+        if (source.get("finish_reason") != "stop"
+                or proxy.get("finished_reason") != "stop"
+                or not 1 <= source_tokens < expected_anchor_tokens):
+            errors.append("source did not naturally finish before its cap")
+    elif (source.get("finish_reason") != "length"
+          or source_tokens != expected_anchor_tokens):
         errors.append("source did not finish its full capped output")
-    if (proxy.get("emitted_tokens") != expected_anchor_tokens
-            or proxy.get("source_origin_tokens") != expected_anchor_tokens
+    if (proxy.get("emitted_tokens") != source_tokens
+            or proxy.get("source_origin_tokens") != source_tokens
             or proxy.get("target_origin_tokens") != 0
             or proxy.get("committed") is not False):
         errors.append("visible response was not entirely from TP1")
@@ -2045,6 +2084,7 @@ def accept_online(
     expected_jobs: int,
     expected_anchor_tokens: int,
     *,
+    natural_eos_anchor: bool = False,
     strategy: str,
     minimum_window_samples: int,
     fixed_rate_gib_s: float | None = None,
@@ -2874,7 +2914,17 @@ def accept_online(
             errors.append("controller did not receive a UDP ready notification")
     if proxy.get("committed") is not True:
         errors.append("unified response proxy did not commit")
-    if proxy.get("emitted_tokens") != expected_anchor_tokens:
+    emitted_tokens = proxy.get("emitted_tokens")
+    if natural_eos_anchor:
+        if (
+            not isinstance(emitted_tokens, int)
+            or isinstance(emitted_tokens, bool)
+            or not 1 <= emitted_tokens < expected_anchor_tokens
+            or proxy.get("finished_reason") != "stop"
+            or target_response.get("finish_reason") != "stop"
+        ):
+            errors.append("unified response did not naturally finish before cap")
+    elif emitted_tokens != expected_anchor_tokens:
         errors.append("unified response length differs from anchor budget")
     if (
         int(proxy.get("source_origin_tokens", 0)) <= 0
@@ -2884,8 +2934,10 @@ def accept_online(
     if proxy.get("handoff_stall_s") is None:
         errors.append("unified response did not record a handoff stall")
     emitted = proxy.get("emitted", [])
-    if [row.get("index") for row in emitted] != list(range(expected_anchor_tokens)):
+    if [row.get("index") for row in emitted] != list(range(len(emitted))):
         errors.append("unified response indices are not contiguous")
+    if len(emitted) != emitted_tokens:
+        errors.append("unified response record count differs from emitted tokens")
     required_windows = (
         ("PRE_SHADOW",)
         if stop_and_copy
@@ -3635,6 +3687,8 @@ def main() -> None:
         "manager_m1_stay_reason": args.manager_m1_stay_reason,
         "anchor_max_tokens": args.anchor_max_tokens,
         "anchor_prompt_tokens": args.anchor_prompt_tokens,
+        "natural_eos_anchor": args.natural_eos_anchor,
+        "anchor_request_sha256": args.expected_anchor_request_sha256,
         "tp4_max_num_seqs": args.tp4_max_num_seqs,
         "bridge_output_tokens": args.bridge_output_tokens,
         "repetitions": args.repetitions,
@@ -3829,6 +3883,7 @@ def main() -> None:
                         accepted = accept_paired_stay(
                             controller_dir, background_dir,
                             expected_jobs, expected_anchor_tokens,
+                            natural_eos_anchor=args.natural_eos_anchor,
                         )
                     elif args.manager_m4_expect_cancel:
                         accepted = accept_m4_cancel(
@@ -3841,6 +3896,7 @@ def main() -> None:
                             background_dir,
                             expected_jobs,
                             expected_anchor_tokens,
+                            natural_eos_anchor=args.natural_eos_anchor,
                             strategy=selected,
                             minimum_window_samples=args.minimum_window_samples,
                             fixed_rate_gib_s=args.fixed_rate_gib_s,

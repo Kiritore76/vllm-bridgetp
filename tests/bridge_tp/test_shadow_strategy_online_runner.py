@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 
 from tools.bridge_tp.build_shadow_strategy_online_manifest import build_manifest
 from tools.bridge_tp.run_phase9_capacity_background import percentile
+from tools.bridge_tp.run_phase9_cap0_calibration import make_source_request
 from tools.bridge_tp.run_phase9_cap0_noop import wait_for_background_first_tokens
 from tools.bridge_tp.run_shadow_rate_load_matrix import (
     parse_load_profiles,
@@ -50,6 +51,23 @@ class TestOnlineShadowManifest(unittest.TestCase):
 
 
 class TestOnlineStrategyTiming(unittest.TestCase):
+    def test_natural_anchor_keeps_exact_prompt_and_eos(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            pinned = root / "pinned.json"
+            pinned.write_text(json.dumps({
+                "model": "bridgetp-model", "prompt": [11, 12, 13],
+                "max_tokens": 4096, "ignore_eos": False,
+            }), encoding="utf-8")
+            args = Namespace(anchor_request_file=pinned,
+                             anchor_prompt_tokens=3, anchor_max_tokens=4096)
+            saved = json.loads(make_source_request(args, root).read_text())
+            self.assertEqual(saved["prompt"], [11, 12, 13])
+            self.assertIs(saved["ignore_eos"], False)
+            args.anchor_prompt_tokens = 4
+            with self.assertRaisesRegex(ValueError, "natural anchor"):
+                make_source_request(args, root)
+
     def test_paired_stay_requires_full_tp1_output_and_suppressed_start(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
@@ -86,6 +104,45 @@ class TestOnlineStrategyTiming(unittest.TestCase):
             )
             self.assertEqual(
                 accept_paired_stay(controller, background, 1, 3)["status"],
+                "FAIL",
+            )
+
+    def test_paired_stay_accepts_natural_eos_before_cap(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            controller, background = root / "controller", root / "background"
+            controller.mkdir()
+            background.mkdir()
+            (controller / "source_response.json").write_text(json.dumps({
+                "token_ids": [10, 11, 12], "finish_reason": "stop",
+            }), encoding="utf-8")
+            (controller / "response_proxy_stats.json").write_text(json.dumps({
+                "emitted_tokens": 3, "source_origin_tokens": 3,
+                "target_origin_tokens": 0, "committed": False,
+                "finished_reason": "stop",
+            }), encoding="utf-8")
+            (background / "background_summary.json").write_text(json.dumps({
+                "jobs": 1, "completed": 1, "failed": 0,
+            }), encoding="utf-8")
+            rows = [
+                {"kind": "manager_m1_start_decision", "decision": {
+                    "action": "START_SHADOW", "reason": "source risk",
+                }},
+                {"kind": "paired_stay_intervention", "action": "STAY"},
+                {"kind": "transition", "to": "COMPLETED_ON_TP1"},
+                {"kind": "run_end", "final_state": "COMPLETED_ON_TP1"},
+            ]
+            (controller / "phase9_audit.jsonl").write_text(
+                "\n".join(map(json.dumps, rows)), encoding="utf-8",
+            )
+            self.assertEqual(
+                accept_paired_stay(
+                    controller, background, 1, 4096,
+                    natural_eos_anchor=True,
+                )["status"], "PASS",
+            )
+            self.assertEqual(
+                accept_paired_stay(controller, background, 1, 4096)["status"],
                 "FAIL",
             )
 
