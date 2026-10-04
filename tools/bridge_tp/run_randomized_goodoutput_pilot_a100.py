@@ -269,18 +269,33 @@ def collect_arm(args: argparse.Namespace, root: Path,
     background_path = run / "background" / "background_summary.json"
     background = (json.loads(background_path.read_text(encoding="utf-8"))
                   if background_path.is_file() else {})
+    source_path = run / "controller" / "source_response.json"
+    source = (json.loads(source_path.read_text(encoding="utf-8"))
+              if source_path.is_file() else {})
     finish_reasons = {
         reason: sum(row.get("finish_reason") == reason
                     for row in background.get("results", []))
         for reason in {row.get("finish_reason")
                        for row in background.get("results", [])}
     }
+    observed = observed_action(run)
+    natural_noop = (
+        action != "stay" and runner_rc != 0 and audit_rc == 0
+        and slo.get("computable") is True
+        and observed.get("audit_available") is True
+        and observed.get("start_count") == 0
+        and source.get("finish_reason") == "stop"
+    )
     result = {
         "assigned_action": action,
         "configured_eligibility_tokens": (
             1024 if action == "late1024" else 128),
         "runner_rc": runner_rc, "audit_rc": audit_rc,
-        "observed_action": observed_action(run),
+        "observed_action": observed,
+        "anchor_source_finish_reason": source.get("finish_reason"),
+        "anchor_source_output_tokens": len(source.get("token_ids", [])),
+        "natural_noop_needs_review": natural_noop,
+        "fatal_error": bool(audit_rc or (runner_rc and not natural_noop)),
         "slo_computable": slo.get("computable"),
         "slo_metrics": slo.get("metrics"),
         "slo_errors": slo.get("errors"),
@@ -340,7 +355,7 @@ def execute_pilot(args: argparse.Namespace) -> None:
             for action in action_order(name):
                 if action in outcomes:
                     prior = outcomes[action]
-                    if prior["runner_rc"] or prior["audit_rc"]:
+                    if prior.get("fatal_error", True):
                         raise ValueError(
                             f"previous failed arm must be diagnosed: {name}/{action}")
                     continue
@@ -352,7 +367,7 @@ def execute_pilot(args: argparse.Namespace) -> None:
                 result = collect_arm(args, root, setup, name, action)
                 outcomes[action] = result
                 write_json(summary_path, summary)
-                if result["runner_rc"] or result["audit_rc"]:
+                if result["fatal_error"]:
                     failed = True
                     break
             if failed:
