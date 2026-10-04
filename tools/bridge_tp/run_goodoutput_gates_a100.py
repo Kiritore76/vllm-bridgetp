@@ -31,6 +31,8 @@ from tools.bridge_tp.run_goodoutput_matrix_a100 import (
 GUARD_TOKENS = 8448
 REPEATS = 3
 PRESSURE_START_FREE_LIMIT = 14000
+PRESSURE_SOURCE_SPACING_S = 0.6
+LATE_TARGET_START_EVENT = "ANCHOR_OUTPUT_800"
 
 
 def build_natural_pressure(
@@ -54,7 +56,7 @@ def build_natural_pressure(
     prefix = tokenizer.encode(
         start + "Read the following context.\n", add_special_tokens=False)
     suffix = tokenizer.encode(
-        "\nWrite a detailed synthesis of about 250 words. Explain the main "
+        "\nWrite a detailed synthesis of about 350 words. Explain the main "
         "points and end with a brief conclusion." + end,
         add_special_tokens=False)
     budget = 3584 - len(prefix) - len(suffix)
@@ -84,7 +86,7 @@ def build_natural_pressure(
                 raise ValueError("pressure prompt length differs from 3584")
             pressure_jobs.append({
                 "job_id": f"source_{index:03d}", "pool": "source",
-                "start_after_s": index * 0.1,
+                "start_after_s": round(index * PRESSURE_SOURCE_SPACING_S, 3),
                 "start_after_event": "ANCHOR_FIRST_OUTPUT",
                 "request": {"model": "bridgetp-model", "prompt": prompt,
                             "max_tokens": 768, "ignore_eos": False},
@@ -98,6 +100,8 @@ def build_natural_pressure(
             "anchor_input_id": base["anchor_input_id"],
             "pressure_prompt_tokens": 3584,
             "pressure_request_max_tokens": 768,
+            "pressure_source_spacing_s": PRESSURE_SOURCE_SPACING_S,
+            "requested_response_words": 350,
             "natural_eos_required": True,
             "pressure_start_event": "ANCHOR_FIRST_OUTPUT",
             "diagnostic_m1_max_source_free_kv_tokens": (
@@ -111,6 +115,38 @@ def build_natural_pressure(
             "jobs": len(manifest["jobs"]), "source_jobs": 5,
             "target_jobs": len(target_jobs),
         }
+
+
+def build_late_target_load(run_dir: Path, setup: dict[str, Any]) -> None:
+    base = json.loads(Path(
+        setup["manifests"]["A_safe_light"]["path"]
+    ).read_text(encoding="utf-8"))
+    warm_targets = [job for job in base["jobs"] if job["pool"] == "target"]
+    if len(warm_targets) != 2:
+        raise ValueError("late-light scenario needs exactly two warm targets")
+    late_targets = []
+    for index, original in enumerate(warm_targets, start=2):
+        job = copy.deepcopy(original)
+        job["job_id"] = f"target_{index:03d}"
+        job["start_after_event"] = LATE_TARGET_START_EVENT
+        job["start_after_s"] = (index - 2) * 0.1
+        late_targets.append(job)
+    manifest = {
+        **base,
+        "scenario": "L_late_light",
+        "status": "GATE_VALIDATION_LATE_TARGET_ARRIVALS",
+        "late_target_start_event": LATE_TARGET_START_EVENT,
+        "late_target_reuses_warm_prompts": True,
+        "jobs": base["jobs"] + late_targets,
+    }
+    path = run_dir / "inputs" / "L_late_light.json"
+    write_json(path, manifest)
+    setup["manifests"]["L_late_light"] = {
+        "path": str(path), "sha256": sha256(path),
+        "jobs": len(manifest["jobs"]), "source_jobs": sum(
+            job["pool"] == "source" for job in manifest["jobs"]),
+        "target_jobs": 4,
+    }
 
 
 def replace_option(command: list[str], name: str, value: str) -> None:
@@ -333,6 +369,7 @@ def main() -> None:
     write_json(run_dir / "preflight.json", preflight)
     setup = prepare(args, run_dir)
     build_natural_pressure(args, run_dir, setup)
+    build_late_target_load(run_dir, setup)
     write_json(run_dir / "inputs" / "gate_setup.json", setup)
     plan = []
     if scope == "all":
@@ -344,7 +381,7 @@ def main() -> None:
                 plan.append((f"{name}/r{repetition:02d}", name, order, False))
     for name in ("C_guard_light", "D_guard_busy"):
         plan.append((f"{name}/r01", name, ("stay", "migrate"), False))
-    plan.append(("L_late_light/r01", "A_safe_light",
+    plan.append(("L_late_light/r01", "L_late_light",
                  ("migrate", "stay"), True))
     outcomes: dict[str, Any] = {}
     try:

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from tools.bridge_tp.run_goodoutput_gates_a100 import (
+    build_late_target_load,
     build_natural_pressure,
     configure_late_command,
     configure_pressure_command,
@@ -81,6 +82,40 @@ class TestNaturalPressure(unittest.TestCase):
                                     for job in source))
                 self.assertTrue(all(job["start_after_event"]
                                     == "ANCHOR_FIRST_OUTPUT" for job in source))
+                self.assertEqual(
+                    [job["start_after_s"] for job in source],
+                    [0.0, 0.6, 1.2, 1.8, 2.4],
+                )
+                self.assertEqual(manifest["requested_response_words"], 350)
+
+    def test_late_targets_arrive_after_anchor_output_800(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base_path = root / "base.json"
+            base_path.write_text(json.dumps({
+                "format_version": 1,
+                "jobs": [
+                    {"job_id": f"target_{index:03d}", "pool": "target",
+                     "start_after_s": 0.5 + index,
+                     "request": {"prompt": [1, 2], "max_tokens": 4096},
+                     "input_id": f"input-{index}"}
+                    for index in range(2)
+                ],
+            }))
+            setup = {"manifests": {"A_safe_light": {"path": str(base_path)}}}
+            build_late_target_load(root, setup)
+            manifest = json.loads(Path(
+                setup["manifests"]["L_late_light"]["path"]
+            ).read_text())
+            self.assertEqual(len(manifest["jobs"]), 4)
+            self.assertEqual(
+                [job["start_after_event"] for job in manifest["jobs"][2:]],
+                ["ANCHOR_OUTPUT_800", "ANCHOR_OUTPUT_800"],
+            )
+            self.assertEqual(
+                [job["job_id"] for job in manifest["jobs"]],
+                [f"target_{index:03d}" for index in range(4)],
+            )
 
     def test_guard_requires_safe_minimum(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

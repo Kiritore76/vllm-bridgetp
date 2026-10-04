@@ -18,6 +18,8 @@ from tools.bridge_tp.build_experiment_a4_pressure_manifest import (
     build_manifest as build_pressure_manifest,
 )
 from tools.bridge_tp.run_phase9_capacity_background import (
+    anchor_output_threshold,
+    load_manifest,
     wait_for_controller_event,
     wait_for_m2_initial_rate,
 )
@@ -137,6 +139,47 @@ class TestM2RateController(unittest.TestCase):
             observed = wait_for_controller_event(
                 audit, "ANCHOR_FIRST_OUTPUT", 1.0,
             )
+            writer.join()
+            self.assertGreaterEqual(observed - started, 0.04)
+
+    def test_late_target_arrival_waits_for_anchor_output_800(self) -> None:
+        self.assertEqual(anchor_output_threshold("ANCHOR_OUTPUT_800"), 800)
+        self.assertIsNone(anchor_output_threshold("ANCHOR_OUTPUT_0"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "manifest.json"
+            manifest = {"format_version": 1, "jobs": [{
+                "job_id": "target_002", "pool": "target",
+                "start_after_event": "ANCHOR_OUTPUT_800",
+                "start_after_s": 0.0,
+                "request": {"model": "model", "prompt": [100],
+                            "max_tokens": 1024},
+            }]}
+            manifest_path.write_text(json.dumps(manifest))
+            self.assertEqual(
+                load_manifest(manifest_path)["jobs"][0]["pool"], "target")
+            manifest["jobs"][0]["pool"] = "source"
+            manifest_path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "requires target"):
+                load_manifest(manifest_path)
+
+            audit = root / "audit.jsonl"
+
+            def publish() -> None:
+                audit.write_text(json.dumps({
+                    "kind": "telemetry", "output_tokens": 799,
+                }) + "\n", encoding="utf-8")
+                time.sleep(0.05)
+                with audit.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps({
+                        "kind": "telemetry", "output_tokens": 800,
+                    }) + "\n")
+
+            writer = threading.Thread(target=publish)
+            writer.start()
+            started = time.monotonic()
+            observed = wait_for_controller_event(
+                audit, "ANCHOR_OUTPUT_800", 1.0)
             writer.join()
             self.assertGreaterEqual(observed - started, 0.04)
 
