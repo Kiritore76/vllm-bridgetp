@@ -66,6 +66,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--background-context-limit", action="store_true",
                         help="Use the largest background output allowed by context")
     parser.add_argument("--background-max-tokens", type=int, default=2048)
+    parser.add_argument("--dtype", default="bfloat16",
+                        choices=("bfloat16", "float16"))
+    parser.add_argument("--max-model-len", type=int, default=8192)
+    parser.add_argument("--tp4-max-model-len", type=int)
     parser.add_argument("--random-arrivals", action="store_true",
                         help="Use seeded exponential interarrival gaps")
     parser.add_argument("--evaluation-horizon-s", type=float, default=180.0)
@@ -152,10 +156,13 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
             offsets[pool] = values
         anchor = rows[index]
         anchor_tokens = tokens(anchor)
-        anchor_cap = (min(8192 - len(anchor_tokens), 8192 - 128)
+        source_max_model_len = getattr(args, "max_model_len", 8192)
+        anchor_cap = (min(source_max_model_len - len(anchor_tokens),
+                          source_max_model_len - 128)
                       if getattr(args, "anchor_context_limit", False)
                       else 4096)
-        if anchor_cap <= 128 or len(anchor_tokens) + anchor_cap > 8192:
+        if (anchor_cap <= 128
+                or len(anchor_tokens) + anchor_cap > source_max_model_len):
             raise ValueError(f"anchor exceeds context limit: {anchor['id']}")
         anchor_request = {
             "model": "bridgetp-model", "prompt": anchor_tokens,
@@ -382,6 +389,11 @@ def collect_arm(args: argparse.Namespace, root: Path,
     command = online_command(args, command_setup, name,
                              "stay" if action == "stay" else "migrate",
                              arm_root)
+    command.extend(("--dtype", args.dtype, "--max-model-len",
+                    str(args.max_model_len)))
+    if args.tp4_max_model_len is not None:
+        command.extend(("--tp4-max-model-len",
+                        str(args.tp4_max_model_len)))
     command[command.index("--anchor-max-tokens") + 1] = str(
         setup["anchors"][name]["max_tokens"])
     configure_action(command, action)
@@ -389,16 +401,24 @@ def collect_arm(args: argparse.Namespace, root: Path,
     runner_rc = execute(command, case_root / f"{action}.console.log")
     run = arm_root / "r01_shadow_only"
     audit_path = case_root / f"{action}.slo_v6.json"
-    audit_command = [
-        sys.executable, "tools/bridge_tp/audit_slo_v6.py",
-        "--run-root", str(run), "--reference", str(args.reference),
-        "--preflight-json", str(root / "preflight.json"),
-        "--require-reference-match", "--out-json", str(audit_path),
-    ]
-    if args.portable_hardware:
-        audit_command += ["--gpu-match-mode", "model"]
-    audit_rc = execute(audit_command,
-                       case_root / f"{action}.slo_v6.console.log")
+    if args.dtype == "bfloat16":
+        audit_command = [
+            sys.executable, "tools/bridge_tp/audit_slo_v6.py",
+            "--run-root", str(run), "--reference", str(args.reference),
+            "--preflight-json", str(root / "preflight.json"),
+            "--require-reference-match", "--out-json", str(audit_path),
+        ]
+        if args.portable_hardware:
+            audit_command += ["--gpu-match-mode", "model"]
+        audit_rc = execute(audit_command,
+                           case_root / f"{action}.slo_v6.console.log")
+    else:
+        audit_rc = 0
+        write_json(audit_path, {
+            "computable": False,
+            "reference_applicability": "EXPLORATORY_FP16_UNCALIBRATED",
+            "errors": ["BF16 SLO reference is inapplicable to FP16"],
+        })
     slo = (json.loads(audit_path.read_text(encoding="utf-8"))
            if audit_path.is_file() else {})
     background_path = run / "background" / "background_summary.json"
@@ -447,7 +467,10 @@ def collect_arm(args: argparse.Namespace, root: Path,
         "fatal_error": bool(audit_rc or (runner_rc and not natural_noop
                                           and not context_censored)),
         "slo_computable": slo.get("computable"),
-        "slo_reference_applicability": slo.get("reference_applicability"),
+        "slo_reference_applicability": (
+            slo.get("reference_applicability") if args.dtype == "bfloat16"
+            else "EXPLORATORY_FP16_UNCALIBRATED"
+        ),
         "slo_metrics": slo.get("metrics"),
         "slo_errors": slo.get("errors"),
         "background_jobs": background.get("jobs"),
@@ -480,6 +503,8 @@ def fixed_horizon_result(result: dict[str, Any], horizon_s: float) -> None:
                    and sum(finish_reasons.values()) == background_count)
     eligible = (
         not result.get("fatal_error", True) and result.get("audit_rc") == 0
+        and result.get("slo_reference_applicability")
+        != "EXPLORATORY_FP16_UNCALIBRATED"
         and completed and natural_eos and isinstance(wall_s, (int, float))
         and math.isfinite(wall_s) and wall_s <= horizon_s
         and isinstance(good_tokens, int) and good_tokens >= 0
@@ -576,6 +601,11 @@ def timing_results(summary: dict[str, Any]) -> dict[str, Any]:
 
 
 def execute_pilot(args: argparse.Namespace) -> None:
+    if not 128 < args.max_model_len <= 32768:
+        raise ValueError("source max model length must be in (128, 32768]")
+    if (args.tp4_max_model_len is not None
+            and not args.max_model_len <= args.tp4_max_model_len <= 32768):
+        raise ValueError("TP4 max model length must cover TP1 and be <= 32768")
     if not math.isfinite(args.evaluation_horizon_s) or args.evaluation_horizon_s <= 0:
         raise ValueError("evaluation horizon must be positive and finite")
     if args.paired_only and args.timing_pilot:
@@ -621,6 +651,9 @@ def execute_pilot(args: argparse.Namespace) -> None:
         "background_context_limit": args.background_context_limit,
         "selected_cases": selected_cases,
         "anchor_context_limit": args.anchor_context_limit,
+        "dtype": args.dtype,
+        "source_max_model_len": args.max_model_len,
+        "tp4_max_model_len": args.tp4_max_model_len or args.max_model_len,
     }
     summary_path = root / "pilot_summary.json"
     if summary_path.is_file():
@@ -636,7 +669,11 @@ def execute_pilot(args: argparse.Namespace) -> None:
                 != args.background_context_limit
                 or summary.get("selected_cases") != selected_cases
                 or summary.get("anchor_context_limit")
-                != args.anchor_context_limit):
+                != args.anchor_context_limit
+                or summary.get("dtype") != args.dtype
+                or summary.get("source_max_model_len") != args.max_model_len
+                or summary.get("tp4_max_model_len")
+                != (args.tp4_max_model_len or args.max_model_len)):
             raise ValueError("resume options differ from original pilot")
     failed = False
     try:

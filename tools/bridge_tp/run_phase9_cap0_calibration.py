@@ -269,6 +269,10 @@ def wait_pair(
 
 
 def server_command(args: argparse.Namespace, tp: int, port: int) -> list[str]:
+    max_model_len = (
+        getattr(args, "tp4_max_model_len", None) or args.max_model_len
+        if tp == 4 else args.max_model_len
+    )
     return [
         str(args.python_bin),
         "-m",
@@ -282,7 +286,7 @@ def server_command(args: argparse.Namespace, tp: int, port: int) -> list[str]:
         "--dtype",
         args.dtype,
         "--max-model-len",
-        str(args.max_model_len),
+        str(max_model_len),
         "--gpu-memory-utilization",
         str(args.gpu_memory_utilization),
         "--port",
