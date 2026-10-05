@@ -75,7 +75,8 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     if revision != args.expected_revision:
         raise ValueError(f"HEAD differs: {revision}")
-    if socket.gethostname() != args.expected_host:
+    portable_hardware = getattr(args, "portable_hardware", False)
+    if not portable_hardware and socket.gethostname() != args.expected_host:
         raise ValueError(f"hostname differs: {socket.gethostname()}")
     status = subprocess.check_output(
         ["git", "status", "--porcelain", "--untracked-files=no"],
@@ -86,7 +87,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         ["nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader"],
         text=True).strip().replace("\r", "").splitlines()
     expected_uuids = expected_gpu_uuids(args)
-    if uuids != expected_uuids:
+    if not portable_hardware and uuids != expected_uuids:
         raise ValueError(f"GPU UUIDs differ: {uuids}")
     names = subprocess.check_output(
         ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
@@ -96,7 +97,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
     active = subprocess.check_output(
         ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid",
          "--format=csv,noheader"], text=True).strip()
-    if any(uuid in active for uuid in expected_uuids):
+    if any(uuid in active for uuid in uuids):
         raise ValueError("an A100 already has a compute process")
     paths = {
         "input": args.input,
@@ -119,6 +120,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         "hostname": socket.gethostname(),
         "gpu_uuids": uuids,
         "gpu_models": names,
+        "portable_hardware": portable_hardware,
         "paths": {name: str(path.resolve()) for name, path in paths.items()},
         "sha256": measured,
         "model_config_sha256": measured["model_config"],
