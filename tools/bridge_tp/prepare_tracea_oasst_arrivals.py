@@ -72,6 +72,21 @@ def read_arrival_slice(
     return result
 
 
+def count_request_tokens(tokenizer: Any, row: dict[str, Any]) -> int:
+    """Count token IDs after rendering the same chat template used by vLLM."""
+    prompt = row.get("prompt")
+    if prompt is None:
+        prompt = tokenizer.apply_chat_template(
+            row["messages"], tokenize=False, add_generation_prompt=True
+        )
+    if not isinstance(prompt, str):
+        raise ValueError("tokenizer did not render a text prompt")
+    ids = tokenizer.encode(prompt)
+    if not isinstance(ids, list) or not ids:
+        raise ValueError("tokenizer returned no token ID list")
+    return len(ids)
+
+
 def make_composite(
     trace: list[dict[str, Any]],
     requests: list[dict[str, Any]],
@@ -208,11 +223,7 @@ def main() -> None:
     )
 
     def token_count(row: dict[str, Any]) -> int:
-        if "prompt" in row:
-            return len(tokenizer.encode(row["prompt"]))
-        return len(tokenizer.apply_chat_template(
-            row["messages"], tokenize=True, add_generation_prompt=True
-        ))
+        return count_request_tokens(tokenizer, row)
 
     requests, arrivals, audit = make_composite(
         read_arrival_slice(
