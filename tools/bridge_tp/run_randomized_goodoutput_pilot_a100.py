@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import sys
 import tarfile
@@ -47,12 +48,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-revision", required=True)
     parser.add_argument("--expected-host", required=True)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--paired-only", action="store_true",
+                        help="Collect STAY and early128 without the late EOS arm")
+    parser.add_argument("--random-arrivals", action="store_true",
+                        help="Use seeded exponential interarrival gaps")
+    parser.add_argument("--evaluation-horizon-s", type=float, default=180.0)
     return parser.parse_args()
 
 
 def select_inputs(path: Path, seed: int = SEED) -> list[dict[str, Any]]:
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8")
             .splitlines() if line.strip()]
+    tree_splits: dict[str, str] = {}
+    for row in rows:
+        tree_id = str(row.get("source_tree_id") or row["id"])
+        split = str(row.get("split"))
+        if tree_id in tree_splits and tree_splits[tree_id] != split:
+            raise ValueError(f"request tree crosses dataset splits: {tree_id}")
+        tree_splits[tree_id] = split
     test = [row for row in rows if row.get("split") == "test"
             and row.get("workload_group") in {"natural", "long_form"}]
     rng = random.Random(seed)
@@ -82,7 +96,8 @@ def select_inputs(path: Path, seed: int = SEED) -> list[dict[str, Any]]:
 def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
     from transformers import AutoTokenizer
 
-    rows = select_inputs(args.input)
+    seed = getattr(args, "seed", SEED)
+    rows = select_inputs(args.input, seed)
     tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
 
     def tokens(row: dict[str, Any]) -> list[int]:
@@ -96,7 +111,7 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
         return value
 
     setup: dict[str, Any] = {
-        "format_version": 1, "seed": SEED,
+        "format_version": 1, "seed": seed,
         "input_path": str(args.input.resolve()),
         "input_sha256": sha256(args.input),
         "manifests": {}, "anchors": {}, "cases": [],
@@ -104,6 +119,22 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
     cursor = len(CASES)
     for index, (name, source_count, target_count, target_spacing,
                 source_spacing) in enumerate(CASES):
+        arrival_rng = random.Random(f"{seed}:{name}:arrivals")
+        offsets: dict[str, list[float]] = {}
+        for pool, count, spacing, initial in (
+            ("target", target_count, target_spacing, 0.5),
+            ("source", source_count, source_spacing, 0.2),
+        ):
+            values = []
+            elapsed = initial
+            for job_index in range(count):
+                if job_index:
+                    gap = (arrival_rng.expovariate(1 / spacing)
+                           if getattr(args, "random_arrivals", False)
+                           else spacing)
+                    elapsed += gap
+                values.append(round(elapsed, 3))
+            offsets[pool] = values
         anchor = rows[index]
         anchor_tokens = tokens(anchor)
         if len(anchor_tokens) + 4096 > 8192:
@@ -136,9 +167,7 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
                     raise ValueError(f"background exceeds context: {row['id']}")
                 job = {
                     "job_id": f"{pool}_{job_index:03d}", "pool": pool,
-                    "start_after_s": round(
-                        (0.5 + job_index * target_spacing) if pool == "target"
-                        else (0.2 + job_index * source_spacing), 3),
+                    "start_after_s": offsets[pool][job_index],
                     "request": {
                         "model": "bridgetp-model", "prompt": prompt_tokens,
                         "max_tokens": 2048, "ignore_eos": False,
@@ -153,13 +182,16 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
         manifest = {
             "format_version": 1, "scenario": name,
             "status": "RANDOMIZED_GOODOUTPUT_PILOT",
-            "seed": SEED, "source_input": str(args.input.resolve()),
+            "seed": seed, "source_input": str(args.input.resolve()),
             "source_input_sha256": sha256(args.input),
             "anchor_input_id": anchor["id"],
             "source_count": source_count, "target_count": target_count,
             "source_spacing_s": source_spacing,
             "target_spacing_s": target_spacing,
             "natural_eos_required": True,
+            "arrival_process": ("seeded_exponential"
+                                if getattr(args, "random_arrivals", False)
+                                else "fixed_spacing"),
             "jobs": jobs,
         }
         manifest_path = root / "inputs" / f"{name}.json"
@@ -200,9 +232,10 @@ def configure_action(command: list[str], action: str) -> None:
                 "1120" if threshold == 1024 else "320"]
 
 
-def action_order(name: str) -> list[str]:
-    actions = list(ACTIONS)
-    random.Random(f"{SEED}:{name}").shuffle(actions)
+def action_order(name: str, seed: int = SEED,
+                 actions: tuple[str, ...] = ACTIONS) -> list[str]:
+    actions = list(actions)
+    random.Random(f"{seed}:{name}").shuffle(actions)
     return actions
 
 
@@ -221,6 +254,42 @@ def observed_action(run: Path) -> dict[str, Any]:
               and row.get("decision", {}).get("action") == "START_SHADOW"]
     decisions = [row for row in rows
                  if row.get("kind") == "manager_m1_start_decision"]
+    latest_m5: dict[str, Any] | None = None
+    first_candidate: dict[str, Any] | None = None
+    for row in rows:
+        if row.get("kind") == "manager_m5_predictor_shadow":
+            latest_m5 = row
+        if row.get("kind") != "manager_m1_start_decision":
+            continue
+        snapshot = row.get("snapshot") or {}
+        output_tokens = snapshot.get("generated_tokens")
+        if not isinstance(output_tokens, int) or output_tokens < 128:
+            continue
+        decision = row.get("decision") or {}
+        matching_m5 = (latest_m5 if latest_m5 is not None
+                       and latest_m5.get("output_tokens") == output_tokens
+                       else None)
+        first_candidate = {
+            "output_tokens": output_tokens,
+            "target_running": snapshot.get("target_running"),
+            "target_waiting": snapshot.get("target_waiting"),
+            "target_kv_usage_frac": snapshot.get("target_kv_usage_frac"),
+            "source_free_kv_tokens": snapshot.get("source_free_kv_tokens"),
+            "source_guard_free_kv_tokens": snapshot.get(
+                "source_guard_free_kv_tokens"),
+            "source_prefill_pending_kv_tokens": snapshot.get(
+                "source_prefill_pending_kv_tokens"),
+            "source_time_to_guard_s": decision.get("source_time_to_guard_s"),
+            "estimated_preparation_s": decision.get("estimated_preparation_s"),
+            "m1_action": decision.get("action"),
+            "m1_reason": decision.get("reason"),
+            "m5_status": matching_m5.get("status") if matching_m5 else None,
+            "p_remaining_gt_512_lower": (
+                (matching_m5.get(
+                    "p_remaining_gt_long_window_runtime_bounds") or [None])[0]
+                if matching_m5 else None),
+        }
+        break
     acceptance = run / "provenance" / "shadow_online_acceptance.json"
     accepted = (json.loads(acceptance.read_text(encoding="utf-8"))
                 if acceptance.is_file() else {})
@@ -230,6 +299,7 @@ def observed_action(run: Path) -> dict[str, Any]:
         "actual_m1_start_output_tokens": [
             row.get("snapshot", {}).get("generated_tokens") for row in starts],
         "m1_decision_count": len(decisions),
+        "first_candidate_at_or_after_128": first_candidate,
         "last_m1_decision": decisions[-1].get("decision")
         if decisions else None,
         "actual_cutover_output_tokens": accepted.get(
@@ -275,6 +345,9 @@ def collect_arm(args: argparse.Namespace, root: Path,
     source_path = run / "controller" / "source_response.json"
     source = (json.loads(source_path.read_text(encoding="utf-8"))
               if source_path.is_file() else {})
+    target_path = run / "controller" / "target_response.json"
+    target = (json.loads(target_path.read_text(encoding="utf-8"))
+              if target_path.is_file() else {})
     finish_reasons = {
         reason: sum(row.get("finish_reason") == reason
                     for row in background.get("results", []))
@@ -296,6 +369,7 @@ def collect_arm(args: argparse.Namespace, root: Path,
         "runner_rc": runner_rc, "audit_rc": audit_rc,
         "observed_action": observed,
         "anchor_source_finish_reason": source.get("finish_reason"),
+        "anchor_target_finish_reason": target.get("finish_reason"),
         "anchor_source_output_tokens": len(source.get("token_ids", [])),
         "natural_noop_needs_review": natural_noop,
         "fatal_error": bool(audit_rc or (runner_rc and not natural_noop)),
@@ -310,7 +384,87 @@ def collect_arm(args: argparse.Namespace, root: Path,
     return result
 
 
+def fixed_horizon_result(result: dict[str, Any], horizon_s: float) -> None:
+    """Score a fully drained natural-EOS arm on one common horizon."""
+    metrics = result.get("slo_metrics") or {}
+    wall_s = metrics.get("wall_time_s")
+    good_tokens = metrics.get("good_output_tokens")
+    request_count = metrics.get("requests")
+    background_count = result.get("background_jobs")
+    completed = (isinstance(request_count, int) and request_count > 0
+                 and request_count == metrics.get("completed_requests")
+                 and isinstance(background_count, int)
+                 and background_count == result.get("background_completed"))
+    finish_reasons = result.get("background_finish_reasons")
+    source_reason = result.get("anchor_source_finish_reason")
+    target_reason = result.get("anchor_target_finish_reason")
+    anchor_natural = (source_reason == "stop" if not target_reason
+                      else source_reason == "abort" and target_reason == "stop")
+    natural_eos = (anchor_natural
+                   and isinstance(finish_reasons, dict)
+                   and set(finish_reasons) <= {"stop"}
+                   and sum(finish_reasons.values()) == background_count)
+    eligible = (
+        not result.get("fatal_error", True) and result.get("audit_rc") == 0
+        and completed and natural_eos and isinstance(wall_s, (int, float))
+        and math.isfinite(wall_s) and wall_s <= horizon_s
+        and isinstance(good_tokens, int) and good_tokens >= 0
+    )
+    result["fixed_horizon_eligible"] = eligible
+    result["fixed_horizon_goodoutput_tokens_s"] = (
+        good_tokens / horizon_s if eligible else None)
+    result["fixed_horizon_exclusions"] = {
+        "technical_or_slo_audit": bool(result.get("fatal_error", True)
+                                       or result.get("audit_rc") != 0),
+        "not_drained": not completed,
+        "not_natural_eos": not natural_eos,
+        "exceeds_horizon": not isinstance(wall_s, (int, float))
+        or not math.isfinite(wall_s) or wall_s > horizon_s,
+    }
+
+
+def pair_results(summary: dict[str, Any]) -> dict[str, Any]:
+    """Keep descriptive paired deltas separate from fitted causal effects."""
+    pairs = {}
+    for name, arms in summary["cases"].items():
+        stay = arms.get("stay", {})
+        now = arms.get("early128", {})
+        eligible = bool(stay.get("fixed_horizon_eligible")
+                        and now.get("fixed_horizon_eligible"))
+        starts = now.get("observed_action", {}).get(
+            "actual_m1_start_output_tokens", [])
+        pairs[name] = {
+            "eligible": eligible,
+            "assigned_now_actuated": bool(starts),
+            "stay_predecision_state": stay.get("observed_action", {}).get(
+                "first_candidate_at_or_after_128"),
+            "now_predecision_state": now.get("observed_action", {}).get(
+                "first_candidate_at_or_after_128"),
+            "stay_goodoutput_tokens_s": stay.get(
+                "fixed_horizon_goodoutput_tokens_s"),
+            "now_goodoutput_tokens_s": now.get(
+                "fixed_horizon_goodoutput_tokens_s"),
+            "descriptive_delta_tokens_s": (
+                now["fixed_horizon_goodoutput_tokens_s"]
+                - stay["fixed_horizon_goodoutput_tokens_s"]
+                if eligible else None),
+            "stay_raw_output_tokens": (stay.get("slo_metrics") or {}).get(
+                "raw_output_tokens"),
+            "now_raw_output_tokens": (now.get("slo_metrics") or {}).get(
+                "raw_output_tokens"),
+        }
+    return {
+        "status": "EXPLORATORY_PAIRED_OUTCOMES_NOT_FITTED_EFFECTS",
+        "seed": summary["seed"],
+        "evaluation_horizon_s": summary["evaluation_horizon_s"],
+        "pairs": pairs,
+    }
+
+
 def execute_pilot(args: argparse.Namespace) -> None:
+    if not math.isfinite(args.evaluation_horizon_s) or args.evaluation_horizon_s <= 0:
+        raise ValueError("evaluation horizon must be positive and finite")
+    actions = ("stay", "early128") if args.paired_only else ACTIONS
     preflight = verify(args)
     root = args.out_dir.resolve()
     setup_path = root / "pilot_setup.json"
@@ -331,11 +485,18 @@ def execute_pilot(args: argparse.Namespace) -> None:
         write_json(setup_path, setup)
     summary: dict[str, Any] = {
         "format_version": 1, "status": "PILOT_IN_PROGRESS",
-        "seed": SEED, "cases": {},
+        "seed": args.seed, "cases": {},
+        "actions": actions,
+        "evaluation_horizon_s": args.evaluation_horizon_s,
     }
     summary_path = root / "pilot_summary.json"
     if summary_path.is_file():
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        if (summary.get("seed") != args.seed
+                or tuple(summary.get("actions", ())) != tuple(actions)
+                or summary.get("evaluation_horizon_s")
+                != args.evaluation_horizon_s):
+            raise ValueError("resume options differ from original pilot")
     failed = False
     try:
         for name in setup["cases"]:
@@ -355,7 +516,7 @@ def execute_pilot(args: argparse.Namespace) -> None:
                 failed = True
                 break
             outcomes = summary["cases"].setdefault(name, {})
-            for action in action_order(name):
+            for action in action_order(name, args.seed, actions):
                 if action in outcomes:
                     prior = outcomes[action]
                     if prior.get("fatal_error", True):
@@ -369,6 +530,7 @@ def execute_pilot(args: argparse.Namespace) -> None:
                 print(f"=== {name} {action} ===", flush=True)
                 result = collect_arm(args, root, setup, name, action)
                 outcomes[action] = result
+                fixed_horizon_result(result, args.evaluation_horizon_s)
                 write_json(summary_path, summary)
                 if result["fatal_error"]:
                     failed = True
@@ -378,10 +540,12 @@ def execute_pilot(args: argparse.Namespace) -> None:
     finally:
         summary["status"] = (
             "INCOMPLETE_DIAGNOSTIC" if failed
-            or any(len(summary["cases"].get(name, {})) < len(ACTIONS)
+            or any(len(summary["cases"].get(name, {})) < len(actions)
                    for name in setup["cases"])
             else "PILOT_COLLECTION_COMPLETE")
         write_json(summary_path, summary)
+        if args.paired_only:
+            write_json(root / "paired_outcomes.json", pair_results(summary))
         archive = root.with_suffix(".tar.gz")
         print(f"packing={root}", flush=True)
         with tarfile.open(archive, "w:gz") as handle:

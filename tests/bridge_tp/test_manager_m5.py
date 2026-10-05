@@ -83,6 +83,11 @@ class TestM5(unittest.TestCase):
             row = reader.advisory("r", 20, 4)
             self.assertEqual(row["status"], "AVAILABLE")
             self.assertAlmostEqual(row["p_remaining_gt_headroom_bounds"][1], 0.9)
+            self.assertEqual(row["long_window_tokens"], 512)
+            self.assertEqual(
+                row["p_remaining_gt_long_window_runtime_bounds"],
+                (0.0, 0.4),
+            )
             capped = reader.advisory(
                 "r", 20, 40, max_output_tokens=32, ignore_eos=False
             )
