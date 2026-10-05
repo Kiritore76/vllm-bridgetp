@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from tools.bridge_tp.prepare_tracea_oasst_arrivals import (
+    count_request_tokens,
     make_composite,
     read_arrival_slice,
 )
@@ -14,6 +15,20 @@ from tools.bridge_tp.prepare_natural_benefit_windows import freeze_windows
 
 
 class TestTraceAOasstArrivals(unittest.TestCase):
+    def test_chat_token_count_is_id_count_not_batch_field_count(self) -> None:
+        class Tokenizer:
+            def apply_chat_template(self, _messages, *, tokenize, **_kwargs):
+                self_test.assertFalse(tokenize)
+                return "rendered conversation"
+
+            def encode(self, prompt):
+                self_test.assertEqual(prompt, "rendered conversation")
+                return [1, 2, 3, 4, 5]
+
+        self_test = self
+        row = {"messages": [{"role": "user", "content": "hello"}]}
+        self.assertEqual(count_request_tokens(Tokenizer(), row), 5)
+
     def test_preserves_order_without_using_future_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "trace.csv"
