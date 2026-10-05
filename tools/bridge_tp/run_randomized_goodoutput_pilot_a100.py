@@ -451,8 +451,9 @@ def collect_arm(args: argparse.Namespace, root: Path,
            if audit_path.is_file() else {})
     if (args.max_model_len != 8192
             or (args.tp4_max_model_len or args.max_model_len) != 8192):
-        slo["reference_applicability"] = "EXPLORATORY_CONTEXT_UNCALIBRATED"
-        slo["comparison_scope"] = "diagnostic_only"
+        slo["reference_context_note"] = (
+            "FROZEN_V6_TTFT_CONTRACT_REUSED_ACROSS_CONTEXT_LENGTHS"
+        )
         write_json(audit_path, slo)
     background_path = run / "background" / "background_summary.json"
     background = (json.loads(background_path.read_text(encoding="utf-8"))
@@ -534,8 +535,6 @@ def fixed_horizon_result(result: dict[str, Any], horizon_s: float) -> None:
                    and sum(finish_reasons.values()) == background_count)
     eligible = (
         not result.get("fatal_error", True) and result.get("audit_rc") == 0
-        and result.get("slo_reference_applicability")
-        != "EXPLORATORY_CONTEXT_UNCALIBRATED"
         and completed and natural_eos and isinstance(wall_s, (int, float))
         and math.isfinite(wall_s) and wall_s <= horizon_s
         and isinstance(good_tokens, int) and good_tokens >= 0

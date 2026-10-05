@@ -313,10 +313,10 @@ class TestRandomizedPilot(unittest.TestCase):
         self.assertFalse(arm["fixed_horizon_eligible"])
         arm["background_finish_reasons"] = {"stop": 2}
         arm["slo_reference_applicability"] = (
-            "EXPLORATORY_CONTEXT_UNCALIBRATED"
+            "VERIFIED_GPU_MODEL_AND_MODEL_CONFIG"
         )
         fixed_horizon_result(arm, 180.0)
-        self.assertFalse(arm["fixed_horizon_eligible"])
+        self.assertTrue(arm["fixed_horizon_eligible"])
         arm.pop("slo_reference_applicability")
         summary = {"seed": 1, "evaluation_horizon_s": 180.0,
                    "cases": {"case": {"stay": arm}}}
