@@ -43,7 +43,12 @@ class TestM1PredictorRefreshGate(unittest.TestCase):
         self.assertEqual(decide(gate, "STAY", 120, guard=8),
                          (False, None))
         self.assertEqual(decide(gate, "START_SHADOW", 120, guard=8),
-                         (True, "WAIT_CAPACITY_SAFETY_RELEASE"))
+                         (True, "CAPACITY_SAFETY_RELEASE"))
+
+    def test_urgent_first_candidate_does_not_wait(self) -> None:
+        gate = M1PredictorRefreshGate("WAIT")
+        self.assertEqual(decide(gate, "START_SHADOW", 120, guard=8),
+                         (True, "CAPACITY_SAFETY_RELEASE"))
 
     def test_natural_eos_before_first_candidate_does_not_arm(self) -> None:
         gate = M1PredictorRefreshGate("WAIT")
