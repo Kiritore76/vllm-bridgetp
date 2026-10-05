@@ -58,6 +58,9 @@ def parse_args() -> argparse.Namespace:
                         help="Collect STAY and early128 without the late EOS arm")
     parser.add_argument("--timing-pilot", action="store_true",
                         help="Compare STAY, NOW, and one M5-refresh WAIT")
+    parser.add_argument("--cross-context-smoke", action="store_true",
+                        help="one forced-length migration beyond TP1 context; "
+                             "not a natural-EOS or GoodOutput experiment")
     parser.add_argument("--actions", nargs="+", choices=TIMING_ACTIONS,
                         help="Collect only these timing actions")
     parser.add_argument("--cases", nargs="+", choices=[row[0] for row in CASES],
@@ -79,6 +82,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tp4-max-model-len", type=int)
     parser.add_argument("--random-arrivals", action="store_true",
                         help="Use seeded exponential interarrival gaps")
+    parser.add_argument("--arrival-window-s", type=float,
+                        help="Replay each case's held-out requests in repeated "
+                             "waves until this fixed arrival window ends")
+    parser.add_argument("--arrival-wave-period-s", type=float, default=40.0,
+                        help="Spacing between repeated arrival waves")
+    parser.add_argument("--max-arrival-lag-s", type=float, default=2.0,
+                        help="Invalidate a fixed-window arm if an actual "
+                             "background arrival misses its schedule")
     parser.add_argument("--evaluation-horizon-s", type=float, default=180.0)
     return parser.parse_args()
 
@@ -197,7 +208,8 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
             raise ValueError(f"anchor total budget exceeds TP4: {anchor['id']}")
         anchor_request = {
             "model": "bridgetp-model", "prompt": anchor_tokens,
-            "max_tokens": anchor_cap, "ignore_eos": False,
+            "max_tokens": anchor_cap,
+            "ignore_eos": getattr(args, "cross_context_smoke", False),
             "temperature": 0.0, "top_p": 1.0, "top_k": 0,
             "min_p": 0.0, "presence_penalty": 0.0,
             "frequency_penalty": 0.0, "repetition_penalty": 1.0,
@@ -244,19 +256,52 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
                 if pool == "source":
                     job["start_after_event"] = "ANCHOR_FIRST_OUTPUT"
                 jobs.append(job)
+        arrival_window_s = getattr(args, "arrival_window_s", None)
+        if arrival_window_s is not None:
+            period_s = getattr(args, "arrival_wave_period_s", 40.0)
+            first_wave = list(jobs)
+            jobs = []
+            wave = 0
+            while True:
+                scheduled = [job for job in first_wave
+                             if wave * period_s + job["start_after_s"]
+                             < arrival_window_s]
+                if not scheduled:
+                    break
+                for job in scheduled:
+                    copy = dict(job)
+                    copy["job_id"] = f"{job['job_id']}_wave{wave:03d}"
+                    copy["start_after_s"] = round(
+                        wave * period_s + job["start_after_s"], 3)
+                    copy["wave"] = wave
+                    jobs.append(copy)
+                wave += 1
+            if (not jobs or any(
+                    max((job["start_after_s"] for job in jobs
+                         if job["pool"] == pool), default=-1)
+                    < arrival_window_s - period_s
+                    for pool in ("source", "target"))):
+                raise ValueError("arrival schedule does not cover the window")
+            if len(jobs) > 512:
+                raise ValueError("arrival schedule exceeds 512 jobs per case")
         manifest = {
             "format_version": 1, "scenario": name,
             "status": "RANDOMIZED_GOODOUTPUT_PILOT",
             "seed": seed, "source_input": str(args.input.resolve()),
             "source_input_sha256": sha256(args.input),
             "anchor_input_id": anchor["id"],
-            "source_count": source_count, "target_count": target_count,
+            "source_count": sum(job["pool"] == "source" for job in jobs),
+            "target_count": sum(job["pool"] == "target" for job in jobs),
             "source_spacing_s": source_spacing,
             "target_spacing_s": target_spacing,
             "natural_eos_required": True,
             "arrival_process": ("seeded_exponential"
                                 if getattr(args, "random_arrivals", False)
                                 else "fixed_spacing"),
+            "arrival_window_s": arrival_window_s,
+            "arrival_wave_period_s": (
+                getattr(args, "arrival_wave_period_s", 40.0)
+                if arrival_window_s is not None else None),
             "jobs": jobs,
         }
         manifest_path = root / "inputs" / f"{name}.json"
@@ -264,8 +309,9 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
         setup["manifests"][name] = {
             "path": str(manifest_path),
             "sha256": sha256(manifest_path),
-            "jobs": len(jobs), "source_jobs": source_count,
-            "target_jobs": target_count,
+            "jobs": len(jobs),
+            "source_jobs": sum(job["pool"] == "source" for job in jobs),
+            "target_jobs": sum(job["pool"] == "target" for job in jobs),
         }
         setup["cases"].append(name)
     if cursor != len(rows):
@@ -408,6 +454,34 @@ def is_context_censored(*, runner_rc: int, audit_rc: int,
     return runner_rc != 0 and audit_rc == 0 and (source_capped or target_capped)
 
 
+def cross_context_smoke_result(*, runner_rc: int, source: dict[str, Any],
+                               target: dict[str, Any], proxy: dict[str, Any],
+                               source_cap: int, total_cap: int) -> dict[str, Any]:
+    """Check a forced-length continuation without treating it as natural EOS."""
+    emitted = proxy.get("emitted") or []
+    passed = (runner_rc == 0 and proxy.get("committed") is True
+              and proxy.get("emitted_tokens") == total_cap
+              and total_cap > source_cap
+              and target.get("finish_reason") == "length"
+              and [row.get("index") for row in emitted]
+              == list(range(total_cap))
+              and proxy.get("source_origin_tokens", 0) > 0
+              and proxy.get("target_origin_tokens", 0) > 0)
+    return {
+        "status": "PASS" if passed else "FAIL",
+        "functional_only": True,
+        "runner_rc": runner_rc,
+        "fatal_error": not passed,
+        "source_output_cap": source_cap,
+        "total_output_budget": total_cap,
+        "emitted_tokens": proxy.get("emitted_tokens"),
+        "source_finish_reason": source.get("finish_reason"),
+        "target_finish_reason": target.get("finish_reason"),
+        "source_origin_tokens": proxy.get("source_origin_tokens"),
+        "target_origin_tokens": proxy.get("target_origin_tokens"),
+    }
+
+
 def collect_arm(args: argparse.Namespace, root: Path,
                 setup: dict[str, Any], name: str,
                 action: str) -> dict[str, Any]:
@@ -433,9 +507,25 @@ def collect_arm(args: argparse.Namespace, root: Path,
         command.extend(("--anchor-total-max-tokens", str(
             setup["anchors"][name]["total_max_tokens"])))
     configure_action(command, action)
+    if args.cross_context_smoke:
+        command.append("--cross-context-smoke")
     write_json(case_root / f"{action}.command.json", command)
     runner_rc = execute(command, case_root / f"{action}.console.log")
     run = arm_root / "r01_shadow_only"
+    if args.cross_context_smoke:
+        source_path = run / "controller" / "source_response.json"
+        target_path = run / "controller" / "target_response.json"
+        proxy_path = run / "controller" / "response_proxy_stats.json"
+        source = json.loads(source_path.read_text()) if source_path.is_file() else {}
+        target = json.loads(target_path.read_text()) if target_path.is_file() else {}
+        proxy = json.loads(proxy_path.read_text()) if proxy_path.is_file() else {}
+        source_cap = setup["anchors"][name]["max_tokens"]
+        total_cap = setup["anchors"][name]["total_max_tokens"]
+        result = cross_context_smoke_result(
+            runner_rc=runner_rc, source=source, target=target, proxy=proxy,
+            source_cap=source_cap, total_cap=total_cap)
+        write_json(case_root / f"{action}.result.json", result)
+        return result
     audit_path = case_root / f"{action}.slo_v6.json"
     audit_command = [
         sys.executable, "tools/bridge_tp/audit_slo_v6.py",
@@ -508,6 +598,10 @@ def collect_arm(args: argparse.Namespace, root: Path,
         "background_jobs": background.get("jobs"),
         "background_completed": background.get("completed"),
         "background_finish_reasons": finish_reasons,
+        "background_latest_planned_arrival_s": background.get(
+            "latest_planned_arrival_s"),
+        "background_max_schedule_lag_s": background.get(
+            "max_schedule_lag_s"),
     }
     write_json(case_root / f"{action}.result.json", result)
     return result
@@ -533,9 +627,16 @@ def fixed_horizon_result(result: dict[str, Any], horizon_s: float) -> None:
                    and isinstance(finish_reasons, dict)
                    and set(finish_reasons) <= {"stop"}
                    and sum(finish_reasons.values()) == background_count)
+    arrival_lag_s = result.get("background_max_schedule_lag_s")
+    allowed_lag_s = result.get("max_arrival_lag_s")
+    arrivals_on_schedule = (allowed_lag_s is None or
+                            isinstance(arrival_lag_s, (int, float))
+                            and math.isfinite(arrival_lag_s)
+                            and arrival_lag_s <= allowed_lag_s)
     eligible = (
         not result.get("fatal_error", True) and result.get("audit_rc") == 0
-        and completed and natural_eos and isinstance(wall_s, (int, float))
+        and completed and natural_eos and arrivals_on_schedule
+        and isinstance(wall_s, (int, float))
         and math.isfinite(wall_s) and wall_s <= horizon_s
         and isinstance(good_tokens, int) and good_tokens >= 0
     )
@@ -547,6 +648,7 @@ def fixed_horizon_result(result: dict[str, Any], horizon_s: float) -> None:
                                        or result.get("audit_rc") != 0),
         "not_drained": not completed,
         "not_natural_eos": not natural_eos,
+        "arrival_schedule_missed": not arrivals_on_schedule,
         "exceeds_horizon": not isinstance(wall_s, (int, float))
         or not math.isfinite(wall_s) or wall_s > horizon_s,
     }
@@ -638,8 +740,28 @@ def execute_pilot(args: argparse.Namespace) -> None:
         raise ValueError("TP4 max model length must cover TP1 and be <= 32768")
     if not math.isfinite(args.evaluation_horizon_s) or args.evaluation_horizon_s <= 0:
         raise ValueError("evaluation horizon must be positive and finite")
+    if args.arrival_window_s is not None:
+        if (not math.isfinite(args.arrival_window_s)
+                or not 0 < args.arrival_window_s < args.evaluation_horizon_s):
+            raise ValueError("arrival window must end before evaluation horizon")
+        if (not math.isfinite(args.arrival_wave_period_s)
+                or not 0 < args.arrival_wave_period_s
+                <= args.arrival_window_s):
+            raise ValueError("arrival wave period must fit the arrival window")
+        if (not math.isfinite(args.max_arrival_lag_s)
+                or args.max_arrival_lag_s < 0):
+            raise ValueError("maximum arrival lag must be non-negative")
     if args.paired_only and args.timing_pilot:
         raise ValueError("choose paired-only or timing-pilot, not both")
+    if args.cross_context_smoke and (
+            args.paired_only or args.timing_pilot or args.actions
+            or args.cases != ["p03_source3_target24"]
+            or not args.anchor_context_limit
+            or args.tp4_max_model_len is None
+            or args.anchor_total_max_tokens is None
+            or args.arrival_window_s is not None):
+        raise ValueError("cross-context smoke requires only p03, a TP4 "
+                         "total budget beyond the TP1 cap, and no arrival waves")
     if args.actions and not args.timing_pilot:
         raise ValueError("--actions requires --timing-pilot")
     if args.actions and len(args.actions) != len(set(args.actions)):
@@ -652,7 +774,8 @@ def execute_pilot(args: argparse.Namespace) -> None:
     selected_cases = list(args.cases or (row[0] for row in CASES))
     if len(selected_cases) != len(set(selected_cases)):
         raise ValueError("case names must be unique")
-    actions = (tuple(args.actions) if args.actions else
+    actions = (("now",) if args.cross_context_smoke else
+               tuple(args.actions) if args.actions else
                TIMING_ACTIONS if args.timing_pilot else
                ("stay", "early128") if args.paired_only else ACTIONS)
     preflight = verify(args)
@@ -678,6 +801,11 @@ def execute_pilot(args: argparse.Namespace) -> None:
         "seed": args.seed, "cases": {},
         "actions": actions,
         "evaluation_horizon_s": args.evaluation_horizon_s,
+        "arrival_window_s": args.arrival_window_s,
+        "arrival_wave_period_s": (args.arrival_wave_period_s
+                                  if args.arrival_window_s else None),
+        "max_arrival_lag_s": (args.max_arrival_lag_s
+                              if args.arrival_window_s else None),
         "background_max_tokens": (None if args.background_context_limit
                                   else args.background_max_tokens),
         "background_context_limit": args.background_context_limit,
@@ -685,6 +813,7 @@ def execute_pilot(args: argparse.Namespace) -> None:
         "anchor_context_limit": args.anchor_context_limit,
         "anchor_total_max_tokens": args.anchor_total_max_tokens,
         "p03_anchor_id": args.p03_anchor_id,
+        "cross_context_smoke": args.cross_context_smoke,
         "source_max_model_len": args.max_model_len,
         "tp4_max_model_len": args.tp4_max_model_len or args.max_model_len,
     }
@@ -695,6 +824,13 @@ def execute_pilot(args: argparse.Namespace) -> None:
                 or tuple(summary.get("actions", ())) != tuple(actions)
                 or summary.get("evaluation_horizon_s")
                 != args.evaluation_horizon_s
+                or summary.get("arrival_window_s") != args.arrival_window_s
+                or summary.get("arrival_wave_period_s") != (
+                    args.arrival_wave_period_s if args.arrival_window_s
+                    else None)
+                or summary.get("max_arrival_lag_s") != (
+                    args.max_arrival_lag_s if args.arrival_window_s
+                    else None)
                 or summary.get("background_max_tokens")
                 != (None if args.background_context_limit
                     else args.background_max_tokens)
@@ -706,6 +842,8 @@ def execute_pilot(args: argparse.Namespace) -> None:
                 or summary.get("anchor_total_max_tokens")
                 != args.anchor_total_max_tokens
                 or summary.get("p03_anchor_id") != args.p03_anchor_id
+                or summary.get("cross_context_smoke")
+                != args.cross_context_smoke
                 or summary.get("source_max_model_len") != args.max_model_len
                 or summary.get("tp4_max_model_len")
                 != (args.tp4_max_model_len or args.max_model_len)):
@@ -742,8 +880,11 @@ def execute_pilot(args: argparse.Namespace) -> None:
                         f"{name}/{action}")
                 print(f"=== {name} {action} ===", flush=True)
                 result = collect_arm(args, root, setup, name, action)
+                result["max_arrival_lag_s"] = (
+                    args.max_arrival_lag_s if args.arrival_window_s else None)
                 outcomes[action] = result
-                fixed_horizon_result(result, args.evaluation_horizon_s)
+                if not args.cross_context_smoke:
+                    fixed_horizon_result(result, args.evaluation_horizon_s)
                 write_json(summary_path, summary)
                 if result["fatal_error"]:
                     failed = True
@@ -751,11 +892,13 @@ def execute_pilot(args: argparse.Namespace) -> None:
             if failed:
                 break
     finally:
+        complete = not failed and all(
+            len(summary["cases"].get(name, {})) == len(actions)
+            for name in selected_cases)
         summary["status"] = (
-            "INCOMPLETE_DIAGNOSTIC" if failed
-            or any(len(summary["cases"].get(name, {})) < len(actions)
-                   for name in selected_cases)
-            else "PILOT_COLLECTION_COMPLETE")
+            "INCOMPLETE_DIAGNOSTIC" if not complete else
+            "CROSS_CONTEXT_SMOKE_PASS" if args.cross_context_smoke else
+            "PILOT_COLLECTION_COMPLETE")
         write_json(summary_path, summary)
         if args.paired_only:
             write_json(root / "paired_outcomes.json", pair_results(summary))
@@ -767,7 +910,8 @@ def execute_pilot(args: argparse.Namespace) -> None:
             handle.add(root, arcname=root.name)
         print(f"archive_to_retrieve={archive}", flush=True)
         print(f"pilot_status={summary['status']}", flush=True)
-    if summary["status"] != "PILOT_COLLECTION_COMPLETE":
+    if summary["status"] not in {"PILOT_COLLECTION_COMPLETE",
+                                "CROSS_CONTEXT_SMOKE_PASS"}:
         raise RuntimeError("pilot incomplete; retrieve the diagnostic archive")
 
 
