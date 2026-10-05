@@ -17,6 +17,7 @@ from tools.bridge_tp.run_randomized_goodoutput_pilot_a100 import (
     build_setup,
     configure_action,
     fixed_horizon_result,
+    is_context_censored,
     observed_action,
     pair_results,
     select_inputs,
@@ -59,6 +60,8 @@ class TestRandomizedPilot(unittest.TestCase):
             with mock.patch.dict(sys.modules, {"transformers": fake}):
                 setup = build_setup(args, root)
             self.assertEqual(len(setup["cases"]), 6)
+            self.assertEqual(setup["anchors"][setup["cases"][0]][
+                "max_tokens"], 4096)
             used_ids = [value["input_id"]
                         for value in setup["anchors"].values()]
             for name in setup["cases"]:
@@ -206,6 +209,44 @@ class TestRandomizedPilot(unittest.TestCase):
                       if job["pool"] == "target"]
             self.assertEqual(target, sorted(target))
             self.assertNotEqual(round(target[2] - target[1], 3), 0.2)
+
+    def test_context_limit_uses_physical_window_and_marks_censor(self) -> None:
+        class Tokenizer:
+            @staticmethod
+            def encode(_value: str) -> list[int]:
+                return list(range(32))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_path = root / "requests.jsonl"
+            input_path.write_text("".join(json.dumps({
+                "id": f"r-{index}", "split": "test",
+                "workload_group": "long_form" if index % 4 == 0
+                else "natural", "prompt": "hello",
+            }) + "\n" for index in range(160)))
+            fake = types.SimpleNamespace(AutoTokenizer=types.SimpleNamespace(
+                from_pretrained=lambda *_a, **_k: Tokenizer()))
+            args = SimpleNamespace(input=input_path, model=root / "model",
+                                   anchor_context_limit=True)
+            with mock.patch.dict(sys.modules, {"transformers": fake}):
+                setup = build_setup(args, root)
+            anchor = setup["anchors"][setup["cases"][0]]
+            self.assertEqual(anchor["max_tokens"], 8064)
+        error = ["source did not naturally finish before its cap"]
+        self.assertTrue(is_context_censored(
+            runner_rc=1, audit_rc=0,
+            source={"finish_reason": "length", "token_ids": [1] * 4},
+            anchor_cap=4, acceptance_errors=error))
+        self.assertFalse(is_context_censored(
+            runner_rc=1, audit_rc=0,
+            source={"finish_reason": "length", "token_ids": [1] * 4},
+            anchor_cap=4, acceptance_errors=error + ["target failed"]))
+        self.assertTrue(is_context_censored(
+            runner_rc=1, audit_rc=0, source={"finish_reason": "abort"},
+            target={"finish_reason": "length"},
+            proxy={"emitted_tokens": 4}, anchor_cap=4,
+            acceptance_errors=[
+                "unified response did not naturally finish before cap"]))
 
     def test_fixed_horizon_excludes_censored_and_incomplete_arms(self) -> None:
         arm = {
