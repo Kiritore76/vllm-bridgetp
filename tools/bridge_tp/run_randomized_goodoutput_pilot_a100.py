@@ -58,6 +58,8 @@ def parse_args() -> argparse.Namespace:
                         help="Run only these cases with the original seed")
     parser.add_argument("--anchor-context-limit", action="store_true",
                         help="Use the largest anchor output allowed by context")
+    parser.add_argument("--background-context-limit", action="store_true",
+                        help="Use the largest background output allowed by context")
     parser.add_argument("--background-max-tokens", type=int, default=2048)
     parser.add_argument("--random-arrivals", action="store_true",
                         help="Use seeded exponential interarrival gaps")
@@ -175,8 +177,13 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
                              ("source", chosen[target_count:])):
             for job_index, row in enumerate(subset):
                 prompt_tokens = tokens(row)
-                background_cap = getattr(args, "background_max_tokens", 2048)
-                if len(prompt_tokens) + background_cap > 8192:
+                background_cap = (
+                    min(8192 - len(prompt_tokens), 8192 - 128)
+                    if getattr(args, "background_context_limit", False)
+                    else getattr(args, "background_max_tokens", 2048)
+                )
+                if (background_cap <= 0
+                        or len(prompt_tokens) + background_cap > 8192):
                     raise ValueError(f"background exceeds context: {row['id']}")
                 job = {
                     "job_id": f"{pool}_{job_index:03d}", "pool": pool,
@@ -563,7 +570,8 @@ def execute_pilot(args: argparse.Namespace) -> None:
         raise ValueError("evaluation horizon must be positive and finite")
     if args.paired_only and args.timing_pilot:
         raise ValueError("choose paired-only or timing-pilot, not both")
-    if not 1 <= args.background_max_tokens <= 4096:
+    if (not args.background_context_limit
+            and not 1 <= args.background_max_tokens <= 4096):
         raise ValueError("background max tokens must be in [1, 4096]")
     selected_cases = list(args.cases or (row[0] for row in CASES))
     if len(selected_cases) != len(set(selected_cases)):
@@ -593,7 +601,9 @@ def execute_pilot(args: argparse.Namespace) -> None:
         "seed": args.seed, "cases": {},
         "actions": actions,
         "evaluation_horizon_s": args.evaluation_horizon_s,
-        "background_max_tokens": args.background_max_tokens,
+        "background_max_tokens": (None if args.background_context_limit
+                                  else args.background_max_tokens),
+        "background_context_limit": args.background_context_limit,
         "selected_cases": selected_cases,
         "anchor_context_limit": args.anchor_context_limit,
     }
@@ -605,7 +615,10 @@ def execute_pilot(args: argparse.Namespace) -> None:
                 or summary.get("evaluation_horizon_s")
                 != args.evaluation_horizon_s
                 or summary.get("background_max_tokens")
-                != args.background_max_tokens
+                != (None if args.background_context_limit
+                    else args.background_max_tokens)
+                or summary.get("background_context_limit")
+                != args.background_context_limit
                 or summary.get("selected_cases") != selected_cases
                 or summary.get("anchor_context_limit")
                 != args.anchor_context_limit):
