@@ -306,6 +306,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--anchor-request-file", type=Path)
     parser.add_argument("--expected-anchor-request-sha256")
     parser.add_argument("--natural-eos-anchor", action="store_true")
+    parser.add_argument("--cross-context-smoke", action="store_true",
+                        help="force a pinned anchor beyond TP1's output cap; "
+                             "exclude this functional run from natural EOS scoring")
     parser.add_argument("--minimum-ready-target-jobs", type=int, default=2)
     parser.add_argument("--minimum-ready-source-jobs", type=int, default=0)
     parser.add_argument("--background-lead-s", type=float, default=2.0)
@@ -596,6 +599,13 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
                 or args.anchor_prompt_tokens + args.anchor_total_max_tokens
                 > (args.tp4_max_model_len or args.max_model_len)):
             raise ValueError("total output budget exceeds TP4 context")
+    if args.cross_context_smoke and (
+            not args.natural_eos_anchor
+            or args.anchor_total_max_tokens is None
+            or args.anchor_total_max_tokens <= args.anchor_max_tokens
+            or args.paired_stay):
+        raise ValueError("cross-context smoke requires migration and a total "
+                         "budget beyond the TP1 output cap")
     if args.natural_eos_anchor and (
         args.anchor_request_file is None
         or not args.expected_anchor_request_sha256
@@ -819,7 +829,7 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
             or len(prompt) != args.anchor_prompt_tokens
             or not all(isinstance(token, int) and not isinstance(token, bool)
                        for token in prompt)
-            or anchor_request.get("ignore_eos") is not False
+            or anchor_request.get("ignore_eos") is not args.cross_context_smoke
             or anchor_request.get("max_tokens") != args.anchor_max_tokens
         ):
             raise ValueError("natural anchor request differs from pinned contract")
@@ -2137,6 +2147,8 @@ def accept_online(
     expected_anchor_tokens: int,
     *,
     natural_eos_anchor: bool = False,
+    cross_context_smoke: bool = False,
+    source_output_cap: int | None = None,
     requested_max_output_tokens: int | None = None,
     strategy: str,
     minimum_window_samples: int,
@@ -2982,7 +2994,14 @@ def accept_online(
     if proxy.get("committed") is not True:
         errors.append("unified response proxy did not commit")
     emitted_tokens = proxy.get("emitted_tokens")
-    if natural_eos_anchor:
+    if cross_context_smoke:
+        if (not isinstance(emitted_tokens, int)
+                or emitted_tokens != expected_anchor_tokens
+                or source_output_cap is None
+                or emitted_tokens <= source_output_cap
+                or target_response.get("finish_reason") != "length"):
+            errors.append("cross-context smoke did not complete beyond TP1 cap")
+    elif natural_eos_anchor:
         if (
             not isinstance(emitted_tokens, int)
             or isinstance(emitted_tokens, bool)
@@ -3981,6 +4000,8 @@ def main() -> None:
                             args.anchor_total_max_tokens
                             or expected_anchor_tokens,
                             natural_eos_anchor=args.natural_eos_anchor,
+                            cross_context_smoke=args.cross_context_smoke,
+                            source_output_cap=args.anchor_max_tokens,
                             requested_max_output_tokens=(
                                 args.anchor_total_max_tokens
                             ),

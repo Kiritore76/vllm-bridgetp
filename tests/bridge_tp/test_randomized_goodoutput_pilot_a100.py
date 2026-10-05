@@ -17,6 +17,7 @@ from tools.bridge_tp.run_randomized_goodoutput_pilot_a100 import (
     action_order,
     build_setup,
     configure_action,
+    cross_context_smoke_result,
     fixed_horizon_result,
     is_context_censored,
     observed_action,
@@ -228,6 +229,53 @@ class TestRandomizedPilot(unittest.TestCase):
             self.assertEqual(target, sorted(target))
             self.assertNotEqual(round(target[2] - target[1], 3), 0.2)
 
+    def test_repeated_arrivals_cover_fixed_window_and_keep_input_ids(self) -> None:
+        class Tokenizer:
+            @staticmethod
+            def encode(_value: str) -> list[int]:
+                return list(range(32))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_path = root / "requests.jsonl"
+            input_path.write_text("".join(json.dumps({
+                "id": f"r-{index}", "split": "test",
+                "workload_group": "long_form" if index % 4 == 0
+                else "natural", "prompt": "hello",
+            }) + "\n" for index in range(160)))
+            fake = types.SimpleNamespace(AutoTokenizer=types.SimpleNamespace(
+                from_pretrained=lambda *_a, **_k: Tokenizer()))
+            args = SimpleNamespace(input=input_path, model=root / "model",
+                                   arrival_window_s=120.0,
+                                   arrival_wave_period_s=40.0)
+            with mock.patch.dict(sys.modules, {"transformers": fake}):
+                setup = build_setup(args, root)
+            manifest = json.loads(Path(setup["manifests"][
+                "p03_source3_target24"]["path"]).read_text())
+            jobs = manifest["jobs"]
+            self.assertEqual(len(jobs), 3 * (3 + 24))
+            self.assertEqual(len({job["job_id"] for job in jobs}), len(jobs))
+            self.assertTrue(all(job["start_after_s"] < 120 for job in jobs))
+            for pool in ("source", "target"):
+                self.assertGreaterEqual(max(job["start_after_s"] for job
+                                            in jobs if job["pool"] == pool), 80)
+            self.assertEqual(len({job["input_id"] for job in jobs}), 27)
+
+    def test_cross_context_smoke_requires_actual_target_continuation(self) -> None:
+        proxy = {"committed": True, "emitted_tokens": 4,
+                 "source_origin_tokens": 2, "target_origin_tokens": 2,
+                 "emitted": [{"index": index} for index in range(4)]}
+        result = cross_context_smoke_result(
+            runner_rc=0, source={"finish_reason": "abort"},
+            target={"finish_reason": "length"}, proxy=proxy,
+            source_cap=3, total_cap=4)
+        self.assertEqual(result["status"], "PASS")
+        proxy["emitted"][3]["index"] = 2
+        result = cross_context_smoke_result(
+            runner_rc=0, source={}, target={"finish_reason": "length"},
+            proxy=proxy, source_cap=3, total_cap=4)
+        self.assertEqual(result["status"], "FAIL")
+
     def test_context_limit_uses_physical_window_and_marks_censor(self) -> None:
         class Tokenizer:
             @staticmethod
@@ -268,6 +316,15 @@ class TestRandomizedPilot(unittest.TestCase):
             p03 = split["anchors"]["p03_source3_target24"]
             self.assertEqual(p03["input_id"], "r-40")
             self.assertEqual(p03["max_tokens"], 16256)
+            args.cross_context_smoke = True
+            args.anchor_total_max_tokens = 16500
+            with mock.patch.dict(sys.modules, {"transformers": fake}):
+                smoke = build_setup(args, root / "cross-context")
+            anchor_request = json.loads(Path(smoke["anchors"][
+                "p03_source3_target24"]["path"]).read_text())
+            self.assertTrue(anchor_request["ignore_eos"])
+            self.assertEqual(smoke["anchors"]["p03_source3_target24"][
+                "total_max_tokens"], 16500)
             self.assertEqual(p03["total_max_tokens"], 24000)
             source_request = json.loads(Path(p03["path"]).read_text())
             self.assertEqual(source_request["max_tokens"], 16256)

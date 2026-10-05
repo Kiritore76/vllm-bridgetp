@@ -175,9 +175,11 @@ def main() -> None:
             wait_for_controller_event(args.controller_audit_path, start_event, 120.0)
             if start_event else start_monotonic
         )
-        remaining = anchor + start_after_s - time.monotonic()
+        scheduled_monotonic = anchor + start_after_s
+        remaining = scheduled_monotonic - time.monotonic()
         if remaining > 0:
             time.sleep(remaining)
+        schedule_lag_s = max(0.0, time.monotonic() - scheduled_monotonic)
         base_url = args.source_url if job["pool"] == "source" else args.target_url
         request = freeze_strict_greedy_sampling(dict(job["request"]))
         request.update(
@@ -188,7 +190,9 @@ def main() -> None:
             }
         )
         request.setdefault("ignore_eos", True)
-        event({"kind": "job_start", "job_id": job_id, "pool": job["pool"]})
+        event({"kind": "job_start", "job_id": job_id, "pool": job["pool"],
+               "start_after_s": start_after_s,
+               "schedule_lag_s": schedule_lag_s})
         request_started_unix_s = time.time()
         token_times: list[float] = []
 
@@ -217,6 +221,8 @@ def main() -> None:
             summary = {
                 "job_id": job_id,
                 "pool": job["pool"],
+                "start_after_s": start_after_s,
+                "schedule_lag_s": schedule_lag_s,
                 "status": "COMPLETED",
                 "response_id": result["response_id"],
                 "finish_reason": result["finish_reason"],
@@ -248,6 +254,8 @@ def main() -> None:
             summary = {
                 "job_id": job_id,
                 "pool": job["pool"],
+                "start_after_s": start_after_s,
+                "schedule_lag_s": schedule_lag_s,
                 "status": "FAILED",
                 "error": f"{type(error).__name__}: {error}",
             }
@@ -262,8 +270,12 @@ def main() -> None:
             "jobs": len(manifest["jobs"]),
         }
     )
-    with ThreadPoolExecutor(max_workers=len(manifest["jobs"])) as executor:
-        futures = [executor.submit(run_job, job) for job in manifest["jobs"]]
+    # Long arrival windows can contain hundreds of jobs. Submit in due-time
+    # order while bounding worker threads; the lag audit detects overload.
+    ordered_jobs = sorted(manifest["jobs"],
+                          key=lambda job: float(job["start_after_s"]))
+    with ThreadPoolExecutor(max_workers=min(128, len(ordered_jobs))) as executor:
+        futures = [executor.submit(run_job, job) for job in ordered_jobs]
         results = [future.result() for future in as_completed(futures)]
     summary = {
         "format_version": 1,
@@ -272,6 +284,10 @@ def main() -> None:
         "failed": sum(item["status"] == "FAILED" for item in results),
         "start_unix_s": start_unix_s,
         "end_unix_s": time.time(),
+        "latest_planned_arrival_s": max(float(job["start_after_s"])
+                                        for job in manifest["jobs"]),
+        "max_schedule_lag_s": max(item.get("schedule_lag_s", 0.0)
+                                  for item in results),
         "results": sorted(results, key=lambda item: item["job_id"]),
     }
     atomic_json_dump(summary, out_dir / "background_summary.json")
