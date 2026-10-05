@@ -11,6 +11,7 @@ from unittest import mock
 
 from tools.bridge_tp.run_randomized_goodoutput_pilot_a100 import (
     ACTIONS,
+    TIMING_ACTIONS,
     CASES,
     action_order,
     build_setup,
@@ -19,6 +20,7 @@ from tools.bridge_tp.run_randomized_goodoutput_pilot_a100 import (
     observed_action,
     pair_results,
     select_inputs,
+    timing_results,
 )
 
 
@@ -98,6 +100,12 @@ class TestRandomizedPilot(unittest.TestCase):
                          action_order("p00_source1_target2"))
         self.assertEqual(set(action_order("p00_source1_target2")),
                          set(ACTIONS))
+        for action in TIMING_ACTIONS:
+            command = base.copy()
+            configure_action(command, action)
+            if action != "stay":
+                self.assertEqual(command[command.index(
+                    "--experiment-m1-action") + 1], action.upper())
 
     def test_rejects_predictor_train_tree_in_held_out_pool(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -144,6 +152,25 @@ class TestRandomizedPilot(unittest.TestCase):
             self.assertEqual(stay["start_count"], 0)
             self.assertEqual(stay["actual_m1_start_output_tokens"], [])
             self.assertEqual(stay["m1_recommendation_output_tokens"], [207])
+
+    def test_timing_summary_preserves_actual_action_and_delta(self) -> None:
+        summary = {"seed": 7, "evaluation_horizon_s": 180.0,
+                   "cases": {"case": {
+                       "stay": {"fixed_horizon_goodoutput_tokens_s": 10.0,
+                                "fixed_horizon_eligible": True},
+                       "now": {"fixed_horizon_goodoutput_tokens_s": 12.0,
+                               "fixed_horizon_eligible": True,
+                               "observed_action": {
+                                   "actual_m1_start_output_tokens": [128]}},
+                       "wait": {"fixed_horizon_eligible": False,
+                                "observed_action": {
+                                    "timing_gate_reasons": ["WAIT_ARMED"]}},
+                   }}}
+        cases = timing_results(summary)["cases"]["case"]
+        self.assertEqual(cases["now"]["descriptive_delta_vs_stay_tokens_s"],
+                         2.0)
+        self.assertIsNone(cases["wait"][
+            "descriptive_delta_vs_stay_tokens_s"])
 
     def test_random_arrivals_are_seeded_and_shared_by_arms(self) -> None:
         class Tokenizer:

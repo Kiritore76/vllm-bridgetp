@@ -24,6 +24,9 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from tools.bridge_tp.experiment_m1_wait import (  # noqa: E402
+    M1PredictorRefreshGate,
+)
 from vllm.bridge_tp.controller.action_adapter import (  # noqa: E402
     ActionAdapter,
     ActionError,
@@ -156,6 +159,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="paired counterfactual: audit M1/M5 but keep the anchor on TP1",
     )
+    parser.add_argument("--experiment-m1-action", choices=("NOW", "WAIT"),
+                        help="experimental migration timing against M5 refresh")
     parser.add_argument(
         "--diagnostic-m1-max-source-free-kv-tokens", type=int,
         help="experiment-only: defer M1 Shadow until TP1 free KV is at most this",
@@ -284,6 +289,11 @@ def parse_args() -> argparse.Namespace:
             parser.error("M1 auto-start requires source KV release tail allowance")
     if args.paired_stay and not args.manager_m1_auto_start:
         parser.error("paired STAY requires M1 auto-start for comparable evidence")
+    if args.experiment_m1_action and (
+        not args.manager_m1_auto_start or not args.manager_m5_predictor_shadow
+        or args.paired_stay
+    ):
+        parser.error("experimental timing requires M1/M5 and forbids paired STAY")
     if args.m1_source_release_tail_s is not None and (
         not args.manager_m1_auto_start
         or not math.isfinite(args.m1_source_release_tail_s)
@@ -1490,6 +1500,10 @@ def main() -> None:
             )
             if args.manager_m5_predictor_shadow else None
         )
+        experiment_gate = (
+            M1PredictorRefreshGate(args.experiment_m1_action)
+            if args.experiment_m1_action else None
+        )
         m0_collector = (
             RuntimeStateCollector()
             if manager_m0 is not None or manager_m1 is not None
@@ -1526,6 +1540,7 @@ def main() -> None:
                 "handoff_mode": args.handoff_mode,
                 "manager_m1_auto_start": args.manager_m1_auto_start,
                 "paired_stay": args.paired_stay,
+                "experiment_m1_action": args.experiment_m1_action,
                 "manager_m3_commit": args.manager_m3_commit,
                 "manager_m4_cancel": args.manager_m4_cancel,
                 "manager_m5_predictor_shadow": args.manager_m5_predictor_shadow,
@@ -1623,6 +1638,7 @@ def main() -> None:
                     "unix_s": time.time(),
                 }
                 audit.write(telemetry_row)
+                m5_row: dict[str, Any] | None = None
                 if manager_m5 is not None:
                     headroom_tokens = (
                         pool1.free_kv_tokens
@@ -1717,6 +1733,37 @@ def main() -> None:
                             m1_start_decision, action="STAY",
                             reason="diagnostic source pressure gate not reached",
                         )
+                    if experiment_gate is not None:
+                        natural_decision = m1_start_decision
+                        allowed, gate_reason = experiment_gate.decide(
+                            m1_action=natural_decision.action,
+                            m5_row=m5_row,
+                            source_time_to_guard_s=(
+                                natural_decision.source_time_to_guard_s
+                            ),
+                            estimated_preparation_s=(
+                                natural_decision.estimated_preparation_s
+                            ),
+                            source_release_tail_s=args.m1_source_release_tail_s,
+                        )
+                        audit.write({
+                            "kind": "experiment_m1_timing",
+                            "tick": tick,
+                            "output_tokens": request.output_tokens,
+                            "assigned_action": experiment_gate.action,
+                            "natural_decision": natural_decision.to_json(),
+                            "m5_prediction_output_tokens": (
+                                m5_row.get("prediction_output_tokens")
+                                if m5_row else None
+                            ),
+                            "gate_reason": gate_reason,
+                            "allowed": allowed,
+                        })
+                        if natural_decision.action == "START_SHADOW" and not allowed:
+                            m1_start_decision = replace(
+                                natural_decision, action="STAY",
+                                reason=f"experimental timing: {gate_reason}",
+                            )
                     audit.write(
                         {
                             "kind": "manager_m1_start_decision",

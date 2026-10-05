@@ -264,6 +264,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manager-m3-commit", action="store_true")
     parser.add_argument("--manager-m4-cancel", action="store_true")
     parser.add_argument("--manager-m5-predictor-shadow", action="store_true")
+    parser.add_argument("--experiment-m1-action", choices=("NOW", "WAIT"))
     parser.add_argument(
         "--paired-stay", action="store_true",
         help="paired GoodOutput control arm: retain M1/M5 observation but suppress migration",
@@ -651,6 +652,11 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         and not args.persistent_sequential_reuse
     ):
         raise ValueError("paired STAY requires one fresh M1 Shadow-only run")
+    if args.experiment_m1_action and (
+        not args.manager_m1_auto_start or not args.manager_m5_predictor_shadow
+        or args.paired_stay or args.repetitions != 1
+    ):
+        raise ValueError("experimental timing needs one M1/M5 migration run")
     if args.manager_m2_expected_profile and not args.manager_m2_rate:
         raise ValueError("M2 expected profile requires --manager-m2-rate")
     if not 0 <= args.manager_m2_min_history_byte_frac <= 1:
@@ -1100,6 +1106,8 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
     rows: list[dict[str, Any]] = []
     for run in runs:
         acceptance = run["acceptance"]
+        if acceptance.get("outcome") == "NATURAL_EOS_BEFORE_MIGRATION":
+            continue
         ready_event_waits = [
             float(value)
             for value in (acceptance.get("target_ready_event_wait_ms") or [])
@@ -3687,6 +3695,7 @@ def main() -> None:
             args.diagnostic_m1_max_source_free_kv_tokens
         ),
         "paired_stay": args.paired_stay,
+        "experiment_m1_action": args.experiment_m1_action,
         "m1_source_release_tail_s": args.m1_source_release_tail_s,
         "manager_m2_rate": args.manager_m2_rate,
         "manager_m3_commit": args.manager_m3_commit,
@@ -4100,6 +4109,10 @@ def main() -> None:
                     ])
                 if args.paired_stay:
                     controller_extra_args.append("--paired-stay")
+                if args.experiment_m1_action:
+                    controller_extra_args.extend([
+                        "--experiment-m1-action", args.experiment_m1_action,
+                    ])
                 if args.diagnostic_m1_max_source_free_kv_tokens is not None:
                     controller_extra_args.extend([
                         "--diagnostic-m1-max-source-free-kv-tokens",

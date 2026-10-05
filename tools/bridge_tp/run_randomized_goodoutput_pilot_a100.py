@@ -38,6 +38,7 @@ CASES = (
     ("p05_source5_target24", 5, 24, 0.2, 0.15),
 )
 ACTIONS = ("stay", "early128", "late1024")
+TIMING_ACTIONS = ("stay", "now", "wait")
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,6 +52,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--paired-only", action="store_true",
                         help="Collect STAY and early128 without the late EOS arm")
+    parser.add_argument("--timing-pilot", action="store_true",
+                        help="Compare STAY, NOW, and one M5-refresh WAIT")
+    parser.add_argument("--background-max-tokens", type=int, default=2048)
     parser.add_argument("--random-arrivals", action="store_true",
                         help="Use seeded exponential interarrival gaps")
     parser.add_argument("--evaluation-horizon-s", type=float, default=180.0)
@@ -163,14 +167,16 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
                              ("source", chosen[target_count:])):
             for job_index, row in enumerate(subset):
                 prompt_tokens = tokens(row)
-                if len(prompt_tokens) + 2048 > 8192:
+                background_cap = getattr(args, "background_max_tokens", 2048)
+                if len(prompt_tokens) + background_cap > 8192:
                     raise ValueError(f"background exceeds context: {row['id']}")
                 job = {
                     "job_id": f"{pool}_{job_index:03d}", "pool": pool,
                     "start_after_s": offsets[pool][job_index],
                     "request": {
                         "model": "bridgetp-model", "prompt": prompt_tokens,
-                        "max_tokens": 2048, "ignore_eos": False,
+                        "max_tokens": background_cap,
+                        "ignore_eos": False,
                         "temperature": 0.0,
                     },
                     "input_id": row["id"],
@@ -209,7 +215,7 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
 
 
 def configure_action(command: list[str], action: str) -> None:
-    if action not in ACTIONS:
+    if action not in ACTIONS + TIMING_ACTIONS:
         raise ValueError(f"unknown pilot action: {action}")
     for flag in ("--manager-m2-force-initial-high",):
         command.remove(flag)
@@ -230,6 +236,8 @@ def configure_action(command: list[str], action: str) -> None:
     command += ["--minimum-window-samples", "0"]
     command += ["--cutover-output-tokens",
                 "1120" if threshold == 1024 else "320"]
+    if action in {"now", "wait"}:
+        command += ["--experiment-m1-action", action.upper()]
 
 
 def action_order(name: str, seed: int = SEED,
@@ -256,6 +264,8 @@ def observed_action(run: Path, *, paired_stay: bool = False) -> dict[str, Any]:
                     for row in starts]
     decisions = [row for row in rows
                  if row.get("kind") == "manager_m1_start_decision"]
+    timing = [row for row in rows
+              if row.get("kind") == "experiment_m1_timing"]
     latest_m5: dict[str, Any] | None = None
     first_candidate: dict[str, Any] | None = None
     for row in rows:
@@ -301,6 +311,12 @@ def observed_action(run: Path, *, paired_stay: bool = False) -> dict[str, Any]:
         "actual_m1_start_output_tokens": [] if paired_stay else start_tokens,
         "m1_recommendation_output_tokens": start_tokens,
         "m1_decision_count": len(decisions),
+        "timing_gate_reasons": [row.get("gate_reason") for row in timing
+                                if row.get("gate_reason")],
+        "timing_first_natural_start_output_tokens": next(
+            (row.get("output_tokens") for row in timing
+             if (row.get("natural_decision") or {}).get("action")
+             == "START_SHADOW"), None),
         "first_candidate_at_or_after_128": first_candidate,
         "last_m1_decision": decisions[-1].get("decision")
         if decisions else None,
@@ -465,10 +481,50 @@ def pair_results(summary: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def timing_results(summary: dict[str, Any]) -> dict[str, Any]:
+    """Report observed timing and descriptive deltas, without fitting policy."""
+    cases = {}
+    for name, arms in summary["cases"].items():
+        stay_rate = arms.get("stay", {}).get(
+            "fixed_horizon_goodoutput_tokens_s")
+        cases[name] = {}
+        for action in TIMING_ACTIONS:
+            arm = arms.get(action, {})
+            observed = arm.get("observed_action") or {}
+            rate = arm.get("fixed_horizon_goodoutput_tokens_s")
+            cases[name][action] = {
+                "eligible": arm.get("fixed_horizon_eligible", False),
+                "goodoutput_tokens_s": rate,
+                "descriptive_delta_vs_stay_tokens_s": (
+                    rate - stay_rate if rate is not None
+                    and stay_rate is not None else None),
+                "actual_start_output_tokens": observed.get(
+                    "actual_m1_start_output_tokens", []),
+                "first_natural_candidate_output_tokens": observed.get(
+                    "timing_first_natural_start_output_tokens"),
+                "timing_gate_reasons": observed.get("timing_gate_reasons", []),
+                "handoff_stall_ms": observed.get("handoff_stall_ms"),
+                "slo_attainment": (arm.get("slo_metrics") or {}).get(
+                    "slo_attainment"),
+                "exclusions": arm.get("fixed_horizon_exclusions"),
+            }
+    return {
+        "status": "ENGINEERING_TIMING_PILOT_NOT_FITTED_BENEFIT",
+        "seed": summary["seed"],
+        "evaluation_horizon_s": summary["evaluation_horizon_s"],
+        "cases": cases,
+    }
+
+
 def execute_pilot(args: argparse.Namespace) -> None:
     if not math.isfinite(args.evaluation_horizon_s) or args.evaluation_horizon_s <= 0:
         raise ValueError("evaluation horizon must be positive and finite")
-    actions = ("stay", "early128") if args.paired_only else ACTIONS
+    if args.paired_only and args.timing_pilot:
+        raise ValueError("choose paired-only or timing-pilot, not both")
+    if not 1 <= args.background_max_tokens <= 4096:
+        raise ValueError("background max tokens must be in [1, 4096]")
+    actions = (TIMING_ACTIONS if args.timing_pilot else
+               ("stay", "early128") if args.paired_only else ACTIONS)
     preflight = verify(args)
     root = args.out_dir.resolve()
     setup_path = root / "pilot_setup.json"
@@ -492,6 +548,7 @@ def execute_pilot(args: argparse.Namespace) -> None:
         "seed": args.seed, "cases": {},
         "actions": actions,
         "evaluation_horizon_s": args.evaluation_horizon_s,
+        "background_max_tokens": args.background_max_tokens,
     }
     summary_path = root / "pilot_summary.json"
     if summary_path.is_file():
@@ -499,7 +556,9 @@ def execute_pilot(args: argparse.Namespace) -> None:
         if (summary.get("seed") != args.seed
                 or tuple(summary.get("actions", ())) != tuple(actions)
                 or summary.get("evaluation_horizon_s")
-                != args.evaluation_horizon_s):
+                != args.evaluation_horizon_s
+                or summary.get("background_max_tokens")
+                != args.background_max_tokens):
             raise ValueError("resume options differ from original pilot")
     failed = False
     try:
@@ -550,6 +609,8 @@ def execute_pilot(args: argparse.Namespace) -> None:
         write_json(summary_path, summary)
         if args.paired_only:
             write_json(root / "paired_outcomes.json", pair_results(summary))
+        if args.timing_pilot:
+            write_json(root / "timing_outcomes.json", timing_results(summary))
         archive = root.with_suffix(".tar.gz")
         print(f"packing={root}", flush=True)
         with tarfile.open(archive, "w:gz") as handle:
