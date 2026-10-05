@@ -344,6 +344,25 @@ class TestOnlineStrategyTiming(unittest.TestCase):
 
 
 class TestOnlineWindows(unittest.TestCase):
+    def test_natural_eos_before_migration_has_no_shadow_measurements(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_measurements(root, [{
+                "repetition": 1,
+                "strategy": "S_NEW_OLD",
+                "acceptance": {
+                    "status": "PASS",
+                    "outcome": "NATURAL_EOS_BEFORE_MIGRATION",
+                    "source_origin_tokens": 943,
+                    "target_origin_tokens": 0,
+                },
+            }])
+            measurements = (root / "measurements.csv").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("shadow_duration_ms", measurements)
+            self.assertIn("943", measurements)
+
     def test_visible_interval_summary_preserves_maximum_stall(self) -> None:
         emitted = [
             {"origin": "source", "unix_s": 1.0},
