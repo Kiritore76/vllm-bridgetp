@@ -36,6 +36,20 @@ class M1PredictorRefreshGate:
         position = (m5_row.get("prediction_output_tokens")
                     if available else None)
         fresh_position = isinstance(position, int) and position >= 0
+        guard_s = source_time_to_guard_s
+        prepare_s = estimated_preparation_s
+        tail_s = source_release_tail_s
+        urgent = (
+            m1_action == "START_SHADOW"
+            and isinstance(guard_s, (int, float)) and math.isfinite(guard_s)
+            and isinstance(prepare_s, (int, float))
+            and math.isfinite(prepare_s)
+            and isinstance(tail_s, (int, float)) and math.isfinite(tail_s)
+            and guard_s <= prepare_s + tail_s
+        )
+        if urgent:
+            self.released = True
+            return True, "CAPACITY_SAFETY_RELEASE"
         if self.action == "NOW":
             if m1_action != "START_SHADOW":
                 return False, None
@@ -56,18 +70,4 @@ class M1PredictorRefreshGate:
             self.released = True
             return m1_action == "START_SHADOW", "WAIT_RECHECK_FRESH_M5"
 
-        # Do not hold a still-feasible migration until its capacity deadline.
-        guard_s = source_time_to_guard_s
-        prepare_s = estimated_preparation_s
-        tail_s = source_release_tail_s
-        if (
-            m1_action == "START_SHADOW"
-            and isinstance(guard_s, (int, float)) and math.isfinite(guard_s)
-            and isinstance(prepare_s, (int, float))
-            and math.isfinite(prepare_s)
-            and isinstance(tail_s, (int, float)) and math.isfinite(tail_s)
-            and guard_s <= prepare_s + tail_s
-        ):
-            self.released = True
-            return True, "WAIT_CAPACITY_SAFETY_RELEASE"
         return False, "WAIT_FOR_FRESH_M5" if m1_action == "START_SHADOW" else None
