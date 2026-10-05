@@ -58,6 +58,18 @@ def write_json(path: Path, value: Any) -> None:
                     encoding="utf-8")
 
 
+def expected_gpu_uuids(args: argparse.Namespace) -> list[str]:
+    override = getattr(args, "expected_gpu_uuids", None)
+    if override is None:
+        return EXPECTED_UUIDS
+    values = [value.strip() for value in override.split(",")]
+    if len(values) != 5 or len(set(values)) != 5 or any(
+        not value.startswith("GPU-") for value in values
+    ):
+        raise ValueError("expected GPU UUIDs must name five distinct GPUs")
+    return values
+
+
 def verify(args: argparse.Namespace) -> dict[str, Any]:
     revision = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
@@ -73,12 +85,18 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
     uuids = subprocess.check_output(
         ["nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader"],
         text=True).strip().replace("\r", "").splitlines()
-    if uuids != EXPECTED_UUIDS:
+    expected_uuids = expected_gpu_uuids(args)
+    if uuids != expected_uuids:
         raise ValueError(f"GPU UUIDs differ: {uuids}")
+    names = subprocess.check_output(
+        ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+        text=True).strip().replace("\r", "").splitlines()
+    if names != ["NVIDIA A100-PCIE-40GB"] * 5:
+        raise ValueError(f"GPU models differ: {names}")
     active = subprocess.check_output(
         ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid",
          "--format=csv,noheader"], text=True).strip()
-    if any(uuid in active for uuid in EXPECTED_UUIDS):
+    if any(uuid in active for uuid in expected_uuids):
         raise ValueError("an A100 already has a compute process")
     paths = {
         "input": args.input,
@@ -100,6 +118,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         "revision": revision,
         "hostname": socket.gethostname(),
         "gpu_uuids": uuids,
+        "gpu_models": names,
         "paths": {name: str(path.resolve()) for name, path in paths.items()},
         "sha256": measured,
         "model_config_sha256": measured["model_config"],
@@ -420,6 +439,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--expected-revision", required=True)
     parser.add_argument("--expected-host", required=True)
+    parser.add_argument("--expected-gpu-uuids")
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--base", type=Path, required=True)
