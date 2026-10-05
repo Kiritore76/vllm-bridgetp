@@ -39,6 +39,7 @@ CASES = (
 )
 ACTIONS = ("stay", "early128", "late1024")
 TIMING_ACTIONS = ("stay", "now", "wait")
+RETIRED_P03_ANCHOR_ID = "oasst1:98d36c03-5335-4f5b-8dbd-1a6e5fd9b0b2"
 
 
 def parse_args() -> argparse.Namespace:
@@ -63,6 +64,14 @@ def parse_args() -> argparse.Namespace:
                         help="Run only these cases with the original seed")
     parser.add_argument("--anchor-context-limit", action="store_true",
                         help="Use the largest anchor output allowed by context")
+    parser.add_argument(
+        "--anchor-total-max-tokens", type=int,
+        help="client-visible total output budget after TP1-to-TP4 migration",
+    )
+    parser.add_argument(
+        "--p03-anchor-id",
+        help="held-out long-form request ID replacing the p03 anchor",
+    )
     parser.add_argument("--background-context-limit", action="store_true",
                         help="Use the largest background output allowed by context")
     parser.add_argument("--background-max-tokens", type=int, default=2048)
@@ -74,7 +83,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def select_inputs(path: Path, seed: int = SEED) -> list[dict[str, Any]]:
+def select_inputs(path: Path, seed: int = SEED,
+                  p03_anchor_id: str | None = None) -> list[dict[str, Any]]:
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8")
             .splitlines() if line.strip()]
     tree_splits: dict[str, str] = {}
@@ -85,7 +95,9 @@ def select_inputs(path: Path, seed: int = SEED) -> list[dict[str, Any]]:
             raise ValueError(f"request tree crosses dataset splits: {tree_id}")
         tree_splits[tree_id] = split
     test = [row for row in rows if row.get("split") == "test"
-            and row.get("workload_group") in {"natural", "long_form"}]
+            and row.get("workload_group") in {"natural", "long_form"}
+            and (p03_anchor_id is None
+                 or row.get("id") != RETIRED_P03_ANCHOR_ID)]
     rng = random.Random(seed)
     long_form = [row for row in test
                  if row["workload_group"] == "long_form"]
@@ -96,6 +108,18 @@ def select_inputs(path: Path, seed: int = SEED) -> list[dict[str, Any]]:
     if len(long_form) < 5 or len(natural) < 1:
         raise ValueError("pilot needs five held-out long-form anchors")
     anchors = long_form[:5] + natural[:1]
+    if p03_anchor_id is not None:
+        replacements = [row for row in long_form
+                        if str(row["id"]) == p03_anchor_id]
+        if len(replacements) != 1:
+            raise ValueError("p03 replacement must be one held-out long-form row")
+        replacement = replacements[0]
+        existing = next((index for index, row in enumerate(anchors)
+                         if row["id"] == p03_anchor_id), None)
+        if existing is not None and existing != 3:
+            anchors[existing], anchors[3] = anchors[3], anchors[existing]
+        else:
+            anchors[3] = replacement
     selected_ids = {str(row["id"]) for row in anchors}
     if len(selected_ids) != len(anchors):
         raise ValueError("duplicate anchor request IDs")
@@ -114,7 +138,7 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
     from transformers import AutoTokenizer
 
     seed = getattr(args, "seed", SEED)
-    rows = select_inputs(args.input, seed)
+    rows = select_inputs(args.input, seed, getattr(args, "p03_anchor_id", None))
     tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
 
     def tokens(row: dict[str, Any]) -> list[int]:
@@ -159,9 +183,18 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
                           source_max_model_len - 128)
                       if getattr(args, "anchor_context_limit", False)
                       else 4096)
+        total_budget = getattr(args, "anchor_total_max_tokens", None)
+        if total_budget is None:
+            total_budget = anchor_cap
         if (anchor_cap <= 128
                 or len(anchor_tokens) + anchor_cap > source_max_model_len):
             raise ValueError(f"anchor exceeds context limit: {anchor['id']}")
+        target_max_model_len = (
+            getattr(args, "tp4_max_model_len", None) or source_max_model_len
+        )
+        if (total_budget < anchor_cap
+                or len(anchor_tokens) + total_budget > target_max_model_len):
+            raise ValueError(f"anchor total budget exceeds TP4: {anchor['id']}")
         anchor_request = {
             "model": "bridgetp-model", "prompt": anchor_tokens,
             "max_tokens": anchor_cap, "ignore_eos": False,
@@ -178,6 +211,7 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
             "path": str(anchor_path), "sha256": sha256(anchor_path),
             "prompt_tokens": len(anchor_tokens), "input_id": anchor["id"],
             "max_tokens": anchor_cap,
+            "total_max_tokens": total_budget,
             "workload_group": anchor["workload_group"],
         }
         jobs = []
@@ -356,9 +390,10 @@ def observed_action(run: Path, *, paired_stay: bool = False) -> dict[str, Any]:
 def is_context_censored(*, runner_rc: int, audit_rc: int,
                         source: dict[str, Any], anchor_cap: int,
                         acceptance_errors: list[str],
+                        total_cap: int | None = None,
                         target: dict[str, Any] | None = None,
                         proxy: dict[str, Any] | None = None) -> bool:
-    """Recognize a clean run stopped only by the model context boundary."""
+    """Recognize a clean run stopped only by an output length cap."""
     source_capped = (
         source.get("finish_reason") == "length"
         and len(source.get("token_ids") or []) == anchor_cap
@@ -366,7 +401,7 @@ def is_context_censored(*, runner_rc: int, audit_rc: int,
     )
     target_capped = (
         (target or {}).get("finish_reason") == "length"
-        and (proxy or {}).get("emitted_tokens") == anchor_cap
+        and (proxy or {}).get("emitted_tokens") == (total_cap or anchor_cap)
         and acceptance_errors == [
             "unified response did not naturally finish before cap"]
     )
@@ -393,6 +428,10 @@ def collect_arm(args: argparse.Namespace, root: Path,
                         str(args.tp4_max_model_len)))
     command[command.index("--anchor-max-tokens") + 1] = str(
         setup["anchors"][name]["max_tokens"])
+    if (setup["anchors"][name]["total_max_tokens"]
+            > setup["anchors"][name]["max_tokens"]):
+        command.extend(("--anchor-total-max-tokens", str(
+            setup["anchors"][name]["total_max_tokens"])))
     configure_action(command, action)
     write_json(case_root / f"{action}.command.json", command)
     runner_rc = execute(command, case_root / f"{action}.console.log")
@@ -438,6 +477,7 @@ def collect_arm(args: argparse.Namespace, root: Path,
     context_censored = is_context_censored(
         runner_rc=runner_rc, audit_rc=audit_rc, source=source,
         anchor_cap=setup["anchors"][name]["max_tokens"],
+        total_cap=setup["anchors"][name]["total_max_tokens"],
         acceptance_errors=acceptance_errors, target=target, proxy=proxy,
     )
     natural_noop = (
@@ -608,6 +648,8 @@ def execute_pilot(args: argparse.Namespace) -> None:
     if (not args.background_context_limit
             and not 1 <= args.background_max_tokens <= 4096):
         raise ValueError("background max tokens must be in [1, 4096]")
+    if args.anchor_total_max_tokens is not None and args.anchor_total_max_tokens <= 0:
+        raise ValueError("anchor total max tokens must be positive")
     selected_cases = list(args.cases or (row[0] for row in CASES))
     if len(selected_cases) != len(set(selected_cases)):
         raise ValueError("case names must be unique")
@@ -642,6 +684,8 @@ def execute_pilot(args: argparse.Namespace) -> None:
         "background_context_limit": args.background_context_limit,
         "selected_cases": selected_cases,
         "anchor_context_limit": args.anchor_context_limit,
+        "anchor_total_max_tokens": args.anchor_total_max_tokens,
+        "p03_anchor_id": args.p03_anchor_id,
         "source_max_model_len": args.max_model_len,
         "tp4_max_model_len": args.tp4_max_model_len or args.max_model_len,
     }
@@ -660,6 +704,9 @@ def execute_pilot(args: argparse.Namespace) -> None:
                 or summary.get("selected_cases") != selected_cases
                 or summary.get("anchor_context_limit")
                 != args.anchor_context_limit
+                or summary.get("anchor_total_max_tokens")
+                != args.anchor_total_max_tokens
+                or summary.get("p03_anchor_id") != args.p03_anchor_id
                 or summary.get("source_max_model_len") != args.max_model_len
                 or summary.get("tp4_max_model_len")
                 != (args.tp4_max_model_len or args.max_model_len)):

@@ -121,6 +121,23 @@ class TestRandomizedPilot(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "crosses dataset splits"):
                 select_inputs(path)
 
+    def test_replaces_p03_anchor_with_held_out_long_form_request(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "requests.jsonl"
+            rows = [
+                {"id": f"r-{index}", "split": "test",
+                 "workload_group": "long_form" if index % 4 == 0
+                 else "natural", "prompt": "hello"}
+                for index in range(160)
+            ]
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            selected = select_inputs(path, 20261007, "r-40")
+            self.assertEqual(selected[3]["id"], "r-40")
+            self.assertEqual(len({row["id"] for row in selected}),
+                             len(selected))
+            with self.assertRaisesRegex(ValueError, "held-out long-form"):
+                select_inputs(path, 20261007, "r-41")
+
     def test_reports_actual_start_separately_from_configured_gate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -243,6 +260,18 @@ class TestRandomizedPilot(unittest.TestCase):
                 extended = build_setup(args, root / "extended")
             extended_anchor = extended["anchors"][extended["cases"][0]]
             self.assertEqual(extended_anchor["max_tokens"], 16256)
+            args.tp4_max_model_len = 32768
+            args.anchor_total_max_tokens = 24000
+            args.p03_anchor_id = "r-40"
+            with mock.patch.dict(sys.modules, {"transformers": fake}):
+                split = build_setup(args, root / "split")
+            p03 = split["anchors"]["p03_source3_target24"]
+            self.assertEqual(p03["input_id"], "r-40")
+            self.assertEqual(p03["max_tokens"], 16256)
+            self.assertEqual(p03["total_max_tokens"], 24000)
+            source_request = json.loads(Path(p03["path"]).read_text())
+            self.assertEqual(source_request["max_tokens"], 16256)
+            self.assertNotIn("total_max_tokens", source_request)
         error = ["source did not naturally finish before its cap"]
         self.assertTrue(is_context_censored(
             runner_rc=1, audit_rc=0,
@@ -256,6 +285,12 @@ class TestRandomizedPilot(unittest.TestCase):
             runner_rc=1, audit_rc=0, source={"finish_reason": "abort"},
             target={"finish_reason": "length"},
             proxy={"emitted_tokens": 4}, anchor_cap=4,
+            acceptance_errors=[
+                "unified response did not naturally finish before cap"]))
+        self.assertTrue(is_context_censored(
+            runner_rc=1, audit_rc=0, source={"finish_reason": "abort"},
+            target={"finish_reason": "length"},
+            proxy={"emitted_tokens": 8}, anchor_cap=4, total_cap=8,
             acceptance_errors=[
                 "unified response did not naturally finish before cap"]))
 
