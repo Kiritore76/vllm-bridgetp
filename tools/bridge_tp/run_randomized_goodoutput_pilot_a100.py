@@ -80,6 +80,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--background-context-limit", action="store_true",
                         help="Use the largest background output allowed by context")
     parser.add_argument("--background-max-tokens", type=int, default=2048)
+    parser.add_argument(
+        "--source-background-max-tokens", type=int,
+        help="source-only output cap; target jobs retain background setting",
+    )
+    parser.add_argument(
+        "--source-prompt-tokens", type=int,
+        help="augment held-out source prompts to this exact length; "
+             "preserve natural EOS and record augmentation provenance",
+    )
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--tp4-max-model-len", type=int)
     parser.add_argument("--random-arrivals", action="store_true",
@@ -145,6 +154,36 @@ def select_inputs(path: Path, seed: int = SEED,
     if len({str(row["id"]) for row in selected}) != len(selected):
         raise ValueError("pilot request IDs are not unique")
     return selected
+
+
+def augmented_source_prompt(tokenizer: Any, row: dict[str, Any],
+                            length: int) -> list[int]:
+    """Repeat held-out source content inside one chat prompt to a fixed length."""
+    template = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "<CONTEXT>"}],
+        tokenize=False, add_generation_prompt=True)
+    if template.count("<CONTEXT>") != 1:
+        raise ValueError("chat template did not retain context marker")
+    before, after = template.split("<CONTEXT>")
+    prefix = tokenizer.encode(
+        before + "Read the following context.\n", add_special_tokens=False)
+    suffix = tokenizer.encode(
+        "\nWrite a detailed synthesis of about 350 words. Explain the main "
+        "points and end with a brief conclusion." + after,
+        add_special_tokens=False)
+    budget = length - len(prefix) - len(suffix)
+    if budget < 128:
+        raise ValueError("source prompt target leaves too little context room")
+    content = "\n".join(str(message.get("content", ""))
+                        for message in row["messages"])
+    body = tokenizer.encode(content + "\n", add_special_tokens=False)
+    if not body:
+        raise ValueError(f"empty source content: {row['id']}")
+    repeat = (budget + len(body) - 1) // len(body)
+    prompt = prefix + (body * repeat)[:budget] + suffix
+    if len(prompt) != length:
+        raise AssertionError("source prompt augmentation length differs")
+    return prompt
 
 
 def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
@@ -234,12 +273,21 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
         for pool, subset in (("target", chosen[:target_count]),
                              ("source", chosen[target_count:])):
             for job_index, row in enumerate(subset):
-                prompt_tokens = tokens(row)
+                prompt_tokens = (
+                    augmented_source_prompt(tokenizer, row,
+                                            args.source_prompt_tokens)
+                    if pool == "source"
+                    and getattr(args, "source_prompt_tokens", None) is not None
+                    else tokens(row)
+                )
                 background_cap = (
                     min(8192 - len(prompt_tokens), 8192 - 128)
                     if getattr(args, "background_context_limit", False)
                     else getattr(args, "background_max_tokens", 2048)
                 )
+                if (pool == "source" and getattr(
+                        args, "source_background_max_tokens", None) is not None):
+                    background_cap = args.source_background_max_tokens
                 if (background_cap <= 0
                         or len(prompt_tokens) + background_cap > 8192):
                     raise ValueError(f"background exceeds context: {row['id']}")
@@ -253,7 +301,12 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
                         "temperature": 0.0,
                     },
                     "input_id": row["id"],
-                    "workload_group": row["workload_group"],
+                    "workload_group": (
+                        "augmented_long_context_natural_eos"
+                        if pool == "source"
+                        and getattr(args, "source_prompt_tokens", None)
+                        is not None else row["workload_group"]
+                    ),
                 }
                 if pool == "source":
                     job["start_after_event"] = "ANCHOR_FIRST_OUTPUT"
@@ -308,6 +361,9 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
             "source_count": sum(job["pool"] == "source" for job in jobs),
             "target_count": sum(job["pool"] == "target" for job in jobs),
             "source_spacing_s": source_spacing,
+            "source_prompt_tokens": getattr(args, "source_prompt_tokens", None),
+            "source_background_max_tokens": getattr(
+                args, "source_background_max_tokens", None),
             "target_spacing_s": target_spacing,
             "natural_eos_required": True,
             "arrival_process": (
@@ -792,6 +848,12 @@ def execute_pilot(args: argparse.Namespace) -> None:
     if (not args.background_context_limit
             and not 1 <= args.background_max_tokens <= 4096):
         raise ValueError("background max tokens must be in [1, 4096]")
+    if (args.source_prompt_tokens is not None
+            and not 512 <= args.source_prompt_tokens <= 6144):
+        raise ValueError("source prompt tokens must be in [512, 6144]")
+    if (args.source_background_max_tokens is not None
+            and not 1 <= args.source_background_max_tokens <= 4096):
+        raise ValueError("source background max tokens must be in [1, 4096]")
     if args.anchor_total_max_tokens is not None and args.anchor_total_max_tokens <= 0:
         raise ValueError("anchor total max tokens must be positive")
     selected_cases = list(args.cases or (row[0] for row in CASES))
@@ -832,6 +894,8 @@ def execute_pilot(args: argparse.Namespace) -> None:
         "background_max_tokens": (None if args.background_context_limit
                                   else args.background_max_tokens),
         "background_context_limit": args.background_context_limit,
+        "source_prompt_tokens": args.source_prompt_tokens,
+        "source_background_max_tokens": args.source_background_max_tokens,
         "selected_cases": selected_cases,
         "anchor_context_limit": args.anchor_context_limit,
         "anchor_total_max_tokens": args.anchor_total_max_tokens,
@@ -859,6 +923,10 @@ def execute_pilot(args: argparse.Namespace) -> None:
                     else args.background_max_tokens)
                 or summary.get("background_context_limit")
                 != args.background_context_limit
+                or summary.get("source_prompt_tokens")
+                != args.source_prompt_tokens
+                or summary.get("source_background_max_tokens")
+                != args.source_background_max_tokens
                 or summary.get("selected_cases") != selected_cases
                 or summary.get("anchor_context_limit")
                 != args.anchor_context_limit

@@ -15,6 +15,7 @@ from tools.bridge_tp.run_randomized_goodoutput_pilot_a100 import (
     TIMING_ACTIONS,
     CASES,
     action_order,
+    augmented_source_prompt,
     build_setup,
     configure_action,
     cross_context_smoke_result,
@@ -28,6 +29,56 @@ from tools.bridge_tp.run_randomized_goodoutput_pilot_a100 import (
 
 
 class TestRandomizedPilot(unittest.TestCase):
+    def test_augmented_source_pressure_keeps_natural_eos_and_provenance(self):
+        class Tokenizer:
+            @staticmethod
+            def apply_chat_template(*_args: object,
+                                    **_kwargs: object) -> str:
+                return "<user><CONTEXT></user><assistant>"
+
+            @staticmethod
+            def encode(value: str, **_kwargs: object) -> list[int]:
+                return [ord(char) for char in value]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_path = root / "requests.jsonl"
+            rows = [
+                {"id": f"input-{index:03d}", "split": "test",
+                 "workload_group": "long_form" if index % 4 == 0
+                 else "natural", "prompt": "hello",
+                 "messages": [{"role": "user", "content": f"topic {index}"}]}
+                for index in range(160)
+            ]
+            input_path.write_text("".join(json.dumps(row) + "\n"
+                                          for row in rows))
+            fake = types.SimpleNamespace(AutoTokenizer=types.SimpleNamespace(
+                from_pretrained=lambda *_args, **_kwargs: Tokenizer()))
+            args = SimpleNamespace(input=input_path, model=root / "model",
+                                   source_prompt_tokens=3584,
+                                   source_background_max_tokens=768,
+                                   background_context_limit=True)
+            with mock.patch.dict(sys.modules, {"transformers": fake}):
+                setup = build_setup(args, root)
+            manifest = json.loads(Path(setup["manifests"][
+                "p04_source5_target2"]["path"]).read_text())
+            source = [job for job in manifest["jobs"]
+                      if job["pool"] == "source"]
+            self.assertEqual(len(source), 5)
+            self.assertEqual(manifest["source_prompt_tokens"], 3584)
+            self.assertEqual(manifest["source_background_max_tokens"], 768)
+            self.assertTrue(all(len(job["request"]["prompt"]) == 3584
+                                and job["request"]["max_tokens"] == 768
+                                and not job["request"]["ignore_eos"]
+                                and job["workload_group"]
+                                == "augmented_long_context_natural_eos"
+                                for job in source))
+            self.assertTrue(all(job["request"]["max_tokens"] > 768
+                                for job in manifest["jobs"]
+                                if job["pool"] == "target"))
+            self.assertEqual(len(augmented_source_prompt(
+                Tokenizer(), rows[0], 3584)), 3584)
+
     def test_selects_unique_held_out_requests_and_builds_six_cases(self) -> None:
         class Tokenizer:
             @staticmethod
