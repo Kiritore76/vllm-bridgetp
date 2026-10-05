@@ -257,9 +257,23 @@ class TestRandomizedPilot(unittest.TestCase):
             self.assertEqual(len({job["job_id"] for job in jobs}), len(jobs))
             self.assertTrue(all(job["start_after_s"] < 120 for job in jobs))
             for pool in ("source", "target"):
-                self.assertGreaterEqual(max(job["start_after_s"] for job
-                                            in jobs if job["pool"] == pool), 80)
+                pool_count = 3 if pool == "source" else 24
+                self.assertGreaterEqual(
+                    max(job["start_after_s"] for job in jobs
+                        if job["pool"] == pool), 120 - 40 / pool_count)
             self.assertEqual(len({job["input_id"] for job in jobs}), 27)
+            args.random_arrivals = True
+            with mock.patch.dict(sys.modules, {"transformers": fake}):
+                random_setup = build_setup(args, root / "random")
+            random_manifest = json.loads(Path(random_setup["manifests"][
+                "p03_source3_target24"]["path"]).read_text())
+            self.assertEqual(random_manifest["arrival_process"],
+                             "seeded_first_burst_stratified_replay")
+            for pool in ("source", "target"):
+                pool_count = 3 if pool == "source" else 24
+                self.assertGreaterEqual(
+                    max(job["start_after_s"] for job in random_manifest["jobs"]
+                        if job["pool"] == pool), 120 - 40 / pool_count)
 
     def test_cross_context_smoke_requires_actual_target_continuation(self) -> None:
         proxy = {"committed": True, "emitted_tokens": 4,

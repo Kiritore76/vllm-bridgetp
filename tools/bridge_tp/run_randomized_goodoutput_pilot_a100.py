@@ -263,24 +263,37 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
             jobs = []
             wave = 0
             while True:
-                scheduled = [job for job in first_wave
-                             if wave * period_s + job["start_after_s"]
-                             < arrival_window_s]
+                scheduled = []
+                for job in first_wave:
+                    if wave == 0:
+                        planned = job["start_after_s"]
+                    else:
+                        pool_count = (source_count if job["pool"] == "source"
+                                      else target_count)
+                        index = int(job["job_id"].rsplit("_", 1)[1])
+                        phase = (random.Random(
+                            f"{seed}:{name}:{job['job_id']}:{wave}"
+                        ).random() if getattr(args, "random_arrivals", False)
+                            else 0.5)
+                        planned = wave * period_s + (
+                            index + phase) * period_s / pool_count
+                    if planned < arrival_window_s:
+                        scheduled.append((job, planned))
                 if not scheduled:
                     break
-                for job in scheduled:
+                for job, planned in scheduled:
                     copy = dict(job)
                     copy["job_id"] = f"{job['job_id']}_wave{wave:03d}"
-                    copy["start_after_s"] = round(
-                        wave * period_s + job["start_after_s"], 3)
+                    copy["start_after_s"] = round(planned, 3)
                     copy["wave"] = wave
                     jobs.append(copy)
                 wave += 1
             if (not jobs or any(
                     max((job["start_after_s"] for job in jobs
                          if job["pool"] == pool), default=-1)
-                    < arrival_window_s - period_s
-                    for pool in ("source", "target"))):
+                    < arrival_window_s - period_s / count
+                    for pool, count in (("source", source_count),
+                                        ("target", target_count)))):
                 raise ValueError("arrival schedule does not cover the window")
             if len(jobs) > 512:
                 raise ValueError("arrival schedule exceeds 512 jobs per case")
@@ -295,9 +308,15 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
             "source_spacing_s": source_spacing,
             "target_spacing_s": target_spacing,
             "natural_eos_required": True,
-            "arrival_process": ("seeded_exponential"
-                                if getattr(args, "random_arrivals", False)
-                                else "fixed_spacing"),
+            "arrival_process": (
+                "seeded_first_burst_stratified_replay"
+                if arrival_window_s is not None and getattr(
+                    args, "random_arrivals", False) else
+                "fixed_first_burst_stratified_replay"
+                if arrival_window_s is not None else
+                "seeded_exponential"
+                if getattr(args, "random_arrivals", False) else
+                "fixed_spacing"),
             "arrival_window_s": arrival_window_s,
             "arrival_wave_period_s": (
                 getattr(args, "arrival_wave_period_s", 40.0)
@@ -746,8 +765,8 @@ def execute_pilot(args: argparse.Namespace) -> None:
             raise ValueError("arrival window must end before evaluation horizon")
         if (not math.isfinite(args.arrival_wave_period_s)
                 or not 0 < args.arrival_wave_period_s
-                <= args.arrival_window_s):
-            raise ValueError("arrival wave period must fit the arrival window")
+                < args.arrival_window_s):
+            raise ValueError("arrival wave period must be shorter than window")
         if (not math.isfinite(args.max_arrival_lag_s)
                 or args.max_arrival_lag_s < 0):
             raise ValueError("maximum arrival lag must be non-negative")
