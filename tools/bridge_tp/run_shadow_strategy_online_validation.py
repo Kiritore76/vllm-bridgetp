@@ -264,6 +264,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manager-m3-commit", action="store_true")
     parser.add_argument("--manager-m4-cancel", action="store_true")
     parser.add_argument("--manager-m5-predictor-shadow", action="store_true")
+    parser.add_argument("--risk-observation-shadow", action="store_true")
     parser.add_argument("--experiment-m1-action", choices=("NOW", "WAIT"))
     parser.add_argument(
         "--paired-stay", action="store_true",
@@ -4172,6 +4173,8 @@ def main() -> None:
                         "--predictor-checkpoint-sha256",
                         args.predictor_checkpoint_sha256,
                     ])
+                if args.risk_observation_shadow:
+                    controller_extra_args.append("--risk-observation-shadow")
                 if args.paired_stay:
                     controller_extra_args.append("--paired-stay")
                 if args.anchor_total_max_tokens is not None:

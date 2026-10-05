@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.bridge_tp.experiment_m1_wait import (  # noqa: E402
     M1PredictorRefreshGate,
 )
+from tools.bridge_tp.risk_observation import build_risk_observation  # noqa: E402
 from vllm.bridge_tp.controller.action_adapter import (  # noqa: E402
     ActionAdapter,
     ActionError,
@@ -163,6 +164,10 @@ def parse_args() -> argparse.Namespace:
         "--paired-stay",
         action="store_true",
         help="paired counterfactual: audit M1/M5 but keep the anchor on TP1",
+    )
+    parser.add_argument(
+        "--risk-observation-shadow", action="store_true",
+        help="record predecision capacity features without changing actions",
     )
     parser.add_argument("--experiment-m1-action", choices=("NOW", "WAIT"),
                         help="experimental migration timing against M5 refresh")
@@ -1565,6 +1570,7 @@ def main() -> None:
                 "handoff_mode": args.handoff_mode,
                 "manager_m1_auto_start": args.manager_m1_auto_start,
                 "paired_stay": args.paired_stay,
+                "risk_observation_shadow": args.risk_observation_shadow,
                 "experiment_m1_action": args.experiment_m1_action,
                 "manager_m3_commit": args.manager_m3_commit,
                 "manager_m4_cancel": args.manager_m4_cancel,
@@ -1758,8 +1764,8 @@ def main() -> None:
                             m1_start_decision, action="STAY",
                             reason="diagnostic source pressure gate not reached",
                         )
+                    natural_decision = m1_start_decision
                     if experiment_gate is not None:
-                        natural_decision = m1_start_decision
                         allowed, gate_reason = experiment_gate.decide(
                             m1_action=natural_decision.action,
                             m5_row=m5_row,
@@ -1789,6 +1795,30 @@ def main() -> None:
                                 natural_decision, action="STAY",
                                 reason=f"experimental timing: {gate_reason}",
                             )
+                    if args.risk_observation_shadow:
+                        effective_decision = (
+                            replace(m1_start_decision, action="STAY",
+                                    reason="paired stay intervention")
+                            if args.paired_stay
+                            and m1_start_decision.action == "START_SHADOW"
+                            else m1_start_decision
+                        )
+                        audit.write(build_risk_observation(
+                            tick=tick,
+                            snapshot=m1_snapshot.to_json(),
+                            m5_row=m5_row,
+                            natural_m1=natural_decision.to_json(),
+                            applied_m1=effective_decision.to_json(),
+                            initial_rate=(
+                                initial_rate_preview.to_json()
+                                if initial_rate_preview is not None else None
+                            ),
+                            assigned_action=(
+                                experiment_gate.action
+                                if experiment_gate is not None
+                                else "STAY" if args.paired_stay else None
+                            ),
+                        ))
                     audit.write(
                         {
                             "kind": "manager_m1_start_decision",

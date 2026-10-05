@@ -58,6 +58,8 @@ def parse_args() -> argparse.Namespace:
                         help="Collect STAY and early128 without the late EOS arm")
     parser.add_argument("--timing-pilot", action="store_true",
                         help="Compare STAY, NOW, and one M5-refresh WAIT")
+    parser.add_argument("--risk-observation-shadow", action="store_true",
+                        help="record passive predecision risk features in each arm")
     parser.add_argument("--cross-context-smoke", action="store_true",
                         help="one forced-length migration beyond TP1 context; "
                              "not a natural-EOS or GoodOutput experiment")
@@ -526,6 +528,8 @@ def collect_arm(args: argparse.Namespace, root: Path,
         command.extend(("--anchor-total-max-tokens", str(
             setup["anchors"][name]["total_max_tokens"])))
     configure_action(command, action)
+    if args.risk_observation_shadow:
+        command.append("--risk-observation-shadow")
     if args.cross_context_smoke:
         command.append("--cross-context-smoke")
     write_json(case_root / f"{action}.command.json", command)
