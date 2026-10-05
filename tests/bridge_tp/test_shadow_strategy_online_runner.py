@@ -374,11 +374,7 @@ class TestOnlineWindows(unittest.TestCase):
                     "target_origin_tokens": 0,
                 },
             }])
-            measurements = (root / "measurements.csv").read_text(
-                encoding="utf-8"
-            )
-            self.assertIn("shadow_duration_ms", measurements)
-            self.assertIn("943", measurements)
+            self.assertFalse((root / "measurements.csv").exists())
 
     def test_visible_interval_summary_preserves_maximum_stall(self) -> None:
         emitted = [
