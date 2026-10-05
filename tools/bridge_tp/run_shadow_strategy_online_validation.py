@@ -335,6 +335,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--delivery-port", type=int, default=30000)
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--max-model-len", type=int, default=8192)
+    parser.add_argument("--tp4-max-model-len", type=int)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.88)
     parser.add_argument("--server-start-timeout-s", type=float, default=900)
     parser.add_argument("--run-timeout-s", type=float, default=2400)
@@ -346,6 +347,11 @@ def parse_args() -> argparse.Namespace:
 def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]:
     if os.name == "nt":
         raise RuntimeError("online Shadow validation requires Linux and five GPUs")
+    if not 128 < args.max_model_len <= 32768:
+        raise ValueError("TP1 max model length must be in (128, 32768]")
+    if (args.tp4_max_model_len is not None
+            and not args.max_model_len <= args.tp4_max_model_len <= 32768):
+        raise ValueError("TP4 max model length must cover TP1 and be <= 32768")
     if (
         args.phase == "formal"
         and args.repetitions < 3
@@ -845,7 +851,9 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         prompt = job["request"].get("prompt")
         if not isinstance(prompt, list) or not all(isinstance(x, int) for x in prompt):
             raise ValueError("online target jobs require exact prompt token IDs")
-        if len(prompt) + int(job["request"]["max_tokens"]) > args.max_model_len:
+        if len(prompt) + int(job["request"]["max_tokens"]) > (
+            args.tp4_max_model_len or args.max_model_len
+        ):
             raise ValueError(f"target job {job['job_id']} exceeds max model length")
     for job in source_jobs:
         prompt = job["request"].get("prompt")

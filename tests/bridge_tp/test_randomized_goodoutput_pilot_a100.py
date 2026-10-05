@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from tools.bridge_tp.run_phase9_cap0_calibration import server_command
 from tools.bridge_tp.run_randomized_goodoutput_pilot_a100 import (
     ACTIONS,
     TIMING_ACTIONS,
@@ -237,6 +238,11 @@ class TestRandomizedPilot(unittest.TestCase):
                 setup["cases"][0]]["path"]).read_text())
             self.assertEqual(manifest["jobs"][0]["request"]["max_tokens"],
                              8064)
+            args.max_model_len = 16384
+            with mock.patch.dict(sys.modules, {"transformers": fake}):
+                extended = build_setup(args, root / "extended")
+            extended_anchor = extended["anchors"][extended["cases"][0]]
+            self.assertEqual(extended_anchor["max_tokens"], 16256)
         error = ["source did not naturally finish before its cap"]
         self.assertTrue(is_context_censored(
             runner_rc=1, audit_rc=0,
@@ -270,6 +276,13 @@ class TestRandomizedPilot(unittest.TestCase):
         arm["background_finish_reasons"] = {"stop": 1, "length": 1}
         fixed_horizon_result(arm, 180.0)
         self.assertFalse(arm["fixed_horizon_eligible"])
+        arm["background_finish_reasons"] = {"stop": 2}
+        arm["slo_reference_applicability"] = (
+            "EXPLORATORY_FP16_UNCALIBRATED"
+        )
+        fixed_horizon_result(arm, 180.0)
+        self.assertFalse(arm["fixed_horizon_eligible"])
+        arm.pop("slo_reference_applicability")
         summary = {"seed": 1, "evaluation_horizon_s": 180.0,
                    "cases": {"case": {"stay": arm}}}
         self.assertIsNone(pair_results(summary)["pairs"]["case"][
@@ -281,6 +294,20 @@ class TestRandomizedPilot(unittest.TestCase):
         self.assertTrue(pair["paired_arms_natural_eos"])
         self.assertFalse(pair["eligible"])
         self.assertIsNone(pair["descriptive_delta_tokens_s"])
+
+    def test_target_context_override_keeps_source_context(self) -> None:
+        args = SimpleNamespace(
+            python_bin=Path("python"), model_path=Path("model"),
+            dtype="float16", max_model_len=16384,
+            tp4_max_model_len=32768, gpu_memory_utilization=0.88,
+        )
+        source = server_command(args, 1, 8001)
+        target = server_command(args, 4, 8200)
+        self.assertEqual(source[source.index("--max-model-len") + 1],
+                         "16384")
+        self.assertEqual(target[target.index("--max-model-len") + 1],
+                         "32768")
+        self.assertEqual(target[target.index("--dtype") + 1], "float16")
 
 
 if __name__ == "__main__":
