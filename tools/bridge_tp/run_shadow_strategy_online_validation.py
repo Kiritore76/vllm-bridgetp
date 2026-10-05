@@ -297,6 +297,11 @@ def parse_args() -> argparse.Namespace:
         help="the specific M1 refusal that the STAY smoke must observe",
     )
     parser.add_argument("--anchor-max-tokens", type=int, default=1024)
+    parser.add_argument(
+        "--anchor-total-max-tokens", type=int,
+        help="client-visible output budget across TP1 and TP4; TP1 keeps "
+             "--anchor-max-tokens as its physical subrequest cap",
+    )
     parser.add_argument("--anchor-prompt-tokens", type=int, default=None)
     parser.add_argument("--anchor-request-file", type=Path)
     parser.add_argument("--expected-anchor-request-sha256")
@@ -582,6 +587,15 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         and args.anchor_prompt_tokens + args.anchor_max_tokens > args.max_model_len
     ):
         raise ValueError("anchor prompt plus output exceeds max model length")
+    if args.anchor_total_max_tokens is not None:
+        if not args.natural_eos_anchor:
+            raise ValueError("separate output budgets require natural EOS mode")
+        if args.anchor_total_max_tokens < args.anchor_max_tokens:
+            raise ValueError("total output budget is below TP1 subrequest cap")
+        if (args.anchor_prompt_tokens is None
+                or args.anchor_prompt_tokens + args.anchor_total_max_tokens
+                > (args.tp4_max_model_len or args.max_model_len)):
+            raise ValueError("total output budget exceeds TP4 context")
     if args.natural_eos_anchor and (
         args.anchor_request_file is None
         or not args.expected_anchor_request_sha256
@@ -2123,6 +2137,7 @@ def accept_online(
     expected_anchor_tokens: int,
     *,
     natural_eos_anchor: bool = False,
+    requested_max_output_tokens: int | None = None,
     strategy: str,
     minimum_window_samples: int,
     fixed_rate_gib_s: float | None = None,
@@ -2398,6 +2413,20 @@ def accept_online(
     )
 
     errors: list[str] = []
+    if requested_max_output_tokens is not None:
+        source_request = common.read_json(controller_dir / "source_request.json")
+        target_request = common.read_json(controller_dir / "target_request.json")
+        budgets = common.read_json(controller_dir / "request_budgets.json")
+        source_cap = int(source_request["max_tokens"])
+        target_prefix = len(target_request["prompt"]) - len(
+            source_request["prompt"]
+        )
+        if (budgets.get("source_subrequest_max_tokens") != source_cap
+                or budgets.get("requested_max_output_tokens")
+                != requested_max_output_tokens
+                or target_request.get("max_tokens")
+                != requested_max_output_tokens - target_prefix):
+            errors.append("TP4 did not receive the remaining total output budget")
     if len(urgent_prearmed) > 1:
         errors.append("urgent source cutover was prearmed more than once")
     if require_remote_attention:
@@ -3728,6 +3757,9 @@ def main() -> None:
         "manager_m1_expect_stay": args.manager_m1_expect_stay,
         "manager_m1_stay_reason": args.manager_m1_stay_reason,
         "anchor_max_tokens": args.anchor_max_tokens,
+        "anchor_total_max_tokens": (
+            args.anchor_total_max_tokens or args.anchor_max_tokens
+        ),
         "anchor_prompt_tokens": args.anchor_prompt_tokens,
         "natural_eos_anchor": args.natural_eos_anchor,
         "anchor_request_sha256": args.expected_anchor_request_sha256,
@@ -3946,8 +3978,12 @@ def main() -> None:
                             controller_dir,
                             background_dir,
                             expected_jobs,
-                            expected_anchor_tokens,
+                            args.anchor_total_max_tokens
+                            or expected_anchor_tokens,
                             natural_eos_anchor=args.natural_eos_anchor,
+                            requested_max_output_tokens=(
+                                args.anchor_total_max_tokens
+                            ),
                             strategy=selected,
                             minimum_window_samples=args.minimum_window_samples,
                             fixed_rate_gib_s=args.fixed_rate_gib_s,
@@ -4117,6 +4153,11 @@ def main() -> None:
                     ])
                 if args.paired_stay:
                     controller_extra_args.append("--paired-stay")
+                if args.anchor_total_max_tokens is not None:
+                    controller_extra_args.extend([
+                        "--requested-max-output-tokens",
+                        str(args.anchor_total_max_tokens),
+                    ])
                 if args.experiment_m1_action:
                     controller_extra_args.extend([
                         "--experiment-m1-action", args.experiment_m1_action,

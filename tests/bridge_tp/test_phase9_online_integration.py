@@ -139,6 +139,25 @@ class TestOnlineArtifacts(unittest.TestCase):
         )
         self.assertFalse(strict_greedy_sampling_errors(request))
 
+    def test_target_receives_remaining_client_budget_after_cutover(self) -> None:
+        source = freeze_strict_greedy_sampling(
+            {"model": "m", "max_tokens": 100}
+        )
+        staging = {
+            "snapshot_num_output_tokens": 40,
+            "all_known_token_ids": [1, 2, 3],
+            "migration_id": "migration",
+        }
+        request, cutover = build_target_request(
+            source, staging, "run", requested_max_output_tokens=200
+        )
+        self.assertEqual(cutover, 40)
+        self.assertEqual(request["max_tokens"], 160)
+        with self.assertRaisesRegex(ValueError, "below TP1"):
+            build_target_request(
+                source, staging, "run", requested_max_output_tokens=99
+            )
+
     def test_gpu_resident_target_reserves_future_token_positions(self) -> None:
         source = freeze_strict_greedy_sampling(
             {"model": "m", "max_tokens": 100, "logprobs": 20}
@@ -157,6 +176,21 @@ class TestOnlineArtifacts(unittest.TestCase):
         self.assertEqual(request["prompt"][:5], [1, 2, 3, 4, 5])
         self.assertEqual(request["max_tokens"], 90)
         self.assertFalse(strict_greedy_sampling_errors(request))
+
+    def test_gpu_resident_target_uses_client_budget(self) -> None:
+        source = freeze_strict_greedy_sampling(
+            {"model": "m", "max_tokens": 100}
+        )
+        session = {
+            "num_prompt_tokens": 3,
+            "all_known_token_ids": [1, 2, 3, 4, 5],
+            "migration_id": "migration",
+        }
+        request, cutover = build_gpu_resident_shadow_target_request(
+            source, session, "run", 10, requested_max_output_tokens=200
+        )
+        self.assertEqual(cutover, 10)
+        self.assertEqual(request["max_tokens"], 190)
 
     def test_stop_copy_target_accepts_complete_frozen_prefix(self) -> None:
         source = freeze_strict_greedy_sampling(

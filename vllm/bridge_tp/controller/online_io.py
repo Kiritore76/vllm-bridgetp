@@ -194,6 +194,8 @@ def build_target_request(
     source_request: dict[str, Any],
     staging: dict[str, Any],
     run_name: str,
+    *,
+    requested_max_output_tokens: int | None = None,
 ) -> tuple[dict[str, Any], int]:
     source_errors = strict_greedy_sampling_errors(source_request)
     if source_errors:
@@ -202,7 +204,14 @@ def build_target_request(
             + "; ".join(source_errors)
         )
     cutover = int(staging["snapshot_num_output_tokens"])
-    remaining = int(source_request["max_tokens"]) - cutover
+    total_budget = (
+        int(source_request["max_tokens"])
+        if requested_max_output_tokens is None
+        else requested_max_output_tokens
+    )
+    if total_budget < int(source_request["max_tokens"]):
+        raise ValueError("requested output budget is below TP1 subrequest cap")
+    remaining = total_budget - cutover
     if remaining <= 0:
         raise ValueError("source max_tokens leaves no post-cutover target tokens")
     target = freeze_strict_greedy_sampling(
@@ -231,6 +240,7 @@ def build_gpu_resident_shadow_target_request(
     cutover_output_tokens: int,
     *,
     allow_complete_prefix: bool = False,
+    requested_max_output_tokens: int | None = None,
 ) -> tuple[dict[str, Any], int]:
     """Build a dormant target request with space for future Shadow tokens.
 
@@ -252,7 +262,14 @@ def build_gpu_resident_shadow_target_request(
         raise ValueError("Shadow target must reserve at least one future token")
     placeholder = int(known[-1]) if known else 0
     prompt = known + [placeholder] * (planned_known - len(known))
-    remaining = int(source_request["max_tokens"]) - cutover_output_tokens
+    total_budget = (
+        int(source_request["max_tokens"])
+        if requested_max_output_tokens is None
+        else requested_max_output_tokens
+    )
+    if total_budget < int(source_request["max_tokens"]):
+        raise ValueError("requested output budget is below TP1 subrequest cap")
+    remaining = total_budget - cutover_output_tokens
     if remaining <= 0:
         raise ValueError("source max_tokens leaves no post-cutover target tokens")
     target = freeze_strict_greedy_sampling(

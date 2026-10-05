@@ -110,6 +110,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--source-request", type=Path, required=True)
     parser.add_argument(
+        "--requested-max-output-tokens", type=int,
+        help="client-visible total output budget across TP1 and TP4; "
+             "defaults to the TP1 subrequest max_tokens",
+    )
+    parser.add_argument(
         "--migration-id",
         default=os.getenv("BRIDGETP_STREAM_MIGRATION_ID", "").strip(),
         help="must match BRIDGETP_STREAM_MIGRATION_ID on source and stager",
@@ -445,6 +450,7 @@ def _start_target_if_ready(
     *,
     run_dir: Path,
     source_request: dict[str, Any],
+    requested_max_output_tokens: int,
     adapter: ActionAdapter,
     recorder: ProxyRecorder,
     executor: ThreadPoolExecutor,
@@ -477,12 +483,14 @@ def _start_target_if_ready(
             target_request_name or run_dir.name,
             cutover_output_tokens,
             allow_complete_prefix=stop_and_copy,
+            requested_max_output_tokens=requested_max_output_tokens,
         )
     else:
         target_request, cutover = build_target_request(
             source_request,
             staging,
             target_request_name or run_dir.name,
+            requested_max_output_tokens=requested_max_output_tokens,
         )
     if recorder.proxy.cutover_index != cutover:
         raise RuntimeError(
@@ -1386,7 +1394,24 @@ def main() -> None:
         run_dir,
         args.source_request_id,
     )
+    requested_max_output_tokens = (
+        args.requested_max_output_tokens
+        if args.requested_max_output_tokens is not None
+        else int(source_request["max_tokens"])
+    )
+    if requested_max_output_tokens < int(source_request["max_tokens"]):
+        raise ValueError(
+            "requested output budget must cover the TP1 subrequest cap"
+        )
     atomic_json_dump(source_request, run_dir / "source_request.json")
+    atomic_json_dump(
+        {
+            "format_version": 1,
+            "source_subrequest_max_tokens": int(source_request["max_tokens"]),
+            "requested_max_output_tokens": requested_max_output_tokens,
+        },
+        run_dir / "request_budgets.json",
+    )
 
     unified_response_path = run_dir / "unified_response.jsonl"
 
@@ -1966,6 +1991,7 @@ def main() -> None:
                     target_future = _start_target_if_ready(
                         run_dir=run_dir,
                         source_request=source_request,
+                        requested_max_output_tokens=requested_max_output_tokens,
                         adapter=adapter,
                         recorder=recorder,
                         executor=executor,
@@ -2102,6 +2128,9 @@ def main() -> None:
                             target_future = _start_target_if_ready(
                                 run_dir=run_dir,
                                 source_request=source_request,
+                                requested_max_output_tokens=(
+                                    requested_max_output_tokens
+                                ),
                                 adapter=adapter,
                                 recorder=recorder,
                                 executor=executor,
