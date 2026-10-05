@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from tools.bridge_tp.run_goodoutput_matrix_a100 import (
+    expected_gpu_uuids,
     observed_pressure,
     online_command,
     prepare,
@@ -42,6 +43,14 @@ class TestObservedPressure(unittest.TestCase):
 
 
 class TestCommands(unittest.TestCase):
+    def test_gpu_inventory_override_is_explicit_and_unique(self) -> None:
+        value = ",".join(f"GPU-{index}" for index in range(5))
+        self.assertEqual(expected_gpu_uuids(SimpleNamespace(
+            expected_gpu_uuids=value)), value.split(","))
+        with self.assertRaisesRegex(ValueError, "five distinct"):
+            expected_gpu_uuids(SimpleNamespace(
+                expected_gpu_uuids="GPU-a,GPU-a,GPU-b,GPU-c,GPU-d"))
+
     def test_prepare_builds_all_four_isolated_cells(self) -> None:
         class Tokenizer:
             @staticmethod

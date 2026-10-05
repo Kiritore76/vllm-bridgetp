@@ -48,6 +48,7 @@ def parse_args() -> argparse.Namespace:
         parser.add_argument(f"--{name}", type=Path, required=True)
     parser.add_argument("--expected-revision", required=True)
     parser.add_argument("--expected-host", required=True)
+    parser.add_argument("--expected-gpu-uuids")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--paired-only", action="store_true",
