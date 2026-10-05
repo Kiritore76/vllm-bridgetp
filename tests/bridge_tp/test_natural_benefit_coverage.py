@@ -8,6 +8,7 @@ from pathlib import Path
 from tools.bridge_tp.audit_natural_benefit_coverage import (
     bin_name,
     extract_run,
+    pilot_metadata,
     summarize,
     validate_cuts,
 )
@@ -82,8 +83,9 @@ class TestNaturalBenefitCoverage(unittest.TestCase):
             "target_busy_count": [2.0, 5.0],
         })
         self.assertEqual(summary["local_decision_ticks"], 2)
-        self.assertEqual(summary["runs_with_candidate"], 1)
-        self.assertEqual(summary["cells"], {"MEDIUM/MEDIUM": 1})
+        self.assertEqual(summary["arms_reaching_eligibility"], 1)
+        self.assertEqual(summary["arm_cells"], {"MEDIUM/MEDIUM": 1})
+        self.assertEqual(summary["scenario_cells"], {"MEDIUM/MEDIUM": 1})
         self.assertFalse(summary["benefit_is_estimated"])
 
     def test_missing_metrics_remain_unknown(self) -> None:
@@ -99,7 +101,7 @@ class TestNaturalBenefitCoverage(unittest.TestCase):
             "source_arrival_rate_rps": [0.1, 0.3],
             "target_busy_count": [2.0, 5.0],
         })
-        self.assertEqual(summary["cells"], {"UNKNOWN/UNKNOWN": 1})
+        self.assertEqual(summary["arm_cells"], {"UNKNOWN/UNKNOWN": 1})
         self.assertEqual(summary["unknown_source_metric"], 1)
         self.assertEqual(summary["unknown_target_metric"], 1)
 
@@ -139,6 +141,55 @@ class TestNaturalBenefitCoverage(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "output mismatch"):
                 extract_run(root)
+
+    def test_pilot_excludes_failed_arm_and_uses_actual_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runs = [root / "case1" / arm / "r01" for arm in ("stay", "late")]
+            for run in runs:
+                run.mkdir(parents=True)
+            summary_path = root / "pilot_summary.json"
+            summary_path.write_text(json.dumps({"cases": {"case1": {
+                "stay": {
+                    "configured_eligibility_tokens": 128,
+                    "runner_rc": 0, "audit_rc": 0,
+                    "observed_action": {
+                        "acceptance_status": "PASS", "acceptance_errors": [],
+                    },
+                },
+                "late": {
+                    "configured_eligibility_tokens": 1024,
+                    "runner_rc": 1, "audit_rc": 0,
+                    "observed_action": {
+                        "acceptance_status": "PASS", "acceptance_errors": [],
+                    },
+                },
+            }}}), encoding="utf-8")
+            metadata = pilot_metadata(summary_path, runs)
+            observations = []
+            for run in runs:
+                rows = []
+                for output_tokens in (40, 128, 200):
+                    rows.append({
+                        "run_root": str(run),
+                        "output_tokens": output_tokens,
+                        "source_arrival_rate_rps": 0.2,
+                        "target_busy_count": 2,
+                        "m1_action": "START_SHADOW" if output_tokens >= 128
+                        else "STAY",
+                        "m5_status": "AVAILABLE",
+                        "paired_stay_intervention": run.parent.name == "stay",
+                    })
+                observations.append(rows)
+            audited = summarize(observations, 32, {
+                "source_arrival_rate_rps": [0.1, 0.3],
+                "target_busy_count": [1, 3],
+            }, metadata)
+        self.assertEqual(audited["run_arms"], 2)
+        self.assertEqual(audited["valid_run_arms"], 1)
+        self.assertEqual(audited["scenario_blocks"], 1)
+        self.assertEqual(audited["arms_reaching_eligibility"], 1)
+        self.assertEqual(audited["representatives"][0]["output_tokens"], 128)
 
 
 if __name__ == "__main__":

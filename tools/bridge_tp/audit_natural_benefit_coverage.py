@@ -4,8 +4,8 @@
 
 The input is existing Phase 9 controller audit logs. This script never infers
 counterfactual benefit, modifies decisions, or labels guard contact as OOM.
-One representative decision per run is used for the 3x3 coverage matrix;
-all LOCAL decisions are retained in observations.jsonl for later analysis.
+One representative decision per valid run is used for arm coverage. Paired
+arms are also grouped into scenario blocks; all LOCAL decisions are retained.
 """
 
 from __future__ import annotations
@@ -284,28 +284,91 @@ def bin_name(value: float | None, cuts: list[float] | None) -> str:
     return "HIGH"
 
 
+def pilot_metadata(
+    summary_path: Path, roots: list[Path]
+) -> list[dict[str, Any]]:
+    """Read validity and configured eligibility from a paired pilot manifest."""
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    cases = summary.get("cases")
+    if not isinstance(cases, dict):
+        raise ValueError("pilot summary has no cases")
+    result = []
+    for root in roots:
+        try:
+            relative = root.relative_to(summary_path.parent.resolve())
+        except ValueError as exc:
+            raise ValueError(f"run is outside pilot root: {root}") from exc
+        if len(relative.parts) != 3:
+            raise ValueError(f"unexpected pilot run path: {root}")
+        scenario, arm, _ = relative.parts
+        info = cases.get(scenario, {}).get(arm)
+        if not isinstance(info, dict):
+            raise ValueError(f"pilot summary lacks {scenario}/{arm}")
+        threshold = _int(info.get("configured_eligibility_tokens"))
+        if threshold is None or threshold < 0:
+            raise ValueError(f"invalid eligibility for {scenario}/{arm}")
+        observed = info.get("observed_action") or {}
+        valid = (
+            info.get("runner_rc") == 0
+            and info.get("audit_rc") == 0
+            and observed.get("acceptance_status") == "PASS"
+            and not observed.get("acceptance_errors")
+            and not info.get("fatal_error")
+        )
+        result.append({
+            "scenario_id": scenario,
+            "arm": arm,
+            "configured_eligibility_tokens": threshold,
+            "valid_run": valid,
+            "runner_rc": info.get("runner_rc"),
+            "audit_rc": info.get("audit_rc"),
+            "observed_start_count": observed.get("start_count"),
+            "actual_cutover_output_tokens": observed.get(
+                "actual_cutover_output_tokens"
+            ),
+        })
+    return result
+
+
 def summarize(
     observations_by_run: list[list[dict[str, Any]]],
     min_output_tokens: int,
     cuts: dict[str, list[float]] | None = None,
+    metadata: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Count independent episodes, never treating controller ticks as trials."""
+    """Count valid arms and scenario blocks, never treating ticks as trials."""
+    if metadata is None:
+        metadata = [{
+            "scenario_id": str(index), "arm": "UNSPECIFIED",
+            "configured_eligibility_tokens": min_output_tokens,
+            "valid_run": True,
+        } for index in range(len(observations_by_run))]
+    if len(metadata) != len(observations_by_run):
+        raise ValueError("run metadata count differs from observations")
     representatives = []
-    for rows in observations_by_run:
+    for rows, run_meta in zip(observations_by_run, metadata):
+        if not run_meta["valid_run"]:
+            continue
         eligible = [
             row for row in rows
             if row["output_tokens"] is not None
-            and row["output_tokens"] >= min_output_tokens
+            and row["output_tokens"] >= run_meta["configured_eligibility_tokens"]
         ]
         if eligible:
-            representatives.append(eligible[0])
+            representatives.append({**eligible[0], **run_meta})
+    scenario_rows: dict[str, dict[str, Any]] = {}
+    for row in representatives:
+        scenario = row["scenario_id"]
+        if scenario not in scenario_rows or row["arm"] == "stay":
+            scenario_rows[scenario] = row
+    baselines = list(scenario_rows.values())
     chosen = cuts or {
         "source_arrival_rate_rps": tertile_cuts([
-            row["source_arrival_rate_rps"] for row in representatives
+            row["source_arrival_rate_rps"] for row in baselines
             if row["source_arrival_rate_rps"] is not None
         ]),
         "target_busy_count": tertile_cuts([
-            float(row["target_busy_count"]) for row in representatives
+            float(row["target_busy_count"]) for row in baselines
             if row["target_busy_count"] is not None
         ]),
     }
@@ -319,21 +382,51 @@ def summarize(
             row["target_busy_count"], chosen["target_busy_count"]
         )
         cells[f"{source}/{target}"] += 1
+    scenario_cells: Counter[str] = Counter()
+    for row in scenario_rows.values():
+        source = bin_name(
+            row["source_arrival_rate_rps"], chosen["source_arrival_rate_rps"]
+        )
+        target = bin_name(row["target_busy_count"], chosen["target_busy_count"])
+        scenario_cells[f"{source}/{target}"] += 1
     return {
         "format_version": 1,
         "status": "OBSERVATIONAL_COVERAGE_ONLY",
-        "independent_runs": len(observations_by_run),
-        "runs_with_candidate": len(representatives),
+        "run_arms": len(observations_by_run),
+        "valid_run_arms": sum(item["valid_run"] for item in metadata),
+        "excluded_run_arms": sum(not item["valid_run"] for item in metadata),
+        "scenario_blocks": len({item["scenario_id"] for item in metadata}),
+        "arms_reaching_eligibility": len(representatives),
+        "scenario_blocks_reaching_eligibility": len(scenario_rows),
         "local_decision_ticks": sum(map(len, observations_by_run)),
-        "representative_rule": f"first LOCAL decision at output >= {min_output_tokens}",
+        "representative_rule": (
+            "first LOCAL decision at each valid arm's configured eligibility"
+        ),
         "cuts": chosen,
         "cuts_source": (
-            "provided_input" if cuts is not None else "exploratory_same_data"
+            "provided_input" if cuts is not None
+            else "exploratory_scenario_baselines"
         ),
         "unresolved_cut_axes": [
             key for key, limits in chosen.items() if limits is None
         ],
-        "cells": dict(sorted(cells.items())),
+        "arm_cells": dict(sorted(cells.items())),
+        "scenario_cells": dict(sorted(scenario_cells.items())),
+        "scenario_representative_rule": "prefer valid stay arm",
+        "representatives": [{
+            "run_root": row["run_root"],
+            "scenario_id": row["scenario_id"],
+            "arm": row["arm"],
+            "output_tokens": row["output_tokens"],
+            "m1_action": row["m1_action"],
+            "paired_stay_intervention": row["paired_stay_intervention"],
+            "observed_start_count": row.get("observed_start_count"),
+            "actual_cutover_output_tokens": row.get(
+                "actual_cutover_output_tokens"
+            ),
+            "source_arrival_rate_rps": row["source_arrival_rate_rps"],
+            "target_busy_count": row["target_busy_count"],
+        } for row in representatives],
         "unknown_source_metric": sum(
             row["source_arrival_rate_rps"] is None
             for row in representatives
@@ -359,6 +452,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-output-tokens", type=int, default=32)
     parser.add_argument("--arrival-window-s", type=float, default=10.0)
     parser.add_argument("--cuts-json", type=Path)
+    parser.add_argument("--pilot-summary", type=Path)
     return parser.parse_args()
 
 
@@ -379,13 +473,25 @@ def main() -> None:
         validate_cuts(json.loads(args.cuts_json.read_text(encoding="utf-8")))
         if args.cuts_json else None
     )
-    summary = summarize([item[0] for item in rows], args.min_output_tokens, cuts)
-    summary["run_audits"] = [item[1] for item in rows]
+    metadata = (
+        pilot_metadata(args.pilot_summary.resolve(), roots)
+        if args.pilot_summary else None
+    )
+    summary = summarize(
+        [item[0] for item in rows], args.min_output_tokens, cuts, metadata
+    )
+    summary["run_audits"] = [
+        {**item[1], **(metadata[index] if metadata else {})}
+        for index, item in enumerate(rows)
+    ]
     summary["arrival_window_s"] = args.arrival_window_s
     summary["cuts_json_path"] = (
         str(args.cuts_json.resolve()) if args.cuts_json else None
     )
     summary["cuts_json_sha256"] = sha256(args.cuts_json) if args.cuts_json else None
+    summary["pilot_summary_sha256"] = (
+        sha256(args.pilot_summary) if args.pilot_summary else None
+    )
     args.out_dir.mkdir(parents=True)
     with (args.out_dir / "observations.jsonl").open("w", encoding="utf-8") as out:
         for observations, _ in rows:
