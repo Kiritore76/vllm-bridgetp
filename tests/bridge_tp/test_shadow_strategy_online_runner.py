@@ -65,8 +65,25 @@ class TestOnlineStrategyTiming(unittest.TestCase):
             self.assertEqual(saved["prompt"], [11, 12, 13])
             self.assertIs(saved["ignore_eos"], False)
             args.anchor_prompt_tokens = 4
-            with self.assertRaisesRegex(ValueError, "natural anchor"):
+            with self.assertRaisesRegex(ValueError, "pinned anchor"):
                 make_source_request(args, root)
+
+    def test_cross_context_smoke_allows_forced_length_only_when_explicit(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            pinned = root / "pinned.json"
+            pinned.write_text(json.dumps({
+                "model": "bridgetp-model", "prompt": [11, 12, 13],
+                "max_tokens": 4, "ignore_eos": True,
+            }), encoding="utf-8")
+            args = Namespace(anchor_request_file=pinned,
+                             anchor_prompt_tokens=3, anchor_max_tokens=4)
+            with self.assertRaisesRegex(ValueError, "EOS rule"):
+                make_source_request(args, root)
+            args.cross_context_smoke = True
+            saved = json.loads(make_source_request(args, root).read_text())
+            self.assertIs(saved["ignore_eos"], True)
+            self.assertEqual(saved["prompt"], [11, 12, 13])
 
     def test_paired_stay_requires_full_tp1_output_and_suppressed_start(self) -> None:
         with TemporaryDirectory() as temp:

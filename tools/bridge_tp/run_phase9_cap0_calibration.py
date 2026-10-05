@@ -360,9 +360,10 @@ def make_source_request(
             or any(not isinstance(token, int) or isinstance(token, bool)
                    for token in prompt)
             or anchor_prompt_tokens != len(prompt)
-            or request.get("ignore_eos") is not False
+            or request.get("ignore_eos") is not bool(
+                getattr(args, "cross_context_smoke", False))
         ):
-            raise ValueError("natural anchor request has invalid prompt or EOS rule")
+            raise ValueError("pinned anchor request has invalid prompt or EOS rule")
     elif anchor_prompt_tokens is not None:
         if int(anchor_prompt_tokens) <= 0:
             raise ValueError("anchor_prompt_tokens must be positive")
