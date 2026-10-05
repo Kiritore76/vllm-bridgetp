@@ -44,6 +44,21 @@ class TestNaturalBenefitWindows(unittest.TestCase):
             freeze_windows(requests, [{**event, "ignore_eos": True}],
                            window_s=5.0)
 
+    def test_simultaneous_arrivals_keep_trace_line_order(self) -> None:
+        requests = [
+            {"id": "z", "prompt": "first", "max_tokens": 20},
+            {"id": "a", "prompt": "second", "max_tokens": 20},
+        ]
+        arrivals = [
+            {"request_id": "z", "arrival_unix_s": 10.0, "pool": "source"},
+            {"request_id": "a", "arrival_unix_s": 10.0, "pool": "target"},
+        ]
+        windows = freeze_windows(requests, arrivals, window_s=5.0)
+        self.assertEqual(
+            [row["request_id"] for row in windows[0]["arrivals"]],
+            ["z", "a"],
+        )
+
     def test_default_output_cap_is_explicit(self) -> None:
         requests = [{"id": "a", "prompt": "x"}]
         arrivals = [{"request_id": "a", "arrival_unix_s": 10.0,
