@@ -93,22 +93,35 @@ def ttft_limit_ms(length: int, config: dict[str, Any]) -> float:
 def audit_v6_payload(
     values: dict[str, Any], config: dict[str, Any],
     provenance: dict[str, Any] | None = None,
+    *, gpu_match_mode: str = "uuid",
 ) -> dict[str, Any]:
     """Audit complete client streams; missing lengths or times fail closed."""
     _reference(config)
-    expected_uuids = config.get("gpu_uuids")
+    if gpu_match_mode not in {"uuid", "model"}:
+        raise ValueError("GPU match mode must be uuid or model")
     if provenance is None:
         applicability = "UNVERIFIED_GPU_ROSTER"
-    elif not isinstance(provenance, dict) or not isinstance(
-        expected_uuids, list
-    ) or (
-        provenance.get("gpu_uuids") != expected_uuids
-        or provenance.get("model_config_sha256")
-        != config.get("model_config_sha256")
-    ):
-        applicability = "REFERENCE_INPUT_MISMATCH"
     else:
-        applicability = "VERIFIED_GPU_AND_MODEL_CONFIG"
+        model_matches = (
+            isinstance(provenance, dict)
+            and provenance.get("model_config_sha256")
+            == config.get("model_config_sha256")
+        )
+        if gpu_match_mode == "model":
+            gpu_matches = (
+                provenance.get("gpu_models")
+                == ["NVIDIA A100-PCIE-40GB"] * 5
+            ) if isinstance(provenance, dict) else False
+            verified = "VERIFIED_GPU_MODEL_AND_MODEL_CONFIG"
+        else:
+            gpu_matches = (
+                isinstance(provenance, dict)
+                and isinstance(config.get("gpu_uuids"), list)
+                and provenance.get("gpu_uuids") == config["gpu_uuids"]
+            )
+            verified = "VERIFIED_GPU_AND_MODEL_CONFIG"
+        applicability = (verified if model_matches and gpu_matches
+                         else "REFERENCE_INPUT_MISMATCH")
     legacy = audit_payload(values)
     errors = list(legacy["errors"])
     if not legacy["computable"]:
@@ -254,6 +267,8 @@ def main() -> None:
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--preflight-json", type=Path)
     parser.add_argument("--require-reference-match", action="store_true")
+    parser.add_argument("--gpu-match-mode", choices=("uuid", "model"),
+                        default="uuid")
     parser.add_argument("--out-json", type=Path, required=True)
     args = parser.parse_args()
     if args.out_json.exists():
@@ -286,7 +301,9 @@ def main() -> None:
         json.loads(args.preflight_json.read_text(encoding="utf-8"))
         if args.preflight_json else None
     )
-    report = audit_v6_payload(values, config, provenance)
+    report = audit_v6_payload(
+        values, config, provenance, gpu_match_mode=args.gpu_match_mode)
+    report["gpu_match_mode"] = args.gpu_match_mode
     report["reference_sha256"] = hashlib.sha256(reference_bytes).hexdigest()
     report["run_root"] = str(run.resolve())
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
@@ -299,9 +316,11 @@ def main() -> None:
                       "errors": report["errors"], "metrics": report["metrics"]}))
     if not report["computable"]:
         raise RuntimeError("v6 SLO audit is not computable; inspect out-json")
+    required = ("VERIFIED_GPU_MODEL_AND_MODEL_CONFIG"
+                if args.gpu_match_mode == "model"
+                else "VERIFIED_GPU_AND_MODEL_CONFIG")
     if (args.require_reference_match
-            and report["reference_applicability"]
-            != "VERIFIED_GPU_AND_MODEL_CONFIG"):
+            and report["reference_applicability"] != required):
         raise RuntimeError("v6 reference does not match this run; inspect out-json")
 
 

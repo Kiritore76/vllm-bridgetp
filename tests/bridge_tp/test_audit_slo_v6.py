@@ -122,6 +122,25 @@ class TestSloV6Audit(unittest.TestCase):
         self.assertEqual(mismatched["reference_applicability"],
                          "REFERENCE_INPUT_MISMATCH")
 
+    def test_autodl_model_mode_does_not_compare_gpu_uuids(self) -> None:
+        config = {**REFERENCE, "gpu_uuids": ["old-gpu"],
+                  "model_config_sha256": "model"}
+        provenance = {
+            "gpu_uuids": ["new-gpu"],
+            "gpu_models": ["NVIDIA A100-PCIE-40GB"] * 5,
+            "model_config_sha256": "model",
+        }
+        report = audit_v6_payload(
+            test_payload(), config, provenance, gpu_match_mode="model")
+        self.assertTrue(report["computable"])
+        self.assertEqual(report["reference_applicability"],
+                         "VERIFIED_GPU_MODEL_AND_MODEL_CONFIG")
+        provenance["gpu_models"][0] = "different GPU"
+        report = audit_v6_payload(
+            test_payload(), config, provenance, gpu_match_mode="model")
+        self.assertEqual(report["reference_applicability"],
+                         "REFERENCE_INPUT_MISMATCH")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -393,10 +393,10 @@ def collect_arm(args: argparse.Namespace, root: Path,
         sys.executable, "tools/bridge_tp/audit_slo_v6.py",
         "--run-root", str(run), "--reference", str(args.reference),
         "--preflight-json", str(root / "preflight.json"),
-        "--out-json", str(audit_path),
+        "--require-reference-match", "--out-json", str(audit_path),
     ]
-    if not args.portable_hardware:
-        audit_command.append("--require-reference-match")
+    if args.portable_hardware:
+        audit_command += ["--gpu-match-mode", "model"]
     audit_rc = execute(audit_command,
                        case_root / f"{action}.slo_v6.console.log")
     slo = (json.loads(audit_path.read_text(encoding="utf-8"))
