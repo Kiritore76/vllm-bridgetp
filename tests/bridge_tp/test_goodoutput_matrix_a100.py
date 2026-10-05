@@ -14,6 +14,7 @@ from tools.bridge_tp.run_goodoutput_matrix_a100 import (
     observed_pressure,
     online_command,
     prepare,
+    verify,
 )
 
 
@@ -43,6 +44,24 @@ class TestObservedPressure(unittest.TestCase):
 
 
 class TestCommands(unittest.TestCase):
+    def test_portable_hardware_keeps_model_and_idle_checks(self) -> None:
+        args = SimpleNamespace(expected_revision="rev", expected_host=None,
+                               portable_hardware=True,
+                               input=Path("input"), model=Path("model"),
+                               base=Path("base"), survival=Path("survival"),
+                               guard=Path("guard"),
+                               checkpoint=Path("checkpoint"),
+                               reference=Path("reference"))
+        values = iter(["rev", "", "GPU-a\nGPU-b\nGPU-c\nGPU-d\nGPU-e",
+                       "\n".join(["NVIDIA A100-PCIE-40GB"] * 5),
+                       "GPU-c, 123"])
+        with mock.patch(
+            "tools.bridge_tp.run_goodoutput_matrix_a100.subprocess.check_output",
+            side_effect=lambda *_a, **_k: next(values),
+        ):
+            with self.assertRaisesRegex(ValueError, "compute process"):
+                verify(args)
+
     def test_gpu_inventory_override_is_explicit_and_unique(self) -> None:
         value = ",".join(f"GPU-{index}" for index in range(5))
         self.assertEqual(expected_gpu_uuids(SimpleNamespace(

@@ -47,8 +47,10 @@ def parse_args() -> argparse.Namespace:
                  "checkpoint", "reference", "out-dir"):
         parser.add_argument(f"--{name}", type=Path, required=True)
     parser.add_argument("--expected-revision", required=True)
-    parser.add_argument("--expected-host", required=True)
+    parser.add_argument("--expected-host")
     parser.add_argument("--expected-gpu-uuids")
+    parser.add_argument("--portable-hardware", action="store_true",
+                        help="Record actual AutoDL host/UUIDs; require five idle A100s")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--paired-only", action="store_true",
