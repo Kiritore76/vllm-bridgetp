@@ -57,6 +57,8 @@ def parse_args() -> argparse.Namespace:
                         help="Collect STAY and early128 without the late EOS arm")
     parser.add_argument("--timing-pilot", action="store_true",
                         help="Compare STAY, NOW, and one M5-refresh WAIT")
+    parser.add_argument("--actions", nargs="+", choices=TIMING_ACTIONS,
+                        help="Collect only these timing actions")
     parser.add_argument("--cases", nargs="+", choices=[row[0] for row in CASES],
                         help="Run only these cases with the original seed")
     parser.add_argument("--anchor-context-limit", action="store_true",
@@ -391,8 +393,10 @@ def collect_arm(args: argparse.Namespace, root: Path,
         sys.executable, "tools/bridge_tp/audit_slo_v6.py",
         "--run-root", str(run), "--reference", str(args.reference),
         "--preflight-json", str(root / "preflight.json"),
-        "--require-reference-match", "--out-json", str(audit_path),
+        "--out-json", str(audit_path),
     ]
+    if not args.portable_hardware:
+        audit_command.append("--require-reference-match")
     audit_rc = execute(audit_command,
                        case_root / f"{action}.slo_v6.console.log")
     slo = (json.loads(audit_path.read_text(encoding="utf-8"))
@@ -443,6 +447,7 @@ def collect_arm(args: argparse.Namespace, root: Path,
         "fatal_error": bool(audit_rc or (runner_rc and not natural_noop
                                           and not context_censored)),
         "slo_computable": slo.get("computable"),
+        "slo_reference_applicability": slo.get("reference_applicability"),
         "slo_metrics": slo.get("metrics"),
         "slo_errors": slo.get("errors"),
         "background_jobs": background.get("jobs"),
@@ -546,6 +551,8 @@ def timing_results(summary: dict[str, Any]) -> dict[str, Any]:
             cases[name][action] = {
                 "eligible": arm.get("fixed_horizon_eligible", False),
                 "context_censored": arm.get("context_censored", False),
+                "slo_reference_applicability": arm.get(
+                    "slo_reference_applicability"),
                 "goodoutput_tokens_s": rate,
                 "descriptive_delta_vs_stay_tokens_s": (
                     rate - stay_rate if rate is not None
@@ -573,13 +580,18 @@ def execute_pilot(args: argparse.Namespace) -> None:
         raise ValueError("evaluation horizon must be positive and finite")
     if args.paired_only and args.timing_pilot:
         raise ValueError("choose paired-only or timing-pilot, not both")
+    if args.actions and not args.timing_pilot:
+        raise ValueError("--actions requires --timing-pilot")
+    if args.actions and len(args.actions) != len(set(args.actions)):
+        raise ValueError("timing actions must be unique")
     if (not args.background_context_limit
             and not 1 <= args.background_max_tokens <= 4096):
         raise ValueError("background max tokens must be in [1, 4096]")
     selected_cases = list(args.cases or (row[0] for row in CASES))
     if len(selected_cases) != len(set(selected_cases)):
         raise ValueError("case names must be unique")
-    actions = (TIMING_ACTIONS if args.timing_pilot else
+    actions = (tuple(args.actions) if args.actions else
+               TIMING_ACTIONS if args.timing_pilot else
                ("stay", "early128") if args.paired_only else ACTIONS)
     preflight = verify(args)
     root = args.out_dir.resolve()
