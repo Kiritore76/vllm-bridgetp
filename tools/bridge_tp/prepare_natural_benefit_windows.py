@@ -106,7 +106,8 @@ def freeze_windows(
                 if key in source
             },
         })
-    ordered.sort(key=lambda row: (row["arrival_unix_s"], row["request_id"]))
+    # Python's stable sort keeps trace line order for simultaneous arrivals.
+    ordered.sort(key=lambda row: row["arrival_unix_s"])
     zero = ordered[0]["arrival_unix_s"]
     windows: dict[int, list[dict[str, Any]]] = {}
     for row in ordered:
