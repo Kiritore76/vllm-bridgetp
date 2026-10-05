@@ -15,7 +15,9 @@ from tools.bridge_tp.run_randomized_goodoutput_pilot_a100 import (
     action_order,
     build_setup,
     configure_action,
+    fixed_horizon_result,
     observed_action,
+    pair_results,
     select_inputs,
 )
 
@@ -97,15 +99,31 @@ class TestRandomizedPilot(unittest.TestCase):
         self.assertEqual(set(action_order("p00_source1_target2")),
                          set(ACTIONS))
 
+    def test_rejects_predictor_train_tree_in_held_out_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "requests.jsonl"
+            path.write_text("\n".join(json.dumps(row) for row in (
+                {"id": "r-train", "split": "train", "source_tree_id": "tree"},
+                {"id": "r-test", "split": "test", "source_tree_id": "tree"},
+            )))
+            with self.assertRaisesRegex(ValueError, "crosses dataset splits"):
+                select_inputs(path)
+
     def test_reports_actual_start_separately_from_configured_gate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             audit = root / "controller" / "phase9_audit.jsonl"
             audit.parent.mkdir()
             audit.write_text(json.dumps({
+                "kind": "manager_m5_predictor_shadow",
+                "status": "AVAILABLE", "output_tokens": 207,
+                "p_remaining_gt_long_window_runtime_bounds": [0.81, 0.88],
+            }) + "\n" + json.dumps({
                 "kind": "manager_m1_start_decision",
-                "decision": {"action": "START_SHADOW"},
-                "snapshot": {"generated_tokens": 207},
+                "decision": {"action": "START_SHADOW",
+                             "source_time_to_guard_s": 90.0,
+                             "estimated_preparation_s": 10.0},
+                "snapshot": {"generated_tokens": 207, "target_running": 8},
             }) + "\n")
             acceptance = (root / "provenance" /
                           "shadow_online_acceptance.json")
@@ -119,6 +137,66 @@ class TestRandomizedPilot(unittest.TestCase):
             self.assertEqual(observed["actual_m1_start_output_tokens"],
                              [207])
             self.assertEqual(observed["actual_cutover_output_tokens"], 302)
+            candidate = observed["first_candidate_at_or_after_128"]
+            self.assertEqual(candidate["target_running"], 8)
+            self.assertEqual(candidate["p_remaining_gt_512_lower"], 0.81)
+
+    def test_random_arrivals_are_seeded_and_shared_by_arms(self) -> None:
+        class Tokenizer:
+            @staticmethod
+            def apply_chat_template(*_args: object, **_kwargs: object) -> str:
+                return "prompt"
+
+            @staticmethod
+            def encode(value: str) -> list[int]:
+                return list(range(len(value)))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_path = root / "requests.jsonl"
+            input_path.write_text("".join(json.dumps({
+                "id": f"r-{index}", "split": "test",
+                "workload_group": "long_form" if index % 4 == 0
+                else "natural", "prompt": "hello",
+            }) + "\n" for index in range(160)))
+            fake = types.SimpleNamespace(AutoTokenizer=types.SimpleNamespace(
+                from_pretrained=lambda *_a, **_k: Tokenizer()))
+            args = SimpleNamespace(input=input_path, model=root / "model",
+                                   seed=713, random_arrivals=True)
+            with mock.patch.dict(sys.modules, {"transformers": fake}):
+                first = build_setup(args, root / "first")
+                second = build_setup(args, root / "second")
+            name = first["cases"][3]
+            one = json.loads(Path(first["manifests"][name]["path"]).read_text())
+            two = json.loads(Path(second["manifests"][name]["path"]).read_text())
+            self.assertEqual(one["jobs"], two["jobs"])
+            self.assertEqual(one["arrival_process"], "seeded_exponential")
+            target = [job["start_after_s"] for job in one["jobs"]
+                      if job["pool"] == "target"]
+            self.assertEqual(target, sorted(target))
+            self.assertNotEqual(round(target[2] - target[1], 3), 0.2)
+
+    def test_fixed_horizon_excludes_censored_and_incomplete_arms(self) -> None:
+        arm = {
+            "fatal_error": False, "audit_rc": 0,
+            "anchor_source_finish_reason": "stop", "background_jobs": 2,
+            "background_completed": 2, "background_finish_reasons": {"stop": 2},
+            "slo_metrics": {"requests": 3, "completed_requests": 3,
+                            "good_output_tokens": 900, "wall_time_s": 75.0},
+        }
+        fixed_horizon_result(arm, 180.0)
+        self.assertEqual(arm["fixed_horizon_goodoutput_tokens_s"], 5.0)
+        arm["anchor_source_finish_reason"] = "abort"
+        arm["anchor_target_finish_reason"] = "stop"
+        fixed_horizon_result(arm, 180.0)
+        self.assertTrue(arm["fixed_horizon_eligible"])
+        arm["background_finish_reasons"] = {"stop": 1, "length": 1}
+        fixed_horizon_result(arm, 180.0)
+        self.assertFalse(arm["fixed_horizon_eligible"])
+        summary = {"seed": 1, "evaluation_horizon_s": 180.0,
+                   "cases": {"case": {"stay": arm}}}
+        self.assertIsNone(pair_results(summary)["pairs"]["case"][
+            "descriptive_delta_tokens_s"])
 
 
 if __name__ == "__main__":

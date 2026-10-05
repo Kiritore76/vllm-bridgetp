@@ -165,6 +165,10 @@ class PredictorEventReader:
         short_bounds = probability_gt_bounds(
             probabilities, edges, short_window_tokens
         )
+        long_window_tokens = 512
+        long_bounds = probability_gt_bounds(
+            probabilities, edges, long_window_tokens
+        )
 
         def cap_aware(bounds: tuple[float, float], horizon: int) -> tuple[float, float]:
             if remaining_cap is None:
@@ -188,4 +192,8 @@ class PredictorEventReader:
                 short_bounds, short_window_tokens
             ),
             "short_window_tokens": short_window_tokens,
+            "p_remaining_gt_long_window_runtime_bounds": cap_aware(
+                long_bounds, long_window_tokens
+            ),
+            "long_window_tokens": long_window_tokens,
         }
