@@ -54,6 +54,10 @@ def parse_args() -> argparse.Namespace:
                         help="Collect STAY and early128 without the late EOS arm")
     parser.add_argument("--timing-pilot", action="store_true",
                         help="Compare STAY, NOW, and one M5-refresh WAIT")
+    parser.add_argument("--cases", nargs="+", choices=[row[0] for row in CASES],
+                        help="Run only these cases with the original seed")
+    parser.add_argument("--anchor-context-limit", action="store_true",
+                        help="Use the largest anchor output allowed by context")
     parser.add_argument("--background-max-tokens", type=int, default=2048)
     parser.add_argument("--random-arrivals", action="store_true",
                         help="Use seeded exponential interarrival gaps")
@@ -141,11 +145,14 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
             offsets[pool] = values
         anchor = rows[index]
         anchor_tokens = tokens(anchor)
-        if len(anchor_tokens) + 4096 > 8192:
+        anchor_cap = (min(8192 - len(anchor_tokens), 8192 - 128)
+                      if getattr(args, "anchor_context_limit", False)
+                      else 4096)
+        if anchor_cap <= 128 or len(anchor_tokens) + anchor_cap > 8192:
             raise ValueError(f"anchor exceeds context limit: {anchor['id']}")
         anchor_request = {
             "model": "bridgetp-model", "prompt": anchor_tokens,
-            "max_tokens": 4096, "ignore_eos": False,
+            "max_tokens": anchor_cap, "ignore_eos": False,
             "temperature": 0.0, "top_p": 1.0, "top_k": 0,
             "min_p": 0.0, "presence_penalty": 0.0,
             "frequency_penalty": 0.0, "repetition_penalty": 1.0,
@@ -158,6 +165,7 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
         setup["anchors"][name] = {
             "path": str(anchor_path), "sha256": sha256(anchor_path),
             "prompt_tokens": len(anchor_tokens), "input_id": anchor["id"],
+            "max_tokens": anchor_cap,
             "workload_group": anchor["workload_group"],
         }
         jobs = []
@@ -328,6 +336,26 @@ def observed_action(run: Path, *, paired_stay: bool = False) -> dict[str, Any]:
     }
 
 
+def is_context_censored(*, runner_rc: int, audit_rc: int,
+                        source: dict[str, Any], anchor_cap: int,
+                        acceptance_errors: list[str],
+                        target: dict[str, Any] | None = None,
+                        proxy: dict[str, Any] | None = None) -> bool:
+    """Recognize a clean run stopped only by the model context boundary."""
+    source_capped = (
+        source.get("finish_reason") == "length"
+        and len(source.get("token_ids") or []) == anchor_cap
+        and acceptance_errors == ["source did not naturally finish before its cap"]
+    )
+    target_capped = (
+        (target or {}).get("finish_reason") == "length"
+        and (proxy or {}).get("emitted_tokens") == anchor_cap
+        and acceptance_errors == [
+            "unified response did not naturally finish before cap"]
+    )
+    return runner_rc != 0 and audit_rc == 0 and (source_capped or target_capped)
+
+
 def collect_arm(args: argparse.Namespace, root: Path,
                 setup: dict[str, Any], name: str,
                 action: str) -> dict[str, Any]:
@@ -342,6 +370,8 @@ def collect_arm(args: argparse.Namespace, root: Path,
     command = online_command(args, command_setup, name,
                              "stay" if action == "stay" else "migrate",
                              arm_root)
+    command[command.index("--anchor-max-tokens") + 1] = str(
+        setup["anchors"][name]["max_tokens"])
     configure_action(command, action)
     write_json(case_root / f"{action}.command.json", command)
     runner_rc = execute(command, case_root / f"{action}.console.log")
@@ -366,6 +396,9 @@ def collect_arm(args: argparse.Namespace, root: Path,
     target_path = run / "controller" / "target_response.json"
     target = (json.loads(target_path.read_text(encoding="utf-8"))
               if target_path.is_file() else {})
+    proxy_path = run / "controller" / "response_proxy_stats.json"
+    proxy = (json.loads(proxy_path.read_text(encoding="utf-8"))
+             if proxy_path.is_file() else {})
     finish_reasons = {
         reason: sum(row.get("finish_reason") == reason
                     for row in background.get("results", []))
@@ -373,6 +406,12 @@ def collect_arm(args: argparse.Namespace, root: Path,
                        for row in background.get("results", [])}
     }
     observed = observed_action(run, paired_stay=action == "stay")
+    acceptance_errors = observed.get("acceptance_errors") or []
+    context_censored = is_context_censored(
+        runner_rc=runner_rc, audit_rc=audit_rc, source=source,
+        anchor_cap=setup["anchors"][name]["max_tokens"],
+        acceptance_errors=acceptance_errors, target=target, proxy=proxy,
+    )
     natural_noop = (
         action != "stay" and audit_rc == 0
         and slo.get("computable") is True
@@ -390,7 +429,9 @@ def collect_arm(args: argparse.Namespace, root: Path,
         "anchor_target_finish_reason": target.get("finish_reason"),
         "anchor_source_output_tokens": len(source.get("token_ids", [])),
         "natural_noop_needs_review": natural_noop,
-        "fatal_error": bool(audit_rc or (runner_rc and not natural_noop)),
+        "context_censored": context_censored,
+        "fatal_error": bool(audit_rc or (runner_rc and not natural_noop
+                                          and not context_censored)),
         "slo_computable": slo.get("computable"),
         "slo_metrics": slo.get("metrics"),
         "slo_errors": slo.get("errors"),
@@ -494,6 +535,7 @@ def timing_results(summary: dict[str, Any]) -> dict[str, Any]:
             rate = arm.get("fixed_horizon_goodoutput_tokens_s")
             cases[name][action] = {
                 "eligible": arm.get("fixed_horizon_eligible", False),
+                "context_censored": arm.get("context_censored", False),
                 "goodoutput_tokens_s": rate,
                 "descriptive_delta_vs_stay_tokens_s": (
                     rate - stay_rate if rate is not None
@@ -523,6 +565,9 @@ def execute_pilot(args: argparse.Namespace) -> None:
         raise ValueError("choose paired-only or timing-pilot, not both")
     if not 1 <= args.background_max_tokens <= 4096:
         raise ValueError("background max tokens must be in [1, 4096]")
+    selected_cases = list(args.cases or (row[0] for row in CASES))
+    if len(selected_cases) != len(set(selected_cases)):
+        raise ValueError("case names must be unique")
     actions = (TIMING_ACTIONS if args.timing_pilot else
                ("stay", "early128") if args.paired_only else ACTIONS)
     preflight = verify(args)
@@ -549,6 +594,8 @@ def execute_pilot(args: argparse.Namespace) -> None:
         "actions": actions,
         "evaluation_horizon_s": args.evaluation_horizon_s,
         "background_max_tokens": args.background_max_tokens,
+        "selected_cases": selected_cases,
+        "anchor_context_limit": args.anchor_context_limit,
     }
     summary_path = root / "pilot_summary.json"
     if summary_path.is_file():
@@ -558,11 +605,14 @@ def execute_pilot(args: argparse.Namespace) -> None:
                 or summary.get("evaluation_horizon_s")
                 != args.evaluation_horizon_s
                 or summary.get("background_max_tokens")
-                != args.background_max_tokens):
+                != args.background_max_tokens
+                or summary.get("selected_cases") != selected_cases
+                or summary.get("anchor_context_limit")
+                != args.anchor_context_limit):
             raise ValueError("resume options differ from original pilot")
     failed = False
     try:
-        for name in setup["cases"]:
+        for name in selected_cases:
             manifest = setup["manifests"][name]
             if sha256(Path(manifest["path"])) != manifest["sha256"]:
                 raise ValueError(f"manifest changed: {name}")
@@ -604,7 +654,7 @@ def execute_pilot(args: argparse.Namespace) -> None:
         summary["status"] = (
             "INCOMPLETE_DIAGNOSTIC" if failed
             or any(len(summary["cases"].get(name, {})) < len(actions)
-                   for name in setup["cases"])
+                   for name in selected_cases)
             else "PILOT_COLLECTION_COMPLETE")
         write_json(summary_path, summary)
         if args.paired_only:
