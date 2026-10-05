@@ -278,7 +278,7 @@ class TestRandomizedPilot(unittest.TestCase):
         self.assertFalse(arm["fixed_horizon_eligible"])
         arm["background_finish_reasons"] = {"stop": 2}
         arm["slo_reference_applicability"] = (
-            "EXPLORATORY_FP16_UNCALIBRATED"
+            "EXPLORATORY_CONTEXT_UNCALIBRATED"
         )
         fixed_horizon_result(arm, 180.0)
         self.assertFalse(arm["fixed_horizon_eligible"])
@@ -298,7 +298,7 @@ class TestRandomizedPilot(unittest.TestCase):
     def test_target_context_override_keeps_source_context(self) -> None:
         args = SimpleNamespace(
             python_bin=Path("python"), model_path=Path("model"),
-            dtype="float16", max_model_len=16384,
+            dtype="bfloat16", max_model_len=16384,
             tp4_max_model_len=32768, gpu_memory_utilization=0.88,
         )
         source = server_command(args, 1, 8001)
@@ -307,7 +307,7 @@ class TestRandomizedPilot(unittest.TestCase):
                          "16384")
         self.assertEqual(target[target.index("--max-model-len") + 1],
                          "32768")
-        self.assertEqual(target[target.index("--dtype") + 1], "float16")
+        self.assertEqual(target[target.index("--dtype") + 1], "bfloat16")
 
 
 if __name__ == "__main__":

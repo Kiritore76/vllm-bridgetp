@@ -66,8 +66,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--background-context-limit", action="store_true",
                         help="Use the largest background output allowed by context")
     parser.add_argument("--background-max-tokens", type=int, default=2048)
-    parser.add_argument("--dtype", default="bfloat16",
-                        choices=("bfloat16", "float16"))
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--tp4-max-model-len", type=int)
     parser.add_argument("--random-arrivals", action="store_true",
@@ -389,8 +387,7 @@ def collect_arm(args: argparse.Namespace, root: Path,
     command = online_command(args, command_setup, name,
                              "stay" if action == "stay" else "migrate",
                              arm_root)
-    command.extend(("--dtype", args.dtype, "--max-model-len",
-                    str(args.max_model_len)))
+    command.extend(("--max-model-len", str(args.max_model_len)))
     if args.tp4_max_model_len is not None:
         command.extend(("--tp4-max-model-len",
                         str(args.tp4_max_model_len)))
@@ -401,26 +398,23 @@ def collect_arm(args: argparse.Namespace, root: Path,
     runner_rc = execute(command, case_root / f"{action}.console.log")
     run = arm_root / "r01_shadow_only"
     audit_path = case_root / f"{action}.slo_v6.json"
-    if args.dtype == "bfloat16":
-        audit_command = [
-            sys.executable, "tools/bridge_tp/audit_slo_v6.py",
-            "--run-root", str(run), "--reference", str(args.reference),
-            "--preflight-json", str(root / "preflight.json"),
-            "--require-reference-match", "--out-json", str(audit_path),
-        ]
-        if args.portable_hardware:
-            audit_command += ["--gpu-match-mode", "model"]
-        audit_rc = execute(audit_command,
-                           case_root / f"{action}.slo_v6.console.log")
-    else:
-        audit_rc = 0
-        write_json(audit_path, {
-            "computable": False,
-            "reference_applicability": "EXPLORATORY_FP16_UNCALIBRATED",
-            "errors": ["BF16 SLO reference is inapplicable to FP16"],
-        })
+    audit_command = [
+        sys.executable, "tools/bridge_tp/audit_slo_v6.py",
+        "--run-root", str(run), "--reference", str(args.reference),
+        "--preflight-json", str(root / "preflight.json"),
+        "--require-reference-match", "--out-json", str(audit_path),
+    ]
+    if args.portable_hardware:
+        audit_command += ["--gpu-match-mode", "model"]
+    audit_rc = execute(audit_command,
+                       case_root / f"{action}.slo_v6.console.log")
     slo = (json.loads(audit_path.read_text(encoding="utf-8"))
            if audit_path.is_file() else {})
+    if (args.max_model_len != 8192
+            or (args.tp4_max_model_len or args.max_model_len) != 8192):
+        slo["reference_applicability"] = "EXPLORATORY_CONTEXT_UNCALIBRATED"
+        slo["comparison_scope"] = "diagnostic_only"
+        write_json(audit_path, slo)
     background_path = run / "background" / "background_summary.json"
     background = (json.loads(background_path.read_text(encoding="utf-8"))
                   if background_path.is_file() else {})
@@ -467,10 +461,7 @@ def collect_arm(args: argparse.Namespace, root: Path,
         "fatal_error": bool(audit_rc or (runner_rc and not natural_noop
                                           and not context_censored)),
         "slo_computable": slo.get("computable"),
-        "slo_reference_applicability": (
-            slo.get("reference_applicability") if args.dtype == "bfloat16"
-            else "EXPLORATORY_FP16_UNCALIBRATED"
-        ),
+        "slo_reference_applicability": slo.get("reference_applicability"),
         "slo_metrics": slo.get("metrics"),
         "slo_errors": slo.get("errors"),
         "background_jobs": background.get("jobs"),
@@ -504,7 +495,7 @@ def fixed_horizon_result(result: dict[str, Any], horizon_s: float) -> None:
     eligible = (
         not result.get("fatal_error", True) and result.get("audit_rc") == 0
         and result.get("slo_reference_applicability")
-        != "EXPLORATORY_FP16_UNCALIBRATED"
+        != "EXPLORATORY_CONTEXT_UNCALIBRATED"
         and completed and natural_eos and isinstance(wall_s, (int, float))
         and math.isfinite(wall_s) and wall_s <= horizon_s
         and isinstance(good_tokens, int) and good_tokens >= 0
@@ -651,7 +642,6 @@ def execute_pilot(args: argparse.Namespace) -> None:
         "background_context_limit": args.background_context_limit,
         "selected_cases": selected_cases,
         "anchor_context_limit": args.anchor_context_limit,
-        "dtype": args.dtype,
         "source_max_model_len": args.max_model_len,
         "tp4_max_model_len": args.tp4_max_model_len or args.max_model_len,
     }
@@ -670,7 +660,6 @@ def execute_pilot(args: argparse.Namespace) -> None:
                 or summary.get("selected_cases") != selected_cases
                 or summary.get("anchor_context_limit")
                 != args.anchor_context_limit
-                or summary.get("dtype") != args.dtype
                 or summary.get("source_max_model_len") != args.max_model_len
                 or summary.get("tp4_max_model_len")
                 != (args.tp4_max_model_len or args.max_model_len)):
