@@ -227,11 +227,16 @@ class TestRandomizedPilot(unittest.TestCase):
             fake = types.SimpleNamespace(AutoTokenizer=types.SimpleNamespace(
                 from_pretrained=lambda *_a, **_k: Tokenizer()))
             args = SimpleNamespace(input=input_path, model=root / "model",
-                                   anchor_context_limit=True)
+                                   anchor_context_limit=True,
+                                   background_context_limit=True)
             with mock.patch.dict(sys.modules, {"transformers": fake}):
                 setup = build_setup(args, root)
             anchor = setup["anchors"][setup["cases"][0]]
             self.assertEqual(anchor["max_tokens"], 8064)
+            manifest = json.loads(Path(setup["manifests"][
+                setup["cases"][0]]["path"]).read_text())
+            self.assertEqual(manifest["jobs"][0]["request"]["max_tokens"],
+                             8064)
         error = ["source did not naturally finish before its cap"]
         self.assertTrue(is_context_censored(
             runner_rc=1, audit_rc=0,
