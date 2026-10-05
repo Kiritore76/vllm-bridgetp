@@ -1126,10 +1126,10 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             "ready_sync_mode": run.get("ready_sync_mode"),
             "ready_notification_mode": run.get("ready_notification_mode"),
             "status": acceptance["status"],
-            "shadow_duration_ms": acceptance["shadow_duration_ms"],
-            "bridge_to_commit_ms": acceptance["bridge_to_commit_ms"],
+            "shadow_duration_ms": acceptance.get("shadow_duration_ms"),
+            "bridge_to_commit_ms": acceptance.get("bridge_to_commit_ms"),
             "final_sync_to_commit_ms": acceptance.get("final_sync_to_commit_ms"),
-            "handoff_stall_ms": acceptance["handoff_stall_ms"],
+            "handoff_stall_ms": acceptance.get("handoff_stall_ms"),
             "freeze_to_final_delta_ack_ms": acceptance.get(
                 "freeze_to_final_delta_ack_ms"
             ),
@@ -1353,7 +1353,9 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
                 "anchor_slo", {}
             ).get("itl_violation_rate"),
         }
-        for window, metrics in acceptance["target_tpot_windows"].items():
+        for window, metrics in (
+            acceptance.get("target_tpot_windows") or {}
+        ).items():
             prefix = window.lower()
             for key, value in metrics.items():
                 row[f"{prefix}_{key}"] = value
