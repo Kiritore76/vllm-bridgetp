@@ -140,6 +140,10 @@ class TestRandomizedPilot(unittest.TestCase):
             candidate = observed["first_candidate_at_or_after_128"]
             self.assertEqual(candidate["target_running"], 8)
             self.assertEqual(candidate["p_remaining_gt_512_lower"], 0.81)
+            stay = observed_action(root, paired_stay=True)
+            self.assertEqual(stay["start_count"], 0)
+            self.assertEqual(stay["actual_m1_start_output_tokens"], [])
+            self.assertEqual(stay["m1_recommendation_output_tokens"], [207])
 
     def test_random_arrivals_are_seeded_and_shared_by_arms(self) -> None:
         class Tokenizer:
@@ -197,6 +201,13 @@ class TestRandomizedPilot(unittest.TestCase):
                    "cases": {"case": {"stay": arm}}}
         self.assertIsNone(pair_results(summary)["pairs"]["case"][
             "descriptive_delta_tokens_s"])
+        arm["background_finish_reasons"] = {"stop": 2}
+        fixed_horizon_result(arm, 180.0)
+        summary["cases"]["case"]["early128"] = dict(arm)
+        pair = pair_results(summary)["pairs"]["case"]
+        self.assertTrue(pair["paired_arms_natural_eos"])
+        self.assertFalse(pair["eligible"])
+        self.assertIsNone(pair["descriptive_delta_tokens_s"])
 
 
 if __name__ == "__main__":

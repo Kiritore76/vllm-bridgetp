@@ -239,7 +239,7 @@ def action_order(name: str, seed: int = SEED,
     return actions
 
 
-def observed_action(run: Path) -> dict[str, Any]:
+def observed_action(run: Path, *, paired_stay: bool = False) -> dict[str, Any]:
     audit = run / "controller" / "phase9_audit.jsonl"
     if not audit.is_file():
         return {"audit_available": False}
@@ -252,6 +252,8 @@ def observed_action(run: Path) -> dict[str, Any]:
     starts = [row for row in rows
               if row.get("kind") == "manager_m1_start_decision"
               and row.get("decision", {}).get("action") == "START_SHADOW"]
+    start_tokens = [row.get("snapshot", {}).get("generated_tokens")
+                    for row in starts]
     decisions = [row for row in rows
                  if row.get("kind") == "manager_m1_start_decision"]
     latest_m5: dict[str, Any] | None = None
@@ -295,9 +297,9 @@ def observed_action(run: Path) -> dict[str, Any]:
                 if acceptance.is_file() else {})
     return {
         "audit_available": True,
-        "start_count": len(starts),
-        "actual_m1_start_output_tokens": [
-            row.get("snapshot", {}).get("generated_tokens") for row in starts],
+        "start_count": 0 if paired_stay else len(starts),
+        "actual_m1_start_output_tokens": [] if paired_stay else start_tokens,
+        "m1_recommendation_output_tokens": start_tokens,
         "m1_decision_count": len(decisions),
         "first_candidate_at_or_after_128": first_candidate,
         "last_m1_decision": decisions[-1].get("decision")
@@ -354,7 +356,7 @@ def collect_arm(args: argparse.Namespace, root: Path,
         for reason in {row.get("finish_reason")
                        for row in background.get("results", [])}
     }
-    observed = observed_action(run)
+    observed = observed_action(run, paired_stay=action == "stay")
     natural_noop = (
         action != "stay" and audit_rc == 0
         and slo.get("computable") is True
@@ -429,13 +431,15 @@ def pair_results(summary: dict[str, Any]) -> dict[str, Any]:
     for name, arms in summary["cases"].items():
         stay = arms.get("stay", {})
         now = arms.get("early128", {})
-        eligible = bool(stay.get("fixed_horizon_eligible")
-                        and now.get("fixed_horizon_eligible"))
+        arm_eligible = bool(stay.get("fixed_horizon_eligible")
+                            and now.get("fixed_horizon_eligible"))
         starts = now.get("observed_action", {}).get(
             "actual_m1_start_output_tokens", [])
+        eligible = arm_eligible and bool(starts)
         pairs[name] = {
             "eligible": eligible,
             "assigned_now_actuated": bool(starts),
+            "paired_arms_natural_eos": arm_eligible,
             "stay_predecision_state": stay.get("observed_action", {}).get(
                 "first_candidate_at_or_after_128"),
             "now_predecision_state": now.get("observed_action", {}).get(
