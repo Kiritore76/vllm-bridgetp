@@ -57,6 +57,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--probability-pilot", action="store_true")
+    parser.add_argument("--constructed-workload", action="store_true",
+                        help="Use marked engineering construction recipes")
+    parser.add_argument("--expected-input-sha256",
+                        help="Pinned request-file SHA for constructed workloads")
+    parser.add_argument("--constructed-source-count", type=int, default=3)
+    parser.add_argument("--constructed-target-count", type=int, default=8)
     parser.add_argument("--probability-thresholds", type=float, nargs="+",
                         default=[0.0, 0.01, 0.05, 0.2])
     parser.add_argument("--paired-only", action="store_true",
@@ -112,7 +118,8 @@ def parse_args() -> argparse.Namespace:
 
 def select_inputs(path: Path, seed: int = SEED,
                   p03_anchor_id: str | None = None,
-                  all_held_out: bool = False) -> list[dict[str, Any]]:
+                  all_held_out: bool = False,
+                  constructed_workload: bool = False) -> list[dict[str, Any]]:
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8")
             .splitlines() if line.strip()]
     tree_splits: dict[str, str] = {}
@@ -132,20 +139,40 @@ def select_inputs(path: Path, seed: int = SEED,
                     if key in content_splits and content_splits[key] != split:
                         raise ValueError("request content crosses predictor splits")
                     content_splits[key] = split
-    test = [row for row in rows if row.get("split") == "test"
-            and row.get("workload_group") in {"natural", "long_form"}
-            and (p03_anchor_id is None
-                 or row.get("id") != RETIRED_P03_ANCHOR_ID)]
+    if constructed_workload:
+        from tools.bridge_tp.build_constructed_probability_workload import SPLITS
+
+        if p03_anchor_id is not None or any(
+            row.get("workload_origin") != "constructed"
+            or row.get("split") not in SPLITS
+            or row.get("controller_split") != row.get("split")
+            or not isinstance(row.get("construction"), dict)
+            or row["construction"].get("role") not in {"anchor", "background"}
+            or row.get("workload_group")
+            != "constructed_" + row["construction"].get("role", "")
+            for row in rows
+        ) or len({row["split"] for row in rows}) != 1:
+            raise ValueError("constructed input requires one engineering split")
+        test = rows
+        anchor_group, background_group = "constructed_anchor", "constructed_background"
+    else:
+        test = [row for row in rows if row.get("split") == "test"
+                and row.get("workload_group") in {"natural", "long_form"}
+                and (p03_anchor_id is None
+                     or row.get("id") != RETIRED_P03_ANCHOR_ID)]
+        anchor_group, background_group = "long_form", "natural"
     rng = random.Random(seed)
     long_form = [row for row in test
-                 if row["workload_group"] == "long_form"]
+                 if row["workload_group"] == anchor_group]
     natural = [row for row in test
-               if row["workload_group"] == "natural"]
+               if row["workload_group"] == background_group]
     rng.shuffle(long_form)
     rng.shuffle(natural)
     if len(long_form) < 5 or len(natural) < 1:
-        raise ValueError("pilot needs five held-out long-form anchors")
-    anchors = long_form[:5] + natural[:1]
+        raise ValueError("pilot needs five anchor-role and one background-role request")
+    anchors = long_form[:6] if constructed_workload else long_form[:5] + natural[:1]
+    if len(anchors) != 6:
+        raise ValueError("constructed pilot needs six distinct anchors")
     if p03_anchor_id is not None:
         replacements = [row for row in long_form
                         if str(row["id"]) == p03_anchor_id]
@@ -202,15 +229,33 @@ def augmented_source_prompt(tokenizer: Any, row: dict[str, Any],
     return prompt
 
 
+def case_definitions(args: argparse.Namespace) -> tuple:
+    if getattr(args, "constructed_workload", False):
+        source = getattr(args, "constructed_source_count", 3)
+        target = getattr(args, "constructed_target_count", 8)
+        if not 1 <= source <= 5 or not 0 <= target <= 24 or args.cases:
+            raise ValueError("constructed load needs source 1..5, target 0..24")
+        name = f"constructed_source{source}_target{target}"
+        return ((name, source, target, 0.35, 0.2),)
+    return CASES
+
+
 def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
     from transformers import AutoTokenizer
 
     seed = getattr(args, "seed", SEED)
     rows = select_inputs(args.input, seed, getattr(args, "p03_anchor_id", None),
-                         getattr(args, "probability_pilot", False))
+                         getattr(args, "probability_pilot", False),
+                         getattr(args, "constructed_workload", False))
     tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
 
     def tokens(row: dict[str, Any]) -> list[int]:
+        if getattr(args, "constructed_workload", False):
+            from tools.bridge_tp.build_constructed_probability_workload import (
+                constructed_prompt_tokens,
+            )
+
+            return constructed_prompt_tokens(tokenizer, row)
         prompt = row.get("prompt")
         if prompt is None:
             prompt = tokenizer.apply_chat_template(
@@ -226,10 +271,11 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
         "input_sha256": sha256(args.input),
         "manifests": {}, "anchors": {}, "cases": [],
     }
+    cases = case_definitions(args)
     cursor = len(CASES)
-    rotation_cursor = sum(row[1] + row[2] for row in CASES) + len(CASES)
+    rotation_cursor = sum(row[1] + row[2] for row in cases) + len(CASES)
     for index, (name, source_count, target_count, target_spacing,
-                source_spacing) in enumerate(CASES):
+                source_spacing) in enumerate(cases):
         if (getattr(args, "probability_pilot", False) and args.cases
                 and name not in args.cases):
             cursor += source_count + target_count
@@ -289,7 +335,10 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
             "total_max_tokens": total_budget,
             "workload_group": anchor["workload_group"],
             "source_tree_id": anchor.get("source_tree_id", anchor["id"]),
-            "controller_split": "engineering_pilot_not_final_test",
+            "controller_split": anchor.get(
+                "controller_split", "engineering_pilot_not_final_test"),
+            "workload_origin": anchor.get("workload_origin", "held_out_natural"),
+            "construction": anchor.get("construction"),
             "messages_sha256": hashlib.sha256(json.dumps(
                 anchor.get("messages", anchor.get("prompt")), sort_keys=True,
                 ensure_ascii=False).encode()).hexdigest(),
@@ -299,6 +348,8 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
         }
         jobs = []
         chosen = rows[cursor:cursor + source_count + target_count]
+        if getattr(args, "constructed_workload", False):
+            chosen = chosen[source_count:] + chosen[:source_count]
         cursor += len(chosen)
         for pool, subset in (("target", chosen[:target_count]),
                              ("source", chosen[target_count:])):
@@ -335,6 +386,10 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
                     "input_id": row["id"],
                     "source_tree_id": row.get("source_tree_id", row["id"]),
                     "input_augmentation": row.get("augmentation"),
+                    "workload_origin": row.get("workload_origin", "held_out_natural"),
+                    "controller_split": row.get(
+                        "controller_split", "engineering_pilot_not_final_test"),
+                    "construction": row.get("construction"),
                     "workload_group": (
                         "augmented_long_context_natural_eos"
                         if pool == "source"
@@ -400,6 +455,11 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
                         )
                         copy["workload_group"] = rotated["workload_group"]
                         copy["input_augmentation"] = rotated.get("augmentation")
+                        copy["workload_origin"] = rotated.get(
+                            "workload_origin", "held_out_natural")
+                        copy["controller_split"] = rotated.get(
+                            "controller_split", "engineering_pilot_not_final_test")
+                        copy["construction"] = rotated.get("construction")
                     copy["job_id"] = f"{job['job_id']}_wave{wave:03d}"
                     copy["start_after_s"] = round(planned, 3)
                     copy["wave"] = wave
@@ -410,7 +470,7 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
                          if job["pool"] == pool), default=-1)
                     < arrival_window_s - period_s / count
                     for pool, count in (("source", source_count),
-                                        ("target", target_count)))):
+                                        ("target", target_count)) if count > 0)):
                 raise ValueError("arrival schedule does not cover the window")
             if len(jobs) > 512:
                 raise ValueError("arrival schedule exceeds 512 jobs per case")
@@ -428,6 +488,9 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
                 args, "source_background_max_tokens", None),
             "target_spacing_s": target_spacing,
             "natural_eos_required": True,
+            "workload_origin": anchor.get("workload_origin", "held_out_natural"),
+            "controller_split": anchor.get(
+                "controller_split", "engineering_pilot_not_final_test"),
             "arrival_process": (
                 "seeded_first_burst_stratified_replay"
                 if arrival_window_s is not None and getattr(
@@ -443,10 +506,13 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
                 if arrival_window_s is not None else None),
             "jobs": jobs,
         }
-        if getattr(args, "probability_pilot", False) and name == "p00_source1_target2":
+        if (getattr(args, "probability_pilot", False)
+                and name == "p00_source1_target2"):
             jobs = [job for job in jobs if job["pool"] == "source"]
             manifest.update(jobs=jobs, target_count=0,
                             target_idle_override=True)
+        if target_count == 0:
+            manifest["target_idle_override"] = True
         for job in jobs:
             job["prompt_token_ids_sha256"] = hashlib.sha256(json.dumps(
                 job["request"]["prompt"]).encode()).hexdigest()
@@ -462,7 +528,7 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
             "target_jobs": sum(job["pool"] == "target" for job in jobs),
         }
         setup["cases"].append(name)
-    if cursor != sum(row[1] + row[2] for row in CASES) + len(CASES):
+    if cursor != sum(row[1] + row[2] for row in cases) + len(CASES):
         raise ValueError("pilot selection was not consumed exactly once")
     return setup
 
@@ -703,7 +769,8 @@ def collect_arm(args: argparse.Namespace, root: Path,
             setup["anchors"][name]["total_max_tokens"])))
     configure_action(command, action)
     if getattr(args, "probability_pilot", False):
-        if name == "p00_source1_target2":
+        if (name == "p00_source1_target2"
+                or setup["manifests"][name].get("target_jobs") == 0):
             command[command.index("--minimum-ready-target-jobs") + 1] = "0"
         command += ["--probability-assignment-seed", f"{args.seed}:{name}:{action}",
                     "--probability-threshold-family",
@@ -907,6 +974,9 @@ def collect_arm(args: argparse.Namespace, root: Path,
                 "assignment_probability": 0.5,
                 "episode_group_id": f"{args.seed}:{name}",
                 "horizon_score": horizon,
+                "workload_origin": setup["anchors"][name].get("workload_origin"),
+                "controller_split": setup["anchors"][name].get("controller_split"),
+                "construction": setup["anchors"][name].get("construction"),
                 "fatal_error": technical,
                 "technical_errors": engineering_errors,
                 "anchor_service_failure": anchor_service_failure,
@@ -1122,6 +1192,19 @@ def probability_results(summary: dict[str, Any]) -> dict[str, Any]:
 
 
 def execute_pilot(args: argparse.Namespace) -> None:
+    if getattr(args, "constructed_workload", False):
+        if (
+            not args.probability_pilot
+            or not args.expected_input_sha256
+            or len(args.expected_input_sha256) != 64
+            or any(c not in "0123456789abcdef" for c in args.expected_input_sha256)
+            or args.source_prompt_tokens is not None
+        ):
+            raise ValueError(
+                "constructed collection needs probability mode and pinned SHA")
+        case_definitions(args)
+    elif getattr(args, "expected_input_sha256", None) is not None:
+        raise ValueError("input SHA override is restricted to constructed collection")
     if args.probability_pilot:
         if (
             args.paired_only
@@ -1131,7 +1214,7 @@ def execute_pilot(args: argparse.Namespace) -> None:
             or args.source_prompt_tokens is not None
         ):
             raise ValueError(
-                "probability pilot uses natural prompts and its own actions"
+                "probability pilot needs its own actions without legacy augmentation"
             )
         if (
             not args.probability_thresholds
@@ -1189,7 +1272,7 @@ def execute_pilot(args: argparse.Namespace) -> None:
         raise ValueError("source background max tokens must be in [1, 4096]")
     if args.anchor_total_max_tokens is not None and args.anchor_total_max_tokens <= 0:
         raise ValueError("anchor total max tokens must be positive")
-    selected_cases = list(args.cases or (row[0] for row in CASES))
+    selected_cases = list(args.cases or (row[0] for row in case_definitions(args)))
     if len(selected_cases) != len(set(selected_cases)):
         raise ValueError("case names must be unique")
     actions = (tuple(f"prob_{theta:g}_{assignment}"
