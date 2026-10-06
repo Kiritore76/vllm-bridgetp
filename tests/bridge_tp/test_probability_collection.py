@@ -78,6 +78,10 @@ class TestProbabilityCollection(unittest.TestCase):
             args.expected_input_sha256 = "a" * 64
             args.constructed_source_count = 3
             args.constructed_target_count = 0
+            args.window_token_goodoutput = True
+            args.evaluation_horizon_s = 300
+            args.arrival_window_s = 300
+            args.arrival_wave_period_s = 24
             with patch(
                 "tools.bridge_tp.run_randomized_goodoutput_pilot_a100.verify",
                 side_effect=RuntimeError("reached hardware preflight"),
@@ -528,6 +532,22 @@ class TestProbabilityCollection(unittest.TestCase):
         self.assertTrue(result["eligible"])
         self.assertEqual(result["good_output_tokens"], 3)
         self.assertEqual(result["unfinished_or_failed_at_H"], 2)
+        # Drain allows late COMPLETED requests to contribute only their
+        # pre-cutoff tokens. Failed service requests remain zero.
+        background["results"][1]["token_times_unix_s"] = [1, 2, 10, 11]
+        streaming = score_horizon(
+            {"computable": True, "request_rows": rows},
+            background, source, {}, proxy, 10, settle_after_h=True,
+        )
+        self.assertEqual(streaming["good_output_tokens"], 5)
+        self.assertEqual(streaming["drain_completed_requests"], 1)
+        self.assertFalse(streaming["drain_tokens_counted"])
+        self.assertEqual(streaming["window_coverage"]["inflight_fraction"], 1)
+        rows[1]["slo_success"] = False
+        self.assertEqual(score_horizon(
+            {"computable": True, "request_rows": rows},
+            background, source, {}, proxy, 10, settle_after_h=True,
+        )["good_output_tokens"], 3)
         del background["results"][0]["token_times_unix_s"]
         self.assertFalse(
             score_horizon(
@@ -554,6 +574,15 @@ class TestProbabilityCollection(unittest.TestCase):
         self.assertNotIn("--experiment-m1-action", command)
         self.assertEqual(command[command.index("--m1-min-output-tokens") + 1], "0")
         self.assertIn("--probability-threshold", command)
+
+    def test_collection_identity_distinguishes_runs_keeps_shared_seed_group(self):
+        summary = {"seed": 1, "probability_thresholds": [0.8],
+                   "cases": {"load": {}}, "collection_id": "recipe-long"}
+        first = probability_results(summary)["samples"][0]
+        summary["collection_id"] = "recipe-short"
+        second = probability_results(summary)["samples"][0]
+        self.assertNotEqual(first["sample_id"], second["sample_id"])
+        self.assertEqual(first["episode_group_id"], second["episode_group_id"])
 
     def test_rotated_unique_prompts_actual_context_and_idle_target(self):
         tokenizer = SimpleNamespace(encode=lambda s: [1] * len(s))
@@ -587,8 +616,8 @@ class TestProbabilityCollection(unittest.TestCase):
                 tp4_max_model_len=32768,
                 anchor_context_limit=True,
                 background_context_limit=True,
-                arrival_window_s=30,
-                arrival_wave_period_s=10,
+                arrival_window_s=300,
+                arrival_wave_period_s=24,
             )
             with patch.dict(sys.modules, {"transformers": fake}):
                 setup = build_setup(args, root)
@@ -598,6 +627,8 @@ class TestProbabilityCollection(unittest.TestCase):
             jobs = manifest["jobs"]
             self.assertEqual(len(jobs), len({j["input_id"] for j in jobs}))
             self.assertEqual(manifest["target_count"], 0)
+            self.assertGreater(max(j["start_after_s"] for j in jobs), 275)
+            self.assertLess(max(j["start_after_s"] for j in jobs), 300)
             self.assertTrue(all(j["pool"] == "source" for j in jobs))
             self.assertTrue(all(j["request"]["max_tokens"] > 8192 for j in jobs))
 

@@ -13,8 +13,10 @@ def score_horizon(
     target: dict,
     proxy: dict,
     horizon_s: float,
+    *,
+    settle_after_h: bool = False,
 ) -> dict:
-    """Count completed, SLO-valid requests by H and zero other service results.
+    """Score fixed-window output, with an opt-in full-request drain SLO mode.
 
     Missing/corrupt evidence is a technical exclusion, never a service zero.
     All timestamps come from client streams; origin is the earliest actual
@@ -60,9 +62,17 @@ def score_horizon(
             or any(b < a for a, b in zip(times, times[1:]))
         ):
             return {**excluded, "errors": ["missing/corrupt stream boundary"]}
-        in_window = sum(origin <= t <= cutoff for t in times)
+        in_window = sum(
+            origin <= t and (t < cutoff if settle_after_h else t <= cutoff)
+            for t in times
+        )
         complete = row["status"] == "COMPLETED" and end <= cutoff
-        good = in_window if complete and row.get("slo_success") else 0
+        service_complete = row["status"] == "COMPLETED"
+        good = (
+            in_window
+            if (service_complete if settle_after_h else complete)
+            and row.get("slo_success") else 0
+        )
         scored.append(
             {
                 "request_id": row["request_id"],
@@ -77,7 +87,7 @@ def score_horizon(
             }
         )
     good = sum(r["good_tokens"] for r in scored)
-    return {
+    result = {
         "eligible": True,
         "errors": [],
         "failure_kind": None,
@@ -89,3 +99,41 @@ def score_horizon(
         "request_rows": scored,
         "unfinished_or_failed_at_H": sum(not r["completed_by_H"] for r in scored),
     }
+    if settle_after_h:
+        # SLO remains the frozen full-request audit, including drain. Drain
+        # tokens never contribute to the fixed-window numerator or denominator.
+        intervals = sorted(
+            (max(origin, r["request_started_unix_s"]),
+             min(cutoff, r["request_ended_unix_s"]))
+            for r in records.values()
+            if r["request_started_unix_s"] < cutoff
+        )
+        busy_s = 0.0
+        latest = origin
+        for start, end in intervals:
+            busy_s += max(0.0, end - max(start, latest))
+            latest = max(latest, end)
+        times = [
+            t for record in records.values()
+            for t in record["token_times_unix_s"] if origin <= t < cutoff
+        ]
+        bin_count = math.ceil(horizon_s / 10)
+        bins = {int((t - origin) // 10) for t in times}
+        result.update(
+            scoring_policy="WINDOW_TOKENS_FULL_REQUEST_SLO_DRAIN_V1",
+            drain_tokens_counted=False,
+            drain_completed_requests=sum(
+                r["service_status"] == "COMPLETED" and not r["completed_by_H"]
+                for r in scored
+            ),
+            window_coverage={
+                "inflight_fraction": busy_s / horizon_s,
+                "output_bin_width_s": 10,
+                "output_bins_total": bin_count,
+                "output_bins_present": len(bins),
+                "output_bin_fraction": len(bins) / bin_count,
+                "last_output_offset_s": max(times) - origin if times else None,
+                "window_output_tokens": len(times),
+            },
+        )
+    return result
