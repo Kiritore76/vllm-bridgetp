@@ -21,6 +21,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
+from tools.bridge_tp.horizon_goodoutput import score_horizon  # noqa: E402
 from tools.bridge_tp.run_goodoutput_matrix_a100 import (  # noqa: E402
     execute,
     online_command,
@@ -28,7 +29,6 @@ from tools.bridge_tp.run_goodoutput_matrix_a100 import (  # noqa: E402
     verify,
     write_json,
 )
-from tools.bridge_tp.horizon_goodoutput import score_horizon  # noqa: E402
 
 SEED = 20261004
 CASES = (
@@ -57,6 +57,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--probability-pilot", action="store_true")
+    parser.add_argument("--pre-episode-warmup", action="store_true",
+                        help="Warm prompt shapes before the measured workload")
+    parser.add_argument("--minimum-initial-source-headroom-tokens", type=int)
     parser.add_argument("--constructed-workload", action="store_true",
                         help="Use marked engineering construction recipes")
     parser.add_argument("--expected-input-sha256",
@@ -249,13 +252,13 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
                          getattr(args, "constructed_workload", False))
     tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
 
-    def tokens(row: dict[str, Any]) -> list[int]:
+    def tokens(row: dict[str, Any], pool: str | None = None) -> list[int]:
         if getattr(args, "constructed_workload", False):
             from tools.bridge_tp.build_constructed_probability_workload import (
                 constructed_prompt_tokens,
             )
 
-            return constructed_prompt_tokens(tokenizer, row)
+            return constructed_prompt_tokens(tokenizer, row, pool)
         prompt = row.get("prompt")
         if prompt is None:
             prompt = tokenizer.apply_chat_template(
@@ -359,7 +362,7 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
                                             args.source_prompt_tokens)
                     if pool == "source"
                     and getattr(args, "source_prompt_tokens", None) is not None
-                    else tokens(row)
+                    else tokens(row, pool)
                 )
                 pool_context = (source_max_model_len if pool == "source"
                                 else target_max_model_len)
@@ -437,7 +440,7 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
                         rotated = rows[rotation_cursor]
                         rotation_cursor += 1
                         copy["request"] = dict(job["request"])
-                        copy["request"]["prompt"] = tokens(rotated)
+                        copy["request"]["prompt"] = tokens(rotated, job["pool"])
                         pool_context = (
                             source_max_model_len
                             if job["pool"] == "source"
@@ -769,6 +772,9 @@ def collect_arm(args: argparse.Namespace, root: Path,
             setup["anchors"][name]["total_max_tokens"])))
     configure_action(command, action)
     if getattr(args, "probability_pilot", False):
+        if getattr(args, "constructed_workload", False):
+            command += ["--probability-min-source-running",
+                        str(args.constructed_source_count + 1)]
         if (name == "p00_source1_target2"
                 or setup["manifests"][name].get("target_jobs") == 0):
             command[command.index("--minimum-ready-target-jobs") + 1] = "0"
@@ -779,6 +785,11 @@ def collect_arm(args: argparse.Namespace, root: Path,
         command.append("--risk-observation-shadow")
     if args.cross_context_smoke:
         command.append("--cross-context-smoke")
+    if getattr(args, "pre_episode_warmup", False):
+        command.append("--pre-episode-warmup")
+    minimum_headroom = getattr(args, "minimum_initial_source_headroom_tokens", None)
+    if minimum_headroom is not None:
+        command += ["--minimum-initial-source-headroom-tokens", str(minimum_headroom)]
     write_json(case_root / f"{action}.command.json", command)
     runner_rc = execute(command, case_root / f"{action}.console.log")
     run = arm_root / "r01_shadow_only"

@@ -55,6 +55,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tp1-blocks", type=int, required=True)
     parser.add_argument("--tp4-blocks", type=int, required=True)
     parser.add_argument("--phase", choices=["smoke", "formal"], default="smoke")
+    parser.add_argument("--pre-episode-warmup", action="store_true")
+    parser.add_argument("--minimum-initial-source-headroom-tokens", type=int)
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument(
         "--managed-formal-subrun",
@@ -258,7 +260,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--m1-source-release-tail-s", type=float,
-        help="diagnostic tail allowance after estimated history copy until TP1 KV release",
+        help=("diagnostic tail allowance after estimated history copy "
+              "until TP1 KV release"),
     )
     parser.add_argument("--manager-m2-rate", action="store_true")
     parser.add_argument("--manager-m3-commit", action="store_true")
@@ -266,6 +269,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manager-m5-predictor-shadow", action="store_true")
     parser.add_argument("--risk-observation-shadow", action="store_true")
     parser.add_argument("--probability-threshold", type=float)
+    parser.add_argument("--probability-min-source-running", type=int, default=0)
     parser.add_argument("--probability-threshold-family", type=float, nargs="*",
                         default=[])
     parser.add_argument("--probability-assigned-action", choices=("START", "STAY"))
@@ -274,7 +278,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--experiment-m1-action", choices=("NOW", "WAIT"))
     parser.add_argument(
         "--paired-stay", action="store_true",
-        help="paired GoodOutput control arm: retain M1/M5 observation but suppress migration",
+        help=("paired GoodOutput control arm: retain M1/M5 observation "
+              "but suppress migration"),
     )
     parser.add_argument("--predictor-checkpoint", type=Path)
     parser.add_argument("--predictor-checkpoint-sha256")
@@ -362,6 +367,15 @@ def parse_args() -> argparse.Namespace:
 def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]:
     if os.name == "nt":
         raise RuntimeError("online Shadow validation requires Linux and five GPUs")
+    if args.probability_min_source_running < 0 or (
+        (args.pre_episode_warmup or args.probability_min_source_running
+         or args.minimum_initial_source_headroom_tokens is not None)
+        and args.probability_threshold is None
+    ):
+        raise ValueError("preparation guards require probability collection")
+    if (args.minimum_initial_source_headroom_tokens is not None
+            and args.minimum_initial_source_headroom_tokens < 0):
+        raise ValueError("initial source headroom minimum must be non-negative")
     if not 128 < args.max_model_len <= 32768:
         raise ValueError("TP1 max model length must be in (128, 32768]")
     if (args.tp4_max_model_len is not None
@@ -1811,7 +1825,8 @@ def accept_paired_stay(
     proxy = common.read_json(controller_dir / "response_proxy_stats.json")
     audit = _load_rows(controller_dir / "phase9_audit.jsonl")
     decisions = [row for row in audit if row.get("kind") == "manager_m1_start_decision"]
-    interventions = [row for row in audit if row.get("kind") == "paired_stay_intervention"]
+    interventions = [row for row in audit
+                     if row.get("kind") == "paired_stay_intervention"]
     endings = [row for row in audit if row.get("kind") == "run_end"]
     transitions = [row.get("to") for row in audit if row.get("kind") == "transition"]
     errors: list[str] = []
@@ -1945,6 +1960,34 @@ def accept_source_eos_after_shadow(
         "background_completed": background.get("completed"),
         "errors": errors,
     }
+
+
+def accept_unexpected_shadow_cancel(controller_dir: Path) -> dict[str, Any]:
+    """Keep pre-cutover cancellation diagnostic and exclude its benefit label."""
+    rows = _load_rows(controller_dir / "phase9_audit.jsonl")
+    reasons = [row.get("reason") for row in rows
+               if row.get("kind") == "abandon"]
+    return {
+        "format_version": 1, "status": "FAIL",
+        "outcome": "SHADOW_CANCELLED_BEFORE_CUTOVER",
+        "cancellation_reasons": reasons,
+        "errors": ["Shadow cancelled before cutover: " +
+                   "; ".join(str(reason) for reason in reasons)],
+    }
+
+
+def accept_shadow_without_cutover(
+    controller_dir: Path, background_dir: Path,
+    expected_jobs: int, expected_anchor_tokens: int,
+) -> dict[str, Any]:
+    """Route using controller termination, rather than absence of a manifest."""
+    rows = _load_rows(controller_dir / "phase9_audit.jsonl")
+    endings = [row for row in rows if row.get("kind") == "run_end"]
+    if len(endings) == 1 and endings[0].get("final_state") == "CANCELLED":
+        return accept_unexpected_shadow_cancel(controller_dir)
+    return accept_source_eos_after_shadow(
+        controller_dir, background_dir, expected_jobs, expected_anchor_tokens,
+    )
 
 
 def active_source_peer_count(
@@ -2738,7 +2781,8 @@ def accept_online(
                         / (max(float(rate) for rate in allowed_rates) * 1024**3)
                         * 1000
                     )
-                    if float(paced.get("history_pacing_span_ms", 0)) < minimum_ms * 0.98:
+                    if (float(paced.get("history_pacing_span_ms", 0))
+                            < minimum_ms * 0.98):
                         errors.append("GPU-direct history pacing span is too short")
                 if manager_m2_rate and manager_m2_expected_profile is not None:
                     assert m2_profiles_gib_s is not None
@@ -3191,12 +3235,11 @@ def accept_online(
             for row in m2_rows
         ):
             errors.append("M2 used a rate outside the three configured profiles")
-        if manager_m2_require_source_high:
-            if not has_measured_source_high(audit, source_peers):
-                errors.append(
-                    "M2 HIGH lacked measured pre-guard pressure with active "
-                    "source peers"
-                )
+        if (manager_m2_require_source_high
+                and not has_measured_source_high(audit, source_peers)):
+            errors.append(
+                "M2 HIGH lacked measured pre-guard pressure with active source peers"
+            )
         if manager_m2_require_low_to_high:
             initial_low = (
                 len(initial_rows) == 1
@@ -3860,6 +3903,11 @@ def main() -> None:
         "paired_stay": args.paired_stay,
         "experiment_m1_action": args.experiment_m1_action,
         "probability_threshold": args.probability_threshold,
+        "probability_min_source_running": args.probability_min_source_running,
+        "pre_episode_warmup": args.pre_episode_warmup,
+        "minimum_initial_source_headroom_tokens": (
+            args.minimum_initial_source_headroom_tokens
+        ),
         "probability_threshold_family": args.probability_threshold_family,
         "probability_assigned_action": args.probability_assigned_action,
         "probability_assignment_seed": args.probability_assignment_seed,
@@ -4069,6 +4117,7 @@ def main() -> None:
                     expected_jobs: int,
                     expected_anchor_tokens: int,
                     selected: str = strategy,
+                    selected_repetition: int = repetition,
                     selected_handoff: str = handoff_mode,
                     selected_remote: bool = selected_online_remote_attention,
                     selected_stop: bool = selected_stop_and_copy,
@@ -4090,6 +4139,11 @@ def main() -> None:
                             expected_jobs, expected_anchor_tokens,
                             natural_eos_anchor=args.natural_eos_anchor,
                         )
+                    elif args.manager_m4_expect_cancel:
+                        accepted = accept_m4_cancel(
+                            controller_dir, background_dir,
+                            expected_jobs, expected_anchor_tokens,
+                        )
                     elif (args.natural_eos_anchor
                           and args.manager_m1_auto_start
                           and not (controller_dir / "session_manifest.json").exists()):
@@ -4103,12 +4157,7 @@ def main() -> None:
                           and args.manager_m1_auto_start
                           and (controller_dir / "session_manifest.json").exists()
                           and not (controller_dir / "cutover_manifest.json").exists()):
-                        accepted = accept_source_eos_after_shadow(
-                            controller_dir, background_dir,
-                            expected_jobs, expected_anchor_tokens,
-                        )
-                    elif args.manager_m4_expect_cancel:
-                        accepted = accept_m4_cancel(
+                        accepted = accept_shadow_without_cutover(
                             controller_dir, background_dir,
                             expected_jobs, expected_anchor_tokens,
                         )
@@ -4168,7 +4217,7 @@ def main() -> None:
                                 args.preconnect_persistent_channel
                             ),
                             persistent_expected_session_count=(
-                                repetition
+                                selected_repetition
                                 if args.persistent_sequential_reuse
                                 else 1
                             ),
@@ -4302,6 +4351,8 @@ def main() -> None:
                         [
                             "--probability-threshold",
                             str(args.probability_threshold),
+                            "--probability-min-source-running",
+                            str(args.probability_min_source_running),
                             "--probability-assignment-seed",
                             args.probability_assignment_seed,
                             "--probability-start-probability",

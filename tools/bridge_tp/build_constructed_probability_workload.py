@@ -45,11 +45,14 @@ def make_rows(
     anchor_sections: int,
     background_sections: int,
     backgrounds: int,
+    target_prompt_tokens: int | None = None,
 ) -> list[dict]:
     if split not in SPLITS or backgrounds < 94:
         raise ValueError("use an engineering split and at least 94 backgrounds")
     if min(anchor_prompt_tokens, background_prompt_tokens) < 1024:
         raise ValueError("constructed context targets must be at least 1024 tokens")
+    if target_prompt_tokens is not None and target_prompt_tokens < 1024:
+        raise ValueError("target context target must be at least 1024 tokens")
     if not (4 <= background_sections <= 16 and 8 <= anchor_sections <= 64):
         raise ValueError("background sections must be 4..16; anchor sections 8..64")
     rows = []
@@ -68,6 +71,8 @@ def make_rows(
             "role": role,
             "output_length_is_not_guaranteed": True,
         }
+        if role == "background" and target_prompt_tokens is not None:
+            recipe["target_prompt_tokens"] = target_prompt_tokens
         rows.append(
             {
                 "id": row_seed,
@@ -99,12 +104,16 @@ def make_rows(
     return rows
 
 
-def constructed_prompt_tokens(tokenizer, row: dict) -> list[int]:
+def constructed_prompt_tokens(
+    tokenizer, row: dict, pool: str | None = None
+) -> list[int]:
     """Fit unique structured records between intact chat and task boundaries."""
     recipe = row["construction"]
     family = recipe["family"]
     sections = recipe["response_sections"]
     length = recipe["requested_prompt_tokens"]
+    if pool == "target":
+        length = recipe.get("target_prompt_tokens", length)
     rng = random.Random(recipe["seed"])
     template = tokenizer.apply_chat_template(
         [{"role": "user", "content": "<CONSTRUCTED_RECORDS>"}],
@@ -148,6 +157,11 @@ def main():
     parser.add_argument("--split", choices=SPLITS, default="engineering_train")
     parser.add_argument("--anchor-prompt-tokens", type=int, default=8192)
     parser.add_argument("--background-prompt-tokens", type=int, default=2048)
+    parser.add_argument(
+        "--target-prompt-tokens",
+        type=int,
+        help="Independent target background context budget",
+    )
     parser.add_argument("--anchor-sections", type=int, default=24)
     parser.add_argument("--background-sections", type=int, default=6)
     parser.add_argument("--backgrounds", type=int, default=640)
@@ -161,6 +175,7 @@ def main():
         anchor_sections=args.anchor_sections,
         background_sections=args.background_sections,
         backgrounds=args.backgrounds,
+        target_prompt_tokens=args.target_prompt_tokens,
     )
     data = "".join(
         json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n" for r in rows

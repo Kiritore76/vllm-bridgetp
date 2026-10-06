@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -47,9 +48,7 @@ class TestKVRestore(unittest.TestCase):
             self.source,
             [7, 2, 10],
             block_axis=0,
-            layer_trace_hook=lambda operation, layer: events.append(
-                (operation, layer)
-            ),
+            layer_trace_hook=lambda operation, layer: events.append((operation, layer)),
         )
         self.assertEqual(
             events,
@@ -122,6 +121,57 @@ class TestKVRestore(unittest.TestCase):
                     destination["layer.0"][block, :, offset],
                     delta["layer.0"][delta_index],
                 )
+            )
+
+    def test_delta_scatter_preserves_every_untouched_slot_and_strided_layout(self):
+        for axis in (0, 1, -1):
+            with self.subTest(axis=axis):
+                original = torch.full((12, 4, 2, 3, 5), -9.0)
+                # Move physical block axis away from zero, including to the end.
+                destination = original.movedim(0, axis)
+                delta = torch.arange(7 * 2 * 3 * 5).reshape(7, 2, 3, 5).float()
+                expected = original.clone()
+                blocks = [7, 2, 10]
+                for index, token in enumerate(range(3, 10)):
+                    expected[blocks[token // 4], token % 4] = delta[index]
+                result = inject_rank_delta(
+                    {"layer": destination},
+                    {"layer": delta},
+                    blocks,
+                    start_token=3,
+                    end_token=10,
+                    block_axis=axis,
+                    block_size=4,
+                )
+                self.assertTrue(result["exact_readback"])
+                self.assertTrue(torch.equal(original, expected))
+
+    def test_delta_rejects_duplicate_and_invalid_blocks(self):
+        for blocks in ([1, 1], [-1, 2], [1, 12]):
+            with self.subTest(blocks=blocks), self.assertRaises(ValueError):
+                inject_rank_delta(
+                    {"layer": torch.zeros(12, 4, 2, 3)},
+                    {"layer": torch.ones(6, 2, 3)},
+                    blocks,
+                    start_token=1,
+                    end_token=7,
+                    block_axis=0,
+                    block_size=4,
+                )
+
+    def test_delta_readback_failure_is_still_fatal(self):
+        with (
+            patch("torch.count_nonzero", return_value=torch.tensor(1)),
+            self.assertRaisesRegex(ValueError, "readback differs"),
+        ):
+            inject_rank_delta(
+                {"layer": torch.zeros(12, 4, 2, 3)},
+                {"layer": torch.ones(3, 2, 3)},
+                [1],
+                start_token=0,
+                end_token=3,
+                block_axis=0,
+                block_size=4,
             )
 
 

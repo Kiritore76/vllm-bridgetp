@@ -19,8 +19,9 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
@@ -31,6 +32,68 @@ from tools.bridge_tp.run_phase9_capacity_background import (  # noqa: E402
 )
 
 KV_CACHE_SIZE = re.compile(r"GPU KV cache size:\s*([\d,]+)\s+tokens")
+
+
+def warmup_prompt_shapes(
+    base_url: str, requests: list[dict[str, Any]], output: Path, timeout_s: float,
+) -> None:
+    """Run ordinary short requests before arrival clocks and retain evidence."""
+    from vllm.bridge_tp.controller.online_io import post_streaming_completion
+
+    seen: set[int] = set()
+    records = []
+    for request in requests:
+        prompt = request["prompt"]
+        if not isinstance(prompt, list) or not prompt:
+            raise ValueError("warmup needs actual prompt token IDs")
+        if len(prompt) in seen:
+            continue
+        seen.add(len(prompt))
+        payload = {
+            "model": request["model"], "prompt": prompt,
+            "max_tokens": 2, "temperature": 0.0,
+            "ignore_eos": False, "stream": True, "return_token_ids": True,
+        }
+        response = post_streaming_completion(
+            base_url, payload, timeout_s, lambda *_: None,
+        )
+        if response.get("finish_reason") not in {"stop", "length"}:
+            raise RuntimeError("pre-episode warmup did not complete")
+        records.append({"prompt_tokens": len(prompt), "response": response})
+        common.write_json(output, {
+            "format_version": 1, "excluded_from_measured_episode": True,
+            "base_url": base_url, "records": records,
+        })
+
+
+def initial_source_prompt_budget(
+    manifest: dict[str, Any], anchor: dict[str, Any], *,
+    total_tokens: int, guard_tokens: int, block_size: int,
+    minimum_headroom_tokens: int,
+) -> dict[str, Any]:
+    """Bound first-burst prompt occupation; runtime decode gates still apply."""
+    requests = [anchor] + [job["request"] for job in manifest["jobs"]
+                           if job["pool"] == "source" and job.get("wave", 0) == 0]
+    if block_size <= 0 or minimum_headroom_tokens < 0:
+        raise ValueError("invalid source prompt budget guard")
+    occupied = 0
+    for request in requests:
+        prompt = request["prompt"]
+        if not isinstance(prompt, list) or not prompt:
+            raise ValueError("source budget needs actual prompt token IDs")
+        occupied += ((len(prompt) + block_size - 1) // block_size) * block_size
+    headroom = total_tokens - guard_tokens - occupied
+    result = {
+        "total_tokens": total_tokens, "guard_tokens": guard_tokens,
+        "first_burst_source_requests_including_anchor": len(requests),
+        "first_burst_prompt_occupied_tokens": occupied,
+        "initial_headroom_tokens": headroom,
+        "minimum_initial_headroom_tokens": minimum_headroom_tokens,
+        "decode_growth_and_later_arrivals_not_reserved_here": True,
+    }
+    if headroom < minimum_headroom_tokens:
+        raise ValueError(f"initial source prompt headroom insufficient: {result}")
+    return result
 
 
 def measured_source_kv_blocks(log_path: Path, block_size: int) -> int:
@@ -726,6 +789,15 @@ def run(
             args.server_start_timeout_s,
         )
         print(f"[{run_id}] target TP4 healthy", flush=True)
+        if getattr(args, "pre_episode_warmup", False):
+            manifest = common.read_json(args.manifest)
+            anchor = common.read_json(source_request)
+            warmup_prompt_shapes(
+                f"http://127.0.0.1:{args.tp4_port}",
+                [anchor] + [job["request"] for job in manifest["jobs"]
+                            if job["pool"] == "target"],
+                provenance_dir / "target_warmup.json", args.run_timeout_s,
+            )
 
         if background_before_source:
             background = common.start_process(
@@ -792,6 +864,13 @@ def run(
             args.server_start_timeout_s,
         )
         print(f"[{run_id}] source TP1 healthy", flush=True)
+        if getattr(args, "pre_episode_warmup", False):
+            warmup_prompt_shapes(
+                f"http://127.0.0.1:{args.tp1_port}",
+                [anchor] + [job["request"] for job in manifest["jobs"]
+                            if job["pool"] == "source"],
+                provenance_dir / "source_warmup.json", args.run_timeout_s,
+            )
         if bool(getattr(args, "manager_m5_predictor_shadow", False)):
             measured_blocks = apply_measured_source_kv_capacity(
                 config_path, provenance_dir, source.log_path
@@ -800,6 +879,20 @@ def run(
                 f"[{run_id}] source TP1 measured KV blocks: {measured_blocks}",
                 flush=True,
             )
+            minimum_headroom = getattr(
+                args, "minimum_initial_source_headroom_tokens", None,
+            )
+            if minimum_headroom is not None:
+                config = common.read_json(config_path)
+                budget = initial_source_prompt_budget(
+                    common.read_json(args.manifest),
+                    common.read_json(source_request),
+                    total_tokens=measured_blocks * int(config["block_size"]),
+                    guard_tokens=guard, block_size=int(config["block_size"]),
+                    minimum_headroom_tokens=minimum_headroom,
+                )
+                common.write_json(provenance_dir / "source_prompt_budget.json",
+                                  budget)
             sampler = SourceGpuMemorySampler(
                 int(args.tp1_gpu), controller_dir / "source_gpu_memory_samples.jsonl"
             )

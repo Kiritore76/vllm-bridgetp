@@ -27,11 +27,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.bridge_tp.experiment_m1_wait import (  # noqa: E402
     M1PredictorRefreshGate,
 )
+from tools.bridge_tp.experiment_probability_gate import (  # noqa: E402
+    ProbabilityGate,
+    source_load_eligibility,
+)
 from tools.bridge_tp.risk_observation import build_risk_observation  # noqa: E402
 from tools.bridge_tp.risk_urgency import (  # noqa: E402
-    DecodeRateTracker, build_snapshot,
+    DecodeRateTracker,
+    build_snapshot,
 )
-from tools.bridge_tp.experiment_probability_gate import ProbabilityGate  # noqa: E402
 from vllm.bridge_tp.controller.action_adapter import (  # noqa: E402
     ActionAdapter,
     ActionError,
@@ -42,6 +46,12 @@ from vllm.bridge_tp.controller.capacity_signal import (  # noqa: E402
     CapacitySignal,
 )
 from vllm.bridge_tp.controller.config import ControllerConfig  # noqa: E402
+from vllm.bridge_tp.controller.events import (  # noqa: E402
+    Action,
+    MigrationState,
+    SourceRequestView,
+    TriggerPath,
+)
 from vllm.bridge_tp.controller.manager_m0 import (  # noqa: E402
     ChannelRegistry,
     M0ExecutorAdapter,
@@ -67,12 +77,6 @@ from vllm.bridge_tp.controller.manager_m4 import (  # noqa: E402
 )
 from vllm.bridge_tp.controller.manager_m5 import (  # noqa: E402
     PredictorEventReader,
-)
-from vllm.bridge_tp.controller.events import (  # noqa: E402
-    Action,
-    MigrationState,
-    SourceRequestView,
-    TriggerPath,
 )
 from vllm.bridge_tp.controller.online_io import (  # noqa: E402
     ProxyRecorder,
@@ -174,6 +178,7 @@ def parse_args() -> argparse.Namespace:
         help="record predecision capacity features without changing actions",
     )
     parser.add_argument("--probability-threshold", type=float)
+    parser.add_argument("--probability-min-source-running", type=int, default=0)
     parser.add_argument("--probability-threshold-family", type=float, nargs="*",
                         default=[])
     parser.add_argument("--probability-assigned-action", choices=("START", "STAY"))
@@ -188,7 +193,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--m1-source-release-tail-s", type=float,
-        help="diagnostic tail allowance after estimated history copy until TP1 KV release",
+        help=("diagnostic tail allowance after estimated history copy "
+              "until TP1 KV release"),
     )
     parser.add_argument(
         "--manager-m2-rate",
@@ -310,6 +316,10 @@ def parse_args() -> argparse.Namespace:
             parser.error("M1 auto-start requires source KV release tail allowance")
     if args.paired_stay and not args.manager_m1_auto_start:
         parser.error("paired STAY requires M1 auto-start for comparable evidence")
+    if args.probability_min_source_running < 0 or (
+        args.probability_min_source_running and args.probability_threshold is None
+    ):
+        parser.error("source concurrency selection requires probability collection")
     if args.probability_threshold is not None and (
         not args.manager_m1_auto_start or not args.manager_m5_predictor_shadow
         or args.experiment_m1_action or args.paired_stay
@@ -333,16 +343,13 @@ def parse_args() -> argparse.Namespace:
         parser.error("M2 rate requires M1 auto-start and M0 snapshots")
     if args.manager_m2_force_initial_high and not args.manager_m2_rate:
         parser.error("M2 forced HIGH requires --manager-m2-rate")
-    if args.manager_m3_commit:
-        if not (
-            args.manager_m2_rate
-            and args.diagnostic_earliest_ready_cutover
-            and args.handoff_mode == "shadow-only"
-            and args.gpu_resident_shadow
-        ):
-            parser.error(
-                "M3 requires M1/M2 GPU-resident Shadow-only earliest-ready"
-            )
+    if args.manager_m3_commit and not (
+        args.manager_m2_rate
+        and args.diagnostic_earliest_ready_cutover
+        and args.handoff_mode == "shadow-only"
+        and args.gpu_resident_shadow
+    ):
+        parser.error("M3 requires M1/M2 GPU-resident Shadow-only earliest-ready")
     if args.manager_m4_cancel and not args.manager_m3_commit:
         parser.error("M4 cancel requires M3 earliest-ready commit")
     if args.diagnostic_m1_max_source_free_kv_tokens is not None and (
@@ -1055,8 +1062,8 @@ def step_shadow(
                 )
             ):
                 late_candidate_reason = (
-                    "initial history became resident too late for the "
-                    f"candidate: output={request.output_tokens}, "
+                    "safe cutover publication lead exhausted after history "
+                    f"became resident: output={request.output_tokens}, "
                     f"candidate={candidate}"
                 )
             else:
@@ -1641,6 +1648,7 @@ def main() -> None:
                 "risk_observation_shadow": args.risk_observation_shadow,
                 "experiment_m1_action": args.experiment_m1_action,
                 "probability_threshold": args.probability_threshold,
+                "probability_min_source_running": args.probability_min_source_running,
                 "probability_threshold_family": args.probability_threshold_family,
                 "probability_assigned_action": args.probability_assigned_action,
                 "probability_assignment_seed": args.probability_assignment_seed,
@@ -1858,7 +1866,12 @@ def main() -> None:
                     risk_snapshot["tick"] = tick
                     audit.write(risk_snapshot)
                     if probability_gate is not None:
-                        gate_row = probability_gate.observe(risk_snapshot, tick)
+                        eligibility_errors = source_load_eligibility(
+                            m1_snapshot.to_json(), args.probability_min_source_running,
+                        )
+                        gate_row = probability_gate.observe(
+                            risk_snapshot, tick, eligibility_errors,
+                        )
                         # Replace only admission; M2/M3/M4 and rank readiness
                         # still execute unchanged. Old length/load soft rules
                         # are observations, not experimental feasibility.
