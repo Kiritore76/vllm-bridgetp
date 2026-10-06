@@ -9,6 +9,7 @@ configured minimum output token is an eligibility gate, not an exact action.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import random
@@ -27,6 +28,7 @@ from tools.bridge_tp.run_goodoutput_matrix_a100 import (  # noqa: E402
     verify,
     write_json,
 )
+from tools.bridge_tp.horizon_goodoutput import score_horizon  # noqa: E402
 
 SEED = 20261004
 CASES = (
@@ -54,6 +56,9 @@ def parse_args() -> argparse.Namespace:
                         help="Record actual AutoDL host/UUIDs; require five idle A100s")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--probability-pilot", action="store_true")
+    parser.add_argument("--probability-thresholds", type=float, nargs="+",
+                        default=[0.0, 0.01, 0.05, 0.2])
     parser.add_argument("--paired-only", action="store_true",
                         help="Collect STAY and early128 without the late EOS arm")
     parser.add_argument("--timing-pilot", action="store_true",
@@ -106,16 +111,27 @@ def parse_args() -> argparse.Namespace:
 
 
 def select_inputs(path: Path, seed: int = SEED,
-                  p03_anchor_id: str | None = None) -> list[dict[str, Any]]:
+                  p03_anchor_id: str | None = None,
+                  all_held_out: bool = False) -> list[dict[str, Any]]:
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8")
             .splitlines() if line.strip()]
     tree_splits: dict[str, str] = {}
+    content_splits: dict[str, str] = {}
     for row in rows:
         tree_id = str(row.get("source_tree_id") or row["id"])
         split = str(row.get("split"))
         if tree_id in tree_splits and tree_splits[tree_id] != split:
             raise ValueError(f"request tree crosses dataset splits: {tree_id}")
         tree_splits[tree_id] = split
+        if all_held_out:
+            content = json.dumps(row.get("messages", row.get("prompt")),
+                                 sort_keys=True, ensure_ascii=False)
+            digest = hashlib.sha256(content.encode()).hexdigest()
+            for key in (digest, row.get("original_prompt_sha256")):
+                if key is not None:
+                    if key in content_splits and content_splits[key] != split:
+                        raise ValueError("request content crosses predictor splits")
+                    content_splits[key] = split
     test = [row for row in rows if row.get("split") == "test"
             and row.get("workload_group") in {"natural", "long_form"}
             and (p03_anchor_id is None
@@ -150,7 +166,7 @@ def select_inputs(path: Path, seed: int = SEED,
     required = sum(source + target for _, source, target, *_ in CASES)
     if len(others) < required:
         raise ValueError(f"pilot needs {required} unique background requests")
-    selected = anchors + others[:required]
+    selected = anchors + (others if all_held_out else others[:required])
     if len({str(row["id"]) for row in selected}) != len(selected):
         raise ValueError("pilot request IDs are not unique")
     return selected
@@ -190,7 +206,8 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
     from transformers import AutoTokenizer
 
     seed = getattr(args, "seed", SEED)
-    rows = select_inputs(args.input, seed, getattr(args, "p03_anchor_id", None))
+    rows = select_inputs(args.input, seed, getattr(args, "p03_anchor_id", None),
+                         getattr(args, "probability_pilot", False))
     tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
 
     def tokens(row: dict[str, Any]) -> list[int]:
@@ -210,8 +227,13 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
         "manifests": {}, "anchors": {}, "cases": [],
     }
     cursor = len(CASES)
+    rotation_cursor = sum(row[1] + row[2] for row in CASES) + len(CASES)
     for index, (name, source_count, target_count, target_spacing,
                 source_spacing) in enumerate(CASES):
+        if (getattr(args, "probability_pilot", False) and args.cases
+                and name not in args.cases):
+            cursor += source_count + target_count
+            continue
         arrival_rng = random.Random(f"{seed}:{name}:arrivals")
         offsets: dict[str, list[float]] = {}
         for pool, count, spacing, initial in (
@@ -266,6 +288,14 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
             "max_tokens": anchor_cap,
             "total_max_tokens": total_budget,
             "workload_group": anchor["workload_group"],
+            "source_tree_id": anchor.get("source_tree_id", anchor["id"]),
+            "controller_split": "engineering_pilot_not_final_test",
+            "messages_sha256": hashlib.sha256(json.dumps(
+                anchor.get("messages", anchor.get("prompt")), sort_keys=True,
+                ensure_ascii=False).encode()).hexdigest(),
+            "prompt_token_ids_sha256": hashlib.sha256(json.dumps(
+                anchor_tokens).encode()).hexdigest(),
+            "input_augmentation": anchor.get("augmentation"),
         }
         jobs = []
         chosen = rows[cursor:cursor + source_count + target_count]
@@ -280,8 +310,10 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
                     and getattr(args, "source_prompt_tokens", None) is not None
                     else tokens(row)
                 )
+                pool_context = (source_max_model_len if pool == "source"
+                                else target_max_model_len)
                 background_cap = (
-                    min(8192 - len(prompt_tokens), 8192 - 128)
+                    min(pool_context - len(prompt_tokens), pool_context - 128)
                     if getattr(args, "background_context_limit", False)
                     else getattr(args, "background_max_tokens", 2048)
                 )
@@ -289,7 +321,7 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
                         args, "source_background_max_tokens", None) is not None):
                     background_cap = args.source_background_max_tokens
                 if (background_cap <= 0
-                        or len(prompt_tokens) + background_cap > 8192):
+                        or len(prompt_tokens) + background_cap > pool_context):
                     raise ValueError(f"background exceeds context: {row['id']}")
                 job = {
                     "job_id": f"{pool}_{job_index:03d}", "pool": pool,
@@ -301,6 +333,8 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
                         "temperature": 0.0,
                     },
                     "input_id": row["id"],
+                    "source_tree_id": row.get("source_tree_id", row["id"]),
+                    "input_augmentation": row.get("augmentation"),
                     "workload_group": (
                         "augmented_long_context_natural_eos"
                         if pool == "source"
@@ -338,6 +372,34 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
                     break
                 for job, planned in scheduled:
                     copy = dict(job)
+                    if wave > 0 and getattr(args, "probability_pilot", False):
+                        # Rotate distinct held-out content, never duplicate
+                        # one tiny prompt set to claim independent coverage.
+                        if rotation_cursor >= len(rows):
+                            raise ValueError(
+                                "held-out pool exhausted; shorten arrival window"
+                            )
+                        rotated = rows[rotation_cursor]
+                        rotation_cursor += 1
+                        copy["request"] = dict(job["request"])
+                        copy["request"]["prompt"] = tokens(rotated)
+                        pool_context = (
+                            source_max_model_len
+                            if job["pool"] == "source"
+                            else target_max_model_len
+                        )
+                        copy["request"]["max_tokens"] = min(
+                            job["request"]["max_tokens"],
+                            pool_context - len(copy["request"]["prompt"]),
+                        )
+                        if copy["request"]["max_tokens"] <= 0:
+                            raise ValueError("rotated request exceeds context")
+                        copy["input_id"] = rotated["id"]
+                        copy["source_tree_id"] = rotated.get(
+                            "source_tree_id", rotated["id"]
+                        )
+                        copy["workload_group"] = rotated["workload_group"]
+                        copy["input_augmentation"] = rotated.get("augmentation")
                     copy["job_id"] = f"{job['job_id']}_wave{wave:03d}"
                     copy["start_after_s"] = round(planned, 3)
                     copy["wave"] = wave
@@ -381,6 +443,15 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
                 if arrival_window_s is not None else None),
             "jobs": jobs,
         }
+        if getattr(args, "probability_pilot", False) and name == "p00_source1_target2":
+            jobs = [job for job in jobs if job["pool"] == "source"]
+            manifest.update(jobs=jobs, target_count=0,
+                            target_idle_override=True)
+        for job in jobs:
+            job["prompt_token_ids_sha256"] = hashlib.sha256(json.dumps(
+                job["request"]["prompt"]).encode()).hexdigest()
+        manifest["distinct_input_ids"] = len({job["input_id"] for job in jobs})
+        manifest["distinct_source_trees"] = len({job["source_tree_id"] for job in jobs})
         manifest_path = root / "inputs" / f"{name}.json"
         write_json(manifest_path, manifest)
         setup["manifests"][name] = {
@@ -391,13 +462,14 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
             "target_jobs": sum(job["pool"] == "target" for job in jobs),
         }
         setup["cases"].append(name)
-    if cursor != len(rows):
+    if cursor != sum(row[1] + row[2] for row in CASES) + len(CASES):
         raise ValueError("pilot selection was not consumed exactly once")
     return setup
 
 
 def configure_action(command: list[str], action: str) -> None:
-    if action not in ACTIONS + TIMING_ACTIONS:
+    probability_arm = action.startswith("prob_")
+    if action not in ACTIONS + TIMING_ACTIONS and not probability_arm:
         raise ValueError(f"unknown pilot action: {action}")
     for flag in ("--manager-m2-force-initial-high",):
         command.remove(flag)
@@ -405,6 +477,17 @@ def configure_action(command: list[str], action: str) -> None:
                  "--manager-m2-min-history-byte-frac"):
         index = command.index(flag)
         del command[index:index + 2]
+    if probability_arm:
+        _, threshold, assigned = action.split("_")
+        if assigned not in {"START", "STAY"} or not 0 <= float(threshold) <= 1:
+            raise ValueError("invalid probability arm")
+        if "--paired-stay" in command:
+            command.remove("--paired-stay")
+        command[command.index("--m1-min-output-tokens") + 1] = "0"
+        command += ["--minimum-window-samples", "0",
+                    "--probability-threshold", threshold,
+                    "--probability-assigned-action", assigned]
+        return
     threshold = 1024 if action == "late1024" else 128
     replacements = {
         "--m1-min-output-tokens": str(threshold),
@@ -585,6 +668,12 @@ def collect_arm(args: argparse.Namespace, root: Path,
         command.extend(("--anchor-total-max-tokens", str(
             setup["anchors"][name]["total_max_tokens"])))
     configure_action(command, action)
+    if getattr(args, "probability_pilot", False):
+        if name == "p00_source1_target2":
+            command[command.index("--minimum-ready-target-jobs") + 1] = "0"
+        command += ["--probability-assignment-seed", f"{args.seed}:{name}:{action}",
+                    "--probability-threshold-family",
+                    *(str(x) for x in args.probability_thresholds)]
     if args.risk_observation_shadow:
         command.append("--risk-observation-shadow")
     if args.cross_context_smoke:
@@ -644,6 +733,39 @@ def collect_arm(args: argparse.Namespace, root: Path,
                        for row in background.get("results", [])}
     }
     observed = observed_action(run, paired_stay=action == "stay")
+    if getattr(args, "probability_pilot", False):
+        audit_rows = [
+            json.loads(line)
+            for line in (run / "controller" / "phase9_audit.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        ]
+        gates = [
+            r for r in audit_rows if r.get("kind") == "experiment_probability_gate"
+        ]
+        executions = [
+            r for r in audit_rows if r.get("kind") == "experiment_probability_execution"
+        ]
+        observed["probability_candidate"] = next(
+            (r for r in gates if r.get("first_feasible_candidate")), None)
+        observed["actual_probability_executions"] = executions
+        observed["probability_gate_ticks"] = len(gates)
+        observed["probability_episode_outcome"] = (
+            "STARTED_SHADOW" if executions else
+            "ASSIGNED_STAY" if observed["probability_candidate"] else
+            "NO_FEASIBLE_CROSSING_BEFORE_EOS" if source.get("finish_reason") == "stop"
+            else "NO_START_CENSORED_OR_SERVICE_FAILURE"
+        )
+        observed["probability_crossings"] = [
+            {"tick": r["tick"], "thresholds": r["first_crossings_this_tick"],
+             "output_tokens": r["snapshot"]["generated_tokens"]}
+            for r in gates if r.get("first_crossings_this_tick")]
+        observed["safety_override_ticks"] = [r["tick"] for r in gates
+                                             if r.get("safety_override")]
+        observed["safety_protection_required_ticks"] = [
+            r["tick"] for r in gates if r.get("safety_protection_required")
+        ]
     acceptance_errors = observed.get("acceptance_errors") or []
     context_censored = is_context_censored(
         runner_rc=runner_rc, audit_rc=audit_rc, source=source,
@@ -683,12 +805,67 @@ def collect_arm(args: argparse.Namespace, root: Path,
         "background_max_schedule_lag_s": background.get(
             "max_schedule_lag_s"),
     }
+    if getattr(args, "probability_pilot", False):
+        horizon = score_horizon(slo, background, source, target, proxy,
+                                args.evaluation_horizon_s)
+        # A recorded request failure is a service result. An unrecognized
+        # runner rejection remains technical and is retained for diagnosis.
+        service_errors = {
+            "background jobs did not all complete",
+            "source did not naturally finish before its cap",
+            "unified response did not naturally finish before cap",
+        }
+        anchor_service_failure = (
+            source.get("failure_kind") == "SERVICE_REQUEST_FAILURE"
+            or target.get("failure_kind") == "SERVICE_REQUEST_FAILURE"
+        )
+        if (
+            anchor_service_failure
+            and not (run / "controller/session_manifest.json").exists()
+        ):
+            service_errors.update(
+                {
+                    "controller did not complete on TP1",
+                    "source did not finish its full capped output",
+                }
+            )
+        engineering_errors = [e for e in acceptance_errors if e not in service_errors]
+        technical = (
+            not horizon["eligible"]
+            or audit_rc != 0
+            or bool(engineering_errors)
+            or bool(runner_rc and not acceptance_errors and not anchor_service_failure)
+            or any(
+                response.get("failure_kind") == "TECHNICAL_INPUT_FAILURE"
+                for response in (source, target)
+            )
+        )
+        result.update(
+            {
+                "configured_eligibility_tokens": None,
+                "configured_probability_threshold": float(action.split("_")[1]),
+                "assigned_action": action.split("_")[2],
+                "assignment_probability": 0.5,
+                "episode_group_id": f"{args.seed}:{name}",
+                "horizon_score": horizon,
+                "fatal_error": technical,
+                "technical_errors": engineering_errors,
+                "anchor_service_failure": anchor_service_failure,
+                "fixed_horizon_eligible": horizon["eligible"] and not technical,
+                "fixed_horizon_goodoutput_tokens_s": (
+                    horizon["goodoutput_tokens_s"] if not technical else None
+                ),
+                "fixed_horizon_exclusions": {"technical_failure": technical},
+            }
+        )
     write_json(case_root / f"{action}.result.json", result)
     return result
 
 
 def fixed_horizon_result(result: dict[str, Any], horizon_s: float) -> None:
     """Score a fully drained natural-EOS arm on one common horizon."""
+    if "horizon_score" in result:
+        return
     metrics = result.get("slo_metrics") or {}
     wall_s = metrics.get("wall_time_s")
     good_tokens = metrics.get("good_output_tokens")
@@ -812,7 +989,103 @@ def timing_results(summary: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def probability_results(summary: dict[str, Any]) -> dict[str, Any]:
+    """One sample per intervention episode; repeated controls share a group."""
+    samples = []
+    for name, arms in summary["cases"].items():
+        for theta in summary["probability_thresholds"]:
+            start = arms.get(f"prob_{theta:g}_START", {})
+            stay = arms.get(f"prob_{theta:g}_STAY", {})
+            candidate = (start.get("observed_action") or {}).get(
+                "probability_candidate"
+            )
+            control = (stay.get("observed_action") or {}).get("probability_candidate")
+            start_g = start.get("fixed_horizon_goodoutput_tokens_s")
+            stay_g = stay.get("fixed_horizon_goodoutput_tokens_s")
+            executed = (start.get("observed_action") or {}).get(
+                "actual_probability_executions", []
+            )
+            valid = (
+                candidate is not None
+                and control is not None
+                and start_g is not None
+                and stay_g is not None
+                and bool(executed)
+                and not candidate.get("safety_override")
+                and not control.get("safety_override")
+            )
+            if any(
+                ((arm.get("observed_action") or {}).get("safety_override_ticks")
+                 or (arm.get("observed_action") or {}).get(
+                     "safety_protection_required_ticks"))
+                for arm in (start, stay)
+            ):
+                valid = False
+            samples.append(
+                {
+                    "episode_group_id": f"{summary['seed']}:{name}",
+                    "sample_id": f"{summary['seed']}:{name}:{theta:g}",
+                    "threshold": theta,
+                    "assignment_probability": 0.5,
+                    "effect_sample_eligible": valid,
+                    "policy_outcome_eligible": start_g is not None
+                    and stay_g is not None,
+                    "no_start_is_valid_policy_outcome": not executed,
+                    "start_candidate": candidate,
+                    "stay_candidate": control,
+                    "descriptive_delta_tokens_s": (start_g - stay_g if valid else None),
+                    "policy_delta_tokens_s": (
+                        start_g - stay_g
+                        if start_g is not None and stay_g is not None
+                        else None
+                    ),
+                    "predecision_generated_token_difference": (
+                        candidate["snapshot"]["generated_tokens"]
+                        - control["snapshot"]["generated_tokens"]
+                        if candidate and control
+                        else None
+                    ),
+                    "predecision_H_difference": (
+                        candidate["snapshot"]["H_tokens"]
+                        - control["snapshot"]["H_tokens"]
+                        if candidate and control
+                        else None
+                    ),
+                    "start_raw_path": f"{name}/prob_{theta:g}_START",
+                    "stay_raw_path": f"{name}/prob_{theta:g}_STAY",
+                }
+            )
+    return {
+        "status": "COLLECTOR_PILOT_NOT_FITTED_NET_BENEFIT",
+        "samples": samples,
+        "independent_grouping": "seed/request_tree/load_block",
+    }
+
+
 def execute_pilot(args: argparse.Namespace) -> None:
+    if args.probability_pilot:
+        if (
+            args.paired_only
+            or args.timing_pilot
+            or args.cross_context_smoke
+            or args.actions
+            or args.source_prompt_tokens is not None
+        ):
+            raise ValueError(
+                "probability pilot uses natural prompts and its own actions"
+            )
+        if (
+            not args.probability_thresholds
+            or 0 not in args.probability_thresholds
+            or len(set(args.probability_thresholds)) != len(args.probability_thresholds)
+            or len({f"{x:g}" for x in args.probability_thresholds})
+            != len(args.probability_thresholds)
+            or any(
+                not math.isfinite(x) or not 0 <= x <= 1
+                for x in args.probability_thresholds
+            )
+        ):
+            raise ValueError("pre-register unique finite thresholds including zero")
     if not 128 < args.max_model_len <= 32768:
         raise ValueError("source max model length must be in (128, 32768]")
     if (args.tp4_max_model_len is not None
@@ -860,12 +1133,17 @@ def execute_pilot(args: argparse.Namespace) -> None:
     selected_cases = list(args.cases or (row[0] for row in CASES))
     if len(selected_cases) != len(set(selected_cases)):
         raise ValueError("case names must be unique")
-    actions = (("now",) if args.cross_context_smoke else
+    actions = (tuple(f"prob_{theta:g}_{assignment}"
+                     for theta in args.probability_thresholds
+                     for assignment in ("START", "STAY")) if args.probability_pilot else
+               ("now",) if args.cross_context_smoke else
                tuple(args.actions) if args.actions else
                TIMING_ACTIONS if args.timing_pilot else
                ("stay", "early128") if args.paired_only else ACTIONS)
     preflight = verify(args)
     root = args.out_dir.resolve()
+    protocol = {k: str(v) if isinstance(v, Path) else v
+                for k, v in vars(args).items() if k not in {"resume"}}
     setup_path = root / "pilot_setup.json"
     if args.resume:
         if not setup_path.is_file():
@@ -875,16 +1153,22 @@ def execute_pilot(args: argparse.Namespace) -> None:
         if saved != preflight:
             raise ValueError("resume preflight differs from original run")
         setup = json.loads(setup_path.read_text(encoding="utf-8"))
+        if args.probability_pilot and json.loads((root / "protocol.json").read_text(
+                encoding="utf-8")) != protocol:
+            raise ValueError("resume probability protocol differs")
     else:
         if root.exists():
             raise ValueError(f"pilot output directory exists: {root}")
         root.mkdir(parents=True)
         write_json(root / "preflight.json", preflight)
+        write_json(root / "protocol.json", protocol)
         setup = build_setup(args, root)
         write_json(setup_path, setup)
     summary: dict[str, Any] = {
         "format_version": 1, "status": "PILOT_IN_PROGRESS",
         "seed": args.seed, "cases": {},
+        "probability_pilot": args.probability_pilot,
+        "probability_thresholds": args.probability_thresholds,
         "actions": actions,
         "evaluation_horizon_s": args.evaluation_horizon_s,
         "arrival_window_s": args.arrival_window_s,
@@ -996,6 +1280,8 @@ def execute_pilot(args: argparse.Namespace) -> None:
             write_json(root / "paired_outcomes.json", pair_results(summary))
         if args.timing_pilot:
             write_json(root / "timing_outcomes.json", timing_results(summary))
+        if args.probability_pilot:
+            write_json(root / "probability_outcomes.json", probability_results(summary))
         archive = root.with_suffix(".tar.gz")
         print(f"packing={root}", flush=True)
         with tarfile.open(archive, "w:gz") as handle:

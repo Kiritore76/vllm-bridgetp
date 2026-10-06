@@ -40,6 +40,7 @@ class RuntimeSnapshot:
     source_running: int | None = None
     source_waiting: int | None = None
     target_free_kv_tokens: int | None = None
+    target_prefill_pending_kv_tokens: int | None = None
     target_kv_usage_frac: float | None = None
     target_running: int | None = None
     target_waiting: int | None = None
@@ -286,6 +287,7 @@ def snapshot_from_telemetry(
         source_running=source.get("num_running"),
         source_waiting=source.get("num_waiting"),
         target_free_kv_tokens=free_tokens(target),
+        target_prefill_pending_kv_tokens=target.get("prefill_pending_kv_tokens"),
         target_kv_usage_frac=target.get("kv_usage_frac"),
         target_running=target.get("num_running"),
         target_waiting=target.get("num_waiting"),

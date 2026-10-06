@@ -28,6 +28,10 @@ from tools.bridge_tp.experiment_m1_wait import (  # noqa: E402
     M1PredictorRefreshGate,
 )
 from tools.bridge_tp.risk_observation import build_risk_observation  # noqa: E402
+from tools.bridge_tp.risk_urgency import (  # noqa: E402
+    DecodeRateTracker, build_snapshot,
+)
+from tools.bridge_tp.experiment_probability_gate import ProbabilityGate  # noqa: E402
 from vllm.bridge_tp.controller.action_adapter import (  # noqa: E402
     ActionAdapter,
     ActionError,
@@ -169,6 +173,13 @@ def parse_args() -> argparse.Namespace:
         "--risk-observation-shadow", action="store_true",
         help="record predecision capacity features without changing actions",
     )
+    parser.add_argument("--probability-threshold", type=float)
+    parser.add_argument("--probability-threshold-family", type=float, nargs="*",
+                        default=[])
+    parser.add_argument("--probability-assigned-action", choices=("START", "STAY"))
+    parser.add_argument("--probability-assignment-seed", default="0")
+    parser.add_argument("--probability-start-probability", type=float, default=0.5)
+    parser.add_argument("--risk-model-config-sha256")
     parser.add_argument("--experiment-m1-action", choices=("NOW", "WAIT"),
                         help="experimental migration timing against M5 refresh")
     parser.add_argument(
@@ -299,6 +310,12 @@ def parse_args() -> argparse.Namespace:
             parser.error("M1 auto-start requires source KV release tail allowance")
     if args.paired_stay and not args.manager_m1_auto_start:
         parser.error("paired STAY requires M1 auto-start for comparable evidence")
+    if args.probability_threshold is not None and (
+        not args.manager_m1_auto_start or not args.manager_m5_predictor_shadow
+        or args.experiment_m1_action or args.paired_stay
+        or args.diagnostic_m1_max_source_free_kv_tokens is not None
+    ):
+        parser.error("probability collection requires M1/M5 and its own assignment")
     if args.experiment_m1_action and (
         not args.manager_m1_auto_start or not args.manager_m5_predictor_shadow
         or args.paired_stay
@@ -505,12 +522,33 @@ def _start_target_if_ready(
     atomic_json_dump(target_request, run_dir / "target_request.json")
     adapter.mark_target_request_admitted(note=f"target admitted at cutover {cutover}")
     return executor.submit(
-        post_streaming_completion,
+        recorded_completion,
         target_url,
         target_request,
         request_timeout_s,
         recorder.on_target_token,
+        run_dir / "target_response.json",
+        recorder,
     )
+
+
+def recorded_completion(
+    base_url,
+    payload,
+    timeout_s,
+    token_sink,
+    response_path: Path,
+    recorder: ProxyRecorder,
+):
+    """Retain service failures and visible tokens even before the first tick."""
+    try:
+        return post_streaming_completion(
+            base_url, payload, timeout_s, token_sink, failure_path=response_path
+        )
+    finally:
+        atomic_json_dump(
+            recorder.stats(), response_path.parent / "response_proxy_stats.json"
+        )
 
 
 def step_local(
@@ -666,6 +704,14 @@ def step_local(
         cutover_output_tokens=cutover,
         note=trigger_reason,
     )
+    if trigger_reason.startswith("probability collector:"):
+        audit.write({
+            "kind": "experiment_probability_execution",
+            "actual_action": "START_SHADOW", "unix_s": now,
+            "observed_output_tokens": request.output_tokens,
+            "trigger_output_tokens": trigger,
+            "reason": trigger_reason,
+        })
     record.trigger_output_tokens = trigger
     record.cutover_output_tokens = (
         None if diagnostic_earliest_ready_cutover else cutover
@@ -1478,11 +1524,13 @@ def main() -> None:
     tick = 0
     with ThreadPoolExecutor(max_workers=2) as executor:
         source_future = executor.submit(
-            post_streaming_completion,
+            recorded_completion,
             config.source_url,
             source_request,
             args.request_timeout_s,
             recorder.on_source_token,
+            run_dir / "source_response.json",
+            recorder,
         )
         first_progress = wait_for_runtime_control(
             run_dir,
@@ -1546,6 +1594,14 @@ def main() -> None:
             M1PredictorRefreshGate(args.experiment_m1_action)
             if args.experiment_m1_action else None
         )
+        probability_gate = (
+            ProbabilityGate(
+                args.probability_threshold, args.probability_assignment_seed,
+                args.probability_start_probability, args.probability_assigned_action,
+                tuple(args.probability_threshold_family),
+            ) if args.probability_threshold is not None else None
+        )
+        candidate_rate_tracker = DecodeRateTracker()
         m0_collector = (
             RuntimeStateCollector()
             if manager_m0 is not None or manager_m1 is not None
@@ -1584,6 +1640,11 @@ def main() -> None:
                 "paired_stay": args.paired_stay,
                 "risk_observation_shadow": args.risk_observation_shadow,
                 "experiment_m1_action": args.experiment_m1_action,
+                "probability_threshold": args.probability_threshold,
+                "probability_threshold_family": args.probability_threshold_family,
+                "probability_assigned_action": args.probability_assigned_action,
+                "probability_assignment_seed": args.probability_assignment_seed,
+                "probability_start_probability": args.probability_start_probability,
                 "manager_m3_commit": args.manager_m3_commit,
                 "manager_m4_cancel": args.manager_m4_cancel,
                 "manager_m5_predictor_shadow": args.manager_m5_predictor_shadow,
@@ -1686,8 +1747,12 @@ def main() -> None:
                     headroom_tokens = (
                         pool1.free_kv_tokens
                         - config.capacity_pilot.guard_free_kv_tokens
+                        - pool1.prefill_pending_kv_tokens
+                        if pool1.prefill_pending_kv_tokens is not None else None
                     )
                     try:
+                        if headroom_tokens is None:
+                            raise ValueError("pending prefill reservation unavailable")
                         m5_row = manager_m5.advisory(
                             request.request_id, request.output_tokens, headroom_tokens,
                             max_output_tokens=int(source_request["max_tokens"]),
@@ -1708,7 +1773,8 @@ def main() -> None:
                     m5_row["survival_table_applicable_to_runtime_stop_rule"] = (
                         not bool(source_request["ignore_eos"])
                     )
-                    if m5_row["survival_table_in_support"]:
+                    if (m5_row["survival_table_in_support"]
+                            and headroom_tokens is not None):
                         m5_row["survival_table_p_remaining_gt_headroom"] = (
                             table.p_remaining_gt(
                                 request.output_tokens, headroom_tokens
@@ -1777,6 +1843,31 @@ def main() -> None:
                             reason="diagnostic source pressure gate not reached",
                         )
                     natural_decision = m1_start_decision
+                    risk_snapshot = build_snapshot(
+                        snapshot=m1_snapshot.to_json(), prediction=m5_row,
+                        candidate_rate=candidate_rate_tracker.update(
+                            m1_snapshot.unix_s, request.output_tokens),
+                        initial_rate=(initial_rate_preview.to_json()
+                                      if initial_rate_preview else {
+                                          "rate_bytes_s": rate.rate_bytes_s}),
+                        kv_bytes_per_token=config.policy.kv_bytes_per_token,
+                        release_tail_s=args.m1_source_release_tail_s,
+                        block_size=config.block_size,
+                        model_config_sha256=args.risk_model_config_sha256,
+                    ).to_json()
+                    risk_snapshot["tick"] = tick
+                    audit.write(risk_snapshot)
+                    if probability_gate is not None:
+                        gate_row = probability_gate.observe(risk_snapshot, tick)
+                        # Replace only admission; M2/M3/M4 and rank readiness
+                        # still execute unchanged. Old length/load soft rules
+                        # are observations, not experimental feasibility.
+                        m1_start_decision = replace(
+                            natural_decision,
+                            action=gate_row["requested_action"],
+                            reason="probability collector: " + gate_row["reason"],
+                        )
+                        audit.write(gate_row)
                     if experiment_gate is not None:
                         allowed, gate_reason = experiment_gate.decide(
                             m1_action=natural_decision.action,
@@ -1826,7 +1917,9 @@ def main() -> None:
                                 if initial_rate_preview is not None else None
                             ),
                             assigned_action=(
-                                experiment_gate.action
+                                probability_gate.assigned_action
+                                if probability_gate is not None
+                                else experiment_gate.action
                                 if experiment_gate is not None
                                 else "STAY" if args.paired_stay else None
                             ),

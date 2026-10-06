@@ -265,6 +265,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manager-m4-cancel", action="store_true")
     parser.add_argument("--manager-m5-predictor-shadow", action="store_true")
     parser.add_argument("--risk-observation-shadow", action="store_true")
+    parser.add_argument("--probability-threshold", type=float)
+    parser.add_argument("--probability-threshold-family", type=float, nargs="*",
+                        default=[])
+    parser.add_argument("--probability-assigned-action", choices=("START", "STAY"))
+    parser.add_argument("--probability-assignment-seed", default="0")
+    parser.add_argument("--probability-start-probability", type=float, default=0.5)
     parser.add_argument("--experiment-m1-action", choices=("NOW", "WAIT"))
     parser.add_argument(
         "--paired-stay", action="store_true",
@@ -745,6 +751,15 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise ValueError(
             "M1 minimum output requires auto-start and at least 64 remaining tokens"
         )
+    if args.probability_threshold is not None and (
+        not math.isfinite(args.probability_threshold)
+        or not 0 <= args.probability_threshold <= 1
+        or not args.manager_m1_auto_start
+        or not args.manager_m5_predictor_shadow
+        or args.paired_stay or args.experiment_m1_action
+        or args.diagnostic_m1_max_source_free_kv_tokens is not None
+    ):
+        raise ValueError("probability collector requires its own valid M1/M5 gate")
     if args.diagnostic_m1_max_source_free_kv_tokens is not None and (
         not args.manager_m1_auto_start
         or not args.source_pressure
@@ -3838,6 +3853,11 @@ def main() -> None:
         ),
         "paired_stay": args.paired_stay,
         "experiment_m1_action": args.experiment_m1_action,
+        "probability_threshold": args.probability_threshold,
+        "probability_threshold_family": args.probability_threshold_family,
+        "probability_assigned_action": args.probability_assigned_action,
+        "probability_assignment_seed": args.probability_assignment_seed,
+        "probability_start_probability": args.probability_start_probability,
         "m1_source_release_tail_s": args.m1_source_release_tail_s,
         "manager_m2_rate": args.manager_m2_rate,
         "manager_m3_commit": args.manager_m3_commit,
@@ -4260,14 +4280,44 @@ def main() -> None:
                 if args.manager_m4_cancel:
                     controller_extra_args.append("--manager-m4-cancel")
                 if args.manager_m5_predictor_shadow:
-                    controller_extra_args.extend([
-                        "--manager-m5-predictor-shadow",
-                        "--predictor-event-path", str(predictor_event_path),
-                        "--predictor-checkpoint-sha256",
-                        args.predictor_checkpoint_sha256,
-                    ])
+                    controller_extra_args.extend(
+                        [
+                            "--manager-m5-predictor-shadow",
+                            "--predictor-event-path",
+                            str(predictor_event_path),
+                            "--predictor-checkpoint-sha256",
+                            args.predictor_checkpoint_sha256,
+                        ]
+                    )
                 if args.risk_observation_shadow:
                     controller_extra_args.append("--risk-observation-shadow")
+                if args.probability_threshold is not None:
+                    controller_extra_args.extend(
+                        [
+                            "--probability-threshold",
+                            str(args.probability_threshold),
+                            "--probability-assignment-seed",
+                            args.probability_assignment_seed,
+                            "--probability-start-probability",
+                            str(args.probability_start_probability),
+                            "--risk-model-config-sha256",
+                            common.sha256(args.model_path / "config.json"),
+                        ]
+                    )
+                    if args.probability_assigned_action:
+                        controller_extra_args.extend(
+                            [
+                                "--probability-assigned-action",
+                                args.probability_assigned_action,
+                            ]
+                        )
+                    if args.probability_threshold_family:
+                        controller_extra_args.extend(
+                            [
+                                "--probability-threshold-family",
+                                *(str(x) for x in args.probability_threshold_family),
+                            ]
+                        )
                 if args.paired_stay:
                     controller_extra_args.append("--paired-stay")
                 if args.anchor_total_max_tokens is not None:

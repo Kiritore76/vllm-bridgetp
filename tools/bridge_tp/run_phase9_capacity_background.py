@@ -257,6 +257,11 @@ def main() -> None:
                 "start_after_s": start_after_s,
                 "schedule_lag_s": schedule_lag_s,
                 "status": "FAILED",
+                "request_started_unix_s": request_started_unix_s,
+                "request_ended_unix_s": time.time(),
+                "output_tokens": len(token_times),
+                "token_times_unix_s": token_times,
+                "failure_kind": "SERVICE_REQUEST_FAILURE",
                 "error": f"{type(error).__name__}: {error}",
             }
             event({"kind": "job_end", **summary})
