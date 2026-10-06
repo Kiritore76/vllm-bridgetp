@@ -110,7 +110,13 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
     }
     measured = {name: sha256(path) for name, path in paths.items()}
     for name, digest in measured.items():
-        if digest != EXPECTED_SHAS[name]:
+        expected = EXPECTED_SHAS[name]
+        if name == "input" and getattr(args, "constructed_workload", False):
+            if not getattr(args, "probability_pilot", False):
+                raise ValueError(
+                    "constructed input is restricted to probability collection")
+            expected = getattr(args, "expected_input_sha256", None)
+        if digest != expected:
             raise ValueError(f"{name} SHA differs: {paths[name]} {digest}")
     if args.guard.read_text(encoding="utf-8").strip() != "8448":
         raise ValueError("guard value differs")
