@@ -19,6 +19,7 @@ from tools.bridge_tp.run_shadow_rate_load_matrix import (
 from tools.bridge_tp.run_shadow_strategy_online_validation import (
     accept_m1_stay,
     accept_paired_stay,
+    accept_source_eos_after_shadow,
     build_controller_config_overrides,
     controller_completion_errors,
     emitted_boundary_gap_ms,
@@ -161,6 +162,70 @@ class TestOnlineStrategyTiming(unittest.TestCase):
             self.assertEqual(
                 accept_paired_stay(controller, background, 1, 4096)["status"],
                 "FAIL",
+            )
+
+    def test_source_eos_after_shadow_requires_target_cleanup(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            controller, background = root / "controller", root / "background"
+            controller.mkdir()
+            background.mkdir()
+
+            def save(path: Path, value: dict) -> None:
+                path.write_text(json.dumps(value), encoding="utf-8")
+
+            save(background / "background_summary.json", {
+                "jobs": 1, "completed": 1, "failed": 0,
+            })
+            save(controller / "source_response.json", {
+                "token_ids": [10, 11], "finish_reason": "stop",
+            })
+            save(controller / "response_proxy_stats.json", {
+                "emitted_tokens": 2, "source_origin_tokens": 2,
+                "target_origin_tokens": 0, "committed": False,
+                "emitted": [
+                    {"token_id": 10, "origin": "source"},
+                    {"token_id": 11, "origin": "source"},
+                ],
+            })
+            save(controller / "runtime_control.json", {
+                "target_request_admitted": True,
+            })
+            save(controller / "source_cleanup_receipt.json", {
+                "status": "CLEANED",
+            })
+            save(controller / "takeover_state.json", {
+                "state": "CANCELLED", "source_abort_dispatched": False,
+                "source_continues_on_tp1": True,
+            })
+            save(controller / "target_cleanup_receipt.json", {
+                "status": "CLEANED",
+            })
+            save(controller / "session_manifest.json", {})
+            rows = [
+                {"kind": "manager_m1_earliest_ready_armed"},
+                {"kind": "transition", "to": "SHADOW"},
+                {"kind": "transition", "to": "READY_NOT_COMMITTED"},
+                {"kind": "transition", "to": "COMPLETED_ON_TP1"},
+                {"kind": "run_end", "final_state": "COMPLETED_ON_TP1",
+                 "trigger_path": "MANAGER_M1_START"},
+            ]
+            (controller / "phase9_audit.jsonl").write_text(
+                "\n".join(map(json.dumps, rows)), encoding="utf-8"
+            )
+            accepted = accept_source_eos_after_shadow(
+                controller, background, 1, 4096
+            )
+            self.assertEqual(accepted["status"], "PASS")
+            self.assertEqual(accepted["outcome"], "NATURAL_EOS_AFTER_SHADOW")
+            (controller / "target_cleanup_receipt.json").unlink()
+            rejected = accept_source_eos_after_shadow(
+                controller, background, 1, 4096
+            )
+            self.assertEqual(rejected["status"], "FAIL")
+            self.assertIn(
+                "admitted TP4 Shadow request was not cleaned",
+                rejected["errors"],
             )
 
     def test_source_readiness_requires_active_source_tokens(self) -> None:

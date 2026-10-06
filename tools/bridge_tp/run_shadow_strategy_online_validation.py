@@ -1139,7 +1139,10 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
     rows: list[dict[str, Any]] = []
     for run in runs:
         acceptance = run["acceptance"]
-        if acceptance.get("outcome") == "NATURAL_EOS_BEFORE_MIGRATION":
+        if acceptance.get("outcome") in {
+            "NATURAL_EOS_BEFORE_MIGRATION",
+            "NATURAL_EOS_AFTER_SHADOW",
+        }:
             continue
         ready_event_waits = [
             float(value)
@@ -1836,6 +1839,88 @@ def accept_paired_stay(
         "natural_start_decisions": natural_starts,
         "interventions": len(interventions),
         "final_state": endings[0].get("final_state") if endings else None,
+        "background_completed": background.get("completed"),
+        "errors": errors,
+    }
+
+
+def accept_source_eos_after_shadow(
+    controller_dir: Path,
+    background_dir: Path,
+    expected_jobs: int,
+    expected_anchor_tokens: int,
+) -> dict[str, Any]:
+    """Accept source EOS after Shadow began but before any takeover."""
+    def optional_json(name: str) -> dict[str, Any]:
+        path = controller_dir / name
+        return common.read_json(path) if path.is_file() else {}
+
+    background_path = background_dir / "background_summary.json"
+    background = (
+        common.read_json(background_path) if background_path.is_file() else {}
+    )
+    source = optional_json("source_response.json")
+    proxy = optional_json("response_proxy_stats.json")
+    control = optional_json("runtime_control.json")
+    target_cleanup = optional_json("target_cleanup_receipt.json")
+    source_cleanup = optional_json("source_cleanup_receipt.json")
+    takeover = optional_json("takeover_state.json")
+    audit_path = controller_dir / "phase9_audit.jsonl"
+    audit = _load_rows(audit_path) if audit_path.is_file() else []
+    transitions = [
+        row.get("to") for row in audit if row.get("kind") == "transition"
+    ]
+    endings = [row for row in audit if row.get("kind") == "run_end"]
+    source_ids = source.get("token_ids") or []
+    emitted = proxy.get("emitted") or []
+    errors: list[str] = []
+    if (background.get("jobs") != expected_jobs
+            or background.get("completed") != expected_jobs
+            or background.get("failed") != 0):
+        errors.append("background jobs did not all complete")
+    if (source.get("finish_reason") != "stop"
+            or not 1 <= len(source_ids) < expected_anchor_tokens):
+        errors.append("source did not naturally finish before its cap")
+    if (proxy.get("emitted_tokens") != len(source_ids)
+            or proxy.get("source_origin_tokens") != len(source_ids)
+            or proxy.get("target_origin_tokens") != 0
+            or proxy.get("committed") is not False
+            or [row.get("token_id") for row in emitted] != source_ids
+            or any(row.get("origin") != "source" for row in emitted)):
+        errors.append("visible response differs from the TP1 response")
+    if (not transitions or transitions[0] != "SHADOW"
+            or transitions[-1] != "COMPLETED_ON_TP1"
+            or any(state in {"TAKEOVER", "HANDOFF"} for state in transitions)):
+        errors.append("controller did not finish Shadow on TP1")
+    if (len(endings) != 1
+            or endings[0].get("final_state") != "COMPLETED_ON_TP1"
+            or endings[0].get("trigger_path") != "MANAGER_M1_START"):
+        errors.append("controller termination lacks M1 source-EOS evidence")
+    if not any(row.get("kind") == "manager_m1_earliest_ready_armed"
+               for row in audit):
+        errors.append("M1 did not start Shadow")
+    if (controller_dir / "cutover_manifest.json").exists():
+        errors.append("source-EOS arm recorded a cutover")
+    if (controller_dir / "target_response.json").exists():
+        errors.append("source-EOS arm recorded a target response")
+    if (controller_dir / "request_frozen_receipt.json").exists():
+        errors.append("source-EOS arm froze the TP1 request")
+    if (takeover.get("state") != "CANCELLED"
+            or takeover.get("source_abort_dispatched") is not False
+            or takeover.get("source_continues_on_tp1") is not True
+            or source_cleanup.get("status") != "CLEANED"):
+        errors.append("source cleanup did not preserve TP1 ownership")
+    target_admitted = control.get("target_request_admitted") is True
+    if target_admitted and target_cleanup.get("status") != "CLEANED":
+        errors.append("admitted TP4 Shadow request was not cleaned")
+    return {
+        "format_version": 1,
+        "status": "PASS" if not errors else "FAIL",
+        "outcome": "NATURAL_EOS_AFTER_SHADOW",
+        "source_origin_tokens": len(source_ids),
+        "target_origin_tokens": 0,
+        "target_request_admitted": target_admitted,
+        "target_cleanup_status": target_cleanup.get("status"),
         "background_completed": background.get("completed"),
         "errors": errors,
     }
@@ -3988,6 +4073,14 @@ def main() -> None:
                             natural_eos_anchor=True,
                         )
                         accepted["outcome"] = "NATURAL_EOS_BEFORE_MIGRATION"
+                    elif (args.natural_eos_anchor
+                          and args.manager_m1_auto_start
+                          and (controller_dir / "session_manifest.json").exists()
+                          and not (controller_dir / "cutover_manifest.json").exists()):
+                        accepted = accept_source_eos_after_shadow(
+                            controller_dir, background_dir,
+                            expected_jobs, expected_anchor_tokens,
+                        )
                     elif args.manager_m4_expect_cancel:
                         accepted = accept_m4_cancel(
                             controller_dir, background_dir,

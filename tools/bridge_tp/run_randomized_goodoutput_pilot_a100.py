@@ -507,6 +507,7 @@ def observed_action(run: Path, *, paired_stay: bool = False) -> dict[str, Any]:
         "handoff_stall_ms": accepted.get("handoff_stall_ms"),
         "acceptance_status": accepted.get("status"),
         "acceptance_errors": accepted.get("errors"),
+        "outcome": accepted.get("outcome"),
     }
 
 
