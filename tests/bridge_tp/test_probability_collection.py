@@ -15,7 +15,13 @@ from tools.bridge_tp.horizon_goodoutput import score_horizon
 from tools.bridge_tp.risk_urgency import build_snapshot, remaining_ge_bounds
 from tools.bridge_tp.run_randomized_goodoutput_pilot_a100 import (
     build_setup,
+    collect_arm,
     configure_action,
+    probability_artifact_errors,
+    probability_results,
+)
+from tools.bridge_tp.run_randomized_goodoutput_pilot_a100 import (
+    parse_args as parse_pilot_args,
 )
 
 
@@ -63,6 +69,173 @@ def risk(growth=10, speed=10, pending=0, pred=None):
 
 
 class TestProbabilityCollection(unittest.TestCase):
+    def pilot_fixture(self, root, name, target_count):
+        files = {}
+        for key in (
+            "model",
+            "input",
+            "base",
+            "survival",
+            "guard",
+            "checkpoint",
+            "reference",
+        ):
+            files[key] = root / key
+            files[key].write_text("8448" if key == "guard" else "{}")
+        argv = ["pilot", "--expected-revision", "test-head", "--out-dir", str(root)]
+        for key, path in files.items():
+            argv += [f"--{key}", str(path)]
+        argv += [
+            "--probability-pilot",
+            "--max-model-len",
+            "16384",
+            "--tp4-max-model-len",
+            "32768",
+            "--risk-observation-shadow",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = parse_pilot_args()
+        anchor = root / "anchor.json"
+        anchor.write_text(
+            json.dumps(
+                {
+                    "prompt": [11, 12],
+                    "max_tokens": 4096,
+                    "ignore_eos": False,
+                }
+            )
+        )
+        jobs = [
+            {
+                "job_id": f"{pool}-{i}",
+                "pool": pool,
+                "start_after_s": 0,
+                "request": {"model": "test", "prompt": [11], "max_tokens": 128},
+            }
+            for pool, count in (("source", 1), ("target", target_count))
+            for i in range(count)
+        ]
+        manifest = root / "manifest.json"
+        manifest.write_text(json.dumps({"format_version": 1, "jobs": jobs}))
+        setup = {
+            "anchors": {
+                name: {
+                    "path": str(anchor),
+                    "sha256": "anchor-sha",
+                    "prompt_tokens": 2,
+                    "max_tokens": 4096,
+                    "total_max_tokens": 4096,
+                }
+            },
+            "manifests": {name: {"path": str(manifest), "sha256": "manifest-sha"}},
+        }
+        return args, setup
+
+    def test_actual_probability_commands_validate_all_pilot_blocks(self):
+        from tools.bridge_tp import run_shadow_strategy_online_validation as online
+
+        for name, targets in (
+            ("p00_source1_target2", 0),
+            ("p02_source3_target8", 8),
+            ("p05_source5_target24", 24),
+        ):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                args, setup = self.pilot_fixture(root, name, targets)
+
+                def validate_command(command, log, args=args, targets=targets):
+                    with patch.object(sys, "argv", command[1:]):
+                        parsed = online.parse_args()
+                    hashes = {
+                        parsed.manifest: parsed.expected_manifest_sha256,
+                        parsed.guard_file: parsed.expected_guard_sha256,
+                        parsed.survival_table: parsed.expected_survival_sha256,
+                        parsed.predictor_checkpoint: parsed.predictor_checkpoint_sha256,
+                        parsed.anchor_request_file: (
+                            parsed.expected_anchor_request_sha256
+                        ),
+                    }
+                    with (
+                        patch.object(online, "os", SimpleNamespace(name="posix")),
+                        patch.object(online.common, "model_kv_geometry"),
+                        patch.object(online.common, "git", return_value="test-head"),
+                        patch.object(online.common, "sha256", side_effect=hashes.get),
+                        patch.object(online.common, "CONFIG_TEMPLATE", args.base),
+                        patch.object(online.common, "SOURCE_REQUEST", args.base),
+                        patch.object(
+                            online.subprocess,
+                            "run",
+                            return_value=SimpleNamespace(returncode=0),
+                        ),
+                    ):
+                        _, _, pressure = online.validate_inputs(parsed)
+                        self.assertEqual(pressure["target_jobs"], targets)
+                        if targets == 0:
+                            parsed.probability_threshold = None
+                            with self.assertRaisesRegex(
+                                ValueError, "target background"
+                            ):
+                                online.validate_inputs(parsed)
+                            parsed.probability_threshold = 0
+                            parsed.minimum_ready_target_jobs = 1
+                            with self.assertRaisesRegex(ValueError, "readiness gate"):
+                                online.validate_inputs(parsed)
+                    return 1  # No GPU launch; exercise the missing-evidence path.
+
+                for theta, assignment in itertools.product(
+                    (0, 0.001, 0.01, 0.05), ("START", "STAY")
+                ):
+                    action = f"prob_{theta:g}_{assignment}"
+                    with (
+                        self.subTest(name=name, action=action),
+                        patch(
+                            "tools.bridge_tp.run_randomized_goodoutput_pilot_a100.execute",
+                            side_effect=validate_command,
+                        ) as execute,
+                    ):
+                        result = collect_arm(args, root, setup, name, action)
+                        self.assertEqual(execute.call_count, 1)
+                        self.assertTrue(result["fatal_error"])
+                        self.assertFalse(result["fixed_horizon_eligible"])
+                        self.assertIsNone(result["fixed_horizon_goodoutput_tokens_s"])
+                        self.assertEqual(
+                            result["observed_action"]["probability_episode_outcome"],
+                            "TECHNICAL_FAILURE",
+                        )
+                        saved = root / name / f"{action}.result.json"
+                        self.assertEqual(json.loads(saved.read_text()), result)
+                        report = probability_results(
+                            {
+                                "seed": args.seed,
+                                "probability_thresholds": [theta],
+                                "cases": {name: {action: result}},
+                            }
+                        )
+                        self.assertFalse(report["samples"][0]["effect_sample_eligible"])
+
+    def test_probability_evidence_checks_parent_contract_and_corrupt_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory) / "r01_shadow_only"
+            run.mkdir()
+            (run.parent / "contract.json").write_text("{}")
+            for relative in (
+                "background/background_manifest.json",
+                "background/background_summary.json",
+                "controller/response_proxy_stats.json",
+                "controller/source_response.json",
+                "controller/phase9_audit.jsonl",
+            ):
+                path = run / relative
+                path.parent.mkdir(exist_ok=True)
+                path.write_text("{}")
+            self.assertEqual(probability_artifact_errors(run), [])
+            (run / "controller/phase9_audit.jsonl").write_text('{"kind":')
+            errors = probability_artifact_errors(run)
+            self.assertEqual(len(errors), 1)
+            self.assertIn(
+                "invalid run artifact: controller/phase9_audit.jsonl", errors[0]
+            )
+
     def test_partial_service_error_and_input_error_have_separate_receipts(self):
         import urllib.error
         from io import BytesIO
