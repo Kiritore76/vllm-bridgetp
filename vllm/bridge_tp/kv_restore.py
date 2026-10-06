@@ -233,9 +233,7 @@ def inject_rank_shard(
         if layer_trace_hook is not None:
             layer_trace_hook("AFTER_INDEX_SELECT", layer_name)
         expected = (
-            source
-            if source_tensor.device == destination.device
-            else source_tensor
+            source if source_tensor.device == destination.device else source_tensor
         )
         if expected.device != restored.device:
             restored = restored.cpu()
@@ -275,14 +273,23 @@ def inject_rank_delta(
         raise ValueError("Destination/delta layer names differ")
     if end_token > len(target_block_ids) * block_size:
         raise ValueError("Delta exceeds the reserved target block range")
+    if not delta_layers or len(set(target_block_ids)) != len(target_block_ids):
+        raise ValueError("Delta needs layers and unique target blocks")
+    if any(block < 0 for block in target_block_ids):
+        raise ValueError("Delta target blocks must be non-negative")
 
     raw_tensor_bytes = 0
     mismatch_count: torch.Tensor | None = None
+    slot_indices: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
     for layer_name, source_tensor in delta_layers.items():
         destination = destination_layers[layer_name]
         normalized_block_axis = (
             block_axis if block_axis >= 0 else destination.ndim + block_axis
         )
+        if not 0 <= normalized_block_axis < destination.ndim:
+            raise ValueError("Delta block axis is outside destination dimensions")
+        if max(target_block_ids) >= destination.shape[normalized_block_axis]:
+            raise ValueError("Delta target block is outside destination capacity")
         token_axes = [
             axis
             for axis, size in enumerate(destination.shape)
@@ -300,7 +307,8 @@ def inject_rank_delta(
 
         token_axis = token_axes[0]
         remaining_axes = [
-            axis for axis in range(destination.ndim)
+            axis
+            for axis in range(destination.ndim)
             if axis not in (normalized_block_axis, token_axis)
         ]
         block_major = destination.permute(
@@ -310,40 +318,29 @@ def inject_rank_delta(
         if tuple(source.shape[1:]) != tuple(block_major.shape[2:]):
             raise ValueError(f"Layer {layer_name} delta payload shape differs")
 
-        # Copy one contiguous slice per touched logical block.  The previous
-        # implementation launched one copy and retained one Python tensor view
-        # per token, which made a 64-token delta execute thousands of tiny CUDA
-        # operations across all layers.  At most the two edge blocks are
-        # partial; every interior block is copied as one block-sized slice.
-        layer_mismatches: torch.Tensor | None = None
-        first_block = start_token // block_size
-        final_block = (end_token - 1) // block_size
-        for logical_block in range(first_block, final_block + 1):
-            interval_start = max(start_token, logical_block * block_size)
-            interval_end = min(end_token, (logical_block + 1) * block_size)
-            token_count = interval_end - interval_start
-            source_offset = interval_start - start_token
-            block_offset = interval_start % block_size
-            destination_slice = block_major[
-                target_block_ids[logical_block],
-                block_offset:block_offset + token_count,
-            ]
-            source_slice = source.narrow(0, source_offset, token_count)
-            if destination_slice.shape != source_slice.shape:
-                raise ValueError(
-                    f"Layer {layer_name} delta shape differs for logical "
-                    f"block {logical_block}"
-                )
-            destination_slice.copy_(source_slice)
-            segment_mismatches = torch.count_nonzero(
-                destination_slice != source_slice
+        # Scatter every token slot in one operation per layer.  Index the
+        # permuted view directly: flatten/reshape can copy a strided KV layout
+        # and silently write outside the real cache.  Unique physical blocks
+        # make every (block, offset) destination unique; untouched edge slots
+        # and other requests remain intact.  Keep the full exact readback.
+        if destination.device not in slot_indices:
+            slots = range(start_token, end_token)
+            slot_indices[destination.device] = (
+                torch.tensor(
+                    [target_block_ids[token // block_size] for token in slots],
+                    device=destination.device,
+                    dtype=torch.long,
+                ),
+                torch.tensor(
+                    [token % block_size for token in slots],
+                    device=destination.device,
+                    dtype=torch.long,
+                ),
             )
-            layer_mismatches = (
-                segment_mismatches
-                if layer_mismatches is None
-                else layer_mismatches + segment_mismatches
-            )
-        assert layer_mismatches is not None
+        blocks, offsets = slot_indices[destination.device]
+        block_major.index_put_((blocks, offsets), source)
+        restored = block_major[blocks, offsets]
+        layer_mismatches = torch.count_nonzero(restored != source)
         mismatch_count = (
             layer_mismatches
             if mismatch_count is None
@@ -352,9 +349,7 @@ def inject_rank_delta(
         raw_tensor_bytes += source_tensor.numel() * source_tensor.element_size()
 
     if mismatch_count is not None and int(mismatch_count.item()) != 0:
-        raise ValueError(
-            f"delta readback differs for [{start_token}, {end_token})"
-        )
+        raise ValueError(f"delta readback differs for [{start_token}, {end_token})")
 
     return {
         "exact_readback": True,

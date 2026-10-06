@@ -46,6 +46,24 @@ def recipes(seed=1, split="engineering_train", backgrounds=120):
 
 
 class TestConstructedProbabilityWorkload(unittest.TestCase):
+    def test_source_and_target_contexts_are_independent(self):
+        rows = make_rows(
+            seed=1,
+            split="engineering_train",
+            anchor_prompt_tokens=8192,
+            background_prompt_tokens=4096,
+            target_prompt_tokens=1536,
+            anchor_sections=24,
+            background_sections=6,
+            backgrounds=120,
+        )
+        row = rows[6]
+        original = json.dumps(row, sort_keys=True)
+        self.assertEqual(len(constructed_prompt_tokens(TOKENIZER, row, "source")), 4096)
+        self.assertEqual(len(constructed_prompt_tokens(TOKENIZER, row, "target")), 1536)
+        self.assertEqual(json.dumps(row, sort_keys=True), original)
+        self.assertEqual(len(constructed_prompt_tokens(TOKENIZER, rows[0])), 8192)
+
     def test_constructed_sha_override_retains_frozen_model_and_checkpoint_checks(self):
         from tools.bridge_tp import run_goodoutput_matrix_a100 as matrix
 
