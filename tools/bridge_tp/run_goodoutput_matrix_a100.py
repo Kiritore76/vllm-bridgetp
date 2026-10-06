@@ -48,6 +48,15 @@ SCENARIOS = (
 )
 
 
+def guard_contract(args: argparse.Namespace) -> tuple[int, str]:
+    profile = getattr(args, "guard_profile", "legacy8448")
+    if profile == "legacy8448":
+        return 8448, EXPECTED_SHAS["guard"]
+    if profile == "reduced2000" and getattr(args, "probability_pilot", False):
+        return 2000, "1d8fa3c8ab49d50b30fccbbd901735d5896a5d7959a5ad7ccecb79c1c849cc66"
+    raise ValueError("guard profile requires an explicit probability pilot contract")
+
+
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -71,6 +80,7 @@ def expected_gpu_uuids(args: argparse.Namespace) -> list[str]:
 
 
 def verify(args: argparse.Namespace) -> dict[str, Any]:
+    guard_tokens, guard_sha = guard_contract(args)
     revision = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     if revision != args.expected_revision:
@@ -111,6 +121,8 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
     measured = {name: sha256(path) for name, path in paths.items()}
     for name, digest in measured.items():
         expected = EXPECTED_SHAS[name]
+        if name == "guard":
+            expected = guard_sha
         if name == "input" and getattr(args, "constructed_workload", False):
             if not getattr(args, "probability_pilot", False):
                 raise ValueError(
@@ -118,7 +130,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             expected = getattr(args, "expected_input_sha256", None)
         if digest != expected:
             raise ValueError(f"{name} SHA differs: {paths[name]} {digest}")
-    if args.guard.read_text(encoding="utf-8").strip() != "8448":
+    if args.guard.read_text(encoding="utf-8").strip() != str(guard_tokens):
         raise ValueError("guard value differs")
     return {
         "format_version": 1,
@@ -273,6 +285,7 @@ def execute(command: list[str], log_path: Path) -> int:
 
 def online_command(args: argparse.Namespace, setup: dict[str, Any],
                    name: str, arm: str, root: Path) -> list[str]:
+    guard_tokens, guard_sha = guard_contract(args)
     manifest = setup["manifests"][name]
     near_guard = name.startswith(("C_", "D_"))
     command = [
@@ -286,8 +299,8 @@ def online_command(args: argparse.Namespace, setup: dict[str, Any],
         "--expected-revision", args.expected_revision,
         "--expected-manifest-sha256", manifest["sha256"],
         "--expected-survival-sha256", EXPECTED_SHAS["survival"],
-        "--expected-guard-sha256", EXPECTED_SHAS["guard"],
-        "--expected-guard", "8448", "--tp1-blocks", "1968",
+        "--expected-guard-sha256", guard_sha,
+        "--expected-guard", str(guard_tokens), "--tp1-blocks", "1968",
         "--tp4-blocks", "35739", "--shadow-only-only",
         "--gpu-resident-shadow", "--gpu-direct-history",
         "--gpu-direct-history-pacing", "--gpu-direct-delta",

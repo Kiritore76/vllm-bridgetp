@@ -135,6 +135,18 @@ class TestConstructedProbabilityWorkload(unittest.TestCase):
                     return matrix.verify(args)
 
             self.assertEqual(check()["input_sha256"], "a" * 64)
+            args.guard_profile = "reduced2000"
+            guard.write_text("2000\n")
+            hashes[args.guard] = matrix.guard_contract(args)[1]
+            self.assertEqual(check()["sha256"]["guard"], matrix.guard_contract(args)[1])
+            guard.write_text("8448")
+            with self.assertRaisesRegex(ValueError, "guard value differs"):
+                check()
+            guard.write_text("2000\n")
+            hashes[args.guard] = matrix.EXPECTED_SHAS["guard"]
+            with self.assertRaisesRegex(ValueError, "guard SHA differs"):
+                check()
+            hashes[args.guard] = matrix.guard_contract(args)[1]
             args.expected_input_sha256 = "b" * 64
             with self.assertRaisesRegex(ValueError, "input SHA differs"):
                 check()

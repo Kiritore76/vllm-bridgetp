@@ -1,5 +1,6 @@
 """Checks for the exploratory A100 paired matrix driver."""
 
+import hashlib
 import json
 import sys
 import tempfile
@@ -11,6 +12,7 @@ from unittest import mock
 
 from tools.bridge_tp.run_goodoutput_matrix_a100 import (
     expected_gpu_uuids,
+    guard_contract,
     observed_pressure,
     online_command,
     prepare,
@@ -19,6 +21,18 @@ from tools.bridge_tp.run_goodoutput_matrix_a100 import (
 
 
 class TestObservedPressure(unittest.TestCase):
+    def test_reduced_guard_file_matches_frozen_contract(self):
+        args = SimpleNamespace(guard_profile="reduced2000", probability_pilot=True)
+        value, digest = guard_contract(args)
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "experiments/phase9/guard_free_kv_tokens_2000.txt"
+        )
+        contents = path.read_bytes().replace(b"\r\n", b"\n")
+        self.assertEqual(contents, b"2000\n")
+        self.assertEqual(value % 16, 0)
+        self.assertEqual(hashlib.sha256(contents).hexdigest(), digest)
+
     def test_near_guard_requires_fresh_anchor_telemetry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -140,6 +154,17 @@ class TestCommands(unittest.TestCase):
         self.assertEqual(pressure[index + 1], "3")
         index = stay.index("--minimum-ready-source-jobs")
         self.assertEqual(stay[index + 1], "0")
+        args.guard_profile = "reduced2000"
+        args.probability_pilot = True
+        reduced = online_command(args, setup, "A_safe_light", "stay", Path("new"))
+        self.assertEqual(reduced[reduced.index("--expected-guard") + 1], "2000")
+        self.assertEqual(
+            reduced[reduced.index("--expected-guard-sha256") + 1],
+            "1d8fa3c8ab49d50b30fccbbd901735d5896a5d7959a5ad7ccecb79c1c849cc66",
+        )
+        args.probability_pilot = False
+        with self.assertRaisesRegex(ValueError, "explicit probability"):
+            online_command(args, setup, "A_safe_light", "stay", Path("invalid"))
 
 
 if __name__ == "__main__":

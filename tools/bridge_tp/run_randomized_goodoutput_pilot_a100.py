@@ -57,6 +57,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--probability-pilot", action="store_true")
+    parser.add_argument("--guard-profile", choices=("legacy8448", "reduced2000"),
+                        default="legacy8448",
+                        help="Pin the guard value and file SHA for this collection")
     parser.add_argument("--pre-episode-warmup", action="store_true",
                         help="Warm prompt shapes before the measured workload")
     parser.add_argument("--minimum-initial-source-headroom-tokens", type=int)
