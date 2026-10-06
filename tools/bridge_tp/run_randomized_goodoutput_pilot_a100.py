@@ -916,6 +916,12 @@ def collect_arm(args: argparse.Namespace, root: Path,
         observed["safety_protection_required_ticks"] = [
             r["tick"] for r in gates if r.get("safety_protection_required")
         ]
+        observed["guard_deadline_warning_ticks"] = [
+            r["tick"] for r in gates if r.get("guard_deadline_warning")
+        ]
+        observed["source_guard_policy"] = sorted({
+            r.get("source_guard_policy", "LEGACY_GUARD_DEADLINE") for r in gates
+        })
     acceptance_errors = observed.get("acceptance_errors") or []
     context_censored = is_context_censored(
         runner_rc=runner_rc, audit_rc=audit_rc, source=source,

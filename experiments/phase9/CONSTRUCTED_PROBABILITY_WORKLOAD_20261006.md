@@ -1,5 +1,11 @@
 # Controlled construction for migration benefit fitting
 
+The source guard is now a warning rather than a START deadline in probability
+collection. See [the version 2 contract](SOURCE_GUARD_WARNING_POLICY_20261006.md).
+Missing the projected guard time does not prove OOM or prohibit Shadow; real
+capacity and four-rank execution gates remain enforced. Old archives retain
+their original version 1 labels.
+
 The user requested controlled artificial requests after the first F3 block
 provided inadequate guard-risk coverage. This is an engineering sampling
 change, not predictor retraining or a replacement of the frozen GoodOutput SLO.
