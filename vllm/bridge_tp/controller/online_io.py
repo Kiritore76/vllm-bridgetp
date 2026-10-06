@@ -46,6 +46,7 @@ def post_streaming_completion(
     payload: dict[str, Any],
     timeout_s: float,
     token_sink: TokenSink,
+    failure_path: Path | None = None,
 ) -> dict[str, Any]:
     """Consume one OpenAI-compatible SSE completion and expose each token."""
     request_started_monotonic = time.monotonic()
@@ -63,6 +64,24 @@ def post_streaming_completion(
     first_token_monotonic: float | None = None
     first_token_unix_s: float | None = None
     saw_done = False
+
+    def failure(detail: str, kind: str = "SERVICE_REQUEST_FAILURE") -> RuntimeError:
+        if failure_path is not None:
+            atomic_json_dump(
+                {
+                    "response_id": response_id,
+                    "token_ids": token_ids,
+                    "finish_reason": "error",
+                    "error": detail,
+                    "failure_kind": kind,
+                    "request_started_unix_s": request_started_unix_s,
+                    "completed_unix_s": time.time(),
+                    "chunks": chunks,
+                },
+                failure_path,
+            )
+        return RuntimeError(detail)
+
     try:
         with urllib.request.urlopen(request, timeout=timeout_s) as response:
             for raw_line in response:
@@ -75,7 +94,7 @@ def post_streaming_completion(
                     break
                 chunk = json.loads(data)
                 if "error" in chunk:
-                    raise RuntimeError(f"streaming completion error: {chunk['error']}")
+                    raise failure(f"streaming completion error: {chunk['error']}")
                 chunks.append(chunk)
                 response_id = chunk.get("id", response_id)
                 choices = chunk.get("choices") or []
@@ -94,15 +113,16 @@ def post_streaming_completion(
                     finish_reason = str(choice["finish_reason"])
     except urllib.error.HTTPError as error:  # pragma: no cover - server path
         body = error.read().decode(errors="replace")
-        raise RuntimeError(
-            f"completion request to {base_url} failed: HTTP {error.code}: {body}"
+        raise failure(
+            f"completion request to {base_url} failed: HTTP {error.code}: {body}",
+            "SERVICE_REQUEST_FAILURE"
+            if error.code >= 500
+            else "TECHNICAL_INPUT_FAILURE",
         ) from error
     except OSError as error:  # pragma: no cover - server path
-        raise RuntimeError(
-            f"completion request to {base_url} failed: {error}"
-        ) from error
+        raise failure(f"completion request to {base_url} failed: {error}") from error
     if not saw_done or finish_reason is None:
-        raise RuntimeError("streaming response ended before completion")
+        raise failure("streaming response ended before completion")
     completed_monotonic = time.monotonic()
     completed_unix_s = time.time()
     return {

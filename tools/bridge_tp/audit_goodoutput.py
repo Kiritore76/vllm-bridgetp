@@ -285,7 +285,7 @@ def audit_payload(
     )
     anchor_status = "COMPLETED" if (
         anchor_times and proxy.get("emitted_tokens") == len(anchor_times)
-        and (target or source).get("finish_reason") not in (None, "abort")
+        and (target or source).get("finish_reason") in ("stop", "length")
     ) else "INCOMPLETE"
     rows.append(_score_request(
         request_id=str(proxy.get("external_request_id", "anchor")),

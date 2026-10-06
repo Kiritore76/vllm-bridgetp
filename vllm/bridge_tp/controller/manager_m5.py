@@ -140,6 +140,8 @@ class PredictorEventReader:
         }
         if self._header is None:
             return {**result, "status": "NO_HEADER"}
+        result["model_config_sha256"] = self._header.get("model_config_sha256")
+        result["capture_input_sha256"] = self._header.get("capture_input_sha256")
         row = self._latest.get(request_id)
         if row is None:
             return {
@@ -147,6 +149,11 @@ class PredictorEventReader:
                 "reason": self._unavailable.get(request_id, "no prediction yet"),
             }
         position = row["generated_tokens"]
+        result.update({
+            "probabilities": row["probabilities"],
+            "category_upper_edges": self._header["category_upper_edges"],
+            "captured_unix_ns": row["captured_unix_ns"],
+        })
         age_s = ((now_ns or time.time_ns()) - row["captured_unix_ns"]) / 1e9
         if (
             position > output_tokens
@@ -159,6 +166,16 @@ class PredictorEventReader:
             }
         probabilities = tuple(float(v) for v in row["probabilities"])
         edges = tuple(self._header["category_upper_edges"])
+        result.update({
+            "probabilities": probabilities,
+            "category_upper_edges": edges,
+            "prediction_output_tokens": position,
+            "captured_unix_ns": row["captured_unix_ns"],
+            "prediction_lag_tokens": output_tokens - position,
+            "feature_layer": self._header["feature_layer"],
+            "interval": self._header["interval"],
+            "position_alignment": "condition R>=lag; subtract lag; cap runtime",
+        })
         headroom_bounds = probability_gt_bounds(
             probabilities, edges, headroom_tokens
         )
@@ -172,11 +189,35 @@ class PredictorEventReader:
 
         def cap_aware(bounds: tuple[float, float], horizon: int) -> tuple[float, float]:
             if remaining_cap is None:
-                return bounds
+                return aligned(horizon)
             if ignore_eos:
                 forced = float(remaining_cap > horizon)
                 return forced, forced
-            return (0.0, 0.0) if horizon >= remaining_cap else bounds
+            return (0.0, 0.0) if horizon >= remaining_cap else aligned(horizon)
+
+        def aligned(horizon: int) -> tuple[float, float]:
+            lag = output_tokens - position
+            if horizon < 0:
+                return 1.0, 1.0
+            # Joint nested tails: all numerator mass also survives. Avoid
+            # dividing independent marginal intervals as if independent.
+            sure_a = possible_a = sure_b = possible_b = 0.0
+            for i, mass in enumerate(probabilities):
+                lo = 0 if i == 0 else edges[i - 1] + 1
+                hi = edges[i] if i < len(edges) else math.inf
+                split = lag + horizon + 1
+                if hi >= max(lo, split):
+                    possible_a += mass
+                    if lo >= split:
+                        sure_a += mass
+                if max(lo, lag) <= min(hi, split - 1):
+                    possible_b += mass
+                    if lo >= lag and hi < split:
+                        sure_b += mass
+            lower_denom = sure_a + possible_b
+            upper_denom = possible_a + sure_b
+            return (sure_a / lower_denom if lower_denom else 0.0,
+                    possible_a / upper_denom if upper_denom else 0.0)
 
         return {
             **result,
