@@ -137,7 +137,8 @@ def build_snapshot(
     initial_rate = audit_finite(initial_rate)
     row: dict[str, Any] = {
         "kind": "risk_urgency_snapshot",
-        "format_version": 1,
+        "format_version": 2,
+        "source_guard_policy": "WARNING_NOT_START_DEADLINE",
         "unix_s": snapshot.get("unix_s"),
         "request_id": snapshot.get("request_id"),
         "migration_id": snapshot.get("migration_id"),
@@ -171,6 +172,10 @@ def build_snapshot(
         "S_bounds_s": None,
         "physical_feasible": False,
         "physical_rejections": [],
+        "guard_warnings": [],
+        "guard_deadline_warning": False,
+        "source_physical_headroom_tokens": None,
+        "source_physical_capacity_exhausted": False,
         "source": snapshot,
     }
     reasons = row["physical_rejections"]
@@ -203,6 +208,13 @@ def build_snapshot(
         - math.ceil(pending / block_size) * block_size
     )
     row["H_tokens"] = h
+    physical_headroom = (free // block_size) * block_size - math.ceil(
+        pending / block_size
+    ) * block_size
+    row["source_physical_headroom_tokens"] = physical_headroom
+    row["source_physical_capacity_exhausted"] = physical_headroom <= 0
+    if physical_headroom <= 0:
+        reasons.append("source_physical_capacity_exhausted")
     row["p_capacity_bounds"] = remaining_ge_bounds(p, h)
     growth = snapshot.get("source_decode_growth_tokens_s")
     row["pool_growth_tokens_s"] = growth
@@ -213,9 +225,17 @@ def build_snapshot(
         and candidate_rate > 0
     )
     if h <= 0:
-        row["status"] = "PROTECTION_BAND"
-        row["T_guard_s"] = 0.0
-        reasons.append("source_in_protection_band")
+        bounds = remaining_ge_bounds(p, 0)
+        row.update(
+            status="GUARD_REACHED" if bounds is not None else "PREDICTION_INVALID",
+            T_guard_s=0.0,
+            T_guard_bounds_s=[0.0, 0.0],
+            r_guard_tokens=0,
+            r_guard_integer_tokens=0,
+            p_guard_est_bounds=bounds,
+            guard_deadline_warning=True,
+        )
+        row["guard_warnings"].append("source_guard_reached")
     elif not valid_growth or growth <= 0:
         row["status"] = "NO_TRUSTED_POSITIVE_GROWTH"
         reasons.append("growth_evidence_unavailable")
@@ -267,7 +287,14 @@ def build_snapshot(
                 "ongoing_decode_delta_catchup": tr - release_tail_s - history_s,
                 "final_sync_handoff_source_release_allowance": release_tail_s,
             }
-            if row["T_guard_s"] and h > 0:
+            if h <= 0:
+                # A zero guard horizon has no finite urgency ratio. Keep U
+                # unknown rather than fabricate a finite value or emit inf.
+                row.update(
+                    S_s=-tr - safety_margin_s,
+                    S_bounds_s=[-upper - safety_margin_s, -tr - safety_margin_s],
+                )
+            elif row["T_guard_s"]:
                 tg = row["T_guard_s"]
                 low, high = row["T_guard_bounds_s"]
                 row.update(
@@ -287,7 +314,8 @@ def build_snapshot(
     if row["T_release_bounds_s"] is None:
         reasons.append("release_time_unavailable")
     if row["S_bounds_s"] is not None and row["S_bounds_s"][0] <= 0:
-        reasons.append("source_release_may_miss_guard")
+        row["guard_deadline_warning"] = True
+        row["guard_warnings"].append("source_release_may_miss_guard")
     if snapshot.get("state") != "LOCAL":
         reasons.append("request_not_local")
     if snapshot.get("channel_available") is not True:

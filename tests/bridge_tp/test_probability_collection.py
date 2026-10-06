@@ -345,7 +345,7 @@ class TestProbabilityCollection(unittest.TestCase):
             self.assertIsNone(row["p_guard_est_bounds"])
             self.assertFalse(row["physical_feasible"])
             json.dumps(row, allow_nan=False)
-        self.assertEqual(risk(pending=1000)["status"], "PROTECTION_BAND")
+        self.assertEqual(risk(pending=1000)["status"], "GUARD_REACHED")
         self.assertIn("delta_cannot_catch_up", risk(speed=10000)["physical_rejections"])
         row = snapshot()
         row["target_sampled_unix_s"] = 1
@@ -358,6 +358,83 @@ class TestProbabilityCollection(unittest.TestCase):
             release_tail_s=5,
         ).to_json()
         self.assertFalse(result["physical_feasible"])
+
+    def test_missing_source_guard_deadline_still_allows_assigned_start(self):
+        row = risk(growth=500, speed=1)
+        self.assertGreater(row["U"], 1)
+        self.assertLess(row["S_bounds_s"][0], 0)
+        self.assertTrue(row["guard_deadline_warning"])
+        self.assertIn("source_release_may_miss_guard", row["guard_warnings"])
+        self.assertTrue(row["physical_feasible"])
+        gate = ProbabilityGate(0.5, "late", assigned_action="START")
+        decision = gate.observe(row, 1)
+        self.assertTrue(decision["first_feasible_candidate"])
+        self.assertEqual(decision["requested_action"], "START_SHADOW")
+        self.assertFalse(decision["safety_protection_required"])
+        self.assertTrue(decision["guard_deadline_warning"])
+
+    def test_guard_reached_is_not_physical_capacity_exhaustion(self):
+        row = risk(pending=1000)
+        self.assertEqual(row["H_tokens"], 0)
+        self.assertEqual(row["source_physical_headroom_tokens"], 100)
+        self.assertEqual(row["p_guard_est_bounds"], [1, 1])
+        self.assertIsNone(row["U"])
+        self.assertTrue(row["physical_feasible"])
+        json.dumps(row, allow_nan=False)
+        gate = ProbabilityGate(0.8, "guard", assigned_action="START")
+        self.assertEqual(gate.observe(row, 1)["requested_action"], "START_SHADOW")
+        exhausted = risk(pending=1100)
+        self.assertFalse(exhausted["physical_feasible"])
+        self.assertIn(
+            "source_physical_capacity_exhausted", exhausted["physical_rejections"]
+        )
+        decision = ProbabilityGate(0, "full", assigned_action="START").observe(
+            exhausted, 1
+        )
+        self.assertEqual(decision["requested_action"], "STAY")
+        self.assertTrue(decision["safety_protection_required"])
+
+    def test_new_guard_warning_preserves_effect_but_legacy_replay_is_unchanged(self):
+        row = risk(growth=500, speed=1)
+        candidate = ProbabilityGate(0, "warning", assigned_action="START").observe(
+            row, 1
+        )
+        legacy = dict(row, physical_feasible=False)
+        legacy.pop("source_guard_policy")
+        legacy["physical_rejections"] = ["source_release_may_miss_guard"]
+        old_gate = ProbabilityGate(0, "legacy", assigned_action="START").observe(
+            legacy, 1
+        )
+        self.assertTrue(old_gate["safety_protection_required"])
+        self.assertEqual(old_gate["requested_action"], "STAY")
+        observed = {
+            "probability_candidate": candidate,
+            "guard_deadline_warning_ticks": [1],
+            "actual_probability_executions": [{"actual_action": "START_SHADOW"}],
+        }
+        summary = {
+            "seed": 1,
+            "probability_thresholds": [0],
+            "cases": {
+                "load": {
+                    "prob_0_START": {
+                        "fixed_horizon_goodoutput_tokens_s": 10,
+                        "observed_action": observed,
+                    },
+                    "prob_0_STAY": {
+                        "fixed_horizon_goodoutput_tokens_s": 8,
+                        "observed_action": observed,
+                    },
+                }
+            },
+        }
+        self.assertTrue(
+            probability_results(summary)["samples"][0]["effect_sample_eligible"]
+        )
+        observed["safety_protection_required_ticks"] = [2]
+        self.assertFalse(
+            probability_results(summary)["samples"][0]["effect_sample_eligible"]
+        )
 
     def test_first_crossing_common_feasibility_stay_and_simultaneous(self):
         gate = ProbabilityGate(

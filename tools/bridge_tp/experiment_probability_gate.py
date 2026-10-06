@@ -45,7 +45,9 @@ class ProbabilityGate:
         eligibility_errors: tuple[str, ...] = (),
     ) -> dict:
         bounds = snapshot.get("p_guard_est_bounds")
-        valid = snapshot.get("status") == "VALID" and bounds is not None
+        valid = (
+            snapshot.get("status") in {"VALID", "GUARD_REACHED"} and bounds is not None
+        )
         crossed = []
         if valid:
             for theta in sorted(set((self.threshold,) + self.thresholds)):
@@ -73,9 +75,15 @@ class ProbabilityGate:
                     else "STAY"
                 )
             self.candidate = {"tick": tick, "snapshot": snapshot}
-        safety = snapshot.get("status") == "PROTECTION_BAND" or (
-            snapshot.get("S_bounds_s") is not None and snapshot["S_bounds_s"][0] <= 0
-        )
+        if snapshot.get("source_guard_policy") == "WARNING_NOT_START_DEADLINE":
+            safety = snapshot.get("source_physical_capacity_exhausted") is True
+        else:
+            # Keep legacy snapshot replay semantics; old evidence is not
+            # silently relabeled using the new source-guard contract.
+            safety = snapshot.get("status") == "PROTECTION_BAND" or (
+                snapshot.get("S_bounds_s") is not None
+                and snapshot["S_bounds_s"][0] <= 0
+            )
         start = bool(
             self.candidate
             and self.assigned_action == "START"
@@ -99,7 +107,12 @@ class ProbabilityGate:
         )
         return {
             "kind": "experiment_probability_gate",
-            "format_version": 1,
+            "format_version": 2,
+            "source_guard_policy": snapshot.get(
+                "source_guard_policy", "LEGACY_GUARD_DEADLINE"
+            ),
+            "guard_deadline_warning": snapshot.get("guard_deadline_warning", False),
+            "guard_warnings": snapshot.get("guard_warnings", []),
             "tick": tick,
             "threshold": self.threshold,
             "first_crossings_this_tick": crossed,
