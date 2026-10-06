@@ -16,11 +16,30 @@ from tools.bridge_tp.run_goodoutput_matrix_a100 import (
     observed_pressure,
     online_command,
     prepare,
+    reference_contract,
     verify,
 )
 
 
 class TestObservedPressure(unittest.TestCase):
+    def test_new_slo_changes_only_fraction_and_version_metadata(self):
+        directory = Path(__file__).resolve().parents[2] / "experiments/phase9/slo"
+        old = json.loads(
+            (directory / "slo_v6_a100_tp4_reference_20261004.json").read_text()
+        )
+        path = directory / "slo_v6_slow2pct_a100_tp4_reference_20261006.json"
+        contents = path.read_bytes().replace(b"\r\n", b"\n")
+        new = json.loads(contents)
+        self.assertEqual(new["primary_max_slow_interval_rate"], .02)
+        self.assertEqual(new["slo_policy_id"], "v6_slow2pct_20261006")
+        for key in old.keys() - {"primary_max_slow_interval_rate", "note"}:
+            self.assertEqual(old[key], new[key])
+        args = SimpleNamespace(slo_profile="slow2pct", probability_pilot=True)
+        self.assertEqual(hashlib.sha256(contents).hexdigest(), reference_contract(args))
+        args.probability_pilot = False
+        with self.assertRaisesRegex(ValueError, "explicit probability"):
+            reference_contract(args)
+
     def test_reduced_guard_file_matches_frozen_contract(self):
         args = SimpleNamespace(guard_profile="reduced2000", probability_pilot=True)
         value, digest = guard_contract(args)

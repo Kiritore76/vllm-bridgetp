@@ -251,6 +251,8 @@ def audit_v6_payload(
         "goodoutput_tokens_s": good_tokens / wall_s,
     }
     return {"format_version": 1, "slo_version": "v6", "computable": True,
+            **({"slo_policy_id": config["slo_policy_id"]}
+               if "slo_policy_id" in config else {}),
             "reference_applicability": applicability,
             "errors": [], "request_rows": rows, "metrics": metrics,
             "workload_kind": (
