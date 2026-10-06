@@ -1339,13 +1339,25 @@ def _finish_source_without_commit(
         MigrationState.SHADOW,
         MigrationState.READY_NOT_COMMITTED,
     }:
+        reason = "source reached EOS before target ready"
+        # An admitted target completion may still be deferred in the TP4
+        # scheduler.  Leaving its SSE reader alive makes the executor wait for
+        # the request timeout even though the source has already finished.
+        try:
+            target_cleanup = adapter.cancel_shadow_target(reason)
+            audit.write({
+                "kind": "source_eos_target_cleanup",
+                "status": (
+                    target_cleanup.get("status")
+                    if target_cleanup is not None else None
+                ),
+            })
+        except ActionError as error:
+            audit.write({"kind": "action_error", "detail": str(error)})
         binding = adapter.refresh_binding()
         if binding is not None:
             try:
-                adapter.cancel(
-                    "source reached EOS before target ready",
-                    abort_source=False,
-                )
+                adapter.cancel(reason, abort_source=False)
             except ActionError as error:
                 audit.write({"kind": "action_error", "detail": str(error)})
         recorder.on_rollback(now, "source reached EOS")
