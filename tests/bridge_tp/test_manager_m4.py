@@ -11,7 +11,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from tools.bridge_tp.run_phase9_controller import parse_args, step_m4_cancel
+from tools.bridge_tp.run_phase9_controller import (
+    _finish_source_without_commit,
+    parse_args,
+    step_m4_cancel,
+)
 from tools.bridge_tp.run_shadow_strategy_online_validation import accept_m4_cancel
 from vllm.bridge_tp.controller.action_adapter import ActionError
 from vllm.bridge_tp.controller.events import MigrationState, SourceRequestView
@@ -139,6 +143,50 @@ class TestM4Cancel(unittest.TestCase):
                 "disarm", "cancel", "target",
             ])
             self.assertEqual(adapter.calls[1], ("cancel", False))
+
+    def test_source_eos_cleans_admitted_target_before_finishing(self) -> None:
+        class Adapter:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def cancel_shadow_target(self, _reason: str):
+                self.calls.append("target")
+                return {"status": "CLEANED"}
+
+            def refresh_binding(self):
+                self.calls.append("binding")
+                return object()
+
+            def cancel(self, _reason: str, *, abort_source: bool):
+                self.calls.append("source")
+                self.assert_source_preserved = not abort_source
+
+        class Audit:
+            def __init__(self) -> None:
+                self.rows: list[dict] = []
+
+            def write(self, row: dict) -> None:
+                self.rows.append(row)
+
+        class Recorder:
+            def on_rollback(self, _now: float, _reason: str) -> None:
+                pass
+
+        adapter = Adapter()
+        audit = Audit()
+        machine = MigrationStateMachine(audit_sink=audit.write)
+        record = machine.create("m", "r")
+        machine.transition("m", MigrationState.SHADOW, 1.0)
+        _finish_source_without_commit(
+            machine, adapter, audit, record, Recorder(), 2.0
+        )
+        self.assertEqual(record.state, MigrationState.COMPLETED_ON_TP1)
+        self.assertEqual(adapter.calls, ["target", "binding", "source"])
+        self.assertTrue(adapter.assert_source_preserved)
+        self.assertIn(
+            {"kind": "source_eos_target_cleanup", "status": "CLEANED"},
+            audit.rows,
+        )
 
     def test_freeze_receipt_prevents_cleanup(self) -> None:
         class Adapter:
