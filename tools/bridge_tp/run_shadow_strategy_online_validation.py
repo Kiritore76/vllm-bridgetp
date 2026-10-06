@@ -864,7 +864,13 @@ def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]
         raise ValueError("M2 LOW-to-HIGH smoke requires event-start source peers")
     if source_jobs and not args.source_pressure:
         raise ValueError("online Shadow manifest must contain target jobs only")
-    if args.source_pressure and (not source_jobs or not target_jobs):
+    if args.source_pressure and not source_jobs:
+        raise ValueError("A4-P requires source peers")
+    if (
+        args.source_pressure
+        and not target_jobs
+        and args.probability_threshold is None
+    ):
         raise ValueError("A4-P requires source peers and target background jobs")
     if args.source_pressure and not (
         args.shadow_only_only
@@ -2405,6 +2411,7 @@ def accept_online(
         for row in audit
         if row.get("kind") == "earliest_ready_candidate_published"
     ]
+    errors: list[str] = []
     if manager_m3_commit:
         m3_candidates = [
             row for row in audit
@@ -2525,7 +2532,6 @@ def accept_online(
         committed_unix_s=committed,
     )
 
-    errors: list[str] = []
     if requested_max_output_tokens is not None:
         source_request = common.read_json(controller_dir / "source_request.json")
         target_request = common.read_json(controller_dir / "target_request.json")

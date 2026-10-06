@@ -643,6 +643,40 @@ def cross_context_smoke_result(*, runner_rc: int, source: dict[str, Any],
     }
 
 
+def probability_artifact_errors(run: Path) -> list[str]:
+    """Reject missing or corrupt run evidence before computing any service label."""
+    errors = []
+    required = [
+        "online/contract.json",
+        "background/background_manifest.json",
+        "background/background_summary.json",
+        "controller/response_proxy_stats.json",
+        "controller/source_response.json",
+        "controller/phase9_audit.jsonl",
+    ]
+    if (run / "controller/target_response.json").is_file():
+        required.append("controller/target_response.json")
+    for relative in required:
+        path = (
+            run.parent / "contract.json"
+            if relative == "online/contract.json" else run / relative
+        )
+        if not path.is_file():
+            errors.append(f"missing run artifact: {relative}")
+            continue
+        try:
+            content = path.read_text(encoding="utf-8")
+            rows = (
+                [json.loads(line) for line in content.splitlines() if line.strip()]
+                if path.suffix == ".jsonl" else [json.loads(content)]
+            )
+            if not rows or any(not isinstance(row, dict) for row in rows):
+                raise ValueError("expected nonempty object records")
+        except (OSError, UnicodeError, ValueError) as error:
+            errors.append(f"invalid run artifact: {relative}: {error}")
+    return errors
+
+
 def collect_arm(args: argparse.Namespace, root: Path,
                 setup: dict[str, Any], name: str,
                 action: str) -> dict[str, Any]:
@@ -695,6 +729,31 @@ def collect_arm(args: argparse.Namespace, root: Path,
             source_cap=source_cap, total_cap=total_cap)
         write_json(case_root / f"{action}.result.json", result)
         return result
+    if getattr(args, "probability_pilot", False):
+        artifact_errors = probability_artifact_errors(run)
+        if artifact_errors:
+            result = {
+                "assigned_action": action.split("_")[2],
+                "configured_probability_threshold": float(action.split("_")[1]),
+                "configured_eligibility_tokens": None,
+                "assignment_probability": 0.5,
+                "episode_group_id": f"{args.seed}:{name}",
+                "runner_rc": runner_rc,
+                "audit_rc": None,
+                "audit_skipped_reason": "MISSING_OR_CORRUPT_RUN_EVIDENCE",
+                "observed_action": {
+                    "audit_available": False,
+                    "probability_episode_outcome": "TECHNICAL_FAILURE",
+                },
+                "fatal_error": True,
+                "technical_errors": artifact_errors,
+                "horizon_score": {"eligible": False, "errors": artifact_errors},
+                "fixed_horizon_eligible": False,
+                "fixed_horizon_goodoutput_tokens_s": None,
+                "fixed_horizon_exclusions": {"technical_failure": True},
+            }
+            write_json(case_root / f"{action}.result.json", result)
+            return result
     audit_path = case_root / f"{action}.slo_v6.json"
     audit_command = [
         sys.executable, "tools/bridge_tp/audit_slo_v6.py",
