@@ -56,10 +56,13 @@ At the historical 1963 x 16 = 31408 source capacity and guard 8448:
 | --- | ---: | --- | ---: | --- |
 | Mechanism | 4096 | 2048 / 1 | 16816 | 0 |
 | Moderate coverage | 4096 | 4096 / 3 | 6576 | 0 |
-| Pressure coverage | 8192 | 4096 / 3 | 2480 | 0 or 8 |
+| Pressure coverage | 7168 | 4480 / 3 | 2352 | 0 or 8 |
 
 Cross the pressure profile with 8/24 requested anchor sections while keeping
 source/target prompt budgets unchanged. Target prompts are 1536 tokens.
+The frozen TTFT curve ends at 7168 prompt tokens: constructed collectors reject
+larger prompts at setup, before GPU episodes. Earlier 8K/10K recipe candidates
+are input diagnostics, not eligible GoodOutput collection under this contract.
 Start with a single burst; do not immediately replay overlapping long-context
 waves. Initial headroom is a planning estimate, not a bound for the whole
 episode. `--minimum-initial-source-headroom-tokens 1536` validates rounded
