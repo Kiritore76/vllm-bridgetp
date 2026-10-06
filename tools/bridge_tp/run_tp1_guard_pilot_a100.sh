@@ -135,4 +135,6 @@ PY
 }
 
 run_tp1_guard_pilot
-echo "函数退出码：$?"
+pilot_rc=$?
+echo "函数退出码：$pilot_rc"
+[[ "$pilot_rc" -eq 0 ]]
