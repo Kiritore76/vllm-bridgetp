@@ -1248,7 +1248,6 @@ def execute_pilot(args: argparse.Namespace) -> None:
             )
         if (
             not args.probability_thresholds
-            or 0 not in args.probability_thresholds
             or len(set(args.probability_thresholds)) != len(args.probability_thresholds)
             or len({f"{x:g}" for x in args.probability_thresholds})
             != len(args.probability_thresholds)
@@ -1257,7 +1256,7 @@ def execute_pilot(args: argparse.Namespace) -> None:
                 for x in args.probability_thresholds
             )
         ):
-            raise ValueError("pre-register unique finite thresholds including zero")
+            raise ValueError("pre-register unique finite thresholds in [0, 1]")
     if not 128 < args.max_model_len <= 32768:
         raise ValueError("source max model length must be in (128, 32768]")
     if (args.tp4_max_model_len is not None
