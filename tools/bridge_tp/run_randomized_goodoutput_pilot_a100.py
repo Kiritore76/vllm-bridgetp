@@ -243,6 +243,17 @@ def case_definitions(args: argparse.Namespace) -> tuple:
     return CASES
 
 
+def validate_constructed_slo_prompts(
+    anchor: dict[str, Any], jobs: list[dict[str, Any]], reference: Path,
+) -> None:
+    """Reject unsupported prompt lengths before paying for GPU episodes."""
+    from tools.bridge_tp.audit_slo_v6 import ttft_limit_ms
+
+    config = json.loads(reference.read_text(encoding="utf-8"))
+    for request in [anchor] + [job["request"] for job in jobs]:
+        ttft_limit_ms(len(request["prompt"]), config)
+
+
 def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
     from transformers import AutoTokenizer
 
@@ -516,6 +527,8 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
                             target_idle_override=True)
         if target_count == 0:
             manifest["target_idle_override"] = True
+        if getattr(args, "constructed_workload", False):
+            validate_constructed_slo_prompts(anchor_request, jobs, args.reference)
         for job in jobs:
             job["prompt_token_ids_sha256"] = hashlib.sha256(json.dumps(
                 job["request"]["prompt"]).encode()).hexdigest()

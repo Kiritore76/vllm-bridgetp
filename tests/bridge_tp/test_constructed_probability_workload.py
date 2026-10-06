@@ -16,6 +16,7 @@ from tools.bridge_tp.build_constructed_probability_workload import (
 from tools.bridge_tp.run_randomized_goodoutput_pilot_a100 import (
     build_setup,
     select_inputs,
+    validate_constructed_slo_prompts,
 )
 
 
@@ -30,6 +31,10 @@ TOKENIZER = SimpleNamespace(
     apply_chat_template=lambda messages, **kw: (
         "CHAT_USER " + messages[0]["content"] + " CHAT_ASSISTANT"
     ),
+)
+REFERENCE = (
+    Path(__file__).resolve().parents[2] / "experiments/phase9/slo/"
+    "slo_v6_a100_tp4_reference_20261004.json"
 )
 
 
@@ -46,6 +51,12 @@ def recipes(seed=1, split="engineering_train", backgrounds=120):
 
 
 class TestConstructedProbabilityWorkload(unittest.TestCase):
+    def test_constructed_prompt_budget_must_fit_frozen_slo_curve(self):
+        jobs = [{"request": {"prompt": [1] * 4480}}]
+        validate_constructed_slo_prompts({"prompt": [1] * 7168}, jobs, REFERENCE)
+        with self.assertRaisesRegex(ValueError, "frozen SLO range"):
+            validate_constructed_slo_prompts({"prompt": [1] * 8192}, jobs, REFERENCE)
+
     def test_source_and_target_contexts_are_independent(self):
         rows = make_rows(
             seed=1,
@@ -186,6 +197,7 @@ class TestConstructedProbabilityWorkload(unittest.TestCase):
             )
             args = SimpleNamespace(
                 input=path,
+                reference=REFERENCE,
                 model=root,
                 constructed_workload=True,
                 probability_pilot=True,
@@ -228,6 +240,7 @@ class TestConstructedProbabilityWorkload(unittest.TestCase):
             for target_count in (0, 8, 24):
                 args = SimpleNamespace(
                     input=path,
+                    reference=REFERENCE,
                     model=root,
                     constructed_workload=True,
                     probability_pilot=True,
