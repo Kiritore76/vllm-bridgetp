@@ -138,6 +138,15 @@ class TestConstructedProbabilityWorkload(unittest.TestCase):
             args.guard_profile = "reduced2000"
             guard.write_text("2000\n")
             hashes[args.guard] = matrix.guard_contract(args)[1]
+            args.slo_profile = "slow2pct"
+            hashes[args.reference] = matrix.reference_contract(args)
+            self.assertEqual(
+                check()["sha256"]["reference"], matrix.reference_contract(args)
+            )
+            hashes[args.reference] = matrix.EXPECTED_SHAS["reference"]
+            with self.assertRaisesRegex(ValueError, "reference SHA differs"):
+                check()
+            hashes[args.reference] = matrix.reference_contract(args)
             self.assertEqual(check()["sha256"]["guard"], matrix.guard_contract(args)[1])
             guard.write_text("8448")
             with self.assertRaisesRegex(ValueError, "guard value differs"):

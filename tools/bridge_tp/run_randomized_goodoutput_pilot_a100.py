@@ -60,6 +60,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--guard-profile", choices=("legacy8448", "reduced2000"),
                         default="legacy8448",
                         help="Pin the guard value and file SHA for this collection")
+    parser.add_argument("--slo-profile", choices=("legacy1pct", "slow2pct"),
+                        default="legacy1pct",
+                        help="Pin the SLO reference SHA for this collection")
     parser.add_argument("--pre-episode-warmup", action="store_true",
                         help="Warm prompt shapes before the measured workload")
     parser.add_argument("--minimum-initial-source-headroom-tokens", type=int)
@@ -1199,6 +1202,7 @@ def probability_results(summary: dict[str, Any]) -> dict[str, Any]:
                     "threshold": theta,
                     "goodoutput_scoring_policy": summary.get(
                         "goodoutput_scoring_policy", "COMPLETED_BY_H_LEGACY"),
+                    "slo_profile": summary.get("slo_profile", "legacy1pct"),
                     "assignment_probability": 0.5,
                     "effect_sample_eligible": valid,
                     "policy_outcome_eligible": start_g is not None
@@ -1358,6 +1362,7 @@ def execute_pilot(args: argparse.Namespace) -> None:
     summary: dict[str, Any] = {
         "format_version": 1, "status": "PILOT_IN_PROGRESS",
         "seed": args.seed, "cases": {},
+        "slo_profile": getattr(args, "slo_profile", "legacy1pct"),
         "collection_id": hashlib.sha256(json.dumps(
             {"protocol": protocol, "manifests": setup["manifests"]},
             sort_keys=True).encode()).hexdigest(),

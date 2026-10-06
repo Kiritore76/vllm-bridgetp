@@ -57,6 +57,15 @@ def guard_contract(args: argparse.Namespace) -> tuple[int, str]:
     raise ValueError("guard profile requires an explicit probability pilot contract")
 
 
+def reference_contract(args: argparse.Namespace) -> str:
+    profile = getattr(args, "slo_profile", "legacy1pct")
+    if profile == "legacy1pct":
+        return EXPECTED_SHAS["reference"]
+    if profile == "slow2pct" and getattr(args, "probability_pilot", False):
+        return "0bea93bd3af4e6d44b3164c14b6e3504666c8adf3ad8679c411f775936f4f6cb"
+    raise ValueError("SLO profile requires an explicit probability pilot contract")
+
+
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -81,6 +90,7 @@ def expected_gpu_uuids(args: argparse.Namespace) -> list[str]:
 
 def verify(args: argparse.Namespace) -> dict[str, Any]:
     guard_tokens, guard_sha = guard_contract(args)
+    reference_sha = reference_contract(args)
     revision = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     if revision != args.expected_revision:
@@ -123,6 +133,8 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         expected = EXPECTED_SHAS[name]
         if name == "guard":
             expected = guard_sha
+        if name == "reference":
+            expected = reference_sha
         if name == "input" and getattr(args, "constructed_workload", False):
             if not getattr(args, "probability_pilot", False):
                 raise ValueError(
