@@ -18,7 +18,11 @@ run_tp1_guard_pilot() {
   local expected=${BRIDGETP_EXPECTED_REVISION:-}
   local seed=20261011
   local phase run_dir archive runner_rc risk_rc natural_rc pack_rc
-  local -a phase_args
+  local -a phase_args phases=(natural stress)
+
+  if [[ "${BRIDGETP_P05_ONLY:-0}" == 1 ]]; then
+    phases=(p05_cleanup)
+  fi
 
   [[ -n "$expected" ]] || { echo '请设置 BRIDGETP_EXPECTED_REVISION'; return 1; }
   cd "$repo" || return 1
@@ -62,7 +66,7 @@ run_tp1_guard_pilot() {
     --expected-input-sha256 75cae22e298548b54b6164b3df9adc9ebdc61ced3a85eecfd7df9e96ea7a1be3 \
     --seed "$seed" --out-file "$output_root/holdout_seed${seed}.json" || return 1
 
-  for phase in natural stress; do
+  for phase in "${phases[@]}"; do
     case "$phase" in
       natural)
         phase_args=(--cases p00_source1_target2 p02_source3_target8
@@ -71,6 +75,11 @@ run_tp1_guard_pilot() {
       stress)
         phase_args=(--cases p04_source5_target2 p05_source5_target24
           --actions stay now --source-prompt-tokens 4096
+          --source-background-max-tokens 1536)
+        ;;
+      p05_cleanup)
+        phase_args=(--cases p05_source5_target24 --actions now
+          --source-prompt-tokens 4096
           --source-background-max-tokens 1536)
         ;;
     esac
