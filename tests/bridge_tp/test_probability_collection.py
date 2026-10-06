@@ -17,6 +17,7 @@ from tools.bridge_tp.run_randomized_goodoutput_pilot_a100 import (
     build_setup,
     collect_arm,
     configure_action,
+    execute_pilot,
     probability_artifact_errors,
     probability_results,
 )
@@ -69,6 +70,36 @@ def risk(growth=10, speed=10, pending=0, pred=None):
 
 
 class TestProbabilityCollection(unittest.TestCase):
+    def test_nonzero_only_threshold_reaches_preflight(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args, _ = self.pilot_fixture(Path(directory), "test", 0)
+            args.probability_thresholds = [0.8]
+            args.constructed_workload = True
+            args.expected_input_sha256 = "a" * 64
+            args.constructed_source_count = 3
+            args.constructed_target_count = 0
+            with patch(
+                "tools.bridge_tp.run_randomized_goodoutput_pilot_a100.verify",
+                side_effect=RuntimeError("reached hardware preflight"),
+            ) as verify_mock:
+                with self.assertRaisesRegex(RuntimeError, "hardware preflight"):
+                    execute_pilot(args)
+                verify_mock.assert_called_once_with(args)
+
+    def test_invalid_thresholds_rejected_before_preflight(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args, _ = self.pilot_fixture(Path(directory), "test", 0)
+            with patch(
+                "tools.bridge_tp.run_randomized_goodoutput_pilot_a100.verify"
+            ) as verify_mock:
+                for thresholds in ([], [0.8, 0.8], [-0.1], [1.1], [math.nan],
+                                   [math.inf], [0.8, 0.80000001]):
+                    with self.subTest(thresholds=thresholds):
+                        args.probability_thresholds = thresholds
+                        with self.assertRaisesRegex(ValueError, "unique finite"):
+                            execute_pilot(args)
+                verify_mock.assert_not_called()
+
     def pilot_fixture(self, root, name, target_count):
         files = {}
         for key in (
