@@ -193,7 +193,12 @@ class TestConstructedProbabilityWorkload(unittest.TestCase):
             root = Path(directory)
             path = root / "input.jsonl"
             path.write_text(
-                "".join(json.dumps(r) + "\n" for r in recipes(backgrounds=350))
+                "".join(json.dumps(r) + "\n" for r in make_rows(
+                    seed=20261031, split="engineering_train",
+                    anchor_prompt_tokens=7168, background_prompt_tokens=4480,
+                    target_prompt_tokens=1536, anchor_sections=24,
+                    background_sections=6, backgrounds=350,
+                ))
             )
             args = SimpleNamespace(
                 input=path,
@@ -202,28 +207,31 @@ class TestConstructedProbabilityWorkload(unittest.TestCase):
                 constructed_workload=True,
                 probability_pilot=True,
                 cases=None,
-                constructed_source_count=1,
+                constructed_source_count=3,
                 constructed_target_count=0,
                 max_model_len=16384,
                 tp4_max_model_len=32768,
                 anchor_context_limit=True,
                 background_context_limit=False,
                 background_max_tokens=2048,
-                arrival_window_s=30,
-                arrival_wave_period_s=10,
+                arrival_window_s=300,
+                arrival_wave_period_s=24,
             )
             with patch.dict("sys.modules", {"transformers": fake}):
                 setup = build_setup(args, root)
-            name = "constructed_source1_target0"
+            name = "constructed_source3_target0"
             anchor = json.loads(Path(setup["anchors"][name]["path"]).read_text())
             manifest = json.loads(Path(setup["manifests"][name]["path"]).read_text())
-            self.assertEqual(len(anchor["prompt"]), 4096)
+            self.assertEqual(len(anchor["prompt"]), 7168)
             self.assertIs(anchor["ignore_eos"], False)
             self.assertEqual(manifest["target_count"], 0)
             self.assertEqual(manifest["controller_split"], "engineering_train")
             jobs = manifest["jobs"]
             self.assertEqual(len(jobs), len({j["input_id"] for j in jobs}))
-            self.assertTrue(all(len(j["request"]["prompt"]) == 2048 for j in jobs))
+            self.assertTrue(all(len(j["request"]["prompt"]) == 4480 for j in jobs))
+            self.assertEqual(len(jobs), 37)
+            self.assertEqual(max(j["start_after_s"] for j in jobs), 292)
+            self.assertEqual(sum(j["wave"] == 0 for j in jobs), 3)
             self.assertTrue(all(j["request"]["ignore_eos"] is False for j in jobs))
             self.assertTrue(all(j["workload_origin"] == "constructed" for j in jobs))
             self.assertTrue(all(j["construction"] for j in jobs))

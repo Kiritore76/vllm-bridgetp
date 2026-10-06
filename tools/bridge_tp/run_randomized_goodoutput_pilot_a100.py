@@ -116,6 +116,9 @@ def parse_args() -> argparse.Namespace:
                         help="Invalidate a fixed-window arm if an actual "
                              "background arrival misses its schedule")
     parser.add_argument("--evaluation-horizon-s", type=float, default=180.0)
+    parser.add_argument("--window-token-goodoutput", action="store_true",
+                        help="Count only window tokens; use frozen full-request "
+                             "SLO after drain, including requests ending after H")
     return parser.parse_args()
 
 
@@ -963,7 +966,9 @@ def collect_arm(args: argparse.Namespace, root: Path,
     }
     if getattr(args, "probability_pilot", False):
         horizon = score_horizon(slo, background, source, target, proxy,
-                                args.evaluation_horizon_s)
+                                args.evaluation_horizon_s,
+                                settle_after_h=getattr(
+                                    args, "window_token_goodoutput", False))
         # A recorded request failure is a service result. An unrecognized
         # runner rejection remains technical and is retained for diagnosis.
         service_errors = {
@@ -1183,8 +1188,14 @@ def probability_results(summary: dict[str, Any]) -> dict[str, Any]:
             samples.append(
                 {
                     "episode_group_id": f"{summary['seed']}:{name}",
-                    "sample_id": f"{summary['seed']}:{name}:{theta:g}",
+                    "sample_id": (
+                        f"{summary['collection_id']}:{name}:{theta:g}"
+                        if summary.get("collection_id") else
+                        f"{summary['seed']}:{name}:{theta:g}"
+                    ),
                     "threshold": theta,
+                    "goodoutput_scoring_policy": summary.get(
+                        "goodoutput_scoring_policy", "COMPLETED_BY_H_LEGACY"),
                     "assignment_probability": 0.5,
                     "effect_sample_eligible": valid,
                     "policy_outcome_eligible": start_g is not None
@@ -1264,10 +1275,16 @@ def execute_pilot(args: argparse.Namespace) -> None:
         raise ValueError("TP4 max model length must cover TP1 and be <= 32768")
     if not math.isfinite(args.evaluation_horizon_s) or args.evaluation_horizon_s <= 0:
         raise ValueError("evaluation horizon must be positive and finite")
+    if getattr(args, "window_token_goodoutput", False) and (
+        not args.probability_pilot
+        or args.arrival_window_s != args.evaluation_horizon_s
+    ):
+        raise ValueError("window token scoring requires probability mode and "
+                         "arrival window equal to H")
     if args.arrival_window_s is not None:
         if (not math.isfinite(args.arrival_window_s)
-                or not 0 < args.arrival_window_s < args.evaluation_horizon_s):
-            raise ValueError("arrival window must end before evaluation horizon")
+                or not 0 < args.arrival_window_s <= args.evaluation_horizon_s):
+            raise ValueError("arrival window must end at or before horizon")
         if (not math.isfinite(args.arrival_wave_period_s)
                 or not 0 < args.arrival_wave_period_s
                 < args.arrival_window_s):
@@ -1338,10 +1355,18 @@ def execute_pilot(args: argparse.Namespace) -> None:
     summary: dict[str, Any] = {
         "format_version": 1, "status": "PILOT_IN_PROGRESS",
         "seed": args.seed, "cases": {},
+        "collection_id": hashlib.sha256(json.dumps(
+            {"protocol": protocol, "manifests": setup["manifests"]},
+            sort_keys=True).encode()).hexdigest(),
         "probability_pilot": args.probability_pilot,
         "probability_thresholds": args.probability_thresholds,
         "actions": actions,
         "evaluation_horizon_s": args.evaluation_horizon_s,
+        "goodoutput_scoring_policy": (
+            "WINDOW_TOKENS_FULL_REQUEST_SLO_DRAIN_V1"
+            if getattr(args, "window_token_goodoutput", False)
+            else "COMPLETED_BY_H_LEGACY"
+        ),
         "arrival_window_s": args.arrival_window_s,
         "arrival_wave_period_s": (args.arrival_wave_period_s
                                   if args.arrival_window_s else None),
