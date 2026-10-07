@@ -680,7 +680,8 @@ def observed_action(run: Path, *, paired_stay: bool = False) -> dict[str, Any]:
         "last_m1_decision": decisions[-1].get("decision")
         if decisions else None,
         "actual_cutover_output_tokens": accepted.get(
-            "earliest_ready_cutover_output_tokens"),
+            "actual_cutover_output_tokens",
+            accepted.get("earliest_ready_cutover_output_tokens")),
         "handoff_stall_ms": accepted.get("handoff_stall_ms"),
         "acceptance_status": accepted.get("status"),
         "acceptance_errors": accepted.get("errors"),
@@ -1208,6 +1209,8 @@ def probability_results(summary: dict[str, Any]) -> dict[str, Any]:
                         f"{summary['seed']}:{name}:{theta:g}"
                     ),
                     "threshold": theta,
+                    "migration_mechanism": summary.get(
+                        "migration_mechanism", "LEGACY_EARLIEST_READY"),
                     "goodoutput_scoring_policy": summary.get(
                         "goodoutput_scoring_policy", "COMPLETED_BY_H_LEGACY"),
                     "slo_profile": summary.get("slo_profile", "legacy1pct"),
@@ -1388,6 +1391,11 @@ def execute_pilot(args: argparse.Namespace) -> None:
             {"protocol": protocol, "manifests": setup["manifests"]},
             sort_keys=True).encode()).hexdigest(),
         "probability_pilot": args.probability_pilot,
+        "migration_mechanism": (
+            "ROLLING_NO_HISTORY_WAIT_V1"
+            if getattr(args, 'rolling_cutover', False)
+            else "LEGACY_EARLIEST_READY"
+        ),
         "probability_thresholds": args.probability_thresholds,
         "actions": actions,
         "evaluation_horizon_s": args.evaluation_horizon_s,
