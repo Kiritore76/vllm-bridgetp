@@ -72,6 +72,7 @@ def parse_args() -> argparse.Namespace:
                         help="Pinned request-file SHA for constructed workloads")
     parser.add_argument("--constructed-source-count", type=int, default=3)
     parser.add_argument("--constructed-target-count", type=int, default=8)
+    parser.add_argument("--probability-min-urgency", type=float, default=0.0)
     parser.add_argument("--probability-thresholds", type=float, nargs="+",
                         default=[0.0, 0.01, 0.05, 0.2])
     parser.add_argument("--paired-only", action="store_true",
@@ -800,6 +801,8 @@ def collect_arm(args: argparse.Namespace, root: Path,
         if (name == "p00_source1_target2"
                 or setup["manifests"][name].get("target_jobs") == 0):
             command[command.index("--minimum-ready-target-jobs") + 1] = "0"
+        command += ["--probability-min-urgency",
+                    str(getattr(args, "probability_min_urgency", 0.0))]
         command += ["--probability-assignment-seed", f"{args.seed}:{name}:{action}",
                     "--probability-threshold-family",
                     *(str(x) for x in args.probability_thresholds)]
@@ -1203,6 +1206,8 @@ def probability_results(summary: dict[str, Any]) -> dict[str, Any]:
                     "goodoutput_scoring_policy": summary.get(
                         "goodoutput_scoring_policy", "COMPLETED_BY_H_LEGACY"),
                     "slo_profile": summary.get("slo_profile", "legacy1pct"),
+                    "probability_min_urgency": summary.get(
+                        "probability_min_urgency", 0.0),
                     "assignment_probability": 0.5,
                     "effect_sample_eligible": valid,
                     "policy_outcome_eligible": start_g is not None
@@ -1253,6 +1258,10 @@ def execute_pilot(args: argparse.Namespace) -> None:
         case_definitions(args)
     elif getattr(args, "expected_input_sha256", None) is not None:
         raise ValueError("input SHA override is restricted to constructed collection")
+    minimum_u = getattr(args, "probability_min_urgency", 0.0)
+    if (not math.isfinite(minimum_u) or minimum_u < 0
+            or (minimum_u and not args.probability_pilot)):
+        raise ValueError("urgency selection requires finite U and probability mode")
     if args.probability_pilot:
         if (
             args.paired_only
@@ -1363,6 +1372,7 @@ def execute_pilot(args: argparse.Namespace) -> None:
         "format_version": 1, "status": "PILOT_IN_PROGRESS",
         "seed": args.seed, "cases": {},
         "slo_profile": getattr(args, "slo_profile", "legacy1pct"),
+        "probability_min_urgency": minimum_u,
         "collection_id": hashlib.sha256(json.dumps(
             {"protocol": protocol, "manifests": setup["manifests"]},
             sort_keys=True).encode()).hexdigest(),

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass, field
 
@@ -18,6 +19,24 @@ def source_load_eligibility(snapshot: dict, minimum_running: int) -> tuple[str, 
     if snapshot.get("source_prefill_pending_kv_tokens") != 0:
         errors.append("source prefill reservation not drained")
     return tuple(errors)
+
+
+def urgency_eligibility(snapshot: dict, minimum_u: float) -> tuple[str, ...]:
+    """Select an experimental urgency stratum, keeping guard a warning."""
+    if not math.isfinite(minimum_u) or minimum_u < 0:
+        raise ValueError("minimum urgency must be finite and non-negative")
+    if minimum_u == 0:
+        return ()
+    if (snapshot.get("status") == "GUARD_REACHED"
+            and snapshot.get("source_guard_policy")
+            == "WARNING_NOT_START_DEADLINE"):
+        # U has no finite value when T_guard is zero. The physical gate
+        # still refuses an exhausted source or an unavailable target.
+        return ()
+    value = snapshot.get("U")
+    if value is None or not math.isfinite(value) or value < minimum_u:
+        return ("planned urgency stratum not reached",)
+    return ()
 
 
 @dataclass

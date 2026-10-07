@@ -177,10 +177,12 @@ class TestProbabilityCollection(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 args, setup = self.pilot_fixture(root, name, targets)
+                args.probability_min_urgency = 1.0
 
                 def validate_command(command, log, args=args, targets=targets):
                     with patch.object(sys, "argv", command[1:]):
                         parsed = online.parse_args()
+                    self.assertEqual(parsed.probability_min_urgency, 1.0)
                     hashes = {
                         parsed.manifest: parsed.expected_manifest_sha256,
                         parsed.guard_file: parsed.expected_guard_sha256,
@@ -207,11 +209,13 @@ class TestProbabilityCollection(unittest.TestCase):
                         self.assertEqual(pressure["target_jobs"], targets)
                         if targets == 0:
                             parsed.probability_threshold = None
+                            parsed.probability_min_urgency = 0.0
                             with self.assertRaisesRegex(
                                 ValueError, "target background"
                             ):
                                 online.validate_inputs(parsed)
                             parsed.probability_threshold = 0
+                            parsed.probability_min_urgency = 1.0
                             parsed.minimum_ready_target_jobs = 1
                             with self.assertRaisesRegex(ValueError, "readiness gate"):
                                 online.validate_inputs(parsed)

@@ -30,6 +30,7 @@ from tools.bridge_tp.experiment_m1_wait import (  # noqa: E402
 from tools.bridge_tp.experiment_probability_gate import (  # noqa: E402
     ProbabilityGate,
     source_load_eligibility,
+    urgency_eligibility,
 )
 from tools.bridge_tp.risk_observation import build_risk_observation  # noqa: E402
 from tools.bridge_tp.risk_urgency import (  # noqa: E402
@@ -179,6 +180,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--probability-threshold", type=float)
     parser.add_argument("--probability-min-source-running", type=int, default=0)
+    parser.add_argument("--probability-min-urgency", type=float, default=0.0)
     parser.add_argument("--probability-threshold-family", type=float, nargs="*",
                         default=[])
     parser.add_argument("--probability-assigned-action", choices=("START", "STAY"))
@@ -320,6 +322,11 @@ def parse_args() -> argparse.Namespace:
         args.probability_min_source_running and args.probability_threshold is None
     ):
         parser.error("source concurrency selection requires probability collection")
+    if (not math.isfinite(args.probability_min_urgency)
+            or args.probability_min_urgency < 0
+            or (args.probability_min_urgency
+                and args.probability_threshold is None)):
+        parser.error("urgency selection requires finite U and probability mode")
     if args.probability_threshold is not None and (
         not args.manager_m1_auto_start or not args.manager_m5_predictor_shadow
         or args.experiment_m1_action or args.paired_stay
@@ -1649,6 +1656,7 @@ def main() -> None:
                 "experiment_m1_action": args.experiment_m1_action,
                 "probability_threshold": args.probability_threshold,
                 "probability_min_source_running": args.probability_min_source_running,
+                "probability_min_urgency": args.probability_min_urgency,
                 "probability_threshold_family": args.probability_threshold_family,
                 "probability_assigned_action": args.probability_assigned_action,
                 "probability_assignment_seed": args.probability_assignment_seed,
@@ -1868,6 +1876,8 @@ def main() -> None:
                     if probability_gate is not None:
                         eligibility_errors = source_load_eligibility(
                             m1_snapshot.to_json(), args.probability_min_source_running,
+                        ) + urgency_eligibility(
+                            risk_snapshot, args.probability_min_urgency,
                         )
                         gate_row = probability_gate.observe(
                             risk_snapshot, tick, eligibility_errors,

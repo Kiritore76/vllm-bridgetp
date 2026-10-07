@@ -270,6 +270,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--risk-observation-shadow", action="store_true")
     parser.add_argument("--probability-threshold", type=float)
     parser.add_argument("--probability-min-source-running", type=int, default=0)
+    parser.add_argument("--probability-min-urgency", type=float, default=0.0)
     parser.add_argument("--probability-threshold-family", type=float, nargs="*",
                         default=[])
     parser.add_argument("--probability-assigned-action", choices=("START", "STAY"))
@@ -367,6 +368,11 @@ def parse_args() -> argparse.Namespace:
 def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]:
     if os.name == "nt":
         raise RuntimeError("online Shadow validation requires Linux and five GPUs")
+    if (not math.isfinite(args.probability_min_urgency)
+            or args.probability_min_urgency < 0
+            or (args.probability_min_urgency
+                and args.probability_threshold is None)):
+        raise ValueError("urgency selection requires finite U and probability mode")
     if args.probability_min_source_running < 0 or (
         (args.pre_episode_warmup or args.probability_min_source_running
          or args.minimum_initial_source_headroom_tokens is not None)
@@ -3904,6 +3910,7 @@ def main() -> None:
         "experiment_m1_action": args.experiment_m1_action,
         "probability_threshold": args.probability_threshold,
         "probability_min_source_running": args.probability_min_source_running,
+        "probability_min_urgency": args.probability_min_urgency,
         "pre_episode_warmup": args.pre_episode_warmup,
         "minimum_initial_source_headroom_tokens": (
             args.minimum_initial_source_headroom_tokens
@@ -4353,6 +4360,8 @@ def main() -> None:
                             str(args.probability_threshold),
                             "--probability-min-source-running",
                             str(args.probability_min_source_running),
+                            "--probability-min-urgency",
+                            str(args.probability_min_urgency),
                             "--probability-assignment-seed",
                             args.probability_assignment_seed,
                             "--probability-start-probability",
