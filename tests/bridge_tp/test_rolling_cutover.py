@@ -29,7 +29,7 @@ def write(path, value):
 
 class TestRollingPlanner(unittest.TestCase):
     def test_late_applied_ack_is_allowed_before_the_actual_boundary(self):
-        planner = RollingPlanner(600)
+        planner = RollingPlanner(600, minimum_lead_tokens=64, lead_seconds=0.75)
         planner.observe(
             output_tokens=100,
             computed_tokens=199,
@@ -61,35 +61,63 @@ class TestRollingPlanner(unittest.TestCase):
         )
         self.assertEqual(planner.version, 1)
 
-    def test_no_boundary_until_history_and_first_delta_are_ready(self):
-        planner = RollingPlanner(600)
-        for history, delta, end in [
-            (False, False, None),
-            (True, False, 100),
-            (True, True, 100),
-        ]:
-            self.assertIsNone(
-                planner.observe(
-                    output_tokens=133,
-                    computed_tokens=230,
-                    resident_end=end,
-                    history_ready=history,
-                    delta_applied=delta,
-                    unix_s=10,
-                )
+    def test_first_plan_after_history_does_not_wait_for_live_delta(self):
+        planner = RollingPlanner(1000)
+        self.assertIsNone(
+            planner.observe(
+                output_tokens=100,
+                computed_tokens=199,
+                resident_end=None,
+                history_ready=False,
+                delta_applied=False,
+                unix_s=10,
             )
+        )
         result = planner.observe(
-            output_tokens=140,
-            computed_tokens=237,
-            resident_end=233,
+            output_tokens=133,
+            computed_tokens=232,
+            resident_end=None,
             history_ready=True,
-            delta_applied=True,
+            delta_applied=False,
             unix_s=11,
         )
-        self.assertEqual(result["cutover_output_tokens"], 204)
+        self.assertEqual(result["cutover_output_tokens"], 389)
+        self.assertEqual(result["reason"], "FIRST_AFTER_HISTORY_RESIDENT")
+        self.assertFalse(result["first_delta_applied"])
+        self.assertIsNone(result["delta_lag_tokens"])
+
+    def test_fast_decode_gets_two_seconds_of_lead_with_reservation_cap(self):
+        planner = RollingPlanner(1000)
+        planner.observe(
+            output_tokens=100,
+            computed_tokens=199,
+            resident_end=None,
+            history_ready=False,
+            delta_applied=False,
+            unix_s=10,
+        )
+        result = planner.observe(
+            output_tokens=300,
+            computed_tokens=399,
+            resident_end=None,
+            history_ready=True,
+            delta_applied=False,
+            unix_s=11,
+        )
+        self.assertEqual(result["requested_lead_tokens"], 400)
+        self.assertEqual(result["cutover_output_tokens"], 700)
+        deferred = planner.observe(
+            output_tokens=700,
+            computed_tokens=799,
+            resident_end=None,
+            history_ready=True,
+            delta_applied=False,
+            unix_s=13,
+        )
+        self.assertEqual(deferred["cutover_output_tokens"], 999)
 
     def test_lag_moves_plan_without_freezing_at_the_old_boundary(self):
-        planner = RollingPlanner(600)
+        planner = RollingPlanner(600, minimum_lead_tokens=64, lead_seconds=0.75)
         first = planner.observe(
             output_tokens=100,
             computed_tokens=199,
@@ -319,6 +347,22 @@ class TestRollingEvidence(unittest.TestCase):
 
     def test_proved_prefix_and_output_budget_are_accepted(self):
         self.assertEqual(self.errors(), [])
+
+    def test_history_only_first_plan_accepts_delta_ack_before_freeze(self):
+        plan = {
+            **self.plan,
+            "reason": "FIRST_AFTER_HISTORY_RESIDENT",
+            "first_delta_applied": False,
+            "resident_end": None,
+            "delta_lag_tokens": None,
+        }
+        (self.root / "rolling_source_plans.jsonl").write_text(json.dumps(plan))
+        path = self.root / "gpu_direct_delta_sender_receipts/first.json"
+        ack = json.loads(path.read_text())
+        write(path, {**ack, "completed_unix_s": 14})
+        self.assertEqual(self.errors(), [])
+        write(path, {**ack, "completed_unix_s": 15.5})
+        self.assertTrue(self.errors())
 
     def test_missing_ack_late_history_or_wrong_final_budget_are_rejected(self):
         patches = [
@@ -674,6 +718,28 @@ class TestActualSourceHook(unittest.TestCase):
             ),
             scheduler_output=types.SimpleNamespace(num_scheduled_tokens={"source1": 1}),
         )
+
+    def test_history_only_plan_keeps_generating_until_applied_boundary(self):
+        with patch("vllm.bridge_tp.request_freeze.request_freeze") as freeze:
+            for rank in range(4):
+                write(
+                    self.root / "gpu_initial_receipts" / f"tp_rank_{rank}.json",
+                    {
+                        "migration_id": "m1",
+                        "status": "INITIAL_HISTORY_GPU_RESIDENT",
+                        "exact_readback": True,
+                        "end_token": 120,
+                    },
+                )
+            self.step(30)
+            plan = json.loads((self.root / "rolling_source_plan.json").read_text())
+            self.assertEqual(plan["cutover_output_tokens"], 286)
+            self.assertFalse(plan["first_delta_applied"])
+            self.step(285)
+            self.assertFalse(freeze.called)
+            self.step(286)
+            self.assertGreater(self.state.rolling_planner.boundary, 286)
+            self.assertFalse(freeze.called)
 
     def test_generation_continues_then_plan_moves_and_freezes_exactly_once(self):
         with (

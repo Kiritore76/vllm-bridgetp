@@ -703,8 +703,8 @@ def maybe_publish_phase8_delta(
         if (num_computed >= reservation['num_prompt_tokens']
                 + planner.reservation_output_tokens):
             return
-        # Until the first confirmed live delta, there is no executable freeze
-        # plan. The ordinary source output cap remains authoritative.
+        # Plan only after exact history residency. Planning does not freeze;
+        # live applied-delta evidence remains mandatory at the actual boundary.
         boundary = planner.boundary or reservation['source_max_output_tokens']
         config = replace(config, phase8_cutover_output_tokens=boundary)
         if output_tokens == planner.boundary:
