@@ -68,6 +68,8 @@ def applied_progress(run_dir: Path, migration_id: str, initial_end: int) -> int 
 @dataclass
 class RollingPlanner:
     reservation_output_tokens: int
+    minimum_lead_tokens: int = 256
+    lead_seconds: float = 2.0
     boundary: int | None = None
     version: int = 0
     last_output: int | None = None
@@ -102,11 +104,14 @@ class RollingPlanner:
             and resident_end <= computed_tokens
         )
         # This is a future cutover lead, not a START token threshold. Include
-        # room for control observation and at least one final delta round.
-        lead = max(64, math.ceil(self.growth_tokens_s * 0.75))
+        # room for continued decoding and multiple applied-delta rounds.
+        lead = max(
+            self.minimum_lead_tokens,
+            math.ceil(self.growth_tokens_s * self.lead_seconds),
+        )
         reason = None
-        if self.boundary is None and ready:
-            reason = "FIRST_AFTER_HISTORY_AND_DELTA_APPLIED"
+        if self.boundary is None and history_ready:
+            reason = "FIRST_AFTER_HISTORY_RESIDENT"
         elif self.boundary is not None and output_tokens >= self.boundary and not ready:
             # This hook owns freeze publication; there is no controller RPC
             # lead to reserve here. Decode through the last 16 tokens normally
@@ -144,6 +149,9 @@ class RollingPlanner:
                 "history_ready": history_ready,
                 "first_delta_applied": delta_applied,
                 "growth_tokens_s": self.growth_tokens_s,
+                "requested_lead_tokens": lead,
+                "minimum_lead_tokens": self.minimum_lead_tokens,
+                "lead_seconds": self.lead_seconds,
                 "published_unix_s": unix_s,
                 "reason": reason,
             }
@@ -232,28 +240,33 @@ def rolling_evidence_errors(
             previous_s = p["published_unix_s"]
         first = plans[0]
         if (
-            first.get("reason") != "FIRST_AFTER_HISTORY_AND_DELTA_APPLIED"
+            first.get("reason")
+            not in {
+                "FIRST_AFTER_HISTORY_RESIDENT",
+                "FIRST_AFTER_HISTORY_AND_DELTA_APPLIED",
+            }
             or first.get("history_ready") is not True
-            or first.get("first_delta_applied") is not True
-            or not 0 <= first["delta_lag_tokens"] <= 16
-            or first["computed_tokens"] - first["resident_end"]
-            != first["delta_lag_tokens"]
         ):
-            errors.append("rolling first plan lacks ready history and applied delta")
+            errors.append("rolling first plan lacks ready history")
         first_s = first["published_unix_s"]
         first_acks = [
             read_json(path)
             for path in (run_dir / "gpu_direct_delta_sender_receipts").glob("*.json")
         ]
+        ack_deadline = (
+            first_s
+            if first.get("reason") == "FIRST_AFTER_HISTORY_AND_DELTA_APPLIED"
+            else s["selected_unix_s"]
+        )
         if not any(
             p.get("status") == "APPLIED_ALL_RANKS"
             and p.get("migration_id") == identity
             and p.get("start_token") == session["num_computed_tokens"]
             and p.get("end_token", 0) > session["num_computed_tokens"]
-            and p.get("completed_unix_s", math.inf) <= first_s
+            and p.get("completed_unix_s", math.inf) <= ack_deadline
             for p in first_acks
         ):
-            errors.append("rolling first plan preceded the first four-rank applied ACK")
+            errors.append("rolling freeze preceded the first four-rank applied ACK")
         if (
             s.get("mechanism") != MECHANISM
             or s.get("migration_id") != identity
