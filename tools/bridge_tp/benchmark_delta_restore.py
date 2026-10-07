@@ -13,6 +13,7 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from vllm.bridge_tp.delta_timing import DeltaTiming  # noqa: E402
 from vllm.bridge_tp.kv_restore import inject_rank_delta  # noqa: E402
 
 
@@ -37,7 +38,10 @@ def reference_blockwise(destination, delta, blocks, start, end, block_size):
         raise ValueError("reference exact readback failed")
 
 
-def benchmark(device: str, *, layers: int, heads: int, head_size: int, iterations: int):
+def benchmark(
+    device: str, *, layers: int, heads: int, head_size: int, iterations: int,
+    token_counts: list[int],
+):
     cache = {
         f"layer.{index}": torch.full(
             (2, 12, 16, heads, head_size), -9.0, device=device, dtype=torch.bfloat16
@@ -51,7 +55,7 @@ def benchmark(device: str, *, layers: int, heads: int, head_size: int, iteration
         if device.startswith("cuda"):
             torch.cuda.synchronize(device)
 
-    for tokens in (10, 17, 29, 32):
+    for tokens in token_counts:
         start, end = 13, 13 + tokens
         delta = {
             name: torch.randn(tokens, 2, heads, head_size, device=device).bfloat16()
@@ -92,9 +96,17 @@ def benchmark(device: str, *, layers: int, heads: int, head_size: int, iteration
                 synchronize()
                 if repetition >= 2:
                     timings[method].append((time.perf_counter() - began) * 1000)
+        trace = DeltaTiming(torch.device(device))
+        synchronize()
+        inject_rank_delta(
+            cache, delta, blocks, start_token=start, end_token=end,
+            block_axis=1, block_size=16, timing_hook=trace.mark,
+        )
+        trace.mark("FINAL_RESULT_RETURNED", cuda=False)
         rows.append(
             {
                 "tokens": tokens,
+                "stage_diagnostic": trace.result(),
                 "exact_full_cache_match": True,
                 "scatter_ms": timings["scatter"],
                 "blockwise_reference_ms": timings["blockwise_reference"],
@@ -120,10 +132,13 @@ def main():
         "--devices", nargs="+", default=[f"cuda:{i}" for i in range(1, 5)]
     )
     parser.add_argument("--iterations", type=int, default=10)
+    parser.add_argument("--tokens", nargs="+", type=int, default=[10, 17, 29, 32])
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     if args.iterations < 3 or args.out.exists():
         raise ValueError("use at least three repetitions and a new output path")
+    if any(not 0 < tokens <= 83 for tokens in args.tokens):
+        raise ValueError("benchmark token counts must fit the test allocation")
     config = json.loads(args.model_config.read_text())
     if config["num_key_value_heads"] % 4:
         raise ValueError("KV heads cannot be partitioned across TP4")
@@ -134,6 +149,7 @@ def main():
             heads=config["num_key_value_heads"] // 4,
             head_size=config["hidden_size"] // config["num_attention_heads"],
             iterations=args.iterations,
+            token_counts=args.tokens,
         )
         for device in args.devices
     ]

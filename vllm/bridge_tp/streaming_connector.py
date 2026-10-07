@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from vllm.bridge_tp.block_layout import snapshot_target_block_ids
+from vllm.bridge_tp.delta_timing import delta_timing
 from vllm.bridge_tp.kv_restore import inject_rank_delta, inject_rank_shard
 from vllm.bridge_tp.online_remote_attention import (
     RemoteAttentionConfig,
@@ -1927,23 +1928,33 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     if restore_stream is not None
                     else nullcontext()
                 )
+                timing = delta_timing(device)
                 delta_apply_started = time.perf_counter()
                 diagnostic_phase = "BEFORE_DELTA_INJECT"
                 with self._gpu_kv_lock, restore_context:
+                    lock_acquired = time.perf_counter()
+                    if timing is not None:
+                        timing.mark("RECEIVE_EVENT_DEPENDENCY")
                     if restore_stream is not None and direct_delta is not None:
                         if direct_delta.receive_done_event is None:
                             raise RuntimeError("GPU delta has no receive-done event")
                         restore_stream.wait_event(direct_delta.receive_done_event)
                         receive_event_links += 1
+                    if timing is not None:
+                        timing.mark("DESTINATION_MAPPING")
+                    destinations = self._destination_layers(delta_layers)
                     delta_validation = inject_rank_delta(
-                        self._destination_layers(delta_layers),
+                        destinations,
                         delta_layers,
                         request.target_block_ids,
                         start_token=start,
                         end_token=end,
                         block_axis=int(manifest["block_axis"]),
                         block_size=int(manifest["block_size"]),
+                        timing_hook=timing.mark if timing is not None else None,
                     )
+                    if timing is not None:
+                        timing.mark("FINAL_RESULT_RETURNED", cuda=False)
                 diagnostic_phase = "AFTER_DELTA_INJECT_AND_READBACK"
                 delta_apply_ms = (
                     time.perf_counter() - delta_apply_started
@@ -1977,6 +1988,14 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     ),
                     "completed_unix_s": time.time(),
                 }
+                if timing is not None:
+                    delta_receipt["stage_timing"] = {
+                        **timing.result(),
+                        "kv_lock_and_context_wait_ms": (
+                            lock_acquired - delta_apply_started
+                        ) * 1000,
+                    }
+                receipt_write_started = time.perf_counter()
                 _atomic_json_dump(
                     delta_receipt,
                     self.manifest_path.parent
@@ -1995,11 +2014,23 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     / "gpu_watermarks"
                     / f"tp_rank_{tp_rank}.json",
                 )
+                receipt_write_ms = (
+                    time.perf_counter() - receipt_write_started
+                ) * 1000
                 if gpu_direct_delta:
+                    ack_started = time.perf_counter()
                     receiver.acknowledge_delta(
                         start_token=start,
                         end_token=end,
                     )
+                    ack_notify_ms = (time.perf_counter() - ack_started) * 1000
+                    stage_extra = {}
+                    if timing is not None:
+                        stage_extra["delta_stage_timing"] = {
+                            **delta_receipt["stage_timing"],
+                            "receipt_and_watermark_write_ms": receipt_write_ms,
+                            "ack_notify_ms": ack_notify_ms,
+                        }
                     _write_gpu_direct_rank_diagnostic(
                         self.manifest_path,
                         request_id=request_id,
@@ -2016,6 +2047,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                         delta_exact_readback=(
                             delta_validation.get("exact_readback") is True
                         ),
+                        **stage_extra,
                     )
 
             if gpu_direct_delta and not rolling:
