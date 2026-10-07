@@ -2078,8 +2078,31 @@ def accept_rolling_cancel(
         'source_cleanup_receipt', 'target_cleanup_receipt', 'stager_cleanup_receipt',
     ):
         receipt = read_json(controller_dir / (name + '.json'))
+        identity_matches = receipt.get('migration_id') == r.get('migration_id')
+        if name == 'stager_cleanup_receipt' and 'migration_id' not in receipt:
+            # Legacy stagers omitted the ID. Bind their receipt to the same
+            # session's cleanup request and reject a stale/wrong-reason receipt.
+            from math import isfinite
+
+            cleanup = read_json(controller_dir / 'cleanup_request.json')
+            session = read_json(controller_dir / 'session_manifest.json')
+            requested = cleanup.get('requested_unix_s')
+            completed = receipt.get('updated_unix_s')
+            identity_matches = (
+                session.get('migration_id') == r.get('migration_id')
+                and cleanup.get('migration_id') == r.get('migration_id')
+                and cleanup.get('source_request_id') == session.get('source_request_id')
+                and cleanup.get('abort_source') is False
+                and receipt.get('component') == 'cpu_stager'
+                and cleanup.get('reason') == receipt.get('reason')
+                and receipt.get('reason') in reasons
+                and type(requested) in (int, float)
+                and type(completed) in (int, float)
+                and isfinite(requested) and isfinite(completed)
+                and requested <= completed
+            )
         if (receipt.get('status') != 'CLEANED'
-                or receipt.get('migration_id') != r.get('migration_id')):
+                or not identity_matches):
             errors.append(f'rolling {name} is incomplete')
     if any((controller_dir / name).exists() for name in
            ('request_frozen_receipt.json', 'cutover_manifest.json')):

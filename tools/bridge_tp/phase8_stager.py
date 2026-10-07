@@ -593,12 +593,18 @@ class _DeliveryPublisher:
 
 
 def _cleanup(run_dir: Path, reason: str, staged_ranks: int, deltas: int) -> None:
+    manifest_path = run_dir / "session_manifest.json"
+    manifest = (
+        json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest_path.is_file() else {}
+    )
     _atomic_json_dump(
         {
             "format_version": 1,
             "phase": "BridgeTP D3 Phase 8",
             "status": "CLEANED",
             "component": "cpu_stager",
+            "migration_id": manifest.get("migration_id"),
             "reason": reason,
             "released_rank_buffers": staged_ranks,
             "released_delta_batches": deltas,
