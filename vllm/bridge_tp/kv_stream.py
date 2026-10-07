@@ -873,21 +873,6 @@ class _GpuDirectHistoryPublisher:
                                 f"{work['end_token']:012d}.json"
                             ),
                         )
-                        if (self.config.run_dir / 'rolling_reservation.json').is_file():
-                            _atomic_json_dump(
-                                {
-                                    'format_version': 1,
-                                    'status': 'APPLIED_ALL_RANKS',
-                                    'migration_id': self.config.migration_id,
-                                    'initial_end_token': self.history_end_token,
-                                    'rank_end_tokens': {
-                                        str(rank): record['end_token']
-                                        for rank in range(self.config.target_tp_size)
-                                    },
-                                    'completed_unix_s': time.time(),
-                                },
-                                self.config.run_dir / 'rolling_delta_progress.json',
-                            )
                     except Exception as error:
                         message = (
                             f"tokens=[{work.get('start_token', '?')},"

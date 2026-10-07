@@ -50,19 +50,24 @@ def resident_progress(run_dir: Path, migration_id: str) -> tuple[bool, int | Non
 
 
 def applied_progress(run_dir: Path, migration_id: str, initial_end: int) -> int | None:
-    """Read the sender's compact watermark after all four applied ACKs."""
-    value = read_json(run_dir / "rolling_delta_progress.json")
-    ends = value.get("rank_end_tokens")
-    if (
-        value.get("migration_id") != migration_id
-        or value.get("status") != "APPLIED_ALL_RANKS"
-        or value.get("initial_end_token") != initial_end
-        or not isinstance(ends, dict)
-        or set(ends) != {"0", "1", "2", "3"}
-        or any(type(v) is not int or v <= initial_end for v in ends.values())
-    ):
-        return None
-    return min(ends.values())
+    """Read contiguous all-rank ACK receipts from the original sender path."""
+    receipts = []
+    for path in (run_dir / "gpu_direct_delta_sender_receipts").glob("*.json"):
+        value = read_json(path)
+        start, end = value.get("start_token"), value.get("end_token")
+        if value.get("migration_id") != migration_id:
+            continue
+        if (value.get("status") != "APPLIED_ALL_RANKS"
+                or type(start) is not int or type(end) is not int
+                or not initial_end <= start < end):
+            return None
+        receipts.append((start, end))
+    current = initial_end
+    for start, end in sorted(receipts):
+        if start != current:
+            return None
+        current = end
+    return current if current > initial_end else None
 
 
 @dataclass
