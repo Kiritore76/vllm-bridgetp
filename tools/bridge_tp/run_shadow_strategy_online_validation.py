@@ -3602,6 +3602,7 @@ def accept_online(
         "strategy": strategy,
         "commit_timing": commit_timing,
         'rolling_cutover': rolling_cutover,
+        'actual_cutover_output_tokens': cutover['cutover_num_output_tokens'],
         "earliest_ready_cutover_output_tokens": (
             earliest_ready_selected[0].get("cutover_output_tokens")
             if earliest_ready_selected
