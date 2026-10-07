@@ -74,6 +74,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--constructed-target-count", type=int, default=8)
     parser.add_argument("--probability-thresholds", type=float, nargs="+",
                         default=[0.0, 0.01, 0.05, 0.2])
+    parser.add_argument("--probability-arms", nargs="+",
+                        help="Select preregistered arms for original-code A/B")
     parser.add_argument("--paired-only", action="store_true",
                         help="Collect STAY and early128 without the late EOS arm")
     parser.add_argument("--timing-pilot", action="store_true",
@@ -1239,6 +1241,22 @@ def probability_results(summary: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def select_probability_arms(
+    thresholds: list[float], requested: list[str] | None = None,
+) -> tuple[str, ...]:
+    """Select engineering arms without changing the preregistered gate family."""
+    available = tuple(
+        f"prob_{theta:g}_{assignment}"
+        for theta in thresholds for assignment in ("START", "STAY")
+    )
+    if requested is None:
+        return available
+    if not requested or len(requested) != len(set(requested)):
+        raise ValueError("probability arms must be nonempty and unique")
+    if any(name not in available for name in requested):
+        raise ValueError("probability arm is outside preregistered thresholds")
+    return tuple(requested)
+
 def execute_pilot(args: argparse.Namespace) -> None:
     if getattr(args, "constructed_workload", False):
         if (
@@ -1335,6 +1353,12 @@ def execute_pilot(args: argparse.Namespace) -> None:
                tuple(args.actions) if args.actions else
                TIMING_ACTIONS if args.timing_pilot else
                ("stay", "early128") if args.paired_only else ACTIONS)
+    if args.probability_arms is not None:
+        if not args.probability_pilot:
+            raise ValueError("arm selection requires probability pilot")
+        actions = select_probability_arms(
+            args.probability_thresholds, args.probability_arms
+        )
     preflight = verify(args)
     root = args.out_dir.resolve()
     protocol = {k: str(v) if isinstance(v, Path) else v
