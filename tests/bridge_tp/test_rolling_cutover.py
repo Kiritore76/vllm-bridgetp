@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 from vllm.bridge_tp.rolling_cutover import (
     MECHANISM,
     RollingPlanner,
+    applied_progress,
     finalize_reserved_request,
     rolling_evidence_errors,
 )
@@ -25,6 +26,25 @@ from vllm.bridge_tp.rolling_cutover import (
 def write(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value), encoding="utf-8")
+
+
+class TestOriginalDeltaProgress(unittest.TestCase):
+    def test_contiguous_original_acks_and_invalid_gap(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertIsNone(applied_progress(root, "m1", 120))
+            folder = root / "gpu_direct_delta_sender_receipts"
+            first = {"migration_id": "m1", "status": "APPLIED_ALL_RANKS",
+                     "start_token": 120, "end_token": 136}
+            write(folder / "first.json", first)
+            self.assertEqual(applied_progress(root, "m1", 120), 136)
+            second = {**first, "start_token": 136, "end_token": 150}
+            write(folder / "second.json", second)
+            self.assertEqual(applied_progress(root, "m1", 120), 150)
+            write(folder / "second.json", {**second, "start_token": 137})
+            self.assertIsNone(applied_progress(root, "m1", 120))
+            write(folder / "second.json", {**second, "status": "RECEIVED"})
+            self.assertIsNone(applied_progress(root, "m1", 120))
 
 
 class TestRollingPlanner(unittest.TestCase):
@@ -701,12 +721,12 @@ class TestActualSourceHook(unittest.TestCase):
                 },
             )
         write(
-            self.root / "rolling_delta_progress.json",
+            self.root / "gpu_direct_delta_sender_receipts/progress.json",
             {
                 "migration_id": "m1",
                 "status": "APPLIED_ALL_RANKS",
-                "initial_end_token": 120,
-                "rank_end_tokens": {str(rank): computed for rank in range(4)},
+                "start_token": 120,
+                "end_token": computed,
             },
         )
 

@@ -21,7 +21,6 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from vllm.bridge_tp.block_layout import snapshot_target_block_ids
-from vllm.bridge_tp.history_coverage import history_block_coverage
 from vllm.bridge_tp.kv_restore import inject_rank_delta, inject_rank_shard
 from vllm.bridge_tp.online_remote_attention import (
     RemoteAttentionConfig,
@@ -1768,16 +1767,32 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             if history_bytes:
                 digest.update(history_bytes)
             aggregate_bytes += history_payload_bytes
-            # The existing full-rank exact readback covers every logical
-            # block. Publish its complete allocation coverage in the initial
-            # receipt instead of blocking live delta reception on hundreds
-            # of redundant per-block file writes.
-            coverage = history_block_coverage(
-                block_size=int(manifest["block_size"]),
-                end_token=initial_end,
-                target_block_ids=request.target_block_ids[:initial_blocks],
-                validation=validation,
-            )
+            # One full-tensor exact readback covers every logical block.  Keep
+            # the per-block receipts required by the protocol without paying
+            # for 132 separate tensor serializations and GPU round trips.
+            completed_unix_s = time.time()
+            for logical_block in range(initial_blocks):
+                _atomic_json_dump(
+                    {
+                        "format_version": 1,
+                        "status": "BLOCK_GPU_RESIDENT",
+                        "migration_id": request.migration_id,
+                        "target_request_id": request_id,
+                        "tp_rank": tp_rank,
+                        "logical_block": logical_block,
+                        "end_token": min(
+                            (logical_block + 1) * int(manifest["block_size"]),
+                            initial_end,
+                        ),
+                        "exact_readback": exact_readback,
+                        "verification_scope": "FULL_RANK_EXACT_READBACK",
+                        "completed_unix_s": completed_unix_s,
+                    },
+                    self.manifest_path.parent
+                    / "gpu_block_receipts"
+                    / f"tp_rank_{tp_rank}"
+                    / f"block_{logical_block:012d}.json",
+                )
             current = initial_end
             delta_batches = 0
             resident_completed_unix_s = time.time()
@@ -1811,7 +1826,6 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     "end_token": current,
                     "exact_readback": exact_readback,
                     "transport": manifest.get("history_transport"),
-                    "history_block_coverage": coverage,
                     "completed_unix_s": resident_completed_unix_s,
                     "buffered_completed_unix_s": buffered_completed_unix_s,
                     "resident_completed_unix_s": resident_completed_unix_s,
