@@ -37,6 +37,28 @@ def test_payload() -> dict:
 
 
 class TestSloV6Audit(unittest.TestCase):
+    def test_cancelled_target_does_not_replace_completed_visible_source(self) -> None:
+        from tools.bridge_tp.horizon_goodoutput import score_horizon
+
+        value = test_payload()
+        source = value['controller/source_response.json']
+        source.update(finish_reason='stop', completed_unix_s=0.2, token_ids=[1, 2, 3])
+        proxy = value['controller/response_proxy_stats.json']
+        proxy.update(committed=False, source_origin_tokens=3, target_origin_tokens=0,
+                     handoff_stall_s=None)
+        for i, row in enumerate(proxy['emitted']):
+            row.update(token_id=i + 1, origin='source')
+        target = value['controller/target_response.json']
+        target.update(finish_reason='error', completed_unix_s=0.14, token_ids=[])
+        report = audit_v6_payload(value, REFERENCE)
+        self.assertTrue(report['computable'], report['errors'])
+        self.assertEqual(report['metrics']['completed_requests'], 2)
+        self.assertEqual(report['metrics']['good_output_tokens'], 6)
+        horizon = score_horizon(report, value['background/background_summary.json'],
+                                source, target, proxy, 1, settle_after_h=True)
+        self.assertTrue(horizon['eligible'], horizon.get('errors'))
+        self.assertEqual(horizon['good_output_tokens'], 6)
+
     def test_interpolates_per_request_length(self) -> None:
         self.assertEqual(ttft_limit_ms(320, REFERENCE), 1200.0)
         self.assertEqual(ttft_limit_ms(1, REFERENCE), 1100.0)

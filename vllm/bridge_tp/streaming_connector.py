@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from vllm.bridge_tp.block_layout import snapshot_target_block_ids
+from vllm.bridge_tp.history_coverage import history_block_coverage
 from vllm.bridge_tp.kv_restore import inject_rank_delta, inject_rank_shard
 from vllm.bridge_tp.online_remote_attention import (
     RemoteAttentionConfig,
@@ -1767,32 +1768,16 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             if history_bytes:
                 digest.update(history_bytes)
             aggregate_bytes += history_payload_bytes
-            # One full-tensor exact readback covers every logical block.  Keep
-            # the per-block receipts required by the protocol without paying
-            # for 132 separate tensor serializations and GPU round trips.
-            completed_unix_s = time.time()
-            for logical_block in range(initial_blocks):
-                _atomic_json_dump(
-                    {
-                        "format_version": 1,
-                        "status": "BLOCK_GPU_RESIDENT",
-                        "migration_id": request.migration_id,
-                        "target_request_id": request_id,
-                        "tp_rank": tp_rank,
-                        "logical_block": logical_block,
-                        "end_token": min(
-                            (logical_block + 1) * int(manifest["block_size"]),
-                            initial_end,
-                        ),
-                        "exact_readback": exact_readback,
-                        "verification_scope": "FULL_RANK_EXACT_READBACK",
-                        "completed_unix_s": completed_unix_s,
-                    },
-                    self.manifest_path.parent
-                    / "gpu_block_receipts"
-                    / f"tp_rank_{tp_rank}"
-                    / f"block_{logical_block:012d}.json",
-                )
+            # The existing full-rank exact readback covers every logical
+            # block. Publish its complete allocation coverage in the initial
+            # receipt instead of blocking live delta reception on hundreds
+            # of redundant per-block file writes.
+            coverage = history_block_coverage(
+                block_size=int(manifest["block_size"]),
+                end_token=initial_end,
+                target_block_ids=request.target_block_ids[:initial_blocks],
+                validation=validation,
+            )
             current = initial_end
             delta_batches = 0
             resident_completed_unix_s = time.time()
@@ -1826,6 +1811,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     "end_token": current,
                     "exact_readback": exact_readback,
                     "transport": manifest.get("history_transport"),
+                    "history_block_coverage": coverage,
                     "completed_unix_s": resident_completed_unix_s,
                     "buffered_completed_unix_s": buffered_completed_unix_s,
                     "resident_completed_unix_s": resident_completed_unix_s,
@@ -1873,7 +1859,8 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     / "initial_stage_receipts"
                     / f"tp_rank_{tp_rank}.json",
                 )
-            while current < request.num_computed_tokens:
+            rolling = (self.manifest_path.parent / 'rolling_reservation.json').is_file()
+            while current < request.num_computed_tokens or rolling:
                 direct_delta = None
                 if gpu_direct_delta:
                     diagnostic_phase = "BEFORE_DELTA_RECEIVE"
@@ -1883,6 +1870,8 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                         synchronize=not stream_event_mode,
                     )
                     if direct_delta is None:
+                        if rolling:
+                            break
                         raise RuntimeError(
                             "GPU-direct delta stream closed before cutover"
                         )
@@ -2015,7 +2004,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                         ),
                     )
 
-            if gpu_direct_delta:
+            if gpu_direct_delta and not rolling:
                 terminal = receiver.receive_delta(
                     migration_id=request.migration_id,
                     rank=tp_rank,
@@ -2330,7 +2319,40 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 raise FileNotFoundError("Shadow receive finished without cutover")
             cutover = _load_json(cutover_path)
             token_ids = list(cutover["all_known_token_ids"])
-            if len(token_ids) != request.num_tokens:
+            reservation_path = self.manifest_path.parent / 'rolling_reservation.json'
+            if reservation_path.is_file():
+                from vllm.bridge_tp.rolling_cutover import (
+                    MECHANISM,
+                    finalize_reserved_request,
+                )
+
+                reservation = _load_json(reservation_path)
+                if (reservation.get('mechanism') != MECHANISM
+                        or reservation.get('migration_id') != cutover['migration_id']
+                        or reservation['num_prompt_tokens']
+                        + reservation['reservation_output_tokens']
+                        != request.num_tokens):
+                    raise ValueError('rolling target reservation identity differs')
+                finalize_reserved_request(
+                    request, cutover, reserved_known_tokens=request.num_tokens,
+                    total_output_budget=reservation['total_output_budget'],
+                )
+                _atomic_json_dump(
+                    {
+                        'format_version': 1, 'mechanism': MECHANISM,
+                        'migration_id': cutover['migration_id'],
+                        'target_request_id': request_id,
+                        'cutover_output_tokens': cutover['cutover_num_output_tokens'],
+                        'reserved_known_tokens': reservation['num_prompt_tokens']
+                        + reservation['reservation_output_tokens'],
+                        'num_tokens': request.num_tokens,
+                        'num_computed_tokens': request.num_computed_tokens,
+                        'max_tokens': request.max_tokens,
+                        'completed_unix_s': time.time(),
+                    },
+                    self.manifest_path.parent / 'rolling_target_finalized.json',
+                )
+            elif len(token_ids) != request.num_tokens:
                 raise ValueError("Final Shadow token count differs from reservation")
             request.prompt_token_ids = token_ids
             request._all_token_ids[:] = token_ids

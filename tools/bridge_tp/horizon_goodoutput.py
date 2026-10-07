@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import math
 
+from tools.bridge_tp.audit_goodoutput import active_anchor_response
+
 
 def score_horizon(
     slo: dict,
@@ -33,11 +35,12 @@ def score_horizon(
         return {**excluded, "errors": slo.get("errors") or ["missing SLO audit"]}
     records = {r["job_id"]: r for r in background.get("results", [])}
     anchor_id = str(proxy.get("external_request_id", "anchor"))
+    active = active_anchor_response(source, target, proxy)
     records[anchor_id] = {
         "request_started_unix_s": source.get("request_started_unix_s"),
-        "request_ended_unix_s": (target or source).get("completed_unix_s"),
+        "request_ended_unix_s": active.get("completed_unix_s"),
         "token_times_unix_s": [x.get("unix_s") for x in proxy.get("emitted", [])],
-        "finish_reason": (target or source).get("finish_reason"),
+        "finish_reason": active.get("finish_reason"),
     }
     rows = slo.get("request_rows", [])
     if not rows or set(records) != {r["request_id"] for r in rows}:
