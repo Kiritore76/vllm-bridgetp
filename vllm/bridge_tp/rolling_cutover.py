@@ -100,7 +100,7 @@ class RollingPlanner:
             history_ready
             and delta_applied
             and lag is not None
-            and lag <= 16
+            and lag >= 0
             and resident_end <= computed_tokens
         )
         # This is a future cutover lead, not a START token threshold. Include
@@ -113,9 +113,9 @@ class RollingPlanner:
         if self.boundary is None and history_ready:
             reason = "FIRST_AFTER_HISTORY_RESIDENT"
         elif self.boundary is not None and output_tokens >= self.boundary and not ready:
-            # This hook owns freeze publication; there is no controller RPC
-            # lead to reserve here. Decode through the last 16 tokens normally
-            # and use the applied watermark at B, before requesting a freeze.
+            # Missing or invalid applied evidence can defer a boundary.
+            # Backlog size does not: freeze at B and drain the finite tail
+            # before publishing cutover and allowing target takeover.
             reason = "DEFERRED_BEFORE_FREEZE"
         if output_tokens >= self.reservation_output_tokens - 1 and not ready:
             return {
@@ -149,6 +149,8 @@ class RollingPlanner:
                 "history_ready": history_ready,
                 "first_delta_applied": delta_applied,
                 "growth_tokens_s": self.growth_tokens_s,
+                "freeze_policy": "FREEZE_AT_BOUNDARY_DRAIN_TAIL",
+                "maximum_pre_freeze_delta_lag_tokens": None,
                 "requested_lead_tokens": lead,
                 "minimum_lead_tokens": self.minimum_lead_tokens,
                 "lead_seconds": self.lead_seconds,
@@ -277,7 +279,7 @@ def rolling_evidence_errors(
             or s.get("cutover_output_tokens") != boundary
             or previous != boundary
             or s.get("computed_tokens") != cutover["num_computed_tokens"]
-            or not 0 <= s["delta_lag_tokens"] <= 16
+            or s["delta_lag_tokens"] < 0
             or s["computed_tokens"] - s["resident_end"] != s["delta_lag_tokens"]
             or not first_s <= s["selected_unix_s"] <= freeze_unix_s
         ):
