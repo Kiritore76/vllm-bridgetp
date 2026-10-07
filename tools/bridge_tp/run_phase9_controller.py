@@ -104,6 +104,7 @@ from vllm.bridge_tp.controller.telemetry import (  # noqa: E402
     MetricsScraper,
     TelemetryError,
 )
+from vllm.bridge_tp.rolling_cutover import MECHANISM, read_json  # noqa: E402
 from vllm.bridge_tp.runtime_control import RuntimeControl  # noqa: E402
 
 _STOP = False
@@ -117,6 +118,8 @@ def _handle_signal(_signum, _frame) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument('--rolling-cutover', action='store_true')
+    parser.add_argument('--rolling-reserve-tokens', type=int, default=512)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--source-request", type=Path, required=True)
     parser.add_argument(
@@ -280,6 +283,12 @@ def parse_args() -> argparse.Namespace:
     trigger = args.diagnostic_trigger_output_tokens
     cutover = args.diagnostic_cutover_output_tokens
     bridge = args.diagnostic_bridge_output_tokens
+    if args.rolling_cutover and (
+        not args.diagnostic_earliest_ready_cutover
+        or not args.gpu_resident_shadow or args.handoff_mode != 'shadow-only'
+        or args.stop_and_copy or args.rolling_reserve_tokens < 64
+    ):
+        raise ValueError('rolling cutover requires GPU Shadow-only earliest-ready')
     if args.diagnostic_earliest_ready_cutover and (
         (trigger is None and not args.manager_m1_auto_start)
         or cutover is not None
@@ -497,6 +506,7 @@ def _start_target_if_ready(
     cutover_output_tokens: int | None = None,
     stop_and_copy: bool = False,
     target_request_name: str | None = None,
+    rolling_cutover: bool = False,
 ) -> Future[dict[str, Any]] | None:
     if target_future is not None:
         return target_future
@@ -528,7 +538,7 @@ def _start_target_if_ready(
             target_request_name or run_dir.name,
             requested_max_output_tokens=requested_max_output_tokens,
         )
-    if recorder.proxy.cutover_index != cutover:
+    if not rolling_cutover and recorder.proxy.cutover_index != cutover:
         raise RuntimeError(
             "stager cutover differs from controller cutover: "
             f"{cutover} != {recorder.proxy.cutover_index}"
@@ -865,6 +875,53 @@ def step_m4_cancel(
     )
 
 
+def step_rolling_shadow(
+    *, adapter: ActionAdapter, audit: AuditLog, record: MigrationRecord,
+    request: SourceRequestView, max_tokens: int, reserve_tokens: int,
+) -> str:
+    """Reserve target space; the source owns plans and pre-freeze deferrals."""
+    if record.candidate_cutover_output_tokens is None:
+        buffered, ranks, detail = adapter.poll_initial_history_gpu_buffered()
+        if not buffered:
+            return ''
+        session = load_json(adapter.run_dir / 'session_manifest.json')
+        outstanding = max(0, request.computed_tokens - session['num_computed_tokens'])
+        reservation = min(max_tokens - 1,
+                          request.output_tokens + outstanding + reserve_tokens)
+        if reservation <= request.output_tokens + 16:
+            return 'rolling reservation has no remaining safe output budget'
+        budgets = load_json(adapter.run_dir / 'request_budgets.json')
+        value = {
+            'format_version': 1, 'mechanism': MECHANISM,
+            'migration_id': session['migration_id'],
+            'source_request_id': session['source_request_id'],
+            'initial_end_token': session['num_computed_tokens'],
+            'num_prompt_tokens': session['num_prompt_tokens'],
+            'reservation_output_tokens': reservation,
+            'source_max_output_tokens': max_tokens,
+            'total_output_budget': budgets['requested_max_output_tokens'],
+            'published_unix_s': time.time(),
+        }
+        atomic_json_dump(value, adapter.run_dir / 'rolling_reservation.json')
+        atomic_json_dump(
+            {**value, 'cutover_output_tokens': reservation,
+             'reservation_only': True},
+            adapter.run_dir / 'earliest_ready_candidate.json',
+        )
+        record.candidate_cutover_output_tokens = reservation
+        audit.write({'kind': 'rolling_target_reserved', **value,
+                     'ranks': sorted(ranks), 'detail': detail})
+    plan = read_json(adapter.run_dir / 'rolling_source_plan.json')
+    if plan.get('status') == 'RESERVATION_EXHAUSTED':
+        return 'rolling reservation exhausted before safe freeze; source continues'
+    if plan and plan.get('version') != getattr(record, 'rolling_seen_version', None):
+        if plan.get('migration_id') != record.migration_id:
+            raise RuntimeError('source rolling plan migration ID differs')
+        record.rolling_seen_version = plan['version']
+        audit.write({'kind': 'rolling_cutover_plan_observed', 'plan': plan})
+    return ''
+
+
 def step_shadow(
     policy: FastPolicy,
     machine: MigrationStateMachine,
@@ -885,6 +942,8 @@ def step_shadow(
     manager_m2: M2RateController | None = None,
     m2_snapshot: RuntimeSnapshot | None = None,
     manager_m3: M3CommitController | None = None,
+    rolling_cutover: bool = False,
+    rolling_reserve_tokens: int = 512,
 ) -> None:
     remaining = policy.migration_bytes(request)
     tpot_samples = getattr(pool4, "tpot_samples", 0)
@@ -923,7 +982,14 @@ def step_shadow(
         adapter.set_rate(rate.rate_gib_s, note=rate.last_reason)
 
     late_candidate_reason = ""
-    if (
+    if rolling_cutover:
+        if dry_run or max_tokens is None:
+            raise ValueError('rolling cutover requires an online output budget')
+        late_candidate_reason = step_rolling_shadow(
+            adapter=adapter, audit=audit, record=record, request=request,
+            max_tokens=max_tokens, reserve_tokens=rolling_reserve_tokens,
+        )
+    elif (
         diagnostic_earliest_ready_cutover
         and record.candidate_cutover_output_tokens is None
     ):
@@ -1662,6 +1728,8 @@ def main() -> None:
                 "probability_assignment_seed": args.probability_assignment_seed,
                 "probability_start_probability": args.probability_start_probability,
                 "manager_m3_commit": args.manager_m3_commit,
+                'rolling_cutover': args.rolling_cutover,
+                'rolling_reserve_tokens': args.rolling_reserve_tokens,
                 "manager_m4_cancel": args.manager_m4_cancel,
                 "manager_m5_predictor_shadow": args.manager_m5_predictor_shadow,
                 "predictor_checkpoint_sha256": args.predictor_checkpoint_sha256,
@@ -2168,6 +2236,7 @@ def main() -> None:
                             if args.source_request_id
                             else None
                         ),
+                        rolling_cutover=args.rolling_cutover,
                     )
                     if (
                         args.handoff_mode == "bridge"
@@ -2202,6 +2271,25 @@ def main() -> None:
                             or (run_dir / "cutover_manifest.json").exists()
                         )
                     ):
+                        if (args.rolling_cutover
+                                and record.cutover_output_tokens is None):
+                            cutover = load_json(run_dir / 'cutover_manifest.json')
+                            selection = load_json(
+                                run_dir / 'rolling_freeze_selection.json'
+                            )
+                            boundary = int(cutover['cutover_num_output_tokens'])
+                            if selection['cutover_output_tokens'] != boundary:
+                                raise RuntimeError(
+                                    'rolling freeze differs from manifest'
+                                )
+                            record.cutover_output_tokens = boundary
+                            recorder.set_cutover(boundary, now)
+                            machine.transition(
+                                record.migration_id, MigrationState.READY_NOT_COMMITTED,
+                                now, 'rolling boundary frozen with exact live delta',
+                            )
+                            audit.write({'kind': 'rolling_cutover_selected',
+                                         'selection': selection})
                         if record.t_cutover is None:
                             record.t_cutover = now
                             audit.write(
@@ -2273,6 +2361,8 @@ def main() -> None:
                             manager_m2,
                             m2_snapshot,
                             manager_m3,
+                            args.rolling_cutover,
+                            args.rolling_reserve_tokens,
                         )
                         if (
                             args.diagnostic_earliest_ready_cutover
@@ -2299,6 +2389,7 @@ def main() -> None:
                                 cutover_output_tokens=(
                                     record.candidate_cutover_output_tokens
                                 ),
+                                rolling_cutover=args.rolling_cutover,
                                 stop_and_copy=args.stop_and_copy,
                                 target_request_name=(
                                     args.migration_id

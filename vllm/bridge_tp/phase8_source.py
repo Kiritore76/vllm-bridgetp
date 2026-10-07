@@ -651,6 +651,82 @@ def maybe_publish_phase8_delta(
         raise RuntimeError("migration anchor advanced after freeze request")
     if num_computed <= state.last_computed_token:
         return
+    rolling = (config.run_dir / 'rolling_reservation.json').is_file()
+    if rolling:
+        if getattr(state, 'rolling_exhausted', False):
+            return
+        from dataclasses import replace
+
+        from vllm.bridge_tp.rolling_cutover import (
+            MECHANISM,
+            RollingPlanner,
+            applied_progress,
+            read_json,
+            resident_progress,
+        )
+
+        reservation = read_json(config.run_dir / 'rolling_reservation.json')
+        if (reservation.get('mechanism') != MECHANISM
+                or reservation.get('migration_id') != config.migration_id
+                or reservation.get('source_request_id') != request_id):
+            raise ValueError('rolling reservation identity differs from source')
+        planner = getattr(state, 'rolling_planner', None)
+        if planner is None:
+            planner = RollingPlanner(reservation['reservation_output_tokens'])
+            state.rolling_planner = planner
+            state.rolling_history_ready = False
+        if not state.rolling_history_ready:
+            state.rolling_history_ready, _ = resident_progress(
+                config.run_dir, config.migration_id,
+            )
+        watermark = applied_progress(
+            config.run_dir, config.migration_id, reservation['initial_end_token'],
+        )
+        decision = planner.observe(
+            output_tokens=output_tokens, computed_tokens=num_computed,
+            resident_end=watermark, history_ready=state.rolling_history_ready,
+            delta_applied=watermark is not None, unix_s=time.time(),
+        )
+        if decision is not None:
+            decision.update(migration_id=config.migration_id,
+                            source_request_id=request_id, mechanism=MECHANISM)
+            _atomic_json_dump(decision, config.run_dir / 'rolling_source_plan.json')
+            with (config.run_dir / 'rolling_source_plans.jsonl').open(
+                'a', encoding='utf-8',
+            ) as handle:
+                handle.write(json.dumps(decision) + '\n')
+            if decision['status'] == 'RESERVATION_EXHAUSTED':
+                # No unreserved delta or request freeze. The controller cleans
+                # Shadow while the ordinary source request continues.
+                state.rolling_exhausted = True
+                return
+        if (num_computed >= reservation['num_prompt_tokens']
+                + planner.reservation_output_tokens):
+            return
+        # Until the first confirmed live delta, there is no executable freeze
+        # plan. The ordinary source output cap remains authoritative.
+        boundary = planner.boundary or reservation['source_max_output_tokens']
+        config = replace(config, phase8_cutover_output_tokens=boundary)
+        if output_tokens == planner.boundary:
+            if (not state.rolling_history_ready or watermark is None
+                    or num_computed - watermark > 16):
+                raise RuntimeError('rolling freeze lacks exact applied watermark')
+            _atomic_json_dump(
+                {
+                    'format_version': 1, 'mechanism': MECHANISM,
+                    'migration_id': config.migration_id,
+                    'source_request_id': request_id,
+                    'version': planner.version,
+                    'cutover_output_tokens': boundary,
+                    'reservation_output_tokens': planner.reservation_output_tokens,
+                    'computed_tokens': num_computed,
+                    'resident_end': watermark,
+                    'delta_lag_tokens': max(0, num_computed - watermark),
+                    'history_ready': True, 'first_delta_applied': True,
+                    'selected_unix_s': time.time(),
+                },
+                config.run_dir / 'rolling_freeze_selection.json',
+            )
     if output_tokens > config.phase8_cutover_output_tokens:
         raise ValueError("Phase 8 skipped its exact cutover output-token boundary")
     block_ids, block_size = _get_request_block_ids(

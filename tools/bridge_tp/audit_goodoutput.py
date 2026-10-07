@@ -25,6 +25,20 @@ NEEDED = (
 )
 
 
+def active_anchor_response(source: dict, target: dict | None, proxy: dict) -> dict:
+    """Use the completed source when a cancelled target never became visible."""
+    ids = source.get('token_ids')
+    visible = [item.get('token_id') for item in proxy.get('emitted', [])]
+    if (proxy.get('committed') is False and proxy.get('target_origin_tokens') == 0
+            and isinstance(ids, list) and ids and ids == visible
+            and proxy.get('emitted_tokens') == len(ids)
+            and proxy.get('source_origin_tokens') == len(ids)
+            and all(item.get('origin') == 'source' for item in proxy.get('emitted', []))
+            and source.get('finish_reason') in {'stop', 'length'}):
+        return source
+    return target or source
+
+
 def _read_members(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
     """Read JSON without extracting archive members or following archive links."""
     values: dict[str, Any] = {}
@@ -280,12 +294,11 @@ def audit_payload(
     if target is not None and not isinstance(target, dict):
         errors.append("target response JSON is not an object")
         target = None
-    anchor_end = (
-        target.get("completed_unix_s") if target else source.get("completed_unix_s")
-    )
+    active_response = active_anchor_response(source, target, proxy)
+    anchor_end = active_response.get('completed_unix_s')
     anchor_status = "COMPLETED" if (
         anchor_times and proxy.get("emitted_tokens") == len(anchor_times)
-        and (target or source).get("finish_reason") in ("stop", "length")
+        and active_response.get("finish_reason") in ("stop", "length")
     ) else "INCOMPLETE"
     rows.append(_score_request(
         request_id=str(proxy.get("external_request_id", "anchor")),
@@ -299,7 +312,7 @@ def audit_payload(
             0.0
             if (proxy.get("committed") is False
                 and proxy.get("target_origin_tokens") == 0
-                and target is None
+                and active_response is source
                 and ((contract.get("paired_stay") is True)
                      or (proxy.get("source_origin_tokens") == len(
                          source.get("token_ids") or [])

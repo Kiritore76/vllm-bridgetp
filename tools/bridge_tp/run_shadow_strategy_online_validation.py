@@ -32,11 +32,15 @@ from tools.bridge_tp import run_phase9_cap0_rescue as rescue  # noqa: E402
 from tools.bridge_tp.run_phase9_capacity_background import (  # noqa: E402
     load_manifest,
 )
+from vllm.bridge_tp.history_coverage import (  # noqa: E402
+    valid_history_block_coverage,
+)
 from vllm.bridge_tp.online_shadow_strategy_protocol import (  # noqa: E402
     percentile,
     summarize_background_windows,
     validate_strategy_timing,
 )
+from vllm.bridge_tp.rolling_cutover import rolling_evidence_errors  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -110,6 +114,8 @@ def parse_args() -> argparse.Namespace:
         help="stream batched Shadow deltas over the retained NCCL session",
     )
     parser.add_argument("--gpu-direct-delta-batch-tokens", type=int, default=16)
+    parser.add_argument('--rolling-cutover', action='store_true')
+    parser.add_argument('--rolling-reserve-tokens', type=int, default=512)
     parser.add_argument("--gpu-direct-delta-flush-ms", type=float, default=25.0)
     parser.add_argument(
         "--persistent-channel",
@@ -366,6 +372,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_inputs(args: argparse.Namespace) -> tuple[str, int, dict[str, Any]]:
+    if getattr(args, 'rolling_cutover', False) and (
+        args.commit_timing != 'EARLIEST_READY' or not args.shadow_only_only
+        or not args.gpu_direct_delta or not args.manager_m3_commit
+        or args.rolling_reserve_tokens < 64
+    ):
+        raise ValueError(
+            'rolling cutover requires GPU delta Shadow-only earliest-ready'
+        )
     if os.name == "nt":
         raise RuntimeError("online Shadow validation requires Linux and five GPUs")
     if (not math.isfinite(args.probability_min_urgency)
@@ -1944,7 +1958,13 @@ def accept_source_eos_after_shadow(
     if (controller_dir / "cutover_manifest.json").exists():
         errors.append("source-EOS arm recorded a cutover")
     if (controller_dir / "target_response.json").exists():
-        errors.append("source-EOS arm recorded a target response")
+        target = optional_json("target_response.json")
+        reservation = optional_json("rolling_reservation.json")
+        if (reservation.get('mechanism') != 'ROLLING_NO_HISTORY_WAIT_V1'
+                or reservation.get('migration_id') != takeover.get('migration_id')
+                or target.get('token_ids')
+                or target_cleanup.get('status') != 'CLEANED'):
+            errors.append("source-EOS arm recorded an unproved target response")
     if (controller_dir / "request_frozen_receipt.json").exists():
         errors.append("source-EOS arm froze the TP1 request")
     if (takeover.get("state") != "CANCELLED"
@@ -1990,10 +2010,87 @@ def accept_shadow_without_cutover(
     rows = _load_rows(controller_dir / "phase9_audit.jsonl")
     endings = [row for row in rows if row.get("kind") == "run_end"]
     if len(endings) == 1 and endings[0].get("final_state") == "CANCELLED":
+        reservation = controller_dir / 'rolling_reservation.json'
+        if reservation.is_file():
+            return accept_rolling_cancel(
+                controller_dir, background_dir, expected_jobs, expected_anchor_tokens,
+            )
         return accept_unexpected_shadow_cancel(controller_dir)
     return accept_source_eos_after_shadow(
         controller_dir, background_dir, expected_jobs, expected_anchor_tokens,
     )
+
+
+def accept_rolling_cancel(
+    controller_dir: Path, background_dir: Path,
+    expected_jobs: int, expected_anchor_tokens: int,
+) -> dict[str, Any]:
+    """Retain a proved pre-freeze reservation exhaustion as a START cost."""
+    from tools.bridge_tp.audit_goodoutput import active_anchor_response
+    from vllm.bridge_tp.rolling_cutover import MECHANISM, read_json
+
+    r = read_json(controller_dir / 'rolling_reservation.json')
+    source = read_json(controller_dir / 'source_response.json')
+    target = read_json(controller_dir / 'target_response.json')
+    proxy = read_json(controller_dir / 'response_proxy_stats.json')
+    takeover = read_json(controller_dir / 'takeover_state.json')
+    background = read_json(background_dir / 'background_summary.json')
+    audit = _load_rows(controller_dir / 'phase9_audit.jsonl')
+    reasons = [row.get('reason') for row in audit if row.get('kind') == 'abandon']
+    endings = [row for row in audit if row.get('kind') == 'run_end']
+    transitions = [row.get('to') for row in audit if row.get('kind') == 'transition']
+    errors = []
+    if (r.get('mechanism') != MECHANISM
+            or reasons != [
+                'rolling reservation exhausted before safe freeze; source continues'
+            ]
+            or takeover.get('migration_id') != r.get('migration_id')
+            or takeover.get('state') != 'CANCELLED'
+            or takeover.get('source_abort_dispatched') is not False
+            or takeover.get('source_continues_on_tp1') is not True):
+        errors.append('rolling cancellation lacks safe source ownership evidence')
+    exhausted = read_json(controller_dir / 'rolling_source_plan.json')
+    if (exhausted.get('mechanism') != MECHANISM
+            or exhausted.get('migration_id') != r.get('migration_id')
+            or exhausted.get('status') != 'RESERVATION_EXHAUSTED'
+            or len(endings) != 1 or endings[0].get('final_state') != 'CANCELLED'
+            or endings[0].get('trigger_path') != 'MANAGER_M1_START'
+            or not transitions or transitions[0] != 'SHADOW'
+            or transitions[-1] != 'CANCELLED'
+            or any(state in {'HANDOFF', 'TAKEOVER'} for state in transitions)):
+        errors.append(
+            'rolling cancellation lacks matching exhaustion and termination'
+        )
+    if (active_anchor_response(source, target, proxy) is not source
+            or not 0 < len(source.get('token_ids', [])) <= expected_anchor_tokens
+            or source.get('finish_reason') not in {'stop', 'length'}
+            or proxy.get('committed') is not False
+            or proxy.get('target_origin_tokens') != 0
+            or proxy.get('source_origin_tokens') != len(source.get('token_ids', []))
+            or proxy.get('emitted_tokens') != len(source.get('token_ids', []))
+            or any(row.get('origin') != 'source' for row in proxy.get('emitted', []))
+            or [row.get('token_id') for row in proxy.get('emitted', [])]
+            != source.get('token_ids') or target.get('token_ids')):
+        errors.append(
+            'rolling cancellation did not preserve the complete source response'
+        )
+    for name in (
+        'source_cleanup_receipt', 'target_cleanup_receipt', 'stager_cleanup_receipt',
+    ):
+        receipt = read_json(controller_dir / (name + '.json'))
+        if (receipt.get('status') != 'CLEANED'
+                or receipt.get('migration_id') != r.get('migration_id')):
+            errors.append(f'rolling {name} is incomplete')
+    if any((controller_dir / name).exists() for name in
+           ('request_frozen_receipt.json', 'cutover_manifest.json')):
+        errors.append('rolling cancellation occurred after source freeze')
+    if (background.get('jobs') != expected_jobs
+            or background.get('completed') != expected_jobs
+            or background.get('failed') != 0):
+        errors.append('background jobs did not all complete')
+    return {'format_version': 1, 'status': 'FAIL' if errors else 'PASS',
+            'outcome': 'START_CANCELLED_SOURCE_COMPLETED', 'errors': errors,
+            'cancellation_reasons': reasons}
 
 
 def active_source_peer_count(
@@ -2332,6 +2429,7 @@ def accept_online(
     fixed_rate_gib_s: float | None = None,
     manager_m2_rate: bool = False,
     manager_m3_commit: bool = False,
+    rolling_cutover: bool = False,
     m2_profiles_gib_s: tuple[float, float, float] | None = None,
     manager_m2_expected_profile: str | None = None,
     manager_m2_min_history_byte_frac: float = 0.0,
@@ -2482,7 +2580,7 @@ def accept_online(
         if row.get("kind") == "earliest_ready_candidate_published"
     ]
     errors: list[str] = []
-    if manager_m3_commit:
+    if manager_m3_commit and not rolling_cutover:
         m3_candidates = [
             row for row in audit
             if row.get("kind") == "manager_m3_candidate_decision"
@@ -2562,6 +2660,14 @@ def accept_online(
         if frozen_receipt is not None
         else float(cutover["updated_unix_s"])
     )
+    if rolling_cutover:
+        errors.extend(rolling_evidence_errors(
+            controller_dir, session, cutover, freeze_unix_s,
+        ))
+        selections = [row for row in audit
+                      if row.get('kind') == 'rolling_cutover_selected']
+        if len(selections) != 1 or urgent_prearmed:
+            errors.append('rolling selection missing/duplicate or used urgent wait')
     urgent_direct_selection = (
         urgent_history_wait_allowed and manager_m3_commit
         and handoff_mode == "shadow-only" and not stop_and_copy
@@ -2732,7 +2838,8 @@ def accept_online(
     if commit_timing == "EARLIEST_READY":
         if len(earliest_ready_armed) != 1:
             errors.append("earliest-ready cutover was not armed exactly once")
-        if len(earliest_ready_selected) != 1 and not urgent_direct_selection:
+        if (len(earliest_ready_selected) != 1 and not urgent_direct_selection
+                and not rolling_cutover):
             errors.append("earliest-ready cutover was not selected exactly once")
         elif earliest_ready_selected and int(
             earliest_ready_selected[0].get("cutover_output_tokens", -1)
@@ -3120,13 +3227,29 @@ def accept_online(
         final_end = int(cutover["num_computed_tokens"])
         expected_blocks = int(session["num_blocks"])
         for rank in range(4):
+            initial = [row for row in gpu_initial_receipts
+                       if row.get("tp_rank") == rank]
+            compact = (len(initial) == 1
+                       and "history_block_coverage" in initial[0])
             block_paths = sorted(
                 (controller_dir / "gpu_block_receipts" / f"tp_rank_{rank}").glob(
                     "*.json"
                 )
             )
             blocks = [common.read_json(path) for path in block_paths]
-            if (
+            if compact:
+                final_receipts = [row for row in target_receipts
+                                  if row.get("tp_rank") == rank]
+                valid = len(final_receipts) == 1 and valid_history_block_coverage(
+                    initial[0], migration_id=session["migration_id"], rank=rank,
+                    end_token=initial_end, block_size=int(session["block_size"]),
+                    expected_blocks=expected_blocks,
+                    target_block_ids=final_receipts[0].get("target_block_ids", []),
+                    target_request_id=final_receipts[0].get("target_request_id", ""),
+                )
+                if not valid:
+                    errors.append(f"TP4 rank {rank} history coverage is invalid")
+            elif (
                 len(blocks) != expected_blocks
                 or [int(row.get("logical_block", -1)) for row in blocks]
                 != list(range(expected_blocks))
@@ -3478,6 +3601,7 @@ def accept_online(
         ),
         "strategy": strategy,
         "commit_timing": commit_timing,
+        'rolling_cutover': rolling_cutover,
         "earliest_ready_cutover_output_tokens": (
             earliest_ready_selected[0].get("cutover_output_tokens")
             if earliest_ready_selected
@@ -3527,6 +3651,7 @@ def accept_online(
         "history_gpu_ready_before_freeze_ms": history_gpu_ready_before_freeze_ms,
         "urgent_history_wait_ms": urgent_history_wait_ms,
         "cutover_selection_path": (
+            "ROLLING_NO_HISTORY_WAIT_V1" if rolling_cutover else
             "URGENT_PREARMED" if urgent_direct_selection else "EARLIEST_READY"
             if commit_timing == "EARLIEST_READY" else "FIXED"
         ),
@@ -3659,6 +3784,9 @@ def accept_online(
         ),
         "gpu_history_block_acks": sum(
             1 for _ in (controller_dir / "gpu_block_receipts").glob("**/*.json")
+        ),
+        "gpu_history_compact_rank_proofs": sum(
+            "history_block_coverage" in row for row in gpu_initial_receipts
         ),
         "gpu_delta_acks": sum(
             1 for _ in (controller_dir / "gpu_delta_receipts").glob("**/*.json")
@@ -3958,6 +4086,8 @@ def main() -> None:
         "m1_source_release_tail_s": args.m1_source_release_tail_s,
         "manager_m2_rate": args.manager_m2_rate,
         "manager_m3_commit": args.manager_m3_commit,
+        'rolling_cutover': args.rolling_cutover,
+        'rolling_reserve_tokens': args.rolling_reserve_tokens,
         "manager_m4_cancel": args.manager_m4_cancel,
         "manager_m5_predictor_shadow": args.manager_m5_predictor_shadow,
         "predictor_checkpoint_sha256": args.predictor_checkpoint_sha256,
@@ -4222,6 +4352,7 @@ def main() -> None:
                             fixed_rate_gib_s=args.fixed_rate_gib_s,
                             manager_m2_rate=args.manager_m2_rate,
                             manager_m3_commit=args.manager_m3_commit,
+                            rolling_cutover=args.rolling_cutover,
                             manager_m2_expected_profile=(
                                 args.manager_m2_expected_profile
                             ),
@@ -4375,6 +4506,11 @@ def main() -> None:
                     controller_extra_args.append("--manager-m2-rate")
                 if args.manager_m3_commit:
                     controller_extra_args.append("--manager-m3-commit")
+                if args.rolling_cutover:
+                    controller_extra_args.extend([
+                        '--rolling-cutover', '--rolling-reserve-tokens',
+                        str(args.rolling_reserve_tokens),
+                    ])
                 if args.manager_m4_cancel:
                     controller_extra_args.append("--manager-m4-cancel")
                 if args.manager_m5_predictor_shadow:

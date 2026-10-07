@@ -73,6 +73,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--constructed-source-count", type=int, default=3)
     parser.add_argument("--constructed-target-count", type=int, default=8)
     parser.add_argument("--probability-min-urgency", type=float, default=0.0)
+    parser.add_argument('--rolling-cutover', action='store_true')
+    parser.add_argument('--rolling-reserve-tokens', type=int, default=512)
     parser.add_argument("--probability-thresholds", type=float, nargs="+",
                         default=[0.0, 0.01, 0.05, 0.2])
     parser.add_argument("--paired-only", action="store_true",
@@ -794,6 +796,9 @@ def collect_arm(args: argparse.Namespace, root: Path,
         command.extend(("--anchor-total-max-tokens", str(
             setup["anchors"][name]["total_max_tokens"])))
     configure_action(command, action)
+    if getattr(args, 'rolling_cutover', False):
+        command.extend(['--rolling-cutover', '--rolling-reserve-tokens',
+                        str(args.rolling_reserve_tokens)])
     if getattr(args, "probability_pilot", False):
         if getattr(args, "constructed_workload", False):
             command += ["--probability-min-source-running",
@@ -1245,6 +1250,12 @@ def probability_results(summary: dict[str, Any]) -> dict[str, Any]:
 
 
 def execute_pilot(args: argparse.Namespace) -> None:
+    if getattr(args, 'rolling_cutover', False) and (
+        not args.probability_pilot or args.rolling_reserve_tokens < 64
+    ):
+        raise ValueError(
+            'rolling cutover needs probability collection and reserve >=64'
+        )
     if getattr(args, "constructed_workload", False):
         if (
             not args.probability_pilot
