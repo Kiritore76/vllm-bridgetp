@@ -144,12 +144,12 @@ class TestM3Commit(unittest.TestCase):
             candidate = json.loads(
                 (root / "earliest_ready_candidate.json").read_text()
             )
-            # Base: output 100 + max(64, backlog 48 + 64) = 212.
-            self.assertEqual(candidate["cutover_output_tokens"], 212)
+            # Base: output 100 + max(256, backlog 48 + 64) = 356.
+            self.assertEqual(candidate["cutover_output_tokens"], 356)
             self.assertTrue(any(
                 row.get("kind") == "manager_m3_candidate_decision"
                 and row["decision"]["action"] == "COMMIT_EARLIEST"
-                and row["decision"]["candidate_output_tokens"] == 212
-                and row["base_candidate_output_tokens"] == 212
+                and row["decision"]["candidate_output_tokens"] == 356
+                and row["base_candidate_output_tokens"] == 356
                 for row in audit.rows
             ))
