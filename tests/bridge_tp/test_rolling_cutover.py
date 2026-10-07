@@ -752,6 +752,15 @@ class TestActualSourceHook(unittest.TestCase):
             scheduler_output=types.SimpleNamespace(num_scheduled_tokens={"source1": 1}),
         )
 
+    def test_pilot_can_select_128_token_lead_without_changing_default(self):
+        with patch.dict("os.environ", {"BRIDGETP_ROLLING_MIN_LEAD_TOKENS": "128"}):
+            self.apply_progress(150)
+            self.step(100)
+        plan = json.loads((self.root / "rolling_source_plan.json").read_text())
+        self.assertEqual(plan["minimum_lead_tokens"], 128)
+        self.assertEqual(plan["cutover_output_tokens"], 228)
+        self.assertEqual(plan["reason"], "FIRST_AFTER_HISTORY_RESIDENT")
+
     def test_history_only_plan_keeps_generating_until_applied_boundary(self):
         with patch("vllm.bridge_tp.request_freeze.request_freeze") as freeze:
             for rank in range(4):

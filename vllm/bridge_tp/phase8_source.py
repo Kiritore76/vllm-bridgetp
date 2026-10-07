@@ -672,7 +672,15 @@ def maybe_publish_phase8_delta(
             raise ValueError('rolling reservation identity differs from source')
         planner = getattr(state, 'rolling_planner', None)
         if planner is None:
-            planner = RollingPlanner(reservation['reservation_output_tokens'])
+            import os
+
+            minimum_lead = int(os.getenv('BRIDGETP_ROLLING_MIN_LEAD_TOKENS', '256'))
+            if minimum_lead <= 0:
+                raise ValueError('rolling minimum lead must be positive')
+            planner = RollingPlanner(
+                reservation['reservation_output_tokens'],
+                minimum_lead_tokens=minimum_lead,
+            )
             state.rolling_planner = planner
             state.rolling_history_ready = False
         if not state.rolling_history_ready:
