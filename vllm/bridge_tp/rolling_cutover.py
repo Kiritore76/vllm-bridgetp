@@ -107,11 +107,10 @@ class RollingPlanner:
         reason = None
         if self.boundary is None and ready:
             reason = "FIRST_AFTER_HISTORY_AND_DELTA_APPLIED"
-        elif (
-            self.boundary is not None
-            and output_tokens >= self.boundary - 16
-            and not ready
-        ):
+        elif self.boundary is not None and output_tokens >= self.boundary and not ready:
+            # This hook owns freeze publication; there is no controller RPC
+            # lead to reserve here. Decode through the last 16 tokens normally
+            # and use the applied watermark at B, before requesting a freeze.
             reason = "DEFERRED_BEFORE_FREEZE"
         if output_tokens >= self.reservation_output_tokens - 1 and not ready:
             return {

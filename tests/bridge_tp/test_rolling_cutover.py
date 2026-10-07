@@ -28,6 +28,39 @@ def write(path, value):
 
 
 class TestRollingPlanner(unittest.TestCase):
+    def test_late_applied_ack_is_allowed_before_the_actual_boundary(self):
+        planner = RollingPlanner(600)
+        planner.observe(
+            output_tokens=100,
+            computed_tokens=199,
+            resident_end=195,
+            history_ready=True,
+            delta_applied=True,
+            unix_s=10,
+        )
+        self.assertIsNone(
+            planner.observe(
+                output_tokens=148,
+                computed_tokens=247,
+                resident_end=229,
+                history_ready=True,
+                delta_applied=True,
+                unix_s=11,
+            )
+        )
+        self.assertEqual(planner.boundary, 164)
+        self.assertIsNone(
+            planner.observe(
+                output_tokens=164,
+                computed_tokens=263,
+                resident_end=259,
+                history_ready=True,
+                delta_applied=True,
+                unix_s=12,
+            )
+        )
+        self.assertEqual(planner.version, 1)
+
     def test_no_boundary_until_history_and_first_delta_are_ready(self):
         planner = RollingPlanner(600)
         for history, delta, end in [
@@ -66,8 +99,8 @@ class TestRollingPlanner(unittest.TestCase):
             unix_s=10,
         )
         second = planner.observe(
-            output_tokens=148,
-            computed_tokens=247,
+            output_tokens=164,
+            computed_tokens=263,
             resident_end=195,
             history_ready=True,
             delta_applied=True,
@@ -442,8 +475,7 @@ class TestSafeRollingCancel(unittest.TestCase):
             {
                 "kind": "abandon",
                 "reason": (
-                    "rolling reservation exhausted before safe freeze; "
-                    "source continues"
+                    "rolling reservation exhausted before safe freeze; source continues"
                 ),
             },
             {"kind": "transition", "to": "CANCELLED"},
@@ -468,6 +500,49 @@ class TestSafeRollingCancel(unittest.TestCase):
         result = self.accept()
         self.assertEqual(result["status"], "PASS", result["errors"])
         self.assertEqual(result["outcome"], "START_CANCELLED_SOURCE_COMPLETED")
+
+    def test_legacy_stager_must_match_this_sessions_cleanup_request(self):
+        reason = "rolling reservation exhausted before safe freeze; source continues"
+        write(
+            self.root / "session_manifest.json",
+            {"migration_id": "m1", "source_request_id": "source1"},
+        )
+        write(
+            self.root / "cleanup_request.json",
+            {
+                "migration_id": "m1",
+                "source_request_id": "source1",
+                "reason": reason,
+                "abort_source": False,
+                "requested_unix_s": 10,
+            },
+        )
+        receipt = {
+            "status": "CLEANED",
+            "component": "cpu_stager",
+            "reason": reason,
+            "updated_unix_s": 11,
+        }
+        path = self.root / "stager_cleanup_receipt.json"
+        write(path, receipt)
+        self.assertEqual(self.accept()["status"], "PASS")
+        for changes in (
+            {"updated_unix_s": 9},
+            {"reason": "different session"},
+            {"migration_id": "wrong"},
+            {"status": "FAILED"},
+        ):
+            write(path, {**receipt, **changes})
+            self.assertEqual(self.accept()["status"], "FAIL")
+
+    def test_stager_publishes_the_session_identity(self):
+        from tools.bridge_tp.phase8_stager import _cleanup
+
+        write(self.root / "session_manifest.json", {"migration_id": "m1"})
+        _cleanup(self.root, "test cleanup", 4, 0)
+        receipt = json.loads((self.root / "stager_cleanup_receipt.json").read_text())
+        self.assertEqual(receipt["migration_id"], "m1")
+        self.assertEqual(receipt["status"], "CLEANED")
 
     def test_unproved_cleanup_or_partial_source_are_not_accepted(self):
         for name in ("target_cleanup_receipt.json", "rolling_source_plan.json"):
@@ -616,6 +691,9 @@ class TestActualSourceHook(unittest.TestCase):
             self.step(134)
             first = self.state.rolling_planner.boundary
             self.step(first - 16)
+            self.assertEqual(self.state.rolling_planner.boundary, first)
+            self.assertFalse(freeze.called)
+            self.step(first)
             second = self.state.rolling_planner.boundary
             self.assertGreater(second, first)
             self.assertFalse(freeze.called)
