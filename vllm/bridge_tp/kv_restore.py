@@ -265,6 +265,7 @@ def inject_rank_delta(
     end_token: int,
     block_axis: int,
     block_size: int,
+    timing_hook: Callable[[str, str], None] | None = None,
 ) -> dict[str, int | bool]:
     """Write a contiguous token delta into an existing paged-KV allocation."""
     if not 0 <= start_token < end_token:
@@ -282,6 +283,8 @@ def inject_rank_delta(
     mismatch_count: torch.Tensor | None = None
     slot_indices: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
     for layer_name, source_tensor in delta_layers.items():
+        if timing_hook is not None:
+            timing_hook("LAYER_PREPARE", layer_name)
         destination = destination_layers[layer_name]
         normalized_block_axis = (
             block_axis if block_axis >= 0 else destination.ndim + block_axis
@@ -314,6 +317,8 @@ def inject_rank_delta(
         block_major = destination.permute(
             normalized_block_axis, token_axis, *remaining_axes
         )
+        if timing_hook is not None:
+            timing_hook("SOURCE_TO_DEVICE", layer_name)
         source = source_tensor.to(device=destination.device)
         if tuple(source.shape[1:]) != tuple(block_major.shape[2:]):
             raise ValueError(f"Layer {layer_name} delta payload shape differs")
@@ -323,6 +328,8 @@ def inject_rank_delta(
         # and silently write outside the real cache.  Unique physical blocks
         # make every (block, offset) destination unique; untouched edge slots
         # and other requests remain intact.  Keep the full exact readback.
+        if timing_hook is not None:
+            timing_hook("SLOT_INDEX_SETUP", layer_name)
         if destination.device not in slot_indices:
             slots = range(start_token, end_token)
             slot_indices[destination.device] = (
@@ -338,8 +345,14 @@ def inject_rank_delta(
                 ),
             )
         blocks, offsets = slot_indices[destination.device]
+        if timing_hook is not None:
+            timing_hook("SCATTER", layer_name)
         block_major.index_put_((blocks, offsets), source)
+        if timing_hook is not None:
+            timing_hook("READBACK", layer_name)
         restored = block_major[blocks, offsets]
+        if timing_hook is not None:
+            timing_hook("REDUCE_MISMATCH", layer_name)
         layer_mismatches = torch.count_nonzero(restored != source)
         mismatch_count = (
             layer_mismatches
@@ -348,6 +361,8 @@ def inject_rank_delta(
         )
         raw_tensor_bytes += source_tensor.numel() * source_tensor.element_size()
 
+    if timing_hook is not None:
+        timing_hook("FINAL_RESULT_WAIT", "")
     if mismatch_count is not None and int(mismatch_count.item()) != 0:
         raise ValueError(f"delta readback differs for [{start_token}, {end_token})")
 
