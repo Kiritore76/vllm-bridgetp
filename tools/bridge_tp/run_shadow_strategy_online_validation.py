@@ -2296,6 +2296,27 @@ def accept_m4_cancel(
     }
 
 
+def valid_urgent_prearmed_selection(
+    prearmed: list[dict], candidates: list[dict],
+    cutover_tokens: int, freeze_unix_s: float,
+) -> bool:
+    """Check the urgent scheduled boundary without inventing ready evidence."""
+    if len(prearmed) != 1 or len(candidates) != 1:
+        return False
+    arm, candidate = prearmed[0], candidates[0]
+    horizon = arm.get("source_time_to_guard_s")
+    armed_s, published_s = arm.get("unix_s"), candidate.get("unix_s")
+    return (
+        isinstance(horizon, (int, float)) and math.isfinite(horizon)
+        and horizon > 0
+        and arm.get("cutover_output_tokens") == cutover_tokens
+        and candidate.get("cutover_output_tokens") == cutover_tokens
+        and isinstance(armed_s, (int, float))
+        and isinstance(published_s, (int, float))
+        and armed_s <= published_s <= freeze_unix_s
+    )
+
+
 def accept_online(
     controller_dir: Path,
     background_dir: Path,
@@ -2541,6 +2562,15 @@ def accept_online(
         if frozen_receipt is not None
         else float(cutover["updated_unix_s"])
     )
+    urgent_direct_selection = (
+        urgent_history_wait_allowed and manager_m3_commit
+        and handoff_mode == "shadow-only" and not stop_and_copy
+        and frozen_receipt is not None and not earliest_ready_selected
+        and valid_urgent_prearmed_selection(
+            urgent_prearmed, earliest_ready_candidates,
+            int(cutover["cutover_num_output_tokens"]), freeze_unix_s,
+        )
+    )
     bridge_marker_path = controller_dir / "remote_attention_bridge.json"
     bridge_start = (
         float(common.read_json(bridge_marker_path)["started_unix_s"])
@@ -2680,7 +2710,7 @@ def accept_online(
         )
     expected_transitions = (
         ["SHADOW", "READY_NOT_COMMITTED", "TAKEOVER"]
-        if manager_m3_commit
+        if manager_m3_commit and not urgent_direct_selection
         else ["SHADOW", "TAKEOVER"]
         if handoff_mode == "shadow-only"
         else ["SHADOW", "HANDOFF", "TAKEOVER"]
@@ -2702,9 +2732,11 @@ def accept_online(
     if commit_timing == "EARLIEST_READY":
         if len(earliest_ready_armed) != 1:
             errors.append("earliest-ready cutover was not armed exactly once")
-        if len(earliest_ready_selected) != 1:
+        if len(earliest_ready_selected) != 1 and not urgent_direct_selection:
             errors.append("earliest-ready cutover was not selected exactly once")
-        elif int(earliest_ready_selected[0].get("cutover_output_tokens", -1)) != int(
+        elif earliest_ready_selected and int(
+            earliest_ready_selected[0].get("cutover_output_tokens", -1)
+        ) != int(
             cutover["cutover_num_output_tokens"]
         ):
             errors.append("selected earliest-ready boundary differs from source freeze")
@@ -3494,6 +3526,10 @@ def accept_online(
         "history_ready_before_freeze_ms": history_ready_before_freeze_ms,
         "history_gpu_ready_before_freeze_ms": history_gpu_ready_before_freeze_ms,
         "urgent_history_wait_ms": urgent_history_wait_ms,
+        "cutover_selection_path": (
+            "URGENT_PREARMED" if urgent_direct_selection else "EARLIEST_READY"
+            if commit_timing == "EARLIEST_READY" else "FIXED"
+        ),
         "gpu_resident_shadow": gpu_resident_shadow,
         "gpu_direct_history": gpu_direct_history,
         "gpu_direct_history_pacing": gpu_direct_history_pacing_expected,
