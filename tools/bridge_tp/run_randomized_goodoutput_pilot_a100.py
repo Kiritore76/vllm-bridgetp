@@ -77,6 +77,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--rolling-reserve-tokens', type=int, default=512)
     parser.add_argument("--probability-thresholds", type=float, nargs="+",
                         default=[0.0, 0.01, 0.05, 0.2])
+    parser.add_argument("--probability-arms", nargs="+",
+                        help="Run only named preregistered probability arms")
     parser.add_argument("--paired-only", action="store_true",
                         help="Collect STAY and early128 without the late EOS arm")
     parser.add_argument("--timing-pilot", action="store_true",
@@ -1252,6 +1254,23 @@ def probability_results(summary: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def select_probability_arms(
+    thresholds: list[float], requested: list[str] | None = None,
+) -> tuple[str, ...]:
+    """Select engineering arms without changing the preregistered gate family."""
+    available = tuple(
+        f"prob_{theta:g}_{assignment}"
+        for theta in thresholds for assignment in ("START", "STAY")
+    )
+    if requested is None:
+        return available
+    if not requested or len(requested) != len(set(requested)):
+        raise ValueError("probability arms must be nonempty and unique")
+    if any(name not in available for name in requested):
+        raise ValueError("probability arm is outside preregistered thresholds")
+    return tuple(requested)
+
+
 def execute_pilot(args: argparse.Namespace) -> None:
     if getattr(args, 'rolling_cutover', False) and (
         not args.probability_pilot or args.rolling_reserve_tokens < 64
@@ -1351,9 +1370,11 @@ def execute_pilot(args: argparse.Namespace) -> None:
     selected_cases = list(args.cases or (row[0] for row in case_definitions(args)))
     if len(selected_cases) != len(set(selected_cases)):
         raise ValueError("case names must be unique")
-    actions = (tuple(f"prob_{theta:g}_{assignment}"
-                     for theta in args.probability_thresholds
-                     for assignment in ("START", "STAY")) if args.probability_pilot else
+    probability_arms = getattr(args, "probability_arms", None)
+    if probability_arms is not None and not args.probability_pilot:
+        raise ValueError("--probability-arms requires --probability-pilot")
+    actions = (select_probability_arms(args.probability_thresholds, probability_arms)
+               if args.probability_pilot else
                ("now",) if args.cross_context_smoke else
                tuple(args.actions) if args.actions else
                TIMING_ACTIONS if args.timing_pilot else

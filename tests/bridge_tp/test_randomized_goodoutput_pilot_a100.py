@@ -12,8 +12,8 @@ from unittest import mock
 from tools.bridge_tp.run_phase9_cap0_calibration import server_command
 from tools.bridge_tp.run_randomized_goodoutput_pilot_a100 import (
     ACTIONS,
-    TIMING_ACTIONS,
     CASES,
+    TIMING_ACTIONS,
     action_order,
     augmented_source_prompt,
     build_setup,
@@ -24,11 +24,22 @@ from tools.bridge_tp.run_randomized_goodoutput_pilot_a100 import (
     observed_action,
     pair_results,
     select_inputs,
+    select_probability_arms,
     timing_results,
 )
 
 
 class TestRandomizedPilot(unittest.TestCase):
+    def test_probability_arm_subset_keeps_only_the_requested_start(self):
+        self.assertEqual(
+            select_probability_arms([0.0, 0.05, 0.1], ["prob_0.05_START"]),
+            ("prob_0.05_START",),
+        )
+        self.assertEqual(len(select_probability_arms([0.0, 0.05, 0.1])), 6)
+        for requested in ([], ["prob_0.2_START"], ["prob_0_START"] * 2):
+            with self.subTest(requested=requested), self.assertRaises(ValueError):
+                select_probability_arms([0.0, 0.05, 0.1], requested)
+
     def test_augmented_source_pressure_keeps_natural_eos_and_provenance(self):
         class Tokenizer:
             @staticmethod
