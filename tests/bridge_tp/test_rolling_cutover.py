@@ -116,7 +116,7 @@ class TestRollingPlanner(unittest.TestCase):
         )
         self.assertEqual(deferred["cutover_output_tokens"], 999)
 
-    def test_lag_moves_plan_without_freezing_at_the_old_boundary(self):
+    def test_large_backlog_does_not_move_the_actual_boundary(self):
         planner = RollingPlanner(600, minimum_lead_tokens=64, lead_seconds=0.75)
         first = planner.observe(
             output_tokens=100,
@@ -135,9 +135,10 @@ class TestRollingPlanner(unittest.TestCase):
             unix_s=12,
         )
         self.assertEqual(first["version"], 1)
-        self.assertEqual(second["version"], 2)
-        self.assertGreater(second["cutover_output_tokens"], 164)
-        self.assertEqual(second["reason"], "DEFERRED_BEFORE_FREEZE")
+        self.assertIsNone(second)
+        self.assertEqual(first["version"], 1)
+        self.assertEqual(planner.version, 1)
+        self.assertEqual(planner.boundary, 164)
 
     def test_exhaustion_has_no_unreserved_boundary(self):
         planner = RollingPlanner(180)
@@ -347,6 +348,18 @@ class TestRollingEvidence(unittest.TestCase):
 
     def test_proved_prefix_and_output_budget_are_accepted(self):
         self.assertEqual(self.errors(), [])
+
+    def test_large_pre_freeze_lag_is_valid_but_missing_applied_proof_is_not(self):
+        path = self.root / "rolling_freeze_selection.json"
+        proof = json.loads(path.read_text())
+        # Existing exact resident proof extends to 293; a claimed watermark
+        # of 229 is valid even though the frozen computed watermark is 297.
+        write(path, {**proof, "resident_end": 229, "delta_lag_tokens": 68})
+        self.assertEqual(self.errors(), [])
+        write(path, {**proof, "resident_end": 229, "delta_lag_tokens": 67})
+        self.assertTrue(self.errors())
+        write(path, {**proof, "first_delta_applied": False})
+        self.assertTrue(self.errors())
 
     def test_history_only_first_plan_accepts_delta_ack_before_freeze(self):
         plan = {
@@ -741,7 +754,7 @@ class TestActualSourceHook(unittest.TestCase):
             self.assertGreater(self.state.rolling_planner.boundary, 286)
             self.assertFalse(freeze.called)
 
-    def test_generation_continues_then_plan_moves_and_freezes_exactly_once(self):
+    def test_large_backlog_freezes_at_first_boundary_and_enqueues_tail(self):
         with (
             patch("vllm.bridge_tp.request_freeze.enabled_from_env", return_value=True),
             patch(
@@ -760,20 +773,21 @@ class TestActualSourceHook(unittest.TestCase):
             self.assertEqual(self.state.rolling_planner.boundary, first)
             self.assertFalse(freeze.called)
             self.step(first)
-            second = self.state.rolling_planner.boundary
-            self.assertGreater(second, first)
-            self.assertFalse(freeze.called)
-            self.apply_progress(100 + second - 5)
-            self.step(second)
             freeze.assert_called_once()
-            self.assertEqual(freeze.call_args.kwargs["output_tokens"], second)
+            self.assertEqual(freeze.call_args.kwargs["output_tokens"], first)
+            self.assertEqual(self.state.rolling_planner.boundary, first)
             self.assertTrue(self.state.finalizing)
             thread.return_value.start.assert_called_once()
             proof = json.loads(
                 (self.root / "rolling_freeze_selection.json").read_text()
             )
-            self.assertEqual(proof["version"], 2)
-            self.assertLessEqual(proof["delta_lag_tokens"], 16)
+            self.assertEqual(proof["version"], 1)
+            self.assertGreater(proof["delta_lag_tokens"], 16)
+            self.assertEqual(proof["freeze_policy"], "FREEZE_AT_BOUNDARY_DRAIN_TAIL")
+            self.assertIsNone(proof["maximum_pre_freeze_delta_lag_tokens"])
+            final = self.state.enqueue_gpu_delta.call_args.kwargs
+            self.assertEqual(final["end_token"], proof["computed_tokens"])
+            self.assertFalse((self.root / "cutover_manifest.json").exists())
 
     def test_reservation_exhaustion_never_freezes_or_enqueues_out_of_range(self):
         with patch("vllm.bridge_tp.request_freeze.request_freeze") as freeze:

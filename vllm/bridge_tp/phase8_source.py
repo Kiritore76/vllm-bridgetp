@@ -709,7 +709,7 @@ def maybe_publish_phase8_delta(
         config = replace(config, phase8_cutover_output_tokens=boundary)
         if output_tokens == planner.boundary:
             if (not state.rolling_history_ready or watermark is None
-                    or num_computed - watermark > 16):
+                    or watermark > num_computed):
                 raise RuntimeError('rolling freeze lacks exact applied watermark')
             _atomic_json_dump(
                 {
@@ -723,6 +723,8 @@ def maybe_publish_phase8_delta(
                     'resident_end': watermark,
                     'delta_lag_tokens': max(0, num_computed - watermark),
                     'history_ready': True, 'first_delta_applied': True,
+                    'freeze_policy': 'FREEZE_AT_BOUNDARY_DRAIN_TAIL',
+                    'maximum_pre_freeze_delta_lag_tokens': None,
                     'selected_unix_s': time.time(),
                 },
                 config.run_dir / 'rolling_freeze_selection.json',
