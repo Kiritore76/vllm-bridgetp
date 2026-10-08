@@ -61,6 +61,8 @@ def reference_contract(args: argparse.Namespace) -> str:
     profile = getattr(args, "slo_profile", "legacy1pct")
     if profile == "legacy1pct":
         return EXPECTED_SHAS["reference"]
+    if profile == "slow1pct_soft" and getattr(args, "probability_pilot", False):
+        return "c6b863bdd74bb6e27138f720b2b819fae8554fe43afe9d9235e3efcdd70af848"
     if (profile == "slow2pct_visible_diagnostic"
             and getattr(args, "probability_pilot", False)):
         return "b238035e2be94370264732ae6ed70e4874503a8ab70793f8492ccf08416343b0"

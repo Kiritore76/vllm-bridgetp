@@ -18,6 +18,11 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from tools.bridge_tp.audit_goodoutput import audit_payload  # noqa: E402
+from tools.bridge_tp.output_quality import (  # noqa: E402
+    SOFT_POLICY,
+    quality_contract,
+    request_quality,
+)
 
 
 def _finite(value: Any) -> float | None:
@@ -40,6 +45,7 @@ def _prompt_length(request: Any) -> int | None:
 
 
 def _reference(config: dict[str, Any]) -> list[tuple[int, float]]:
+    quality_contract(config)
     if config.get("slo_version") != "v6":
         raise ValueError("reference is not SLO v6")
     if config.get("max_visible_interval_policy", "HARD_GATE") not in {
@@ -227,7 +233,7 @@ def audit_v6_payload(
             ttft, mean, longest, slow, slow_rate = None, None, None, None, None
             handoff, success = None, False
             failures = ["INCOMPLETE"]
-        rows.append({
+        result_row = {
             "request_id": request_id, "pool": pool, "status": status,
             "prompt_tokens": length, "output_tokens": row["output_tokens"],
             "ttft_ms": ttft, "ttft_limit_ms": limit,
@@ -235,7 +241,13 @@ def audit_v6_payload(
             "slow_interval_rate": slow_rate, "max_visible_interval_ms": longest,
             "handoff_ms": handoff, "slo_success": success,
             "failure_reasons": failures,
-        })
+        }
+        if config.get("output_quality_policy") == SOFT_POLICY:
+            try:
+                result_row.update(request_quality(result_row, config))
+            except ValueError as exc:
+                errors.append(f"{pool}/{request_id}: {exc}")
+        rows.append(result_row)
     if errors:
         return {"format_version": 1, "slo_version": "v6", "computable": False,
                 "reference_applicability": applicability,
@@ -256,7 +268,17 @@ def audit_v6_payload(
         "wall_time_s": wall_s,
         "goodoutput_tokens_s": good_tokens / wall_s,
     }
+    quality_metadata = {}
+    if config.get("output_quality_policy") == SOFT_POLICY:
+        weighted = sum(row["output_tokens"] * row["quality_weight"] for row in rows)
+        metrics.update(quality_adjusted_output_tokens=weighted,
+                       quality_adjusted_output_tokens_s=weighted / wall_s)
+        quality_metadata = {
+            "output_quality_policy": SOFT_POLICY,
+            "output_quality_beta": config["output_quality_beta"],
+        }
     return {"format_version": 1, "slo_version": "v6", "computable": True,
+            **quality_metadata,
             **({"slo_policy_id": config["slo_policy_id"]}
                if "slo_policy_id" in config else {}),
             "reference_applicability": applicability,
