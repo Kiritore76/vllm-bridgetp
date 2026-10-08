@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Freeze whole-pool SLO v6 GoodOutput at H; drain is diagnostic only."""
+"""Score versioned whole-pool hard or quality-adjusted output in a fixed window."""
 
 from __future__ import annotations
 
 import math
 
 from tools.bridge_tp.audit_goodoutput import active_anchor_response
+from tools.bridge_tp.output_quality import SOFT_POLICY, SOFT_WINDOW_POLICY
 
 
 def score_horizon(
@@ -31,6 +32,9 @@ def score_horizon(
         "goodoutput_tokens_s": None,
         "failure_kind": "TECHNICAL_FAILURE",
     }
+    soft = slo.get("output_quality_policy") == SOFT_POLICY
+    if soft and not settle_after_h:
+        raise ValueError("soft output requires full-request drain scoring")
     if not slo.get("computable") or slo.get("errors"):
         return {**excluded, "errors": slo.get("errors") or ["missing SLO audit"]}
     records = {r["job_id"]: r for r in background.get("results", [])}
@@ -76,8 +80,20 @@ def score_horizon(
             if (service_complete if settle_after_h else complete)
             and row.get("slo_success") else 0
         )
+        hard_good = good
+        quality_fields = {}
+        if soft:
+            weight = row.get("quality_weight")
+            if (isinstance(weight, bool) or not isinstance(weight, (int, float))
+                    or not math.isfinite(weight) or not 0 <= weight <= 1
+                    or not service_complete and weight != 0):
+                return {**excluded, "errors": ["missing/invalid quality weight"]}
+            good = in_window * weight if service_complete else 0.0
+            quality_fields = {"hard_good_tokens": hard_good,
+                              "quality_weight": weight}
         scored.append(
             {
+                **quality_fields,
                 "request_id": row["request_id"],
                 "pool": row["pool"],
                 "completed_by_H": complete,
@@ -102,6 +118,17 @@ def score_horizon(
         "request_rows": scored,
         "unfinished_or_failed_at_H": sum(not r["completed_by_H"] for r in scored),
     }
+    if soft:
+        hard_tokens = sum(r["hard_good_tokens"] for r in scored)
+        result.update(
+            output_metric="QUALITY_ADJUSTED_OUTPUT",
+            output_quality_policy=SOFT_POLICY,
+            output_quality_beta=slo["output_quality_beta"],
+            quality_adjusted_output_tokens=good,
+            quality_adjusted_output_tokens_s=good / horizon_s,
+            hard_good_output_tokens=hard_tokens,
+            hard_goodoutput_tokens_s=hard_tokens / horizon_s,
+        )
     if settle_after_h:
         # SLO remains the frozen full-request audit, including drain. Drain
         # tokens never contribute to the fixed-window numerator or denominator.
@@ -123,7 +150,8 @@ def score_horizon(
         bin_count = math.ceil(horizon_s / 10)
         bins = {int((t - origin) // 10) for t in times}
         result.update(
-            scoring_policy="WINDOW_TOKENS_FULL_REQUEST_SLO_DRAIN_V1",
+            scoring_policy=(SOFT_WINDOW_POLICY if soft else
+                            "WINDOW_TOKENS_FULL_REQUEST_SLO_DRAIN_V1"),
             drain_tokens_counted=False,
             drain_completed_requests=sum(
                 r["service_status"] == "COMPLETED" and not r["completed_by_H"]

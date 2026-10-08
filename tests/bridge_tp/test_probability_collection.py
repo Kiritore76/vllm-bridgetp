@@ -75,6 +75,22 @@ def risk(growth=10, speed=10, pending=0, pred=None, free=1100,
 
 
 class TestProbabilityCollection(unittest.TestCase):
+    def test_soft_slo_requires_full_request_window_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args, _ = self.pilot_fixture(Path(directory), "test", 0)
+            args.slo_profile = "slow1pct_soft"
+            with patch(
+                "tools.bridge_tp.run_randomized_goodoutput_pilot_a100.verify",
+                side_effect=RuntimeError("hardware preflight"),
+            ) as verify_mock:
+                with self.assertRaisesRegex(ValueError, "soft SLO profile"):
+                    execute_pilot(args)
+                verify_mock.assert_not_called()
+                args.window_token_goodoutput = True
+                args.arrival_window_s = args.evaluation_horizon_s
+                with self.assertRaisesRegex(RuntimeError, "hardware preflight"):
+                    execute_pilot(args)
+
     def test_nonzero_only_threshold_reaches_preflight(self):
         with tempfile.TemporaryDirectory() as directory:
             args, _ = self.pilot_fixture(Path(directory), "test", 0)

@@ -60,7 +60,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--guard-profile", choices=("legacy8448", "reduced2000"),
                         default="legacy8448",
                         help="Pin the guard value and file SHA for this collection")
-    parser.add_argument("--slo-profile", choices=("legacy1pct", "slow2pct", "slow2pct_visible_diagnostic"),
+    parser.add_argument("--slo-profile", choices=(
+        "legacy1pct", "slow2pct", "slow2pct_visible_diagnostic", "slow1pct_soft"),
                         default="legacy1pct",
                         help="Pin the SLO reference SHA for this collection")
     parser.add_argument("--pre-episode-warmup", action="store_true",
@@ -1026,6 +1027,11 @@ def collect_arm(args: argparse.Namespace, root: Path,
                 "assignment_probability": 0.5,
                 "episode_group_id": f"{args.seed}:{name}",
                 "horizon_score": horizon,
+                "output_metric": horizon.get("output_metric", "HARD_SLO_OUTPUT"),
+                "hard_fixed_horizon_goodoutput_tokens_s": horizon.get(
+                    "hard_goodoutput_tokens_s", horizon["goodoutput_tokens_s"]),
+                "quality_adjusted_window_output_tokens_s": horizon.get(
+                    "quality_adjusted_output_tokens_s"),
                 "workload_origin": setup["anchors"][name].get("workload_origin"),
                 "controller_split": setup["anchors"][name].get("controller_split"),
                 "construction": setup["anchors"][name].get("construction"),
@@ -1216,6 +1222,11 @@ def probability_results(summary: dict[str, Any]) -> dict[str, Any]:
                     "goodoutput_scoring_policy": summary.get(
                         "goodoutput_scoring_policy", "COMPLETED_BY_H_LEGACY"),
                     "slo_profile": summary.get("slo_profile", "legacy1pct"),
+                    "output_metric": start.get("output_metric", "HARD_SLO_OUTPUT"),
+                    "start_hard_goodoutput_tokens_s": start.get(
+                        "hard_fixed_horizon_goodoutput_tokens_s"),
+                    "stay_hard_goodoutput_tokens_s": stay.get(
+                        "hard_fixed_horizon_goodoutput_tokens_s"),
                     "probability_min_urgency": summary.get(
                         "probability_min_urgency", 0.0),
                     "assignment_probability": 0.5,
@@ -1330,6 +1341,9 @@ def execute_pilot(args: argparse.Namespace) -> None:
     ):
         raise ValueError("window token scoring requires probability mode and "
                          "arrival window equal to H")
+    if (getattr(args, "slo_profile", "legacy1pct") == "slow1pct_soft"
+            and not getattr(args, "window_token_goodoutput", False)):
+        raise ValueError("soft SLO profile requires window token scoring")
     if args.arrival_window_s is not None:
         if (not math.isfinite(args.arrival_window_s)
                 or not 0 < args.arrival_window_s <= args.evaluation_horizon_s):
@@ -1407,6 +1421,11 @@ def execute_pilot(args: argparse.Namespace) -> None:
         "format_version": 1, "status": "PILOT_IN_PROGRESS",
         "seed": args.seed, "cases": {},
         "slo_profile": getattr(args, "slo_profile", "legacy1pct"),
+        "output_metric": (
+            "QUALITY_ADJUSTED_OUTPUT"
+            if getattr(args, "slo_profile", "legacy1pct") == "slow1pct_soft"
+            else "HARD_SLO_OUTPUT"
+        ),
         "probability_min_urgency": minimum_u,
         "collection_id": hashlib.sha256(json.dumps(
             {"protocol": protocol, "manifests": setup["manifests"]},
@@ -1421,6 +1440,8 @@ def execute_pilot(args: argparse.Namespace) -> None:
         "actions": actions,
         "evaluation_horizon_s": args.evaluation_horizon_s,
         "goodoutput_scoring_policy": (
+            "WINDOW_TOKENS_FULL_REQUEST_SOFT_SLO_DRAIN_V1"
+            if getattr(args, "slo_profile", "legacy1pct") == "slow1pct_soft" else
             "WINDOW_TOKENS_FULL_REQUEST_SLO_DRAIN_V1"
             if getattr(args, "window_token_goodoutput", False)
             else "COMPLETED_BY_H_LEGACY"
