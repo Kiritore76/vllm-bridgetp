@@ -9,7 +9,6 @@ import unittest
 from tests.bridge_tp.test_audit_goodoutput import payload
 from tools.bridge_tp.audit_slo_v6 import audit_v6_payload, ttft_limit_ms
 
-
 REFERENCE = {
     "slo_version": "v6",
     "anchors": [
@@ -103,6 +102,27 @@ class TestSloV6Audit(unittest.TestCase):
         self.assertFalse(row["slo_success"])
         self.assertGreater(row["max_visible_interval_ms"], 1000)
         self.assertIn("MAX_VISIBLE_INTERVAL", row["failure_reasons"])
+
+    def test_visible_pause_diagnostic_keeps_handoff_gate(self) -> None:
+        value = test_payload()
+        peer = value["background/background_summary.json"]["results"][0]
+        times = [0.1 + index * 0.001 for index in range(100)]
+        times.append(times[-1] + 1.001)
+        peer.update(output_tokens=len(times), token_times_unix_s=times,
+                    request_ended_unix_s=1.3)
+        reference = dict(REFERENCE, max_visible_interval_policy="DIAGNOSTIC_ONLY",
+                         primary_max_slow_interval_rate=0.02)
+        report = audit_v6_payload(value, reference)
+        row = report["request_rows"][0]
+        self.assertTrue(row["slo_success"])
+        self.assertGreater(row["max_visible_interval_ms"], 1000)
+        proxy = value["controller/response_proxy_stats.json"]
+        proxy["handoff_stall_s"] = 1.001
+        report = audit_v6_payload(value, reference)
+        self.assertTrue(report["computable"])
+        anchor = report["request_rows"][-1]
+        self.assertIn("HANDOFF", anchor["failure_reasons"])
+        self.assertFalse(anchor["slo_success"])
 
     def test_missing_prompt_ids_fails_closed(self) -> None:
         value = copy.deepcopy(test_payload())

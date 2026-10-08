@@ -316,6 +316,12 @@ def pool_from_samples(
             if has_metric(samples, "vllm:bridgetp_prefill_pending_kv_tokens")
             else None
         ),
+        prefill_unallocated_kv_tokens=(
+            int(first_value(samples, "vllm:bridgetp_prefill_unallocated_kv_tokens"))
+            if has_metric(samples, "vllm:bridgetp_prefill_unallocated_kv_tokens")
+            and first_value(samples, "vllm:bridgetp_prefill_unallocated_kv_tokens") >= 0
+            else None
+        ),
         prefill_scheduled_tokens_total=optional_counter(
             samples, "vllm:bridgetp_prefill_scheduled_tokens"
         ),
@@ -374,6 +380,7 @@ def interval_pool_from_samples(
             tpot_samples=count,
             tpot_metric=selected_tpot_metric,
             prefill_pending_kv_tokens=pool.prefill_pending_kv_tokens,
+            prefill_unallocated_kv_tokens=pool.prefill_unallocated_kv_tokens,
             prefill_scheduled_tokens_total=pool.prefill_scheduled_tokens_total,
             decode_scheduled_tokens_total=pool.decode_scheduled_tokens_total,
         ),

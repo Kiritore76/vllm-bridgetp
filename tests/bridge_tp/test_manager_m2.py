@@ -47,6 +47,7 @@ def sample(**updates: object) -> RuntimeSnapshot:
         source_free_kv_tokens=30000,
         source_guard_free_kv_tokens=8448,
         source_pool_growth_tokens_s=100,
+        source_prefill_unallocated_kv_tokens=0,
         target_running=0,
         target_waiting=0,
         target_kv_usage_frac=0.1,
@@ -250,6 +251,7 @@ class TestM2RateController(unittest.TestCase):
                 source_pool_growth_tokens_s=8000.0,
                 source_pool_sustained_growth_tokens_s=8000.0,
                 source_prefill_pending_kv_tokens=0,
+        source_prefill_unallocated_kv_tokens=0,
                 source_decode_growth_tokens_s=32.0,
             ),
             before_start=True,
@@ -257,7 +259,7 @@ class TestM2RateController(unittest.TestCase):
         self.assertEqual(burst.profile, "LOW")
         self.assertEqual(
             burst.source_capacity_model,
-            "allocated_kv_plus_decode_growth",
+            "FINITE_UNALLOCATED_PREFILL_PLUS_DECODE",
         )
         reserved = self.controller.decide(
             sample(
@@ -276,6 +278,7 @@ class TestM2RateController(unittest.TestCase):
             state="LOCAL", source_prefill_pending_kv_tokens=50000,
             source_decode_growth_tokens_s=0.0,
             source_prefill_growth_tokens_s=10000.0,
+            source_prefill_unallocated_kv_tokens=30000,
         ), before_start=True)
         self.assertAlmostEqual(decision.source_time_to_guard_s, 2.1552)
         self.assertEqual(decision.profile, "HIGH")
@@ -327,6 +330,7 @@ class TestM2RateController(unittest.TestCase):
                 state="LOCAL", target_running=4,
                 source_free_kv_tokens=14448,
                 source_pool_growth_tokens_s=100,
+        source_prefill_unallocated_kv_tokens=0,
                 history_total_bytes=20 * 1024**3,
             ),
             before_start=True,

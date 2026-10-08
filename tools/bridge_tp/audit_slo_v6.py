@@ -42,6 +42,10 @@ def _prompt_length(request: Any) -> int | None:
 def _reference(config: dict[str, Any]) -> list[tuple[int, float]]:
     if config.get("slo_version") != "v6":
         raise ValueError("reference is not SLO v6")
+    if config.get("max_visible_interval_policy", "HARD_GATE") not in {
+        "HARD_GATE", "DIAGNOSTIC_ONLY",
+    }:
+        raise ValueError("unknown max visible interval policy")
     anchors = config.get("anchors")
     if not isinstance(anchors, list) or len(anchors) < 2:
         raise ValueError("reference needs at least two anchors")
@@ -212,7 +216,9 @@ def audit_v6_payload(
                 failures.append("MEAN_TPOT")
             if slow_rate > config["primary_max_slow_interval_rate"]:
                 failures.append("SLOW_INTERVAL_RATE")
-            if longest is not None and longest > config["max_visible_interval_ms"]:
+            if (config.get("max_visible_interval_policy", "HARD_GATE")
+                    == "HARD_GATE" and longest is not None
+                    and longest > config["max_visible_interval_ms"]):
                 failures.append("MAX_VISIBLE_INTERVAL")
             if pool == "anchor" and handoff > config["max_handoff_ms"]:
                 failures.append("HANDOFF")

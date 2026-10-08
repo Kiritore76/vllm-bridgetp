@@ -7,6 +7,8 @@ import math
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from tools.bridge_tp.guard_forecast import snapshot_guard_time
+
 from .manager_m0 import RuntimeSnapshot
 from .predictor import SurvivalTable
 
@@ -163,19 +165,16 @@ class M1StartController:
         headroom = (
             snapshot.source_free_kv_tokens - snapshot.source_guard_free_kv_tokens
         )
-        time_to_guard = (
-            0.0 if headroom <= 0 else
-            math.inf if growth == 0 else headroom / growth
-        )
+        time_to_guard = snapshot_guard_time(snapshot.to_json(), headroom)
+        if time_to_guard is None:
+            return M1StartDecision("STAY", "prefill allocation evidence missing")
         capacity_evidence = {
             "target_required_tokens": target_required,
             "estimated_preparation_s": prepare_s,
             "source_time_to_guard_s": time_to_guard,
             "source_safe_headroom_tokens": headroom,
             "source_capacity_model": (
-                "allocated_kv_plus_scheduled_growth"
-                if prefill_growth is not None
-                else "allocated_kv_plus_decode_growth"
+                "FINITE_UNALLOCATED_PREFILL_PLUS_DECODE"
             ),
             "source_release_tail_s": cfg.source_release_tail_s,
         }

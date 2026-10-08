@@ -58,10 +58,11 @@ def snapshot(growth=10, pending=0):
 
 
 def risk(growth=10, speed=10, pending=0, pred=None, free=1100,
-         prefill_growth=None):
+         prefill_growth=None, unallocated=0):
     state = snapshot(growth, pending)
     state["source_free_kv_tokens"] = free
     state["source_prefill_growth_tokens_s"] = prefill_growth
+    state["source_prefill_unallocated_kv_tokens"] = unallocated
     return build_snapshot(
         snapshot=state,
         prediction=pred or prediction(cap=2000),
@@ -399,8 +400,8 @@ class TestProbabilityCollection(unittest.TestCase):
         self.assertTrue(result["physical_feasible"])
 
     def test_prefill_and_decode_rates_both_advance_guard(self):
-        mixed = risk(growth=10, prefill_growth=90)
-        prefill_only = risk(growth=0, prefill_growth=100)
+        mixed = risk(growth=10, prefill_growth=90, unallocated=2000)
+        prefill_only = risk(growth=0, prefill_growth=100, unallocated=2000)
         for row in (mixed, prefill_only):
             self.assertEqual(row["H_tokens"], 1000)
             self.assertEqual(row["pool_growth_tokens_s"], 100)
@@ -411,13 +412,34 @@ class TestProbabilityCollection(unittest.TestCase):
                          prefill_only["p_guard_est_bounds"])
 
     def test_prefill_guard_time_without_candidate_decode_rate(self):
-        row = risk(growth=0, prefill_growth=100, speed=0)
+        row = risk(growth=0, prefill_growth=100, speed=0, unallocated=2000)
         self.assertEqual(row["T_guard_s"], 10)
         self.assertIsNone(row["p_guard_est_bounds"])
         self.assertEqual(row["status"], "NO_CANDIDATE_RATE")
 
+    def test_finite_prefill_cannot_fill_guard_without_decode(self):
+        row = risk(growth=0, prefill_growth=100, unallocated=500)
+        self.assertEqual(row["status"], "NO_PROJECTED_GUARD_REACH")
+        self.assertEqual(row["U"], 0)
+        self.assertEqual(row["p_guard_est_bounds"], [0, 0])
+        self.assertIsNone(row["T_guard_s"])
+        json.dumps(row, allow_nan=False)
+
+    def test_release_calibration_includes_freeze_wait_budget(self):
+        row = build_snapshot(
+            snapshot=snapshot(), prediction=prediction(cap=2000),
+            candidate_rate=10, initial_rate={"rate_bytes_s": 1000000},
+            kv_bytes_per_token=100, release_tail_s=5, block_size=1,
+            timing_calibration={"release_budget_s": 11.665,
+                                "calibration_id": "test-budget",
+                                "status": "ENGINEERING_BUDGET"},
+        ).to_json()
+        self.assertEqual(row["T_release_s"], 11.665)
+        self.assertAlmostEqual(row["U"], (11.665 + 2) / 100)
+        self.assertEqual(row["release_calibration_id"], "test-budget")
+
     def test_no_growth_protection_stale_and_delta_catchup(self):
-        for growth in (0, -1, None, math.nan):
+        for growth in (-1, None, math.nan):
             row = risk(growth=growth)
             self.assertIsNone(row["T_guard_s"])
             self.assertIsNone(row["p_guard_est_bounds"])

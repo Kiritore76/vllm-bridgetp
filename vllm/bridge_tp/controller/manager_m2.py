@@ -12,6 +12,8 @@ from copy import copy
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from tools.bridge_tp.guard_forecast import snapshot_guard_time
+
 from .manager_m0 import RuntimeSnapshot
 
 
@@ -180,7 +182,16 @@ class M2RateController:
                 "HOLD", self.profile, current_rate, "prefill observation invalid",
                 ("source_prefill_pending_kv_tokens",),
             )
-        horizon = math.inf if growth == 0 else max(0.0, headroom / growth)
+        if separated:
+            horizon = snapshot_guard_time(snapshot.to_json(), headroom)
+            if horizon is None:
+                return M2RateDecision(
+                    "HOLD", self.profile, current_rate,
+                    "prefill allocation evidence missing",
+                )
+            capacity_model = "FINITE_UNALLOCATED_PREFILL_PLUS_DECODE"
+        else:
+            horizon = math.inf if growth == 0 else max(0.0, headroom / growth)
         remaining_history = None
         if (
             snapshot.history_total_bytes is not None

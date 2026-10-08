@@ -7,6 +7,8 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from tools.bridge_tp.guard_forecast import snapshot_guard_time
+
 
 def build_risk_observation(
     *, tick: int, snapshot: dict[str, Any],
@@ -36,15 +38,17 @@ def build_risk_observation(
     point_time_to_guard = None
     if (headroom is not None and isinstance(growth, (int, float))
             and math.isfinite(growth) and growth > 0):
-        point_time_to_guard = max(0.0, headroom) / growth
+        projected = snapshot_guard_time(snapshot, headroom)
+        point_time_to_guard = (
+            projected if projected is not None and math.isfinite(projected)
+            else None
+        )
     m5 = m5_row or {}
     return {
         "kind": "manager_risk_observation_shadow",
         "format_version": 2,
         "capacity_model": (
-            "allocated_kv_plus_scheduled_growth"
-            if prefill_growth is not None
-            else "allocated_kv_plus_decode_growth"
+            "FINITE_UNALLOCATED_PREFILL_PLUS_DECODE"
         ),
         "prefill_capacity_policy": "OBSERVATION_ONLY",
         "tick": tick,
