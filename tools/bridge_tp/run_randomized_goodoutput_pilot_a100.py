@@ -1201,13 +1201,41 @@ def probability_results(summary: dict[str, Any]) -> dict[str, Any]:
                 and not candidate.get("safety_override")
                 and not control.get("safety_override")
             )
-            if any(
-                ((arm.get("observed_action") or {}).get("safety_override_ticks")
-                 or (arm.get("observed_action") or {}).get(
-                     "safety_protection_required_ticks"))
-                for arm in (start, stay)
+            retain_service_outcomes = all(
+                (selected or {}).get("snapshot", {}).get("source_guard_policy")
+                == "WARNING_NOT_START_DEADLINE"
+                for selected in (candidate, control)
+            )
+            postdecision_exhaustion = {}
+            for assignment, arm, selected in (
+                ("START", start, candidate), ("STAY", stay, control)
             ):
-                valid = False
+                observed = arm.get("observed_action") or {}
+                protection = observed.get("safety_protection_required_ticks", [])
+                if observed.get("safety_override_ticks"):
+                    valid = False
+                if retain_service_outcomes:
+                    selected_tick = selected.get("candidate_tick")
+                    # Eligibility uses only predecision evidence. A later
+                    # capacity loss is a measured service outcome, not grounds
+                    # to select away an unfavorable STAY response.
+                    if (
+                        selected_tick is None
+                        or selected["snapshot"].get("physical_feasible") is not True
+                        or selected.get("experimental_eligibility_errors")
+                        or selected.get("safety_protection_required")
+                        or arm.get("fatal_error")
+                        or arm.get("fixed_horizon_eligible") is False
+                        or any(tick <= selected_tick for tick in protection)
+                    ):
+                        valid = False
+                    postdecision_exhaustion[assignment] = [
+                        tick for tick in protection
+                        if selected_tick is not None and tick > selected_tick
+                    ]
+                elif protection:
+                    # Preserve legacy guard replay semantics.
+                    valid = False
             samples.append(
                 {
                     "episode_group_id": f"{summary['seed']}:{name}",
@@ -1231,6 +1259,14 @@ def probability_results(summary: dict[str, Any]) -> dict[str, Any]:
                         "probability_min_urgency", 0.0),
                     "assignment_probability": 0.5,
                     "effect_sample_eligible": valid,
+                    "effect_sample_policy": (
+                        "PREDECISION_FEASIBILITY_POSTDECISION_SERVICE_OUTCOMES_V2"
+                        if retain_service_outcomes else
+                        "LEGACY_ANY_PROTECTION_EXCLUSION_V1"
+                    ),
+                    "postdecision_capacity_exhaustion_ticks": (
+                        postdecision_exhaustion
+                    ),
                     "policy_outcome_eligible": start_g is not None
                     and stay_g is not None,
                     "no_start_is_valid_policy_outcome": not executed,

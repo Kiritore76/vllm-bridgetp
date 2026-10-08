@@ -548,9 +548,60 @@ class TestProbabilityCollection(unittest.TestCase):
             probability_results(summary)["samples"][0]["effect_sample_eligible"]
         )
         observed["safety_protection_required_ticks"] = [2]
+        sample = probability_results(summary)["samples"][0]
+        self.assertTrue(sample["effect_sample_eligible"])
+        self.assertEqual(sample["descriptive_delta_tokens_s"], 2)
+        self.assertEqual(sample["postdecision_capacity_exhaustion_ticks"],
+                         {"START": [2], "STAY": [2]})
+        summary["cases"]["load"]["prob_0_START"][
+            "fixed_horizon_goodoutput_tokens_s"
+        ] = 0
+        harmed = probability_results(summary)["samples"][0]
+        self.assertTrue(harmed["effect_sample_eligible"])
+        self.assertEqual(harmed["descriptive_delta_tokens_s"], -8)
+        summary["cases"]["load"]["prob_0_START"][
+            "fixed_horizon_goodoutput_tokens_s"
+        ] = 10
+        observed["safety_protection_required_ticks"] = [1]
         self.assertFalse(
             probability_results(summary)["samples"][0]["effect_sample_eligible"]
         )
+        observed["safety_protection_required_ticks"] = [2]
+        observed["safety_override_ticks"] = [2]
+        self.assertFalse(
+            probability_results(summary)["samples"][0]["effect_sample_eligible"]
+        )
+        del observed["safety_override_ticks"]
+        candidate["snapshot"]["physical_feasible"] = False
+        self.assertFalse(
+            probability_results(summary)["samples"][0]["effect_sample_eligible"]
+        )
+
+    def test_legacy_postdecision_protection_remains_excluded(self):
+        candidate = {"snapshot": {"generated_tokens": 9, "H_tokens": 1000}}
+        observed = {
+            "probability_candidate": candidate,
+            "actual_probability_executions": [{"actual_action": "START_SHADOW"}],
+            "safety_protection_required_ticks": [12],
+        }
+        summary = {
+            "seed": 1, "probability_thresholds": [0.1],
+            "cases": {"load": {
+                "prob_0.1_START": {
+                    "fixed_horizon_goodoutput_tokens_s": 10,
+                    "observed_action": observed,
+                },
+                "prob_0.1_STAY": {
+                    "fixed_horizon_goodoutput_tokens_s": 8,
+                    "observed_action": {"probability_candidate": candidate},
+                },
+            }},
+        }
+        sample = probability_results(summary)["samples"][0]
+        self.assertFalse(sample["effect_sample_eligible"])
+        self.assertEqual(sample["policy_delta_tokens_s"], 2)
+        self.assertEqual(sample["effect_sample_policy"],
+                         "LEGACY_ANY_PROTECTION_EXCLUSION_V1")
 
     def test_first_crossing_common_feasibility_stay_and_simultaneous(self):
         gate = ProbabilityGate(
