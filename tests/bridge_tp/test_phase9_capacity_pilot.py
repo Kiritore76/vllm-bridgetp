@@ -142,6 +142,22 @@ class TestCapacityHeadroomTracker(unittest.TestCase):
         )
         self.assertIsNone(reset.decode_growth_tokens_s)
 
+    def test_prefill_rate_uses_counter_deltas_and_resets(self) -> None:
+        tracker = CapacityHeadroomTracker(self.config())
+        first = tracker.update(20000, 1.0,
+                               prefill_scheduled_tokens_total=100,
+                               decode_scheduled_tokens_total=0)
+        self.assertIsNone(first.prefill_growth_tokens_s)
+        current = tracker.update(18000, 2.0,
+                                 prefill_scheduled_tokens_total=2100,
+                                 decode_scheduled_tokens_total=0)
+        self.assertEqual(current.prefill_growth_tokens_s, 2000.0)
+        self.assertEqual(current.decode_growth_tokens_s, 0.0)
+        reset = tracker.update(18000, 3.0,
+                               prefill_scheduled_tokens_total=0,
+                               decode_scheduled_tokens_total=0)
+        self.assertIsNone(reset.prefill_growth_tokens_s)
+
     def test_enabled_config_requires_measured_guard(self) -> None:
         with self.assertRaisesRegex(ValueError, "guard_free_kv_tokens"):
             CapacityHeadroomTracker(CapacityPilotConfig(enabled=True))

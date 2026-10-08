@@ -92,11 +92,10 @@ def audit_episode(episode: str, rows: list[dict[str, Any]],
             signal = row.get("capacity_signal") or {}
             free = signal.get("free_kv_tokens")
             guard = signal.get("guard_free_kv_tokens")
-            pending = signal.get("prefill_pending_kv_tokens")
-            if all(isinstance(x, int) for x in (free, guard, pending)):
-                if free - guard - pending <= 0:
-                    hit_s = row["unix_s"]
-                    break
+            if (all(isinstance(x, int) for x in (free, guard))
+                    and free - guard <= 0):
+                hit_s = row["unix_s"]
+                break
         if hit_s is not None:
             status = "OBSERVED_SAMPLED_GUARD_HIT"
         elif release_s is not None and future:

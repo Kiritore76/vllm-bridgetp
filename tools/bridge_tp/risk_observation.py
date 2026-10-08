@@ -20,19 +20,33 @@ def build_risk_observation(
     guard = snapshot.get("source_guard_free_kv_tokens")
     pending = snapshot.get("source_prefill_pending_kv_tokens")
     growth = snapshot.get("source_decode_growth_tokens_s")
+    prefill_growth = snapshot.get("source_prefill_growth_tokens_s")
+    if isinstance(growth, (int, float)) and prefill_growth is not None:
+        growth = (
+            growth + prefill_growth
+            if isinstance(prefill_growth, (int, float))
+            and math.isfinite(prefill_growth) and prefill_growth >= 0
+            else None
+        )
     headroom = (
-        free - guard - pending
-        if all(isinstance(value, int) for value in (free, guard, pending))
+        free - guard
+        if all(isinstance(value, int) for value in (free, guard))
         else None
     )
     point_time_to_guard = None
-    if headroom is not None and isinstance(growth, (int, float)):
-        if math.isfinite(growth) and growth > 0:
-            point_time_to_guard = max(0.0, headroom) / growth
+    if (headroom is not None and isinstance(growth, (int, float))
+            and math.isfinite(growth) and growth > 0):
+        point_time_to_guard = max(0.0, headroom) / growth
     m5 = m5_row or {}
     return {
         "kind": "manager_risk_observation_shadow",
-        "format_version": 1,
+        "format_version": 2,
+        "capacity_model": (
+            "allocated_kv_plus_scheduled_growth"
+            if prefill_growth is not None
+            else "allocated_kv_plus_decode_growth"
+        ),
+        "prefill_capacity_policy": "OBSERVATION_ONLY",
         "tick": tick,
         "unix_s": snapshot.get("unix_s"),
         "request_id": snapshot.get("request_id"),
@@ -43,7 +57,10 @@ def build_risk_observation(
         "source_guard_free_kv_tokens": guard,
         "source_prefill_pending_kv_tokens": pending,
         "source_safe_headroom_tokens": headroom,
-        "source_decode_growth_tokens_s": growth,
+        "source_decode_growth_tokens_s": snapshot.get(
+            "source_decode_growth_tokens_s"),
+        "source_prefill_growth_tokens_s": prefill_growth,
+        "source_estimated_kv_growth_tokens_s": growth,
         "source_pool_sustained_growth_tokens_s": snapshot.get(
             "source_pool_sustained_growth_tokens_s"),
         "point_time_to_guard_s": point_time_to_guard,

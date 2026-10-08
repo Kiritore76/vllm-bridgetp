@@ -57,9 +57,13 @@ def snapshot(growth=10, pending=0):
     }
 
 
-def risk(growth=10, speed=10, pending=0, pred=None):
+def risk(growth=10, speed=10, pending=0, pred=None, free=1100,
+         prefill_growth=None):
+    state = snapshot(growth, pending)
+    state["source_free_kv_tokens"] = free
+    state["source_prefill_growth_tokens_s"] = prefill_growth
     return build_snapshot(
-        snapshot=snapshot(growth, pending),
+        snapshot=state,
         prediction=pred or prediction(cap=2000),
         candidate_rate=speed,
         initial_rate={"rate_bytes_s": 1000000, "profile": "LOW"},
@@ -375,7 +379,42 @@ class TestProbabilityCollection(unittest.TestCase):
         self.assertEqual(parallel["r_guard_tokens"], 100)
         self.assertEqual(parallel["T_guard_s"], 10)
         self.assertGreater(parallel["U"], single["U"])
-        self.assertEqual(risk(pending=128)["H_tokens"], 872)
+        self.assertEqual(risk(pending=128)["H_tokens"], 1000)
+
+    def test_pending_prefill_does_not_consume_capacity(self):
+        baseline = risk()
+        pending = risk(pending=100000)
+        for key in ("H_tokens", "source_physical_headroom_tokens",
+                    "T_guard_s", "U", "p_guard_est_bounds", "physical_feasible"):
+            self.assertEqual(pending[key], baseline[key], key)
+        self.assertEqual(pending["source"]["source_prefill_pending_kv_tokens"],
+                         100000)
+        state = snapshot()
+        state["target_prefill_pending_kv_tokens"] = 100000
+        result = build_snapshot(
+            snapshot=state, prediction=prediction(cap=2000), candidate_rate=10,
+            initial_rate={"rate_bytes_s": 1000000, "profile": "LOW"},
+            kv_bytes_per_token=100, release_tail_s=5, block_size=1,
+        ).to_json()
+        self.assertTrue(result["physical_feasible"])
+
+    def test_prefill_and_decode_rates_both_advance_guard(self):
+        mixed = risk(growth=10, prefill_growth=90)
+        prefill_only = risk(growth=0, prefill_growth=100)
+        for row in (mixed, prefill_only):
+            self.assertEqual(row["H_tokens"], 1000)
+            self.assertEqual(row["pool_growth_tokens_s"], 100)
+            self.assertEqual(row["T_guard_s"], 10)
+            self.assertTrue(row["physical_feasible"])
+        self.assertEqual(mixed["U"], prefill_only["U"])
+        self.assertEqual(mixed["p_guard_est_bounds"],
+                         prefill_only["p_guard_est_bounds"])
+
+    def test_prefill_guard_time_without_candidate_decode_rate(self):
+        row = risk(growth=0, prefill_growth=100, speed=0)
+        self.assertEqual(row["T_guard_s"], 10)
+        self.assertIsNone(row["p_guard_est_bounds"])
+        self.assertEqual(row["status"], "NO_CANDIDATE_RATE")
 
     def test_no_growth_protection_stale_and_delta_catchup(self):
         for growth in (0, -1, None, math.nan):
@@ -384,7 +423,7 @@ class TestProbabilityCollection(unittest.TestCase):
             self.assertIsNone(row["p_guard_est_bounds"])
             self.assertFalse(row["physical_feasible"])
             json.dumps(row, allow_nan=False)
-        self.assertEqual(risk(pending=1000)["status"], "GUARD_REACHED")
+        self.assertEqual(risk(free=100)["status"], "GUARD_REACHED")
         self.assertIn("delta_cannot_catch_up", risk(speed=10000)["physical_rejections"])
         row = snapshot()
         row["target_sampled_unix_s"] = 1
@@ -413,7 +452,7 @@ class TestProbabilityCollection(unittest.TestCase):
         self.assertTrue(decision["guard_deadline_warning"])
 
     def test_guard_reached_is_not_physical_capacity_exhaustion(self):
-        row = risk(pending=1000)
+        row = risk(free=100)
         self.assertEqual(row["H_tokens"], 0)
         self.assertEqual(row["source_physical_headroom_tokens"], 100)
         self.assertEqual(row["p_guard_est_bounds"], [1, 1])
@@ -422,7 +461,7 @@ class TestProbabilityCollection(unittest.TestCase):
         json.dumps(row, allow_nan=False)
         gate = ProbabilityGate(0.8, "guard", assigned_action="START")
         self.assertEqual(gate.observe(row, 1)["requested_action"], "START_SHADOW")
-        exhausted = risk(pending=1100)
+        exhausted = risk(free=0)
         self.assertFalse(exhausted["physical_feasible"])
         self.assertIn(
             "source_physical_capacity_exhausted", exhausted["physical_rejections"]

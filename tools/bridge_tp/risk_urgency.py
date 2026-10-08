@@ -137,7 +137,9 @@ def build_snapshot(
     initial_rate = audit_finite(initial_rate)
     row: dict[str, Any] = {
         "kind": "risk_urgency_snapshot",
-        "format_version": 2,
+        "format_version": 4,
+        "capacity_model": "allocated_kv_plus_decode_growth",
+        "prefill_capacity_policy": "OBSERVATION_ONLY",
         "source_guard_policy": "WARNING_NOT_START_DEADLINE",
         "unix_s": snapshot.get("unix_s"),
         "request_id": snapshot.get("request_id"),
@@ -153,7 +155,7 @@ def build_snapshot(
         "probability_is_pool_oom_risk": False,
         "time_bound_status": "ASSUMED_ENVELOPE_NOT_CALIBRATED_CI",
         "assumptions": [
-            "current decode growth persists; prefill separated",
+            "current scheduled growth persists; pending prefill is observation only",
             "future arrivals/EOS change next snapshot",
             "growth 0.5..1.5x; effective M2 rate 0.5..1.0x",
             "release tail includes final sync/handoff/KV release",
@@ -201,22 +203,34 @@ def build_snapshot(
         reasons.append("invalid_capacity")
         row["status"] = "INVALID_CAPACITY"
         return RiskUrgencySnapshot(row)
-    free, guard, pending = amounts
+    free, guard, _pending = amounts
+    # Account only for allocated KV; pending prefill remains in the snapshot.
     h = (
         (free // block_size) * block_size
         - math.ceil(guard / block_size) * block_size
-        - math.ceil(pending / block_size) * block_size
     )
     row["H_tokens"] = h
-    physical_headroom = (free // block_size) * block_size - math.ceil(
-        pending / block_size
-    ) * block_size
+    physical_headroom = (free // block_size) * block_size
     row["source_physical_headroom_tokens"] = physical_headroom
     row["source_physical_capacity_exhausted"] = physical_headroom <= 0
     if physical_headroom <= 0:
         reasons.append("source_physical_capacity_exhausted")
     row["p_capacity_bounds"] = remaining_ge_bounds(p, h)
     growth = snapshot.get("source_decode_growth_tokens_s")
+    prefill_growth = snapshot.get("source_prefill_growth_tokens_s")
+    row["prefill_growth_tokens_s"] = prefill_growth
+    if prefill_growth is not None:
+        if (not isinstance(prefill_growth, (int, float))
+                or not math.isfinite(prefill_growth) or prefill_growth < 0):
+            reasons.append("prefill_growth_invalid")
+            growth = None
+        elif isinstance(growth, (int, float)):
+            growth += prefill_growth
+        row["capacity_model"] = "allocated_kv_plus_scheduled_growth"
+    row["growth_estimate_basis"] = (
+        "SCHEDULED_TOKEN_EWMA_APPROXIMATION" if prefill_growth is not None
+        else "LEGACY_DECODE_ONLY_PREFILL_RATE_UNAVAILABLE"
+    )
     row["pool_growth_tokens_s"] = growth
     valid_growth = isinstance(growth, (int, float)) and math.isfinite(growth)
     valid_speed = (
@@ -240,6 +254,8 @@ def build_snapshot(
         row["status"] = "NO_TRUSTED_POSITIVE_GROWTH"
         reasons.append("growth_evidence_unavailable")
     elif not valid_speed:
+        tg = h / growth
+        row.update(T_guard_s=tg, T_guard_bounds_s=[tg / 1.5, tg / 0.5])
         row["status"] = "NO_CANDIDATE_RATE"
         reasons.append("candidate_rate_unavailable")
     else:
@@ -348,7 +364,7 @@ def build_snapshot(
         or target_guard is None
         or (
             isinstance(target_pending, int)
-            and target - target_guard - target_pending
+            and target - target_guard
             < math.ceil((context + cap) / block_size) * block_size
         )
     ):

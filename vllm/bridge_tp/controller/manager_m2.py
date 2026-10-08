@@ -138,18 +138,29 @@ class M2RateController:
             snapshot.source_prefill_pending_kv_tokens is not None
             and snapshot.source_decode_growth_tokens_s is not None
         )
-        reserved_prefill = (
+        pending_prefill = (
             snapshot.source_prefill_pending_kv_tokens if separated else 0
         )
-        assert reserved_prefill is not None
+        assert pending_prefill is not None
+        # Free KV already excludes allocated blocks. Unfinished prefill is
+        # observed demand, not an additional allocation.
         headroom = (
             snapshot.source_free_kv_tokens
             - snapshot.source_guard_free_kv_tokens
-            - reserved_prefill
         )
         if separated:
             growth = snapshot.source_decode_growth_tokens_s
-            capacity_model = "prefill_reservation_plus_decode_growth"
+            capacity_model = "allocated_kv_plus_decode_growth"
+            prefill_growth = snapshot.source_prefill_growth_tokens_s
+            if prefill_growth is not None:
+                if not math.isfinite(prefill_growth) or prefill_growth < 0:
+                    return M2RateDecision(
+                        "HOLD", self.profile, current_rate,
+                        "prefill growth invalid", ("source prefill growth",),
+                    )
+                assert growth is not None
+                growth += prefill_growth
+                capacity_model = "allocated_kv_plus_scheduled_growth"
         else:
             # Older traces do not distinguish prompt allocation from decode.
             growth = (
@@ -164,9 +175,9 @@ class M2RateController:
                 "HOLD", self.profile, current_rate, "source growth invalid",
                 ("source growth",),
             )
-        if reserved_prefill < 0:
+        if pending_prefill < 0:
             return M2RateDecision(
-                "HOLD", self.profile, current_rate, "prefill reservation invalid",
+                "HOLD", self.profile, current_rate, "prefill observation invalid",
                 ("source_prefill_pending_kv_tokens",),
             )
         horizon = math.inf if growth == 0 else max(0.0, headroom / growth)

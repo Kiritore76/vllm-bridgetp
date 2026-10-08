@@ -22,8 +22,8 @@ class TestRiskObservation(unittest.TestCase):
             initial_rate={"profile": "LOW", "rate_bytes_s": 1.0},
             assigned_action="WAIT",
         )
-        self.assertEqual(row["source_safe_headroom_tokens"], 90)
-        self.assertEqual(row["point_time_to_guard_s"], 3.0)
+        self.assertEqual(row["source_safe_headroom_tokens"], 100)
+        self.assertEqual(row["point_time_to_guard_s"], 100 / 30)
         self.assertEqual(row["natural_m1_action"], "START_SHADOW")
         self.assertEqual(row["applied_m1_action"], "STAY")
         self.assertFalse(row["m5_probability_is_pool_oom_risk"])
@@ -36,7 +36,7 @@ class TestRiskObservation(unittest.TestCase):
             {"kind": "telemetry", "unix_s": 11.0,
              "capacity_signal": {"free_kv_tokens": 21,
                                  "guard_free_kv_tokens": 20,
-                                 "prefill_pending_kv_tokens": 0}},
+                                 "prefill_pending_kv_tokens": 1000}},
             {"kind": "telemetry", "unix_s": 12.0,
              "capacity_signal": {"free_kv_tokens": 19,
                                  "guard_free_kv_tokens": 20,
