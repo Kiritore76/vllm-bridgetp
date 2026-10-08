@@ -69,6 +69,7 @@ class CapacitySignal:
     reason: str
     sustained_decline_rate_tokens_s: float | None = None
     prefill_pending_kv_tokens: int | None = None
+    prefill_unallocated_kv_tokens: int | None = None
     prefill_scheduled_tokens_total: int | None = None
     decode_scheduled_tokens_total: int | None = None
     decode_growth_tokens_s: float | None = None
@@ -110,6 +111,7 @@ class CapacityHeadroomTracker:
         sampled_unix_s: float,
         *,
         prefill_pending_kv_tokens: int | None = None,
+        prefill_unallocated_kv_tokens: int | None = None,
         prefill_scheduled_tokens_total: int | None = None,
         decode_scheduled_tokens_total: int | None = None,
     ) -> CapacitySignal:
@@ -227,6 +229,7 @@ class CapacityHeadroomTracker:
                 else None
             ),
             prefill_pending_kv_tokens=prefill_pending_kv_tokens,
+            prefill_unallocated_kv_tokens=prefill_unallocated_kv_tokens,
             prefill_scheduled_tokens_total=prefill_scheduled_tokens_total,
             decode_scheduled_tokens_total=decode_scheduled_tokens_total,
             decode_growth_tokens_s=self._decode_growth,

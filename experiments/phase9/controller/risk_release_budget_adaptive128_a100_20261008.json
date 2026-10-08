@@ -1,0 +1,120 @@
+{
+  "format_version": 1,
+  "calibration_id": "adaptive128_a100_engineering_release_20261008_v1",
+  "status": "ENGINEERING_EMPIRICAL_BUDGET_NOT_CONFIDENCE_INTERVAL",
+  "scope": {
+    "gpu_models": [
+      "NVIDIA A100-PCIE-40GB",
+      "NVIDIA A100-PCIE-40GB",
+      "NVIDIA A100-PCIE-40GB",
+      "NVIDIA A100-PCIE-40GB",
+      "NVIDIA A100-PCIE-40GB"
+    ],
+    "minimum_lead_tokens": 128,
+    "reserve_tokens": 512,
+    "maximum_plan_adjustments": 2,
+    "source_concurrency": 4,
+    "anchor_prompt_tokens": 7168
+  },
+  "sample_count": 12,
+  "release_budget_s": 11.664878368377686,
+  "post_freeze_budget_s": 0.503929615020752,
+  "samples": [
+    {
+      "arm": "formal_regular_seed20261081:prob_0_START",
+      "archive_sha256": "fd687ef669986e598402c5d42d930e9466ac7d9f4437237c01f867228b6c077f",
+      "release_s": 11.370915174484253,
+      "freeze_to_release_s": 0.37079763412475586,
+      "lead_tokens": 315,
+      "planning_rate": 31.086855573586316
+    },
+    {
+      "arm": "formal_regular_seed20261081:prob_0.05_START",
+      "archive_sha256": "fd687ef669986e598402c5d42d930e9466ac7d9f4437237c01f867228b6c077f",
+      "release_s": 8.122268676757812,
+      "freeze_to_release_s": 0.48356032371520996,
+      "lead_tokens": 175,
+      "planning_rate": 33.20984663135308
+    },
+    {
+      "arm": "formal_regular_seed20261082:prob_0.05_START",
+      "archive_sha256": "fd687ef669986e598402c5d42d930e9466ac7d9f4437237c01f867228b6c077f",
+      "release_s": 7.227473735809326,
+      "freeze_to_release_s": 0.26551032066345215,
+      "lead_tokens": 175,
+      "planning_rate": 33.95675159287235
+    },
+    {
+      "arm": "formal_regular_seed20261082:prob_0_START",
+      "archive_sha256": "fd687ef669986e598402c5d42d930e9466ac7d9f4437237c01f867228b6c077f",
+      "release_s": 6.521462678909302,
+      "freeze_to_release_s": 0.2571876049041748,
+      "lead_tokens": 163,
+      "planning_rate": 33.586137313624064
+    },
+    {
+      "arm": "formal_high_seed20261083:prob_0.8_START",
+      "archive_sha256": "40b8f757436409cc7f9a05ba474a9e512db7a06c98645af66a1de4e8486aa874",
+      "release_s": 11.475565910339355,
+      "freeze_to_release_s": 0.34351325035095215,
+      "lead_tokens": 315,
+      "planning_rate": 31.009921085809452
+    },
+    {
+      "arm": "formal_high_seed20261083:prob_0_START",
+      "archive_sha256": "40b8f757436409cc7f9a05ba474a9e512db7a06c98645af66a1de4e8486aa874",
+      "release_s": 11.664878368377686,
+      "freeze_to_release_s": 0.4322092533111572,
+      "lead_tokens": 319,
+      "planning_rate": 31.736561743341404
+    },
+    {
+      "arm": "formal_high_seed20261084:prob_0_START",
+      "archive_sha256": "40b8f757436409cc7f9a05ba474a9e512db7a06c98645af66a1de4e8486aa874",
+      "release_s": 6.461857318878174,
+      "freeze_to_release_s": 0.271223783493042,
+      "lead_tokens": 163,
+      "planning_rate": 32.25122451961154
+    },
+    {
+      "arm": "formal_high_seed20261084:prob_0.8_START",
+      "archive_sha256": "40b8f757436409cc7f9a05ba474a9e512db7a06c98645af66a1de4e8486aa874",
+      "release_s": 6.745577335357666,
+      "freeze_to_release_s": 0.44598913192749023,
+      "lead_tokens": 167,
+      "planning_rate": 32.779011699242716
+    },
+    {
+      "arm": "formal_target_busy_seed20261085:prob_0.01_START",
+      "archive_sha256": "c06dc3e24c3567b78495453cfe2250e4c477f4307c92f69af4a1de9a00dbbaad",
+      "release_s": 6.24497652053833,
+      "freeze_to_release_s": 0.27469325065612793,
+      "lead_tokens": 165,
+      "planning_rate": 34.16363799268557
+    },
+    {
+      "arm": "formal_target_busy_seed20261085:prob_0_START",
+      "archive_sha256": "c06dc3e24c3567b78495453cfe2250e4c477f4307c92f69af4a1de9a00dbbaad",
+      "release_s": 6.438241958618164,
+      "freeze_to_release_s": 0.41181302070617676,
+      "lead_tokens": 166,
+      "planning_rate": 33.46528049276727
+    },
+    {
+      "arm": "formal_target_busy_seed20261086:prob_0_START",
+      "archive_sha256": "c06dc3e24c3567b78495453cfe2250e4c477f4307c92f69af4a1de9a00dbbaad",
+      "release_s": 6.680628538131714,
+      "freeze_to_release_s": 0.503929615020752,
+      "lead_tokens": 168,
+      "planning_rate": 33.61305316471927
+    },
+    {
+      "arm": "formal_target_busy_seed20261086:prob_0.01_START",
+      "archive_sha256": "c06dc3e24c3567b78495453cfe2250e4c477f4307c92f69af4a1de9a00dbbaad",
+      "release_s": 11.631271839141846,
+      "freeze_to_release_s": 0.3980419635772705,
+      "lead_tokens": 320,
+      "planning_rate": 31.959549552439924
+    }
+  ]
+}

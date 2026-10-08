@@ -60,7 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--guard-profile", choices=("legacy8448", "reduced2000"),
                         default="legacy8448",
                         help="Pin the guard value and file SHA for this collection")
-    parser.add_argument("--slo-profile", choices=("legacy1pct", "slow2pct"),
+    parser.add_argument("--slo-profile", choices=("legacy1pct", "slow2pct", "slow2pct_visible_diagnostic"),
                         default="legacy1pct",
                         help="Pin the SLO reference SHA for this collection")
     parser.add_argument("--pre-episode-warmup", action="store_true",

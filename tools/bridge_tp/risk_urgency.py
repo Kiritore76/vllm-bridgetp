@@ -3,9 +3,23 @@
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import asdict, dataclass
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
+
+from tools.bridge_tp.guard_forecast import snapshot_guard_time
+
+
+@lru_cache(maxsize=1)
+def release_calibration():
+    path = Path(__file__).resolve().parents[2] / (
+        "experiments/phase9/controller/"
+        "risk_release_budget_adaptive128_a100_20261008.json"
+    )
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def audit_finite(value: Any) -> Any:
@@ -123,8 +137,9 @@ def build_snapshot(
     safety_margin_s: float = 2.0,
     max_sample_age_s: float = 2.0,
     model_config_sha256: str | None = None,
+    timing_calibration: dict | None = None,
 ) -> RiskUrgencySnapshot:
-    """Use decode growth excluding isolated prefill, pending only once.
+    """Project finite unallocated prefill plus ongoing decode growth.
 
     Timing envelope assumes 0.5..1.5 current growth and 0.5..1.0 initial
     M2 effective bandwidth. Copy catches ongoing candidate decode. The
@@ -137,7 +152,7 @@ def build_snapshot(
     initial_rate = audit_finite(initial_rate)
     row: dict[str, Any] = {
         "kind": "risk_urgency_snapshot",
-        "format_version": 4,
+        "format_version": 5,
         "capacity_model": "allocated_kv_plus_decode_growth",
         "prefill_capacity_policy": "OBSERVATION_ONLY",
         "source_guard_policy": "WARNING_NOT_START_DEADLINE",
@@ -218,21 +233,22 @@ def build_snapshot(
     row["p_capacity_bounds"] = remaining_ge_bounds(p, h)
     growth = snapshot.get("source_decode_growth_tokens_s")
     prefill_growth = snapshot.get("source_prefill_growth_tokens_s")
+    forecast = snapshot_guard_time(snapshot, h)
     row["prefill_growth_tokens_s"] = prefill_growth
-    if prefill_growth is not None:
-        if (not isinstance(prefill_growth, (int, float))
-                or not math.isfinite(prefill_growth) or prefill_growth < 0):
-            reasons.append("prefill_growth_invalid")
-            growth = None
-        elif isinstance(growth, (int, float)):
-            growth += prefill_growth
-        row["capacity_model"] = "allocated_kv_plus_scheduled_growth"
-    row["growth_estimate_basis"] = (
-        "SCHEDULED_TOKEN_EWMA_APPROXIMATION" if prefill_growth is not None
-        else "LEGACY_DECODE_ONLY_PREFILL_RATE_UNAVAILABLE"
+    row["prefill_unallocated_kv_tokens"] = snapshot.get(
+        "source_prefill_unallocated_kv_tokens")
+    row["capacity_model"] = "FINITE_UNALLOCATED_PREFILL_PLUS_DECODE"
+    row["growth_estimate_basis"] = "FINITE_ALLOCATION_SCHEDULED_RATE_PROXY"
+    row["pool_growth_tokens_s"] = (
+        h / forecast if forecast is not None
+        and math.isfinite(forecast) and forecast > 0 else growth
     )
-    row["pool_growth_tokens_s"] = growth
-    valid_growth = isinstance(growth, (int, float)) and math.isfinite(growth)
+    row["prefill_seconds_per_token_estimate"] = (
+        1 / prefill_growth if isinstance(prefill_growth, (int, float))
+        and prefill_growth > 0 else None
+    )
+    valid_growth = (forecast is not None and math.isfinite(forecast)
+                    and forecast > 0)
     valid_speed = (
         isinstance(candidate_rate, (int, float))
         and math.isfinite(candidate_rate)
@@ -250,19 +266,27 @@ def build_snapshot(
             guard_deadline_warning=True,
         )
         row["guard_warnings"].append("source_guard_reached")
-    elif not valid_growth or growth <= 0:
+    elif forecast == math.inf:
+        row.update(status="NO_PROJECTED_GUARD_REACH",
+                   p_guard_est_bounds=[0.0, 0.0], U=0.0, U_bounds=[0.0, 0.0])
+    elif not valid_growth:
         row["status"] = "NO_TRUSTED_POSITIVE_GROWTH"
         reasons.append("growth_evidence_unavailable")
     elif not valid_speed:
-        tg = h / growth
-        row.update(T_guard_s=tg, T_guard_bounds_s=[tg / 1.5, tg / 0.5])
+        tg = forecast
+        row.update(
+            T_guard_s=tg,
+            T_guard_bounds_s=[snapshot_guard_time(snapshot, h, 1.5),
+                              snapshot_guard_time(snapshot, h, 0.5)],
+        )
         row["status"] = "NO_CANDIDATE_RATE"
         reasons.append("candidate_rate_unavailable")
     else:
-        tg = h / growth
+        tg = forecast
         row.update(
             T_guard_s=tg,
-            T_guard_bounds_s=[tg / 1.5, tg / 0.5],
+            T_guard_bounds_s=[snapshot_guard_time(snapshot, h, 1.5),
+                                                snapshot_guard_time(snapshot, h, 0.5)],
             r_guard_tokens=candidate_rate * tg,
         )
         row["p_guard_est_bounds"] = remaining_ge_bounds(p, candidate_rate * tg)
@@ -296,11 +320,26 @@ def build_snapshot(
                 / (bandwidth * 0.5 - produced_bytes_s * 1.5)
                 + release_tail_s
             )
+            if timing_calibration is not None:
+                budget = timing_calibration["release_budget_s"]
+                if not math.isfinite(budget) or budget <= 0:
+                    raise ValueError("invalid empirical release budget")
+                tr = max(tr, budget)
+                upper = max(upper, budget * 1.5)
+                row["release_calibration_id"] = timing_calibration["calibration_id"]
+                row["release_budget_basis"] = timing_calibration["status"]
             row.update(T_release_s=tr, T_release_bounds_s=[tr, upper])
             history_s = context * kv_bytes_per_token / bandwidth
             row["release_components_point_s"] = {
                 "history": history_s,
-                "ongoing_decode_delta_catchup": tr - release_tail_s - history_s,
+                "ongoing_decode_delta_catchup": (
+                    context * kv_bytes_per_token / (bandwidth - produced_bytes_s)
+                    - history_s
+                ),
+                "empirical_preparation_freeze_wait_release_allowance": (
+                    tr - context * kv_bytes_per_token
+                    / (bandwidth - produced_bytes_s) - release_tail_s
+                ),
                 "final_sync_handoff_source_release_allowance": release_tail_s,
             }
             if h <= 0:

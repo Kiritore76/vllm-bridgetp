@@ -36,6 +36,7 @@ from tools.bridge_tp.risk_observation import build_risk_observation  # noqa: E40
 from tools.bridge_tp.risk_urgency import (  # noqa: E402
     DecodeRateTracker,
     build_snapshot,
+    release_calibration,
 )
 from vllm.bridge_tp.controller.action_adapter import (  # noqa: E402
     ActionAdapter,
@@ -1802,6 +1803,9 @@ def main() -> None:
                     pool1.free_kv_tokens,
                     pool1.sampled_unix_s or now,
                     prefill_pending_kv_tokens=pool1.prefill_pending_kv_tokens,
+                    prefill_unallocated_kv_tokens=(
+                        pool1.prefill_unallocated_kv_tokens
+                    ),
                     prefill_scheduled_tokens_total=(
                         pool1.prefill_scheduled_tokens_total
                     ),
@@ -1831,8 +1835,6 @@ def main() -> None:
                     headroom_tokens = (
                         pool1.free_kv_tokens
                         - config.capacity_pilot.guard_free_kv_tokens
-                        - pool1.prefill_pending_kv_tokens
-                        if pool1.prefill_pending_kv_tokens is not None else None
                     )
                     try:
                         if headroom_tokens is None:
@@ -1936,6 +1938,8 @@ def main() -> None:
                                           "rate_bytes_s": rate.rate_bytes_s}),
                         kv_bytes_per_token=config.policy.kv_bytes_per_token,
                         release_tail_s=args.m1_source_release_tail_s,
+                        timing_calibration=(release_calibration()
+                                            if args.rolling_cutover else None),
                         block_size=config.block_size,
                         model_config_sha256=args.risk_model_config_sha256,
                     ).to_json()

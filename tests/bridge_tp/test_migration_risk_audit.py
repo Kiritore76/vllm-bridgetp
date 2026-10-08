@@ -14,6 +14,7 @@ class TestRiskObservation(unittest.TestCase):
             snapshot={"unix_s": 10.0, "source_free_kv_tokens": 120,
                       "source_guard_free_kv_tokens": 20,
                       "source_prefill_pending_kv_tokens": 10,
+                      "source_prefill_unallocated_kv_tokens": 0,
                       "source_decode_growth_tokens_s": 30.0},
             m5_row={"status": "AVAILABLE",
                     "p_remaining_gt_headroom_runtime_bounds": [0.7, 0.9]},

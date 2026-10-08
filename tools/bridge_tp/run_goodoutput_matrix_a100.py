@@ -61,6 +61,9 @@ def reference_contract(args: argparse.Namespace) -> str:
     profile = getattr(args, "slo_profile", "legacy1pct")
     if profile == "legacy1pct":
         return EXPECTED_SHAS["reference"]
+    if (profile == "slow2pct_visible_diagnostic"
+            and getattr(args, "probability_pilot", False)):
+        return "6f80a63345b981cdbeda28e595e11d32e2041767ba983b2eafa39475c6436cb5"
     if profile == "slow2pct" and getattr(args, "probability_pilot", False):
         return "0bea93bd3af4e6d44b3164c14b6e3504666c8adf3ad8679c411f775936f4f6cb"
     raise ValueError("SLO profile requires an explicit probability pilot contract")

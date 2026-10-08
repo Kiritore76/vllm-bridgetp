@@ -2072,6 +2072,7 @@ class Scheduler(SchedulerInterface):
             kv_connector_stats.data if kv_connector_stats else None
         )
         pending_prefill = None
+        unallocated_prefill = None
         if self._bridgetp_request_freeze is not None:
             pending_prefill = sum(
                 (
@@ -2084,12 +2085,20 @@ class Scheduler(SchedulerInterface):
                     - request.num_computed_tokens,
                 )) > 0
             )
+        if self._bridgetp_request_freeze is not None:
+            from tools.bridge_tp.guard_forecast import unallocated_prefill_tokens
+
+            unallocated_prefill = unallocated_prefill_tokens(
+                self.requests.values(), self.kv_cache_manager,
+                self.block_size, self.max_model_len,
+            )
         stats = SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             num_skipped_waiting_reqs=len(self.skipped_waiting),
             kv_cache_usage=self.kv_cache_manager.usage,
             bridgetp_prefill_pending_kv_tokens=pending_prefill,
+            bridgetp_prefill_unallocated_kv_tokens=unallocated_prefill,
             bridgetp_prefill_scheduled_tokens=(
                 self._bridgetp_prefill_scheduled_tokens
             ),

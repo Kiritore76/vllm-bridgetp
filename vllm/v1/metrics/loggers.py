@@ -535,6 +535,14 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         self.gauge_bridgetp_prefill_pending = create_metric_per_engine(
             pending_prefill, per_engine_labelvalues
         )
+        unallocated = self._gauge_cls(
+            name="vllm:bridgetp_prefill_unallocated_kv_tokens",
+            documentation="Prompt KV tokens not yet allocated, single KV group.",
+            multiprocess_mode="mostrecent", labelnames=labelnames,
+        )
+        self.gauge_bridgetp_prefill_unallocated = create_metric_per_engine(
+            unallocated, per_engine_labelvalues
+        )
         prefill_scheduled = self._counter_cls(
             name="vllm:bridgetp_prefill_scheduled_tokens",
             documentation="Prompt tokens scheduled by the engine.",
@@ -1109,6 +1117,11 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 self.gauge_bridgetp_prefill_pending[engine_idx].set(
                     scheduler_stats.bridgetp_prefill_pending_kv_tokens
                 )
+            self.gauge_bridgetp_prefill_unallocated[engine_idx].set(
+                scheduler_stats.bridgetp_prefill_unallocated_kv_tokens
+                if scheduler_stats.bridgetp_prefill_unallocated_kv_tokens is not None
+                else -1
+            )
             self.counter_bridgetp_prefill_scheduled[engine_idx].inc(
                 scheduler_stats.bridgetp_prefill_scheduled_tokens
             )
