@@ -618,6 +618,7 @@ class _GpuDirectHistoryPublisher:
         self.delta_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self.delta_errors: list[str] = []
         self.delta_records: list[dict[str, Any]] = []
+        self.delta_inflight: tuple[float, int] | None = None
         self.delta_submissions = 0
         self.delta_coalesced_submissions = 0
         self.failure: str | None = None
@@ -842,6 +843,9 @@ class _GpuDirectHistoryPublisher:
                             break
                         work, consumed = self._take_coalesced_delta(work)
                         self.delta_coalesced_submissions += consumed - 1
+                        self.delta_inflight = (
+                            time.time(), work["end_token"] - work["start_token"]
+                        )
                         work["ready_event"].synchronize()
                         record = sender.send_delta(
                             migration_id=self.config.migration_id,
@@ -858,6 +862,7 @@ class _GpuDirectHistoryPublisher:
                         record["logical_submissions"] = consumed
                         record["completed_unix_s"] = time.time()
                         self.delta_records.append(record)
+                        self.delta_inflight = None
                         _atomic_json_dump(
                             {
                                 "format_version": 1,

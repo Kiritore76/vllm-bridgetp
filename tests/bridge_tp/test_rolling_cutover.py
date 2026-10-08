@@ -127,8 +127,8 @@ class TestRollingPlanner(unittest.TestCase):
         self.assertEqual(result["requested_lead_tokens"], 400)
         self.assertEqual(result["cutover_output_tokens"], 700)
         deferred = planner.observe(
-            output_tokens=700,
-            computed_tokens=799,
+            output_tokens=701,
+            computed_tokens=800,
             resident_end=None,
             history_ready=True,
             delta_applied=False,
@@ -194,6 +194,67 @@ class TestRollingPlanner(unittest.TestCase):
             )
         )
         self.assertEqual(planner.version, 1)
+
+
+class TestAdaptiveLead(unittest.TestCase):
+    def test_backlog_and_inflight_extend_initial_lead(self):
+        planner = RollingPlanner(2000)
+        planner.observe(output_tokens=100, computed_tokens=200,
+                        resident_end=None, history_ready=False,
+                        delta_applied=False, unix_s=10)
+        plan = planner.observe(
+            output_tokens=200, computed_tokens=300, resident_end=200,
+            history_ready=True, delta_applied=True, unix_s=11,
+            delta_records=({"tokens": 16, "transfer_ms": 500},),
+            delta_inflight=(10.9, 16), initial_end=200,
+        )
+        self.assertGreater(plan["requested_lead_tokens"], 256)
+        self.assertEqual(plan["transport_lead_estimate"]["estimate_status"],
+                         "DRAIN_AFTER_FREEZE")
+        boundary = planner.boundary
+        self.assertIsNone(planner.observe(
+            output_tokens=boundary, computed_tokens=boundary + 100,
+            resident_end=201, history_ready=True, delta_applied=True,
+            unix_s=12, delta_records=({"tokens": 16, "transfer_ms": 900},),
+        ))
+        self.assertEqual(planner.boundary, boundary)
+
+    def test_overdue_inflight_retains_margin_with_fast_transport(self):
+        from vllm.bridge_tp.rolling_cutover import transport_lead_estimate
+        result = transport_lead_estimate(
+            backlog_tokens=40, growth_tokens_s=30,
+            records=({"tokens": 16, "transfer_ms": 100},),
+            inflight=(1.0, 16), unix_s=10.0,
+        )
+        self.assertEqual(result["estimate_status"], "CATCHUP")
+        self.assertGreater(result["inflight_remaining_estimate_s"], 0)
+        self.assertGreater(result["adaptive_horizon_s"], 2)
+
+    def test_only_missed_boundary_can_move_and_adjustments_are_bounded(self):
+        planner = RollingPlanner(10000, minimum_lead_tokens=32)
+        def observe(output, now):
+            return planner.observe(output_tokens=output, computed_tokens=output+100,
+                                   resident_end=output+99, history_ready=True,
+                                   delta_applied=True, unix_s=now)
+        observe(10, 10)
+        for now in (11, 12):
+            result = observe(planner.boundary + 1, now)
+            self.assertEqual(result["reason"], "SAFE_PUBLICATION_BOUNDARY_MISSED")
+        result = observe(planner.boundary + 1, 13)
+        self.assertEqual(result["reason"], "PLAN_ADJUSTMENT_LIMIT")
+        self.assertEqual(planner.version, 3)
+
+    def test_large_estimate_stays_inside_fixed_reservation(self):
+        planner = RollingPlanner(500)
+        planner.observe(output_tokens=10, computed_tokens=110, resident_end=100,
+                        history_ready=False, delta_applied=True, unix_s=1)
+        result = planner.observe(
+            output_tokens=200, computed_tokens=300, resident_end=100,
+            history_ready=True, delta_applied=True, unix_s=2,
+            delta_records=({"tokens": 1, "transfer_ms": 1000},),
+        )
+        self.assertEqual(result["cutover_output_tokens"], 499)
+        self.assertTrue(result["lead_capped_by_reservation"])
 
 
 class TargetRequest:
@@ -761,6 +822,19 @@ class TestActualSourceHook(unittest.TestCase):
         self.assertEqual(plan["cutover_output_tokens"], 228)
         self.assertEqual(plan["reason"], "FIRST_AFTER_HISTORY_RESIDENT")
 
+    def test_actual_hook_consumes_sender_timing_for_wider_plan(self):
+        self.state.history_publishers = [types.SimpleNamespace(
+            delta_records=[{"tokens": 4, "transfer_ms": 500}],
+            delta_inflight=(103.0, 4),
+        )]
+        self.step(30)
+        self.apply_progress(125)
+        self.step(134)
+        plan = json.loads((self.root / "rolling_source_plan.json").read_text())
+        self.assertGreater(plan["requested_lead_tokens"], 256)
+        self.assertEqual(plan["transport_lead_estimate"]["transport_samples"], 1)
+        self.assertEqual(plan["transport_lead_estimate"]["backlog_tokens"], 108)
+
     def test_history_only_plan_keeps_generating_until_applied_boundary(self):
         with patch("vllm.bridge_tp.request_freeze.request_freeze") as freeze:
             for rank in range(4):
@@ -779,8 +853,9 @@ class TestActualSourceHook(unittest.TestCase):
             self.assertFalse(plan["first_delta_applied"])
             self.step(285)
             self.assertFalse(freeze.called)
-            self.step(286)
-            self.assertGreater(self.state.rolling_planner.boundary, 286)
+            with self.assertRaisesRegex(RuntimeError, "exact applied watermark"):
+                self.step(286)
+            self.assertEqual(self.state.rolling_planner.boundary, 286)
             self.assertFalse(freeze.called)
 
     def test_large_backlog_freezes_at_first_boundary_and_enqueues_tail(self):
