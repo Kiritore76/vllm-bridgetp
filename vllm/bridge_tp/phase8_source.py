@@ -690,10 +690,16 @@ def maybe_publish_phase8_delta(
         watermark = applied_progress(
             config.run_dir, config.migration_id, reservation['initial_end_token'],
         )
+        publishers = getattr(state, 'history_publishers', ())
+        publisher = publishers[0] if publishers else None
+        records = tuple(getattr(publisher, 'delta_records', ())[-8:])
+        inflight = getattr(publisher, 'delta_inflight', None)
         decision = planner.observe(
             output_tokens=output_tokens, computed_tokens=num_computed,
             resident_end=watermark, history_ready=state.rolling_history_ready,
             delta_applied=watermark is not None, unix_s=time.time(),
+            delta_records=records, delta_inflight=inflight,
+            initial_end=reservation['initial_end_token'],
         )
         if decision is not None:
             decision.update(migration_id=config.migration_id,

@@ -70,11 +70,62 @@ def applied_progress(run_dir: Path, migration_id: str, initial_end: int) -> int 
     return current if current > initial_end else None
 
 
+def transport_lead_estimate(
+    *,
+    backlog_tokens: int,
+    growth_tokens_s: float,
+    records: tuple[dict[str, Any], ...],
+    inflight: tuple[float, int] | None,
+    unix_s: float,
+) -> dict[str, Any]:
+    """Estimate conservative drain time without waiting for a sender or GPU.
+
+    Completed batch wall times include packing, receiver readiness and ACK.
+    In-flight remaining time is an estimate, not a completion guarantee.
+    """
+    samples = [r for r in records[-8:]
+               if r.get("tokens", 0) > 0 and r.get("transfer_ms", 0) > 0]
+    if samples:
+        service_s = max(r["transfer_ms"] for r in samples) / 1000
+        rate = sum(r["tokens"] for r in samples) / sum(
+            r["transfer_ms"] / 1000 for r in samples
+        )
+    else:
+        # Bootstrap only until completed batches supply measured throughput.
+        service_s, rate = 0.5, 32.0
+    active_tokens = inflight[1] if inflight else 0
+    elapsed = max(0.0, unix_s - inflight[0]) if inflight else 0.0
+    # An overdue batch still needs margin; zero remaining would be optimistic.
+    remaining = max(service_s - elapsed, service_s * 0.5) if inflight else 0.0
+    queued = max(0, backlog_tokens - active_tokens)
+    net_rate = rate - growth_tokens_s
+    drain_s = remaining + queued / rate
+    if net_rate > 0:
+        catchup_s = (queued + remaining * growth_tokens_s) / net_rate
+        estimated_s = remaining + catchup_s
+    else:
+        # Extending indefinitely cannot catch a producer faster than transport.
+        estimated_s = drain_s
+    horizon_s = min(8.0, 2.0 + 1.5 * estimated_s)
+    return {
+        "transport_samples": len(samples), "backlog_tokens": backlog_tokens,
+        "inflight_tokens": active_tokens, "inflight_elapsed_s": elapsed,
+        "inflight_remaining_estimate_s": remaining,
+        "transport_tokens_s": rate, "net_catchup_tokens_s": net_rate,
+        "estimated_catchup_s": estimated_s, "adaptive_horizon_s": horizon_s,
+        "adaptive_horizon_capped": 2.0 + 1.5 * estimated_s > 8.0,
+        "adaptive_lead_tokens": math.ceil(growth_tokens_s * horizon_s),
+        "estimate_status": ("BOOTSTRAP" if not samples else
+                            "CATCHUP" if net_rate > 0 else "DRAIN_AFTER_FREEZE"),
+    }
+
+
 @dataclass
 class RollingPlanner:
     reservation_output_tokens: int
     minimum_lead_tokens: int = 256
     lead_seconds: float = 2.0
+    maximum_plan_adjustments: int = 2
     boundary: int | None = None
     version: int = 0
     last_output: int | None = None
@@ -90,6 +141,9 @@ class RollingPlanner:
         history_ready: bool,
         delta_applied: bool,
         unix_s: float,
+        delta_records: tuple[dict[str, Any], ...] = (),
+        delta_inflight: tuple[float, int] | None = None,
+        initial_end: int | None = None,
     ) -> dict[str, Any] | None:
         """Plan or move a future boundary; never pause decoding to catch up."""
         if self.last_unix_s is not None and unix_s > self.last_unix_s:
@@ -114,14 +168,32 @@ class RollingPlanner:
             self.minimum_lead_tokens,
             math.ceil(self.growth_tokens_s * self.lead_seconds),
         )
+        backlog = max(0, computed_tokens - (
+            resident_end if resident_end is not None
+            else initial_end if initial_end is not None else computed_tokens
+        ))
+        timing = transport_lead_estimate(
+            backlog_tokens=backlog, growth_tokens_s=self.growth_tokens_s,
+            records=delta_records, inflight=delta_inflight, unix_s=unix_s,
+        )
+        lead = max(lead, timing["adaptive_lead_tokens"])
+        if delta_records or delta_inflight or initial_end is not None:
+            # Keep the base token cushion in addition to backlog drain margin.
+            extra_s = min(6.0, 1.5 * timing["estimated_catchup_s"])
+            lead = max(lead, self.minimum_lead_tokens + math.ceil(
+                self.growth_tokens_s * extra_s
+            ))
         reason = None
         if self.boundary is None and history_ready:
             reason = "FIRST_AFTER_HISTORY_RESIDENT"
-        elif self.boundary is not None and output_tokens >= self.boundary and not ready:
-            # Missing or invalid applied evidence can defer a boundary.
-            # Backlog size does not: freeze at B and drain the finite tail
-            # before publishing cutover and allowing target takeover.
-            reason = "DEFERRED_BEFORE_FREEZE"
+        elif self.boundary is not None and output_tokens > self.boundary:
+            # Only a skipped publication boundary can move an existing plan.
+            # ACK lag and new timing estimates never move a published boundary.
+            if self.version > self.maximum_plan_adjustments:
+                return {"status": "RESERVATION_EXHAUSTED",
+                        "version": self.version, "output_tokens": output_tokens,
+                        "reason": "PLAN_ADJUSTMENT_LIMIT"}
+            reason = "SAFE_PUBLICATION_BOUNDARY_MISSED"
         if output_tokens >= self.reservation_output_tokens - 1 and not ready:
             return {
                 "status": "RESERVATION_EXHAUSTED",
@@ -157,6 +229,10 @@ class RollingPlanner:
                 "freeze_policy": "FREEZE_AT_BOUNDARY_DRAIN_TAIL",
                 "maximum_pre_freeze_delta_lag_tokens": None,
                 "requested_lead_tokens": lead,
+                "transport_lead_estimate": timing,
+                "lead_capped_by_reservation": candidate < output_tokens + lead,
+                "plan_adjustments": self.version - 1,
+                "maximum_plan_adjustments": self.maximum_plan_adjustments,
                 "minimum_lead_tokens": self.minimum_lead_tokens,
                 "lead_seconds": self.lead_seconds,
                 "published_unix_s": unix_s,
