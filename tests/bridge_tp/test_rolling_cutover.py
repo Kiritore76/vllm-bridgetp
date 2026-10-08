@@ -101,7 +101,7 @@ class TestRollingPlanner(unittest.TestCase):
             delta_applied=False,
             unix_s=11,
         )
-        self.assertEqual(result["cutover_output_tokens"], 389)
+        self.assertEqual(result["cutover_output_tokens"], 261)
         self.assertEqual(result["reason"], "FIRST_AFTER_HISTORY_RESIDENT")
         self.assertFalse(result["first_delta_applied"])
         self.assertIsNone(result["delta_lag_tokens"])
@@ -849,13 +849,13 @@ class TestActualSourceHook(unittest.TestCase):
                 )
             self.step(30)
             plan = json.loads((self.root / "rolling_source_plan.json").read_text())
-            self.assertEqual(plan["cutover_output_tokens"], 286)
+            self.assertEqual(plan["cutover_output_tokens"], 158)
             self.assertFalse(plan["first_delta_applied"])
-            self.step(285)
+            self.step(157)
             self.assertFalse(freeze.called)
             with self.assertRaisesRegex(RuntimeError, "exact applied watermark"):
-                self.step(286)
-            self.assertEqual(self.state.rolling_planner.boundary, 286)
+                self.step(158)
+            self.assertEqual(self.state.rolling_planner.boundary, 158)
             self.assertFalse(freeze.called)
 
     def test_large_backlog_freezes_at_first_boundary_and_enqueues_tail(self):

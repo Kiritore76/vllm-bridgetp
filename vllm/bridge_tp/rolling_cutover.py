@@ -123,7 +123,7 @@ def transport_lead_estimate(
 @dataclass
 class RollingPlanner:
     reservation_output_tokens: int
-    minimum_lead_tokens: int = 256
+    minimum_lead_tokens: int = 128
     lead_seconds: float = 2.0
     maximum_plan_adjustments: int = 2
     boundary: int | None = None

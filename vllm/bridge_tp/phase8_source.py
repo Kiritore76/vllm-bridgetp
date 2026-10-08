@@ -674,7 +674,7 @@ def maybe_publish_phase8_delta(
         if planner is None:
             import os
 
-            minimum_lead = int(os.getenv('BRIDGETP_ROLLING_MIN_LEAD_TOKENS', '256'))
+            minimum_lead = int(os.getenv('BRIDGETP_ROLLING_MIN_LEAD_TOKENS', '128'))
             if minimum_lead <= 0:
                 raise ValueError('rolling minimum lead must be positive')
             planner = RollingPlanner(
