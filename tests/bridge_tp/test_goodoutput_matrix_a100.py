@@ -22,6 +22,23 @@ from tools.bridge_tp.run_goodoutput_matrix_a100 import (
 
 
 class TestObservedPressure(unittest.TestCase):
+    def test_visible_diagnostic_reference_matches_linux_checkout(self):
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "experiments/phase9/slo"
+            / "slo_v6_slow2pct_visible_diagnostic_a100_tp4_reference_20261008.json"
+        )
+        contents = path.read_bytes().replace(b"\r\n", b"\n")
+        args = SimpleNamespace(
+            slo_profile="slow2pct_visible_diagnostic", probability_pilot=True
+        )
+        self.assertEqual(hashlib.sha256(contents).hexdigest(), reference_contract(args))
+        self.assertEqual(json.loads(contents)["max_visible_interval_policy"],
+                         "DIAGNOSTIC_ONLY")
+        args.probability_pilot = False
+        with self.assertRaisesRegex(ValueError, "explicit probability"):
+            reference_contract(args)
+
     def test_new_slo_changes_only_fraction_and_version_metadata(self):
         directory = Path(__file__).resolve().parents[2] / "experiments/phase9/slo"
         old = json.loads(
