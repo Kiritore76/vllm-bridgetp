@@ -72,6 +72,7 @@ class CapacitySignal:
     prefill_scheduled_tokens_total: int | None = None
     decode_scheduled_tokens_total: int | None = None
     decode_growth_tokens_s: float | None = None
+    prefill_growth_tokens_s: float | None = None
 
     def to_json(self) -> dict:
         value = asdict(self)
@@ -96,6 +97,8 @@ class CapacityHeadroomTracker:
         self._recent_declines: deque[float] = deque(maxlen=3)
         self._previous_decode_tokens: int | None = None
         self._decode_growth: float | None = None
+        self._previous_prefill_tokens: int | None = None
+        self._prefill_growth: float | None = None
 
     @property
     def active(self) -> bool:
@@ -137,6 +140,25 @@ class CapacityHeadroomTracker:
         else:
             self._decode_growth = None
         self._previous_decode_tokens = decode_scheduled_tokens_total
+
+        if (
+            prefill_scheduled_tokens_total is not None
+            and self._previous_prefill_tokens is not None
+            and dt is not None
+            and 0 < dt <= cfg.maximum_observation_gap_s
+            and prefill_scheduled_tokens_total >= self._previous_prefill_tokens
+        ):
+            observed = (
+                prefill_scheduled_tokens_total - self._previous_prefill_tokens
+            ) / dt
+            self._prefill_growth = (
+                observed if self._prefill_growth is None
+                else cfg.ewma_alpha * observed
+                + (1.0 - cfg.ewma_alpha) * self._prefill_growth
+            )
+        else:
+            self._prefill_growth = None
+        self._previous_prefill_tokens = prefill_scheduled_tokens_total
 
         if self._previous_free is not None and self._previous_unix_s is not None:
             assert dt is not None
@@ -208,4 +230,5 @@ class CapacityHeadroomTracker:
             prefill_scheduled_tokens_total=prefill_scheduled_tokens_total,
             decode_scheduled_tokens_total=decode_scheduled_tokens_total,
             decode_growth_tokens_s=self._decode_growth,
+            prefill_growth_tokens_s=self._prefill_growth,
         )

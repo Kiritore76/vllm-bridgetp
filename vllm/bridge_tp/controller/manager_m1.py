@@ -141,6 +141,11 @@ class M1StartController:
                 missing=("source_release_tail_s",),
             )
         growth = snapshot.source_decode_growth_tokens_s
+        prefill_growth = snapshot.source_prefill_growth_tokens_s
+        if prefill_growth is not None:
+            if not math.isfinite(prefill_growth) or prefill_growth < 0:
+                return M1StartDecision("STAY", "prefill growth invalid")
+            growth += prefill_growth
         pending_prefill = snapshot.source_prefill_pending_kv_tokens
         if (
             not math.isfinite(growth) or growth < 0
@@ -153,9 +158,10 @@ class M1StartController:
         prepare_s = history_transfer_s + max(
             cfg.preparation_margin_s, cfg.source_release_tail_s,
         )
+        # Free KV already excludes allocated blocks. Unfinished prefill is
+        # observed demand, not an additional allocation.
         headroom = (
             snapshot.source_free_kv_tokens - snapshot.source_guard_free_kv_tokens
-            - pending_prefill
         )
         time_to_guard = (
             0.0 if headroom <= 0 else
@@ -166,7 +172,11 @@ class M1StartController:
             "estimated_preparation_s": prepare_s,
             "source_time_to_guard_s": time_to_guard,
             "source_safe_headroom_tokens": headroom,
-            "source_capacity_model": "prefill_reservation_plus_decode_growth",
+            "source_capacity_model": (
+                "allocated_kv_plus_scheduled_growth"
+                if prefill_growth is not None
+                else "allocated_kv_plus_decode_growth"
+            ),
             "source_release_tail_s": cfg.source_release_tail_s,
         }
         if headroom <= 0 or time_to_guard <= prepare_s:

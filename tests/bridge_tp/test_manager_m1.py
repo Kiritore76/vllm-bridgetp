@@ -139,13 +139,25 @@ class TestM1Start(unittest.TestCase):
         )
         self.assertEqual(
             decision.source_capacity_model,
-            "prefill_reservation_plus_decode_growth",
+            "allocated_kv_plus_decode_growth",
         )
         reserved = self.decide(replace(
             state, source_prefill_pending_kv_tokens=600,
         ))
-        self.assertEqual(reserved.action, "STAY")
-        self.assertEqual(reserved.source_safe_headroom_tokens, 1240)
+        self.assertEqual(reserved.action, decision.action)
+        self.assertEqual(reserved.source_safe_headroom_tokens, 1840)
+        self.assertEqual(
+            reserved.source_time_to_guard_s, decision.source_time_to_guard_s,
+        )
+
+    def test_prefill_only_has_finite_guard_horizon(self) -> None:
+        state = replace(snapshot(), source_free_kv_tokens=10288,
+                        source_decode_growth_tokens_s=0.0,
+                        source_prefill_growth_tokens_s=100.0)
+        decision = self.decide(state)
+        self.assertAlmostEqual(decision.source_time_to_guard_s, 18.4)
+        self.assertEqual(decision.source_capacity_model,
+                         "allocated_kv_plus_scheduled_growth")
 
     def test_missing_release_calibration_fails_closed(self) -> None:
         controller = M1StartController(M1StartConfig())
