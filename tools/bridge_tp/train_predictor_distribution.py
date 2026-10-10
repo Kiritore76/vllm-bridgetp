@@ -25,6 +25,7 @@ from predictor_distribution import (
     softmax,
 )
 from train_length_predictor import load_examples, read_jsonl, sha256_file
+from predictor_progress import EpochProgress, emit
 
 
 def validation_groups(data: dict) -> tuple[np.ndarray, np.ndarray]:
@@ -169,10 +170,14 @@ def fit_distribution(
     best_nll = float("inf")
     best_epoch = 0
     checkpoint_path = out_dir / "predictor_distribution.pt"
+    training_requests = len(set(data["requests"][train]))
     for epoch in range(1, epochs + 1):
         model.train()
         shuffled = rng.permutation(train_indices)
         epoch_loss = 0.0
+        progress = EpochProgress(
+            epoch, epochs, len(shuffled), batch_size, training_requests
+        )
         for start in range(0, len(shuffled), batch_size):
             indices = shuffled[start : start + batch_size]
             batch = torch.from_numpy(indices).to(device)
@@ -188,6 +193,8 @@ def fit_distribution(
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5)
             optimizer.step()
             epoch_loss += float(loss.detach().cpu()) * len(indices)
+            progress.update(start // batch_size + 1, start + len(indices))
+        emit(f"续训 第{epoch}/{epochs}轮：训练完成，正在验证")
         validation_nll = distribution_nll(
             softmax(logits_for(selection)),
             targets[selection],
@@ -202,6 +209,10 @@ def fit_distribution(
             }
         )
         print(json.dumps(history[-1]), flush=True)
+        emit(
+            f"续训 第{epoch}/{epochs}轮：训练NLL={history[-1]['train_nll']:.4f}，"
+            f"验证NLL={validation_nll:.4f}"
+        )
         if validation_nll < best_nll:
             best_nll, best_epoch = validation_nll, epoch
             torch.save(
@@ -248,6 +259,7 @@ def fit_distribution(
         if epoch - best_epoch >= patience:
             break
 
+    emit(f"训练结束，最佳轮次{best_epoch}，正在校准温度并评估")
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     model.load_state_dict(checkpoint["state_dict"])
     calibration_logits = logits_for(calibration)
@@ -434,6 +446,7 @@ def fit_distribution(
         ),
         flush=True,
     )
+    emit(f"续训完成：最佳第{best_epoch}轮，温度{temperature:.2f}，结果保存到{out_dir}")
     return report
 
 
