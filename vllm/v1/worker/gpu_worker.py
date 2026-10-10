@@ -1136,6 +1136,25 @@ class Worker(WorkerBase):
         self._weight_update_active = False
         self._is_checkpoint_format = True
 
+    def bridge_tp_drain_predictor_diagnostics(self) -> dict[str, int]:
+        """Finish an opted-in live probe after all generation requests complete.
+
+        Returns:
+            Number of saved diagnostic batches after the predictor queue drains.
+
+        Raises:
+            RuntimeError: This worker has no diagnostic live observer.
+        """
+        from vllm.bridge_tp.predictor_capture import PredictorLiveObserver
+
+        observer = self.model_runner.predictor_feature_capture
+        if not isinstance(observer, PredictorLiveObserver) or (
+            observer._diagnostic_dir is None
+        ):
+            raise RuntimeError("predictor drain RPC requires an opted-in live probe")
+        observer.close()
+        return {"probes": observer._diagnostic_count}
+
     def shutdown(self) -> None:
         gc.unfreeze()
 
