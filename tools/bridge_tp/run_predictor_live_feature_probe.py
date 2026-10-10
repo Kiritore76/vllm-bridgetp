@@ -9,13 +9,15 @@ from pathlib import Path
 from run_predictor_capture import load_requests
 
 
-def drain_observer(worker):
-    """Drain the prediction queue before the controller reads diagnostic files."""
-    observer = worker.model_runner.predictor_feature_capture
-    if observer is None or observer.__class__.__name__ != "PredictorLiveObserver":
-        raise ValueError("live observer missing")
-    observer.close()
-    return {"probes": observer._diagnostic_count}
+def finish_probe(llm):
+    """Drain using a named RPC, then shut down even if the diagnostic fails."""
+    try:
+        drained = llm.collective_rpc(
+            "bridge_tp_drain_predictor_diagnostics", timeout=60
+        )
+        print(json.dumps({"drain": drained}), flush=True)
+    finally:
+        llm.llm_engine.engine_core.shutdown()
 
 
 def main():
@@ -83,8 +85,7 @@ def main():
     (args.out_dir / "labels.jsonl").write_text(
         "".join(json.dumps(r) + "\n" for r in labels), encoding="utf-8"
     )
-    print(json.dumps({"drain": llm.collective_rpc(drain_observer)}), flush=True)
-    llm.llm_engine.engine_core.shutdown()
+    finish_probe(llm)
 
 
 if __name__ == "__main__":

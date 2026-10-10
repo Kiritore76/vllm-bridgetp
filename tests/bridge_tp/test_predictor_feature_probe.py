@@ -1,10 +1,13 @@
 """Test paired feature diagnostics and actual-length coverage accounting."""
 
+import ast
 import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
@@ -13,9 +16,68 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools/bridge_tp"))
 from build_predictor_long_pilot import inputs
 from compare_predictor_feature_paths import compare
 from summarize_predictor_long_pilot import summarize
+from run_predictor_live_feature_probe import finish_probe
 
 
 class ProbeTests(unittest.TestCase):
+    def test_named_rpc_routes_to_drain_without_function_serialization(self):
+        from tests.bridge_tp.test_predictor_capture import capture
+
+        # Isolate the GPU worker method for CPU testing; run its actual body.
+        root = Path(__file__).resolve().parents[2]
+        tree = ast.parse((root / "vllm/v1/worker/gpu_worker.py").read_text())
+        worker = next(
+            n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Worker"
+        )
+        method = next(
+            n
+            for n in worker.body
+            if isinstance(n, ast.FunctionDef)
+            and n.name == "bridge_tp_drain_predictor_diagnostics"
+        )
+        namespace = {}
+        exec(
+            compile(ast.Module(body=[method], type_ignores=[]), str(root), "exec"),
+            namespace,
+        )
+        observer = capture.PredictorLiveObserver.__new__(capture.PredictorLiveObserver)
+        observer._diagnostic_dir = Path("diagnostic")
+        observer._diagnostic_count = 40
+        observer.close = Mock()
+        fake_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(predictor_feature_capture=observer)
+        )
+        drained = namespace[method.name]
+
+        def rpc(name, timeout):
+            # JSON has the same primitive-only property needed by default RPC.
+            name, timeout = json.loads(json.dumps([name, timeout]))
+            self.assertEqual(name, method.name)
+            return [drained(fake_worker)]
+
+        shutdown = Mock()
+        llm = SimpleNamespace(
+            collective_rpc=rpc,
+            llm_engine=SimpleNamespace(engine_core=SimpleNamespace(shutdown=shutdown)),
+        )
+        with patch.dict(sys.modules, {"vllm.bridge_tp.predictor_capture": capture}):
+            finish_probe(llm)
+            observer.close.assert_called_once()
+            shutdown.assert_called_once()
+            observer._diagnostic_dir = None
+            with self.assertRaises(RuntimeError):
+                drained(fake_worker)
+
+    def test_rpc_failure_still_shuts_down_engine(self):
+        shutdown = Mock()
+        llm = SimpleNamespace(
+            collective_rpc=Mock(side_effect=RuntimeError("worker failed")),
+            llm_engine=SimpleNamespace(engine_core=SimpleNamespace(shutdown=shutdown)),
+        )
+        with self.assertRaisesRegex(RuntimeError, "worker failed"):
+            finish_probe(llm)
+        shutdown.assert_called_once()
+
     def test_paired_features_and_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
