@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 
 from run_predictor_capture import load_requests
+from predictor_progress import RequestProgress, emit
 
 
 def finish_probe(llm):
@@ -50,6 +51,7 @@ def main():
     )
     from vllm import LLM, SamplingParams
 
+    emit("正在加载在线特征对照模型")
     llm = LLM(
         model=args.model,
         tensor_parallel_size=1,
@@ -62,15 +64,19 @@ def main():
     )
     tokenizer = llm.get_tokenizer()
     labels = []
-    for row in requests:
+    for number, row in enumerate(requests, 1):
         prompt = tokenizer.apply_chat_template(
             row["messages"], tokenize=False, add_generation_prompt=True
         )
-        result = llm.generate(
-            [prompt],
-            SamplingParams(max_tokens=384, temperature=0, ignore_eos=False),
-            use_tqdm=False,
-        )[0]
+        with RequestProgress(number, len(requests), label="在线特征对照") as progress:
+            result = llm.generate(
+                [prompt],
+                SamplingParams(max_tokens=384, temperature=0, ignore_eos=False),
+                use_tqdm=False,
+            )[0]
+            progress.finish(
+                len(result.outputs[0].token_ids), result.outputs[0].finish_reason
+            )
         completion = result.outputs[0]
         labels.append(
             {

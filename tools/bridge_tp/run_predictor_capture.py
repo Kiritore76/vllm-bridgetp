@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from predictor_progress import RequestProgress, emit
 
 _INTERNAL_ID_SUFFIX = re.compile(r"[0-9a-fA-F]{8}")
 
@@ -291,6 +292,7 @@ def main() -> None:
 
     from vllm import LLM, SamplingParams
 
+    emit("正在加载模型和初始化采集引擎")
     llm = LLM(
         model=args.model,
         tensor_parallel_size=1,
@@ -302,6 +304,7 @@ def main() -> None:
         max_num_seqs=1,
     )
     tokenizer = llm.get_tokenizer()
+    emit(f"模型就绪，准备采集{len(requests)}条请求")
     sampling = SamplingParams(
         max_tokens=args.max_tokens,
         ignore_eos=False,
@@ -311,11 +314,6 @@ def main() -> None:
     label_path = args.out_dir / "labels.jsonl"
     with label_path.open("w", encoding="utf-8") as handle:
         for request_number, row in enumerate(requests, 1):
-            if request_number == 1 or request_number % 10 == 0:
-                print(
-                    f"capture request {request_number}/{len(requests)} id={row['id']}",
-                    flush=True,
-                )
             prompt = (
                 row["prompt"]
                 if "prompt" in row
@@ -330,8 +328,12 @@ def main() -> None:
                     f"plus {args.max_tokens} output tokens, exceeding "
                     f"max-model-len {args.max_model_len}"
                 )
-            result = llm.generate([prompt], sampling, use_tqdm=False)[0]
-            completion = result.outputs[0]
+            with RequestProgress(
+                request_number, len(requests), features=features
+            ) as progress:
+                result = llm.generate([prompt], sampling, use_tqdm=False)[0]
+                completion = result.outputs[0]
+                progress.finish(len(completion.token_ids), completion.finish_reason)
             label = {
                 "input_id": row["id"],
                 "split": row.get("split"),
@@ -353,6 +355,7 @@ def main() -> None:
             labels[result.request_id] = label
             handle.write(json.dumps(label, ensure_ascii=False) + "\n")
             handle.flush()
+    emit("请求采集完成，正在核对特征与标签")
     if args.feature_layers:
         summaries = {}
         first_index_sha = None

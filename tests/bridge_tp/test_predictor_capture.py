@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "tools/bridge_tp"))
 
 
 def load_module(name: str, path: Path):
