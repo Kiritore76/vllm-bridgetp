@@ -30,12 +30,16 @@ from predictor_progress import EpochProgress, emit
 from train_length_predictor import load_examples, read_jsonl, sha256_file
 
 
-def validation_groups(data: dict) -> tuple[np.ndarray, np.ndarray]:
+def validation_groups(
+    data: dict, allowed_ids: set[str] | None = None
+) -> tuple[np.ndarray, np.ndarray]:
     """Separate model selection and calibration at the request-tree level."""
     validation = {
         label["input_id"]: label["source_tree_id"]
         for label in data["labels"]
-        if label["split"] == "validation" and label["natural_finish"]
+        if label["split"] == "validation"
+        and label["natural_finish"]
+        and (allowed_ids is None or label["input_id"] in allowed_ids)
     }
     ranked = sorted(
         set(validation.values()),
@@ -74,6 +78,10 @@ def fit_distribution(
     bucket_profile: str = "parent",
     head_warmup_epochs: int = 0,
     head_learning_rate: float = 0.0003,
+    training_weights: np.ndarray | None = None,
+    weighting_provenance: dict | None = None,
+    validation_ids: set[str] | None = None,
+    diagnostic_groups: dict[str, np.ndarray] | None = None,
 ) -> dict:
     """Fit on train, select on one validation half, calibrate on the other."""
     import torch
@@ -95,7 +103,7 @@ def fit_distribution(
     rng = np.random.default_rng(seed)
     device = torch.device(device_name)
     train = data["splits"] == "train"
-    selection, calibration = validation_groups(data)
+    selection, calibration = validation_groups(data, validation_ids)
     test = (data["splits"] == "test") & ~data["censored"]
     parent = None
     original_parent = None
@@ -128,6 +136,19 @@ def fit_distribution(
         else default_upper_edges(preflight["max_tokens"], bin_step)
     )
     targets = category_targets(data["remaining"], edges)
+    weight = np.zeros(len(targets), dtype=np.float64)
+    if training_weights is None:
+        weight[train] = request_weights(data["requests"][train])
+    else:
+        weight = np.asarray(training_weights, dtype=np.float64)
+        if (
+            weight.shape != targets.shape
+            or not np.isfinite(weight).all()
+            or (weight[train] <= 0).any()
+            or (weight[~train] != 0).any()
+            or not np.isclose(weight.sum(), 1)
+        ):
+            raise ValueError("invalid train-only normalized sample weights")
     hidden = data["hidden"].astype(np.float32)
     feature_mean = (
         parent["feature_mean"].numpy() if parent else hidden[train].mean(axis=0)
@@ -160,7 +181,7 @@ def fit_distribution(
     prior = (
         np.bincount(
             targets[exact_train],
-            weights=request_weights(data["requests"][exact_train]),
+            weights=weight[exact_train] / weight[exact_train].sum(),
             minlength=len(edges) + 1,
         )
         + 0.001
@@ -178,9 +199,7 @@ def fit_distribution(
         model.parameters(), lr=learning_rate, weight_decay=weight_decay
     )
     train_indices = np.flatnonzero(train)
-    weight = np.zeros(len(features), dtype=np.float32)
-    weight[train] = request_weights(data["requests"][train]) * train.sum()
-    weights = torch.from_numpy(weight).to(device)
+    weights = torch.from_numpy((weight * train.sum()).astype(np.float32)).to(device)
 
     def logits_for(mask, evaluated_model=None):
         evaluated_model = model if evaluated_model is None else evaluated_model
@@ -388,6 +407,12 @@ def fit_distribution(
         "calibration_validation": calibration,
         "test": test,
     }
+    for name, mask in (diagnostic_groups or {}).items():
+        if name in groups or np.asarray(mask).shape != test.shape:
+            raise ValueError("invalid diagnostic group")
+        mask = np.asarray(mask, dtype=bool) & ~data["censored"]
+        if mask.any():
+            groups[name] = mask
     if known_test_ids:
         known = np.isin(data["requests"], sorted(known_test_ids))
         if (test & known).any():
@@ -487,6 +512,20 @@ def fit_distribution(
                         data["requests"][subset],
                     ),
                 }
+                from predictor_training_mix import length_metrics
+
+                stage_results[label]["parent_length"] = length_metrics(
+                    old_p[subset],
+                    old_edges,
+                    data["remaining"][subset],
+                    data["requests"][subset],
+                )
+                stage_results[label]["new_length"] = length_metrics(
+                    calibrated_p[subset],
+                    edges,
+                    data["remaining"][subset],
+                    data["requests"][subset],
+                )
             common_comparison["progress_by_split"][name] = stage_results
         del old_model, old_p, old_common, new_common
     stratified = {}
@@ -540,6 +579,10 @@ def fit_distribution(
         "temperature": temperature,
         "calibration_curve": calibration_curve,
         "metric_weighting": "each request has equal total sample weight",
+        "training_weighting": weighting_provenance or {"rule": "request equal"},
+        "validation_scope": "primary new requests only"
+        if validation_ids is not None
+        else "all validation trees",
         "previous_stage_test_request_ids": sorted(known_test_ids or set()),
         "horizon_note": "capacity-exceedance probability, not physical CUDA OOM",
         "results": results,
