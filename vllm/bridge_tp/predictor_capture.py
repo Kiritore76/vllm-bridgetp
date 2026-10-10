@@ -304,6 +304,16 @@ class PredictorLiveObserver(PredictorFeatureCapture):
             feature_layer="decoder:31",
             device=device,
         )
+        diagnostic = os.environ.get("BRIDGETP_PREDICTOR_DIAGNOSTIC_DIR")
+        self._diagnostic_dir = Path(diagnostic) if diagnostic else None
+        self._diagnostic_limit = int(
+            os.environ.get("BRIDGETP_PREDICTOR_DIAGNOSTIC_LIMIT", "32")
+        )
+        self._diagnostic_count = 0
+        if self._diagnostic_dir:
+            if self._diagnostic_limit <= 0:
+                raise ValueError("diagnostic limit must be positive")
+            self._diagnostic_dir.mkdir(parents=True, exist_ok=True)
         self.feature_layer = "decoder:31"
         self.layer_index = 31
         self._intermediate_states = None
@@ -453,6 +463,29 @@ class PredictorLiveObserver(PredictorFeatureCapture):
                             done.record(self._compute_stream)
                         done.synchronize()
                 self._publish(rows, host.tolist(), captured_unix_ns)
+                if (
+                    self._diagnostic_dir
+                    and self._diagnostic_count < self._diagnostic_limit
+                ):
+                    self._diagnostic_count += 1
+                    # Worker only; optional diagnostic perturbation, not benefit data.
+                    if self._compute_stream is not None:
+                        with torch.cuda.stream(self._compute_stream):
+                            feature = snapshot.to(torch.float16).cpu()
+                    else:
+                        feature = snapshot.to(torch.float16).cpu()
+                    torch.save(
+                        {
+                            "hidden_fp16": feature,
+                            "generated_tokens": counts.cpu(),
+                            "probabilities": host,
+                            "request_ids": [row.request_id for row in rows],
+                            "captured_unix_ns": captured_unix_ns,
+                            "checkpoint_sha256": self.predictor.checkpoint_sha256,
+                        },
+                        self._diagnostic_dir
+                        / f"probe-{os.getpid()}-{self._diagnostic_count:04d}.pt",
+                    )
             except BaseException as exc:
                 self._worker_error = exc
                 return

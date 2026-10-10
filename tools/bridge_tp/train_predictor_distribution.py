@@ -65,6 +65,9 @@ def fit_distribution(
     seed: int = 42,
     bin_step: int = 32,
     known_test_ids: set[str] | None = None,
+    warmstart_checkpoint: Path | None = None,
+    warmstart_sha256: str | None = None,
+    tail_edges: list[int] | None = None,
 ) -> dict:
     """Fit on train, select on one validation half, calibrate on the other."""
     import torch
@@ -83,12 +86,36 @@ def fit_distribution(
     train = data["splits"] == "train"
     selection, calibration = validation_groups(data)
     test = (data["splits"] == "test") & ~data["censored"]
-    edges = default_upper_edges(preflight["max_tokens"], bin_step)
+    parent = None
+    if warmstart_checkpoint:
+        from predictor_warmstart import expand_tail, load_warmstart
+
+        parent = load_warmstart(
+            warmstart_checkpoint, warmstart_sha256, preflight, data["hidden"].shape[1]
+        )
+        if hidden_width != parent["hidden_width"]:
+            raise ValueError("warmstart hidden width differs")
+        parent = expand_tail(parent, tail_edges or [])
+    elif tail_edges:
+        raise ValueError("tail extension requires warmstart")
+    edges = (
+        parent["category_upper_edges"].numpy()
+        if parent
+        else default_upper_edges(preflight["max_tokens"], bin_step)
+    )
     targets = category_targets(data["remaining"], edges)
     hidden = data["hidden"].astype(np.float32)
-    feature_mean = hidden[train].mean(axis=0)
-    feature_std = hidden[train].std(axis=0).clip(min=1e-4)
-    position_scale = math.log1p(preflight["max_tokens"])
+    feature_mean = (
+        parent["feature_mean"].numpy() if parent else hidden[train].mean(axis=0)
+    )
+    feature_std = (
+        parent["feature_std"].numpy()
+        if parent
+        else hidden[train].std(axis=0).clip(min=1e-4)
+    )
+    position_scale = (
+        parent["position_log_scale"] if parent else math.log1p(preflight["max_tokens"])
+    )
     features = np.column_stack(
         (
             (hidden - feature_mean) / feature_std,
@@ -117,6 +144,8 @@ def fit_distribution(
     prior /= prior.sum()
     with torch.no_grad():
         model[-1].bias.copy_(torch.from_numpy(np.log(prior)).to(device))
+    if parent:
+        model.load_state_dict(parent["state_dict"], strict=True)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=learning_rate, weight_decay=weight_decay
     )
@@ -177,6 +206,16 @@ def fit_distribution(
             best_nll, best_epoch = validation_nll, epoch
             torch.save(
                 {
+                    "warmstart_provenance": {
+                        "parent_sha256": warmstart_sha256,
+                        "tail_edges": tail_edges or [],
+                        "feature_normalization": "parent"
+                        if parent
+                        else "new train split",
+                        "optimizer": "new AdamW, not optimizer resume",
+                        "parent_temperature": parent["temperature"] if parent else None,
+                        "tail_initialization": "equal split preserving parent calibrated sums",
+                    },
                     "format_version": 2,
                     "model_type": "remaining_length_categorical",
                     "state_dict": {
@@ -233,7 +272,22 @@ def fit_distribution(
     raw_p = softmax(all_logits)
     horizons = [
         int(h)
-        for h in (32, 64, 128, 256, 512, 768, 1024, 1536, 2048, 3072, 4096)
+        for h in (
+            32,
+            64,
+            128,
+            256,
+            512,
+            768,
+            1024,
+            1536,
+            2048,
+            3072,
+            4096,
+            8192,
+            12288,
+            16384,
+        )
         if h in edges
     ]
     train_labels = [label for label in data["labels"] if label["split"] == "train"]
@@ -351,6 +405,7 @@ def fit_distribution(
         "validation_stratified": validation_stratified,
         "history": history,
         "checkpoint_sha256": sha256_file(checkpoint_path),
+        "warmstart_provenance": checkpoint["warmstart_provenance"],
     }
     (out_dir / "report.json").write_text(
         json.dumps(report, indent=2) + "\n", encoding="utf-8"
@@ -401,6 +456,12 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--bin-step", type=int, default=32)
     parser.add_argument("--known-test-input", type=Path)
+    parser.add_argument("--replay-run-dir", type=Path)
+    parser.add_argument("--expected-replay-input-sha256")
+    parser.add_argument("--warmstart-checkpoint", type=Path)
+    parser.add_argument("--warmstart-sha256")
+    parser.add_argument("--tail-edges", nargs="+", type=int)
+
     parser.add_argument("--expected-feature-layer", default="final")
     args = parser.parse_args()
     if (
@@ -421,6 +482,10 @@ def main() -> None:
         or args.weight_decay < 0
     ):
         parser.error("training dimensions and learning-rate must be positive")
+    if bool(args.warmstart_checkpoint) != bool(args.warmstart_sha256):
+        parser.error("warmstart checkpoint and SHA must be provided together")
+    if args.tail_edges and not args.warmstart_checkpoint:
+        parser.error("tail edges require warmstart checkpoint")
     if args.out_dir.exists() and any(args.out_dir.iterdir()):
         parser.error("out-dir must be new or empty")
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
@@ -457,9 +522,28 @@ def main() -> None:
     ):
         parser.error(f"GPU inventory differs: {names}")
     data = load_examples(args.run_dir, include_censored=True)
+    replay_meta = None
     known_test_ids = set()
+    if args.replay_run_dir:
+        from predictor_warmstart import merge_captures
+
+        replay_meta = json.loads((args.replay_run_dir / "preflight.json").read_text())
+        if not args.expected_replay_input_sha256:
+            parser.error("replay input SHA256 is required")
+        if (
+            sha256_file(args.replay_run_dir / "input_requests.jsonl")
+            != args.expected_replay_input_sha256
+            or replay_meta["input_sha256"] != args.expected_replay_input_sha256
+        ):
+            parser.error("replay input SHA256 differs")
+        for key in ["feature_layer", "feature_semantics", "model_config_sha256"]:
+            if replay_meta.get(key) != preflight.get(key):
+                parser.error(f"replay {key} differs")
+        replay_data = load_examples(args.replay_run_dir, include_censored=True)
+        known_test_ids.update(replay_data["requests"][replay_data["splits"] == "test"])
+        data = merge_captures(data, replay_data)
     if args.known_test_input:
-        known_test_ids = {
+        known_test_ids |= {
             row["id"]
             for row in read_jsonl(args.known_test_input)
             if row.get("split") == "test"
@@ -482,6 +566,7 @@ def main() -> None:
     training_preflight = {
         "hostname": socket.gethostname(),
         "training_revision": revision,
+        "replay_capture": replay_meta,
         "capture_dir": str(args.run_dir.resolve()),
         "capture_revision": preflight["revision"],
         "input_sha256": preflight["input_sha256"],
@@ -513,6 +598,9 @@ def main() -> None:
         seed=args.seed,
         bin_step=args.bin_step,
         known_test_ids=known_test_ids,
+        warmstart_checkpoint=args.warmstart_checkpoint,
+        warmstart_sha256=args.warmstart_sha256,
+        tail_edges=args.tail_edges,
     )
 
 
