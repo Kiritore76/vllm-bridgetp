@@ -204,6 +204,11 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--feature-layer", default="final")
+    parser.add_argument(
+        "--save-token-ids",
+        action="store_true",
+        help="diagnostic only: retain output IDs for paired replay",
+    )
     parser.add_argument("--feature-layers", help="paired probe, e.g. decoder:31,mlp:31")
     args = parser.parse_args()
     if args.interval <= 0 or args.max_tokens <= 0 or args.max_model_len <= 0:
@@ -276,6 +281,7 @@ def main() -> None:
         "num_hidden_layers": config.get("num_hidden_layers"),
         "feature_layers": layers,
         "requests": len(requests),
+        "max_num_seqs": 1,
     }
     (args.out_dir / "preflight.json").write_text(
         json.dumps(preflight, indent=2, ensure_ascii=False) + "\n",
@@ -293,6 +299,7 @@ def main() -> None:
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enable_prefix_caching=False,
+        max_num_seqs=1,
     )
     tokenizer = llm.get_tokenizer()
     sampling = SamplingParams(
@@ -339,6 +346,8 @@ def main() -> None:
                 "natural_finish": completion.finish_reason == "stop",
                 "max_tokens": args.max_tokens,
             }
+            if args.save_token_ids:
+                label["output_token_ids"] = list(completion.token_ids)
             if result.request_id in labels:
                 raise RuntimeError(f"reused engine request id: {result.request_id}")
             labels[result.request_id] = label
