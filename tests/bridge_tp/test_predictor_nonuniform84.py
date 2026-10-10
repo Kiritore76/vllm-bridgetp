@@ -164,11 +164,21 @@ class Nonuniform84Tests(unittest.TestCase):
                 warmstart_sha256=sha,
                 bucket_profile="nonuniform84",
                 head_warmup_epochs=1,
+                training_weights=np.array([0.1, 0.1, 0.4, 0.4] + [0] * 6),
+                validation_ids={"r4", "r5"},
+                diagnostic_groups={"held_out_old": splits == "test"},
             )
             self.assertEqual(
                 [r["phase"] for r in report["history"]], ["head_only", "joint"]
             )
             self.assertEqual(report["common_bucket_comparison"]["categories"], 76)
+            self.assertEqual(report["validation_scope"], "primary new requests only")
+            self.assertEqual(
+                set(report["selection_validation_request_ids"])
+                | set(report["calibration_validation_request_ids"]),
+                {"r4", "r5"},
+            )
+            self.assertIn("held_out_old", report["results"])
             saved = torch.load(out / "predictor_distribution.pt", weights_only=True)
             self.assertEqual(saved["state_dict"]["3.weight"].shape, (84, 4))
             for key in ("feature_mean", "feature_std"):
