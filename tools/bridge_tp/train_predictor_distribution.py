@@ -15,17 +15,19 @@ from pathlib import Path
 
 import numpy as np
 from predictor_distribution import (
+    aggregate_probabilities,
     binary_risk_metrics,
     category_targets,
     default_upper_edges,
     distribution_nll,
     km_conditional_survival,
+    nonuniform84_upper_edges,
     probability_remaining_gt,
     request_weights,
     softmax,
 )
-from train_length_predictor import load_examples, read_jsonl, sha256_file
 from predictor_progress import EpochProgress, emit
+from train_length_predictor import load_examples, read_jsonl, sha256_file
 
 
 def validation_groups(data: dict) -> tuple[np.ndarray, np.ndarray]:
@@ -69,9 +71,13 @@ def fit_distribution(
     warmstart_checkpoint: Path | None = None,
     warmstart_sha256: str | None = None,
     tail_edges: list[int] | None = None,
+    bucket_profile: str = "parent",
+    head_warmup_epochs: int = 0,
+    head_learning_rate: float = 0.0003,
 ) -> dict:
     """Fit on train, select on one validation half, calibrate on the other."""
     import torch
+    from predictor_warmstart import configure_training_phase
     from torch import nn
 
     if (
@@ -79,6 +85,10 @@ def fit_distribution(
         or not 0 <= dropout < 1
         or not math.isfinite(weight_decay)
         or weight_decay < 0
+        or bucket_profile not in ("parent", "nonuniform84")
+        or not 0 <= head_warmup_epochs < epochs
+        or not math.isfinite(head_learning_rate)
+        or head_learning_rate <= 0
     ):
         raise ValueError("dropout must be in [0, 1); weight decay must be nonnegative")
     torch.manual_seed(seed)
@@ -88,17 +98,30 @@ def fit_distribution(
     selection, calibration = validation_groups(data)
     test = (data["splits"] == "test") & ~data["censored"]
     parent = None
+    original_parent = None
+    parent_temperature = None
+    parent_categories = None
     if warmstart_checkpoint:
-        from predictor_warmstart import expand_tail, load_warmstart
+        from predictor_warmstart import expand_tail, load_warmstart, rebuild_output_head
 
         parent = load_warmstart(
             warmstart_checkpoint, warmstart_sha256, preflight, data["hidden"].shape[1]
         )
         if hidden_width != parent["hidden_width"]:
             raise ValueError("warmstart hidden width differs")
-        parent = expand_tail(parent, tail_edges or [])
+        parent_temperature = parent["temperature"]
+        parent_categories = len(parent["category_upper_edges"]) + 1
+        original_parent = parent
+        if bucket_profile == "nonuniform84":
+            if tail_edges or head_warmup_epochs < 1:
+                raise ValueError("84 categories need head warmup, without tail-edges")
+            parent = rebuild_output_head(parent, nonuniform84_upper_edges(), seed)
+        else:
+            parent = expand_tail(parent, tail_edges or [])
     elif tail_edges:
         raise ValueError("tail extension requires warmstart")
+    elif bucket_profile != "parent" or head_warmup_epochs:
+        raise ValueError("category replacement and head warmup require warmstart")
     edges = (
         parent["category_upper_edges"].numpy()
         if parent
@@ -147,6 +170,10 @@ def fit_distribution(
         model[-1].bias.copy_(torch.from_numpy(np.log(prior)).to(device))
     if parent:
         model.load_state_dict(parent["state_dict"], strict=True)
+        if bucket_profile == "nonuniform84":
+            # Train-only priors; parent temperature cannot calibrate a new head.
+            with torch.no_grad():
+                model[-1].bias.copy_(torch.from_numpy(np.log(prior)).to(device))
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=learning_rate, weight_decay=weight_decay
     )
@@ -155,14 +182,15 @@ def fit_distribution(
     weight[train] = request_weights(data["requests"][train]) * train.sum()
     weights = torch.from_numpy(weight).to(device)
 
-    def logits_for(mask):
-        model.eval()
+    def logits_for(mask, evaluated_model=None):
+        evaluated_model = model if evaluated_model is None else evaluated_model
+        evaluated_model.eval()
         indices = np.flatnonzero(mask)
         outputs = []
         with torch.no_grad():
             for start in range(0, len(indices), batch_size):
                 batch = torch.from_numpy(indices[start : start + batch_size]).to(device)
-                outputs.append(model(x[batch]).cpu().numpy())
+                outputs.append(evaluated_model(x[batch]).cpu().numpy())
         return np.concatenate(outputs)
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -172,6 +200,18 @@ def fit_distribution(
     checkpoint_path = out_dir / "predictor_distribution.pt"
     training_requests = len(set(data["requests"][train]))
     for epoch in range(1, epochs + 1):
+        head_only = epoch <= head_warmup_epochs
+        configure_training_phase(
+            model,
+            optimizer,
+            head_only=head_only,
+            head_learning_rate=head_learning_rate,
+            learning_rate=learning_rate,
+        )
+        emit(
+            f"训练阶段：{'仅新分类层' if head_only else '整个小预测器'}，"
+            f"学习率{optimizer.param_groups[0]['lr']:g}"
+        )
         model.train()
         shuffled = rng.permutation(train_indices)
         epoch_loss = 0.0
@@ -206,6 +246,8 @@ def fit_distribution(
                 "epoch": epoch,
                 "train_nll": epoch_loss / len(shuffled),
                 "selection_validation_nll": validation_nll,
+                "phase": "head_only" if head_only else "joint",
+                "learning_rate": optimizer.param_groups[0]["lr"],
             }
         )
         print(json.dumps(history[-1]), flush=True)
@@ -224,8 +266,16 @@ def fit_distribution(
                         if parent
                         else "new train split",
                         "optimizer": "new AdamW, not optimizer resume",
-                        "parent_temperature": parent["temperature"] if parent else None,
-                        "tail_initialization": "equal split preserving parent calibrated sums",
+                        "parent_temperature": parent_temperature,
+                        "parent_categories": parent_categories,
+                        "bucket_profile": bucket_profile,
+                        "head_warmup_epochs": head_warmup_epochs,
+                        "head_initialization": "seeded weights, train-only prior bias"
+                        if bucket_profile == "nonuniform84"
+                        else "parent head",
+                        "tail_initialization": "not used for new classifier"
+                        if bucket_profile == "nonuniform84"
+                        else "equal split preserving parent calibrated sums",
                     },
                     "format_version": 2,
                     "model_type": "remaining_length_categorical",
@@ -256,7 +306,7 @@ def fit_distribution(
                 },
                 checkpoint_path,
             )
-        if epoch - best_epoch >= patience:
+        if epoch > head_warmup_epochs and epoch - best_epoch >= patience:
             break
 
     emit(f"训练结束，最佳轮次{best_epoch}，正在校准温度并评估")
@@ -362,6 +412,83 @@ def fit_distribution(
             ),
             "risk_by_horizon_tokens": risk_report(mask),
         }
+    common_comparison = None
+    if bucket_profile == "nonuniform84":
+        old_edges = original_parent["category_upper_edges"].numpy()
+        common_edges = edges[np.isin(edges, old_edges)]
+        old_model = nn.Sequential(
+            nn.Linear(features.shape[1], hidden_width),
+            nn.GELU(),
+            nn.Dropout(float(original_parent["dropout"])),
+            nn.Linear(hidden_width, len(old_edges) + 1),
+        ).to(device)
+        old_model.load_state_dict(original_parent["state_dict"], strict=True)
+        old_p = softmax(
+            logits_for(np.ones(len(features), dtype=bool), old_model),
+            parent_temperature,
+        )
+        old_common = aggregate_probabilities(old_p, old_edges, common_edges)
+        new_common = aggregate_probabilities(calibrated_p, edges, common_edges)
+        common_targets = category_targets(data["remaining"], common_edges)
+        common_comparison = {
+            "category_upper_edges": common_edges.tolist(),
+            "categories": len(common_edges) + 1,
+            "tail_note": "common open tail; parent cannot split new high-tail bins",
+            "results": {},
+            "progress_by_split": {},
+        }
+        total_length = data["generated"] + data["remaining"]
+        fraction = np.divide(
+            data["generated"],
+            total_length,
+            out=np.zeros(len(total_length), dtype=np.float64),
+            where=total_length > 0,
+        )
+        stage = np.minimum((fraction * 4).astype(int), 3)
+        for name, mask in groups.items():
+            common_comparison["results"][name] = {
+                "parent_nll": distribution_nll(
+                    old_common[mask],
+                    common_targets[mask],
+                    data["censored"][mask],
+                    data["requests"][mask],
+                ),
+                "new_nll": distribution_nll(
+                    new_common[mask],
+                    common_targets[mask],
+                    data["censored"][mask],
+                    data["requests"][mask],
+                ),
+            }
+            stage_results = {}
+            for index, label in enumerate(("0-25%", "25-50%", "50-75%", "75-100%")):
+                subset = mask & ~data["censored"] & (stage == index)
+                if not subset.any():
+                    continue
+                stage_results[label] = {
+                    "requests": len(set(data["requests"][subset])),
+                    "samples": int(subset.sum()),
+                    "parent_common_nll": distribution_nll(
+                        old_common[subset],
+                        common_targets[subset],
+                        data["censored"][subset],
+                        data["requests"][subset],
+                    ),
+                    "new_common_nll": distribution_nll(
+                        new_common[subset],
+                        common_targets[subset],
+                        data["censored"][subset],
+                        data["requests"][subset],
+                    ),
+                    "new84_true_bucket_nll": distribution_nll(
+                        calibrated_p[subset],
+                        targets[subset],
+                        data["censored"][subset],
+                        data["requests"][subset],
+                    ),
+                }
+            common_comparison["progress_by_split"][name] = stage_results
+        del old_model, old_p, old_common, new_common
     stratified = {}
     for field in ("phases", "languages"):
         for value in sorted(set(data[field][test])):
@@ -395,6 +522,9 @@ def fit_distribution(
             "dropout": dropout,
             "weight_decay": weight_decay,
             "parameter_count": sum(p.numel() for p in model.parameters()),
+            "bucket_profile": bucket_profile,
+            "head_warmup_epochs": head_warmup_epochs,
+            "head_learning_rate": head_learning_rate,
         },
         "device": str(device),
         "category_upper_edges": edges.tolist(),
@@ -418,6 +548,7 @@ def fit_distribution(
         "history": history,
         "checkpoint_sha256": sha256_file(checkpoint_path),
         "warmstart_provenance": checkpoint["warmstart_provenance"],
+        "common_bucket_comparison": common_comparison,
     }
     (out_dir / "report.json").write_text(
         json.dumps(report, indent=2) + "\n", encoding="utf-8"
@@ -452,7 +583,9 @@ def fit_distribution(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run-dir", type=Path, required=True)
+    capture_input = parser.add_mutually_exclusive_group(required=True)
+    capture_input.add_argument("--run-dir", type=Path)
+    capture_input.add_argument("--collection-batch", type=Path)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--expected-revision", required=True)
     parser.add_argument("--expected-capture-revision", required=True)
@@ -469,11 +602,19 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--bin-step", type=int, default=32)
     parser.add_argument("--known-test-input", type=Path)
-    parser.add_argument("--replay-run-dir", type=Path)
+    replay_input = parser.add_mutually_exclusive_group()
+    replay_input.add_argument("--replay-run-dir", type=Path)
+    replay_input.add_argument("--replay-collection-batch", type=Path)
     parser.add_argument("--expected-replay-input-sha256")
+    parser.add_argument("--expected-replay-capture-revision")
     parser.add_argument("--warmstart-checkpoint", type=Path)
     parser.add_argument("--warmstart-sha256")
     parser.add_argument("--tail-edges", nargs="+", type=int)
+    parser.add_argument(
+        "--bucket-profile", choices=("parent", "nonuniform84"), default="parent"
+    )
+    parser.add_argument("--head-warmup-epochs", type=int, default=0)
+    parser.add_argument("--head-learning-rate", type=float, default=0.0003)
 
     parser.add_argument("--expected-feature-layer", default="final")
     args = parser.parse_args()
@@ -493,12 +634,22 @@ def main() -> None:
         or not 0 <= args.dropout < 1
         or not math.isfinite(args.weight_decay)
         or args.weight_decay < 0
+        or not math.isfinite(args.head_learning_rate)
+        or args.head_learning_rate <= 0
     ):
         parser.error("training dimensions and learning-rate must be positive")
     if bool(args.warmstart_checkpoint) != bool(args.warmstart_sha256):
         parser.error("warmstart checkpoint and SHA must be provided together")
     if args.tail_edges and not args.warmstart_checkpoint:
         parser.error("tail edges require warmstart checkpoint")
+    if args.bucket_profile == "nonuniform84" and (
+        not args.warmstart_checkpoint or args.tail_edges or args.head_warmup_epochs < 1
+    ):
+        parser.error(
+            "84 categories require warmstart and head warmup, without tail-edges"
+        )
+    if not 0 <= args.head_warmup_epochs < args.epochs:
+        parser.error("head warmup must leave at least one joint-training epoch")
     if args.out_dir.exists() and any(args.out_dir.iterdir()):
         parser.error("out-dir must be new or empty")
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
@@ -506,9 +657,27 @@ def main() -> None:
         parser.error("HEAD differs from expected revision")
     if subprocess.check_output(["git", "status", "--porcelain"], text=True).strip():
         parser.error("worktree has uncommitted files")
-    preflight = json.loads(
-        (args.run_dir / "preflight.json").read_text(encoding="utf-8")
-    )
+    data = None
+    capture_dir = args.run_dir or args.collection_batch
+    if args.collection_batch:
+        from predictor_collection_training import load_collection_examples
+
+        data, preflight = load_collection_examples(
+            args.collection_batch,
+            expected_revision=args.expected_capture_revision,
+            expected_recipe_sha256=args.expected_input_sha256,
+            expected_feature_layer=args.expected_feature_layer,
+        )
+    else:
+        preflight = json.loads(
+            (args.run_dir / "preflight.json").read_text(encoding="utf-8")
+        )
+        copied_input = args.run_dir / "input_requests.jsonl"
+        if (
+            not copied_input.is_file()
+            or sha256_file(copied_input) != args.expected_input_sha256
+        ):
+            parser.error("archived input_requests.jsonl missing or SHA256 differs")
     if preflight.get("feature_layer", "final") != args.expected_feature_layer:
         parser.error("capture feature layer differs from expected")
     if (
@@ -516,12 +685,6 @@ def main() -> None:
         or preflight["input_sha256"] != args.expected_input_sha256
     ):
         parser.error("capture revision or input SHA256 differs")
-    copied_input = args.run_dir / "input_requests.jsonl"
-    if (
-        not copied_input.is_file()
-        or sha256_file(copied_input) != args.expected_input_sha256
-    ):
-        parser.error("archived input_requests.jsonl missing or SHA256 differs")
     if (
         sha256_file(Path(preflight["model_path"]) / "config.json")
         != (preflight["model_config_sha256"])
@@ -534,25 +697,41 @@ def main() -> None:
         x.strip() != args.expected_gpu_name for x in names
     ):
         parser.error(f"GPU inventory differs: {names}")
-    data = load_examples(args.run_dir, include_censored=True)
+    if data is None:
+        data = load_examples(args.run_dir, include_censored=True)
     replay_meta = None
     known_test_ids = set()
-    if args.replay_run_dir:
+    if args.replay_run_dir or args.replay_collection_batch:
         from predictor_warmstart import merge_captures
 
-        replay_meta = json.loads((args.replay_run_dir / "preflight.json").read_text())
         if not args.expected_replay_input_sha256:
             parser.error("replay input SHA256 is required")
-        if (
-            sha256_file(args.replay_run_dir / "input_requests.jsonl")
-            != args.expected_replay_input_sha256
-            or replay_meta["input_sha256"] != args.expected_replay_input_sha256
-        ):
-            parser.error("replay input SHA256 differs")
+        if args.replay_collection_batch:
+            from predictor_collection_training import load_collection_examples
+
+            if not args.expected_replay_capture_revision:
+                parser.error("replay collection capture revision is required")
+            replay_data, replay_meta = load_collection_examples(
+                args.replay_collection_batch,
+                expected_revision=args.expected_replay_capture_revision,
+                expected_recipe_sha256=args.expected_replay_input_sha256,
+                expected_feature_layer=args.expected_feature_layer,
+                require_complete=False,
+            )
+        else:
+            replay_meta = json.loads(
+                (args.replay_run_dir / "preflight.json").read_text()
+            )
+            if (
+                sha256_file(args.replay_run_dir / "input_requests.jsonl")
+                != args.expected_replay_input_sha256
+                or replay_meta["input_sha256"] != args.expected_replay_input_sha256
+            ):
+                parser.error("replay input SHA256 differs")
+            replay_data = load_examples(args.replay_run_dir, include_censored=True)
         for key in ["feature_layer", "feature_semantics", "model_config_sha256"]:
             if replay_meta.get(key) != preflight.get(key):
                 parser.error(f"replay {key} differs")
-        replay_data = load_examples(args.replay_run_dir, include_censored=True)
         known_test_ids.update(replay_data["requests"][replay_data["splits"] == "test"])
         data = merge_captures(data, replay_data)
     if args.known_test_input:
@@ -580,7 +759,7 @@ def main() -> None:
         "hostname": socket.gethostname(),
         "training_revision": revision,
         "replay_capture": replay_meta,
-        "capture_dir": str(args.run_dir.resolve()),
+        "capture_dir": str(capture_dir.resolve()),
         "capture_revision": preflight["revision"],
         "input_sha256": preflight["input_sha256"],
         "model_path": preflight["model_path"],
@@ -614,6 +793,9 @@ def main() -> None:
         warmstart_checkpoint=args.warmstart_checkpoint,
         warmstart_sha256=args.warmstart_sha256,
         tail_edges=args.tail_edges,
+        bucket_profile=args.bucket_profile,
+        head_warmup_epochs=args.head_warmup_epochs,
+        head_learning_rate=args.head_learning_rate,
     )
 
 
