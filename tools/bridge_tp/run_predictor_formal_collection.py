@@ -20,9 +20,15 @@ def main():
     parser.add_argument("--expected-recipe-sha256", required=True)
     parser.add_argument("--expected-gpu-count", type=int, required=True)
     parser.add_argument("--shard-stop", type=int, default=3)
+    parser.add_argument("--expected-requests", type=int)
     args = parser.parse_args()
     inputs = args.batch / "inputs"
     manifest = json.loads((inputs / "manifest.json").read_text())
+    total = manifest["rows"]
+    if total != sum(s["rows"] for s in manifest["shards"]):
+        raise ValueError("manifest request count differs from shards")
+    if args.expected_requests is not None and total != args.expected_requests:
+        raise ValueError("manifest request count differs from requested collection")
     recipe_sha = hashlib.sha256((inputs / "recipe.jsonl").read_bytes()).hexdigest()
     if recipe_sha != args.expected_recipe_sha256:
         raise ValueError("recipe SHA differs")
@@ -32,6 +38,8 @@ def main():
         raise ValueError("shard-stop outside manifest")
     labels = []
     completed = []
+    seen_requests = set()
+    tree_splits = {}
     for number, shard in enumerate(manifest["shards"][: args.shard_stop], 1):
         source = inputs / shard["input"]
         if hashlib.sha256(source.read_bytes()).hexdigest() != shard["sha256"]:
@@ -44,7 +52,7 @@ def main():
         if not out.exists():
             print(
                 f"[进度] 批次 {number}/{args.shard_stop}：{shard['name']}，"
-                f"已完成{len(labels)}/600条",
+                f"已完成{len(labels)}/{total}条",
                 flush=True,
             )
             command = [
@@ -77,7 +85,13 @@ def main():
             ]
             subprocess.run(command, check=True)
         # Completed shards must pass a fresh label/index/SQLite audit.
-        data = load_examples(out)
+        input_copy = out / "input_requests.jsonl"
+        if input_copy.exists():
+            if hashlib.sha256(input_copy.read_bytes()).hexdigest() != shard["sha256"]:
+                raise ValueError(f"archived input differs: {input_copy}")
+        else:
+            input_copy.write_bytes(source.read_bytes())
+        data = load_examples(out, include_censored=True)
         preflight = json.loads((out / "preflight.json").read_text())
         if (
             preflight["revision"] != args.expected_revision
@@ -85,10 +99,23 @@ def main():
             or len(data["labels"]) != shard["rows"]
         ):
             raise ValueError(f"completed shard identity differs: {out}")
+        input_rows = [json.loads(line) for line in source.read_text().splitlines()]
+        expected_ids = {r["id"] for r in input_rows}
+        actual_ids = {r["input_id"] for r in data["labels"]}
+        if len(expected_ids) != shard["rows"] or actual_ids != expected_ids:
+            raise ValueError(f"completed shard request identities differ: {out}")
+        if seen_requests & actual_ids:
+            raise ValueError("duplicate requests across shards")
+        seen_requests.update(actual_ids)
+        for row in input_rows:
+            tree = row["source_tree_id"]
+            if tree_splits.setdefault(tree, row["split"]) != row["split"]:
+                raise ValueError("source tree crosses data splits")
         labels.extend(data["labels"])
         completed.append(shard["name"])
         print(
-            f"[进度] 正式采集已完成{len(labels)}/600条，本批审计通过：{shard['name']}",
+            f"[进度] 正式采集已完成{len(labels)}/{total}条，"
+            f"本批审计通过：{shard['name']}",
             flush=True,
         )
     histogram = Counter()
@@ -110,13 +137,16 @@ def main():
         "natural_eos": sum(r["natural_finish"] for r in labels),
         "censored": sum(not r["natural_finish"] for r in labels),
         "actual_length_upper_edge_histogram": dict(histogram),
-        "all_600_collected": len(labels) == 600,
+        "planned_requests": total,
+        "all_requested_collected": len(labels) == total,
+        "all_600_collected": total == 600 and len(labels) == 600,
+        "collection_role": "length_predictor_feature_collection",
         "training_started": False,
     }
     (args.batch / "collection_summary.json").write_text(
         json.dumps(summary, indent=2) + "\n"
     )
-    print(f"[进度] 本轮采集完成：{len(labels)}/600条；尚未开始训练", flush=True)
+    print(f"[进度] 本轮采集完成：{len(labels)}/{total}条；尚未开始训练", flush=True)
 
 
 if __name__ == "__main__":

@@ -48,6 +48,93 @@ STYLES = (
     "a troubleshooting guide, each section with symptoms and diagnostic steps",
     "a worked example collection, showing reasoning and intermediate results",
 )
+LONG_FOCUSES = (
+    "burst traffic admission policies",
+    "multi-tenant service fairness",
+    "checkpoint recovery exercises",
+    "heterogeneous deployment choices",
+    "rolling upgrade incident reviews",
+    "observability instrumentation exercises",
+    "queue management under overload",
+    "cross-region continuity planning",
+    "reproducible benchmarking procedures",
+    "cost and reliability budgeting",
+)
+LONG_GROUP_COUNTS = {"upper_mid": 120, "tail8192": 120, "tail12288": 60}
+LONG_TRAINING_EDGES = (
+    [0, 8, 16, 32]
+    + list(range(64, 513, 32))
+    + list(range(576, 2049, 64))
+    + list(range(2176, 4097, 128))
+    + list(range(4352, 8193, 256))
+    + list(range(9216, 16385, 1024))
+)
+
+
+def long300_recipe():
+    """Preregister 300 fresh tasks; actual EOS lengths remain the labels."""
+    rng = random.Random(202610102)
+    trees = list(range(100))
+    rng.shuffle(trees)
+    splits = {
+        tree: ("train" if i < 70 else "validation" if i < 85 else "test")
+        for i, tree in enumerate(trees)
+    }
+    groups = [g for g, count in LONG_GROUP_COUNTS.items() for _ in range(count)]
+    rng.shuffle(groups)
+    specifications = {
+        "upper_mid": (8, 500, 520),
+        "tail8192": (12, 575, 600),
+        "tail12288": (16, 650, 650),
+    }
+    rows = []
+    contextual = 0
+    for i, group in enumerate(groups):
+        tree, variant = divmod(i, 3)
+        topic = f"{DOMAINS[tree // 10]}: {LONG_FOCUSES[tree % 10]}"
+        lang = "zh" if (tree + variant) % 2 else "en"
+        context = "short"
+        if group == "upper_mid" and contextual < 40:
+            context = "ctx2k"
+            contextual += 1
+        chapters, words, characters = specifications[group]
+        style = STYLES[(tree + variant) % len(STYLES)]
+        if lang == "en":
+            instruction = (
+                f"Write a complete {chapters}-chapter {style} about {topic}. "
+                f"Each chapter should contain about {words} words of substantive "
+                "prose, divided into four developed subsections: a concrete "
+                "scenario, a worked analysis, alternatives and tradeoffs, and "
+                "a practical verification exercise with its explanation. "
+                f"Use scenario family {tree + 101} and perspective {variant + 1}. "
+                "Use distinct examples across chapters. Write all chapters in "
+                "English in this response, with full explanations; do not "
+                "substitute an outline or ask the reader to request continuation."
+            )
+        else:
+            instruction = (
+                f"围绕{topic}，用中文写完整的{chapters}章{style}。"
+                f"每章约{characters}个汉字的实质内容，展开四个小节："
+                "具体案例、推演分析、替代方案与取舍、带解答的实践验证。"
+                f"采用第{tree + 101}组场景和第{variant + 1}种分析视角。"
+                "各章使用不同例子，完整解释过程。一次写完全部章节，"
+                "不要用提纲替代正文，也不要询问是否继续。"
+            )
+        rows.append(
+            {
+                "id": f"predictor-long300-20261010-tree{tree:03d}-v{variant}",
+                "source_tree_id": f"predictor-long300-20261010-tree{tree:03d}",
+                "split": splits[tree],
+                "lang": lang,
+                "source": "constructed_long300_not_natural_calibration",
+                "topic": topic,
+                "requested_group": group,
+                "context_group": context,
+                "instruction": instruction,
+            }
+        )
+    rng.shuffle(rows)
+    return rows
 
 
 def recipe():
@@ -162,13 +249,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument(
+        "--profile", choices=("formal600", "long300"), default="formal600"
+    )
     args = parser.parse_args()
     if args.out_dir.exists():
         raise ValueError("input directory must be new")
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
-    rows = recipe()
+    rows = long300_recipe() if args.profile == "long300" else recipe()
     raw = serialized(rows)
     args.out_dir.mkdir(parents=True)
     (args.out_dir / "recipe.jsonl").write_bytes(raw)
@@ -176,7 +266,7 @@ def main():
     for n, row in enumerate(rows, 1):
         pools[row["context_group"]].append(materialize(row, tokenizer))
         if n % 60 == 0:
-            print(f"[进度] 输入准备 {n}/600", flush=True)
+            print(f"[进度] 输入准备 {n}/{len(rows)}", flush=True)
     shards = []
     # Interleave context groups so early collection covers all three contexts.
     for offset in range(0, max(map(len, pools.values())), 20):
@@ -200,8 +290,9 @@ def main():
                 }
             )
     manifest = {
-        "rows": 600,
-        "trees": 100,
+        "profile": args.profile,
+        "rows": len(rows),
+        "trees": len({r["source_tree_id"] for r in rows}),
         "recipe_sha256": hashlib.sha256(raw).hexdigest(),
         "split_rows": dict(Counter(r["split"] for r in rows)),
         "requested_group_counts": dict(Counter(r["requested_group"] for r in rows)),
@@ -209,8 +300,15 @@ def main():
         "label_rule": "actual natural EOS; requested groups are not labels",
         "shards": shards,
     }
+    if args.profile == "long300":
+        manifest["planned_training_buckets"] = {
+            "category_upper_edges": LONG_TRAINING_EDGES,
+            "overflow_category": True,
+            "categories": len(LONG_TRAINING_EDGES) + 1,
+            "status": "training plan; does not change capture or live checkpoint",
+        }
     (args.out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    print("[进度] 600条输入及预注册划分准备完成", flush=True)
+    print(f"[进度] {len(rows)}条输入及预注册划分准备完成", flush=True)
 
 
 if __name__ == "__main__":
