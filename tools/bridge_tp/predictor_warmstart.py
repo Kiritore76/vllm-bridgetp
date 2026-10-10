@@ -1,10 +1,12 @@
 """Initialize continued training without changing feature normalization."""
 
 from __future__ import annotations
+
 import copy
 import hashlib
 import math
 from pathlib import Path
+
 import numpy as np
 
 
@@ -79,6 +81,50 @@ def expand_tail(checkpoint: dict, tail_edges: list[int]):
         )
     result["category_upper_edges"] = torch.from_numpy(edges)
     return result
+
+
+def rebuild_output_head(checkpoint: dict, edges: np.ndarray, seed: int) -> dict:
+    """Reuse the backbone and normalization; initialize a new classifier.
+
+    Args:
+        checkpoint: Audited parent checkpoint, which remains unchanged.
+        edges: New finite inclusive category bounds, starting at zero.
+        seed: Seed for reproducible CPU initialization of the new head.
+
+    Returns:
+        Independent checkpoint with a fresh head and uncalibrated temperature.
+    """
+    import torch
+    from predictor_distribution import validate_edges
+    from torch import nn
+
+    validate_edges(edges)
+    if not np.issubdtype(edges.dtype, np.integer):
+        raise ValueError("new category bounds must be integers")
+    result = copy.deepcopy(checkpoint)
+    with torch.random.fork_rng(devices=[]):
+        torch.random.default_generator.manual_seed(seed)
+        head = nn.Linear(checkpoint["hidden_width"], len(edges) + 1)
+    result["state_dict"]["3.weight"] = head.weight.detach().clone()
+    result["state_dict"]["3.bias"] = head.bias.detach().clone()
+    result["category_upper_edges"] = torch.from_numpy(edges.copy())
+    result["temperature"] = 1.0
+    return result
+
+
+def configure_training_phase(
+    model,
+    optimizer,
+    *,
+    head_only: bool,
+    head_learning_rate: float,
+    learning_rate: float,
+) -> None:
+    """Freeze the inherited first layer during classifier warmup only."""
+    for parameter in model[0].parameters():
+        parameter.requires_grad_(not head_only)
+    for group in optimizer.param_groups:
+        group["lr"] = head_learning_rate if head_only else learning_rate
 
 
 def merge_captures(primary: dict, replay: dict) -> dict:

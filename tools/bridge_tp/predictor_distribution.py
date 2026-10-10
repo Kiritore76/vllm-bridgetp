@@ -11,6 +11,43 @@ from collections import Counter
 import numpy as np
 
 
+def nonuniform84_upper_edges() -> np.ndarray:
+    """Return the agreed 83 finite bounds plus a separate open tail."""
+    return np.asarray(
+        [0, 8, 16, 32]
+        + list(range(64, 513, 32))
+        + list(range(576, 2049, 64))
+        + list(range(2176, 4097, 128))
+        + list(range(4352, 8193, 256))
+        + list(range(9216, 16385, 1024)),
+        dtype=np.int64,
+    )
+
+
+def aggregate_probabilities(
+    probabilities: np.ndarray,
+    source_edges: np.ndarray,
+    target_edges: np.ndarray,
+) -> np.ndarray:
+    """Sum adjacent probabilities only when every new boundary already exists."""
+    validate_edges(source_edges)
+    validate_edges(target_edges)
+    p = np.asarray(probabilities)
+    if (
+        not np.isin(target_edges, source_edges).all()
+        or p.shape[-1] != len(source_edges) + 1
+        or not np.isfinite(p).all()
+        or (p < 0).any()
+        or not np.allclose(p.sum(axis=-1), 1, atol=1e-6)
+    ):
+        raise ValueError("aggregation needs aligned edges and valid probabilities")
+    mapping = np.append(np.searchsorted(target_edges, source_edges), len(target_edges))
+    result = np.zeros((*p.shape[:-1], len(target_edges) + 1), dtype=p.dtype)
+    for target in range(len(target_edges) + 1):
+        result[..., target] = p[..., mapping == target].sum(axis=-1)
+    return result
+
+
 def default_upper_edges(max_tokens: int, step: int = 32) -> np.ndarray:
     if max_tokens <= 0 or step <= 0:
         raise ValueError("max_tokens and step must be positive")
