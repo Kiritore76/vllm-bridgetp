@@ -1,4 +1,4 @@
-"""Audit three saved datasets and train the new 84-class predictor on one GPU."""
+"""Audit saved datasets and train a fixed categorical predictor on one GPU."""
 
 import argparse
 import json
@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 from predictor_collection_training import load_collection_examples
+from predictor_distribution import nonuniform84_upper_edges, risk76_upper_edges
 from predictor_progress import emit
 from predictor_training_mix import capture_coverage, mixed_training_weights
 from predictor_warmstart import merge_captures
@@ -151,8 +152,10 @@ def write_result_summary(out: Path, report: dict) -> None:
     depth = report["training_parameters"].get("network_depth", 2)
     initialization = report["warmstart_provenance"].get("initialization", "warmstart")
     prefill_mass = report["training_weighting"].get("prefill_mass_per_request", 0)
+    output_categories = len(report["category_upper_edges"]) + 1
+    tail_boundary = report["category_upper_edges"][-1]
     lines = [
-        f"# {depth}层84桶混合训练结果",
+        f"# {depth}层{output_categories}桶混合训练结果",
         "",
         "训练完成，新权重仍为离线候选，尚未替换控制器。",
         "",
@@ -198,7 +201,7 @@ def write_result_summary(out: Path, report: dict) -> None:
     lines += [
         "",
         "完整真实桶概率、区间宽度、开放尾占比及长度误差见本目录report.json。",
-        "开放尾区间不裁剪成16384，有限宽度和误差只在有限区间上统计。",
+        f"超过{tail_boundary}的开放尾区间不裁剪，有限宽度和误差只在有限区间上统计。",
         "查看覆盖率时须同时查看宽度，覆盖提升不等于长度预测更集中。",
         "",
     ]
@@ -214,6 +217,9 @@ def main() -> None:
     parser.add_argument("--reference-checkpoint", type=Path)
     parser.add_argument("--reference-sha256")
     parser.add_argument("--network-depth", type=int, choices=(2, 4), default=2)
+    parser.add_argument(
+        "--bucket-profile", choices=("nonuniform84", "risk76"), default="nonuniform84"
+    )
     parser.add_argument("--legacy-loss-mass", type=float, default=0.25)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--patience", type=int, default=2)
@@ -226,6 +232,8 @@ def main() -> None:
     parser.add_argument("--expected-revision", required=True)
     parser.add_argument("--expected-gpu-count", type=int, required=True)
     args = parser.parse_args()
+    if args.bucket_profile == "risk76" and not args.from_scratch:
+        parser.error("risk76 requires from-scratch training of a new classifier")
     if (
         not np.isfinite(args.legacy_loss_mass)
         or not 0 < args.legacy_loss_mass < 1
@@ -387,6 +395,12 @@ def main() -> None:
         "parent_sha256": None if args.from_scratch else PARENT_SHA,
         "initialization": "from scratch" if args.from_scratch else "warmstart",
         "reference_sha256": args.reference_sha256,
+        "bucket_profile": args.bucket_profile,
+        "category_upper_edges": (
+            risk76_upper_edges()
+            if args.bucket_profile == "risk76"
+            else nonuniform84_upper_edges()
+        ).tolist(),
         "validation_policy": "old/new validation trees split separately, 50/50 loss"
         if args.balanced_validation
         else "new300 validation trees only",
@@ -443,7 +457,7 @@ def main() -> None:
         seed=42,
         warmstart_checkpoint=None if args.from_scratch else args.checkpoint,
         warmstart_sha256=None if args.from_scratch else PARENT_SHA,
-        bucket_profile="nonuniform84",
+        bucket_profile=args.bucket_profile,
         head_warmup_epochs=0 if args.from_scratch else 1,
         head_learning_rate=3e-4,
         validation_ids=validation_ids,
@@ -493,6 +507,10 @@ def main() -> None:
             "",
             "旧/新增训练权重50%/50%。",
             "两组随机初始化，没有继承旧参数或归一化。",
+            (
+                f"输出桶配置：{args.bucket_profile}；两组prefill权重"
+                f"{args.prefill_loss_mass:.0%}，参考概率合并到相同桶后比较。"
+            ),
             "旧版已封存；新权重均为离线候选。",
             "",
             "| 数据 | 原暂存两层 | 新两层50% | 新四层50% |",
@@ -501,6 +519,10 @@ def main() -> None:
         for name in (
             "new300_validation_diagnostic",
             "new300_test_diagnostic",
+            "new300_validation_prefill_complete",
+            "new300_test_prefill_complete",
+            "new300_validation_early_decode",
+            "new300_test_early_decode",
             "legacy5000_validation_diagnostic",
             "legacy5000_test_diagnostic",
         ):
@@ -561,7 +583,7 @@ def main() -> None:
         )
         + "\n"
     )
-    emit("84桶续训完成，请取回完整训练包；新权重尚未部署")
+    emit(f"{args.bucket_profile}训练完成，请取回完整训练包；新权重尚未部署")
 
 
 if __name__ == "__main__":

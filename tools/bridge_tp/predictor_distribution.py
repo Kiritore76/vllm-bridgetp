@@ -24,6 +24,12 @@ def nonuniform84_upper_edges() -> np.ndarray:
     )
 
 
+def risk76_upper_edges() -> np.ndarray:
+    """Keep all bounds through 8192, with one open category for larger lengths."""
+    edges = nonuniform84_upper_edges()
+    return edges[edges <= 8192]
+
+
 def aggregate_probabilities(
     probabilities: np.ndarray,
     source_edges: np.ndarray,
