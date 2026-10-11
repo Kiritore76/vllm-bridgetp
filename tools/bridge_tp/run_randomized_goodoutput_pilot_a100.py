@@ -881,6 +881,10 @@ def collect_arm(args: argparse.Namespace, root: Path,
         artifact_errors = probability_artifact_errors(
             run, require_features=getattr(args, "save_predictor_features", False))
         if artifact_errors:
+            print(
+                f"[{action}] incomplete run evidence: {'; '.join(artifact_errors)}",
+                flush=True,
+            )
             result = {
                 "assigned_action": action.split("_")[2],
                 "configured_probability_threshold": float(action.split("_")[1]),

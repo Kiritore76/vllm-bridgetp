@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import os
 import time
@@ -20,6 +21,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 router = APIRouter()
 _takeover_lock = asyncio.Lock()
+_predictor_finalize_lock = asyncio.Lock()
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -372,6 +374,49 @@ async def shadow_target_cleanup(raw_request: Request) -> dict[str, Any]:
     }
     _atomic_json_dump(receipt, run_dir / "target_cleanup_receipt.json")
     return receipt
+
+
+@router.post("/bridge_tp/v1/predictor_features/finalize")
+async def finalize_predictor_features(raw_request: Request) -> dict[str, Any]:
+    """Confirm feature persistence before the experiment stops its source.
+
+    This experiment-only route accepts a per-run secret, exposes only one named
+    worker operation, and is called after controller and background completion.
+    It does not enable the unrestricted development RPC router.
+    """
+    token = os.environ.get("BRIDGETP_PREDICTOR_FINALIZE_TOKEN", "")
+    if not token or not os.environ.get("BRIDGETP_PREDICTOR_FEATURE_JOURNAL"):
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_FOUND, detail="Feature journal is disabled"
+        )
+    try:
+        body = await raw_request.json()
+    except (ValueError, TypeError) as error:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST, detail="Expected a JSON object"
+        ) from error
+    provided = body.get("token") if isinstance(body, dict) else None
+    if not isinstance(provided, str) or not hmac.compare_digest(provided, token):
+        raise HTTPException(
+            status_code=HTTPStatus.FORBIDDEN, detail="Finalization token differs"
+        )
+    async with _predictor_finalize_lock:
+        results = await raw_request.app.state.engine_client.collective_rpc(
+            "bridge_tp_finalize_predictor_features", timeout=60.0
+        )
+    if (
+        not isinstance(results, list)
+        or len(results) != 1
+        or not isinstance(results[0], dict)
+        or results[0].get("status") != "FINALIZED"
+        or not isinstance(results[0].get("saved_batches"), int)
+        or results[0]["saved_batches"] <= 0
+    ):
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            detail="Source feature journal did not confirm persistence",
+        )
+    return results[0]
 
 
 def attach_router(app: FastAPI) -> None:

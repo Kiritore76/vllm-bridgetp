@@ -1,5 +1,6 @@
 """Risk76 runtime, phase observations, evidence integrity and fit boundaries."""
 
+import ast
 import hashlib
 import importlib.util
 import json
@@ -281,6 +282,7 @@ class BenefitV4Tests(unittest.TestCase):
                 {
                     "vllm.bridge_tp.controller.distribution_predictor": runtime,
                     "vllm.bridge_tp.async_journal": journal,
+                    "vllm.bridge_tp.predictor_capture": capture,
                 },
             ),
         ):
@@ -291,10 +293,40 @@ class BenefitV4Tests(unittest.TestCase):
                 self.root,
                 torch.device("cpu"),
             )
+            self.addCleanup(observer.close)
             observer.capture(
                 torch.ones(2, 2), ["a", "b"], [0, 20], [15, 16], [1, 1], [16, 16]
             )
+            tree = ast.parse((ROOT / "vllm/v1/worker/gpu_worker.py").read_text())
+            worker = next(
+                node
+                for node in tree.body
+                if isinstance(node, ast.ClassDef) and node.name == "Worker"
+            )
+            method = next(
+                node
+                for node in worker.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "bridge_tp_finalize_predictor_features"
+            )
+            namespace = {}
+            exec(
+                compile(ast.Module(body=[method], type_ignores=[]), "rpc", "exec"),
+                namespace,
+            )
+            source_worker = SimpleNamespace(
+                model_runner=SimpleNamespace(predictor_feature_capture=observer)
+            )
+            finalized = namespace[method.name](source_worker)
+            self.assertEqual(finalized["status"], "FINALIZED")
+            self.assertGreater(finalized["saved_batches"], 0)
+            self.assertTrue((features / "receipt.json").is_file())
+            self.assertEqual(namespace[method.name](source_worker), finalized)
+            # Model teardown follows explicit finalization. It must not hang or
+            # rewrite the receipt when it closes the observer for a second time.
             observer.close()
+            with self.assertRaisesRegex(RuntimeError, "finalized"):
+                observer.begin_forward()
         prediction = json.loads(events.read_text().splitlines()[1])
         audit = self.root / "audit.jsonl"
         audit.write_text(

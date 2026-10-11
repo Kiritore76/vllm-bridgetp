@@ -25,6 +25,12 @@ target reservation仍512，是空间预留上界，不能与基础冻结提前�
 每对之后CPU重放全部保存状态，检查在线概率误差≤1e-5与候选关联。
 这增加了特征复制和保存负担，必须通过GPU pilot衡量，CPU一致性不代表GPU开销通过。
 
+实验收尾必须在controller和背景请求全部完成后，通过源端专用finalize接口
+排空预测与写盘队列，确认receipt和保存批次数，再停止服务进程。
+不能依赖API server的abort/强制退出完成异步保存。该操作位于窗口和请求排空之后，
+不进入冻结／最终增量确认路径；接口只接受本轮secret，不开放任意开发RPC。
+重复finalize／模型shutdown不会再次向已退出的写盘线程投递终止标记。
+
 ## 分阶段采集
 
 `run_benefit_v4_collection.py --stage pilot`只运行六格训练replicate0，12arm。

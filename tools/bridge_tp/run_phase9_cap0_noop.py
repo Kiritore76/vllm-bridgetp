@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -30,6 +31,28 @@ from tools.bridge_tp import run_phase9_cap0_calibration as common  # noqa: E402
 from tools.bridge_tp.run_phase9_capacity_background import (  # noqa: E402
     load_manifest,
 )
+
+
+def finalize_predictor_features(base_url: str, token: str, output: Path) -> None:
+    """Wait for the source journal receipt before stopping its process group.
+
+    Args:
+        base_url: The source HTTP service for this experiment.
+        token: Per-run secret configured only for the source finalization route.
+        output: Path retaining the worker's persistence confirmation.
+
+    Raises:
+        RuntimeError: The worker did not confirm successful feature persistence.
+    """
+    from tools.bridge_tp.run_atomic_takeover import _post_json
+
+    result = _post_json(
+        base_url, "/bridge_tp/v1/predictor_features/finalize", {"token": token}, 65
+    )
+    common.write_json(output, result)
+    if result.get("status") != "FINALIZED" or result.get("saved_batches", 0) <= 0:
+        raise RuntimeError("source feature journal finalization was not confirmed")
+
 
 KV_CACHE_SIZE = re.compile(r"GPU KV cache size:\s*([\d,]+)\s+tokens")
 
@@ -839,8 +862,11 @@ def run(
         source_env = common.source_environment(args, run_id, server_dir)
         source_env.update(source_env_overrides or {})
         if base_env.get("BRIDGETP_SAVE_PREDICTOR_FEATURES") == "1":
+            if service_pool is not None:
+                raise ValueError("feature journals require dedicated source services")
             source_env["BRIDGETP_PREDICTOR_FEATURE_JOURNAL"] = str(
                 controller_dir / "predictor_features")
+            source_env["BRIDGETP_PREDICTOR_FINALIZE_TOKEN"] = secrets.token_hex(32)
         source_command = common.server_command(args, 1, args.tp1_port)
         if bool(getattr(args, "force_source_eager", False)):
             source_command.append("--enforce-eager")
@@ -1027,6 +1053,12 @@ def run(
             )
             processes.append(background)
         common.wait_pair(controller, background, args.run_timeout_s)
+        if base_env.get("BRIDGETP_SAVE_PREDICTOR_FEATURES") == "1":
+            finalize_predictor_features(
+                f"http://127.0.0.1:{args.tp1_port}",
+                source_env["BRIDGETP_PREDICTOR_FINALIZE_TOKEN"],
+                provenance_dir / "predictor_feature_finalization.json",
+            )
         if memory_sampler is not None:
             memory_summary = memory_sampler.stop(
                 provenance_dir / "source_gpu_memory_summary.json"

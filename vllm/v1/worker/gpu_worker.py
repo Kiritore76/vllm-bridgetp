@@ -1155,6 +1155,28 @@ class Worker(WorkerBase):
         observer.close()
         return {"probes": observer._diagnostic_count}
 
+    def bridge_tp_finalize_predictor_features(self) -> dict[str, int | str]:
+        """Drain an opted-in feature journal after measured requests finish.
+
+        Returns:
+            Confirmation and the number of batches durably saved by this worker.
+
+        Raises:
+            RuntimeError: Feature saving is disabled or its queue failed.
+        """
+        from vllm.bridge_tp.predictor_capture import PredictorLiveObserver
+
+        observer = self.model_runner.predictor_feature_capture
+        if not isinstance(observer, PredictorLiveObserver) or (
+            observer._feature_journal is None
+        ):
+            raise RuntimeError("feature finalization requires an opted-in journal")
+        observer.close()
+        return {
+            "status": "FINALIZED",
+            "saved_batches": observer._feature_journal.saved,
+        }
+
     def shutdown(self) -> None:
         gc.unfreeze()
 

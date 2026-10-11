@@ -334,6 +334,7 @@ class PredictorLiveObserver(PredictorFeatureCapture):
             else None
         )
         self._worker_error: BaseException | None = None
+        self._closed = False
         event_path.parent.mkdir(parents=True, exist_ok=True)
         self._events = event_path.open("x", encoding="utf-8", buffering=1)
         self._events.write(
@@ -386,6 +387,8 @@ class PredictorLiveObserver(PredictorFeatureCapture):
         return selected
 
     def begin_forward(self) -> None:
+        if self._closed:
+            raise RuntimeError("live predictor has already been finalized")
         self._check_worker()
         super().begin_forward()
 
@@ -400,6 +403,8 @@ class PredictorLiveObserver(PredictorFeatureCapture):
     ) -> None:
         import torch
 
+        if self._closed:
+            raise RuntimeError("live predictor has already been finalized")
         self._check_worker()
         rows = select_capture_rows(
             request_ids,
@@ -564,6 +569,13 @@ class PredictorLiveObserver(PredictorFeatureCapture):
 
     def close(self) -> None:
         """Drain predictions when the runner shuts down."""
+        if self._closed:
+            self._check_worker()
+            if self._feature_journal is not None and (
+                self._feature_journal.error or self._feature_journal.dropped
+            ):
+                raise RuntimeError("predictor features incomplete")
+            return
         if self._worker.is_alive():
             self._pending.put(None)
             self._worker.join()
@@ -575,6 +587,7 @@ class PredictorLiveObserver(PredictorFeatureCapture):
                     self._feature_journal.close()
             finally:
                 self._events.close()
+                self._closed = True
 
 
 def predictor_observer_from_environment(
