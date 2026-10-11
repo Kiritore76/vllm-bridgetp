@@ -150,6 +150,7 @@ def write_result_summary(out: Path, report: dict) -> None:
     categories = comparison["categories"]
     depth = report["training_parameters"].get("network_depth", 2)
     initialization = report["warmstart_provenance"].get("initialization", "warmstart")
+    prefill_mass = report["training_weighting"].get("prefill_mass_per_request", 0)
     lines = [
         f"# {depth}层84桶混合训练结果",
         "",
@@ -157,7 +158,11 @@ def write_result_summary(out: Path, report: dict) -> None:
         "",
         f"最佳轮次：{report['best_epoch']}；温度：{report['temperature']:.2f}。",
         f"训练权重：旧4000条{old_mass:.0%}，新增训练请求{1 - old_mass:.0%}。",
-        "自然EOS请求的早/中/后期权重30%/40%/30%；截断请求保留下界似然。",
+        f"每请求prefill独立权重{prefill_mass:.0%}；"
+        "其余decode按早/中/后期30%/40%/30%分配。"
+        if prefill_mass
+        else "自然EOS请求的早/中/后期权重30%/40%/30%。",
+        "截断请求保留下界似然，不使用未知的最终生成进度。",
         f"初始化：{initialization}。",
         f"验证策略：{report['validation_scope']}。",
         "",
@@ -192,7 +197,7 @@ def write_result_summary(out: Path, report: dict) -> None:
             )
     lines += [
         "",
-        "完整真实桶概率、区间宽度、开放尾占比及长度误差见train/report.json。",
+        "完整真实桶概率、区间宽度、开放尾占比及长度误差见本目录report.json。",
         "开放尾区间不裁剪成16384，有限宽度和误差只在有限区间上统计。",
         "查看覆盖率时须同时查看宽度，覆盖提升不等于长度预测更集中。",
         "",
@@ -215,6 +220,8 @@ def main() -> None:
     parser.add_argument("--learning-rate", type=float, default=5e-5)
     parser.add_argument("--balanced-validation", action="store_true")
     parser.add_argument("--comparison-trial", action="store_true")
+    parser.add_argument("--prefill-loss-mass", type=float, default=0.0)
+    parser.add_argument("--prefill-comparison-trial", action="store_true")
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--expected-revision", required=True)
     parser.add_argument("--expected-gpu-count", type=int, required=True)
@@ -224,8 +231,12 @@ def main() -> None:
         or not 0 < args.legacy_loss_mass < 1
         or not np.isfinite(args.learning_rate)
         or args.learning_rate <= 0
+        or not np.isfinite(args.prefill_loss_mass)
+        or not 0 <= args.prefill_loss_mass < 1
     ):
-        parser.error("loss mass must be in (0,1) and learning rate finite/positive")
+        parser.error(
+            "legacy mass in (0,1), prefill mass in [0,1), learning rate positive"
+        )
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     if (
         revision != args.expected_revision
@@ -253,6 +264,18 @@ def main() -> None:
     ):
         parser.error(
             "comparison requires scratch depth4, mass0.5 and balanced validation"
+        )
+    if args.prefill_comparison_trial and (
+        args.comparison_trial
+        or args.prefill_loss_mass != 0
+        or not args.from_scratch
+        or args.network_depth != 4
+        or args.legacy_loss_mass != 0.5
+        or not args.balanced_validation
+    ):
+        parser.error(
+            "prefill comparison requires scratch depth4, mass0.5, balanced "
+            "validation; cannot combine with another comparison or prefill mass"
         )
     if args.epochs < 2 or args.patience < 1:
         parser.error("epochs must be at least 2 and patience positive")
@@ -332,15 +355,27 @@ def main() -> None:
     legacy_ids = set(old["requests"])
     validation_ids = set(parts[0]["requests"])
     weights, weighting = mixed_training_weights(
-        data, legacy_ids, legacy_mass=args.legacy_loss_mass
+        data,
+        legacy_ids,
+        legacy_mass=args.legacy_loss_mass,
+        prefill_mass=0.1 if args.prefill_comparison_trial else args.prefill_loss_mass,
     )
     groups = {}
     for name, part in zip(("new300", "first60", "legacy5000"), parts):
         ids = set(part["requests"])
         for split in ("validation", "test"):
-            groups[f"{name}_{split}_diagnostic"] = np.isin(
-                data["requests"], sorted(ids)
-            ) & (data["splits"] == split)
+            mask = np.isin(data["requests"], sorted(ids)) & (data["splits"] == split)
+            groups[f"{name}_{split}_diagnostic"] = mask
+            groups[f"{name}_{split}_prefill_complete"] = mask & (
+                data["phases"] == "PREFILL_COMPLETE"
+            )
+            total = data["generated"] + data["remaining"]
+            fraction = np.divide(
+                data["generated"], total, out=np.zeros(len(total)), where=total > 0
+            )
+            groups[f"{name}_{split}_early_decode"] = (
+                mask & (data["generated"] > 0) & (fraction < 0.25)
+            )
     known = set(parts[1]["requests"][parts[1]["splits"] == "test"])
     known |= set(old["requests"][old["splits"] == "test"])
     provenance = {
@@ -359,11 +394,26 @@ def main() -> None:
         "qwen_training": False,
         "deployment": "offline candidate only",
     }
+    variants = (
+        [("prefill10", 4, 0.1), ("prefill20", 4, 0.2)]
+        if args.prefill_comparison_trial
+        else [(str(depth), depth, args.prefill_loss_mass) for depth in (2, 4)]
+        if args.comparison_trial
+        else [(str(args.network_depth), args.network_depth, args.prefill_loss_mass)]
+    )
+    variant_weights = {}
+    for key, _, mass in variants:
+        variant_weights[key] = mixed_training_weights(
+            data, legacy_ids, legacy_mass=args.legacy_loss_mass, prefill_mass=mass
+        )
+    provenance["trial_weighting"] = {
+        key: description for key, (_, description) in variant_weights.items()
+    }
     (args.out_dir / "training_preflight.json").write_text(
         json.dumps(provenance, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
     emit(f"数据审计完成：{weighting['cohorts']}；共{len(data['remaining'])}个状态")
-    if args.comparison_trial:
+    if args.comparison_trial or args.prefill_comparison_trial:
         reference_dir = args.reference_checkpoint.parent
         snapshot = args.out_dir / "baseline-two-layer"
         snapshot.mkdir()
@@ -396,8 +446,6 @@ def main() -> None:
         bucket_profile="nonuniform84",
         head_warmup_epochs=0 if args.from_scratch else 1,
         head_learning_rate=3e-4,
-        training_weights=weights,
-        weighting_provenance=weighting,
         validation_ids=validation_ids,
         diagnostic_groups=groups,
         known_test_ids=known,
@@ -408,16 +456,30 @@ def main() -> None:
         else None,
     )
     reports = {}
-    for depth in (2, 4) if args.comparison_trial else (args.network_depth,):
-        emit(f"开始{depth}层小预测器；初始化={provenance['initialization']}")
-        destination = args.out_dir / (
-            f"train-mlp{depth}-50pct" if args.comparison_trial else "train"
+    for key, depth, mass in variants:
+        emit(
+            f"开始{depth}层小预测器；初始化={provenance['initialization']}；"
+            f"prefill独立权重={mass:.0%}"
         )
+        destination = args.out_dir / (
+            f"train-{key}pct"
+            if args.prefill_comparison_trial
+            else f"train-mlp{depth}-50pct"
+            if args.comparison_trial
+            else "train"
+        )
+        weights, weighting = variant_weights[key]
         report = fit_distribution(
-            data, metas[0], destination, network_depth=depth, **parameters
+            data,
+            metas[0],
+            destination,
+            network_depth=depth,
+            training_weights=weights,
+            weighting_provenance=weighting,
+            **parameters,
         )
         write_result_summary(destination, report)
-        reports[str(depth)] = report
+        reports[key] = report
         torch.cuda.empty_cache()
     if args.checkpoint is not None and sha256_file(args.checkpoint) != PARENT_SHA:
         raise ValueError("immutable parent changed during training")
@@ -447,6 +509,36 @@ def main() -> None:
             rows.append(
                 f"| {name} | {two['parent_nll']:.4f} | "
                 f"{two['new_nll']:.4f} | {four['new_nll']:.4f} |"
+            )
+        (args.out_dir / "TRAINING_RESULT_CN.md").write_text(
+            "\n".join(rows) + "\n", encoding="utf-8"
+        )
+    elif args.prefill_comparison_trial:
+        rows = [
+            "# 四层从头训练：prefill独立权重10%／20%对照",
+            "",
+            "两组旧/新增损失各50%，其余decode按30/40/30分配。",
+            "从头训练，不继承旧权重；原参考模型已封存，新权重均未部署。",
+            "选轮次和温度仍使用旧/新验证各50%的全程NLL。",
+            "首点及早中期单列监控，不能仅凭全程平均替换模型。",
+            "",
+            "| 数据 | 暂存两层 | prefill10%四层 | prefill20%四层 |",
+            "|---|---:|---:|---:|",
+        ]
+        for name in (
+            "new300_validation_diagnostic",
+            "new300_validation_prefill_complete",
+            "new300_validation_early_decode",
+            "legacy5000_validation_diagnostic",
+            "new300_test_diagnostic",
+            "new300_test_prefill_complete",
+            "legacy5000_test_diagnostic",
+        ):
+            ten = reports["prefill10"]["common_bucket_comparison"]["results"][name]
+            twenty = reports["prefill20"]["common_bucket_comparison"]["results"][name]
+            rows.append(
+                f"| {name} | {ten['parent_nll']:.4f} | "
+                f"{ten['new_nll']:.4f} | {twenty['new_nll']:.4f} |"
             )
         (args.out_dir / "TRAINING_RESULT_CN.md").write_text(
             "\n".join(rows) + "\n", encoding="utf-8"
