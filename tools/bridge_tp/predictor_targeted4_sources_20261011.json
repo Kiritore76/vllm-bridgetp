@@ -1,0 +1,138 @@
+{
+  "dataset_downloads": [
+    {
+      "dataset": "LongProc",
+      "revision": "673ec4c230876e941d674116d66d28783c186b15",
+      "file": "README.md",
+      "url": "https://raw.githubusercontent.com/princeton-pli/LongProc/673ec4c230876e941d674116d66d28783c186b15/README.md",
+      "bytes": 5845,
+      "sha256": "068acee39e23f3f4ac1138f47cbef80084143314fb4af979dd68ad7467bcc2c9"
+    },
+    {
+      "dataset": "LongProc",
+      "revision": "673ec4c230876e941d674116d66d28783c186b15",
+      "file": "LICENSE",
+      "url": "https://raw.githubusercontent.com/princeton-pli/LongProc/673ec4c230876e941d674116d66d28783c186b15/LICENSE",
+      "bytes": 11357,
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    {
+      "dataset": "LongProc",
+      "revision": "673ec4c230876e941d674116d66d28783c186b15",
+      "file": "data/html_to_tsv/html_to_tsv_8k.json",
+      "url": "https://raw.githubusercontent.com/princeton-pli/LongProc/673ec4c230876e941d674116d66d28783c186b15/data/html_to_tsv/html_to_tsv_8k.json",
+      "bytes": 1529298,
+      "sha256": "78f24dbdfcbab6188e7aa027b58a2c79da8ab7adb7d1df2a24799538a01364f4"
+    },
+    {
+      "dataset": "LongProc",
+      "revision": "673ec4c230876e941d674116d66d28783c186b15",
+      "file": "data/html_to_tsv/prompts.yaml",
+      "url": "https://raw.githubusercontent.com/princeton-pli/LongProc/673ec4c230876e941d674116d66d28783c186b15/data/html_to_tsv/prompts.yaml",
+      "bytes": 2116,
+      "sha256": "1192cf2432084b49aff6ec8e0f1ed4f8b56f926826849041711b3733d2fe4dbb"
+    },
+    {
+      "dataset": "LongProc",
+      "revision": "673ec4c230876e941d674116d66d28783c186b15",
+      "file": "longproc/longproc_data.py",
+      "url": "https://raw.githubusercontent.com/princeton-pli/LongProc/673ec4c230876e941d674116d66d28783c186b15/longproc/longproc_data.py",
+      "bytes": 16970,
+      "sha256": "d9c2f1b383aa83e56751875a2612b858be3765b0c692261bbfd42348de388b49"
+    },
+    {
+      "dataset": "LongProc",
+      "revision": "673ec4c230876e941d674116d66d28783c186b15",
+      "file": "longproc/html_to_tsv_evaluator.py",
+      "url": "https://raw.githubusercontent.com/princeton-pli/LongProc/673ec4c230876e941d674116d66d28783c186b15/longproc/html_to_tsv_evaluator.py",
+      "bytes": 3849,
+      "sha256": "36ef6459595da82bc5c721169fa266c0e2425eb2adb1f1535d6b558733134216"
+    },
+    {
+      "dataset": "LongProc",
+      "revision": "673ec4c230876e941d674116d66d28783c186b15",
+      "file": "data/path_traversal/path_traversal_8k.json",
+      "url": "https://raw.githubusercontent.com/princeton-pli/LongProc/673ec4c230876e941d674116d66d28783c186b15/data/path_traversal/path_traversal_8k.json",
+      "bytes": 24527986,
+      "sha256": "39ae8ec2adc0cc3ab1e3cdd884a4c6783c88ed5b0cb0312382368ca55c39b0a4"
+    },
+    {
+      "dataset": "LongProc",
+      "revision": "673ec4c230876e941d674116d66d28783c186b15",
+      "file": "data/path_traversal/prompts.yaml",
+      "url": "https://raw.githubusercontent.com/princeton-pli/LongProc/673ec4c230876e941d674116d66d28783c186b15/data/path_traversal/prompts.yaml",
+      "bytes": 2839,
+      "sha256": "8625b1fe0c77b667b20bb2533b4116192f47aafb9069b0aa2295adb46cc7d685"
+    },
+    {
+      "dataset": "LongGenBench",
+      "revision": "45c320e11fb5b6589f787011caa4313ff6600275",
+      "file": "README.md",
+      "url": "https://raw.githubusercontent.com/mozhu621/LongGenBench/45c320e11fb5b6589f787011caa4313ff6600275/README.md",
+      "bytes": 3620,
+      "sha256": "64d986ecbf6b50a00afe456d1edc2308dd6bcf7dd6a3e3fb5872119ea254e69d"
+    },
+    {
+      "dataset": "LongGenBench",
+      "revision": "45c320e11fb5b6589f787011caa4313ff6600275",
+      "file": "Dataset/Dataset_short.json",
+      "url": "https://raw.githubusercontent.com/mozhu621/LongGenBench/45c320e11fb5b6589f787011caa4313ff6600275/Dataset/Dataset_short.json",
+      "bytes": 1474710,
+      "sha256": "3cf98c4badc330a93d1010f57f6658b09f2ebc2e6428a3df083b652d902d96e8"
+    },
+    {
+      "dataset": "LongGenBench",
+      "revision": "45c320e11fb5b6589f787011caa4313ff6600275",
+      "file": "Dataset/Dataset_long.json",
+      "url": "https://raw.githubusercontent.com/mozhu621/LongGenBench/45c320e11fb5b6589f787011caa4313ff6600275/Dataset/Dataset_long.json",
+      "bytes": 1244214,
+      "sha256": "f61048da5ecfb1b717584af8b2dc5999198459e9b95aceedde2dcc6f5cdd35e7"
+    },
+    {
+      "dataset": "LongProc",
+      "revision": "673ec4c230876e941d674116d66d28783c186b15",
+      "file": "data/html_to_tsv/webpage/W205_8k_1.html",
+      "url": "https://raw.githubusercontent.com/princeton-pli/LongProc/673ec4c230876e941d674116d66d28783c186b15/data/html_to_tsv/webpage/W205_8k_1.html",
+      "bytes": 40420,
+      "sha256": "646ccbe63c74e8085f55867153b6150466a17dae8bb383ce944a465d7eb32a6b"
+    },
+    {
+      "dataset": "LongProc",
+      "revision": "673ec4c230876e941d674116d66d28783c186b15",
+      "file": "data/html_to_tsv/webpage/W261_8k_1.html",
+      "url": "https://raw.githubusercontent.com/princeton-pli/LongProc/673ec4c230876e941d674116d66d28783c186b15/data/html_to_tsv/webpage/W261_8k_1.html",
+      "bytes": 24691,
+      "sha256": "5a47ff73e8b20f7796d706287f0c242573352894ede277538767a7a0352c58fc"
+    }
+  ],
+  "local_tokenizer_config_sha256": "5b5d4f65d0acd3b2d56a35b56d374a36cbc1c8fa5cf3b3febbbfabf22f359583",
+  "local_tokenizer_sha256": "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539",
+  "selection": "HTML: smallest source page, unfiltered; route: maximum reference token length; diary and menu: first original short-config task in each family. No generation results used.",
+  "prompt_adapted": false,
+  "budgets": [
+    {
+      "id": "predictor-targeted4-public-v1-20261011-html_to_tsv",
+      "prompt_tokens": 9348,
+      "output_cap": 11000,
+      "total_reserved": 20364
+    },
+    {
+      "id": "predictor-targeted4-public-v1-20261011-path_traversal",
+      "prompt_tokens": 12783,
+      "output_cap": 11000,
+      "total_reserved": 23799
+    },
+    {
+      "id": "predictor-targeted4-public-v1-20261011-diary",
+      "prompt_tokens": 655,
+      "output_cap": 18432,
+      "total_reserved": 19103
+    },
+    {
+      "id": "predictor-targeted4-public-v1-20261011-menu",
+      "prompt_tokens": 805,
+      "output_cap": 18432,
+      "total_reserved": 19253
+    }
+  ]
+}
