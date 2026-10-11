@@ -35,9 +35,11 @@ class DistributionPredictor:
         if digest.hexdigest() != checkpoint_sha256:
             raise ValueError("predictor checkpoint SHA-256 differs")
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-        if checkpoint.get("format_version") != 2 or checkpoint.get(
-            "model_type"
-        ) != "remaining_length_categorical":
+        model_type = checkpoint.get("model_type")
+        if checkpoint.get("format_version") != 2 or model_type not in {
+            "remaining_length_categorical",
+            "remaining_length_categorical_mlp4",
+        }:
             raise ValueError("unsupported predictor checkpoint format")
         if checkpoint.get("feature_layer") != feature_layer:
             raise ValueError("predictor feature layer differs")
@@ -46,7 +48,9 @@ class DistributionPredictor:
         if checkpoint.get("overflow_category") is not True:
             raise ValueError("predictor needs an open tail category")
         self.feature_layer = feature_layer
+        self.model_type = model_type
         self.checkpoint_sha256 = checkpoint_sha256
+        self.model_config_sha256 = model_config_sha256
         self.capture_input_sha256 = checkpoint["capture_input_sha256"]
         self.device = torch.device(device)
 
@@ -81,12 +85,25 @@ class DistributionPredictor:
         self.feature_mean = mean.to(self.device)
         self.feature_std = std.to(self.device)
         self.category_upper_edges = edges.to(self.device)
-        self.model = nn.Sequential(
-            nn.Linear(input_width, width),
-            nn.GELU(),
-            nn.Dropout(float(checkpoint["dropout"])),
-            nn.Linear(width, edges.numel() + 1),
-        ).to(self.device)
+        depth = 4 if model_type.endswith("mlp4") else 2
+        widths = [width, 2 * width, width] if depth == 4 else [width]
+        if (
+            checkpoint.get("network_depth", depth) != depth
+            or checkpoint.get("hidden_widths", widths) != widths
+        ):
+            raise ValueError("predictor declared architecture differs")
+        dropout = float(checkpoint["dropout"])
+        if not math.isfinite(dropout) or not 0 <= dropout < 1:
+            raise ValueError("invalid predictor dropout")
+        self.network_depth = depth
+        layers = []
+        for next_width in widths:
+            layers.extend(
+                (nn.Linear(input_width, next_width), nn.GELU(), nn.Dropout(dropout))
+            )
+            input_width = next_width
+        layers.append(nn.Linear(input_width, edges.numel() + 1))
+        self.model = nn.Sequential(*layers).to(self.device)
         self.model.load_state_dict(checkpoint["state_dict"], strict=True)
         self.model.eval()
 

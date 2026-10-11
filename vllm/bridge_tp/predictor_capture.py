@@ -304,6 +304,12 @@ class PredictorLiveObserver(PredictorFeatureCapture):
             feature_layer="decoder:31",
             device=device,
         )
+        feature_directory = os.environ.get("BRIDGETP_PREDICTOR_FEATURE_JOURNAL")
+        self._feature_journal = None
+        if feature_directory:
+            from vllm.bridge_tp.async_journal import FeatureJournal
+
+            self._feature_journal = FeatureJournal(Path(feature_directory))
         diagnostic = os.environ.get("BRIDGETP_PREDICTOR_DIAGNOSTIC_DIR")
         self._diagnostic_dir = Path(diagnostic) if diagnostic else None
         self._diagnostic_limit = int(
@@ -336,6 +342,9 @@ class PredictorLiveObserver(PredictorFeatureCapture):
                     "kind": "predictor_header",
                     "format_version": 1,
                     "checkpoint_sha256": checkpoint_sha256,
+                    "model_type": self.predictor.model_type,
+                    "network_depth": self.predictor.network_depth,
+                    "feature_journal_enabled": self._feature_journal is not None,
                     "capture_input_sha256": self.predictor.capture_input_sha256,
                     "model_config_sha256": digest,
                     "feature_layer": self.feature_layer,
@@ -418,7 +427,14 @@ class PredictorLiveObserver(PredictorFeatureCapture):
             ready = torch.cuda.Event()
             ready.record(torch.cuda.current_stream())
         try:
-            self._pending.put_nowait((snapshot, ready, rows, captured_unix_ns))
+            boundaries = [{
+                "phase": row.phase,
+                "computed_prompt_tokens": int(computed_prompt_tokens[row.batch_index]),
+                "scheduled_tokens": int(scheduled_tokens[row.batch_index]),
+                "prompt_tokens": int(prompt_tokens[row.batch_index]),
+            } for row in rows]
+            self._pending.put_nowait((
+                snapshot, ready, rows, captured_unix_ns, boundaries))
         except queue.Full as exc:
             raise RuntimeError("live predictor event queue is full") from exc
         for row in rows:
@@ -436,7 +452,7 @@ class PredictorLiveObserver(PredictorFeatureCapture):
             try:
                 if item is None:
                     return
-                snapshot, ready, rows, captured_unix_ns = item
+                snapshot, ready, rows, captured_unix_ns, boundaries = item
                 counts = torch.tensor(
                     [row.generated_tokens for row in rows], dtype=torch.float32
                 )
@@ -462,7 +478,28 @@ class PredictorLiveObserver(PredictorFeatureCapture):
                             done = torch.cuda.Event()
                             done.record(self._compute_stream)
                         done.synchronize()
-                self._publish(rows, host.tolist(), captured_unix_ns)
+                feature_id = None
+                if self._feature_journal is not None:
+                    feature_id = f"feature-{os.getpid()}-{captured_unix_ns}"
+                    if self._compute_stream is not None:
+                        with torch.cuda.stream(self._compute_stream):
+                            feature = snapshot.to(torch.float16).cpu()
+                    else:
+                        feature = snapshot.to(torch.float16).cpu()
+                    self._feature_journal.submit(feature_id, {
+                        "hidden_fp16": feature,
+                        "generated_tokens": counts.cpu(), "probabilities": host,
+                        "request_ids": [row.request_id for row in rows],
+                        "captured_unix_ns": captured_unix_ns,
+                        "checkpoint_sha256": self.predictor.checkpoint_sha256,
+                        "feature_layer": self.feature_layer,
+                        "sampling_boundaries": boundaries,
+                        "model_config_sha256": self.predictor.model_config_sha256,
+                        "model_type": self.predictor.model_type,
+                        "category_upper_edges": (
+                            self.predictor.category_upper_edges.cpu()),
+                    })
+                self._publish(rows, host.tolist(), captured_unix_ns, feature_id)
                 if (
                     self._diagnostic_dir
                     and self._diagnostic_count < self._diagnostic_limit
@@ -492,7 +529,8 @@ class PredictorLiveObserver(PredictorFeatureCapture):
             finally:
                 self._pending.task_done()
 
-    def _publish(self, rows, probability_rows, captured_unix_ns: int) -> None:
+    def _publish(self, rows, probability_rows, captured_unix_ns: int,
+                 feature_id: str | None = None) -> None:
         published_unix_ns = time.time_ns()
         for row, probabilities in zip(rows, probability_rows):
             if (
@@ -518,6 +556,7 @@ class PredictorLiveObserver(PredictorFeatureCapture):
                         "checkpoint_sha256": self.predictor.checkpoint_sha256,
                         "captured_unix_ns": captured_unix_ns,
                         "published_unix_ns": published_unix_ns,
+                        "feature_id": feature_id,
                     }
                 )
                 + "\n"
@@ -531,7 +570,11 @@ class PredictorLiveObserver(PredictorFeatureCapture):
         try:
             self._check_worker()
         finally:
-            self._events.close()
+            try:
+                if self._feature_journal is not None:
+                    self._feature_journal.close()
+            finally:
+                self._events.close()
 
 
 def predictor_observer_from_environment(

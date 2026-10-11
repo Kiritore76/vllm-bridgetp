@@ -33,6 +33,9 @@ from tools.bridge_tp.experiment_probability_gate import (  # noqa: E402
     urgency_eligibility,
 )
 from tools.bridge_tp.risk_observation import build_risk_observation  # noqa: E402
+from tools.bridge_tp.target_observation import (  # noqa: E402
+    TargetObserver, state_eligibility,
+)
 from tools.bridge_tp.risk_urgency import (  # noqa: E402
     DecodeRateTracker,
     build_snapshot,
@@ -1623,6 +1626,9 @@ def main() -> None:
         )
 
         table = SurvivalTable.load(config.survival_table_path)
+        target_observer = (
+            TargetObserver(run_dir.parent / "background/target_native_events.jsonl")
+            if os.environ.get("BRIDGETP_TARGET_OBSERVATION") == "1" else None)
         policy = FastPolicy(
             config.policy,
             table,
@@ -1830,6 +1836,9 @@ def main() -> None:
                     "unix_s": time.time(),
                 }
                 audit.write(telemetry_row)
+                target_observation = (
+                    target_observer.snapshot(time.time(), pool4.__dict__)
+                    if target_observer else None)
                 m5_row: dict[str, Any] | None = None
                 if manager_m5 is not None:
                     headroom_tokens = (
@@ -1944,6 +1953,8 @@ def main() -> None:
                         model_config_sha256=args.risk_model_config_sha256,
                     ).to_json()
                     risk_snapshot["tick"] = tick
+                    if target_observation is not None:
+                        risk_snapshot["target_observation"] = target_observation
                     audit.write(risk_snapshot)
                     if probability_gate is not None:
                         eligibility_errors = source_load_eligibility(
@@ -1951,6 +1962,20 @@ def main() -> None:
                         ) + urgency_eligibility(
                             risk_snapshot, args.probability_min_urgency,
                         )
+                        maximum_u = os.environ.get("BRIDGETP_BENEFIT_MAX_URGENCY")
+                        if maximum_u and (
+                            risk_snapshot.get("U") is None
+                            or risk_snapshot["U"] > float(maximum_u)
+                        ):
+                            eligibility_errors += ("planned maximum U exceeded",)
+                        if target_observation is not None:
+                            eligibility_errors += state_eligibility(
+                                target_observation,
+                                os.environ.get("BRIDGETP_BENEFIT_TARGET_STATE", "any"),
+                                float(os.environ.get("BRIDGETP_TARGET_DECODE_MIN", 1)),
+                                int(os.environ.get(
+                                    "BRIDGETP_TARGET_PREFILL_MIN", 1024)),
+                            )
                         gate_row = probability_gate.observe(
                             risk_snapshot, tick, eligibility_errors,
                         )

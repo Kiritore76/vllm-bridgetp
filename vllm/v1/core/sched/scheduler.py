@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -2073,6 +2074,13 @@ class Scheduler(SchedulerInterface):
         )
         pending_prefill = None
         unallocated_prefill = None
+        pending_prefill_tokens = None
+        if os.environ.get("BRIDGETP_TARGET_OBSERVATION") == "1":
+            pending_prefill_tokens = sum(
+                max(0, min(request.num_prompt_tokens, self.max_model_len)
+                    - request.num_computed_tokens)
+                for request in self.requests.values()
+            )
         if self._bridgetp_request_freeze is not None:
             pending_prefill = sum(
                 (
@@ -2098,6 +2106,10 @@ class Scheduler(SchedulerInterface):
             num_skipped_waiting_reqs=len(self.skipped_waiting),
             kv_cache_usage=self.kv_cache_manager.usage,
             bridgetp_prefill_pending_kv_tokens=pending_prefill,
+            bridgetp_prefill_pending_tokens=pending_prefill_tokens,
+            bridgetp_target_observation_unix_s=(
+                time.time() if pending_prefill_tokens is not None else None
+            ),
             bridgetp_prefill_unallocated_kv_tokens=unallocated_prefill,
             bridgetp_prefill_scheduled_tokens=(
                 self._bridgetp_prefill_scheduled_tokens

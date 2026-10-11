@@ -47,6 +47,22 @@ SCENARIOS = (
     ("D_guard_busy", True, True, ("migrate", "stay")),
 )
 
+PREDICTOR_PROFILES = {
+    "seed44": EXPECTED_SHAS["checkpoint"],
+    "risk76_mlp4":
+        "dbe02d968e19c32d69deaa9a37748e9ca68f506807b220c114d22a4e2845c8a7",
+}
+
+
+def checkpoint_contract(args: argparse.Namespace) -> str:
+    """Select an immutable predictor identity, without accepting arbitrary SHAs."""
+    profile = getattr(args, "predictor_profile", "seed44")
+    if profile not in PREDICTOR_PROFILES:
+        raise ValueError("unknown predictor profile")
+    if profile != "seed44" and not getattr(args, "probability_pilot", False):
+        raise ValueError("new predictor profile requires probability collection")
+    return PREDICTOR_PROFILES[profile]
+
 
 def guard_contract(args: argparse.Namespace) -> tuple[int, str]:
     profile = getattr(args, "guard_profile", "legacy8448")
@@ -140,6 +156,8 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             expected = guard_sha
         if name == "reference":
             expected = reference_sha
+        if name == "checkpoint":
+            expected = checkpoint_contract(args)
         if name == "input" and getattr(args, "constructed_workload", False):
             if not getattr(args, "probability_pilot", False):
                 raise ValueError(
@@ -156,6 +174,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         "gpu_uuids": uuids,
         "gpu_models": names,
         "portable_hardware": portable_hardware,
+        "predictor_profile": getattr(args, "predictor_profile", "seed44"),
         "paths": {name: str(path.resolve()) for name, path in paths.items()},
         "sha256": measured,
         "model_config_sha256": measured["model_config"],
@@ -336,7 +355,7 @@ def online_command(args: argparse.Namespace, setup: dict[str, Any],
         "--manager-m3-commit", "--manager-m4-cancel",
         "--manager-m5-predictor-shadow",
         "--predictor-checkpoint", str(args.checkpoint),
-        "--predictor-checkpoint-sha256", EXPECTED_SHAS["checkpoint"],
+        "--predictor-checkpoint-sha256", checkpoint_contract(args),
         "--m2-low-gib-s", "0.5", "--m2-medium-gib-s", "2.4",
         "--m2-high-gib-s", "8.0",
         "--source-pressure", "--minimum-ready-source-jobs",

@@ -184,6 +184,8 @@ class SchedulerStats:
     # BridgeTP source-capacity telemetry. Pending prefill is an upper-bound
     # reservation; scheduled counts describe work since the previous report.
     bridgetp_prefill_pending_kv_tokens: int | None = None
+    bridgetp_prefill_pending_tokens: int | None = None
+    bridgetp_target_observation_unix_s: float | None = None
     bridgetp_prefill_unallocated_kv_tokens: int | None = None
     bridgetp_prefill_scheduled_tokens: int = 0
     bridgetp_decode_scheduled_tokens: int = 0

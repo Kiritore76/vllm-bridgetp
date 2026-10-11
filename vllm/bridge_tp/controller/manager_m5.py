@@ -151,6 +151,7 @@ class PredictorEventReader:
         position = row["generated_tokens"]
         result.update({
             "probabilities": row["probabilities"],
+            "feature_id": row.get("feature_id"),
             "category_upper_edges": self._header["category_upper_edges"],
             "captured_unix_ns": row["captured_unix_ns"],
         })

@@ -838,6 +838,9 @@ def run(
 
         source_env = common.source_environment(args, run_id, server_dir)
         source_env.update(source_env_overrides or {})
+        if base_env.get("BRIDGETP_SAVE_PREDICTOR_FEATURES") == "1":
+            source_env["BRIDGETP_PREDICTOR_FEATURE_JOURNAL"] = str(
+                controller_dir / "predictor_features")
         source_command = common.server_command(args, 1, args.tp1_port)
         if bool(getattr(args, "force_source_eager", False)):
             source_command.append("--enforce-eager")

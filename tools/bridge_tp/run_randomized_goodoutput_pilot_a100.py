@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import random
 import sys
 import tarfile
@@ -57,6 +58,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--probability-pilot", action="store_true")
+    parser.add_argument("--predictor-profile", choices=("seed44", "risk76_mlp4"),
+                        default="seed44")
+    parser.add_argument("--benefit-target-state",
+                        choices=("any", "idle", "decode", "prefill"), default="any")
+    parser.add_argument("--target-decode-pressure-min", type=float, default=1.0)
+    parser.add_argument("--target-prefill-min-tokens", type=int, default=1024)
+    parser.add_argument("--probability-max-urgency", type=float)
+    parser.add_argument("--save-predictor-features", action="store_true")
+    parser.add_argument("--target-arrival-wave-period-s", type=float)
     parser.add_argument("--guard-profile", choices=("legacy8448", "reduced2000"),
                         default="legacy8448",
                         help="Pin the guard value and file SHA for this collection")
@@ -448,8 +458,11 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
                             f"{seed}:{name}:{job['job_id']}:{wave}"
                         ).random() if getattr(args, "random_arrivals", False)
                             else 0.5)
-                        planned = wave * period_s + (
-                            index + phase) * period_s / pool_count
+                        pool_period = (getattr(
+                            args, "target_arrival_wave_period_s", None)
+                            if job["pool"] == "target" else None) or period_s
+                        planned = wave * pool_period + (
+                            index + phase) * pool_period / pool_count
                     if planned < arrival_window_s:
                         scheduled.append((job, planned))
                 if not scheduled:
@@ -497,7 +510,9 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
             if (not jobs or any(
                     max((job["start_after_s"] for job in jobs
                          if job["pool"] == pool), default=-1)
-                    < arrival_window_s - period_s / count
+                    < arrival_window_s - ((getattr(
+                        args, "target_arrival_wave_period_s", None)
+                        if pool == "target" else None) or period_s) / count
                     for pool, count in (("source", source_count),
                                         ("target", target_count)) if count > 0)):
                 raise ValueError("arrival schedule does not cover the window")
@@ -741,7 +756,7 @@ def cross_context_smoke_result(*, runner_rc: int, source: dict[str, Any],
     }
 
 
-def probability_artifact_errors(run: Path) -> list[str]:
+def probability_artifact_errors(run: Path, *, require_features=False) -> list[str]:
     """Reject missing or corrupt run evidence before computing any service label."""
     errors = []
     required = [
@@ -772,6 +787,27 @@ def probability_artifact_errors(run: Path) -> list[str]:
                 raise ValueError("expected nonempty object records")
         except (OSError, UnicodeError, ValueError) as error:
             errors.append(f"invalid run artifact: {relative}: {error}")
+    if require_features:
+        receipt_path = run / "controller/predictor_features/receipt.json"
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            if (receipt.get("dropped_batches") or receipt.get("writer_error")
+                    or not receipt.get("saved_batches")):
+                errors.append("predictor feature journal incomplete")
+            elif (len(list(receipt_path.parent.glob("*.pt")))
+                  != receipt["saved_batches"]):
+                errors.append("predictor feature batch count differs")
+        except (OSError, ValueError):
+            errors.append("predictor feature receipt missing or invalid")
+        target_path = run / "background/target_native_events.jsonl"
+        try:
+            footer = json.loads(target_path.read_text(
+                encoding="utf-8").splitlines()[-1])
+            if (footer.get("kind") != "evidence_footer" or footer.get("dropped")
+                    or footer.get("writer_error")):
+                errors.append("target native evidence incomplete")
+        except (OSError, ValueError, IndexError):
+            errors.append("target native evidence receipt missing or invalid")
     return errors
 
 
@@ -842,7 +878,8 @@ def collect_arm(args: argparse.Namespace, root: Path,
         write_json(case_root / f"{action}.result.json", result)
         return result
     if getattr(args, "probability_pilot", False):
-        artifact_errors = probability_artifact_errors(run)
+        artifact_errors = probability_artifact_errors(
+            run, require_features=getattr(args, "save_predictor_features", False))
         if artifact_errors:
             result = {
                 "assigned_action": action.split("_")[2],
@@ -1273,6 +1310,8 @@ def probability_results(summary: dict[str, Any]) -> dict[str, Any]:
                     "start_candidate": candidate,
                     "stay_candidate": control,
                     "descriptive_delta_tokens_s": (start_g - stay_g if valid else None),
+                    "start_quality_output_tokens_s": start_g,
+                    "stay_quality_output_tokens_s": stay_g,
                     "policy_delta_tokens_s": (
                         start_g - stay_g
                         if start_g is not None and stay_g is not None
@@ -1319,6 +1358,40 @@ def select_probability_arms(
 
 
 def execute_pilot(args: argparse.Namespace) -> None:
+    if getattr(args, "save_predictor_features", False) and not args.probability_pilot:
+        raise ValueError("feature journaling requires probability collection")
+    if getattr(args, "predictor_profile", "seed44") == "risk76_mlp4":
+        if (not args.probability_pilot or args.slo_profile != "slow1pct_soft"
+                or args.guard_profile != "reduced2000"):
+            raise ValueError("risk76 collection requires probability/soft1pct/2000")
+        os.environ["BRIDGETP_TARGET_OBSERVATION"] = "1"
+    target_state = getattr(args, "benefit_target_state", "any")
+    if target_state != "any":
+        if not args.probability_pilot:
+            raise ValueError("target state selection needs probability mode")
+        os.environ["BRIDGETP_TARGET_OBSERVATION"] = "1"
+    os.environ["BRIDGETP_BENEFIT_TARGET_STATE"] = target_state
+    maximum_u = getattr(args, "probability_max_urgency", None)
+    if maximum_u is not None and (
+        not math.isfinite(maximum_u) or maximum_u < args.probability_min_urgency
+    ):
+        raise ValueError("maximum urgency must be finite and >= minimum")
+    os.environ["BRIDGETP_BENEFIT_MAX_URGENCY"] = (
+        str(maximum_u) if maximum_u is not None else "")
+    pressure = getattr(args, "target_decode_pressure_min", 1.0)
+    prefill = getattr(args, "target_prefill_min_tokens", 1024)
+    if not math.isfinite(pressure) or pressure <= 0 or prefill <= 0:
+        raise ValueError("target observation thresholds must be positive")
+    os.environ["BRIDGETP_TARGET_DECODE_MIN"] = str(pressure)
+    os.environ["BRIDGETP_TARGET_PREFILL_MIN"] = str(prefill)
+    os.environ["BRIDGETP_SAVE_PREDICTOR_FEATURES"] = (
+        "1" if getattr(args, "save_predictor_features", False) else "0")
+    target_period = getattr(args, "target_arrival_wave_period_s", None)
+    if target_period is not None and (
+        not math.isfinite(target_period) or target_period <= 0
+        or args.arrival_window_s is None or target_period >= args.arrival_window_s
+    ):
+        raise ValueError("target period needs a positive fixed arrival window")
     if getattr(args, 'rolling_cutover', False) and (
         not args.probability_pilot or args.rolling_reserve_tokens < 64
     ):
@@ -1463,6 +1536,13 @@ def execute_pilot(args: argparse.Namespace) -> None:
             else "HARD_SLO_OUTPUT"
         ),
         "probability_min_urgency": minimum_u,
+        "probability_max_urgency": maximum_u,
+        "predictor_profile": getattr(args, "predictor_profile", "seed44"),
+        "benefit_target_state": target_state,
+        "target_observation_version": (
+            "TARGET_OBSERVATION_V1"
+            if os.environ.get("BRIDGETP_TARGET_OBSERVATION") == "1" else None),
+        "predictor_features_required": getattr(args, "save_predictor_features", False),
         "collection_id": hashlib.sha256(json.dumps(
             {"protocol": protocol, "manifests": setup["manifests"]},
             sort_keys=True).encode()).hexdigest(),

@@ -535,6 +535,22 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         self.gauge_bridgetp_prefill_pending = create_metric_per_engine(
             pending_prefill, per_engine_labelvalues
         )
+        pending_tokens = self._gauge_cls(
+            name="vllm:bridgetp_prefill_pending_tokens",
+            documentation="Unprocessed prompt tokens, without KV block rounding.",
+            multiprocess_mode="mostrecent", labelnames=labelnames,
+        )
+        self.gauge_bridgetp_prefill_pending_tokens = create_metric_per_engine(
+            pending_tokens, per_engine_labelvalues
+        )
+        observation_time = self._gauge_cls(
+            name="vllm:bridgetp_target_observation_unix_s",
+            documentation="Engine timestamp of target work observations.",
+            multiprocess_mode="mostrecent", labelnames=labelnames,
+        )
+        self.gauge_bridgetp_target_observation_time = create_metric_per_engine(
+            observation_time, per_engine_labelvalues
+        )
         unallocated = self._gauge_cls(
             name="vllm:bridgetp_prefill_unallocated_kv_tokens",
             documentation="Prompt KV tokens not yet allocated, single KV group.",
@@ -1113,6 +1129,16 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 scheduler_stats.num_skipped_waiting_reqs
             )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+            self.gauge_bridgetp_prefill_pending_tokens[engine_idx].set(
+                scheduler_stats.bridgetp_prefill_pending_tokens
+                if scheduler_stats.bridgetp_prefill_pending_tokens is not None
+                else -1
+            )
+            self.gauge_bridgetp_target_observation_time[engine_idx].set(
+                scheduler_stats.bridgetp_target_observation_unix_s
+                if scheduler_stats.bridgetp_target_observation_unix_s is not None
+                else -1
+            )
             if scheduler_stats.bridgetp_prefill_pending_kv_tokens is not None:
                 self.gauge_bridgetp_prefill_pending[engine_idx].set(
                     scheduler_stats.bridgetp_prefill_pending_kv_tokens

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 import threading
@@ -160,6 +161,11 @@ def main() -> None:
     event_lock = threading.Lock()
     start_monotonic = time.monotonic()
     start_unix_s = time.time()
+    live = None
+    if os.environ.get("BRIDGETP_TARGET_OBSERVATION") == "1":
+        from vllm.bridge_tp.async_journal import AsyncJournal
+
+        live = AsyncJournal(out_dir / "target_native_events.jsonl")
 
     def event(value: dict[str, Any]) -> None:
         record = {"unix_s": time.time(), **value}
@@ -194,6 +200,10 @@ def main() -> None:
                "start_after_s": start_after_s,
                "schedule_lag_s": schedule_lag_s})
         request_started_unix_s = time.time()
+        if live and job["pool"] == "target":
+            live.submit({"kind": "native_arrival", "job_id": job_id,
+                         "unix_s": request_started_unix_s,
+                         "prompt_tokens": len(request["prompt"])})
         token_times: list[float] = []
 
         def record_token(_index: int, _token_id: int, unix_s: float) -> None:
@@ -205,6 +215,10 @@ def main() -> None:
                         "pool": job["pool"],
                     }
                 )
+            if live and job["pool"] == "target" and token_times:
+                live.submit({"kind": "native_itl", "job_id": job_id,
+                             "unix_s": unix_s, "itl_s": unix_s - token_times[-1],
+                             "tpot_reference_s": 0.1})
             token_times.append(unix_s)
         try:
             result = post_streaming_completion(
@@ -231,6 +245,7 @@ def main() -> None:
                     json.dumps(result["token_ids"], separators=(",", ":"))
                     .encode("ascii")
                 ).hexdigest(),
+                "token_ids": result["token_ids"] if live else None,
                 "request_started_unix_s": request_started_unix_s,
                 "first_token_unix_s": token_times[0] if token_times else None,
                 "last_token_unix_s": token_times[-1] if token_times else None,
@@ -282,6 +297,8 @@ def main() -> None:
     with ThreadPoolExecutor(max_workers=min(128, len(ordered_jobs))) as executor:
         futures = [executor.submit(run_job, job) for job in ordered_jobs]
         results = [future.result() for future in as_completed(futures)]
+    if live:
+        live.close()
     summary = {
         "format_version": 1,
         "jobs": len(results),
