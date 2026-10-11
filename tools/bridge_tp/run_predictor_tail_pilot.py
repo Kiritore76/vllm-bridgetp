@@ -1,4 +1,4 @@
-"""Collect twelve independent natural-EOS tasks to test long-output recipes."""
+"""Collect independent natural-EOS tasks to test long-output recipes."""
 
 import argparse
 import hashlib
@@ -10,10 +10,16 @@ from collections import Counter
 from pathlib import Path
 
 from predictor_progress import emit
+from predictor_tail_workload import VERSION as WORKLOAD_VERSION
+from predictor_tail_workload import recipe as workload_recipe
 
 MAX_MODEL_LEN = 24576
 MAX_OUTPUT_TOKENS = 18432
 RECIPE_VERSION = "tail12-natural-v1-20261011"
+PROFILES = {
+    "tail12": (RECIPE_VERSION, 6, 3),
+    "workload6": (WORKLOAD_VERSION, 4, 2),
+}
 
 # Each task has a distinct subject; language partners are not translations.
 TASKS = [
@@ -154,8 +160,12 @@ TASKS = [
 ]
 
 
-def recipe():
+def recipe(recipe_profile="tail12"):
     """Return fixed tasks; target ranges express intentions, never labels."""
+    if recipe_profile == "workload6":
+        return workload_recipe()
+    if recipe_profile != "tail12":
+        raise ValueError("unknown tail recipe profile")
     rows = []
     for number, (lang, target, kind, title, components) in enumerate(TASKS, 1):
         sections = 12 if target == "8193-12288" else 16
@@ -218,13 +228,13 @@ def serialized(rows):
     ).encode("utf-8")
 
 
-def prepare(out_dir, tokenizer, config):
+def prepare(out_dir, tokenizer, config, *, recipe_profile="tail12"):
     """Check every actual prompt budget before launching the capture engine."""
     if config.get("max_position_embeddings", 0) < MAX_MODEL_LEN:
         raise ValueError("model configuration cannot support pilot context length")
     if out_dir.exists() and any(out_dir.iterdir()):
         raise ValueError("pilot output must be new or empty; old data are preserved")
-    rows = recipe()
+    rows = recipe(recipe_profile)
     budgets = []
     for row in rows:
         prompt_ids = tokenizer.apply_chat_template(
@@ -240,7 +250,8 @@ def prepare(out_dir, tokenizer, config):
     input_path = out_dir / "input_requests.jsonl"
     input_path.write_bytes(payload)
     manifest = {
-        "recipe_version": RECIPE_VERSION,
+        "recipe_version": PROFILES[recipe_profile][0],
+        "recipe_profile": recipe_profile,
         "requests": len(rows),
         "input_sha256": hashlib.sha256(payload).hexdigest(),
         "max_model_len": MAX_MODEL_LEN,
@@ -274,9 +285,9 @@ def length_band(tokens):
     return ">16384"
 
 
-def summarize(out_dir, tokenizer, *, capture_returncode):
+def summarize(out_dir, tokenizer, *, capture_returncode, recipe_profile="tail12"):
     """Preserve partial responses and report natural and censored counts apart."""
-    inputs = {row["id"]: row for row in recipe()}
+    inputs = {row["id"]: row for row in recipe(recipe_profile)}
     label_path = out_dir / "capture/labels.jsonl"
     labels = (
         [
@@ -324,11 +335,13 @@ def summarize(out_dir, tokenizer, *, capture_returncode):
     # This is a recipe-development gate, not an acceptance test for a predictor.
     lower_hits = sum(natural[b] for b in ("8193-12288", "12289-16384", ">16384"))
     upper_hits = sum(natural[b] for b in ("12289-16384", ">16384"))
-    promising = complete and lower_hits >= 6 and upper_hits >= 3
+    _, minimum_lower, minimum_upper = PROFILES[recipe_profile]
+    promising = complete and lower_hits >= minimum_lower and upper_hits >= minimum_upper
     result = {
         "status": "COLLECTION_COMPLETE" if complete else "INCOMPLETE_DIAGNOSTIC",
         "capture_returncode": capture_returncode,
         "planned_requests": len(inputs),
+        "recipe_profile": recipe_profile,
         "completed_requests": len(seen),
         "natural_eos_by_output_band": dict(natural),
         "censored_observed_lower_bounds_by_band": dict(censored),
@@ -336,7 +349,9 @@ def summarize(out_dir, tokenizer, *, capture_returncode):
         "natural_gt8192": lower_hits,
         "natural_gt12288": upper_hits,
         "recipe_promising_for_expansion": promising,
-        "recipe_gate": "at least 6 natural outputs >8192 and 3 >12288",
+        "recipe_gate": (
+            f"at least {minimum_lower} natural outputs >8192 and {minimum_upper} >12288"
+        ),
         "next_action": (
             "review response quality and length diversity before formal collection"
             if promising
@@ -350,7 +365,7 @@ def summarize(out_dir, tokenizer, *, capture_returncode):
         json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     emit(
-        f"已完成{len(seen)}/12条；自然输出>8192有{lower_hits}条，"
+        f"已完成{len(seen)}/{len(inputs)}条；自然输出>8192有{lower_hits}条，"
         f">12288有{upper_hits}条；配方覆盖{'达到' if promising else '未达到'}试采目标"
     )
     return result
@@ -399,8 +414,9 @@ def main():
     parser.add_argument("--expected-recipe-sha256", required=True)
     parser.add_argument("--expected-gpu-count", required=True, type=int)
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--recipe-profile", choices=tuple(PROFILES), default="tail12")
     args = parser.parse_args()
-    actual_sha = hashlib.sha256(serialized(recipe())).hexdigest()
+    actual_sha = hashlib.sha256(serialized(recipe(args.recipe_profile))).hexdigest()
     if actual_sha != args.expected_recipe_sha256:
         parser.error("preregistered recipe SHA differs")
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
@@ -411,15 +427,23 @@ def main():
     config = json.loads((args.model / "config.json").read_text(encoding="utf-8"))
     from transformers import AutoTokenizer
 
-    emit("正在核对12条新配方与实际tokenizer上下文预算")
+    count = len(recipe(args.recipe_profile))
+    emit(f"正在核对{count}条新配方与实际tokenizer上下文预算")
     tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
-    manifest = prepare(args.out_dir, tokenizer, config)
-    emit("预算通过：12条，decoder:31，20 token采样，自然EOS；本轮只采集")
+    manifest = prepare(
+        args.out_dir, tokenizer, config, recipe_profile=args.recipe_profile
+    )
+    emit(f"预算通过：{count}条，decoder:31，20 token采样，自然EOS；本轮只采集")
     if args.prepare_only:
         return
     started = time.monotonic()
     code = subprocess.call(capture_command(args, manifest))
-    result = summarize(args.out_dir, tokenizer, capture_returncode=code)
+    result = summarize(
+        args.out_dir,
+        tokenizer,
+        capture_returncode=code,
+        recipe_profile=args.recipe_profile,
+    )
     result["collection_wall_time_s"] = time.monotonic() - started
     (args.out_dir / "pilot_summary.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
