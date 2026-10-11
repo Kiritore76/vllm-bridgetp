@@ -146,37 +146,57 @@ def validate_legacy(data: dict, meta: dict, inputs: list[dict]) -> None:
 def write_result_summary(out: Path, report: dict) -> None:
     """Save reviewable paired metrics; completion does not authorize deployment."""
     comparison = report["common_bucket_comparison"]
+    old_mass = report["training_weighting"]["cohorts"]["legacy5000"]["loss_mass"]
+    categories = comparison["categories"]
+    depth = report["training_parameters"].get("network_depth", 2)
+    initialization = report["warmstart_provenance"].get("initialization", "warmstart")
     lines = [
-        "# 84桶混合续训结果", "",
-        "训练完成，新权重仍为离线候选，尚未替换控制器。", "",
+        f"# {depth}层84桶混合训练结果",
+        "",
+        "训练完成，新权重仍为离线候选，尚未替换控制器。",
+        "",
         f"最佳轮次：{report['best_epoch']}；温度：{report['temperature']:.2f}。",
-        "训练权重：旧4000条25%，新300条及首60条的训练请求75%。",
+        f"训练权重：旧4000条{old_mass:.0%}，新增训练请求{1 - old_mass:.0%}。",
         "自然EOS请求的早/中/后期权重30%/40%/30%；截断请求保留下界似然。",
-        "只用新300条验证树选权重及校准；旧验证/测试与首60条仅作诊断。", "",
-        "## 公共76桶的同样本对比", "",
-        "NLL越低越好。下面是相同桶划分，不直接比较旧260类与新84类NLL。", "",
-        "| 数据 | 父模型NLL | 新模型NLL | 新减旧 |",
+        f"初始化：{initialization}。",
+        f"验证策略：{report['validation_scope']}。",
+        "",
+        f"## 公共{categories}桶的同样本对比",
+        "",
+        "NLL越低越好。参考权重仅读取评估，不代表继承。",
+        "",
+        "| 数据 | 参考模型NLL | 新模型NLL | 新减旧 |",
         "|---|---:|---:|---:|",
     ]
     for name, row in comparison["results"].items():
         old, new = row["parent_nll"], row["new_nll"]
         lines.append(f"| {name} | {old:.4f} | {new:.4f} | {new - old:+.4f} |")
     for name in (
-        "selection_validation", "test_new_stage", "legacy5000_test_diagnostic"
+        "selection_validation",
+        "test_new_stage",
+        "legacy5000_test_diagnostic",
     ):
         rows = comparison["progress_by_split"].get(name, {})
-        lines += ["", f"## {name} 按实际生成进度", "",
-                  "| 进度 | 请求数 | 父公共NLL | 新公共NLL | 新90%覆盖 |",
-                  "|---|---:|---:|---:|---:|"]
+        lines += [
+            "",
+            f"## {name} 按实际生成进度",
+            "",
+            "| 进度 | 请求数 | 父公共NLL | 新公共NLL | 新90%覆盖 |",
+            "|---|---:|---:|---:|---:|",
+        ]
         for stage, row in rows.items():
             lines.append(
                 f"| {stage} | {row['requests']} | {row['parent_common_nll']:.4f} | "
                 f"{row['new_common_nll']:.4f} | "
                 f"{row['new_length']['interval90_coverage']:.1%} |"
             )
-    lines += ["", "完整真实桶概率、区间宽度、开放尾占比及长度误差见train/report.json。",
-              "开放尾区间不裁剪成16384，有限宽度和误差只在有限区间上统计。",
-              "查看覆盖率时须同时查看宽度，覆盖提升不等于长度预测更集中。", ""]
+    lines += [
+        "",
+        "完整真实桶概率、区间宽度、开放尾占比及长度误差见train/report.json。",
+        "开放尾区间不裁剪成16384，有限宽度和误差只在有限区间上统计。",
+        "查看覆盖率时须同时查看宽度，覆盖提升不等于长度预测更集中。",
+        "",
+    ]
     (out / "TRAINING_RESULT_CN.md").write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -184,19 +204,58 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--results", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--from-scratch", action="store_true")
+    parser.add_argument("--reference-checkpoint", type=Path)
+    parser.add_argument("--reference-sha256")
+    parser.add_argument("--network-depth", type=int, choices=(2, 4), default=2)
+    parser.add_argument("--legacy-loss-mass", type=float, default=0.25)
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--patience", type=int, default=2)
+    parser.add_argument("--learning-rate", type=float, default=5e-5)
+    parser.add_argument("--balanced-validation", action="store_true")
+    parser.add_argument("--comparison-trial", action="store_true")
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--expected-revision", required=True)
     parser.add_argument("--expected-gpu-count", type=int, required=True)
     args = parser.parse_args()
+    if (
+        not np.isfinite(args.legacy_loss_mass)
+        or not 0 < args.legacy_loss_mass < 1
+        or not np.isfinite(args.learning_rate)
+        or args.learning_rate <= 0
+    ):
+        parser.error("loss mass must be in (0,1) and learning rate finite/positive")
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     if (
         revision != args.expected_revision
         or subprocess.check_output(["git", "status", "--porcelain"], text=True).strip()
     ):
         parser.error("training HEAD differs or checkout is dirty")
-    if sha256_file(args.checkpoint) != PARENT_SHA:
+    if args.from_scratch:
+        if args.checkpoint is not None:
+            parser.error("from-scratch training must not receive a parent checkpoint")
+        if args.reference_checkpoint is None or not args.reference_sha256:
+            parser.error(
+                "from-scratch comparison requires a pinned read-only reference"
+            )
+        if sha256_file(args.reference_checkpoint) != args.reference_sha256:
+            parser.error("read-only reference checkpoint SHA differs")
+    elif args.checkpoint is None or sha256_file(args.checkpoint) != PARENT_SHA:
         parser.error("parent checkpoint SHA differs")
+    if args.network_depth == 4 and not args.from_scratch:
+        parser.error("four-layer trial must train from scratch")
+    if args.comparison_trial and (
+        not args.from_scratch
+        or args.network_depth != 4
+        or args.legacy_loss_mass != 0.5
+        or not args.balanced_validation
+    ):
+        parser.error(
+            "comparison requires scratch depth4, mass0.5 and balanced validation"
+        )
+    if args.epochs < 2 or args.patience < 1:
+        parser.error("epochs must be at least 2 and patience positive")
     if sha256_file(args.model / "config.json") != CONFIG_SHA:
         parser.error("model config SHA differs")
     inventory = subprocess.check_output(
@@ -215,7 +274,7 @@ def main() -> None:
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         parser.error("select exactly one visible CUDA device for training")
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    if (args.out_dir / "train").exists():
+    if any(args.out_dir.glob("train*")):
         parser.error("training output must be new")
     emit("正在定位新增300条、已有60条和旧5000条")
     primary_path = resolve_collection(
@@ -272,7 +331,9 @@ def main() -> None:
     data = merge_captures(merge_captures(parts[0], parts[1]), parts[2])
     legacy_ids = set(old["requests"])
     validation_ids = set(parts[0]["requests"])
-    weights, weighting = mixed_training_weights(data, legacy_ids)
+    weights, weighting = mixed_training_weights(
+        data, legacy_ids, legacy_mass=args.legacy_loss_mass
+    )
     groups = {}
     for name, part in zip(("new300", "first60", "legacy5000"), parts):
         ids = set(part["requests"])
@@ -288,9 +349,13 @@ def main() -> None:
         "gpu_inventory_uuid_record_only": inventory,
         "sources": sources,
         "weighting": weighting,
-        "parent_sha256": PARENT_SHA,
-        "validation_policy": "new300 validation trees only for selection/calibration",
-        "test_policy": "all held-out requests remain held out; legacy diagnostic only",
+        "parent_sha256": None if args.from_scratch else PARENT_SHA,
+        "initialization": "from scratch" if args.from_scratch else "warmstart",
+        "reference_sha256": args.reference_sha256,
+        "validation_policy": "old/new validation trees split separately, 50/50 loss"
+        if args.balanced_validation
+        else "new300 validation trees only",
+        "test_policy": "test never enters gradients/selection/calibration; diagnostic",
         "qwen_training": False,
         "deployment": "offline candidate only",
     }
@@ -298,40 +363,107 @@ def main() -> None:
         json.dumps(provenance, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
     emit(f"数据审计完成：{weighting['cohorts']}；共{len(data['remaining'])}个状态")
-    report = fit_distribution(
-        data,
-        metas[0],
-        args.out_dir / "train",
+    if args.comparison_trial:
+        reference_dir = args.reference_checkpoint.parent
+        snapshot = args.out_dir / "baseline-two-layer"
+        snapshot.mkdir()
+        for name in ("predictor_distribution.pt", "report.json"):
+            source = reference_dir / name
+            if not source.is_file():
+                raise ValueError(f"reference baseline is incomplete: {source}")
+            shutil.copy2(source, snapshot / name)
+        if sha256_file(snapshot / "predictor_distribution.pt") != args.reference_sha256:
+            raise ValueError("baseline snapshot SHA differs")
+        snapshot_record = {
+            "checkpoint_sha256": args.reference_sha256,
+            "original_path": str(args.reference_checkpoint.resolve()),
+            "role": "archived baseline; not initialization",
+        }
+        (snapshot / "snapshot.json").write_text(
+            json.dumps(snapshot_record, indent=2) + "\n", encoding="utf-8"
+        )
+    parameters = dict(
         revision=revision,
-        epochs=5,
+        epochs=args.epochs,
         batch_size=256,
-        learning_rate=5e-5,
+        learning_rate=args.learning_rate,
         dropout=0.1,
         weight_decay=0.01,
-        patience=2,
+        patience=args.patience,
         seed=42,
-        warmstart_checkpoint=args.checkpoint,
-        warmstart_sha256=PARENT_SHA,
+        warmstart_checkpoint=None if args.from_scratch else args.checkpoint,
+        warmstart_sha256=None if args.from_scratch else PARENT_SHA,
         bucket_profile="nonuniform84",
-        head_warmup_epochs=1,
+        head_warmup_epochs=0 if args.from_scratch else 1,
         head_learning_rate=3e-4,
         training_weights=weights,
         weighting_provenance=weighting,
         validation_ids=validation_ids,
         diagnostic_groups=groups,
         known_test_ids=known,
+        reference_checkpoint=args.reference_checkpoint,
+        reference_sha256=args.reference_sha256,
+        balanced_validation_ids={"legacy5000": legacy_ids, "new300": validation_ids}
+        if args.balanced_validation
+        else None,
     )
-    if sha256_file(args.checkpoint) != PARENT_SHA:
+    reports = {}
+    for depth in (2, 4) if args.comparison_trial else (args.network_depth,):
+        emit(f"开始{depth}层小预测器；初始化={provenance['initialization']}")
+        destination = args.out_dir / (
+            f"train-mlp{depth}-50pct" if args.comparison_trial else "train"
+        )
+        report = fit_distribution(
+            data, metas[0], destination, network_depth=depth, **parameters
+        )
+        write_result_summary(destination, report)
+        reports[str(depth)] = report
+        torch.cuda.empty_cache()
+    if args.checkpoint is not None and sha256_file(args.checkpoint) != PARENT_SHA:
         raise ValueError("immutable parent changed during training")
-    write_result_summary(args.out_dir, report)
+    if args.reference_checkpoint is not None and (
+        sha256_file(args.reference_checkpoint) != args.reference_sha256
+    ):
+        raise ValueError("immutable reference changed during training")
+    if args.comparison_trial:
+        rows = [
+            "# 两层/四层从头训练对照",
+            "",
+            "旧/新增训练权重50%/50%。",
+            "两组随机初始化，没有继承旧参数或归一化。",
+            "旧版已封存；新权重均为离线候选。",
+            "",
+            "| 数据 | 原暂存两层 | 新两层50% | 新四层50% |",
+            "|---|---:|---:|---:|",
+        ]
+        for name in (
+            "new300_validation_diagnostic",
+            "new300_test_diagnostic",
+            "legacy5000_validation_diagnostic",
+            "legacy5000_test_diagnostic",
+        ):
+            two = reports["2"]["common_bucket_comparison"]["results"][name]
+            four = reports["4"]["common_bucket_comparison"]["results"][name]
+            rows.append(
+                f"| {name} | {two['parent_nll']:.4f} | "
+                f"{two['new_nll']:.4f} | {four['new_nll']:.4f} |"
+            )
+        (args.out_dir / "TRAINING_RESULT_CN.md").write_text(
+            "\n".join(rows) + "\n", encoding="utf-8"
+        )
+    else:
+        write_result_summary(args.out_dir, report)
     (args.out_dir / "status.json").write_text(
         json.dumps(
             {
                 "completed": True,
                 "best_epoch": report["best_epoch"],
                 "checkpoint_sha256": report["checkpoint_sha256"],
+                "models": {
+                    key: value["checkpoint_sha256"] for key, value in reports.items()
+                },
                 "deployed": False,
-        "model_status": "CANDIDATE_REQUIRES_REVIEW",
+                "model_status": "CANDIDATE_REQUIRES_REVIEW",
             },
             indent=2,
         )

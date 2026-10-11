@@ -6,8 +6,10 @@ import numpy as np
 from predictor_distribution import category_targets, request_weights
 
 
-def mixed_training_weights(data: dict, legacy_ids: set[str]) -> tuple[np.ndarray, dict]:
-    """Allocate 25% to legacy, 75% to new requests; stages get 30/40/30.
+def mixed_training_weights(
+    data: dict, legacy_ids: set[str], *, legacy_mass: float = 0.25
+) -> tuple[np.ndarray, dict]:
+    """Balance legacy/new requests with configurable mass; stages get 30/40/30.
 
     Each request has equal mass within its source cohort. Exact requests use
     actual generation progress: early <25%, middle 25-75%, late >=75%.
@@ -15,6 +17,8 @@ def mixed_training_weights(data: dict, legacy_ids: set[str]) -> tuple[np.ndarray
     requests have unknown final length and retain flat within-request weight.
     Only original training splits receive positive loss weights.
     """
+    if not np.isfinite(legacy_mass) or not 0 < legacy_mass < 1:
+        raise ValueError("legacy mass must be finite and strictly between 0 and 1")
     train = data["splits"] == "train"
     weights = np.zeros(len(train), dtype=np.float64)
     stage_mass = np.array([0.3, 0.4, 0.3])
@@ -33,7 +37,7 @@ def mixed_training_weights(data: dict, legacy_ids: set[str]) -> tuple[np.ndarray
     for index in np.flatnonzero(train):
         by_id.setdefault(str(ids[index]), []).append(index)
     report = {}
-    for (name, mask), mass in zip(cohorts.items(), (0.25, 0.75)):
+    for (name, mask), mass in zip(cohorts.items(), (legacy_mass, 1 - legacy_mass)):
         members = sorted(set(ids[mask]))
         if not members:
             raise ValueError(f"empty training cohort: {name}")

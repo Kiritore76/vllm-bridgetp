@@ -1,4 +1,4 @@
-"""Train and calibrate a two-layer remaining-length probability distribution.
+"""Train and calibrate a remaining-length probability distribution.
 
 Reuses an existing capture; does not load the LLM or actuate the controller.
 Exact responses train category likelihood. Capped responses train a compatible
@@ -26,6 +26,7 @@ from predictor_distribution import (
     request_weights,
     softmax,
 )
+from predictor_network import build_mlp, hidden_widths
 from predictor_progress import EpochProgress, emit
 from train_length_predictor import load_examples, read_jsonl, sha256_file
 
@@ -82,11 +83,14 @@ def fit_distribution(
     weighting_provenance: dict | None = None,
     validation_ids: set[str] | None = None,
     diagnostic_groups: dict[str, np.ndarray] | None = None,
+    network_depth: int = 2,
+    balanced_validation_ids: dict[str, set[str]] | None = None,
+    reference_checkpoint: Path | None = None,
+    reference_sha256: str | None = None,
 ) -> dict:
     """Fit on train, select on one validation half, calibrate on the other."""
     import torch
     from predictor_warmstart import configure_training_phase
-    from torch import nn
 
     if (
         not math.isfinite(dropout)
@@ -97,6 +101,7 @@ def fit_distribution(
         or not 0 <= head_warmup_epochs < epochs
         or not math.isfinite(head_learning_rate)
         or head_learning_rate <= 0
+        or network_depth not in (2, 4)
     ):
         raise ValueError("dropout must be in [0, 1); weight decay must be nonnegative")
     torch.manual_seed(seed)
@@ -104,6 +109,43 @@ def fit_distribution(
     device = torch.device(device_name)
     train = data["splits"] == "train"
     selection, calibration = validation_groups(data, validation_ids)
+    validation_cohorts = {}
+    if balanced_validation_ids is not None:
+        if len(balanced_validation_ids) != 2:
+            raise ValueError("balanced validation requires exactly two cohorts")
+        selection = np.zeros(len(train), dtype=bool)
+        calibration = selection.copy()
+        for name, allowed in balanced_validation_ids.items():
+            selected, calibrated = validation_groups(data, allowed)
+            if ((selection | calibration) & (selected | calibrated)).any():
+                raise ValueError("validation cohorts overlap")
+            validation_cohorts[name] = (selected, calibrated)
+            selection |= selected
+            calibration |= calibrated
+        if (selection & calibration).any():
+            raise ValueError("validation selection/calibration overlap")
+
+    def validation_nll(probabilities, mask):
+        if not validation_cohorts:
+            return distribution_nll(
+                probabilities,
+                targets[mask],
+                data["censored"][mask],
+                data["requests"][mask],
+            )
+        losses = []
+        for selected, calibrated in validation_cohorts.values():
+            subset = (selected | calibrated)[mask]
+            losses.append(
+                distribution_nll(
+                    probabilities[subset],
+                    targets[mask][subset],
+                    data["censored"][mask][subset],
+                    data["requests"][mask][subset],
+                )
+            )
+        return float(np.mean(losses))
+
     test = (data["splits"] == "test") & ~data["censored"]
     parent = None
     original_parent = None
@@ -128,11 +170,23 @@ def fit_distribution(
             parent = expand_tail(parent, tail_edges or [])
     elif tail_edges:
         raise ValueError("tail extension requires warmstart")
-    elif bucket_profile != "parent" or head_warmup_epochs:
-        raise ValueError("category replacement and head warmup require warmstart")
+    elif head_warmup_epochs:
+        raise ValueError("head warmup requires warmstart")
+    if network_depth == 4 and parent is not None:
+        raise ValueError("four-layer trial trains from scratch")
+    if reference_checkpoint is not None:
+        if original_parent is not None:
+            raise ValueError("explicit reference cannot replace a warmstart parent")
+        from predictor_warmstart import load_warmstart
+
+        original_parent = load_warmstart(
+            reference_checkpoint, reference_sha256, preflight, data["hidden"].shape[1]
+        )
     edges = (
         parent["category_upper_edges"].numpy()
         if parent
+        else nonuniform84_upper_edges()
+        if bucket_profile == "nonuniform84"
         else default_upper_edges(preflight["max_tokens"], bin_step)
     )
     targets = category_targets(data["remaining"], edges)
@@ -171,11 +225,8 @@ def fit_distribution(
     x = torch.from_numpy(features).to(device)
     target = torch.from_numpy(targets).to(device)
     censored = torch.from_numpy(data["censored"]).to(device)
-    model = nn.Sequential(
-        nn.Linear(features.shape[1], hidden_width),
-        nn.GELU(),
-        nn.Dropout(dropout),
-        nn.Linear(hidden_width, len(edges) + 1),
+    model = build_mlp(
+        features.shape[1], hidden_width, len(edges) + 1, dropout, network_depth
     ).to(device)
     exact_train = train & ~data["censored"]
     prior = (
@@ -228,7 +279,7 @@ def fit_distribution(
             learning_rate=learning_rate,
         )
         emit(
-            f"训练阶段：{'仅新分类层' if head_only else '整个小预测器'}，"
+            f"训练阶段：{'冻结第一层，训练新增层' if head_only else '整个小预测器'}，"
             f"学习率{optimizer.param_groups[0]['lr']:g}"
         )
         model.train()
@@ -254,17 +305,12 @@ def fit_distribution(
             epoch_loss += float(loss.detach().cpu()) * len(indices)
             progress.update(start // batch_size + 1, start + len(indices))
         emit(f"续训 第{epoch}/{epochs}轮：训练完成，正在验证")
-        validation_nll = distribution_nll(
-            softmax(logits_for(selection)),
-            targets[selection],
-            data["censored"][selection],
-            data["requests"][selection],
-        )
+        validation_loss = validation_nll(softmax(logits_for(selection)), selection)
         history.append(
             {
                 "epoch": epoch,
                 "train_nll": epoch_loss / len(shuffled),
-                "selection_validation_nll": validation_nll,
+                "selection_validation_nll": validation_loss,
                 "phase": "head_only" if head_only else "joint",
                 "learning_rate": optimizer.param_groups[0]["lr"],
             }
@@ -272,10 +318,10 @@ def fit_distribution(
         print(json.dumps(history[-1]), flush=True)
         emit(
             f"续训 第{epoch}/{epochs}轮：训练NLL={history[-1]['train_nll']:.4f}，"
-            f"验证NLL={validation_nll:.4f}"
+            f"验证NLL={validation_loss:.4f}"
         )
-        if validation_nll < best_nll:
-            best_nll, best_epoch = validation_nll, epoch
+        if validation_loss < best_nll:
+            best_nll, best_epoch = validation_loss, epoch
             torch.save(
                 {
                     "warmstart_provenance": {
@@ -287,23 +333,29 @@ def fit_distribution(
                         "optimizer": "new AdamW, not optimizer resume",
                         "parent_temperature": parent_temperature,
                         "parent_categories": parent_categories,
+                        "network_depth": network_depth,
+                        "initialization": "warmstart" if parent else "from scratch",
                         "bucket_profile": bucket_profile,
                         "head_warmup_epochs": head_warmup_epochs,
                         "head_initialization": "seeded weights, train-only prior bias"
-                        if bucket_profile == "nonuniform84"
+                        if bucket_profile == "nonuniform84" or not parent
                         else "parent head",
                         "tail_initialization": "not used for new classifier"
                         if bucket_profile == "nonuniform84"
                         else "equal split preserving parent calibrated sums",
                     },
                     "format_version": 2,
-                    "model_type": "remaining_length_categorical",
+                    "model_type": "remaining_length_categorical_mlp4"
+                    if network_depth == 4
+                    else "remaining_length_categorical",
                     "state_dict": {
                         k: v.detach().cpu().clone()
                         for k, v in model.state_dict().items()
                     },
                     "input_width": features.shape[1],
                     "hidden_width": hidden_width,
+                    "network_depth": network_depth,
+                    "hidden_widths": hidden_widths(hidden_width, network_depth),
                     "activation": "GELU",
                     "dropout": dropout,
                     "weight_decay": weight_decay,
@@ -336,11 +388,8 @@ def fit_distribution(
     calibration_curve = [
         {
             "temperature": temperature,
-            "nll": distribution_nll(
-                softmax(calibration_logits, temperature),
-                targets[calibration],
-                data["censored"][calibration],
-                data["requests"][calibration],
+            "nll": validation_nll(
+                softmax(calibration_logits, temperature), calibration
             ),
         }
         for temperature in candidates
@@ -437,20 +486,51 @@ def fit_distribution(
             ),
             "risk_by_horizon_tokens": risk_report(mask),
         }
+        if validation_cohorts and name in (
+            "selection_validation",
+            "calibration_validation",
+        ):
+            results[name]["balanced_raw_nll"] = validation_nll(raw_p[mask], mask)
+            results[name]["balanced_calibrated_nll"] = validation_nll(
+                calibrated_p[mask], mask
+            )
     common_comparison = None
-    if bucket_profile == "nonuniform84":
+    if bucket_profile == "nonuniform84" and original_parent is not None:
         old_edges = original_parent["category_upper_edges"].numpy()
         common_edges = edges[np.isin(edges, old_edges)]
-        old_model = nn.Sequential(
-            nn.Linear(features.shape[1], hidden_width),
-            nn.GELU(),
-            nn.Dropout(float(original_parent["dropout"])),
-            nn.Linear(hidden_width, len(old_edges) + 1),
+        old_model = build_mlp(
+            features.shape[1],
+            int(original_parent["hidden_width"]),
+            len(old_edges) + 1,
+            float(original_parent["dropout"]),
         ).to(device)
         old_model.load_state_dict(original_parent["state_dict"], strict=True)
+        old_model.eval()
+        reference_logits = []
+        ref_mean = original_parent["feature_mean"].to(device)
+        ref_std = original_parent["feature_std"].to(device)
+        with torch.no_grad():
+            for start in range(0, len(features), batch_size):
+                stop = start + batch_size
+                ref_hidden = torch.tensor(
+                    data["hidden"][start:stop].astype(np.float32), device=device
+                )
+                ref_generated = torch.tensor(
+                    data["generated"][start:stop], device=device
+                )
+                ref_features = torch.cat(
+                    (
+                        (ref_hidden - ref_mean) / ref_std,
+                        (
+                            torch.log1p(ref_generated)
+                            / original_parent["position_log_scale"]
+                        ).to(torch.float32)[:, None],
+                    ),
+                    dim=1,
+                )
+                reference_logits.append(old_model(ref_features).cpu().numpy())
         old_p = softmax(
-            logits_for(np.ones(len(features), dtype=bool), old_model),
-            parent_temperature,
+            np.concatenate(reference_logits), float(original_parent["temperature"])
         )
         old_common = aggregate_probabilities(old_p, old_edges, common_edges)
         new_common = aggregate_probabilities(calibrated_p, edges, common_edges)
@@ -458,7 +538,11 @@ def fit_distribution(
         common_comparison = {
             "category_upper_edges": common_edges.tolist(),
             "categories": len(common_edges) + 1,
-            "tail_note": "common open tail; parent cannot split new high-tail bins",
+            "tail_note": "shared inclusive category edges and an open tail",
+            "reference_sha256": reference_sha256 or warmstart_sha256,
+            "reference_role": "read-only comparison; not initialization"
+            if reference_checkpoint
+            else "warmstart parent",
             "results": {},
             "progress_by_split": {},
         }
@@ -553,6 +637,8 @@ def fit_distribution(
         "seed": seed,
         "training_parameters": {
             "hidden_width": hidden_width,
+            "network_depth": network_depth,
+            "hidden_widths": hidden_widths(hidden_width, network_depth),
             "bin_step": bin_step,
             "epochs": epochs,
             "batch_size": batch_size,
@@ -580,9 +666,19 @@ def fit_distribution(
         "calibration_curve": calibration_curve,
         "metric_weighting": "each request has equal total sample weight",
         "training_weighting": weighting_provenance or {"rule": "request equal"},
-        "validation_scope": "primary new requests only"
+        "validation_scope": "legacy/new validation cohorts, equal loss mass"
+        if validation_cohorts
+        else "primary new requests only"
         if validation_ids is not None
         else "all validation trees",
+        "validation_cohorts": {
+            name: {
+                "selection_ids": sorted(set(data["requests"][selected])),
+                "calibration_ids": sorted(set(data["requests"][calibrated])),
+                "loss_mass": 0.5,
+            }
+            for name, (selected, calibrated) in validation_cohorts.items()
+        },
         "previous_stage_test_request_ids": sorted(known_test_ids or set()),
         "horizon_note": "capacity-exceedance probability, not physical CUDA OOM",
         "results": results,
@@ -591,6 +687,12 @@ def fit_distribution(
         "history": history,
         "checkpoint_sha256": sha256_file(checkpoint_path),
         "warmstart_provenance": checkpoint["warmstart_provenance"],
+        "reference_provenance": {
+            "sha256": reference_sha256,
+            "role": "read-only evaluation; no parameters or normalization inherited",
+        }
+        if reference_checkpoint
+        else None,
         "common_bucket_comparison": common_comparison,
     }
     (out_dir / "report.json").write_text(
