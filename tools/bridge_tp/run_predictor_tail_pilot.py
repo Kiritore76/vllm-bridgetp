@@ -19,6 +19,7 @@ RECIPE_VERSION = "tail12-natural-v1-20261011"
 PROFILES = {
     "tail12": (RECIPE_VERSION, 6, 3),
     "workload6": (WORKLOAD_VERSION, 4, 2),
+    "longwriter3": ("longwriter3-public-v1-20261011", 2, 1),
 }
 
 # Each task has a distinct subject; language partners are not translations.
@@ -162,6 +163,20 @@ TASKS = [
 
 def recipe(recipe_profile="tail12"):
     """Return fixed tasks; target ranges express intentions, never labels."""
+    if recipe_profile == "longwriter3":
+        path = Path(__file__).with_name("predictor_longwriter3_requests_20261011.json")
+        rows = json.loads(path.read_text(encoding="utf-8"))
+        if len(rows) != 3 or len({row["source_tree_id"] for row in rows}) != 3:
+            raise ValueError("public pilot needs three distinct sources")
+        for row in rows:
+            if (
+                row["split"] != "pilot"
+                or [message["role"] for message in row["messages"]] != ["user"]
+                or hashlib.sha256(row["messages"][0]["content"].encode()).hexdigest()
+                != row["source_prompt_sha256"]
+            ):
+                raise ValueError("public prompt provenance differs")
+        return rows
     if recipe_profile == "workload6":
         return workload_recipe()
     if recipe_profile != "tail12":

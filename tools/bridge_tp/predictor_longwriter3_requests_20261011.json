@@ -1,0 +1,74 @@
+[
+  {
+    "collection_role": "recipe_development_not_formal_holdout",
+    "id": "predictor-longwriter3-public-v1-20261011-task01",
+    "lang": "en",
+    "messages": [
+      {
+        "content": "write 5000 words essay about history of USA's economic",
+        "role": "user"
+      }
+    ],
+    "reference_answer_sha256": "acdaea134ee5566ad17de3807bb3468f5e5face492339525c910864f05c175b3",
+    "reference_length_is_not_local_eos_label": true,
+    "reference_output_tokens_qwen_tokenizer": 12262,
+    "source": "zai-org/LongWriter-6k",
+    "source_file_sha256": "baac20a6fe9fc9d8ad600c8f1e98214f4b9590d810c9c9c875237d57b8342f52",
+    "source_prompt_sha256": "ff3ee8ccb8d5df4d4444070cd03ea740c7af8374bd52aaab9017cadd1450c75f",
+    "source_revision": "0db15c0624f19d63e2efe1021595af933cc5b6cc",
+    "source_row_index_zero_based": 308,
+    "source_tree_id": "longwriter6k-prompt-ff3ee8ccb8d5df4d4444070cd03ea740c7af8374bd52aaab9017cadd1450c75f",
+    "split": "pilot",
+    "target_output_range": "8193-12288",
+    "task_kind": "expository_essay",
+    "title": "美国经济史长篇论述"
+  },
+  {
+    "collection_role": "recipe_development_not_formal_holdout",
+    "id": "predictor-longwriter3-public-v1-20261011-task02",
+    "lang": "en",
+    "messages": [
+      {
+        "content": "Medieval fantasy. Describe the region where the element Air (power of wind, storm and tempest) dominates. Be inspired by the following curtsies: Tibet (Buddhist culture), Maori people of New Zealand, Inca civilization of Peru.\nDescribe the region according to the following points:\n- Name of the Region (proper name)\n- Name of the Country (form of government and proper name)\n- General description of the region and country\n- Description of the Climate\n- Description of the Relief and Landscape\n- Description of Weather (Spring, Summer, Autumn, Winter)\n- Description of Flora (specific types of terrestrial plants, trees, aquatic plants)\n- Description of Fauna (specific types of animals, birds, fish, insects)\n- Description of Monsters (specific types of wild monsters of land, air and water)\n- Organization of government and state agencies\n- Description of Culture, Traditions and Rituals.\n- Description of clothing and fashion of noble people (men and women)\n- Description of clothing and fashion of commoners (men and women)\n- Description of clothing and fashion of clergy (men and women)\n- Description of clothing and fashion of military (men and women)\n- Architecture and organization of the city space (specific architectural techniques and elements)\n- Architecture and organization of the village space (specific architectural techniques and elements)\n- Architecture and organization of the castle space (specific architectural techniques and elements)\n- Agriculture (specific cultivated plants and agricultural animals)\n- Minerals\n- Crafts and productions\n- Cooking (specific dishes)\n- Musical instruments\n- Weapons, army and tactics\n- History\n- Example of male and female names\n- Example of surnames\n- Noble titles",
+        "role": "user"
+      }
+    ],
+    "reference_answer_sha256": "8cd0b1018398369c8fc201db70cecda7e2d1afef946d0aa2d89049d45ee261fe",
+    "reference_length_is_not_local_eos_label": true,
+    "reference_output_tokens_qwen_tokenizer": 13401,
+    "source": "zai-org/LongWriter-6k",
+    "source_file_sha256": "baac20a6fe9fc9d8ad600c8f1e98214f4b9590d810c9c9c875237d57b8342f52",
+    "source_prompt_sha256": "f490de6048b711ac6f0ee5e3642246a1ad1579400ab9e08500d2fa7ac9143ca3",
+    "source_revision": "0db15c0624f19d63e2efe1021595af933cc5b6cc",
+    "source_row_index_zero_based": 1127,
+    "source_tree_id": "longwriter6k-prompt-f490de6048b711ac6f0ee5e3642246a1ad1579400ab9e08500d2fa7ac9143ca3",
+    "split": "pilot",
+    "target_output_range": "12289-16384",
+    "task_kind": "fictional_worldbuilding",
+    "title": "风元素主导的虚构世界设定"
+  },
+  {
+    "collection_role": "recipe_development_not_formal_holdout",
+    "id": "predictor-longwriter3-public-v1-20261011-task03",
+    "lang": "zh",
+    "messages": [
+      {
+        "content": "请以 疫情常态化下餐饮行业营销策略分析为题写一篇毕业论文，框架如下 \n摘  要\tI\nABSTRACT\tII\n目  录\t3\n1 绪论\t\n1.1 研究背景、意义\t\n1.1.1 研究背景\t\n1.1.2 研究意义\t\n1.2 研究方法\t\n1.2.1. 文献分析法\t\n1.2.2. 实证研究法\t\n2 相关概念及理论基础\t\n2.1 概念界定\t\n2.1.1疫情常态化\t\n2.1.2 营销策略\t\n2.2相关理论基础\t\n2.2.1 PEST分析\t\n2.2.2 微观环境分析\t\n3 疫情常态化下餐饮行业现状分析\t\n3.1 餐饮行业现存的营销策略及营销效果\t\n3.1.1 餐饮行业现存营销策略\t\n3.1.2竞争对手的营销策略\t\n3.2 餐饮行业面临的市场营销环境分析\t\n3.2.1宏观环境分析（PEST分析）\t\n3.2.2微观环境分析\t\n3.3疫情常态化下餐饮行业面临的挑战\t\n3.3.1消费者餐饮需求的变化\t\n3.3.2营销策略同质化严重\t\n4 疫情常态化下餐饮行业的营销策略优化设计\t\n4.1 价格策略\t\n4.2 产品策略\t\n4.3促销策略\t\n4.4渠道策略\t\n4.5实施营销策略的保障措施",
+        "role": "user"
+      }
+    ],
+    "reference_answer_sha256": "d978989ed9d7d68023371f8b2b62933f0dcb11ac6f28fdb252f53a9978079500",
+    "reference_length_is_not_local_eos_label": true,
+    "reference_output_tokens_qwen_tokenizer": 12247,
+    "source": "zai-org/LongWriter-6k",
+    "source_file_sha256": "baac20a6fe9fc9d8ad600c8f1e98214f4b9590d810c9c9c875237d57b8342f52",
+    "source_prompt_sha256": "cd85ee9e58a176824f717931e8fae2c4b717b14b746e0d6c1bd3121e8e431749",
+    "source_revision": "0db15c0624f19d63e2efe1021595af933cc5b6cc",
+    "source_row_index_zero_based": 4345,
+    "source_tree_id": "longwriter6k-prompt-cd85ee9e58a176824f717931e8fae2c4b717b14b746e0d6c1bd3121e8e431749",
+    "split": "pilot",
+    "target_output_range": "8193-12288",
+    "task_kind": "structured_essay",
+    "title": "餐饮行业营销策略结构化论文"
+  }
+]
