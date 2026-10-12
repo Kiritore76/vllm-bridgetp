@@ -7,7 +7,6 @@ import hashlib
 import json
 import subprocess
 import sys
-import tarfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -16,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 from tools.bridge_tp.build_constructed_probability_workload import (  # noqa: E402
     make_rows,
 )
+from tools.bridge_tp.result_archive import pack  # noqa: E402
 
 PROTOCOL = "RISK76_MLP4_TARGET_PHASE_V4"
 
@@ -198,6 +198,7 @@ def command(args, row, input_path, out):
         "--seed",
         str(row["seed"]),
         "--probability-pilot",
+        "--no-archive",
         "--constructed-workload",
         "--expected-input-sha256",
         digest,
@@ -266,6 +267,8 @@ def main():
         default="pilot",
     )
     parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument("--no-archive", action="store_true",
+                        help="outer launcher packs the entire batch once")
     parser.add_argument("--out-dir", required=True, type=Path)
     parser.add_argument("--expected-revision", required=True)
     for key in ("model", "base", "survival", "guard", "checkpoint", "reference"):
@@ -382,11 +385,10 @@ def main():
                     "pair failed; inspect archived evidence before continuing"
                 )
     finally:
-        archive = args.out_dir.with_suffix(".tar.gz")
-        with tarfile.open(archive, "w:gz") as handle:
-            handle.add(args.out_dir, arcname=args.out_dir.name)
-        print(f"请取回完整目录压缩包：{archive}", flush=True)
-        print(hashlib.sha256(archive.read_bytes()).hexdigest(), flush=True)
+        if not args.no_archive:
+            archive = args.out_dir.with_suffix(".tar.gz")
+            print(json.dumps(pack(args.out_dir, archive)), flush=True)
+            print(f"请取回完整目录压缩包：{archive}", flush=True)
 
 
 if __name__ == "__main__":

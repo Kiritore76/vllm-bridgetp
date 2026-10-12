@@ -15,7 +15,6 @@ import math
 import os
 import random
 import sys
-import tarfile
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from tools.bridge_tp.horizon_goodoutput import score_horizon  # noqa: E402
+from tools.bridge_tp.result_archive import pack  # noqa: E402
 from tools.bridge_tp.run_goodoutput_matrix_a100 import (  # noqa: E402
     execute,
     online_command,
@@ -56,6 +56,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--portable-hardware", action="store_true",
                         help="Record actual AutoDL host/UUIDs; require five idle A100s")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--no-archive", action="store_true",
+                        help="parent collection packs the evidence once")
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--probability-pilot", action="store_true")
     parser.add_argument("--predictor-profile", choices=("seed44", "risk76_mlp4"),
@@ -1717,11 +1719,10 @@ def execute_pilot(args: argparse.Namespace) -> None:
             write_json(root / "timing_outcomes.json", timing_results(summary))
         if args.probability_pilot:
             write_json(root / "probability_outcomes.json", probability_results(summary))
-        archive = root.with_suffix(".tar.gz")
-        print(f"packing={root}", flush=True)
-        with tarfile.open(archive, "w:gz") as handle:
-            handle.add(root, arcname=root.name)
-        print(f"archive_to_retrieve={archive}", flush=True)
+        if not getattr(args, "no_archive", False):
+            archive = root.with_suffix(".tar.gz")
+            print(json.dumps(pack(root, archive)), flush=True)
+            print(f"archive_to_retrieve={archive}", flush=True)
         print(f"pilot_status={summary['status']}", flush=True)
     if summary["status"] not in {"PILOT_COLLECTION_COMPLETE",
                                 "CROSS_CONTEXT_SMOKE_PASS"}:

@@ -103,3 +103,9 @@ UUID仅记录。已有未提交工作先备份并保留，使用return而不关�
 background_events改为AsyncJournal，关闭后核对footer及summary完整性；每条请求记录dispatch、worker_entry、HTTP客户端调用边界与各段耗时。HTTP时间是调用边界，不是socket发出或服务器收到的时刻。collector_resources.jsonl每2秒读取Linux CPU/内存压力与cgroup原始计数，无GPU调用；缺文件标为unavailable，不补零。
 
 若复验仍迟发，先据分段时序与资源记录定位，不能据CPU模拟已通过就认定GPU/硬件有问题。CPU检查233项通过并不代替服务器性能验收。
+
+## 2026-10-12：回传包精简
+
+采集层子进程使用--no-archive，上层仅打包一次；外层模板也给stage传--no-archive，并使用tools/bridge_tp/result_archive.py。保留预测特征、概率/状态快照、原始输出与时间戳、SLO/窗口结果、日志、receipt、输入与唯一源码包；不因收益符号或运行失败删除记录。移除有对应完整采集目录/契约的重复内层tar和Python缓存，并附archive_contents_manifest.json。没有对应原目录的唯一tar包（例如runtime_source.tar.gz）保留。
+
+打包不修改原结果目录，原子替换输出；失败保留旧的完整包。此次真实6-arm包750.73MB可精简为192.46MB（减少74.36%），15970个特征文件校验及31份核心原始文件字节一致检查通过。239项CPU回归通过；精简是包装层变化，不改预测器、p/U、SLO、窗口、KV迁移或实验标签。
