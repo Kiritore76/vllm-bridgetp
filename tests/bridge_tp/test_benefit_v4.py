@@ -478,6 +478,11 @@ class BenefitV4Tests(unittest.TestCase):
         self.assertTrue(all(row["minimum_u"] == 0.8 and row["threshold"] == 0
                             for row in rows))
 
+    def test_prefill_recovery_does_not_repeat_decode(self):
+        rows = collect.urgent_prefill_recovery_design()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0], collect.urgent_followup_design()[1])
+
     def test_prefix_diagnostic_ignores_post_action_divergence(self):
         arms = {}
         for action, boundary in (("prob_0_STAY", 20), ("prob_0_START", 25)):

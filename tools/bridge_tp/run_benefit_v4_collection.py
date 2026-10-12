@@ -141,6 +141,12 @@ def urgent_followup_design():
     return rows
 
 
+def urgent_prefill_recovery_design():
+    """Only the unstarted prefill pair, with identical inputs and timing."""
+    return [row for row in urgent_followup_design()
+            if row["target_state"] == "prefill"]
+
+
 def prefix_diagnostic(pair_root):
     """Describe pre-action divergence without selecting on benefit outcomes."""
     summary = json.loads((pair_root / "pilot_summary.json").read_text())
@@ -282,6 +288,7 @@ def main():
         choices=("pilot", "repair-pilot", "dispatch-pilot", "prefill-repeat",
                  "urgent-phase",
                  "urgent-followup",
+                 "urgent-prefill-recovery",
                  "train-rest",
                  "validation", "test"),
         default="pilot",
@@ -297,6 +304,7 @@ def main():
     diagnostic = args.stage in {
         "repair-pilot", "dispatch-pilot", "prefill-repeat", "urgent-phase",
         "urgent-followup",
+        "urgent-prefill-recovery",
     }
     all_rows = repair_design() if diagnostic else design()
     if args.stage == "dispatch-pilot":
@@ -307,6 +315,8 @@ def main():
         all_rows = urgent_phase_design()
     elif args.stage == "urgent-followup":
         all_rows = urgent_followup_design()
+    elif args.stage == "urgent-prefill-recovery":
+        all_rows = urgent_prefill_recovery_design()
     selected = [
         row
         for row in all_rows
@@ -397,7 +407,7 @@ def main():
                     (directory / "replay_verification.json").write_text(
                         json.dumps(replay, indent=2) + "\n", encoding="utf-8"
                     )
-                if args.stage in {"prefill-repeat", "urgent-phase", "urgent-followup"}:
+                if diagnostic:
                     prefix_diagnostic(args.out_dir / item["pair"]["pair_id"])
             results.append({"pair_id": item["pair"]["pair_id"], "returncode": rc})
             (args.out_dir / "stage_results.json").write_text(

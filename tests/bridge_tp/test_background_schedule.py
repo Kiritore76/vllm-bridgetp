@@ -236,6 +236,21 @@ class BackgroundDriverTests(unittest.TestCase):
             for i in range(count)
         ]
 
+    def test_target_can_wait_for_anchor_first_output_in_manifest(self):
+        jobs = self.jobs(1)
+        jobs[0]["start_after_event"] = "ANCHOR_FIRST_OUTPUT"
+        args = self.args(jobs)
+        loaded = self.driver.load_manifest(args.manifest)
+        self.assertEqual(loaded["jobs"][0]["start_after_event"],
+                         "ANCHOR_FIRST_OUTPUT")
+
+    def test_m2_initial_rate_remains_source_only(self):
+        jobs = self.jobs(1)
+        jobs[0]["start_after_event"] = "M2_INITIAL_RATE"
+        args = self.args(jobs)
+        with self.assertRaisesRegex(ValueError, "requires a source job"):
+            self.driver.load_manifest(args.manifest)
+
     def test_real_driver_dispatches_262_before_long_responses_complete(self):
         count = 262
         arguments = self.args(self.jobs(count))

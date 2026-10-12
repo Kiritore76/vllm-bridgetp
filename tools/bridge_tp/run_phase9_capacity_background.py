@@ -68,7 +68,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
             None, "M2_INITIAL_RATE", "ANCHOR_FIRST_OUTPUT"
         ) and anchor_output_threshold(start_event) is None:
             raise ValueError(f"job {job_id} has an unknown start event")
-        if start_event in ("M2_INITIAL_RATE", "ANCHOR_FIRST_OUTPUT") and (
+        if start_event == "M2_INITIAL_RATE" and (
             job["pool"] != "source"
         ):
             raise ValueError(f"job {job_id} event start requires a source job")
