@@ -442,6 +442,39 @@ class BenefitV4Tests(unittest.TestCase):
             {key: value for key, value in expected.items() if key != "pair_id"},
         )
 
+    def test_prefill_repeat_changes_records_not_pressure_recipe(self):
+        row = collect.prefill_repeat_design()[0]
+        self.assertEqual(row["seed"], 20261253)
+        self.assertEqual(row["target_state"], "prefill")
+        self.assertTrue(row["target_burst_arrivals"])
+        self.assertTrue(row["diagnostic_use_only"])
+        self.assertEqual(row["target_count"], 4)
+        self.assertEqual(row["target_period_s"], 30)
+
+    def test_prefix_diagnostic_ignores_post_action_divergence(self):
+        arms = {}
+        for action, boundary in (("prob_0_STAY", 20), ("prob_0_START", 25)):
+            path = self.root / "case" / action / "r01_shadow_only/controller"
+            path.mkdir(parents=True)
+            tokens = list(range(40))
+            if action.endswith("START"):
+                tokens[30] = 99
+            (path / "source_response.json").write_text(json.dumps({
+                "token_ids": tokens,
+            }))
+            arms[action] = {"observed_action": {"probability_candidate": {
+                "snapshot": {"generated_tokens": boundary},
+            }}}
+        (self.root / "pilot_summary.json").write_text(json.dumps({
+            "cases": {"case": arms},
+        }))
+        collect.prefix_diagnostic(self.root)
+        report = json.loads((self.root / "pre_action_prefix_diagnostic.json")
+                            .read_text())
+        self.assertTrue(report["identical_pre_action_prefix"])
+        self.assertEqual(report["comparison_tokens"], 20)
+        self.assertFalse(report["selection_on_goodoutput"])
+
     def test_fit_rejects_legacy_file_and_renamed_wrong_contract(self):
         row = collect.design()[0]
         (self.root / "preregistration.json").write_text(json.dumps({

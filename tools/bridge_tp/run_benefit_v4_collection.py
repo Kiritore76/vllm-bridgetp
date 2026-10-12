@@ -94,6 +94,54 @@ def dispatch_design():
     ]
 
 
+def prefill_repeat_design():
+    """New request records for diagnosing pre-action prefix divergence."""
+    seed = 20261253
+    return [{
+        **repair_design()[1], "seed": seed,
+        "pair_id": f"prefill-repeat-slack-{seed}",
+        "source_family_group": f"constructed-prefill-repeat-record-set-{seed}",
+    }]
+
+
+def prefix_diagnostic(pair_root):
+    """Describe pre-action divergence without selecting on benefit outcomes."""
+    summary = json.loads((pair_root / "pilot_summary.json").read_text())
+    rows = []
+    for case, arms in summary["cases"].items():
+        for action, result in arms.items():
+            candidate = (result.get("observed_action") or {}).get(
+                "probability_candidate"
+            ) or {}
+            snapshot = candidate.get("snapshot") or {}
+            run = pair_root / case / action / "r01_shadow_only/controller"
+            source = json.loads((run / "source_response.json").read_text())
+            rows.append({
+                "action": action, "snapshot": snapshot,
+                "token_ids": source["token_ids"],
+            })
+    if len(rows) != 2:
+        raise ValueError("prefix diagnosis requires two completed arms")
+    boundary = min(int(row["snapshot"]["generated_tokens"]) for row in rows)
+    left, right = [row.pop("token_ids")[:boundary] for row in rows]
+    available = min(len(left), len(right))
+    first = next((i for i, (a, b) in enumerate(zip(left, right)) if a != b), None)
+    report = {
+        "diagnostic_only": True, "comparison_tokens": available,
+        "common_pre_action_boundary": boundary,
+        "complete_pre_action_prefix": available == boundary,
+        "first_divergence_zero_based": first,
+        "aligned_mismatch_tokens": sum(a != b for a, b in zip(left, right)),
+        "identical_pre_action_prefix": available == boundary and first is None,
+        "selection_on_goodoutput": False, "candidate_snapshots": rows,
+    }
+    (pair_root / "pre_action_prefix_diagnostic.json").write_text(
+        json.dumps(report, indent=2) + "\n", encoding="utf-8"
+    )
+    print(f"[诊断] 动作前共同前缀{available} token；首次分歧索引={first}；"
+          f"一致={report['identical_pre_action_prefix']}", flush=True)
+
+
 def command(args, row, input_path, out):
     """Build probability interventions; keep migration/SLO contracts frozen."""
     digest = hashlib.sha256(input_path.read_bytes()).hexdigest()
@@ -175,7 +223,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--stage",
-        choices=("pilot", "repair-pilot", "dispatch-pilot", "train-rest",
+        choices=("pilot", "repair-pilot", "dispatch-pilot", "prefill-repeat",
+                 "train-rest",
                  "validation", "test"),
         default="pilot",
     )
@@ -185,10 +234,12 @@ def main():
     for key in ("model", "base", "survival", "guard", "checkpoint", "reference"):
         parser.add_argument(f"--{key}", required=True, type=Path)
     args = parser.parse_args()
-    diagnostic = args.stage in {"repair-pilot", "dispatch-pilot"}
+    diagnostic = args.stage in {"repair-pilot", "dispatch-pilot", "prefill-repeat"}
     all_rows = repair_design() if diagnostic else design()
     if args.stage == "dispatch-pilot":
         all_rows = dispatch_design()
+    elif args.stage == "prefill-repeat":
+        all_rows = prefill_repeat_design()
     selected = [
         row
         for row in all_rows
@@ -279,6 +330,8 @@ def main():
                     (directory / "replay_verification.json").write_text(
                         json.dumps(replay, indent=2) + "\n", encoding="utf-8"
                     )
+                if args.stage == "prefill-repeat":
+                    prefix_diagnostic(args.out_dir / item["pair"]["pair_id"])
             results.append({"pair_id": item["pair"]["pair_id"], "returncode": rc})
             (args.out_dir / "stage_results.json").write_text(
                 json.dumps(results, indent=2) + "\n", encoding="utf-8"
