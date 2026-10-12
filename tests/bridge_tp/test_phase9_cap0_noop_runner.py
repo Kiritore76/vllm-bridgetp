@@ -10,7 +10,6 @@ from argparse import Namespace
 from pathlib import Path
 from unittest import mock
 
-
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -42,6 +41,43 @@ FORMAL = load_script(
 
 
 class TestNoopManifest(unittest.TestCase):
+    def test_event_target_gate_allows_controller_to_start(self) -> None:
+        jobs = [{"pool": "target",
+                 "start_after_event": "ANCHOR_FIRST_OUTPUT"}] * 40
+        count = RUNNER.pre_controller_ready_count(jobs, 2, "target")
+        self.assertEqual(count, 0)
+        process = mock.Mock()
+        process.process.poll.side_effect = AssertionError(
+            "must start controller before waiting for these arrivals"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            RUNNER.wait_for_background_first_tokens(
+                Path(directory) / "not-yet-created.jsonl", process,
+                count, 120, pool="target",
+            )
+        process.process.poll.assert_not_called()
+
+    def test_immediate_target_readiness_is_preserved(self) -> None:
+        jobs = [{"pool": "target", "start_after_event": None}] * 12
+        self.assertEqual(RUNNER.pre_controller_ready_count(
+            jobs, 2, "target"), 2)
+
+    def test_readiness_is_pool_specific_for_mixed_events(self) -> None:
+        jobs = [
+            {"pool": "target", "start_after_event": "ANCHOR_FIRST_OUTPUT"},
+            {"pool": "target", "start_after_event": None},
+            {"pool": "source", "start_after_event": None},
+        ]
+        self.assertEqual(RUNNER.pre_controller_ready_count(
+            jobs, 2, "target"), 1)
+        self.assertEqual(RUNNER.pre_controller_ready_count(
+            jobs, 1, "source"), 1)
+
+    def test_source_controller_events_cannot_block_controller(self) -> None:
+        jobs = [{"pool": "source", "start_after_event": "M2_INITIAL_RATE"}]
+        self.assertEqual(RUNNER.pre_controller_ready_count(
+            jobs, 1, "source"), 0)
+
     def test_target_workers_do_not_receive_source_persistent_env(self) -> None:
         source_like_env = {
             "BRIDGETP_PERSISTENT_CHANNEL": "1",

@@ -384,6 +384,15 @@ def load_audit(path: Path) -> list[dict[str, Any]]:
     ]
 
 
+def pre_controller_ready_count(jobs, minimum_jobs, pool=None):
+    """Controller-event arrivals cannot be prerequisites for that controller."""
+    selected = [job for job in jobs if pool is None or job["pool"] == pool]
+    if not any(job.get("start_after_event") for job in selected):
+        return minimum_jobs
+    immediate = sum(not job.get("start_after_event") for job in selected)
+    return min(minimum_jobs, immediate)
+
+
 def wait_for_background_first_tokens(
     event_path: Path,
     process: common.ManagedProcess,
@@ -655,6 +664,22 @@ def run(
         server_dir = active
     run_id = run_id or out_root.name
     manifest = load_manifest(args.manifest)
+    startup_readiness = {
+        "requested_target": background_ready_jobs,
+        "requested_source": background_ready_source_jobs,
+        "effective_target": pre_controller_ready_count(
+            manifest["jobs"], background_ready_jobs, "target"
+        ),
+        "effective_source": pre_controller_ready_count(
+            manifest["jobs"], background_ready_source_jobs, "source"
+        ),
+        "effective_all": pre_controller_ready_count(
+            manifest["jobs"], background_ready_jobs
+        ),
+        "basis": "ONLY_ARRIVALS_INDEPENDENT_OF_CONTROLLER_EVENTS",
+    }
+    common.write_json(provenance_dir / "startup_readiness.json",
+                      startup_readiness)
     config_path = make_config(
         args,
         controller_dir,
@@ -848,7 +873,7 @@ def run(
             wait_for_background_first_tokens(
                 background_dir / "background_events.jsonl",
                 background,
-                background_ready_jobs,
+                startup_readiness["effective_all"],
                 min(args.run_timeout_s, args.server_start_timeout_s),
             )
             if background_lead_s > 0:
@@ -954,14 +979,14 @@ def run(
             wait_for_background_first_tokens(
                 background_dir / "background_events.jsonl",
                 background,
-                background_ready_jobs,
+                startup_readiness["effective_target"],
                 min(args.run_timeout_s, args.server_start_timeout_s),
                 pool="target",
             )
             wait_for_background_first_tokens(
                 background_dir / "background_events.jsonl",
                 background,
-                background_ready_source_jobs,
+                startup_readiness["effective_source"],
                 min(args.run_timeout_s, args.server_start_timeout_s),
                 pool="source",
                 require_active=True,
