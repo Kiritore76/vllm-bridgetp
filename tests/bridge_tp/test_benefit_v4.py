@@ -483,6 +483,69 @@ class BenefitV4Tests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0], collect.urgent_followup_design()[1])
 
+    def test_formal_expansion_is_fresh_and_role_isolated(self):
+        rows = collect.formal_expansion_design()
+        self.assertEqual(len(rows), 24)
+        self.assertEqual([sum(r["role"] == role for r in rows)
+                          for role in ("train", "validation", "test")], [12, 6, 6])
+        self.assertEqual(len({r["seed"] for r in rows}), 24)
+        old = collect.design() + collect.repair_design() + collect.urgent_phase_design()
+        self.assertFalse({r["seed"] for r in rows} & {r["seed"] for r in old})
+        for r in rows:
+            self.assertEqual(r["threshold"], 0)
+            self.assertNotIn("diagnostic_use_only", r)
+            if r["target_state"] == "prefill":
+                self.assertTrue(r["target_start_after_anchor"])
+                self.assertEqual((r["target_count"], r["target_period_s"],
+                                  r["target_max_tokens"]), (4, 30, 256))
+
+    def test_f11_retains_fresh_prefill_and_marks_missing_pressure(self):
+        snapshot = {
+            "p_guard_est_bounds": [0.6, 0.7], "U": 0.9,
+            "source": {"source_running": 6, "target_running": 1},
+            "target_observation": {"version": "TARGET_OBSERVATION_V1",
+                "prompt_arrival_tokens_s": 2457.6,
+                "prefill_pending_tokens": 18432, "decode_status": "MISSING",
+                "decode_pressure_p95": None, "telemetry_age_s": 0.5,
+                "integrity_errors": []},
+        }
+        self.assertIsNone(fit.features(snapshot, 10))
+        self.assertEqual(fit.features(snapshot, 11)[-3:], [18432, 0.0, 0.0])
+        obs = snapshot["target_observation"]
+        for change in ({"telemetry_age_s": 3}, {"prefill_pending_tokens": None},
+                       {"integrity_errors": ["lost records"]},
+                       {"decode_status": "STALE"}, {"prefill_pending_tokens": 0}):
+            with self.subTest(change=change):
+                altered = {**snapshot, "target_observation": {**obs, **change}}
+                self.assertIsNone(fit.features(altered, 11))
+        observed = {**snapshot, "target_observation": {
+            **obs, "decode_status": "VALID", "decode_pressure_p95": 0.3}}
+        self.assertEqual(fit.features(observed, 11)[-2:], [0.3, 1.0])
+        rows = [{"eligible": True, "delta": float(i), "snapshot": state}
+                for i, state in enumerate([snapshot, observed, snapshot, observed])]
+        model = fit.train(rows, 11, 1.0)
+        self.assertEqual(model["training_pairs"], 4)
+        self.assertIsNotNone(fit.predict(model, rows[0]))
+        model["features"] = model["features"][:-1]
+        with self.assertRaisesRegex(ValueError, "contract"):
+            fit.predict(model, rows[0])
+
+    def test_formal_first_batch_plan_selects_only_six_training_pairs(self):
+        args = ["collect", "--stage", "formal-train1", "--plan-only",
+                "--out-dir", str(self.root / "formal"),
+                "--expected-revision", "local-check"]
+        for key in ("model", "base", "survival", "guard", "checkpoint", "reference"):
+            args += [f"--{key}", str(self.root / key)]
+        with patch.object(sys, "argv", args):
+            collect.main()
+        commands = json.loads((self.root / "formal/commands.json").read_text())
+        self.assertEqual(len(commands), 6)
+        self.assertEqual({r["pair"]["seed"] for r in commands},
+                         set(range(20261500, 20261506)))
+        plan = json.loads((self.root / "formal/preregistration.json").read_text())
+        self.assertFalse(plan["diagnostic_only"])
+        self.assertTrue(all(r["pair"]["role"] == "train" for r in commands))
+
     def test_prefix_diagnostic_ignores_post_action_divergence(self):
         arms = {}
         for action, boundary in (("prob_0_STAY", 20), ("prob_0_START", 25)):
@@ -606,7 +669,7 @@ class BenefitV4Tests(unittest.TestCase):
         ):
             fit.main()
         result = json.loads((out / "result.json").read_text())
-        self.assertEqual(set(result["models"]), {"F8", "F10"})
+        self.assertEqual(set(result["models"]), {"F8", "F11"})
         self.assertFalse(result["engineering_gate"]["automatic_deployment"])
 
 

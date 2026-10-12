@@ -147,6 +147,32 @@ def urgent_prefill_recovery_design():
             if row["target_state"] == "prefill"]
 
 
+def formal_expansion_design():
+    """Fresh 12 train / 6 validation / 6 test pairs using verified recipes."""
+    rows = []
+    for role, repeats, seed_base in (
+        ("train", 2, 20261500), ("validation", 1, 20261600),
+        ("test", 1, 20261700),
+    ):
+        for replicate in range(repeats):
+            for index, base in enumerate(design()[:6]):
+                seed = seed_base + replicate * 6 + index
+                target = base["target_state"]
+                rows.append({
+                    **base, "role": role, "replicate": replicate, "seed": seed,
+                    "pair_id": f"formal-{role}-{base['source_state']}-{target}-{seed}",
+                    "source_family_group": f"constructed-formal-record-set-{seed}",
+                    "target_count": {"idle": 0, "decode": 12, "prefill": 4}[target],
+                    "target_period_s": 30 if target == "prefill" else 40,
+                    "target_max_tokens": 256 if target == "prefill" else 4096,
+                    "target_burst_arrivals": target == "prefill",
+                    "target_start_after_anchor": target == "prefill",
+                    "target_burst_offset_s": 1.0,
+                    "threshold": 0.0,
+                })
+    return rows
+
+
 def prefix_diagnostic(pair_root):
     """Describe pre-action divergence without selecting on benefit outcomes."""
     summary = json.loads((pair_root / "pilot_summary.json").read_text())
@@ -289,6 +315,7 @@ def main():
                  "urgent-phase",
                  "urgent-followup",
                  "urgent-prefill-recovery",
+                 "formal-train1", "formal-train2", "formal-validation", "formal-test",
                  "train-rest",
                  "validation", "test"),
         default="pilot",
@@ -317,11 +344,17 @@ def main():
         all_rows = urgent_followup_design()
     elif args.stage == "urgent-prefill-recovery":
         all_rows = urgent_prefill_recovery_design()
+    elif args.stage.startswith("formal-"):
+        all_rows = formal_expansion_design()
     selected = [
         row
         for row in all_rows
         if (
             diagnostic
+            or args.stage in {"formal-train1", "formal-train2"}
+            and row["role"] == "train"
+            and row["replicate"] == int(args.stage[-1]) - 1
+            or args.stage == f"formal-{row['role']}"
             or args.stage == "pilot"
             and row["role"] == "train"
             and row["replicate"] == 0
@@ -407,7 +440,7 @@ def main():
                     (directory / "replay_verification.json").write_text(
                         json.dumps(replay, indent=2) + "\n", encoding="utf-8"
                     )
-                if diagnostic:
+                if diagnostic or args.stage.startswith("formal-"):
                     prefix_diagnostic(args.out_dir / item["pair"]["pair_id"])
             results.append({"pair_id": item["pair"]["pair_id"], "returncode": rc})
             (args.out_dir / "stage_results.json").write_text(

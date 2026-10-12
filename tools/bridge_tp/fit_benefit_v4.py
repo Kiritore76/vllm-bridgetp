@@ -21,6 +21,7 @@ NAMES = [
     "U_target",
 ]
 EXTRA = ["target_pending_prefill_tokens", "target_decode_pressure_p95_3s"]
+MASK = ["target_decode_pressure_available"]
 ALPHAS = (0.1, 1.0, 10.0, 100.0)
 MARGINS = (0.0, 5.0, 10.0)
 PROFILE_SHA = "dbe02d968e19c32d69deaa9a37748e9ca68f506807b220c114d22a4e2845c8a7"
@@ -36,13 +37,26 @@ def features(snapshot, width):
         s, t = source["source_running"], source["target_running"]
         arrival = observation["prompt_arrival_tokens_s"]
         values = [p, u, p * u, s, t, arrival, p * t, u * t]
-        if width == 10:
-            if observation.get("decode_status") not in {"VALID", "IDLE"}:
-                return None
-            values += [
-                observation["prefill_pending_tokens"],
-                observation["decode_pressure_p95"],
-            ]
+        if width in (10, 11):
+            status = observation.get("decode_status")
+            available = status in {"VALID", "IDLE"}
+            pending = observation.get("prefill_pending_tokens")
+            pressure = observation.get("decode_pressure_p95")
+            if not available:
+                age = observation.get("telemetry_age_s")
+                if (width == 10 or status != "MISSING"
+                        or observation.get("integrity_errors")
+                        or not isinstance(pending, (int, float))
+                        or not math.isfinite(pending) or pending < 1024
+                        or not isinstance(age, (int, float))
+                        or not math.isfinite(age) or not 0 <= age <= 2):
+                    return None
+                # Encoded placeholder with an explicit availability indicator.
+                # Never interpreted as measured zero decode pressure.
+                pressure = 0.0
+            values += [pending, pressure]
+            if width == 11:
+                values += [float(available)]
         if observation.get("version") != "TARGET_OBSERVATION_V1":
             return None
         if not all(
@@ -155,7 +169,8 @@ def train(rows, width, alpha):
     return {
         "width": width,
         "alpha": alpha,
-        "features": NAMES + (EXTRA if width == 10 else []),
+        "features": NAMES + (EXTRA if width in (10, 11) else [])
+        + (MASK if width == 11 else []),
         "mean": mean.tolist(),
         "std": std.tolist(),
         "coefficients": coefficients.tolist(),
@@ -167,6 +182,8 @@ def train(rows, width, alpha):
 
 
 def predict(model, row, *, enforce_support=True):
+    if model["width"] == 11 and model.get("features") != NAMES + EXTRA + MASK:
+        raise ValueError("F11 feature contract differs")
     value = features(row["snapshot"], model["width"])
     if value is None:
         return None
@@ -309,7 +326,7 @@ def main():
             "status": "OFFLINE_ONLY_NO_VALIDATED_LCB",
             "predictor_sha256": PROFILE_SHA,
         }
-        for width in (8, 10):
+        for width in (8, 11):
             alpha, cv = grouped_alpha(training, width)
             model = train(training, width, alpha)
             choices = [
