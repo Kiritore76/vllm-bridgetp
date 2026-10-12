@@ -468,6 +468,16 @@ class BenefitV4Tests(unittest.TestCase):
         self.assertFalse({row["seed"] for row in rows} &
                          {row["seed"] for row in collect.design()})
 
+    def test_urgent_followup_reuses_inputs_and_moves_only_prefill_epoch(self):
+        rows = collect.urgent_followup_design()
+        self.assertEqual([row["seed"] for row in rows], [20261262, 20261263])
+        self.assertEqual([row["target_state"] for row in rows], ["decode", "prefill"])
+        self.assertFalse(rows[0]["target_start_after_anchor"])
+        self.assertTrue(rows[1]["target_start_after_anchor"])
+        self.assertEqual(rows[1]["target_burst_offset_s"], 1.0)
+        self.assertTrue(all(row["minimum_u"] == 0.8 and row["threshold"] == 0
+                            for row in rows))
+
     def test_prefix_diagnostic_ignores_post_action_divergence(self):
         arms = {}
         for action, boundary in (("prob_0_STAY", 20), ("prob_0_START", 25)):

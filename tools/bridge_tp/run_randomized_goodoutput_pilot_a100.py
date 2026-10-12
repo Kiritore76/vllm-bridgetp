@@ -70,6 +70,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-predictor-features", action="store_true")
     parser.add_argument("--target-arrival-wave-period-s", type=float)
     parser.add_argument("--target-burst-arrivals", action="store_true")
+    parser.add_argument("--target-start-after-anchor", action="store_true")
+    parser.add_argument("--target-burst-offset-s", type=float, default=0.5)
     parser.add_argument("--guard-profile", choices=("legacy8448", "reduced2000"),
                         default="legacy8448",
                         help="Pin the guard value and file SHA for this collection")
@@ -439,7 +441,10 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
                         is not None else row["workload_group"]
                     ),
                 }
-                if pool == "source":
+                if pool == "source" or (
+                    pool == "target"
+                    and getattr(args, "target_start_after_anchor", False)
+                ):
                     job["start_after_event"] = "ANCHOR_FIRST_OUTPUT"
                 jobs.append(job)
         arrival_window_s = getattr(args, "arrival_window_s", None)
@@ -472,7 +477,7 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
                     ):
                         planned = wave * (getattr(
                             args, "target_arrival_wave_period_s", None
-                        ) or period_s) + 0.5
+                        ) or period_s) + getattr(args, "target_burst_offset_s", 0.5)
                     if planned < arrival_window_s:
                         scheduled.append((job, planned))
                 if not scheduled:
@@ -559,6 +564,9 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
             "arrival_window_s": arrival_window_s,
             "target_arrival_wave_period_s": getattr(
                 args, "target_arrival_wave_period_s", None),
+            "target_start_after_anchor": getattr(
+                args, "target_start_after_anchor", False),
+            "target_burst_offset_s": getattr(args, "target_burst_offset_s", 0.5),
             "target_arrival_process": (
                 "fixed_periodic_bursts" if getattr(args, "target_burst_arrivals", False)
                 else "stratified_replay"),
@@ -1432,6 +1440,17 @@ def execute_pilot(args: argparse.Namespace) -> None:
         not args.probability_pilot or args.arrival_window_s is None
     ):
         raise ValueError("target bursts require a fixed-window probability pilot")
+    offset = getattr(args, "target_burst_offset_s", 0.5)
+    if not math.isfinite(offset) or offset < 0:
+        raise ValueError("target burst offset must be finite and nonnegative")
+    if (getattr(args, "target_start_after_anchor", False) or offset != 0.5) and (
+        not getattr(args, "target_burst_arrivals", False)
+        or not getattr(args, "constructed_workload", False)
+        or target_period is None or offset >= target_period
+    ):
+        raise ValueError(
+            "anchor-relative offset needs constructed periodic target bursts"
+        )
     if getattr(args, 'rolling_cutover', False) and (
         not args.probability_pilot or args.rolling_reserve_tokens < 64
     ):
@@ -1580,6 +1599,8 @@ def execute_pilot(args: argparse.Namespace) -> None:
         "predictor_profile": getattr(args, "predictor_profile", "seed44"),
         "benefit_target_state": target_state,
         "target_burst_arrivals": getattr(args, "target_burst_arrivals", False),
+        "target_start_after_anchor": getattr(args, "target_start_after_anchor", False),
+        "target_burst_offset_s": offset,
         "target_arrival_wave_period_s": target_period,
         "target_observation_version": (
             "TARGET_OBSERVATION_V1"
@@ -1628,6 +1649,9 @@ def execute_pilot(args: argparse.Namespace) -> None:
         if (summary.get("seed") != args.seed
                 or summary.get("target_burst_arrivals", False)
                 != getattr(args, "target_burst_arrivals", False)
+                or summary.get("target_start_after_anchor", False)
+                != getattr(args, "target_start_after_anchor", False)
+                or summary.get("target_burst_offset_s", 0.5) != offset
                 or summary.get("target_arrival_wave_period_s") != target_period
                 or tuple(summary.get("actions", ())) != tuple(actions)
                 or summary.get("evaluation_horizon_s")

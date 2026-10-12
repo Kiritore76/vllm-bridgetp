@@ -109,3 +109,11 @@ background_events改为AsyncJournal，关闭后核对footer及summary完整性�
 采集层子进程使用--no-archive，上层仅打包一次；外层模板也给stage传--no-archive，并使用tools/bridge_tp/result_archive.py。保留预测特征、概率/状态快照、原始输出与时间戳、SLO/窗口结果、日志、receipt、输入与唯一源码包；不因收益符号或运行失败删除记录。移除有对应完整采集目录/契约的重复内层tar和Python缓存，并附archive_contents_manifest.json。没有对应原目录的唯一tar包（例如runtime_source.tar.gz）保留。
 
 打包不修改原结果目录，原子替换输出；失败保留旧的完整包。此次真实6-arm包750.73MB可精简为192.46MB（减少74.36%），15970个特征文件校验及31份核心原始文件字节一致检查通过。239项CPU回归通过；精简是包装层变化，不改预测器、p/U、SLO、窗口、KV迁移或实验标签。
+
+## 2026-10-12：紧急层后续4-arm
+
+新增--stage urgent-followup，只选decode/prefill两对，沿用seed20261262/20261263请求内容；不重跑空闲组。decode保持原到达配方以复验2.24秒迟发。prefill仍4x6144、30秒周期、最多256输出，改为ANCHOR_FIRST_OUTPUT事件后1秒及每30秒注入。源5x4992、U>=0.8、p门槛0和其他评分/迁移协议不变。目标时间锚点与偏移写入manifest/summary，resume必须一致。
+
+source首次输出事件是首个正输出遥测的记录unix_s，调度器使用实际事件时间，不用观察到日志时的当前时间重置。该变更只用于构造目标负载，不使用固定token迁移门槛，也不把未来计划提供给在线收益输入。期望在普通紧急U附近观察到prefill，但实际可达性仍需GPU验证；未达状态/无START/负收益保留，不能自动放宽门槛或加大源压力。
+
+240项CPU检查及实际Qwen tokenizer完整setup通过。后续指令采用单层精简归档，不再包含pair/pilot的重复压缩包。

@@ -125,6 +125,22 @@ def urgent_phase_design():
     return rows
 
 
+def urgent_followup_design():
+    """Repeat decode; align prefill to the source event using the same inputs."""
+    rows = []
+    for row in urgent_phase_design():
+        if row["target_state"] == "idle":
+            continue
+        rows.append({
+            **row, "pair_id": f"urgent-followup-{row['target_state']}-{row['seed']}",
+            "target_start_after_anchor": row["target_state"] == "prefill",
+            "target_burst_offset_s": 1.0 if row["target_state"] == "prefill" else 0.5,
+            "purpose": ("repeat dispatch eligibility" if row["target_state"] == "decode"
+                        else "earlier source-relative prefill phase"),
+        })
+    return rows
+
+
 def prefix_diagnostic(pair_root):
     """Describe pre-action divergence without selecting on benefit outcomes."""
     summary = json.loads((pair_root / "pilot_summary.json").read_text())
@@ -253,6 +269,9 @@ def command(args, row, input_path, out):
         cmd += ["--probability-max-urgency", str(row["maximum_u"])]
     if row.get("target_burst_arrivals"):
         cmd += ["--target-burst-arrivals"]
+    if row.get("target_start_after_anchor"):
+        cmd += ["--target-start-after-anchor", "--target-burst-offset-s",
+                str(row["target_burst_offset_s"])]
     return cmd
 
 
@@ -262,6 +281,7 @@ def main():
         "--stage",
         choices=("pilot", "repair-pilot", "dispatch-pilot", "prefill-repeat",
                  "urgent-phase",
+                 "urgent-followup",
                  "train-rest",
                  "validation", "test"),
         default="pilot",
@@ -276,6 +296,7 @@ def main():
     args = parser.parse_args()
     diagnostic = args.stage in {
         "repair-pilot", "dispatch-pilot", "prefill-repeat", "urgent-phase",
+        "urgent-followup",
     }
     all_rows = repair_design() if diagnostic else design()
     if args.stage == "dispatch-pilot":
@@ -284,6 +305,8 @@ def main():
         all_rows = prefill_repeat_design()
     elif args.stage == "urgent-phase":
         all_rows = urgent_phase_design()
+    elif args.stage == "urgent-followup":
+        all_rows = urgent_followup_design()
     selected = [
         row
         for row in all_rows
@@ -374,7 +397,7 @@ def main():
                     (directory / "replay_verification.json").write_text(
                         json.dumps(replay, indent=2) + "\n", encoding="utf-8"
                     )
-                if args.stage in {"prefill-repeat", "urgent-phase"}:
+                if args.stage in {"prefill-repeat", "urgent-phase", "urgent-followup"}:
                     prefix_diagnostic(args.out_dir / item["pair"]["pair_id"])
             results.append({"pair_id": item["pair"]["pair_id"], "returncode": rc})
             (args.out_dir / "stage_results.json").write_text(
