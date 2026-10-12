@@ -63,6 +63,29 @@ def design():
     return rows
 
 
+def repair_design():
+    """Two diagnostic pairs; keep later selection and test sets untouched."""
+    rows = []
+    for target, seed in (("decode", 20261251), ("prefill", 20261252)):
+        base = next(row for row in design() if row["role"] == "train"
+                    and row["replicate"] == 0 and row["source_state"] == "slack"
+                    and row["target_state"] == target)
+        row = {
+            **base,
+            "pair_id": f"repair-slack-{target}-{seed}",
+            "role": "validation",
+            "seed": seed,
+            "source_family_group": f"constructed-repair-record-set-{seed}",
+            "diagnostic_use_only": True,
+            "target_count": 12 if target == "decode" else 4,
+            "target_period_s": 40 if target == "decode" else 30,
+            "target_max_tokens": 4096 if target == "decode" else 256,
+            "target_burst_arrivals": target == "prefill",
+        }
+        rows.append(row)
+    return rows
+
+
 def command(args, row, input_path, out):
     """Build probability interventions; keep migration/SLO contracts frozen."""
     digest = hashlib.sha256(input_path.read_bytes()).hexdigest()
@@ -135,6 +158,8 @@ def command(args, row, input_path, out):
     ]
     if row["maximum_u"] is not None:
         cmd += ["--probability-max-urgency", str(row["maximum_u"])]
+    if row.get("target_burst_arrivals"):
+        cmd += ["--target-burst-arrivals"]
     return cmd
 
 
@@ -142,7 +167,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--stage",
-        choices=("pilot", "train-rest", "validation", "test"),
+        choices=("pilot", "repair-pilot", "train-rest", "validation", "test"),
         default="pilot",
     )
     parser.add_argument("--plan-only", action="store_true")
@@ -151,12 +176,13 @@ def main():
     for key in ("model", "base", "survival", "guard", "checkpoint", "reference"):
         parser.add_argument(f"--{key}", required=True, type=Path)
     args = parser.parse_args()
-    all_rows = design()
+    all_rows = repair_design() if args.stage == "repair-pilot" else design()
     selected = [
         row
         for row in all_rows
         if (
-            args.stage == "pilot"
+            args.stage == "repair-pilot"
+            or args.stage == "pilot"
             and row["role"] == "train"
             and row["replicate"] == 0
             or args.stage == "train-rest"
@@ -169,6 +195,9 @@ def main():
     frozen = {
         "protocol": PROTOCOL,
         "stage": args.stage,
+        "diagnostic_only": args.stage == "repair-pilot",
+        "collection_revision": args.expected_revision,
+        "arrival_schedule_version": "FIXED_EVENT_EPOCH_DUE_TIME_DISPATCH_V2",
         "all_pairs": all_rows,
         "predictor_sha256": (
             "dbe02d968e19c32d69deaa9a37748e9ca68f506807b220c114d22a4e2845c8a7"

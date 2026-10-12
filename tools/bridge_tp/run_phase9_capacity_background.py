@@ -13,16 +13,21 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from tools.bridge_tp.background_schedule import (  # noqa: E402
+    SCHEDULE_VERSION,
+    ControllerEpochs,
+    event_matches,
+    execute_schedule,
+    output_threshold,
+)
 from vllm.bridge_tp.controller.online_io import (  # noqa: E402
     atomic_json_dump,
     post_streaming_completion,
@@ -33,8 +38,7 @@ from vllm.bridge_tp.controller.sampling_contract import (  # noqa: E402
 
 
 def anchor_output_threshold(event: str) -> int | None:
-    match = re.fullmatch(r"ANCHOR_OUTPUT_([1-9][0-9]*)", event)
-    return int(match.group(1)) if match else None
+    return output_threshold(event)
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
@@ -106,35 +110,15 @@ def parse_args() -> argparse.Namespace:
 
 
 def wait_for_controller_event(path: Path, event: str, timeout_s: float) -> float:
-    """Release diagnostic arrivals after observed controller progress."""
-    output_threshold = anchor_output_threshold(event)
-    if event not in {"M2_INITIAL_RATE", "ANCHOR_FIRST_OUTPUT"} and (
-        output_threshold is None
-    ):
-        raise ValueError(f"unknown controller event: {event}")
-    deadline = time.monotonic() + timeout_s
+    """Return the recorded event epoch, even when it is observed much later."""
+    event_matches({}, event)  # Validate before waiting for a file.
+    origin = time.monotonic()
+    epochs = ControllerEpochs(path, {event}, origin, time.time())
+    deadline = origin + timeout_s
     while time.monotonic() < deadline:
-        if path.is_file():
-            for line in path.read_text(encoding="utf-8").splitlines():
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if event == "M2_INITIAL_RATE" and (
-                    row.get("kind") == "manager_m2_initial_rate"
-                ):
-                    return time.monotonic()
-                if event == "ANCHOR_FIRST_OUTPUT" and (
-                    row.get("kind") == "telemetry"
-                    and int(row.get("output_tokens") or 0) > 0
-                ):
-                    return time.monotonic()
-                if output_threshold is not None and (
-                    row.get("kind") == "telemetry"
-                    and int(row.get("output_tokens") or 0)
-                    >= output_threshold
-                ):
-                    return time.monotonic()
+        epochs.poll()
+        if event in epochs.epochs:
+            return epochs.epochs[event]
         time.sleep(0.02)
     raise TimeoutError(f"{event} event was not observed")
 
@@ -150,9 +134,11 @@ def main() -> None:
     if args.validate_only:
         print(f"valid CAP-0 background manifest: {len(manifest['jobs'])} jobs")
         return
-    if any(job.get("start_after_event") for job in manifest["jobs"]):
-        if args.controller_audit_path is None:
-            raise ValueError("event-start jobs require --controller-audit-path")
+    if (
+        any(job.get("start_after_event") for job in manifest["jobs"])
+        and args.controller_audit_path is None
+    ):
+        raise ValueError("event-start jobs require --controller-audit-path")
 
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -173,19 +159,16 @@ def main() -> None:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             handle.flush()
 
-    def run_job(job: dict[str, Any]) -> dict[str, Any]:
+    def run_job(planned) -> dict[str, Any]:
+        job = planned.job
         job_id = str(job["job_id"])
         start_after_s = float(job["start_after_s"])
-        start_event = job.get("start_after_event")
-        anchor = (
-            wait_for_controller_event(args.controller_audit_path, start_event, 120.0)
-            if start_event else start_monotonic
-        )
-        scheduled_monotonic = anchor + start_after_s
-        remaining = scheduled_monotonic - time.monotonic()
-        if remaining > 0:
-            time.sleep(remaining)
-        schedule_lag_s = max(0.0, time.monotonic() - scheduled_monotonic)
+        schedule_lag_s = max(0.0, time.monotonic() - planned.scheduled_monotonic)
+        schedule_fields = {
+            "schedule_version": SCHEDULE_VERSION,
+            "schedule_epoch_unix_s": planned.epoch_unix_s,
+            "scheduled_unix_s": planned.scheduled_unix_s,
+        }
         base_url = args.source_url if job["pool"] == "source" else args.target_url
         request = freeze_strict_greedy_sampling(dict(job["request"]))
         request.update(
@@ -198,8 +181,9 @@ def main() -> None:
         request.setdefault("ignore_eos", True)
         event({"kind": "job_start", "job_id": job_id, "pool": job["pool"],
                "start_after_s": start_after_s,
-               "schedule_lag_s": schedule_lag_s})
+               "schedule_lag_s": schedule_lag_s, **schedule_fields})
         request_started_unix_s = time.time()
+        schedule_lag_s = max(0.0, time.monotonic() - planned.scheduled_monotonic)
         if live and job["pool"] == "target":
             live.submit({"kind": "native_arrival", "job_id": job_id,
                          "unix_s": request_started_unix_s,
@@ -237,6 +221,7 @@ def main() -> None:
                 "pool": job["pool"],
                 "start_after_s": start_after_s,
                 "schedule_lag_s": schedule_lag_s,
+                **schedule_fields,
                 "status": "COMPLETED",
                 "response_id": result["response_id"],
                 "finish_reason": result["finish_reason"],
@@ -271,6 +256,7 @@ def main() -> None:
                 "pool": job["pool"],
                 "start_after_s": start_after_s,
                 "schedule_lag_s": schedule_lag_s,
+                **schedule_fields,
                 "status": "FAILED",
                 "request_started_unix_s": request_started_unix_s,
                 "request_ended_unix_s": time.time(),
@@ -290,17 +276,26 @@ def main() -> None:
             "jobs": len(manifest["jobs"]),
         }
     )
-    # Long arrival windows can contain hundreds of jobs. Submit in due-time
-    # order while bounding worker threads; the lag audit detects overload.
-    ordered_jobs = sorted(manifest["jobs"],
-                          key=lambda job: float(job["start_after_s"]))
-    with ThreadPoolExecutor(max_workers=min(128, len(ordered_jobs))) as executor:
-        futures = [executor.submit(run_job, job) for job in ordered_jobs]
-        results = [future.result() for future in as_completed(futures)]
+    results = execute_schedule(
+        manifest["jobs"], run_job, args.controller_audit_path,
+        start_monotonic, start_unix_s,
+    )
+    evidence_error = None
     if live:
-        live.close()
+        try:
+            live.close()
+        except Exception as error:
+            evidence_error = error
     summary = {
         "format_version": 1,
+        "schedule_version": SCHEDULE_VERSION,
+        "native_evidence_integrity": {
+            "enabled": live is not None,
+            "complete": evidence_error is None,
+            "dropped": live.dropped if live else 0,
+            "writer_error": str(live.error) if live and live.error else None,
+            "error": str(evidence_error) if evidence_error else None,
+        },
         "jobs": len(results),
         "completed": sum(item["status"] == "COMPLETED" for item in results),
         "failed": sum(item["status"] == "FAILED" for item in results),
@@ -314,6 +309,8 @@ def main() -> None:
     }
     atomic_json_dump(summary, out_dir / "background_summary.json")
     event({"kind": "run_end", **summary})
+    if evidence_error is not None:
+        raise RuntimeError("background native evidence incomplete") from evidence_error
     if summary["failed"]:
         raise SystemExit(f"{summary['failed']} background jobs failed")
     print(f"CAP-0 background complete: {summary['completed']} jobs")

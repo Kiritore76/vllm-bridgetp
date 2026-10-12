@@ -5,22 +5,32 @@ import hashlib
 import json
 import queue
 import threading
+import time
 
 
 class AsyncJournal:
     """Drain immutable event records and expose losses instead of hiding them."""
 
-    def __init__(self, path, capacity=4096):
+    def __init__(self, path, capacity=65536, batch_size=512, flush_interval_s=0.05):
+        if capacity < 1 or batch_size < 1 or flush_interval_s <= 0:
+            raise ValueError("invalid journal buffering parameters")
         path.parent.mkdir(parents=True, exist_ok=True)
         self.queue = queue.Queue(maxsize=capacity)
         self.dropped = 0
         self.error = None
-        self.handle = path.open("x", encoding="utf-8", buffering=1)
+        self.saved = 0
+        self.write_batches = 0
+        self.batch_size = batch_size
+        self.flush_interval_s = flush_interval_s
+        self.closed = False
+        self.handle = path.open("x", encoding="utf-8", buffering=65536)
         self.worker = threading.Thread(target=self._run, daemon=True)
         self.worker.start()
 
     def submit(self, value):
         """Return False on overflow; the footer makes evidence loss auditable."""
+        if self.closed:
+            raise RuntimeError("evidence journal is closed")
         try:
             self.queue.put_nowait(value)
             return True
@@ -29,20 +39,56 @@ class AsyncJournal:
             return False
 
     def _run(self):
+        last_flush = time.monotonic()
         while True:
-            value = self.queue.get()
             try:
-                if value is None:
-                    return
+                value = self.queue.get(timeout=self.flush_interval_s)
+            except queue.Empty:
                 if self.error is None:
-                    self.handle.write(json.dumps(value, allow_nan=False) + "\n")
+                    try:
+                        self.handle.flush()
+                    except Exception as error:
+                        self.error = error
+                last_flush = time.monotonic()
+                continue
+            values = [value]
+            while values[-1] is not None and len(values) < self.batch_size:
+                try:
+                    values.append(self.queue.get_nowait())
+                except queue.Empty:
+                    break
+            stopping = values[-1] is None
+            records = values[:-1] if stopping else values
+            try:
+                if records and self.error is None:
+                    payload = "".join(
+                        json.dumps(record, allow_nan=False) + "\n"
+                        for record in records
+                    )
+                    self.handle.write(payload)
+                    self.saved += len(records)
+                    self.write_batches += 1
+                if self.error is None and (
+                    stopping
+                    or time.monotonic() - last_flush >= self.flush_interval_s
+                ):
+                    self.handle.flush()
+                    last_flush = time.monotonic()
             except Exception as error:
                 self.error = error
             finally:
-                self.queue.task_done()
+                for _ in values:
+                    self.queue.task_done()
+            if stopping:
+                return
 
     def close(self):
         """Drain at shutdown, writing a final evidence-integrity receipt."""
+        if self.closed:
+            if self.error or self.dropped:
+                raise RuntimeError("asynchronous evidence incomplete") from self.error
+            return
+        self.closed = True
         self.queue.put(None)
         self.worker.join()
         try:
@@ -52,6 +98,10 @@ class AsyncJournal:
                         "kind": "evidence_footer",
                         "dropped": self.dropped,
                         "writer_error": str(self.error) if self.error else None,
+                        "saved_records": self.saved,
+                        "write_batches": self.write_batches,
+                        "queue_capacity": self.queue.maxsize,
+                        "flush_interval_s": self.flush_interval_s,
                     }
                 )
                 + "\n"

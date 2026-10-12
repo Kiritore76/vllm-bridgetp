@@ -54,10 +54,12 @@ def features(snapshot, width):
         return None
 
 
-def load_pairs(roots, allowed):
+def load_pairs(roots, allowed, *, selected_pair_ids=None):
     pairs, seen = [], set()
     for root in roots:
         plan = json.loads((root / "preregistration.json").read_text(encoding="utf-8"))
+        if plan.get("diagnostic_only"):
+            raise ValueError("diagnostic repair pilot is excluded from model selection")
         if plan["protocol"] != "RISK76_MLP4_TARGET_PHASE_V4":
             raise ValueError("mixed collection protocol")
         if plan["predictor_sha256"] != PROFILE_SHA:
@@ -66,9 +68,17 @@ def load_pairs(roots, allowed):
         for row in plan["all_pairs"]:
             if row["pair_id"] not in selected or row["role"] not in allowed:
                 continue  # In selection mode, do not read final test outcomes.
-            path = root / row["pair_id"] / "paired_outcomes.json"
+            if (
+                selected_pair_ids is not None
+                and row["pair_id"] not in selected_pair_ids
+            ):
+                continue  # Explicit subset for offline diagnostics; main uses all.
+            path = root / row["pair_id"] / "probability_outcomes.json"
             if not path.exists():
-                raise ValueError(f"missing paired outcome: {path}")
+                raise ValueError(f"missing probability outcome: {path}")
+            outcome = json.loads(path.read_text(encoding="utf-8"))
+            if outcome.get("status") != "COLLECTOR_PILOT_NOT_FITTED_NET_BENEFIT":
+                raise ValueError("expected probability collector outcome contract")
             journals = list(
                 path.parent.glob("*/*/r01_shadow_only/controller/predictor_features")
             )
@@ -90,7 +100,7 @@ def load_pairs(roots, allowed):
                     or error > 1e-5
                 ):
                     raise ValueError("paired predictor replay verification failed")
-            for sample in json.loads(path.read_text(encoding="utf-8"))["samples"]:
+            for sample in outcome["samples"]:
                 key = (row["seed"], row["source_family_group"], sample["threshold"])
                 if key in seen:
                     raise ValueError("duplicate pilot/train root or threshold")

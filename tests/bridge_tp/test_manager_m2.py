@@ -118,6 +118,7 @@ class TestM2RateController(unittest.TestCase):
                 audit.write_text(json.dumps({
                     "kind": "manager_m2_initial_rate",
                     "decision": {"profile": "LOW"},
+                    "unix_s": time.time(),
                 }) + "\n", encoding="utf-8")
 
             writer = threading.Thread(target=publish)
@@ -134,11 +135,13 @@ class TestM2RateController(unittest.TestCase):
             def publish() -> None:
                 audit.write_text(json.dumps({
                     "kind": "telemetry", "output_tokens": 0,
+                    "unix_s": time.time(),
                 }) + "\n", encoding="utf-8")
                 time.sleep(0.05)
                 with audit.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps({
                         "kind": "telemetry", "output_tokens": 1,
+                        "unix_s": time.time(),
                     }) + "\n")
 
             writer = threading.Thread(target=publish)
@@ -176,11 +179,13 @@ class TestM2RateController(unittest.TestCase):
             def publish() -> None:
                 audit.write_text(json.dumps({
                     "kind": "telemetry", "output_tokens": 799,
+                    "unix_s": time.time(),
                 }) + "\n", encoding="utf-8")
                 time.sleep(0.05)
                 with audit.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps({
                         "kind": "telemetry", "output_tokens": 800,
+                        "unix_s": time.time(),
                     }) + "\n")
 
             writer = threading.Thread(target=publish)

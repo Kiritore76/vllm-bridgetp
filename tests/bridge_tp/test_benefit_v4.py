@@ -411,6 +411,44 @@ class BenefitV4Tests(unittest.TestCase):
         self.assertEqual(result["total_regret"], 10)
         self.assertEqual(result["missed_positives"], 1)
 
+    def test_repair_design_is_four_arms_without_using_selection_test_seeds(self):
+        rows = collect.repair_design()
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(row["diagnostic_use_only"] for row in rows))
+        self.assertTrue(all(row["threshold"] == 0 for row in rows))
+        self.assertTrue(all(row["source_state"] == "slack" for row in rows))
+        self.assertEqual([row["target_count"] for row in rows], [12, 4])
+        self.assertEqual(rows[1]["target_period_s"], 30)
+        self.assertEqual(rows[1]["target_max_tokens"], 256)
+        self.assertTrue(rows[1]["target_burst_arrivals"])
+        self.assertFalse({row["seed"] for row in rows} &
+                         {row["seed"] for row in collect.design()})
+
+    def test_diagnostic_repair_pilot_cannot_enter_model_selection(self):
+        (self.root / "preregistration.json").write_text(json.dumps({
+            "diagnostic_only": True,
+        }))
+        with self.assertRaisesRegex(ValueError, "excluded from model selection"):
+            fit.load_pairs([self.root], {"train", "validation"})
+
+    def test_fit_rejects_legacy_file_and_renamed_wrong_contract(self):
+        row = collect.design()[0]
+        (self.root / "preregistration.json").write_text(json.dumps({
+            "protocol": collect.PROTOCOL, "predictor_sha256": fit.PROFILE_SHA,
+            "all_pairs": [row], "selected_pairs": [row["pair_id"]],
+        }))
+        directory = self.root / row["pair_id"]
+        directory.mkdir()
+        old = {"status": "PAIRED_ONLY", "samples": []}
+        (directory / "paired_outcomes.json").write_text(json.dumps(old))
+        with self.assertRaisesRegex(ValueError, "missing probability outcome"):
+            fit.load_pairs([self.root], {"train"})
+        (directory / "probability_outcomes.json").write_text(json.dumps(old))
+        with self.assertRaisesRegex(
+            ValueError, "probability collector outcome contract"
+        ):
+            fit.load_pairs([self.root], {"train"})
+
     def test_fit_selection_does_not_open_final_test_labels(self):
         plan = collect.design()
         (self.root / "preregistration.json").write_text(
@@ -460,9 +498,10 @@ class BenefitV4Tests(unittest.TestCase):
                     "decode_pressure_p95": 0.5,
                 },
             }
-            (directory / "paired_outcomes.json").write_text(
+            (directory / "probability_outcomes.json").write_text(
                 json.dumps(
                     {
+                        "status": "COLLECTOR_PILOT_NOT_FITTED_NET_BENEFIT",
                         "samples": [
                             {
                                 "threshold": row["threshold"],

@@ -67,6 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--probability-max-urgency", type=float)
     parser.add_argument("--save-predictor-features", action="store_true")
     parser.add_argument("--target-arrival-wave-period-s", type=float)
+    parser.add_argument("--target-burst-arrivals", action="store_true")
     parser.add_argument("--guard-profile", choices=("legacy8448", "reduced2000"),
                         default="legacy8448",
                         help="Pin the guard value and file SHA for this collection")
@@ -463,6 +464,13 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
                             if job["pool"] == "target" else None) or period_s
                         planned = wave * pool_period + (
                             index + phase) * pool_period / pool_count
+                    if (
+                        job["pool"] == "target"
+                        and getattr(args, "target_burst_arrivals", False)
+                    ):
+                        planned = wave * (getattr(
+                            args, "target_arrival_wave_period_s", None
+                        ) or period_s) + 0.5
                     if planned < arrival_window_s:
                         scheduled.append((job, planned))
                 if not scheduled:
@@ -512,7 +520,9 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
                          if job["pool"] == pool), default=-1)
                     < arrival_window_s - ((getattr(
                         args, "target_arrival_wave_period_s", None)
-                        if pool == "target" else None) or period_s) / count
+                        if pool == "target" else None) or period_s) / (
+                            1 if pool == "target" and getattr(
+                                args, "target_burst_arrivals", False) else count)
                     for pool, count in (("source", source_count),
                                         ("target", target_count)) if count > 0)):
                 raise ValueError("arrival schedule does not cover the window")
@@ -545,6 +555,11 @@ def build_setup(args: argparse.Namespace, root: Path) -> dict[str, Any]:
                 if getattr(args, "random_arrivals", False) else
                 "fixed_spacing"),
             "arrival_window_s": arrival_window_s,
+            "target_arrival_wave_period_s": getattr(
+                args, "target_arrival_wave_period_s", None),
+            "target_arrival_process": (
+                "fixed_periodic_bursts" if getattr(args, "target_burst_arrivals", False)
+                else "stratified_replay"),
             "arrival_wave_period_s": (
                 getattr(args, "arrival_wave_period_s", 40.0)
                 if arrival_window_s is not None else None),
@@ -1396,6 +1411,10 @@ def execute_pilot(args: argparse.Namespace) -> None:
         or args.arrival_window_s is None or target_period >= args.arrival_window_s
     ):
         raise ValueError("target period needs a positive fixed arrival window")
+    if getattr(args, "target_burst_arrivals", False) and (
+        not args.probability_pilot or args.arrival_window_s is None
+    ):
+        raise ValueError("target bursts require a fixed-window probability pilot")
     if getattr(args, 'rolling_cutover', False) and (
         not args.probability_pilot or args.rolling_reserve_tokens < 64
     ):
@@ -1543,6 +1562,8 @@ def execute_pilot(args: argparse.Namespace) -> None:
         "probability_max_urgency": maximum_u,
         "predictor_profile": getattr(args, "predictor_profile", "seed44"),
         "benefit_target_state": target_state,
+        "target_burst_arrivals": getattr(args, "target_burst_arrivals", False),
+        "target_arrival_wave_period_s": target_period,
         "target_observation_version": (
             "TARGET_OBSERVATION_V1"
             if os.environ.get("BRIDGETP_TARGET_OBSERVATION") == "1" else None),
@@ -1588,6 +1609,9 @@ def execute_pilot(args: argparse.Namespace) -> None:
     if summary_path.is_file():
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
         if (summary.get("seed") != args.seed
+                or summary.get("target_burst_arrivals", False)
+                != getattr(args, "target_burst_arrivals", False)
+                or summary.get("target_arrival_wave_period_s") != target_period
                 or tuple(summary.get("actions", ())) != tuple(actions)
                 or summary.get("evaluation_horizon_s")
                 != args.evaluation_horizon_s

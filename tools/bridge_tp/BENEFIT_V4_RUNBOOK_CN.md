@@ -31,9 +31,25 @@ target reservation仍512，是空间预留上界，不能与基础冻结提前�
 不进入冻结／最终增量确认路径；接口只接受本轮secret，不开放任意开发RPC。
 重复finalize／模型shutdown不会再次向已退出的写盘线程投递终止标记。
 
+原生事件使用65536条有限队列、最多512条批量写盘和50ms定时刷新，
+后台生成回调仍只做非阻塞提交。发生丢失或写入错误仍拒绝完整性验收；
+background_summary先保存逐请求诊断与native_evidence_integrity，再报工程失败。
+
+到达版本为FIXED_EVENT_EPOCH_DUE_TIME_DISPATCH_V2：共享审计中事件发生的unix_s，
+映射到固定monotonic epoch，调度器只在到达时派发HTTP任务；响应线程不提前占位睡眠。
+最多512个在途HTTP请求；客户端超限显式失败，不在采集器内悄悄排队。
+每条结果保存epoch、scheduled_unix_s和真实schedule_lag_s。
+发生于引擎内部的排队／抢占仍属于服务结果，不能通过改事件锚点隐藏采集端晚发。
+
 ## 分阶段采集
 
 `run_benefit_v4_collection.py --stage pilot`只运行六格训练replicate0，12arm。
+
+`--stage repair-pilot`仅运行有余量源的decode／prefill两对，4arm；独立seed
+20261251／20261252，diagnostic_only=true，不使用后续选择验证／测试记录。
+decode配方为12请求×2048prompt、40秒周期，保留25ms压力档；prefill配方为
+4请求×6144prompt、30秒一波同时到达、最多256输出token。两者都按真实观测选候选。
+新配方尚需GPU可达性验收；未达到状态不能称已覆盖，不能进入正式模型选择。
 两档源：实测U≤0.5、有余量；U≥0.8、紧急（允许物理可行的U>1）。
 三档目标：真正空闲、原生decode繁忙、prefill队列积压。
 人数／prompt／到达周期只是构造旋钮，候选必须符合实际观测门槛。
@@ -55,6 +71,11 @@ preregistration.json写出全部角色，commands.json保存命令与每个pair�
 OOM／抢占／超时等服务结果按现有评分保留。
 
 ## 离线F8／F10
+
+读取probability pilot的`probability_outcomes.json`，校验其专用状态契约。
+`paired_outcomes.json`是另一个paired-only协议产物，不能复制或重命名替代。
+无干预对保留为eligible=false，不变成效果标签；缺重放证据的臂继续拒绝。
+诊断可显式选择已完成pair；训练CLI仍要求所选阶段全部结果，不静默跳过失败对。
 
 `fit_benefit_v4.py --collections <pilot> <train-rest> <validation> --out-dir <new-fit>`
 只读取训练与选择验证结果，不读取test标签。
