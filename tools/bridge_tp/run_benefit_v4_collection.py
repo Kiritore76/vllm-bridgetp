@@ -104,6 +104,27 @@ def prefill_repeat_design():
     }]
 
 
+def urgent_phase_design():
+    """Reach high U with previously tested target-phase recipes, not high p gates."""
+    rows = []
+    for index, target in enumerate(("idle", "decode", "prefill")):
+        seed = 20261261 + index
+        base = next(row for row in design() if row["role"] == "train"
+                    and row["replicate"] == 0 and row["source_state"] == "urgent"
+                    and row["target_state"] == target)
+        rows.append({
+            **base, "role": "validation", "seed": seed,
+            "pair_id": f"urgent-phase-{target}-{seed}",
+            "source_family_group": f"constructed-urgent-phase-record-set-{seed}",
+            "diagnostic_use_only": True,
+            "target_count": {"idle": 0, "decode": 12, "prefill": 4}[target],
+            "target_period_s": 30 if target == "prefill" else 40,
+            "target_max_tokens": 256 if target == "prefill" else 4096,
+            "target_burst_arrivals": target == "prefill",
+        })
+    return rows
+
+
 def prefix_diagnostic(pair_root):
     """Describe pre-action divergence without selecting on benefit outcomes."""
     summary = json.loads((pair_root / "pilot_summary.json").read_text())
@@ -118,10 +139,25 @@ def prefix_diagnostic(pair_root):
             source = json.loads((run / "source_response.json").read_text())
             rows.append({
                 "action": action, "snapshot": snapshot,
-                "token_ids": source["token_ids"],
+                "token_ids": source.get("token_ids") or [],
             })
     if len(rows) != 2:
         raise ValueError("prefix diagnosis requires two completed arms")
+    if any(row["snapshot"].get("generated_tokens") is None for row in rows):
+        report = {
+            "diagnostic_only": True, "status": "CANDIDATE_NOT_OBSERVED",
+            "identical_pre_action_prefix": None, "selection_on_goodoutput": False,
+            "candidate_snapshots": [
+                {key: value for key, value in row.items() if key != "token_ids"}
+                for row in rows
+            ],
+        }
+        (pair_root / "pre_action_prefix_diagnostic.json").write_text(
+            json.dumps(report, indent=2) + "\n", encoding="utf-8"
+        )
+        print("[诊断] 某臂未观察到合格候选；保留无START结果，不伪造前缀匹配。",
+              flush=True)
+        return
     boundary = min(int(row["snapshot"]["generated_tokens"]) for row in rows)
     left, right = [row.pop("token_ids")[:boundary] for row in rows]
     available = min(len(left), len(right))
@@ -224,6 +260,7 @@ def main():
     parser.add_argument(
         "--stage",
         choices=("pilot", "repair-pilot", "dispatch-pilot", "prefill-repeat",
+                 "urgent-phase",
                  "train-rest",
                  "validation", "test"),
         default="pilot",
@@ -234,12 +271,16 @@ def main():
     for key in ("model", "base", "survival", "guard", "checkpoint", "reference"):
         parser.add_argument(f"--{key}", required=True, type=Path)
     args = parser.parse_args()
-    diagnostic = args.stage in {"repair-pilot", "dispatch-pilot", "prefill-repeat"}
+    diagnostic = args.stage in {
+        "repair-pilot", "dispatch-pilot", "prefill-repeat", "urgent-phase",
+    }
     all_rows = repair_design() if diagnostic else design()
     if args.stage == "dispatch-pilot":
         all_rows = dispatch_design()
     elif args.stage == "prefill-repeat":
         all_rows = prefill_repeat_design()
+    elif args.stage == "urgent-phase":
+        all_rows = urgent_phase_design()
     selected = [
         row
         for row in all_rows
@@ -330,7 +371,7 @@ def main():
                     (directory / "replay_verification.json").write_text(
                         json.dumps(replay, indent=2) + "\n", encoding="utf-8"
                     )
-                if args.stage == "prefill-repeat":
+                if args.stage in {"prefill-repeat", "urgent-phase"}:
                     prefix_diagnostic(args.out_dir / item["pair"]["pair_id"])
             results.append({"pair_id": item["pair"]["pair_id"], "returncode": rc})
             (args.out_dir / "stage_results.json").write_text(

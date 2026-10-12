@@ -451,6 +451,23 @@ class BenefitV4Tests(unittest.TestCase):
         self.assertEqual(row["target_count"], 4)
         self.assertEqual(row["target_period_s"], 30)
 
+    def test_urgent_phase_changes_source_not_verified_target_recipes(self):
+        rows = collect.urgent_phase_design()
+        self.assertEqual(len(rows), 3)
+        self.assertEqual([row["target_count"] for row in rows], [0, 12, 4])
+        self.assertEqual([row["seed"] for row in rows], [20261261, 20261262, 20261263])
+        for row in rows:
+            self.assertEqual(row["source_count"], 5)
+            self.assertEqual(row["source_prompt_tokens"], 4992)
+            self.assertEqual(row["minimum_u"], 0.8)
+            self.assertIsNone(row["maximum_u"])
+            self.assertEqual(row["threshold"], 0)
+            self.assertTrue(row["diagnostic_use_only"])
+        self.assertTrue(rows[-1]["target_burst_arrivals"])
+        self.assertEqual(rows[-1]["target_max_tokens"], 256)
+        self.assertFalse({row["seed"] for row in rows} &
+                         {row["seed"] for row in collect.design()})
+
     def test_prefix_diagnostic_ignores_post_action_divergence(self):
         arms = {}
         for action, boundary in (("prob_0_STAY", 20), ("prob_0_START", 25)):
@@ -474,6 +491,15 @@ class BenefitV4Tests(unittest.TestCase):
         self.assertTrue(report["identical_pre_action_prefix"])
         self.assertEqual(report["comparison_tokens"], 20)
         self.assertFalse(report["selection_on_goodoutput"])
+        arms["prob_0_START"]["observed_action"] = {}
+        (self.root / "pilot_summary.json").write_text(json.dumps({
+            "cases": {"case": arms},
+        }))
+        collect.prefix_diagnostic(self.root)
+        report = json.loads((self.root / "pre_action_prefix_diagnostic.json")
+                            .read_text())
+        self.assertEqual(report["status"], "CANDIDATE_NOT_OBSERVED")
+        self.assertIsNone(report["identical_pre_action_prefix"])
 
     def test_fit_rejects_legacy_file_and_renamed_wrong_contract(self):
         row = collect.design()[0]
