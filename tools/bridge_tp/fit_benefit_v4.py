@@ -70,8 +70,21 @@ def features(snapshot, width):
 
 def load_pairs(roots, allowed, *, selected_pair_ids=None):
     pairs, seen = [], set()
-    for root in roots:
-        plan = json.loads((root / "preregistration.json").read_text(encoding="utf-8"))
+    plans = [(root, json.loads((root / "preregistration.json")
+                              .read_text(encoding="utf-8"))) for root in roots]
+    replacements = {}
+    for root, plan in plans:
+        for pair_id in plan.get("replacement_pair_ids", []):
+            if (not plan.get("replacement_source_batch") or
+                    not any(row["pair_id"] == pair_id and row["role"] == "train"
+                            for row in plan["all_pairs"]
+                            if row["pair_id"] in plan["selected_pairs"])):
+                raise ValueError("replacement declaration lacks selected training pair")
+            key = (plan.get("replacement_source_batch"), pair_id)
+            if key in replacements:
+                raise ValueError("multiple replacement collections for one pair")
+            replacements[key] = root
+    for root, plan in plans:
         if plan.get("diagnostic_only"):
             raise ValueError("diagnostic repair pilot is excluded from model selection")
         if plan["protocol"] != "RISK76_MLP4_TARGET_PHASE_V4":
@@ -91,6 +104,10 @@ def load_pairs(roots, allowed, *, selected_pair_ids=None):
             if not path.exists():
                 raise ValueError(f"missing probability outcome: {path}")
             outcome = json.loads(path.read_text(encoding="utf-8"))
+            if (root.parent.name, row["pair_id"]) in replacements:
+                if any(s.get("effect_sample_eligible") for s in outcome["samples"]):
+                    raise ValueError("cannot supersede an eligible training pair")
+                continue  # Keep its raw policy outcome; use preregistered repeat.
             if outcome.get("status") != "COLLECTOR_PILOT_NOT_FITTED_NET_BENEFIT":
                 raise ValueError("expected probability collector outcome contract")
             journals = list(

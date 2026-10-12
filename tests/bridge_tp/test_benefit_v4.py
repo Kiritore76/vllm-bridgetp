@@ -499,6 +499,53 @@ class BenefitV4Tests(unittest.TestCase):
                 self.assertEqual((r["target_count"], r["target_period_s"],
                                   r["target_max_tokens"]), (4, 30, 256))
 
+    def test_recovery_validation_plan_keeps_roles_and_requests(self):
+        rows = collect.recovery_validation_design()
+        self.assertEqual(len(rows), 8)
+        self.assertEqual([r["seed"] for r in rows[:2]], [20261504, 20261508])
+        self.assertTrue(all(r["role"] == "train" for r in rows[:2]))
+        self.assertTrue(all(r["role"] == "validation" for r in rows[2:]))
+        self.assertEqual({r["seed"] for r in rows[2:]}, set(range(20261600, 20261606)))
+        for row in rows:
+            self.assertEqual(row, next(r for r in collect.formal_expansion_design()
+                                      if r["seed"] == row["seed"]))
+
+    def test_fit_replacement_only_supersedes_ineligible_original(self):
+        row = collect.recovery_validation_design()[0]
+        original = self.root / "old-batch/pilot"
+        replacement = self.root / "new-batch/pilot"
+        for root in (original, replacement):
+            root.mkdir(parents=True)
+            (root / row["pair_id"]).mkdir()
+            plan = {"protocol": collect.PROTOCOL, "predictor_sha256": fit.PROFILE_SHA,
+                    "all_pairs": [row], "selected_pairs": [row["pair_id"]]}
+            if root == replacement:
+                plan.update(replacement_source_batch="old-batch",
+                            replacement_pair_ids=[row["pair_id"]])
+            (root / "preregistration.json").write_text(json.dumps(plan))
+        old_path = original / row["pair_id"] / "probability_outcomes.json"
+        old_path.write_text(json.dumps({
+            "samples": [{"effect_sample_eligible": False}]}))
+        for action in ("START", "STAY"):
+            directory = (replacement / row["pair_id"] /
+                         f"case/prob_0_{action}/r01_shadow_only/controller/predictor_features")
+            directory.mkdir(parents=True)
+            (directory / "replay_verification.json").write_text(json.dumps({
+                "checkpoint_sha256": fit.PROFILE_SHA, "saved_states": 1,
+                "max_probability_absolute_error": 0.0}))
+        new_path = replacement / row["pair_id"] / "probability_outcomes.json"
+        new_path.write_text(json.dumps({
+            "status": "COLLECTOR_PILOT_NOT_FITTED_NET_BENEFIT", "samples": [{
+                "threshold": 0, "effect_sample_eligible": True,
+                "descriptive_delta_tokens_s": -10,
+                "stay_quality_output_tokens_s": 100}]}))
+        result = fit.load_pairs([original, replacement], {"train"})
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["delta"], -10)
+        old_path.write_text(json.dumps({"samples": [{"effect_sample_eligible": True}]}))
+        with self.assertRaisesRegex(ValueError, "cannot supersede"):
+            fit.load_pairs([original, replacement], {"train"})
+
     def test_f11_retains_fresh_prefill_and_marks_missing_pressure(self):
         snapshot = {
             "p_guard_est_bounds": [0.6, 0.7], "U": 0.9,

@@ -172,6 +172,9 @@ def main() -> None:
             "scheduled_unix_s": planned.scheduled_unix_s,
             "dispatch_unix_s": planned.dispatch_unix_s,
             "worker_started_unix_s": worker_unix_s,
+            "dispatch_thread_cpu_s": planned.dispatch_thread_cpu_s,
+            "since_previous_dispatch_wall_s": planned.since_previous_dispatch_wall_s,
+            "since_previous_dispatch_cpu_s": planned.since_previous_dispatch_cpu_s,
             "due_to_dispatch_s": max(
                 0.0, planned.dispatch_monotonic - planned.scheduled_monotonic
             ),

@@ -285,6 +285,9 @@ class BackgroundDriverTests(unittest.TestCase):
         self.assertEqual(summary["failed"], 0)
         self.assertTrue(summary["background_event_integrity"]["complete"])
         for row in summary["results"]:
+            self.assertGreaterEqual(row["dispatch_thread_cpu_s"], 0)
+            self.assertGreaterEqual(row["since_previous_dispatch_cpu_s"], 0)
+            self.assertGreaterEqual(row["since_previous_dispatch_wall_s"], 0)
             self.assertLessEqual(row["dispatch_unix_s"],
                                  row["worker_started_unix_s"])
             self.assertLessEqual(row["worker_started_unix_s"],

@@ -173,6 +173,13 @@ def formal_expansion_design():
     return rows
 
 
+def recovery_validation_design():
+    """Repeat only two arrival-ineligible training pairs, then blind validation."""
+    rows = formal_expansion_design()
+    return ([r for r in rows if r["seed"] in {20261504, 20261508}]
+            + [r for r in rows if r["role"] == "validation"])
+
+
 def prefix_diagnostic(pair_root):
     """Describe pre-action divergence without selecting on benefit outcomes."""
     summary = json.loads((pair_root / "pilot_summary.json").read_text())
@@ -344,6 +351,7 @@ def main():
                  "urgent-prefill-recovery",
                  "formal-train1", "formal-train2", "formal-train-all",
                  "formal-validation", "formal-test",
+                 "formal-recovery-validation",
                  "train-rest",
                  "validation", "test"),
         default="pilot",
@@ -376,6 +384,8 @@ def main():
         all_rows = urgent_followup_design()
     elif args.stage == "urgent-prefill-recovery":
         all_rows = urgent_prefill_recovery_design()
+    elif args.stage == "formal-recovery-validation":
+        all_rows = recovery_validation_design()
     elif args.stage.startswith("formal-"):
         all_rows = formal_expansion_design()
     selected = [
@@ -383,6 +393,7 @@ def main():
         for row in all_rows
         if (
             diagnostic
+            or args.stage == "formal-recovery-validation"
             or args.stage == "formal-train-all" and row["role"] == "train"
             or args.stage in {"formal-train1", "formal-train2"}
             and row["role"] == "train"
@@ -404,6 +415,14 @@ def main():
         "diagnostic_only": diagnostic,
         "max_failed_pairs": args.max_failed_pairs,
         "failure_count_basis": "CUMULATIVE_FAILED_PAIRS_NOT_ARMS",
+        "replacement_source_batch": (
+            "benefit-v4-mlp4-formal-train-all-24arm-v1-20261012T144446Z-1232"
+            if args.stage == "formal-recovery-validation" else None
+        ),
+        "replacement_pair_ids": (
+            [r["pair_id"] for r in selected if r["role"] == "train"]
+            if args.stage == "formal-recovery-validation" else []
+        ),
         "collection_revision": args.expected_revision,
         "arrival_schedule_version": "FIXED_EVENT_EPOCH_DUE_TIME_DISPATCH_V2",
         "all_pairs": all_rows,

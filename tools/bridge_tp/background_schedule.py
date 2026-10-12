@@ -79,6 +79,9 @@ class ScheduledJob:
     scheduled_unix_s: float
     dispatch_monotonic: float | None = None
     dispatch_unix_s: float | None = None
+    dispatch_thread_cpu_s: float | None = None
+    since_previous_dispatch_wall_s: float | None = None
+    since_previous_dispatch_cpu_s: float | None = None
 
 
 def due_jobs(jobs, audit, mono_origin, unix_origin, event_timeout_s=120.0):
@@ -134,14 +137,19 @@ def execute_schedule(
         raise ValueError("invalid background dispatch capacity")
     with ThreadPoolExecutor(max_workers=min(maximum_inflight, len(jobs))) as executor:
         futures, active = [], set()
+        previous_wall, previous_cpu = time.monotonic(), time.thread_time()
         for planned in due_jobs(jobs, audit, mono_origin, unix_origin):
             active = {f for f in active if not f.done()}
             if len(active) >= maximum_inflight:
                 raise RuntimeError("collector HTTP dispatch capacity exhausted")
+            dispatch_wall, dispatch_cpu = time.monotonic(), time.thread_time()
             planned = replace(
-                planned, dispatch_monotonic=time.monotonic(),
-                dispatch_unix_s=time.time(),
+                planned, dispatch_monotonic=dispatch_wall,
+                dispatch_unix_s=time.time(), dispatch_thread_cpu_s=dispatch_cpu,
+                since_previous_dispatch_wall_s=dispatch_wall - previous_wall,
+                since_previous_dispatch_cpu_s=dispatch_cpu - previous_cpu,
             )
+            previous_wall, previous_cpu = dispatch_wall, dispatch_cpu
             future = executor.submit(run_job, planned)
             futures.append(future)
             active.add(future)
