@@ -268,6 +268,14 @@ class BackgroundDriverTests(unittest.TestCase):
         )
         self.assertEqual(summary["completed"], count)
         self.assertEqual(summary["failed"], 0)
+        self.assertTrue(summary["background_event_integrity"]["complete"])
+        for row in summary["results"]:
+            self.assertLessEqual(row["dispatch_unix_s"],
+                                 row["worker_started_unix_s"])
+            self.assertLessEqual(row["worker_started_unix_s"],
+                                 row["http_call_started_unix_s"])
+            self.assertGreaterEqual(row["due_to_dispatch_s"], 0)
+            self.assertGreaterEqual(row["dispatch_to_worker_s"], 0)
         self.assertTrue(summary["native_evidence_integrity"]["complete"])
         native = [
             json.loads(line)

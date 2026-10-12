@@ -431,6 +431,17 @@ class BenefitV4Tests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "excluded from model selection"):
             fit.load_pairs([self.root], {"train", "validation"})
 
+    def test_dispatch_pair_reuses_decode_recipe_without_expansion(self):
+        rows = collect.dispatch_design()
+        self.assertEqual(len(rows), 1)
+        expected = collect.repair_design()[0]
+        self.assertEqual(rows[0]["seed"], 20261251)
+        self.assertTrue(rows[0]["diagnostic_use_only"])
+        self.assertEqual(
+            {key: value for key, value in rows[0].items() if key != "pair_id"},
+            {key: value for key, value in expected.items() if key != "pair_id"},
+        )
+
     def test_fit_rejects_legacy_file_and_renamed_wrong_contract(self):
         row = collect.design()[0]
         (self.root / "preregistration.json").write_text(json.dumps({

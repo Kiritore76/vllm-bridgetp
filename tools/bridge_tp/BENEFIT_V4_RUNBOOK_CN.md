@@ -93,3 +93,13 @@ UNKNOWN按STAY计算机会损失；不因全部弃权就称正确。
 
 服务器用原仓库、SSH拉固定HEAD、激活原环境，核对5张A100-PCIE-40GB和各文件SHA；
 UUID仅记录。已有未提交工作先备份并保留，使用return而不关闭终端。
+
+## 2026-10-12：到达验收与两臂调度复验
+
+新增 `--stage dispatch-pilot`：只重复 repair decode 配方/种子20261251的一对START/STAY；diagnostic_only，不能进入模型选择。负载仍目标12请求、2048 prompt、40秒周期、4096输出上限；源端3同伴，guard2000，冻结预测器/SLO/KV迁移机制。没有增大请求或改固定token触发。
+
+300秒窗口评分现在也应用预注册max_arrival_lag_s（默认2秒）。迟发不删除原始horizon_score或服务失败结果，只令fixed_horizon_eligible=false，并保存arrival_schedule_missed。先验收发送协议，再分析效应；不得以收益符号决定资格。
+
+background_events改为AsyncJournal，关闭后核对footer及summary完整性；每条请求记录dispatch、worker_entry、HTTP客户端调用边界与各段耗时。HTTP时间是调用边界，不是socket发出或服务器收到的时刻。collector_resources.jsonl每2秒读取Linux CPU/内存压力与cgroup原始计数，无GPU调用；缺文件标为unavailable，不补零。
+
+若复验仍迟发，先据分段时序与资源记录定位，不能据CPU模拟已通过就认定GPU/硬件有问题。CPU检查233项通过并不代替服务器性能验收。

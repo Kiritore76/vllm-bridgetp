@@ -1108,6 +1108,21 @@ def collect_arm(args: argparse.Namespace, root: Path,
 def fixed_horizon_result(result: dict[str, Any], horizon_s: float) -> None:
     """Score a fully drained natural-EOS arm on one common horizon."""
     if "horizon_score" in result:
+        lag = result.get("background_max_schedule_lag_s")
+        limit = result.get("max_arrival_lag_s")
+        on_schedule = (
+            limit is None
+            or isinstance(lag, (int, float))
+            and math.isfinite(lag) and 0 <= lag <= limit
+        )
+        result.setdefault("fixed_horizon_exclusions", {})[
+            "arrival_schedule_missed"
+        ] = not on_schedule
+        # Preserve the measured service score, including negative outcomes.
+        # Only the reliability of the assigned-arrival comparison is gated.
+        result["fixed_horizon_eligible"] = (
+            bool(result.get("fixed_horizon_eligible")) and on_schedule
+        )
         return
     metrics = result.get("slo_metrics") or {}
     wall_s = metrics.get("wall_time_s")
@@ -1680,6 +1695,7 @@ def execute_pilot(args: argparse.Namespace) -> None:
                 outcomes[action] = result
                 if not args.cross_context_smoke:
                     fixed_horizon_result(result, args.evaluation_horizon_s)
+                write_json(root / name / f"{action}.result.json", result)
                 write_json(summary_path, summary)
                 if result["fatal_error"]:
                     failed = True

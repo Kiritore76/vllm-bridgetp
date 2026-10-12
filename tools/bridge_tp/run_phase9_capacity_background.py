@@ -14,7 +14,6 @@ import hashlib
 import json
 import os
 import sys
-import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -28,6 +27,8 @@ from tools.bridge_tp.background_schedule import (  # noqa: E402
     execute_schedule,
     output_threshold,
 )
+from tools.bridge_tp.collector_resources import ResourceSampler  # noqa: E402
+from vllm.bridge_tp.async_journal import AsyncJournal as BackgroundJournal  # noqa: E402
 from vllm.bridge_tp.controller.online_io import (  # noqa: E402
     atomic_json_dump,
     post_streaming_completion,
@@ -144,7 +145,9 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     atomic_json_dump(manifest, out_dir / "background_manifest.json")
     event_path = out_dir / "background_events.jsonl"
-    event_lock = threading.Lock()
+    events = BackgroundJournal(event_path)
+    resources = BackgroundJournal(out_dir / "collector_resources.jsonl")
+    sampler = ResourceSampler(resources)
     start_monotonic = time.monotonic()
     start_unix_s = time.time()
     live = None
@@ -155,11 +158,10 @@ def main() -> None:
 
     def event(value: dict[str, Any]) -> None:
         record = {"unix_s": time.time(), **value}
-        with event_lock, event_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-            handle.flush()
+        events.submit(record)
 
     def run_job(planned) -> dict[str, Any]:
+        worker_monotonic, worker_unix_s = time.monotonic(), time.time()
         job = planned.job
         job_id = str(job["job_id"])
         start_after_s = float(job["start_after_s"])
@@ -168,6 +170,14 @@ def main() -> None:
             "schedule_version": SCHEDULE_VERSION,
             "schedule_epoch_unix_s": planned.epoch_unix_s,
             "scheduled_unix_s": planned.scheduled_unix_s,
+            "dispatch_unix_s": planned.dispatch_unix_s,
+            "worker_started_unix_s": worker_unix_s,
+            "due_to_dispatch_s": max(
+                0.0, planned.dispatch_monotonic - planned.scheduled_monotonic
+            ),
+            "dispatch_to_worker_s": max(
+                0.0, worker_monotonic - planned.dispatch_monotonic
+            ),
         }
         base_url = args.source_url if job["pool"] == "source" else args.target_url
         request = freeze_strict_greedy_sampling(dict(job["request"]))
@@ -183,6 +193,13 @@ def main() -> None:
                "start_after_s": start_after_s,
                "schedule_lag_s": schedule_lag_s, **schedule_fields})
         request_started_unix_s = time.time()
+        schedule_fields["worker_to_http_call_s"] = (
+            time.monotonic() - worker_monotonic
+        )
+        schedule_fields["http_call_started_unix_s"] = request_started_unix_s
+        schedule_fields["http_timestamp_basis"] = (
+            "CLIENT_CALL_BOUNDARY_NOT_SOCKET_SEND_OR_SERVER_RECEIPT"
+        )
         schedule_lag_s = max(0.0, time.monotonic() - planned.scheduled_monotonic)
         if live and job["pool"] == "target":
             live.submit({"kind": "native_arrival", "job_id": job_id,
@@ -276,10 +293,23 @@ def main() -> None:
             "jobs": len(manifest["jobs"]),
         }
     )
-    results = execute_schedule(
-        manifest["jobs"], run_job, args.controller_audit_path,
-        start_monotonic, start_unix_s,
-    )
+    try:
+        results = execute_schedule(
+            manifest["jobs"], run_job, args.controller_audit_path,
+            start_monotonic, start_unix_s,
+        )
+    except BaseException:
+        # Response workers have drained before execute_schedule raises.
+        try:
+            if live:
+                live.close()
+        finally:
+            sampler.close()
+            resources.close()
+            events.close()
+        raise
+    sampler.close()
+    resources.close()
     evidence_error = None
     if live:
         try:
@@ -309,6 +339,19 @@ def main() -> None:
     }
     atomic_json_dump(summary, out_dir / "background_summary.json")
     event({"kind": "run_end", **summary})
+    try:
+        events.close()
+    except Exception as error:
+        summary["background_event_integrity"] = {
+            "complete": False, "error": str(error), "dropped": events.dropped,
+        }
+        atomic_json_dump(summary, out_dir / "background_summary.json")
+        raise
+    summary["background_event_integrity"] = {
+        "complete": True, "dropped": events.dropped,
+        "saved_records": events.saved,
+    }
+    atomic_json_dump(summary, out_dir / "background_summary.json")
     if evidence_error is not None:
         raise RuntimeError("background native evidence incomplete") from evidence_error
     if summary["failed"]:

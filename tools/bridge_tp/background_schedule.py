@@ -8,7 +8,7 @@ import math
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 SCHEDULE_VERSION = "FIXED_EVENT_EPOCH_DUE_TIME_DISPATCH_V2"
 
@@ -77,6 +77,8 @@ class ScheduledJob:
     scheduled_monotonic: float
     epoch_unix_s: float
     scheduled_unix_s: float
+    dispatch_monotonic: float | None = None
+    dispatch_unix_s: float | None = None
 
 
 def due_jobs(jobs, audit, mono_origin, unix_origin, event_timeout_s=120.0):
@@ -136,6 +138,10 @@ def execute_schedule(
             active = {f for f in active if not f.done()}
             if len(active) >= maximum_inflight:
                 raise RuntimeError("collector HTTP dispatch capacity exhausted")
+            planned = replace(
+                planned, dispatch_monotonic=time.monotonic(),
+                dispatch_unix_s=time.time(),
+            )
             future = executor.submit(run_job, planned)
             futures.append(future)
             active.add(future)

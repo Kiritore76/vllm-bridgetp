@@ -463,6 +463,23 @@ class TestRandomizedPilot(unittest.TestCase):
         self.assertFalse(pair["eligible"])
         self.assertIsNone(pair["descriptive_delta_tokens_s"])
 
+    def test_window_score_keeps_service_outcome_but_checks_arrivals(self):
+        for lag, expected in ((0.1, True), (26.859, False), (None, False)):
+            arm = {
+                "horizon_score": {"eligible": True},
+                "fixed_horizon_eligible": True,
+                "fixed_horizon_goodoutput_tokens_s": 12.3,
+                "background_max_schedule_lag_s": lag,
+                "max_arrival_lag_s": 2.0,
+                # Failed service requests remain measurable, not filtered here.
+                "anchor_service_failure": True,
+            }
+            fixed_horizon_result(arm, 300.0)
+            self.assertEqual(arm["fixed_horizon_eligible"], expected)
+            self.assertEqual(arm["fixed_horizon_goodoutput_tokens_s"], 12.3)
+            self.assertEqual(arm["fixed_horizon_exclusions"][
+                "arrival_schedule_missed"], not expected)
+
     def test_target_context_override_keeps_source_context(self) -> None:
         args = SimpleNamespace(
             python_bin=Path("python"), model_path=Path("model"),

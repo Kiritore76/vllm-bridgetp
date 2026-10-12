@@ -86,6 +86,14 @@ def repair_design():
     return rows
 
 
+def dispatch_design():
+    """Repeat one decode pair/seed to isolate collector changes."""
+    return [
+        {**row, "pair_id": f"dispatch-slack-decode-{row['seed']}"}
+        for row in repair_design() if row["target_state"] == "decode"
+    ]
+
+
 def command(args, row, input_path, out):
     """Build probability interventions; keep migration/SLO contracts frozen."""
     digest = hashlib.sha256(input_path.read_bytes()).hexdigest()
@@ -167,7 +175,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--stage",
-        choices=("pilot", "repair-pilot", "train-rest", "validation", "test"),
+        choices=("pilot", "repair-pilot", "dispatch-pilot", "train-rest",
+                 "validation", "test"),
         default="pilot",
     )
     parser.add_argument("--plan-only", action="store_true")
@@ -176,12 +185,15 @@ def main():
     for key in ("model", "base", "survival", "guard", "checkpoint", "reference"):
         parser.add_argument(f"--{key}", required=True, type=Path)
     args = parser.parse_args()
-    all_rows = repair_design() if args.stage == "repair-pilot" else design()
+    diagnostic = args.stage in {"repair-pilot", "dispatch-pilot"}
+    all_rows = repair_design() if diagnostic else design()
+    if args.stage == "dispatch-pilot":
+        all_rows = dispatch_design()
     selected = [
         row
         for row in all_rows
         if (
-            args.stage == "repair-pilot"
+            diagnostic
             or args.stage == "pilot"
             and row["role"] == "train"
             and row["replicate"] == 0
@@ -195,7 +207,7 @@ def main():
     frozen = {
         "protocol": PROTOCOL,
         "stage": args.stage,
-        "diagnostic_only": args.stage == "repair-pilot",
+        "diagnostic_only": diagnostic,
         "collection_revision": args.expected_revision,
         "arrival_schedule_version": "FIXED_EVENT_EPOCH_DUE_TIME_DISPATCH_V2",
         "all_pairs": all_rows,
