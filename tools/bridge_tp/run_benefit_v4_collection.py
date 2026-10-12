@@ -307,6 +307,33 @@ def command(args, row, input_path, out):
     return cmd
 
 
+def verify_completed_pair(args, pair_root, inspect_prefix):
+    import torch
+
+    from tools.bridge_tp.verify_predictor_feature_journal import verify
+
+    torch.set_num_threads(1)
+    journals = list(
+        (pair_root).glob(
+            "*/*/r01_shadow_only/controller/predictor_features"
+        )
+    )
+    if len(journals) != 2:
+        raise RuntimeError("paired source feature journals missing")
+    for directory in journals:
+        replay = verify(
+            directory,
+            args.checkpoint,
+            "0f2085dbbe2ee251bd6a6a0797d84a6ce34436044d629aa3cba793b43d311a9e",
+            directory.parent / "phase9_audit.jsonl",
+        )
+        (directory / "replay_verification.json").write_text(
+            json.dumps(replay, indent=2) + "\n", encoding="utf-8"
+        )
+    if inspect_prefix:
+        prefix_diagnostic(pair_root)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -315,12 +342,15 @@ def main():
                  "urgent-phase",
                  "urgent-followup",
                  "urgent-prefill-recovery",
-                 "formal-train1", "formal-train2", "formal-validation", "formal-test",
+                 "formal-train1", "formal-train2", "formal-train-all",
+                 "formal-validation", "formal-test",
                  "train-rest",
                  "validation", "test"),
         default="pilot",
     )
     parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument("--max-failed-pairs", type=int, default=1,
+                        help="stop at this cumulative number of failed pairs")
     parser.add_argument("--no-archive", action="store_true",
                         help="outer launcher packs the entire batch once")
     parser.add_argument("--out-dir", required=True, type=Path)
@@ -328,6 +358,8 @@ def main():
     for key in ("model", "base", "survival", "guard", "checkpoint", "reference"):
         parser.add_argument(f"--{key}", required=True, type=Path)
     args = parser.parse_args()
+    if args.max_failed_pairs < 1:
+        parser.error("--max-failed-pairs must be positive")
     diagnostic = args.stage in {
         "repair-pilot", "dispatch-pilot", "prefill-repeat", "urgent-phase",
         "urgent-followup",
@@ -351,6 +383,7 @@ def main():
         for row in all_rows
         if (
             diagnostic
+            or args.stage == "formal-train-all" and row["role"] == "train"
             or args.stage in {"formal-train1", "formal-train2"}
             and row["role"] == "train"
             and row["replicate"] == int(args.stage[-1]) - 1
@@ -369,6 +402,8 @@ def main():
         "protocol": PROTOCOL,
         "stage": args.stage,
         "diagnostic_only": diagnostic,
+        "max_failed_pairs": args.max_failed_pairs,
+        "failure_count_basis": "CUMULATIVE_FAILED_PAIRS_NOT_ARMS",
         "collection_revision": args.expected_revision,
         "arrival_schedule_version": "FIXED_EVENT_EPOCH_DUE_TIME_DISPATCH_V2",
         "all_pairs": all_rows,
@@ -416,40 +451,51 @@ def main():
                 f"[进度] 配对 {index}/{len(commands)}: {item['pair']['pair_id']}",
                 flush=True,
             )
-            rc = subprocess.call(item["argv"], cwd=ROOT)
+            error = None
+            try:
+                rc = subprocess.call(item["argv"], cwd=ROOT)
+            except OSError as failure:
+                rc = 1
+                error = f"{type(failure).__name__}: {failure}"
             if rc == 0:
-                import torch
-
-                from tools.bridge_tp.verify_predictor_feature_journal import verify
-
-                torch.set_num_threads(1)
-                journals = list(
-                    (args.out_dir / item["pair"]["pair_id"]).glob(
-                        "*/*/r01_shadow_only/controller/predictor_features"
+                try:
+                    verify_completed_pair(
+                        args, args.out_dir / item["pair"]["pair_id"],
+                        diagnostic or args.stage.startswith("formal-"),
                     )
-                )
-                if len(journals) != 2:
-                    raise RuntimeError("paired source feature journals missing")
-                for directory in journals:
-                    replay = verify(
-                        directory,
-                        args.checkpoint,
-                        "0f2085dbbe2ee251bd6a6a0797d84a6ce34436044d629aa3cba793b43d311a9e",
-                        directory.parent / "phase9_audit.jsonl",
-                    )
-                    (directory / "replay_verification.json").write_text(
-                        json.dumps(replay, indent=2) + "\n", encoding="utf-8"
-                    )
-                if diagnostic or args.stage.startswith("formal-"):
-                    prefix_diagnostic(args.out_dir / item["pair"]["pair_id"])
-            results.append({"pair_id": item["pair"]["pair_id"], "returncode": rc})
+                except Exception as failure:
+                    rc = 1
+                    error = f"{type(failure).__name__}: {failure}"
+            results.append({"pair_id": item["pair"]["pair_id"], "returncode": rc,
+                            "verification_error": error})
             (args.out_dir / "stage_results.json").write_text(
                 json.dumps(results, indent=2) + "\n", encoding="utf-8"
             )
+            failed = sum(row["returncode"] != 0 for row in results)
+            stopped = failed >= args.max_failed_pairs
+            completed = index == len(commands)
+            status = ("STOPPED_AT_FAILURE_LIMIT" if stopped else
+                      "COMPLETE_WITH_FAILURES" if completed and failed else
+                      "COLLECTION_COMPLETE" if completed else "RUNNING")
+            (args.out_dir / "stage_status.json").write_text(json.dumps({
+                "status": status, "planned_pairs": len(commands),
+                "attempted_pairs": len(results), "failed_pairs": failed,
+                "successful_pairs": len(results) - failed,
+                "unattempted_pairs": len(commands) - len(results),
+                "max_failed_pairs": args.max_failed_pairs,
+            }, indent=2) + "\n", encoding="utf-8")
             if rc:
-                raise RuntimeError(
-                    "pair failed; inspect archived evidence before continuing"
-                )
+                next_step = ("达到上限，停止后续配对" if stopped
+                             else "保留证据，继续下一对")
+                print(f"[进度] 配对失败；累计{failed}/{args.max_failed_pairs}；"
+                      + next_step,
+                      flush=True)
+            if stopped:
+                raise RuntimeError("cumulative failed-pair limit reached")
+        if any(row["returncode"] for row in results):
+            raise RuntimeError(
+                "collection attempted all pairs with failures; inspect archive"
+            )
     finally:
         if not args.no_archive:
             archive = args.out_dir.with_suffix(".tar.gz")

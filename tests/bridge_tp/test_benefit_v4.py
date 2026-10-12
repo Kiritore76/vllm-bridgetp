@@ -546,6 +546,50 @@ class BenefitV4Tests(unittest.TestCase):
         self.assertFalse(plan["diagnostic_only"])
         self.assertTrue(all(r["pair"]["role"] == "train" for r in commands))
 
+    def run_failure_budget(self, codes, verification_error=None):
+        args = ["collect", "--stage", "formal-train-all", "--no-archive",
+                "--max-failed-pairs", "3", "--out-dir", str(self.root / "all"),
+                "--expected-revision", "local-check"]
+        for key in ("model", "base", "survival", "guard", "checkpoint", "reference"):
+            args += [f"--{key}", str(self.root / key)]
+        with (patch.object(sys, "argv", args),
+              patch.object(collect.subprocess, "call", side_effect=codes) as call,
+              patch.object(collect, "verify_completed_pair",
+                           side_effect=verification_error)):
+            try:
+                collect.main()
+                error = None
+            except RuntimeError as failure:
+                error = str(failure)
+        status = json.loads((self.root / "all/stage_status.json").read_text())
+        return call.call_count, status, error
+
+    def test_two_failed_pairs_continue_through_all_twelve(self):
+        calls, status, error = self.run_failure_budget([1, 0, 1] + [0] * 9)
+        self.assertEqual(calls, 12)
+        self.assertEqual(status["failed_pairs"], 2)
+        self.assertEqual(status["status"], "COMPLETE_WITH_FAILURES")
+        self.assertIn("attempted all", error)
+
+    def test_third_cumulative_failure_stops_even_if_not_consecutive(self):
+        calls, status, error = self.run_failure_budget([1, 0, 1, 0, 1] + [0] * 7)
+        self.assertEqual(calls, 5)
+        self.assertEqual(status["unattempted_pairs"], 7)
+        self.assertEqual(status["status"], "STOPPED_AT_FAILURE_LIMIT")
+        self.assertIn("limit reached", error)
+
+    def test_verification_failure_counts_as_failed_pair(self):
+        calls, status, _ = self.run_failure_budget(
+            [0] * 12, RuntimeError("feature receipt damaged"))
+        self.assertEqual(calls, 3)
+        self.assertEqual(status["failed_pairs"], 3)
+
+    def test_all_twelve_successes_finish_normally(self):
+        calls, status, error = self.run_failure_budget([0] * 12)
+        self.assertEqual(calls, 12)
+        self.assertEqual(status["status"], "COLLECTION_COMPLETE")
+        self.assertIsNone(error)
+
     def test_prefix_diagnostic_ignores_post_action_divergence(self):
         arms = {}
         for action, boundary in (("prob_0_STAY", 20), ("prob_0_START", 25)):
