@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Low-frequency Linux host observations; no GPU calls or controller inputs."""
 
+import gc
+import sys
 import threading
 import time
 from pathlib import Path
@@ -9,12 +11,49 @@ from pathlib import Path
 class ResourceSampler:
     """Save raw CPU/memory counters for attributing collector dispatch delays."""
 
-    def __init__(self, journal, interval_s=2.0):
+    def __init__(self, journal, interval_s=2.0, diagnostics=False):
         self.journal = journal
         self.interval_s = interval_s
         self.stop = threading.Event()
+        self.diagnostics = diagnostics
+        self.gc_started = {}
+        self.gc_observer = self._gc_event
+        if diagnostics:
+            gc.callbacks.append(self.gc_observer)
         self.worker = threading.Thread(target=self._run, daemon=True)
         self.worker.start()
+
+    def _gc_event(self, phase, info):
+        key = (threading.get_ident(), info["generation"])
+        if phase == "start":
+            self.gc_started[key] = (time.monotonic(), time.thread_time())
+        elif phase == "stop" and key in self.gc_started:
+            wall, cpu = self.gc_started.pop(key)
+            elapsed = time.monotonic() - wall
+            if elapsed >= 0.02:
+                self.journal.submit({
+                    "kind": "collector_gc_pause", "unix_s": time.time(),
+                    "generation": key[1], "thread_id": key[0],
+                    "wall_s": elapsed, "thread_cpu_s": time.thread_time() - cpu,
+                    "collected": info.get("collected"),
+                    "uncollectable": info.get("uncollectable"),
+                })
+
+    @staticmethod
+    def thread_locations():
+        """Bounded locations after a stall; no locals or response content."""
+        result = []
+        for thread_id, frame in list(sys._current_frames().items())[:32]:
+            stack = []
+            for _ in range(6):
+                if frame is None:
+                    break
+                stack.append({"file": frame.f_code.co_filename,
+                              "function": frame.f_code.co_name,
+                              "line": frame.f_lineno})
+                frame = frame.f_back
+            result.append({"thread_id": thread_id, "stack": stack})
+        return result
 
     def _run(self):
         paths = (
@@ -23,7 +62,16 @@ class ResourceSampler:
         )
         # cgroup mounts differ between containers; retain unavailable paths.
         groups = (Path("/sys/fs/cgroup"), Path("/sys/fs/cgroup/cpu"))
+        expected = time.monotonic()
         while not self.stop.is_set():
+            lateness = max(0.0, time.monotonic() - expected)
+            if self.diagnostics and lateness >= 0.5:
+                self.journal.submit({
+                    "kind": "collector_sampler_resumed_after_stall",
+                    "unix_s": time.time(), "lateness_s": lateness,
+                    "stack_basis": "AFTER_RESUMPTION_NOT_PROOF_OF_BLOCKER",
+                    "thread_locations": self.thread_locations(),
+                })
             values = {}
             for path in [Path(p) for p in paths] + [
                 group / name for group in groups
@@ -40,8 +88,11 @@ class ResourceSampler:
                 "monotonic_s": time.monotonic(), "process_cpu_s": time.process_time(),
                 "counters": values,
             })
+            expected = time.monotonic() + self.interval_s
             self.stop.wait(self.interval_s)
 
     def close(self):
         self.stop.set()
         self.worker.join()
+        if self.diagnostics:
+            gc.callbacks.remove(self.gc_observer)

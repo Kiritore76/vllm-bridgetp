@@ -130,7 +130,8 @@ def due_jobs(jobs, audit, mono_origin, unix_origin, event_timeout_s=120.0):
 
 
 def execute_schedule(
-    jobs, run_job, audit, mono_origin, unix_origin, maximum_inflight=512
+    jobs, run_job, audit, mono_origin, unix_origin, maximum_inflight=512,
+    diagnostic_event=None,
 ):
     """Bound active HTTP workers; overload fails instead of silently queuing."""
     if not jobs or maximum_inflight < 1:
@@ -151,6 +152,14 @@ def execute_schedule(
             )
             previous_wall, previous_cpu = dispatch_wall, dispatch_cpu
             future = executor.submit(run_job, planned)
+            if diagnostic_event is not None:
+                diagnostic_event({
+                    "kind": "collector_dispatch_submit_finished",
+                    "job_id": planned.job["job_id"],
+                    "dispatch_monotonic_s": dispatch_wall,
+                    "submit_wall_s": time.monotonic() - dispatch_wall,
+                    "submit_thread_cpu_s": time.thread_time() - dispatch_cpu,
+                })
             futures.append(future)
             active.add(future)
         return [future.result() for future in as_completed(futures)]

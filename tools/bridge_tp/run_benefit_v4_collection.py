@@ -207,6 +207,16 @@ def expansion_a1_design():
     return rows
 
 
+def dispatch_stall_diagnostic_design():
+    """Same record seed/task/split; vary only target decode concurrency."""
+    base = expansion_a1_design()[2]
+    return [{**base, "pair_id": f"dispatch-stall-decode{count}-20261802",
+             "target_count": count, "decode_pressure_min": 0.1,
+             "diagnostic_use_only": True,
+             "purpose": "collector GC and thread stall attribution"}
+            for count in (4, 12, 24)]
+
+
 def prefix_diagnostic(pair_root):
     """Describe pre-action divergence without selecting on benefit outcomes."""
     summary = json.loads((pair_root / "pilot_summary.json").read_text())
@@ -380,6 +390,7 @@ def main():
                  "formal-validation", "formal-test",
                  "formal-recovery-validation",
                  "expansion-a1",
+                 "dispatch-stall-diagnostic",
                  "train-rest",
                  "validation", "test"),
         default="pilot",
@@ -400,6 +411,7 @@ def main():
         "repair-pilot", "dispatch-pilot", "prefill-repeat", "urgent-phase",
         "urgent-followup",
         "urgent-prefill-recovery",
+        "dispatch-stall-diagnostic",
     }
     all_rows = repair_design() if diagnostic else design()
     if args.stage == "dispatch-pilot":
@@ -418,6 +430,8 @@ def main():
         all_rows = formal_expansion_design()
     elif args.stage == "expansion-a1":
         all_rows = expansion_a1_design()
+    elif args.stage == "dispatch-stall-diagnostic":
+        all_rows = dispatch_stall_diagnostic_design()
     selected = [
         row
         for row in all_rows

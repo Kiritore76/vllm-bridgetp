@@ -147,7 +147,8 @@ def main() -> None:
     event_path = out_dir / "background_events.jsonl"
     events = BackgroundJournal(event_path)
     resources = BackgroundJournal(out_dir / "collector_resources.jsonl")
-    sampler = ResourceSampler(resources)
+    diagnostics = os.environ.get("BRIDGETP_COLLECTOR_STALL_DIAGNOSTICS") == "1"
+    sampler = ResourceSampler(resources, diagnostics=diagnostics)
     start_monotonic = time.monotonic()
     start_unix_s = time.time()
     live = None
@@ -162,6 +163,7 @@ def main() -> None:
 
     def run_job(planned) -> dict[str, Any]:
         worker_monotonic, worker_unix_s = time.monotonic(), time.time()
+        worker_cpu = time.thread_time()
         job = planned.job
         job_id = str(job["job_id"])
         start_after_s = float(job["start_after_s"])
@@ -261,6 +263,7 @@ def main() -> None:
                     else None
                 ),
                 "e2e_ms": (request_ended_unix_s - request_started_unix_s) * 1000,
+                "worker_stream_cpu_s": time.thread_time() - worker_cpu,
                 "tpot_p50_ms": percentile(token_intervals_ms, 0.50),
                 "tpot_p95_ms": percentile(token_intervals_ms, 0.95),
                 "tpot_p99_ms": percentile(token_intervals_ms, 0.99),
@@ -300,6 +303,7 @@ def main() -> None:
         results = execute_schedule(
             manifest["jobs"], run_job, args.controller_audit_path,
             start_monotonic, start_unix_s,
+            diagnostic_event=event if diagnostics else None,
         )
     except BaseException:
         # Response workers have drained before execute_schedule raises.

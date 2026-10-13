@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Regression checks for burst evidence loss and delayed arrival epochs."""
 
+import gc
 import importlib.util
 import json
 import tempfile
@@ -12,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from tools.bridge_tp.background_schedule import ControllerEpochs, execute_schedule
+from tools.bridge_tp.collector_resources import ResourceSampler
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location(
@@ -22,6 +24,39 @@ spec.loader.exec_module(journal)
 
 
 class BackgroundScheduleTests(unittest.TestCase):
+    def test_gc_pause_records_cpu_wall_without_changing_collection_policy(self):
+        probe = object.__new__(ResourceSampler)
+        probe.gc_started = {}
+        records = []
+        probe.journal = SimpleNamespace(submit=records.append)
+        with (patch("tools.bridge_tp.collector_resources.time.monotonic",
+                    side_effect=[10, 10.2]),
+              patch("tools.bridge_tp.collector_resources.time.thread_time",
+                    side_effect=[1, 1.01])):
+            probe._gc_event("start", {"generation": 2})
+            probe._gc_event("stop", {"generation": 2, "collected": 20})
+        self.assertEqual(len(records), 1)
+        self.assertAlmostEqual(records[0]["wall_s"], 0.2)
+        self.assertAlmostEqual(records[0]["thread_cpu_s"], 0.01)
+        self.assertEqual(probe.gc_started, {})
+
+    def test_probe_unregisters_gc_callback_at_close(self):
+        probe = ResourceSampler(SimpleNamespace(submit=lambda row: None),
+                                diagnostics=True)
+        self.assertIn(probe.gc_observer, gc.callbacks)
+        probe.close()
+        self.assertNotIn(probe.gc_observer, gc.callbacks)
+
+    def test_executor_submit_diagnostics_do_not_change_due_epoch(self):
+        records = []
+        mono, unix = time.monotonic(), time.time()
+        jobs = [{"job_id": "x", "start_after_s": 0}]
+        results = execute_schedule(jobs, lambda job: job, None, mono, unix,
+                                   diagnostic_event=records.append)
+        self.assertEqual(results[0].scheduled_unix_s, unix)
+        self.assertEqual(records[0]["job_id"], "x")
+        self.assertGreaterEqual(records[0]["submit_wall_s"], 0)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

@@ -534,6 +534,23 @@ class BenefitV4Tests(unittest.TestCase):
                                .read_text().splitlines()[0])
             self.assertEqual(first["construction"]["response_sections"], 8)
 
+    def test_stall_diagnostic_keeps_same_task_and_excludes_training(self):
+        rows = collect.dispatch_stall_diagnostic_design()
+        self.assertEqual([r["target_count"] for r in rows], [4, 12, 24])
+        self.assertEqual(len({r["seed"] for r in rows}), 1)
+        self.assertTrue(all(r["role"] == "train" and r["anchor_sections"] == 8
+                            and r["diagnostic_use_only"] for r in rows))
+        args = ["collect", "--stage", "dispatch-stall-diagnostic", "--plan-only",
+                "--out-dir", str(self.root / "stall"), "--expected-revision", "check"]
+        for key in ("model", "base", "survival", "guard", "checkpoint", "reference"):
+            args += [f"--{key}", str(self.root / key)]
+        with patch.object(sys, "argv", args):
+            collect.main()
+        inputs = list((self.root / "stall/inputs").glob("*.jsonl"))
+        self.assertEqual(len({p.read_bytes() for p in inputs}), 1)
+        with self.assertRaisesRegex(ValueError, "diagnostic"):
+            fit.load_pairs([self.root / "stall"], {"train"})
+
     def test_fit_replacement_only_supersedes_ineligible_original(self):
         row = collect.recovery_validation_design()[0]
         original = self.root / "old-batch/pilot"
