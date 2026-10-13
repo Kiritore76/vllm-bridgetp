@@ -180,6 +180,33 @@ def recovery_validation_design():
             + [r for r in rows if r["role"] == "validation"])
 
 
+def expansion_a1_design():
+    """Low-risk task and six target cost levels; observed p is not forced."""
+    rows = []
+    settings = (
+        ("idle", 0, 2048, 4096, 40, 0.25),
+        ("decode", 4, 2048, 4096, 40, 0.10),
+        ("decode", 12, 2048, 4096, 40, 0.25),
+        ("decode", 24, 2048, 4096, 40, 0.25),
+        ("prefill", 4, 4096, 256, 30, 0.25),
+        ("prefill", 8, 6144, 256, 30, 0.25),
+    )
+    for index, (target, count, prompt, output, period, pressure) in enumerate(settings):
+        seed = 20261800 + index
+        base = next(r for r in formal_expansion_design()
+                    if r["source_state"] == "slack" and r["target_state"] == target)
+        rows.append({
+            **base, "pair_id": f"expansion-a1-{target}-{seed}", "seed": seed,
+            "source_family_group": f"constructed-expansion-record-set-{seed}",
+            "role": "train", "anchor_sections": 8,
+            "target_count": count, "target_prompt_tokens": prompt,
+            "target_max_tokens": output, "target_period_s": period,
+            "decode_pressure_min": pressure,
+            "purpose": "low-p support and target cost intensity",
+        })
+    return rows
+
+
 def prefix_diagnostic(pair_root):
     """Describe pre-action divergence without selecting on benefit outcomes."""
     summary = json.loads((pair_root / "pilot_summary.json").read_text())
@@ -352,6 +379,7 @@ def main():
                  "formal-train1", "formal-train2", "formal-train-all",
                  "formal-validation", "formal-test",
                  "formal-recovery-validation",
+                 "expansion-a1",
                  "train-rest",
                  "validation", "test"),
         default="pilot",
@@ -388,11 +416,14 @@ def main():
         all_rows = recovery_validation_design()
     elif args.stage.startswith("formal-"):
         all_rows = formal_expansion_design()
+    elif args.stage == "expansion-a1":
+        all_rows = expansion_a1_design()
     selected = [
         row
         for row in all_rows
         if (
             diagnostic
+            or args.stage == "expansion-a1"
             or args.stage == "formal-recovery-validation"
             or args.stage == "formal-train-all" and row["role"] == "train"
             or args.stage in {"formal-train1", "formal-train2"}
@@ -447,7 +478,7 @@ def main():
             split=f"engineering_{row['role']}",
             anchor_prompt_tokens=2048,
             background_prompt_tokens=row["source_prompt_tokens"],
-            anchor_sections=24,
+            anchor_sections=row.get("anchor_sections", 24),
             background_sections=16,
             backgrounds=640,
             target_prompt_tokens=row["target_prompt_tokens"],
@@ -480,7 +511,7 @@ def main():
                 try:
                     verify_completed_pair(
                         args, args.out_dir / item["pair"]["pair_id"],
-                        diagnostic or args.stage.startswith("formal-"),
+                        diagnostic or args.stage.startswith(("formal-", "expansion-")),
                     )
                 except Exception as failure:
                     rc = 1

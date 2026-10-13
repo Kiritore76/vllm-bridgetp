@@ -510,6 +510,30 @@ class BenefitV4Tests(unittest.TestCase):
             self.assertEqual(row, next(r for r in collect.formal_expansion_design()
                                       if r["seed"] == row["seed"]))
 
+    def test_expansion_a1_separates_target_intensity_without_fixed_token_gate(self):
+        rows = collect.expansion_a1_design()
+        self.assertEqual(len(rows), 6)
+        self.assertEqual([r["target_count"] for r in rows], [0, 4, 12, 24, 4, 8])
+        self.assertTrue(all(r["role"] == "train" and r["anchor_sections"] == 8
+                            and r["threshold"] == 0 for r in rows))
+        self.assertEqual({r["seed"] for r in rows}, set(range(20261800, 20261806)))
+        old = collect.formal_expansion_design() + collect.recovery_validation_design()
+        self.assertFalse({r["seed"] for r in rows} & {r["seed"] for r in old})
+        self.assertTrue(all(r["target_start_after_anchor"] for r in rows[-2:]))
+        args = ["collect", "--stage", "expansion-a1", "--plan-only",
+                "--out-dir", str(self.root / "a1"), "--expected-revision", "check"]
+        for key in ("model", "base", "survival", "guard", "checkpoint", "reference"):
+            args += [f"--{key}", str(self.root / key)]
+        with patch.object(sys, "argv", args):
+            collect.main()
+        plan = json.loads((self.root / "a1/preregistration.json").read_text())
+        self.assertFalse(plan["diagnostic_only"])
+        commands = json.loads((self.root / "a1/commands.json").read_text())
+        for item in commands:
+            first = json.loads(Path(item["argv"][item["argv"].index("--input") + 1])
+                               .read_text().splitlines()[0])
+            self.assertEqual(first["construction"]["response_sections"], 8)
+
     def test_fit_replacement_only_supersedes_ineligible_original(self):
         row = collect.recovery_validation_design()[0]
         original = self.root / "old-batch/pilot"
