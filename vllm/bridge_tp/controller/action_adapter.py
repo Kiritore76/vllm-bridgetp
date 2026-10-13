@@ -27,6 +27,7 @@ server will reject.
 from __future__ import annotations
 
 import json
+import math
 import socket
 import time
 import urllib.error
@@ -313,7 +314,8 @@ class ActionAdapter:
             except (OSError, json.JSONDecodeError):
                 continue
             if receipt.get("migration_id") != binding.migration_id:
-                return False, buffered, f"rank {rank} initial receipt migration ID differs"
+                return (False, buffered,
+                        f"rank {rank} initial receipt migration ID differs")
             status = receipt.get("status")
             if status == "INITIAL_HISTORY_GPU_BUFFERED":
                 if receipt.get("gpu_ready") is True:
@@ -645,10 +647,47 @@ class ActionAdapter:
         policy abandonment passes ``abort_source=False`` because ownership has
         not moved and the user's request must continue on TP1.
         """
-        return _post(
+        result = _post(
             f"{self.source_url}/bridge_tp/v1/cleanup",
             self.binding.body(reason=reason, abort_source=abort_source),
         )
+        if not abort_source and (self.run_dir / "rolling_reservation.json").is_file():
+            self.wait_for_source_cleanup()
+        return result
+
+    def wait_for_source_cleanup(self, timeout_s: float = 30.0) -> dict[str, Any]:
+        """Keep the target receiver alive until source delta drain is proven."""
+        request = json.loads(
+            (self.run_dir / "cleanup_request.json").read_text(encoding="utf-8")
+        )
+        binding = self.binding
+        requested = request.get("requested_unix_s")
+        if (request.get("migration_id") != binding.migration_id
+                or request.get("source_request_id") != binding.source_request_id
+                or request.get("abort_source") is not False
+                or type(requested) not in (int, float)
+                or not math.isfinite(requested)):
+            raise ActionError("rolling source cleanup request identity differs")
+        deadline = time.monotonic() + timeout_s
+        path = self.run_dir / "source_cleanup_receipt.json"
+        while True:
+            try:
+                receipt = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                receipt = {}
+            if (receipt.get("status") == "CLEANED"
+                    and receipt.get("component") == "source_delta_mirror"
+                    and receipt.get("migration_id") == binding.migration_id
+                    and receipt.get("reason") == request.get("reason")
+                    and type(receipt.get("updated_unix_s")) in (int, float)
+                    and math.isfinite(receipt["updated_unix_s"])
+                    and receipt["updated_unix_s"] >= requested):
+                return receipt
+            if time.monotonic() >= deadline:
+                raise ActionError(
+                    "source delta cleanup timed out; target receiver retained"
+                )
+            time.sleep(0.02)
 
     def cancel_shadow_target(self, reason: str) -> dict[str, Any] | None:
         """Abort and release an admitted dormant TP4 Shadow request."""
