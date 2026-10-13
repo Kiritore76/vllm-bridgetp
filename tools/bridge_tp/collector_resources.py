@@ -72,7 +72,8 @@ class ResourceSampler:
 
     def _run(self):
         paths = (
-            "/proc/self/status", "/proc/self/stat", "/proc/loadavg",
+            "/proc/self/status", "/proc/self/stat", "/proc/self/schedstat",
+            "/proc/self/sched", "/proc/loadavg",
             "/proc/pressure/cpu", "/proc/pressure/memory", "/proc/self/cgroup",
         )
         # cgroup mounts differ between containers; retain unavailable paths.

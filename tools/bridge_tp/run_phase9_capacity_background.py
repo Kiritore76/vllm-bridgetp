@@ -129,6 +129,15 @@ def wait_for_m2_initial_rate(path: Path, timeout_s: float) -> float:
     return wait_for_controller_event(path, "M2_INITIAL_RATE", timeout_s)
 
 
+def prepare_background_request(job):
+    """Freeze and encode requests before selecting the arrival epoch."""
+    request = freeze_strict_greedy_sampling(dict(job["request"]))
+    request.update({"request_id": f"bridgetp-cap0-load-{job['job_id']}",
+                    "stream": True, "return_token_ids": True})
+    request.setdefault("ignore_eos", True)
+    return request
+
+
 def run_background_job(planned, args, event, live) -> dict[str, Any]:
     out_dir = args.out_dir.resolve()
     worker_monotonic, worker_unix_s = time.monotonic(), time.time()
@@ -153,16 +162,18 @@ def run_background_job(planned, args, event, live) -> dict[str, Any]:
             0.0, worker_monotonic - planned.dispatch_monotonic
         ),
     }
+    if "_ticket_received_monotonic" in job:
+        received = job["_ticket_received_monotonic"]
+        schedule_fields.update({
+            "ticket_received_unix_s": job["_ticket_received_unix_s"],
+            "dispatch_to_ticket_receive_s": received - planned.dispatch_monotonic,
+            "ticket_receive_to_worker_s": worker_monotonic - received,
+            "request_preencoded": "_prepared_body" in job,
+        })
     base_url = args.source_url if job["pool"] == "source" else args.target_url
-    request = freeze_strict_greedy_sampling(dict(job["request"]))
-    request.update(
-        {
-            "request_id": f"bridgetp-cap0-load-{job_id}",
-            "stream": True,
-            "return_token_ids": True,
-        }
-    )
-    request.setdefault("ignore_eos", True)
+    request = job.get("_prepared_request")
+    if request is None:
+        request = prepare_background_request(job)
     event({"kind": "job_start", "job_id": job_id, "pool": job["pool"],
            "start_after_s": start_after_s,
            "schedule_lag_s": schedule_lag_s, **schedule_fields})
@@ -198,6 +209,8 @@ def run_background_job(planned, args, event, live) -> dict[str, Any]:
     try:
         stream_options = ({} if getattr(args, "collector_retain_chunks", True)
                           else {"retain_chunks": False})
+        if "_prepared_body" in job:
+            stream_options["encoded_body"] = job["_prepared_body"]
         result = post_streaming_completion(
             base_url,
             request,
@@ -309,7 +322,8 @@ def main() -> None:
 
         try:
             collector = IsolatedCollector(
-                {**vars(args), "collector_retain_chunks": False}, event, live,
+                {**vars(args), "collector_retain_chunks": False,
+                 "collector_preencode_requests": True}, event, live,
                 resources=resources,
             )
             collector.prepare(manifest["jobs"], args.controller_audit_path)
@@ -369,7 +383,8 @@ def main() -> None:
             evidence_error = error
     summary = {
         "format_version": 1,
-        "collector_backend": "ISOLATED_PROCESSES_V1" if isolated else "THREADS_V2",
+        "collector_backend": "ISOLATED_PREPARED_REQUESTS_V2" if isolated
+        else "THREADS_V2",
         "schedule_version": SCHEDULE_VERSION,
         "native_evidence_integrity": {
             "enabled": live is not None,

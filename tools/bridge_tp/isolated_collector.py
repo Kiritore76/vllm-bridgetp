@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Spawned HTTP process groups; the parent never parses response streams."""
 
+import json
 import multiprocessing as mp
 import os
 import queue
@@ -9,18 +10,35 @@ import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
+from pathlib import Path
 
 
-def _dispatcher(jobs, audit, epoch_input, inputs, output):
+def _dispatcher(jobs, audit, epoch_input, inputs, output, diagnostic_dir=None):
     """Dedicated process: no SSE parsing, native journal or response objects."""
     from tools.bridge_tp.background_schedule import due_jobs
 
+    sampler = None
+    handle = None
+    timings = []
+    if diagnostic_dir is not None:
+        from tools.bridge_tp.collector_resources import ResourceSampler
+
+        handle = (Path(diagnostic_dir) / "dispatcher_resources.jsonl").open(
+            "w", encoding="utf-8")
+
+        class Sink:
+            def submit(self, row):
+                handle.write(json.dumps(row) + "\n")
+                handle.flush()
+                return True
+
+        sampler = ResourceSampler(Sink(), diagnostics=True)
     output.put(("dispatcher_ready", -1, {}), timeout=5)
     mono_origin, unix_origin = epoch_input.get()
     previous_wall, previous_cpu = time.monotonic(), time.thread_time()
     try:
         arrivals = due_jobs(jobs, audit, mono_origin, unix_origin)
-        for index, planned in enumerate(arrivals):
+        for planned in arrivals:
             wall, cpu = time.monotonic(), time.thread_time()
             planned = replace(
                 planned, dispatch_monotonic=wall, dispatch_unix_s=time.time(),
@@ -29,11 +47,28 @@ def _dispatcher(jobs, audit, epoch_input, inputs, output):
                 since_previous_dispatch_cpu_s=cpu - previous_cpu,
             )
             previous_wall, previous_cpu = wall, cpu
-            inputs[index % len(inputs)].put_nowait(planned)
+            # HTTP workers already own all prompts and encoded request bodies.
+            ticket = replace(planned, job={"job_id": planned.job["job_id"]})
+            owner = inputs["ownership"][ticket.job["job_id"]]
+            inputs["queues"][owner].put_nowait(("dispatch", ticket))
+            if diagnostic_dir is not None:
+                timings.append({"job_id": ticket.job["job_id"],
+                                "scheduled_unix_s": ticket.scheduled_unix_s,
+                                "dispatch_unix_s": ticket.dispatch_unix_s,
+                                "due_to_dispatch_s": wall - ticket.scheduled_monotonic,
+                                "enqueue_wall_s": time.monotonic() - wall,
+                                "enqueue_thread_cpu_s": time.thread_time() - cpu})
         output.put(("dispatch_done", -1, {}), timeout=5)
     except BaseException as error:
         detail = f"dispatch: {type(error).__name__}: {error}"
         output.put(("fatal", -1, detail), timeout=5)
+    finally:
+        if sampler is not None:
+            sampler.close()
+            handle.close()
+            path = Path(diagnostic_dir) / "dispatcher_timing.jsonl"
+            path.write_text("".join(json.dumps(r) + "\n" for r in timings),
+                            encoding="utf-8")
 
 
 class EvidenceChannel:
@@ -142,6 +177,7 @@ def _worker(index, incoming, output, config, handler, native_enabled, threads):
 
         with ThreadPoolExecutor(max_workers=threads) as pool:
             active = set()
+            prepared = {}
             warm_gate, warm_started = threading.Event(), queue.Queue()
 
             def warm():
@@ -169,9 +205,30 @@ def _worker(index, incoming, output, config, handler, native_enabled, threads):
 
             channel.send("ready", {})
             while True:
-                planned = incoming.get()
-                if planned is None:
+                message = incoming.get()
+                if message is None:
                     break
+                kind, value = message
+                if kind == "load":
+                    job = dict(value)
+                    if config.get("collector_preencode_requests"):
+                        from tools.bridge_tp.run_phase9_capacity_background import (
+                            prepare_background_request,
+                        )
+
+                        request = prepare_background_request(job)
+                        job["_prepared_request"] = request
+                        job["_prepared_body"] = json.dumps(request).encode()
+                    prepared[job["job_id"]] = job
+                    continue
+                if kind == "loaded":
+                    channel.send("prepared", {"jobs": len(prepared)})
+                    continue
+                if kind != "dispatch":
+                    raise ValueError("unknown isolated dispatch message")
+                planned = replace(value, job=prepared.pop(value.job["job_id"]))
+                planned.job["_ticket_received_monotonic"] = time.monotonic()
+                planned.job["_ticket_received_unix_s"] = time.time()
                 active = {future for future in active if not future.done()}
                 if len(active) >= threads:
                     raise RuntimeError("isolated HTTP worker capacity exhausted")
@@ -196,6 +253,8 @@ class IsolatedCollector:
         self.resources = resources
         self.pending, self.lock = {}, threading.Lock()
         self.ready, self.receipts = set(), {}
+        self.prepared = {}
+        self.config = config
         self.dispatcher = None
         self.dispatched = False
         self.dispatcher_ready = False
@@ -234,6 +293,8 @@ class IsolatedCollector:
                     continue
                 if kind == "ready":
                     self.ready.add(index)
+                elif kind == "prepared":
+                    self.prepared[index] = payload["jobs"]
                 elif kind == "worker_receipt":
                     self.receipts[index] = payload
                 elif kind == "dispatch_done":
@@ -271,14 +332,40 @@ class IsolatedCollector:
             self.pending = {job["job_id"]: Future() for job in jobs}
             if len(self.pending) != len(jobs):
                 raise ValueError("duplicate isolated job id")
+        counts = [0] * len(self.inputs)
+        for index, job in enumerate(jobs):
+            worker = index % len(self.inputs)
+            self.inputs[worker].put(("load", job), timeout=5)
+            counts[worker] += 1
+        for inbox in self.inputs:
+            inbox.put(("loaded", None), timeout=5)
+        deadline = time.monotonic() + 120
+        while len(self.prepared) != len(self.inputs):
+            self.check()
+            if time.monotonic() > deadline:
+                raise TimeoutError("isolated request preparation timed out")
+            time.sleep(0.02)
+        if any(self.prepared[i] != count for i, count in enumerate(counts)):
+            raise RuntimeError("isolated prepared request count differs")
+        # Stable manifest order determines worker ownership, independent of due order.
+        compact = [{key: job[key] for key in
+                    ("job_id", "start_after_s", "start_after_event") if key in job}
+                   for job in jobs]
+        ownership = {job["job_id"]: i % len(self.inputs)
+                     for i, job in enumerate(jobs)}
         self.dispatcher = self.context.Process(
             target=_dispatcher,
-            args=(jobs, audit, self.epoch_input, self.inputs, self.output),
+            args=(compact, audit, self.epoch_input,
+                  {"queues": self.inputs, "ownership": ownership}, self.output,
+                  self.config.get("out_dir") if os.environ.get(
+                      "BRIDGETP_COLLECTOR_STALL_DIAGNOSTICS") == "1" else None),
         )
         self.dispatcher.start()
         deadline = time.monotonic() + 120
         while not self.dispatcher_ready:
             self.check()
+            if self.dispatcher.exitcode is not None:
+                raise RuntimeError("isolated dispatcher exited before readiness")
             if time.monotonic() > deadline:
                 raise TimeoutError("isolated dispatcher readiness timed out")
             time.sleep(0.02)

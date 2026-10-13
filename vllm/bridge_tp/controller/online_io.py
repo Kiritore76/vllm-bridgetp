@@ -49,13 +49,14 @@ def post_streaming_completion(
     failure_path: Path | None = None,
     *,
     retain_chunks: bool = True,
+    encoded_body: bytes | None = None,
 ) -> dict[str, Any]:
     """Consume one OpenAI-compatible SSE completion and expose each token."""
     request_started_monotonic = time.monotonic()
     request_started_unix_s = time.time()
     request = urllib.request.Request(
         base_url.rstrip("/") + "/v1/completions",
-        data=json.dumps(payload).encode(),
+        data=json.dumps(payload).encode() if encoded_body is None else encoded_body,
         headers={"Content-Type": "application/json"},
         method="POST",
     )

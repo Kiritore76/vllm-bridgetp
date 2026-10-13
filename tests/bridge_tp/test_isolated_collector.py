@@ -4,6 +4,8 @@
 import importlib.util
 import json
 import os
+import pickle
+import queue
 import sys
 import tempfile
 import threading
@@ -25,6 +27,7 @@ def stub_vllm_packages():
             package = types.ModuleType(name)
             package.__path__ = [str(ROOT / name.replace(".", "/"))]
             sys.modules[name] = package
+stub_vllm_packages()
 spec = importlib.util.spec_from_file_location(
     "isolated_journal_test", ROOT / "vllm/bridge_tp/async_journal.py")
 journal = importlib.util.module_from_spec(spec)
@@ -44,6 +47,7 @@ def busy_handler(planned, config, event, native):
             native.submit({"kind": "native_itl", "job_id": planned.job["job_id"],
                            "unix_s": 124 + index / 100, "index": index})
     return {"job_id": planned.job["job_id"],
+            "marker": planned.job.get("marker"),
             "dispatch_lag_s": planned.dispatch_monotonic - planned.scheduled_monotonic,
             "scheduled_unix_s": planned.scheduled_unix_s}
 
@@ -56,10 +60,48 @@ def real_background_handler(planned, config, event, native):
 
 
 class IsolatedCollectorTests(unittest.TestCase):
+    def test_dispatch_ticket_omits_large_prompt_and_saves_own_diagnostics(self):
+        from tools.bridge_tp.isolated_collector import _dispatcher
+
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            epoch, output, incoming = queue.Queue(), queue.Queue(), queue.Queue()
+            epoch.put((time.monotonic(), time.time()))
+            job = {"job_id": "large", "start_after_s": 0,
+                   "request": {"prompt": "x" * 1_000_000}}
+            _dispatcher([job], None, epoch,
+                        {"queues": [incoming], "ownership": {"large": 0}},
+                        output, directory)
+            kind, ticket = incoming.get_nowait()
+            self.assertEqual(kind, "dispatch")
+            self.assertEqual(ticket.job, {"job_id": "large"})
+            self.assertLess(len(pickle.dumps(ticket)), 1024)
+            timing = json.loads((Path(directory) / "dispatcher_timing.jsonl")
+                                .read_text().splitlines()[0])
+            self.assertEqual(timing["job_id"], "large")
+            self.assertTrue((Path(directory) / "dispatcher_resources.jsonl").is_file())
+
+    def test_preloaded_jobs_keep_ownership_when_due_order_differs(self):
+        collector = IsolatedCollector({}, lambda row: None, handler=busy_handler,
+                                      processes=2, threads=2)
+        try:
+            jobs = [{"job_id": "later", "start_after_s": 0.05, "marker": "A"},
+                    {"job_id": "first", "start_after_s": 0, "marker": "B"}]
+            collector.prepare(jobs, None)
+            self.assertEqual(collector.prepared, {0: 1, 1: 1})
+            results = collector.execute(time.monotonic(), time.time())
+            self.assertEqual({r["job_id"]: r["marker"] for r in results},
+                             {"later": "A", "first": "B"})
+            collector.close()
+        finally:
+            collector.close(abort=True)
+
     def test_real_http_streams_keep_tokens_and_drain_batched_receipts(self):
+        requests = []
+
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
-                self.rfile.read(int(self.headers["Content-Length"]))
+                requests.append(json.loads(self.rfile.read(
+                    int(self.headers["Content-Length"]))))
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()
@@ -79,7 +121,8 @@ class IsolatedCollectorTests(unittest.TestCase):
                 url = f"http://127.0.0.1:{server.server_port}"
                 config = {"out_dir": Path(directory), "source_url": url,
                           "target_url": url, "request_timeout_s": 5,
-                          "collector_retain_chunks": False}
+                          "collector_retain_chunks": False,
+                          "collector_preencode_requests": True}
                 native = journal.AsyncJournal(Path(directory) / "native.jsonl")
                 collector = IsolatedCollector(config, lambda row: None, native,
                                               handler=real_background_handler,
@@ -104,6 +147,8 @@ class IsolatedCollectorTests(unittest.TestCase):
                                     .read_text().splitlines()[-1])
                 self.assertEqual(footer["saved_records"], 12)
                 self.assertEqual(footer["dropped"], 0)
+                self.assertEqual(len(requests), 4)
+                self.assertTrue(all(r["return_token_ids"] for r in requests))
         finally:
             server.shutdown()
             server.server_close()
