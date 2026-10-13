@@ -1192,12 +1192,21 @@ def capture_persistent_memory(
 
 def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
     rows: list[dict[str, Any]] = []
+    non_takeover: list[dict[str, Any]] = []
     for run in runs:
         acceptance = run["acceptance"]
         if acceptance.get("outcome") in {
             "NATURAL_EOS_BEFORE_MIGRATION",
             "NATURAL_EOS_AFTER_SHADOW",
+            "START_CANCELLED_SOURCE_COMPLETED",
         }:
+            non_takeover.append({
+                "root": run.get("root"),
+                "repetition": run.get("repetition"),
+                "strategy": run.get("strategy"),
+                "acceptance": acceptance,
+                "handoff_applicable": False,
+            })
             continue
         ready_event_waits = [
             float(value)
@@ -1459,6 +1468,7 @@ def write_measurements(out_root: Path, runs: list[dict[str, Any]]) -> None:
             for key, value in metrics.items():
                 row[f"{prefix}_{key}"] = value
         rows.append(row)
+    common.write_json(out_root / "non_takeover_measurements.json", non_takeover)
     if not rows:
         return
     # Architecture comparisons intentionally expose different semantic windows:

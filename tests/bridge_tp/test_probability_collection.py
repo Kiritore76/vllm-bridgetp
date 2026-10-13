@@ -767,3 +767,29 @@ class TestProbabilityCollection(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class NonTakeoverMeasurementsTests(unittest.TestCase):
+    def test_clean_cancellation_has_outcome_without_fabricated_handoff(self):
+        from tools.bridge_tp.run_shadow_strategy_online_validation import (
+            write_measurements,
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            acceptance = {'status': 'PASS',
+                          'outcome': 'START_CANCELLED_SOURCE_COMPLETED',
+                          'cancellation_reasons': ['reservation exhausted']}
+            write_measurements(root, [{'root': str(root), 'repetition': 1,
+                                      'strategy': 'S_NEW_OLD',
+                                      'acceptance': acceptance}])
+            rows = json.loads((root / 'non_takeover_measurements.json').read_text())
+            self.assertEqual(rows[0]['acceptance'], acceptance)
+            self.assertFalse(rows[0]['handoff_applicable'])
+            self.assertFalse((root / 'measurements.csv').exists())
+
+    def test_successful_takeover_still_requires_origin_evidence(self):
+        from tools.bridge_tp.run_shadow_strategy_online_validation import (
+            write_measurements,
+        )
+        with tempfile.TemporaryDirectory() as temp, self.assertRaises(KeyError):
+            write_measurements(Path(temp), [{'repetition': 1, 'strategy': 's',
+                                              'acceptance': {'status': 'PASS'}}])
