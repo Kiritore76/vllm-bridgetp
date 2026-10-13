@@ -870,6 +870,11 @@ def run(
                 background_dir / "background.log",
             )
             processes.append(background)
+            if base_env.get("BRIDGETP_ISOLATED_COLLECTOR") == "1":
+                common.wait_for_file_or_exit(
+                    background_dir / "collector_ready.json", background,
+                    timeout_s=args.server_start_timeout_s,
+                )
             wait_for_background_first_tokens(
                 background_dir / "background_events.jsonl",
                 background,
@@ -976,6 +981,11 @@ def run(
                 background_dir / "background.log",
             )
             processes.append(background)
+            if base_env.get("BRIDGETP_ISOLATED_COLLECTOR") == "1":
+                common.wait_for_file_or_exit(
+                    background_dir / "collector_ready.json", background,
+                    timeout_s=args.server_start_timeout_s,
+                )
             wait_for_background_first_tokens(
                 background_dir / "background_events.jsonl",
                 background,

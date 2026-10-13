@@ -5,6 +5,7 @@ import gc
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 
@@ -17,6 +18,8 @@ class ResourceSampler:
         self.stop = threading.Event()
         self.diagnostics = diagnostics
         self.gc_started = {}
+        self.gc_events = deque()
+        self.gc_dropped = 0
         self.gc_observer = self._gc_event
         if diagnostics:
             gc.callbacks.append(self.gc_observer)
@@ -31,19 +34,31 @@ class ResourceSampler:
             wall, cpu = self.gc_started.pop(key)
             elapsed = time.monotonic() - wall
             if elapsed >= 0.02:
-                self.journal.submit({
+                record = {
                     "kind": "collector_gc_pause", "unix_s": time.time(),
                     "generation": key[1], "thread_id": key[0],
                     "wall_s": elapsed, "thread_cpu_s": time.thread_time() - cpu,
                     "collected": info.get("collected"),
                     "uncollectable": info.get("uncollectable"),
-                })
+                }
+                if len(self.gc_events) < 4096:
+                    self.gc_events.append(record)
+                else:
+                    self.gc_dropped += 1
+
+    def drain_gc(self):
+        while self.gc_events:
+            self.journal.submit(self.gc_events.popleft())
 
     @staticmethod
     def thread_locations():
         """Bounded locations after a stall; no locals or response content."""
         result = []
-        for thread_id, frame in list(sys._current_frames().items())[:32]:
+        frames = sys._current_frames()
+        main = threading.main_thread().ident
+        ordered = sorted(frames, key=lambda thread_id: thread_id != main)
+        for thread_id in ordered[:32]:
+            frame = frames[thread_id]
             stack = []
             for _ in range(6):
                 if frame is None:
@@ -64,6 +79,7 @@ class ResourceSampler:
         groups = (Path("/sys/fs/cgroup"), Path("/sys/fs/cgroup/cpu"))
         expected = time.monotonic()
         while not self.stop.is_set():
+            self.drain_gc()
             lateness = max(0.0, time.monotonic() - expected)
             if self.diagnostics and lateness >= 0.5:
                 self.journal.submit({
@@ -96,3 +112,7 @@ class ResourceSampler:
         self.worker.join()
         if self.diagnostics:
             gc.callbacks.remove(self.gc_observer)
+        self.drain_gc()
+        if self.gc_dropped:
+            self.journal.submit({"kind": "collector_gc_diagnostic_loss",
+                                 "dropped": self.gc_dropped})

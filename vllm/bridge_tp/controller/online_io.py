@@ -47,6 +47,8 @@ def post_streaming_completion(
     timeout_s: float,
     token_sink: TokenSink,
     failure_path: Path | None = None,
+    *,
+    retain_chunks: bool = True,
 ) -> dict[str, Any]:
     """Consume one OpenAI-compatible SSE completion and expose each token."""
     request_started_monotonic = time.monotonic()
@@ -95,7 +97,8 @@ def post_streaming_completion(
                 chunk = json.loads(data)
                 if "error" in chunk:
                     raise failure(f"streaming completion error: {chunk['error']}")
-                chunks.append(chunk)
+                if retain_chunks:
+                    chunks.append(chunk)
                 response_id = chunk.get("id", response_id)
                 choices = chunk.get("choices") or []
                 if not choices:

@@ -38,6 +38,19 @@ class AsyncJournal:
             self.dropped += 1
             return False
 
+    def submit_batch(self, records):
+        """One queue acquisition per bounded batch; preserve every record."""
+        if self.closed:
+            raise RuntimeError("evidence journal is closed")
+        if not 1 <= len(records) <= 64:
+            raise ValueError("journal batches must contain 1..64 records")
+        try:
+            self.queue.put_nowait(("records", tuple(records)))
+            return True
+        except queue.Full:
+            self.dropped += len(records)
+            return False
+
     def _run(self):
         last_flush = time.monotonic()
         while True:
@@ -58,7 +71,13 @@ class AsyncJournal:
                 except queue.Empty:
                     break
             stopping = values[-1] is None
-            records = values[:-1] if stopping else values
+            entries = values[:-1] if stopping else values
+            records = []
+            for entry in entries:
+                if isinstance(entry, tuple) and entry[0] == "records":
+                    records.extend(entry[1])
+                else:
+                    records.append(entry)
             try:
                 if records and self.error is None:
                     payload = "".join(

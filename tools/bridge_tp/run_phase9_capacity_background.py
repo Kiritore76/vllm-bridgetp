@@ -129,6 +129,142 @@ def wait_for_m2_initial_rate(path: Path, timeout_s: float) -> float:
     return wait_for_controller_event(path, "M2_INITIAL_RATE", timeout_s)
 
 
+def run_background_job(planned, args, event, live) -> dict[str, Any]:
+    out_dir = args.out_dir.resolve()
+    worker_monotonic, worker_unix_s = time.monotonic(), time.time()
+    worker_cpu = time.thread_time()
+    job = planned.job
+    job_id = str(job["job_id"])
+    start_after_s = float(job["start_after_s"])
+    schedule_lag_s = max(0.0, time.monotonic() - planned.scheduled_monotonic)
+    schedule_fields = {
+        "schedule_version": SCHEDULE_VERSION,
+        "schedule_epoch_unix_s": planned.epoch_unix_s,
+        "scheduled_unix_s": planned.scheduled_unix_s,
+        "dispatch_unix_s": planned.dispatch_unix_s,
+        "worker_started_unix_s": worker_unix_s,
+        "dispatch_thread_cpu_s": planned.dispatch_thread_cpu_s,
+        "since_previous_dispatch_wall_s": planned.since_previous_dispatch_wall_s,
+        "since_previous_dispatch_cpu_s": planned.since_previous_dispatch_cpu_s,
+        "due_to_dispatch_s": max(
+            0.0, planned.dispatch_monotonic - planned.scheduled_monotonic
+        ),
+        "dispatch_to_worker_s": max(
+            0.0, worker_monotonic - planned.dispatch_monotonic
+        ),
+    }
+    base_url = args.source_url if job["pool"] == "source" else args.target_url
+    request = freeze_strict_greedy_sampling(dict(job["request"]))
+    request.update(
+        {
+            "request_id": f"bridgetp-cap0-load-{job_id}",
+            "stream": True,
+            "return_token_ids": True,
+        }
+    )
+    request.setdefault("ignore_eos", True)
+    event({"kind": "job_start", "job_id": job_id, "pool": job["pool"],
+           "start_after_s": start_after_s,
+           "schedule_lag_s": schedule_lag_s, **schedule_fields})
+    request_started_unix_s = time.time()
+    schedule_fields["worker_to_http_call_s"] = (
+        time.monotonic() - worker_monotonic
+    )
+    schedule_fields["http_call_started_unix_s"] = request_started_unix_s
+    schedule_fields["http_timestamp_basis"] = (
+        "CLIENT_CALL_BOUNDARY_NOT_SOCKET_SEND_OR_SERVER_RECEIPT"
+    )
+    schedule_lag_s = max(0.0, time.monotonic() - planned.scheduled_monotonic)
+    if live and job["pool"] == "target":
+        live.submit({"kind": "native_arrival", "job_id": job_id,
+                     "unix_s": request_started_unix_s,
+                     "prompt_tokens": len(request["prompt"])})
+    token_times: list[float] = []
+
+    def record_token(_index: int, _token_id: int, unix_s: float) -> None:
+        if not token_times:
+            event(
+                {
+                    "kind": "job_first_token",
+                    "job_id": job_id,
+                    "pool": job["pool"],
+                }
+            )
+        if live and job["pool"] == "target" and token_times:
+            live.submit({"kind": "native_itl", "job_id": job_id,
+                         "unix_s": unix_s, "itl_s": unix_s - token_times[-1],
+                         "tpot_reference_s": 0.1})
+        token_times.append(unix_s)
+    try:
+        stream_options = ({} if getattr(args, "collector_retain_chunks", True)
+                          else {"retain_chunks": False})
+        result = post_streaming_completion(
+            base_url,
+            request,
+            args.request_timeout_s,
+            record_token,
+            **stream_options,
+        )
+        request_ended_unix_s = time.time()
+        token_intervals_ms = [
+            (current - previous) * 1000
+            for previous, current in zip(token_times, token_times[1:])
+        ]
+        summary = {
+            "job_id": job_id,
+            "pool": job["pool"],
+            "start_after_s": start_after_s,
+            "schedule_lag_s": schedule_lag_s,
+            **schedule_fields,
+            "status": "COMPLETED",
+            "response_id": result["response_id"],
+            "finish_reason": result["finish_reason"],
+            "output_tokens": len(result["token_ids"]),
+            "token_ids_sha256": hashlib.sha256(
+                json.dumps(result["token_ids"], separators=(",", ":"))
+                .encode("ascii")
+            ).hexdigest(),
+            "token_ids": result["token_ids"] if live else None,
+            "request_started_unix_s": request_started_unix_s,
+            "first_token_unix_s": token_times[0] if token_times else None,
+            "last_token_unix_s": token_times[-1] if token_times else None,
+            "request_ended_unix_s": request_ended_unix_s,
+            "ttft_ms": (
+                (token_times[0] - request_started_unix_s) * 1000
+                if token_times
+                else None
+            ),
+            "e2e_ms": (request_ended_unix_s - request_started_unix_s) * 1000,
+            "worker_stream_cpu_s": time.thread_time() - worker_cpu,
+            "tpot_p50_ms": percentile(token_intervals_ms, 0.50),
+            "tpot_p95_ms": percentile(token_intervals_ms, 0.95),
+            "tpot_p99_ms": percentile(token_intervals_ms, 0.99),
+            # Preserved for paired pre/Shadow/Bridge/post window analysis.
+            "token_times_unix_s": token_times,
+        }
+        event({"kind": "job_end", **summary})
+        atomic_json_dump(summary, out_dir / f"{job_id}.json")
+        return summary
+    except Exception as error:
+        summary = {
+            "job_id": job_id,
+            "pool": job["pool"],
+            "start_after_s": start_after_s,
+            "schedule_lag_s": schedule_lag_s,
+            **schedule_fields,
+            "status": "FAILED",
+            "request_started_unix_s": request_started_unix_s,
+            "request_ended_unix_s": time.time(),
+            "output_tokens": len(token_times),
+            "token_times_unix_s": token_times,
+            "failure_kind": "SERVICE_REQUEST_FAILURE",
+            "error": f"{type(error).__name__}: {error}",
+        }
+        event({"kind": "job_end", **summary})
+        atomic_json_dump(summary, out_dir / f"{job_id}.json")
+        return summary
+
+
 def main() -> None:
     args = parse_args()
     manifest = load_manifest(args.manifest)
@@ -151,146 +287,45 @@ def main() -> None:
     sampler = ResourceSampler(resources, diagnostics=diagnostics)
     start_monotonic = time.monotonic()
     start_unix_s = time.time()
+    isolated = os.environ.get("BRIDGETP_ISOLATED_COLLECTOR") == "1"
     live = None
     if os.environ.get("BRIDGETP_TARGET_OBSERVATION") == "1":
         from vllm.bridge_tp.async_journal import AsyncJournal
 
-        live = AsyncJournal(out_dir / "target_native_events.jsonl")
+        live = AsyncJournal(out_dir / "target_native_events.jsonl",
+                            capacity=1024 if isolated else 65536,
+                            batch_size=32 if isolated else 512)
 
     def event(value: dict[str, Any]) -> None:
         record = {"unix_s": time.time(), **value}
         events.submit(record)
 
-    def run_job(planned) -> dict[str, Any]:
-        worker_monotonic, worker_unix_s = time.monotonic(), time.time()
-        worker_cpu = time.thread_time()
-        job = planned.job
-        job_id = str(job["job_id"])
-        start_after_s = float(job["start_after_s"])
-        schedule_lag_s = max(0.0, time.monotonic() - planned.scheduled_monotonic)
-        schedule_fields = {
-            "schedule_version": SCHEDULE_VERSION,
-            "schedule_epoch_unix_s": planned.epoch_unix_s,
-            "scheduled_unix_s": planned.scheduled_unix_s,
-            "dispatch_unix_s": planned.dispatch_unix_s,
-            "worker_started_unix_s": worker_unix_s,
-            "dispatch_thread_cpu_s": planned.dispatch_thread_cpu_s,
-            "since_previous_dispatch_wall_s": planned.since_previous_dispatch_wall_s,
-            "since_previous_dispatch_cpu_s": planned.since_previous_dispatch_cpu_s,
-            "due_to_dispatch_s": max(
-                0.0, planned.dispatch_monotonic - planned.scheduled_monotonic
-            ),
-            "dispatch_to_worker_s": max(
-                0.0, worker_monotonic - planned.dispatch_monotonic
-            ),
-        }
-        base_url = args.source_url if job["pool"] == "source" else args.target_url
-        request = freeze_strict_greedy_sampling(dict(job["request"]))
-        request.update(
-            {
-                "request_id": f"bridgetp-cap0-load-{job_id}",
-                "stream": True,
-                "return_token_ids": True,
-            }
-        )
-        request.setdefault("ignore_eos", True)
-        event({"kind": "job_start", "job_id": job_id, "pool": job["pool"],
-               "start_after_s": start_after_s,
-               "schedule_lag_s": schedule_lag_s, **schedule_fields})
-        request_started_unix_s = time.time()
-        schedule_fields["worker_to_http_call_s"] = (
-            time.monotonic() - worker_monotonic
-        )
-        schedule_fields["http_call_started_unix_s"] = request_started_unix_s
-        schedule_fields["http_timestamp_basis"] = (
-            "CLIENT_CALL_BOUNDARY_NOT_SOCKET_SEND_OR_SERVER_RECEIPT"
-        )
-        schedule_lag_s = max(0.0, time.monotonic() - planned.scheduled_monotonic)
-        if live and job["pool"] == "target":
-            live.submit({"kind": "native_arrival", "job_id": job_id,
-                         "unix_s": request_started_unix_s,
-                         "prompt_tokens": len(request["prompt"])})
-        token_times: list[float] = []
+    def run_job(planned):
+        return run_background_job(planned, args, event, live)
 
-        def record_token(_index: int, _token_id: int, unix_s: float) -> None:
-            if not token_times:
-                event(
-                    {
-                        "kind": "job_first_token",
-                        "job_id": job_id,
-                        "pool": job["pool"],
-                    }
-                )
-            if live and job["pool"] == "target" and token_times:
-                live.submit({"kind": "native_itl", "job_id": job_id,
-                             "unix_s": unix_s, "itl_s": unix_s - token_times[-1],
-                             "tpot_reference_s": 0.1})
-            token_times.append(unix_s)
+    collector = None
+    if isolated:
+        from tools.bridge_tp.isolated_collector import IsolatedCollector
+
         try:
-            result = post_streaming_completion(
-                base_url,
-                request,
-                args.request_timeout_s,
-                record_token,
+            collector = IsolatedCollector(
+                {**vars(args), "collector_retain_chunks": False}, event, live,
+                resources=resources,
             )
-            request_ended_unix_s = time.time()
-            token_intervals_ms = [
-                (current - previous) * 1000
-                for previous, current in zip(token_times, token_times[1:])
-            ]
-            summary = {
-                "job_id": job_id,
-                "pool": job["pool"],
-                "start_after_s": start_after_s,
-                "schedule_lag_s": schedule_lag_s,
-                **schedule_fields,
-                "status": "COMPLETED",
-                "response_id": result["response_id"],
-                "finish_reason": result["finish_reason"],
-                "output_tokens": len(result["token_ids"]),
-                "token_ids_sha256": hashlib.sha256(
-                    json.dumps(result["token_ids"], separators=(",", ":"))
-                    .encode("ascii")
-                ).hexdigest(),
-                "token_ids": result["token_ids"] if live else None,
-                "request_started_unix_s": request_started_unix_s,
-                "first_token_unix_s": token_times[0] if token_times else None,
-                "last_token_unix_s": token_times[-1] if token_times else None,
-                "request_ended_unix_s": request_ended_unix_s,
-                "ttft_ms": (
-                    (token_times[0] - request_started_unix_s) * 1000
-                    if token_times
-                    else None
-                ),
-                "e2e_ms": (request_ended_unix_s - request_started_unix_s) * 1000,
-                "worker_stream_cpu_s": time.thread_time() - worker_cpu,
-                "tpot_p50_ms": percentile(token_intervals_ms, 0.50),
-                "tpot_p95_ms": percentile(token_intervals_ms, 0.95),
-                "tpot_p99_ms": percentile(token_intervals_ms, 0.99),
-                # Preserved for paired pre/Shadow/Bridge/post window analysis.
-                "token_times_unix_s": token_times,
-            }
-            event({"kind": "job_end", **summary})
-            atomic_json_dump(summary, out_dir / f"{job_id}.json")
-            return summary
-        except Exception as error:
-            summary = {
-                "job_id": job_id,
-                "pool": job["pool"],
-                "start_after_s": start_after_s,
-                "schedule_lag_s": schedule_lag_s,
-                **schedule_fields,
-                "status": "FAILED",
-                "request_started_unix_s": request_started_unix_s,
-                "request_ended_unix_s": time.time(),
-                "output_tokens": len(token_times),
-                "token_times_unix_s": token_times,
-                "failure_kind": "SERVICE_REQUEST_FAILURE",
-                "error": f"{type(error).__name__}: {error}",
-            }
-            event({"kind": "job_end", **summary})
-            atomic_json_dump(summary, out_dir / f"{job_id}.json")
-            return summary
+            collector.prepare(manifest["jobs"], args.controller_audit_path)
+        except BaseException:
+            if collector is not None:
+                collector.close(abort=True)
+            sampler.close()
+            resources.close()
+            events.close()
+            if live:
+                live.close()
+            raise
+        start_monotonic, start_unix_s = time.monotonic(), time.time()
+
+    atomic_json_dump({"ready": True, "isolated": isolated,
+                      "unix_s": start_unix_s}, out_dir / "collector_ready.json")
 
     event(
         {
@@ -300,12 +335,21 @@ def main() -> None:
         }
     )
     try:
-        results = execute_schedule(
-            manifest["jobs"], run_job, args.controller_audit_path,
-            start_monotonic, start_unix_s,
-            diagnostic_event=event if diagnostics else None,
-        )
+        if collector is not None:
+            results = collector.execute(start_monotonic, start_unix_s)
+            collector.close()
+            atomic_json_dump(collector.receipts,
+                             out_dir / "isolated_worker_receipts.json")
+            collector = None
+        else:
+            results = execute_schedule(
+                manifest["jobs"], run_job, args.controller_audit_path,
+                start_monotonic, start_unix_s,
+                diagnostic_event=event if diagnostics else None,
+            )
     except BaseException:
+        if collector is not None:
+            collector.close(abort=True)
         # Response workers have drained before execute_schedule raises.
         try:
             if live:
@@ -325,6 +369,7 @@ def main() -> None:
             evidence_error = error
     summary = {
         "format_version": 1,
+        "collector_backend": "ISOLATED_PROCESSES_V1" if isolated else "THREADS_V2",
         "schedule_version": SCHEDULE_VERSION,
         "native_evidence_integrity": {
             "enabled": live is not None,

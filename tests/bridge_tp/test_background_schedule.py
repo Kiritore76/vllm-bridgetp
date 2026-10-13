@@ -27,6 +27,9 @@ class BackgroundScheduleTests(unittest.TestCase):
     def test_gc_pause_records_cpu_wall_without_changing_collection_policy(self):
         probe = object.__new__(ResourceSampler)
         probe.gc_started = {}
+        from collections import deque
+
+        probe.gc_events, probe.gc_dropped = deque(), 0
         records = []
         probe.journal = SimpleNamespace(submit=records.append)
         with (patch("tools.bridge_tp.collector_resources.time.monotonic",
@@ -35,6 +38,8 @@ class BackgroundScheduleTests(unittest.TestCase):
                     side_effect=[1, 1.01])):
             probe._gc_event("start", {"generation": 2})
             probe._gc_event("stop", {"generation": 2, "collected": 20})
+        self.assertEqual(records, [])
+        probe.drain_gc()
         self.assertEqual(len(records), 1)
         self.assertAlmostEqual(records[0]["wall_s"], 0.2)
         self.assertAlmostEqual(records[0]["thread_cpu_s"], 0.01)
