@@ -424,6 +424,28 @@ class PerformanceTraceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "lacks measured prefill"):
                 verify(root, 1)
 
+    def test_failed_journal_or_partial_startup_cannot_prevent_worker_cleanup(self):
+        method = actual_method(
+            "vllm/v1/engine/core.py",
+            "EngineCore",
+            "shutdown",
+            {"logger": Mock(), "gc": Mock(), "cleanup_dist_env_and_memory": Mock()},
+        )
+        for has_trace in (True, False):
+            engine = NS(
+                structured_output_manager=Mock(),
+                model_executor=Mock(),
+                scheduler=Mock(),
+            )
+            if has_trace:
+                engine._bridgetp_performance_trace = Mock()
+                engine._bridgetp_performance_trace.close.side_effect = RuntimeError(
+                    "disk"
+                )
+            method(engine)
+            engine.model_executor.shutdown.assert_called_once()
+            engine.scheduler.shutdown.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

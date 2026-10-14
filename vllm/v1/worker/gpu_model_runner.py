@@ -6435,8 +6435,13 @@ class GPUModelRunner(
         from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
         from vllm.v1.worker.workspace import reset_workspace_manager
 
-        if self._bridgetp_performance_trace is not None:
-            self._bridgetp_performance_trace.close()
+        if trace := getattr(self, "_bridgetp_performance_trace", None):
+            try:
+                trace.close()
+            except Exception:
+                logger.exception(
+                    "BridgeTP GPU performance evidence incomplete at shutdown"
+                )
 
         if self.predictor_feature_capture is not None and hasattr(
             self.predictor_feature_capture, "close"

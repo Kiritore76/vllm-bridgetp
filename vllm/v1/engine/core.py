@@ -643,8 +643,12 @@ class EngineCore:
 
     def shutdown(self):
         logger.debug_once("[shutdown] EngineCore: tearing down local resources")
-        if self._bridgetp_performance_trace is not None:
-            self._bridgetp_performance_trace.close()
+        if trace := getattr(self, "_bridgetp_performance_trace", None):
+            try:
+                trace.close()
+            except Exception:
+                # Explicit finalization still fails; cleanup must release workers.
+                logger.exception("BridgeTP performance journal incomplete at shutdown")
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()
