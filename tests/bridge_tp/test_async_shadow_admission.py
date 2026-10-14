@@ -190,13 +190,45 @@ class TestAsyncShadowAdmission(unittest.TestCase):
     def test_connector_opt_in_is_specific_to_gpu_resident_shadow(self):
         methods = self.connector_methods()
         state = types.SimpleNamespace(
-            gpu_resident_shadow=False, _request_matches=lambda r: r == "shadow"
+            gpu_resident_shadow=False,
+            _active_requests={},
+            _request_matches=lambda r: r.request_id == "shadow",
         )
         predicate = methods["can_load_kv_without_token_budget"]
-        self.assertFalse(predicate(state, "shadow"))
+        self.assertFalse(predicate(state, Request("shadow")))
         state.gpu_resident_shadow = True
-        self.assertTrue(predicate(state, "shadow"))
-        self.assertFalse(predicate(state, "ordinary"))
+        self.assertTrue(predicate(state, Request("shadow")))
+        self.assertFalse(predicate(state, Request("ordinary")))
+
+    def test_loaded_shadow_is_not_revalidated_after_final_length_changes(self):
+        methods = self.connector_methods()
+        request = Request("shadow")
+        request.num_tokens = 409
+        request.num_computed_tokens = 408
+
+        def invalid_first_admission_probe(request):
+            raise ValueError("final continuation differs from initial reservation")
+
+        state = types.SimpleNamespace(
+            gpu_resident_shadow=True,
+            _active_requests={request.request_id: request},
+            _request_matches=invalid_first_admission_probe,
+        )
+        self.assertFalse(methods["can_load_kv_without_token_budget"](state, request))
+        # Identity remains authoritative even if a preemption resets computed KV.
+        request.num_computed_tokens = 0
+        self.assertFalse(methods["can_load_kv_without_token_budget"](state, request))
+
+    def test_remote_kv_resume_does_not_repeat_initial_admission_probe(self):
+        methods = self.connector_methods()
+        request = Request("shadow")
+        request.num_computed_tokens = 16
+        state = types.SimpleNamespace(
+            gpu_resident_shadow=True,
+            _active_requests={},
+            _request_matches=lambda r: self.fail("resume probed as initial admission"),
+        )
+        self.assertFalse(methods["can_load_kv_without_token_budget"](state, request))
 
     def test_admission_receipt_keeps_budget_and_reservation_evidence(self):
         methods = self.connector_methods()

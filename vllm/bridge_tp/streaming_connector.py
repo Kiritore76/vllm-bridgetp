@@ -673,8 +673,14 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         return self.gpu_resident_shadow
 
     def can_load_kv_without_token_budget(self, request: Request) -> bool:
-        """Opt in only the active GPU-resident BridgeTP continuation."""
-        return self.gpu_resident_shadow and self._request_matches(request)
+        """Probe only first admission, before the continuation can change length."""
+        if (
+            not self.gpu_resident_shadow
+            or request.request_id in self._active_requests
+            or request.num_computed_tokens != 0
+        ):
+            return False
+        return self._request_matches(request)
 
     def record_async_load_admission(
         self, request: Request, token_budget: int, reserved_blocks: int,
