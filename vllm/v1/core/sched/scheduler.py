@@ -579,8 +579,15 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
+            budget_deferred_waiting = []
+            budget_free_async = (
+                getattr(self.connector, "budget_free_async_load_admission", False)
+                is True
+            )
 
-            while (self.waiting or self.skipped_waiting) and token_budget > 0:
+            while (self.waiting or self.skipped_waiting) and (
+                token_budget > 0 or budget_free_async
+            ):
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
@@ -589,6 +596,16 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                if token_budget == 0 and not (
+                    self.connector.can_load_kv_without_token_budget(request)
+                ):
+                    # Inspect only the opt-in async loader. Restore ordinary
+                    # requests to their original queue/order after this pass.
+                    budget_deferred_waiting.append(
+                        (request_queue, request_queue.pop_request())
+                    )
+                    continue
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -694,6 +711,12 @@ class Scheduler(SchedulerInterface):
                     assert num_external_computed_tokens > 0
                     num_new_tokens = 0
                 else:
+                    if token_budget == 0:
+                        # A connector probe is not permission for local compute.
+                        budget_deferred_waiting.append(
+                            (request_queue, request_queue.pop_request())
+                        )
+                        continue
                     # Number of tokens to be scheduled.
                     # We use `request.num_tokens` instead of
                     # `request.num_prompt_tokens` to consider the resumed
@@ -802,6 +825,11 @@ class Scheduler(SchedulerInterface):
                 # This information is used to determine if a load is
                 # needed for this request.
                 if self.connector is not None:
+                    if budget_free_async and load_kv_async:
+                        self.connector.record_async_load_admission(
+                            request, token_budget, reserved_blocks,
+                            num_external_computed_tokens,
+                        )
                     self.connector.update_state_after_alloc(
                         request,
                         self.kv_cache_manager.get_blocks(request_id),
@@ -879,6 +907,9 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.allocate(request, i)
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
+
+            for original_queue, deferred_request in reversed(budget_deferred_waiting):
+                original_queue.prepend_request(deferred_request)
 
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:

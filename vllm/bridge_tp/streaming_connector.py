@@ -667,6 +667,36 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
     def _external_computed_tokens(self, manifest: dict[str, Any]) -> int:
         return self._planned_known_tokens(manifest) - 1
 
+    # Async history needs scheduler-owned blocks, but no forward token budget.
+    @property
+    def budget_free_async_load_admission(self) -> bool:
+        return self.gpu_resident_shadow
+
+    def can_load_kv_without_token_budget(self, request: Request) -> bool:
+        """Opt in only the active GPU-resident BridgeTP continuation."""
+        return self.gpu_resident_shadow and self._request_matches(request)
+
+    def record_async_load_admission(
+        self, request: Request, token_budget: int, reserved_blocks: int,
+        num_external_tokens: int,
+    ) -> None:
+        """Persist admission evidence after physical allocation succeeds."""
+        manifest = self._load_manifest()
+        _atomic_json_dump(
+            {
+                "format_version": 1,
+                "status": "ASYNC_LOAD_BLOCKS_ALLOCATED",
+                "migration_id": manifest["migration_id"],
+                "target_request_id": request.request_id,
+                "unix_s": time.time(),
+                "remaining_compute_token_budget": token_budget,
+                "inflight_prefill_reserved_blocks": reserved_blocks,
+                "num_external_tokens": num_external_tokens,
+                "budget_free_admission": token_budget == 0,
+            },
+            self.manifest_path.parent / "async_load_admission_receipt.json",
+        )
+
     def get_num_new_matched_tokens(
         self,
         request: Request,
