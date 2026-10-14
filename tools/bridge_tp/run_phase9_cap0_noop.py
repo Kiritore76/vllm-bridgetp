@@ -757,6 +757,13 @@ def run(
             base_env,
             tp4_gpus=args.tp4_gpus,
         )
+        if base_env.get("BRIDGETP_PERFORMANCE_TRACE") == "1":
+            if service_pool is not None:
+                raise ValueError("performance pilot requires fresh per-arm servers")
+            target_env["BRIDGETP_PERFORMANCE_TRACE_DIR"] = str(
+                controller_dir / "performance_trace" / "target"
+            )
+            target_env["BRIDGETP_PERFORMANCE_FINALIZE_TOKEN"] = secrets.token_hex(32)
         if gpu_resident_shadow:
             target_env.update(
                 {
@@ -891,6 +898,11 @@ def run(
 
         source_env = common.source_environment(args, run_id, server_dir)
         source_env.update(source_env_overrides or {})
+        if base_env.get("BRIDGETP_PERFORMANCE_TRACE") == "1":
+            source_env["BRIDGETP_PERFORMANCE_TRACE_DIR"] = str(
+                controller_dir / "performance_trace" / "source"
+            )
+            source_env["BRIDGETP_PERFORMANCE_FINALIZE_TOKEN"] = secrets.token_hex(32)
         if base_env.get("BRIDGETP_SAVE_PREDICTOR_FEATURES") == "1":
             if service_pool is not None:
                 raise ValueError("feature journals require dedicated source services")
@@ -1088,6 +1100,26 @@ def run(
             )
             processes.append(background)
         common.wait_pair(controller, background, args.run_timeout_s)
+        if base_env.get("BRIDGETP_PERFORMANCE_TRACE") == "1":
+            from tools.bridge_tp.run_atomic_takeover import _post_json
+
+            for pool, port, env in (
+                ("source", args.tp1_port, source_env),
+                ("target", args.tp4_port, target_env),
+            ):
+                result = _post_json(
+                    f"http://127.0.0.1:{port}",
+                    "/bridge_tp/v1/performance_trace/finalize",
+                    {"token": env["BRIDGETP_PERFORMANCE_FINALIZE_TOKEN"]}, 65,
+                )
+                common.write_json(
+                    provenance_dir / f"performance_trace_{pool}_finalization.json",
+                    result,
+                )
+                if result.get("status") != "FINALIZED":
+                    raise RuntimeError(f"{pool} performance trace not finalized")
+                print(f"[{run_id}] {pool} performance trace finalized; "
+                      f"workers={len(result.get('workers', []))}", flush=True)
         if base_env.get("BRIDGETP_SAVE_PREDICTOR_FEATURES") == "1":
             finalize_predictor_features(
                 f"http://127.0.0.1:{args.tp1_port}",

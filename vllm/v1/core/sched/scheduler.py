@@ -106,6 +106,14 @@ class Scheduler(SchedulerInterface):
         from vllm.bridge_tp.request_freeze import RequestFreezeGate
 
         self._bridgetp_request_freeze = RequestFreezeGate.from_env()
+        from vllm.bridge_tp.performance_trace import BatchSampler, trace_enabled
+
+        self._bridgetp_batch_sampler = BatchSampler() if trace_enabled() else None
+        self._bridgetp_count_scheduled = (
+            self._bridgetp_request_freeze is not None
+            or os.environ.get("BRIDGETP_TARGET_OBSERVATION") == "1"
+            or self._bridgetp_batch_sampler is not None
+        )
         self._bridgetp_prefill_scheduled_tokens = 0
         self._bridgetp_decode_scheduled_tokens = 0
 
@@ -1053,9 +1061,18 @@ class Scheduler(SchedulerInterface):
         # 3. If some tokens (e.g. spec tokens) are rejected later, the number of
         #    computed tokens will be adjusted in update_from_output.
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        if self._bridgetp_batch_sampler is not None:
+            scheduler_output.bridgetp_performance_sample = (
+                self._bridgetp_batch_sampler.snapshot(
+                    self.requests, scheduler_output,
+                    kv_usage=self.kv_cache_manager.usage,
+                    running=len(self.running),
+                    waiting=len(self.waiting) + len(self.skipped_waiting),
+                )
+            )
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
-            if self._bridgetp_request_freeze is not None:
+            if self._bridgetp_count_scheduled:
                 prefill_tokens = min(
                     num_scheduled_token,
                     max(0, request.num_prompt_tokens - request.num_computed_tokens),

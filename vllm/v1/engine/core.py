@@ -203,6 +203,10 @@ class EngineCore:
         )
         self.is_pooling_model = vllm_config.model_config.runner_type == "pooling"
 
+        from vllm.bridge_tp.performance_trace import HostTrace
+
+        self._bridgetp_performance_trace = HostTrace.from_env()
+
         self.request_block_hasher: Callable[[Request], list[BlockHash]] | None = None
         if vllm_config.cache_config.enable_prefix_caching or kv_connector is not None:
             caching_hash_fn = get_hash_fn_by_name(
@@ -452,6 +456,10 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
+        if self._bridgetp_performance_trace is not None:
+            self._bridgetp_performance_trace.submitted(
+                scheduler_output.bridgetp_performance_sample
+            )
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -461,6 +469,11 @@ class EngineCore:
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+
+        if self._bridgetp_performance_trace is not None:
+            self._bridgetp_performance_trace.completed(
+                scheduler_output.bridgetp_performance_sample
+            )
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -510,6 +523,10 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
+            if self._bridgetp_performance_trace is not None:
+                self._bridgetp_performance_trace.submitted(
+                    scheduler_output.bridgetp_performance_sample
+                )
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -564,6 +581,11 @@ class EngineCore:
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
 
+        if self._bridgetp_performance_trace is not None:
+            self._bridgetp_performance_trace.completed(
+                scheduler_output.bridgetp_performance_sample
+            )
+
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
@@ -607,8 +629,22 @@ class EngineCore:
             # More efficient to abort all as a single batch.
             self.abort_requests(request_ids)
 
+    def bridge_tp_finalize_performance_trace(self):
+        """Drain opted-in evidence after the measured workload has finished."""
+        trace = self._bridgetp_performance_trace
+        if trace is None:
+            raise RuntimeError("performance trace disabled")
+        if self.scheduler.has_unfinished_requests() or self.batch_queue:
+            raise RuntimeError("performance finalization requires an idle engine")
+        workers = self.model_executor.collective_rpc(
+            "bridge_tp_finalize_performance_trace", timeout=30.0
+        )
+        return {"status": "FINALIZED", "engine": trace.close(), "workers": workers}
+
     def shutdown(self):
         logger.debug_once("[shutdown] EngineCore: tearing down local resources")
+        if self._bridgetp_performance_trace is not None:
+            self._bridgetp_performance_trace.close()
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()

@@ -1177,6 +1177,13 @@ class Worker(WorkerBase):
             "saved_batches": observer._feature_journal.saved,
         }
 
+    def bridge_tp_finalize_performance_trace(self):
+        """Confirm sampled CUDA events and evidence after generation drains."""
+        trace = self.model_runner._bridgetp_performance_trace
+        if trace is None:
+            raise RuntimeError("performance trace disabled")
+        return trace.close()
+
     def shutdown(self) -> None:
         gc.unfreeze()
 

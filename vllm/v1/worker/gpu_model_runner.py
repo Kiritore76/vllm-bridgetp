@@ -455,6 +455,11 @@ class GPUModelRunner(
         scheduler_config = self.scheduler_config
         parallel_config = self.parallel_config
         self.device = device
+        from vllm.bridge_tp.performance_trace import GpuTrace, trace_enabled
+
+        self._bridgetp_performance_trace = GpuTrace.from_env(
+            get_tp_group().rank_in_group, device
+        ) if trace_enabled() else None
         self.pin_memory = is_pin_memory_available()
         self.dtype = self.model_config.dtype
 
@@ -4066,6 +4071,8 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        if self._bridgetp_performance_trace is not None:
+            self._bridgetp_performance_trace.poll()
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -4340,9 +4347,18 @@ class GPUModelRunner(
             # The attention op normally has no request identities.  BridgeTP
             # uses this immutable per-forward snapshot to select exactly one
             # migration anchor while leaving colocated TP1 work untouched.
-            get_forward_context().additional_kwargs[
-                "bridgetp_request_ids"
-            ] = list(req_ids[:num_reqs])
+            get_forward_context().additional_kwargs["bridgetp_request_ids"] = list(
+                req_ids[:num_reqs]
+            )
+            performance_ticket = (
+                self._bridgetp_performance_trace.begin(
+                    scheduler_output.bridgetp_performance_sample,
+                    padded_tokens=int(num_tokens_padded),
+                    cudagraph_mode=str(cudagraph_mode),
+                )
+                if self._bridgetp_performance_trace is not None
+                else None
+            )
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -4408,6 +4424,9 @@ class GPUModelRunner(
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
+
+        if self._bridgetp_performance_trace is not None:
+            self._bridgetp_performance_trace.end(performance_ticket)
 
         if self.predictor_feature_capture is not None:
             active_req_ids = req_ids[:num_reqs]
@@ -6415,6 +6434,9 @@ class GPUModelRunner(
         memory is reclaimable when running in the same process."""
         from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
         from vllm.v1.worker.workspace import reset_workspace_manager
+
+        if self._bridgetp_performance_trace is not None:
+            self._bridgetp_performance_trace.close()
 
         if self.predictor_feature_capture is not None and hasattr(
             self.predictor_feature_capture, "close"

@@ -419,5 +419,24 @@ async def finalize_predictor_features(raw_request: Request) -> dict[str, Any]:
     return results[0]
 
 
+@router.post("/bridge_tp/v1/performance_trace/finalize")
+async def finalize_performance_trace(raw_request: Request) -> dict[str, Any]:
+    """Expose one authenticated, idle-only experiment evidence operation."""
+    token = os.environ.get("BRIDGETP_PERFORMANCE_FINALIZE_TOKEN", "")
+    if not token or not os.environ.get("BRIDGETP_PERFORMANCE_TRACE_DIR"):
+        raise HTTPException(status_code=404, detail="Performance trace disabled")
+    try:
+        body = await raw_request.json()
+    except (ValueError, TypeError) as error:
+        raise HTTPException(status_code=400, detail="Expected JSON object") from error
+    provided = body.get("token") if isinstance(body, dict) else None
+    if not isinstance(provided, str) or not hmac.compare_digest(provided, token):
+        raise HTTPException(status_code=403, detail="Finalization token differs")
+    async with _predictor_finalize_lock:
+        return await raw_request.app.state.engine_client.engine_core.call_utility_async(
+            "bridge_tp_finalize_performance_trace"
+        )
+
+
 def attach_router(app: FastAPI) -> None:
     app.include_router(router)
