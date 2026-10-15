@@ -109,6 +109,9 @@ class Scheduler(SchedulerInterface):
         from vllm.bridge_tp.performance_trace import BatchSampler, trace_enabled
 
         self._bridgetp_batch_sampler = BatchSampler() if trace_enabled() else None
+        from vllm.bridge_tp.pressure_inventory import InventoryPublisher
+
+        self._bridgetp_pressure_inventory = InventoryPublisher.from_env()
         self._bridgetp_count_scheduled = (
             self._bridgetp_request_freeze is not None
             or os.environ.get("BRIDGETP_TARGET_OBSERVATION") == "1"
@@ -1061,6 +1064,9 @@ class Scheduler(SchedulerInterface):
         # 3. If some tokens (e.g. spec tokens) are rejected later, the number of
         #    computed tokens will be adjusted in update_from_output.
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        pressure_inventory = getattr(self, "_bridgetp_pressure_inventory", None)
+        if pressure_inventory is not None:
+            pressure_inventory.record_batch(self.requests, scheduler_output)
         if self._bridgetp_batch_sampler is not None:
             scheduler_output.bridgetp_performance_sample = (
                 self._bridgetp_batch_sampler.snapshot(
@@ -2103,6 +2109,9 @@ class Scheduler(SchedulerInterface):
         cudagraph_stats: CUDAGraphStat | None = None,
         perf_stats: PerfStats | None = None,
     ) -> SchedulerStats | None:
+        pressure_inventory = getattr(self, "_bridgetp_pressure_inventory", None)
+        if pressure_inventory is not None:
+            pressure_inventory.sample(self)
         if not self.log_stats:
             return None
         prefix_cache_stats = self.kv_cache_manager.make_prefix_cache_stats()

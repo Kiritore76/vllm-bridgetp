@@ -614,7 +614,7 @@ def _cleanup(run_dir: Path, reason: str, staged_ranks: int, deltas: int) -> None
     )
 
 
-def main() -> None:
+def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--delta-host", default="127.0.0.1")
@@ -627,7 +627,11 @@ def main() -> None:
         action="store_true",
         help="relay initial history and every delta to dormant TP4 GPU blocks",
     )
-    args = parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def main() -> None:
+    args = parse_args()
     args.run_dir.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + args.timeout_s
     cleanup_path = args.run_dir / "cleanup_request.json"

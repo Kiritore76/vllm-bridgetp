@@ -154,6 +154,7 @@ class PredictorEventReader:
             "feature_id": row.get("feature_id"),
             "category_upper_edges": self._header["category_upper_edges"],
             "captured_unix_ns": row["captured_unix_ns"],
+            "published_unix_ns": row.get("published_unix_ns"),
         })
         age_s = ((now_ns or time.time_ns()) - row["captured_unix_ns"]) / 1e9
         if (

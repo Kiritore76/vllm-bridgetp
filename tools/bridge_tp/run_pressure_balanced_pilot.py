@@ -1,0 +1,555 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""Experimental single-session pressure pilot with multiple existing source streams.
+
+The workload generator knows arrivals; the policy receives only due admissions,
+published inventory, current stream windows and per-request frozen PMFs. Run
+--validate-only on CPU before starting the existing five-GPU server mechanism.
+"""
+
+from __future__ import annotations
+
+import argparse
+import atexit
+import hashlib
+import json
+import math
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, replace
+from pathlib import Path
+from types import SimpleNamespace
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from tools.bridge_tp.pressure_cpu import load  # noqa: E402
+
+p, r, o, i, s = (
+    load(name)
+    for name in (
+        "pressure_policy",
+        "pressure_runtime",
+        "pressure_observation",
+        "pressure_ingress",
+        "pressure_service",
+    )
+)
+
+
+def read(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--policy", choices=["pressure-balanced-v1"], required=True)
+    parser.add_argument("--policy-config", type=Path, required=True)
+    parser.add_argument("--controller-config", type=Path, required=True)
+    parser.add_argument("--service-evidence", type=Path, required=True)
+    parser.add_argument("--arrivals", type=Path, required=True)
+    parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--source-inventory", type=Path, required=True)
+    parser.add_argument("--target-inventory", type=Path, required=True)
+    parser.add_argument("--predictor-events", type=Path, required=True)
+    parser.add_argument("--predictor-sha256", required=True)
+    parser.add_argument("--migration-id", required=True)
+    parser.add_argument("--max-seconds", type=float, default=900)
+    parser.add_argument("--tick-s", type=float, default=0.2)
+    parser.add_argument("--no-migration", action="store_true")
+    parser.add_argument("--validate-only", action="store_true")
+    args = parser.parse_args(argv)
+    if args.tick_s <= 0 or args.max_seconds <= 0:
+        parser.error("positive tick and runtime required")
+    if (
+        args.predictor_sha256
+        != "dbe02d968e19c32d69deaa9a37748e9ca68f506807b220c114d22a4e2845c8a7"
+    ):
+        parser.error("frozen four-layer76 checkpoint identity required")
+    return args
+
+
+def preflight(args):
+    cfg = p.PressureConfig(**read(args.policy_config))
+    raw = read(args.controller_config)
+    # Reuse only mechanism geometry/transport rates. The legacy config loader
+    # enforces benefit-model calibration and must not gate this new policy.
+    controller = SimpleNamespace(
+        **{
+            key: raw[key]
+            for key in (
+                "source_url",
+                "target_url",
+                "block_size",
+                "tp1_total_kv_blocks",
+                "tp4_total_kv_blocks",
+            )
+        },
+        rate=SimpleNamespace(**raw["rate"]),
+        policy=SimpleNamespace(kv_bytes_per_token=raw["policy"]["kv_bytes_per_token"]),
+        ready_notification_mode=raw.get("ready_notification_mode", "FILE_POLL"),
+        ready_notification_port=raw.get("ready_notification_port", 0),
+    )
+    if (
+        controller.block_size != 16
+        or cfg.capacity_guard_blocks * 16 != 2000
+        or controller.tp1_total_kv_blocks <= 0
+        or controller.tp4_total_kv_blocks <= 0
+        or controller.policy.kv_bytes_per_token <= 0
+    ):
+        raise ValueError("pilot geometry/2000-token guard contract differs")
+    load("manager_m2").M2RateConfig(
+        low_bytes_s=controller.rate.b_min_bytes_s,
+        medium_bytes_s=controller.rate.b_start_bytes_s,
+        high_bytes_s=controller.rate.b_max_bytes_s,
+    ).validate()
+    evidence = read(args.service_evidence)
+    lookup = s.LocalServiceLookup(evidence)
+    lookup.release_budget = evidence["source_release_summary"]["start_to_release_s"][
+        "max"
+    ]
+    jobs = read(args.arrivals)
+    if not isinstance(jobs, list) or not jobs:
+        raise ValueError("arrivals must be a nonempty list")
+    ids = set()
+    for job in jobs:
+        req = job["request"]
+        if (
+            job["id"] in ids
+            or not math.isfinite(job["at_s"])
+            or job["at_s"] < 0
+            or not isinstance(req["prompt"], list)
+            or not req["prompt"]
+            or any(type(t) is not int or t < 0 for t in req["prompt"])
+            or not 0 < req["max_tokens"] <= 8192
+            or job.get("route") not in {None, "tp1", "tp4"}
+        ):
+            raise ValueError("invalid/duplicate arrival or stop contract")
+        ids.add(job["id"])
+    paths = (
+        args.policy_config,
+        args.controller_config,
+        args.service_evidence,
+        args.arrivals,
+    )
+    receipt = dict(
+        policy=p.VERSION,
+        policy_config_sha256=cfg.sha256,
+        input_sha256={
+            str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths
+        },
+        jobs=len(jobs),
+        maximum_migrations=1,
+        mode="CPU_PREFLIGHT",
+        service_estimator=(
+            "observed engine-span local proxy; causal ITL delta unmeasured"
+        ),
+        gpu_validated=False,
+    )
+    return cfg, controller, lookup, jobs, receipt
+
+
+def batch(inventory, now, cfg, reading):
+    if reading.idle:
+        return dict(
+            decode_requests=0,
+            decode_context_sum=0,
+            prefill_tokens=0,
+            recompute_tokens=0,
+            requests=[],
+        )
+    value = inventory.get("last_scheduled_batch")
+    if (
+        not value
+        or value.get("error")
+        or not 0 <= now - value["sampled_at"] <= cfg.max_age_s
+    ):
+        return None
+    return value
+
+
+def run(args, prepared):
+    from tools.bridge_tp.pressure_session import RollingPressureSession
+    from vllm.bridge_tp.async_journal import AsyncJournal
+
+    cfg, controller, lookup, jobs, receipt = prepared
+    receipt = receipt | {"mode": "ONLINE_FUNCTION_PILOT"}
+    args.run_dir.mkdir(parents=True, exist_ok=True)
+    if any(
+        (args.run_dir / name).exists()
+        for name in (
+            "pressure_audit.jsonl",
+            "native_tokens.jsonl",
+            "pressure_request_results.json",
+        )
+    ):
+        raise FileExistsError(
+            "pressure pilot restart requires a fresh, reconciled run directory"
+        )
+    audit = load("audit").AuditLog(args.run_dir / "pressure_audit.jsonl", receipt)
+    tokens = AsyncJournal(args.run_dir / "native_tokens.jsonl")
+    co = r.PressureCoordinator(cfg, audit.write)
+    service = o.NativeServiceWindow()
+    executor = ThreadPoolExecutor(max_workers=max(4, len(jobs) + 1))
+    ingress = i.PressureIngress(
+        co, service, executor, controller.source_url, controller.target_url
+    )
+    session = RollingPressureSession(
+        run_dir=args.run_dir,
+        migration_id=args.migration_id,
+        config=controller,
+        coordinator=co,
+        ingress=ingress,
+        executor=executor,
+        audit=audit,
+    )
+    readers = (
+        o.InventoryReader(args.source_inventory, "tp1"),
+        o.InventoryReader(args.target_inventory, "tp4"),
+    )
+    scrapers = tuple(
+        load("telemetry").MetricsScraper(url, controller.block_size, total)
+        for url, total in (
+            (controller.source_url, controller.tp1_total_kv_blocks),
+            (controller.target_url, controller.tp4_total_kv_blocks),
+        )
+    )
+    predictor = load("manager_m5").PredictorEventReader(
+        args.predictor_events, args.predictor_sha256
+    )
+    dispatched, previous = {}, {}
+    started = time.monotonic()
+    last_view = None
+    outcome = "FAILED_OR_INTERRUPTED"
+    try:
+        while time.monotonic() - started < args.max_seconds:
+            now, elapsed = time.time(), time.monotonic() - started
+            inventories = [reader.poll(now) for reader in readers]
+            if any(v is None for v in inventories):
+                time.sleep(args.tick_s)
+                continue
+            pools, shapes = [], []
+            for reader, raw, scraper in zip(readers, inventories, scrapers):
+                if raw["block_size"] != controller.block_size:
+                    raise ValueError(
+                        "live KV block geometry differs from pilot contract"
+                    )
+                scraper.total_kv_blocks = raw["total_blocks"]
+                metrics = scraper.scrape().__dict__
+                now = time.time()
+                measured = service.snapshot(raw["pool_id"], now)
+                growth = None
+                prior = previous.get(raw["pool_id"])
+                if prior and raw["sampled_at"] > prior["sampled_at"]:
+                    dt = raw["sampled_at"] - prior["sampled_at"]
+                    if dt <= cfg.max_age_s:
+                        growth = max(
+                            0, (prior["free_blocks"] - raw["free_blocks"]) / dt
+                        )
+                previous[raw["pool_id"]] = raw
+                pool = o.pool_reading(
+                    raw,
+                    reader.observed_at,
+                    measured,
+                    cfg,
+                    now,
+                    growth_blocks_s=growth,
+                    heartbeat=metrics,
+                )
+                pools.append(pool)
+                shapes.append(batch(raw, now, cfg, pool))
+                if 0 <= now - pool.sampled_at <= cfg.max_age_s:
+                    ingress.reconcile(raw | {"sampled_at": pool.sampled_at}, now)
+            now = time.time()
+            source_rates = service.snapshot("tp1", now)["request_rates"]
+            if source_rates:
+                horizon = min(
+                    8192,
+                    cfg.survival_horizon
+                    + math.ceil(lookup.release_budget * max(source_rates.values())),
+                )
+                if horizon != co.policy.cfg.survival_horizon:
+                    co.policy.cfg = replace(cfg, survival_horizon=horizon)
+                    audit.write(
+                        {
+                            "kind": "pressure_cost_horizon",
+                            "unix_s": now,
+                            "config": asdict(co.policy.cfg),
+                            "release_budget_s": lookup.release_budget,
+                            "observed_source_request_rates": source_rates,
+                            "scope": "empirical budget plus configured recovery tokens",
+                        }
+                    )
+            for job in jobs:
+                if job["id"] in dispatched or elapsed < job["at_s"]:
+                    continue
+                costs = {
+                    name: lookup.admission_cost(
+                        pool, shape, len(job["request"]["prompt"])
+                    )
+                    if shape
+                    else None
+                    for name, pool, shape in zip(
+                        ("tp1", "tp4"), ("source", "target"), shapes
+                    )
+                }
+                try:
+                    value = ingress.submit(
+                        job["request"],
+                        tuple(pools),
+                        costs,
+                        allowed_pool_id=job.get("route"),
+                        emission_sink=lambda token, job_id=job["id"]: tokens.submit(
+                            {"kind": "visible_token", "job_id": job_id, **token}
+                        ),
+                    )
+                except ValueError as error:
+                    if not str(error).startswith("queue:"):
+                        raise
+                    continue
+                dispatched[job["id"]] = value
+                audit.write(
+                    dict(
+                        kind="pressure_dispatch",
+                        job_id=job["id"],
+                        at_s=job["at_s"],
+                        actual_s=elapsed,
+                        client_id=value.client_id,
+                        pool=value.pool_id,
+                        frozen_cap=value.payload["max_tokens"],
+                    )
+                )
+            candidates, eos = [], {}
+            for row in inventories[0]["requests"]:
+                try:
+                    stream = ingress.for_server_id(row["request_id"])
+                except ValueError:
+                    stream = None
+                relief, cost = (
+                    lookup.deltas(shapes[0], shapes[1], row["request_id"])
+                    if all(shapes)
+                    else (None, None)
+                )
+                release_budget = lookup.release_budget
+                candidates.append(
+                    p.Candidate(
+                        row["request_id"],
+                        co._owners.get(row["request_id"], "tp1"),
+                        inventories[0]["sampled_at"],
+                        readers[0].observed_at,
+                        row["generated"],
+                        row["prompt_tokens"],
+                        row["max_output_tokens"],
+                        row["releasable_blocks"],
+                        row["owned_blocks"],
+                        row["owned_blocks"]
+                        * controller.block_size
+                        * controller.policy.kv_bytes_per_token
+                        if row["owned_blocks"] is not None
+                        else None,
+                        None,
+                        "UNAVAILABLE",
+                        relief,
+                        cost,
+                        release_budget,
+                        finished=stream.future.done() if stream is not None else False,
+                        action_available=stream is not None,
+                        inventory_reference=f"{args.source_inventory}:{inventories[0]['generation']}",
+                        migrating=bool(
+                            session.record
+                            and session.record.request_id == row["request_id"]
+                        ),
+                    )
+                )
+                eos[row["request_id"]] = row["ignore_eos"]
+            candidates = co.with_predictions(
+                candidates,
+                predictor,
+                now,
+                pools[0].free_blocks * pools[0].block_size - 2000,
+                eos,
+            )
+            growth = pools[0].growth_blocks_s
+            guard_time = (
+                max(0, pools[0].free_blocks - cfg.capacity_guard_blocks) / growth
+                if growth is not None and growth > 0
+                else None
+            )
+            pools[0] = replace(
+                pools[0],
+                guard_time_s=guard_time,
+                urgency=lookup.release_budget / guard_time
+                if guard_time is not None and guard_time > 0
+                else None,
+            )
+            runtime = load("manager_m0").RuntimeSnapshot(
+                unix_s=now,
+                migration_id=args.migration_id,
+                request_id=None,
+                state="LOCAL",
+                generated_tokens=None,
+                source_sampled_unix_s=pools[0].sampled_at,
+                target_sampled_unix_s=pools[1].sampled_at,
+                source_free_kv_tokens=pools[0].free_blocks * pools[0].block_size,
+                source_guard_free_kv_tokens=2000,
+                source_pool_growth_tokens_s=pools[0].growth_blocks_s
+                * pools[0].block_size
+                if pools[0].growth_blocks_s is not None
+                else None,
+                target_running=inventories[1]["running"],
+                target_waiting=pools[1].waiting,
+                target_kv_usage_frac=1
+                - pools[1].free_blocks / inventories[1]["total_blocks"],
+            )
+            actions = (
+                None
+                if args.no_migration or session.record is not None or not source_rates
+                else {
+                    c.request_id: r.BoundAction(
+                        c.request_id,
+                        args.migration_id,
+                        lambda c=c, runtime=runtime: session.start(c, runtime),
+                    )
+                    for c in candidates
+                }
+            )
+            co.tick(now, pools[0], pools[1], candidates, actions)
+            if session.record is not None and not session.settled:
+                progress = session.old.read_source_progress(
+                    args.run_dir, session.stream.payload, now
+                )
+                if (
+                    progress is not None
+                    and progress.request_id == session.record.request_id
+                ):
+                    last_view = progress
+                if last_view is not None:
+                    session.tick(last_view, runtime)
+                elif session.stream.future.done():
+                    session.cancel(
+                        "source ended before selected progress was published"
+                    )
+            if session.target_future is not None and session.target_future.done():
+                session.target_future.result()
+                service.finish(session.stream.recorder.target_service_id)
+            if session.record is not None:
+                entry = co.ledger.entries[args.migration_id]
+                prefix = f"cmpl-bridgetp-phase9-target-{args.run_dir.name}-0-"
+                targets = [
+                    row
+                    for row in inventories[1]["requests"]
+                    if row["request_id"].startswith(prefix)
+                ]
+                if len(targets) > 1:
+                    raise ValueError("ambiguous target inventory identity")
+                if (
+                    targets
+                    and entry.state in {"ACTIVE", "COMMITTED"}
+                    and 0 <= now - pools[1].sampled_at <= cfg.max_age_s
+                    and targets[0]["owned_blocks"] is not None
+                ):
+                    co.ledger.observe(
+                        entry.key,
+                        allocated_blocks=min(targets[0]["owned_blocks"], entry.blocks),
+                        service_observed=entry.service_observed
+                        or targets[0]["generated"] >= 2,
+                        prefill_observed=True,
+                    )
+                if (
+                    not targets
+                    and session.settled
+                    and session.target_future is not None
+                    and session.target_future.done()
+                    and not session.target_future.exception()
+                    and pools[1].sampled_at
+                    > session.target_future.result()["completed_unix_s"]
+                    and entry.state in {"COMMITTED", "ACCOUNTED"}
+                ):
+                    co.ledger.complete(entry.key, evidence=True)
+            for value in dispatched.values():
+                if value.future.done():
+                    value.future.result()
+            if (
+                len(dispatched) == len(jobs)
+                and all(v.future.done() for v in dispatched.values())
+                and not any(
+                    row.state in {"ACTIVE", "COMMITTED"}
+                    and not (
+                        session.cleanup_requires_shutdown and row.kind == "migration"
+                    )
+                    for row in co.ledger.entries.values()
+                )
+                and (
+                    session.record is None
+                    or (
+                        (session.settled or session.cleanup_requires_shutdown)
+                        and (
+                            session.target_future is None
+                            or session.target_future.done()
+                        )
+                    )
+                )
+            ):
+                outcome = (
+                    "COMPLETED_PENDING_OWNER_CLEANUP"
+                    if session.cleanup_requires_shutdown
+                    else "COMPLETED"
+                )
+                return
+            time.sleep(args.tick_s)
+        raise TimeoutError(
+            "pilot timed out; preserve inventory/audit and reconcile active promises"
+        )
+    finally:
+        results = []
+        for job_id, value in dispatched.items():
+            results.append(
+                dict(
+                    job_id=job_id,
+                    client_id=value.client_id,
+                    server_id=value.server_id,
+                    initial_pool=value.pool_id,
+                    request=value.payload,
+                    source_done=value.future.done(),
+                    source_error=str(value.future.exception())
+                    if value.future.done() and value.future.exception()
+                    else None,
+                    response=value.recorder.stats(),
+                )
+            )
+        (args.run_dir / "pressure_request_results.json").write_text(
+            json.dumps(results), encoding="utf-8"
+        )
+        audit.write(
+            dict(
+                kind="pressure_final",
+                reservations=co.ledger.snapshot(),
+                dispatched=list(dispatched),
+                elapsed_s=time.monotonic() - started,
+                session_settled=session.settled,
+                outcome=outcome,
+                shutdown_cleanup_required=session.cleanup_requires_shutdown,
+            )
+        )
+        executor.shutdown(wait=False, cancel_futures=True)
+        if all(v.future.done() for v in dispatched.values()) and (
+            session.target_future is None or session.target_future.done()
+        ):
+            tokens.close()
+        else:
+            atexit.register(tokens.close)
+        session.adapter.close()
+        audit.close()
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    prepared = preflight(args)
+    if args.validate_only:
+        print(json.dumps(prepared[-1], indent=2))
+        return 0
+    run(args, prepared)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

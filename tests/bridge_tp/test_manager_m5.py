@@ -103,6 +103,9 @@ class TestM5(unittest.TestCase):
 
     def test_live_observer_emits_cpu_event_for_prefill_and_decode(self):
         class FakePredictor:
+            model_type = "remaining_length_categorical_mlp4"
+            network_depth = 4
+
             def __init__(self, *args, **kwargs):
                 self.capture_input_sha256 = "input"
                 self.checkpoint_sha256 = SHA
@@ -149,6 +152,9 @@ class TestM5(unittest.TestCase):
         observed = []
 
         class FakePredictor:
+            model_type = "remaining_length_categorical_mlp4"
+            network_depth = 4
+
             def __init__(self, *args, **kwargs):
                 self.capture_input_sha256 = "input"
                 self.checkpoint_sha256 = SHA
