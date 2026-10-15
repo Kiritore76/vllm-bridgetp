@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace as NS
+from unittest.mock import patch
 
 from tools.bridge_tp import launch_pressure_balanced_pilot as launch
 
@@ -29,6 +30,65 @@ def functions(path, names, context):
 
 
 class LauncherTests(unittest.TestCase):
+    def test_git_bundle_records_runtime_head_and_resolves_repo_paths(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as folder:
+            root = Path(folder).resolve()
+            path = root / "pilot_spec.json"
+            spec = dict(
+                identity_mode="git-tracked-bundle-v1",
+                policy_config="policy.json",
+                service_evidence="evidence.json",
+                controller_config_template="controller.json",
+                scenarios=[dict(name="both-light", arrivals="arrivals.json")],
+            )
+            path.write_text(json.dumps(spec), encoding="utf-8")
+            with (
+                patch.object(launch, "ROOT", root),
+                patch.object(launch.subprocess, "run") as tracked,
+                patch.object(
+                    launch.subprocess, "check_output", return_value="abc123\n"
+                ),
+            ):
+                resolved = launch.load_spec(path)
+            self.assertEqual(resolved["expected_head"], "abc123")
+            self.assertEqual(resolved["bundle_spec_sha256"], launch.sha(path))
+            self.assertEqual(resolved["policy_config"], str(root / "policy.json"))
+            self.assertEqual(
+                resolved["scenarios"][0]["arrivals"], str(root / "arrivals.json")
+            )
+            self.assertIn("--error-unmatch", tracked.call_args.args[0])
+            self.assertNotIn("expected_head", json.loads(path.read_text()))
+
+    def test_git_bundle_paths_cannot_escape_checkout(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as folder:
+            root = Path(folder).resolve()
+            path = root / "pilot_spec.json"
+            path.write_text(
+                json.dumps(
+                    dict(
+                        identity_mode="git-tracked-bundle-v1",
+                        policy_config="../outside.json",
+                    )
+                )
+            )
+            with (
+                patch.object(launch, "ROOT", root),
+                patch.object(launch.subprocess, "run"),
+                patch.object(
+                    launch.subprocess, "check_output", return_value="abc123\n"
+                ),
+                self.assertRaises(ValueError),
+            ):
+                launch.load_spec(path)
+
+    def test_legacy_frozen_external_spec_keeps_exact_head_contract(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "pilot_spec.json"
+            path.write_text(
+                json.dumps(dict(expected_head="fixed", policy_config="/old/path"))
+            )
+            self.assertEqual(launch.load_spec(path)["expected_head"], "fixed")
+
     def test_actual_transport_helpers_and_stager_parser_accept_full_argv(self):
         context = dict(
             argparse=argparse,

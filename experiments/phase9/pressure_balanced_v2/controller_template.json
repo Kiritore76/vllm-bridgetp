@@ -1,0 +1,68 @@
+{
+  "block_size": 16,
+  "capacity_pilot": {
+    "clear_time_to_guard_s": 20.0,
+    "enabled": true,
+    "ewma_alpha": 0.35,
+    "exclusive_trigger_path": true,
+    "guard_free_kv_tokens": 2000,
+    "maximum_observation_gap_s": 2.0,
+    "minimum_decline_tokens_s": 1.0,
+    "minimum_samples": 4,
+    "trigger_time_to_guard_s": 8.0
+  },
+  "handoff_output_tokens": 96,
+  "interference": {
+    "calibration_source": "CAP-0 placeholder; replace with Phase 9 C2 before formal runs",
+    "s_per_gib_at_ref": 1.0
+  },
+  "platform_note": "ONLINE SHADOW_ONLY / S_NEW_OLD; real Phase 8 takeover; no online remote attention",
+  "policy": {
+    "alpha": 0.45,
+    "kv_bytes_per_token": 196608,
+    "max_concurrent_migrations": 1,
+    "max_target_kv_usage_frac": 0.85,
+    "max_target_waiting": 4,
+    "min_output_tokens_before_eligible": 0,
+    "p_oom_force": 0.85,
+    "theta_0": 0.6,
+    "theta_min": 0.15
+  },
+  "proxy_mode": "HOLD_BACK",
+  "rate": {
+    "b_hard_max_bytes_s": 8589934592.0,
+    "b_max_bytes_s": 8589934592.0,
+    "b_min_bytes_s": 536870912.0,
+    "b_start_bytes_s": 2576980377.6,
+    "control_period_s": 0.2,
+    "slo_p99_tpot_s": 0.08
+  },
+  "run_dir": "/root/autodl-tmp/bridgetp/results/benefit-v4-mlp4-prefill-newseed-2arm-v1-20261012T085812Z-1232/pilot/prefill-repeat-slack-20261253/constructed_source3_target4/prob_0_STAY/r01_shadow_only/controller",
+  "slow": {
+    "ewma_alpha": 0.08,
+    "high_threshold": 0.65,
+    "low_threshold": 0.45,
+    "minimum_hold_s": 120.0,
+    "persistent_windows": 150,
+    "physical_reconfiguration": false,
+    "recovery_windows": 60
+  },
+  "source_url": "http://127.0.0.1:8001",
+  "survival_table_path": "/root/autodl-tmp/bridgetp/results/benefit-v4-mlp4-prefill-newseed-2arm-v1-20261012T085812Z-1232/frozen_inputs/survival.json",
+  "target_url": "http://127.0.0.1:8200",
+  "tick_s": 0.2,
+  "tp1_total_kv_blocks": 1963,
+  "tp4_total_kv_blocks": 35739,
+  "tpot_tp1": {
+    "base_s": 0.03,
+    "calibration_source": "CAP-0 placeholder; performance trigger is disabled",
+    "per_running_s": 0.0
+  },
+  "tpot_tp4": {
+    "base_s": 0.02,
+    "calibration_source": "CAP-0 placeholder; performance trigger is disabled",
+    "per_running_s": 0.0
+  },
+  "ready_notification_mode": "UDP",
+  "ready_notification_port": 30300
+}

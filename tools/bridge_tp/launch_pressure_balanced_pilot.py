@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Own four fresh function-pilot server groups; never run paired benefit fitting.
 
-The spec freezes input/code/model/checkpoint SHA and an actual committed HEAD.
---validate-only verifies the CPU controller argv and prints the server commands
-without starting processes. Linux dependency/rolling checks precede GPU startup.
+The spec freezes input/code/model/checkpoint SHA. Repository bundles record the
+actual clean committed HEAD at runtime, avoiding self-referential manifests.
+Linux dependency/rolling checks precede GPU startup.
 """
 
 from __future__ import annotations
@@ -41,6 +41,35 @@ def sha(path):
 
 def read(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def load_spec(path):
+    spec = read(path)
+    if spec.get("identity_mode") != "git-tracked-bundle-v1":
+        return spec
+    relative = path.resolve().relative_to(ROOT).as_posix()
+    subprocess.run(
+        ["git", "ls-files", "--error-unmatch", "--", relative],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+    )
+    spec["expected_head"] = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+    ).strip()
+    spec["bundle_spec_path"] = relative
+    spec["bundle_spec_sha256"] = sha(path)
+
+    def resolve(value):
+        resolved = (ROOT / value).resolve()
+        resolved.relative_to(ROOT)
+        return str(resolved)
+
+    for key in ("policy_config", "service_evidence", "controller_config_template"):
+        spec[key] = resolve(spec[key])
+    for scene in spec["scenarios"]:
+        scene["arrivals"] = resolve(scene["arrivals"])
+    return spec
 
 
 def verify_spec(spec):
@@ -475,7 +504,7 @@ def main():
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--smoke-only", action="store_true")
     args = parser.parse_args()
-    spec = read(args.spec)
+    spec = load_spec(args.spec)
     announce("preflight", "核对HEAD、分支和代码/输入/模型SHA")
     verify_spec(spec)
     common, settings = arguments(spec)

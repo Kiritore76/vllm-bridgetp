@@ -148,3 +148,9 @@ ten seconds. Due work without token/admission/completion/session progress for
 60 seconds fails with queue diagnostics; future arrivals alone do not time out.
 Use --smoke-only for a single both-light admission check before rerunning the
 four-scene pilot. Code/identity/parser gates still cover the full frozen spec.
+
+The v2 workload is also available as a Git-tracked bundle under
+experiments/phase9/pressure_balanced_v2. After updating the existing branch, run
+`bash tools/bridge_tp/run_pressure_pilot.sh` for smoke or append `--full` for all
+four scenes. No input archive upload is needed. SHA checks are retained; the
+actual clean checkout HEAD and source spec digest are recorded at runtime.
