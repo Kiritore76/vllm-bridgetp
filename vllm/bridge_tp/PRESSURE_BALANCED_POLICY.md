@@ -16,11 +16,17 @@ They have CPU contract checks, **not GPU end-to-end acceptance**.
   capacity readings; persistence, hysteresis, cooldown, capacity fast path;
   inventory-wide filtering and a longest-remaining tier before physical release,
   transfer bytes, and stable request ID tie breaks. U is audit data, not a gate.
-- Admission fixes the output stop cap to the chosen instance's context limit.
-  Both admission and migration reserve through one ledger. Physical free blocks
-  are never decremented in telemetry by pending prompt demand. Partial physical
-  allocation acknowledgements subtract only that allocated part from future
-  promises. Commit does not discard still-unallocated future output capacity.
+- Admission preserves `min(8192, requested_output)` and checks that prompt plus
+  this unchanged stop cap fits the chosen instance's context limit. New ingress
+  reserves only `ceil(prompt_tokens / block_size)` in the shared ledger;
+  migration still reserves its full target prompt plus frozen output cap.
+  Physical free blocks are never decremented in telemetry by ledger promises.
+  Admission availability is raw free blocks minus outstanding unallocated
+  promises from both kinds. Partial allocation acknowledgements reduce only
+  the outstanding part, avoiding duplicate charges during chunked prefill.
+  Subsequent decode growth consumes physical blocks as it occurs; ingress no
+  longer guarantees capacity for the maximum future output. Accounted requests
+  remain active for restart protection until completion or migration evidence.
 - `controller/pressure_runtime.py`: serialized, in-process coordination with a
   bound callback for the selected request/session. Audit precedes START.
   Ambiguous START failures retain promises until confirmed cleanup. Commit
@@ -162,7 +168,8 @@ by a one-step prefill budget; sparse three-request lookup cells also delayed
 admission. Revised pressure records actual prefill step tokens separately from
 pending full prompts. A draft 8192-token backlog reference is for pressure only;
 there is no idle-only long-prompt admission exception or service-pressure gate.
-Physical blocks and original output stop caps remain protected.
+Shared prompt/migration commitments and original output stop caps remain enforced.
+New ingress promises prompt blocks only; future decode growth is observed live.
 
 For decode-only gaps, a separately audited empirical P95 envelope can use
 supported heavier request-count/mean-context shapes. It assumes monotone cost,

@@ -60,6 +60,19 @@ preferred pool cannot hold the full unchanged stop cap/context or shared physica
 commitments, try the other pool. Do not shrink the output cap to fit TP1.
 max_tokens is a stop contract, not a prediction of expected output length.
 
+New ingress reserves only `ceil(prompt_tokens / block_size)` logical blocks.
+The unchanged output stop cap still participates in context feasibility, but
+future output blocks are not promised at ingress. Actual decode growth consumes
+allocator free blocks and is tracked by live capacity feedback. Migration target
+reservations retain their full prompt plus frozen output-cap commitment.
+
+Raw allocator free blocks exclude real allocations only. Effective admission
+availability subtracts all outstanding unallocated ledger promises from that
+raw value. As each prefill chunk gets blocks, reconciliation reduces the pending
+promise by the allocated amount; it is never charged twice. Preemption restores
+the unallocated prompt commitment. A prompt promise is not an allocator block
+lock and does not guarantee capacity for all subsequent decode tokens.
+
 Only fresh physical inventory, shared block commitments and context feasibility
 gate ingress. Observed service pressure, waiting/backlog and lookup gaps do not
 prevent a physically feasible submission. Unknown decode cost is flagged and

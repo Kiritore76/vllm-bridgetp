@@ -348,12 +348,12 @@ class LedgerRuntimeTests(unittest.TestCase):
         self.assertEqual(value2.max_output_tokens, 8192)
 
     def test_shared_arrival_reservations_block_migration_capacity(self):
-        target = pool("tp4", free_blocks=500)
+        target = pool("tp4", free_blocks=450)
         self.co.admission(
             "new",
             512,
             6000,
-            (pool(decode_ratio=1.5, free_blocks=100), target),
+            (pool(decode_ratio=1.5, free_blocks=20), target),
             now=10,
             key="a",
             decode_costs={"tp1": 0.1, "tp4": 0.1},

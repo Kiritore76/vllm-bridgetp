@@ -103,14 +103,15 @@ class AdmissionPressureTests(unittest.TestCase):
 
     def test_prompt_backlog_does_not_gate_physically_feasible_admission(self):
         ledger = self.p.ReservationLedger()
-        self.admit(ledger, "first")
-        self.admit(ledger, "second")
-        self.assertEqual(ledger.pending("tp1"), (1024, 0.4, 8192))
-        self.admit(ledger, "third")
-        self.assertEqual(ledger.pending("tp1")[0], 1536)
+        source = pool(free_blocks=900)
+        self.admit(ledger, "first", source=source)
+        self.admit(ledger, "second", source=source)
+        self.assertEqual(ledger.pending("tp1"), (512, 0.4, 8192))
+        self.admit(ledger, "third", source=source)
+        self.assertEqual(ledger.pending("tp1")[0], 768)
         self.assertEqual(ledger.pending("tp1")[2], 12288)
         with self.assertRaises(self.p.AdmissionQueued) as caught:
-            self.admit(ledger, "fourth")
+            self.admit(ledger, "fourth", source=source)
         self.assertIn(
             "physical blocks including pending commitments",
             caught.exception.diagnostics["tp1"]["reasons"],
@@ -120,7 +121,7 @@ class AdmissionPressureTests(unittest.TestCase):
     def test_migration_commitments_still_protect_physical_capacity(self):
         ledger = self.p.ReservationLedger()
         ledger.reserve(
-            self.p.Reservation("migration", "moving", "tp1", 1600, 0.1, 0, "migration"),
+            self.p.Reservation("migration", "moving", "tp1", 1800, 0.1, 0, "migration"),
             pool(),
         )
         with self.assertRaises(self.p.AdmissionQueued) as caught:

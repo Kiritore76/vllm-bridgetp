@@ -115,7 +115,7 @@ class BootstrapTests(unittest.TestCase):
                     {"tp1": 0.25, "tp4": 0.2},
                 )
                 self.assertEqual(admission.pool_id, "tp1")
-                self.assertEqual(ledger.entries["admit-a"].blocks, 128)
+                self.assertEqual(ledger.entries["admit-a"].blocks, 64)
                 # A real request update replaces idle evidence, without trusting
                 # the older zero-running /metrics sample.
                 active = inv.inventory_snapshot(scheduler(), "tp1", 20)

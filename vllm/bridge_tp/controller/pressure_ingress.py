@@ -220,7 +220,7 @@ class PressureIngress:
     def refuse_restart_if_active(self):
         """First pilot does not recover ownership from an in-memory ledger."""
         if any(
-            r.state in {"ACTIVE", "COMMITTED"}
+            r.state in {"ACTIVE", "COMMITTED", "ACCOUNTED"}
             for r in self.coordinator.ledger.entries.values()
         ):
             raise RuntimeError(

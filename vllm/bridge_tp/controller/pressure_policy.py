@@ -621,6 +621,7 @@ class Admission:
     reservation_key: str
     decode_cost_known: bool = True
     routing_reason: str = ""
+    reservation_basis: str = "prompt_only"
 
 
 class AdmissionQueued(ValueError):
@@ -644,12 +645,14 @@ def admit(
     decode_costs: dict[str, float],
     allowed_pool_id: str | None = None,
 ) -> Admission:
-    """Fix a feasible total stop cap and reserve before dispatching a request.
+    """Fix a feasible stop cap and reserve prompt blocks before dispatch.
 
     Callers must submit the returned max_output_tokens unchanged on both pools.
     Service pressure guides routing, never hard admission. Only fresh physical
     capacity and context/stop feasibility gate submission. Fixed pilot routes
     are explicit constraints used for mechanism coverage, not normal routing.
+    Decode growth consumes actual free blocks; future output is not reserved
+    for new ingress. Migration target reservations remain a separate contract.
     """
     if prompt_tokens < 0 or requested_output <= 0:
         raise ValueError("invalid request lengths")
@@ -683,9 +686,7 @@ def admit(
             cost = None
         capped = output_cap
         required = (
-            math.ceil((prompt_tokens + capped) / pool.block_size)
-            if capped > 0 and pool.block_size > 0
-            else 0
+            math.ceil(prompt_tokens / pool.block_size) if pool.block_size > 0 else 0
         )
         if pool.block_size <= 0:
             reasons.append("KV geometry")
@@ -701,6 +702,7 @@ def admit(
         diagnostics[pool.pool_id] = dict(
             reasons=reasons,
             required_blocks=required,
+            reservation_basis="prompt_only",
             pending_blocks=blocks,
             free_blocks=pool.free_blocks,
             projected_prompt_backlog=backlog,

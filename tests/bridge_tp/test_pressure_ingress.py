@@ -91,8 +91,8 @@ class IngressTests(unittest.TestCase):
         self.ingress.reconcile(self.snapshot(), 10)
         entry = self.co.ledger.entries[self.stream.reservation_key]
         self.assertEqual(entry.request_id, self.server_id)
-        self.assertEqual(entry.state, "COMMITTED")
-        self.assertEqual(self.co.ledger.pending("tp1"), (10, 0, 0))
+        self.assertEqual(entry.state, "ACCOUNTED")
+        self.assertEqual(self.co.ledger.pending("tp1"), (0, 0, 0))
         self.assertIs(self.ingress.for_server_id(self.server_id), self.stream)
         with self.assertRaises(RuntimeError):
             self.ingress.refuse_restart_if_active()
@@ -158,7 +158,46 @@ class IngressTests(unittest.TestCase):
         self.ingress.reconcile(self.snapshot(owned_blocks=20), 10)
         self.assertEqual(self.co.ledger.pending("tp1"), (0, 0, 0))
         self.ingress.reconcile(self.snapshot(owned_blocks=2), 10)
-        self.assertEqual(self.co.ledger.pending("tp1")[0], 18)
+        self.assertEqual(self.co.ledger.pending("tp1")[0], 2)
+
+    def test_chunked_prefill_and_decode_do_not_double_charge_blocks(self):
+        # 64 prompt tokens promise four blocks, independently of max_tokens=256.
+        ledger = self.co.ledger
+        entry = ledger.entries[self.stream.reservation_key]
+        self.assertEqual(entry.blocks, 4)
+        initial_free = reading("tp1").free_blocks
+        for allocated in (0, 2, 4, 6):
+            with self.subTest(allocated=allocated):
+                self.ingress.reconcile(
+                    self.snapshot(owned_blocks=allocated, generated=0), 10
+                )
+                raw_free = initial_free - allocated
+                pending = ledger.pending("tp1")[0]
+                self.assertEqual(pending, max(0, 4 - allocated))
+                self.assertEqual(raw_free - pending, initial_free - max(4, allocated))
+        self.ingress.reconcile(self.snapshot(owned_blocks=6, generated=20), 10)
+        self.assertEqual(entry.state, "ACCOUNTED")
+        self.assertEqual(ledger.pending("tp1"), (0, 0, 0))
+        with self.assertRaises(RuntimeError):
+            self.ingress.refuse_restart_if_active()
+
+    def test_prompt_reservation_rounds_up_without_reserving_output(self):
+        ledger = p.ReservationLedger()
+        result = p.admit(
+            "tail",
+            65,
+            8192,
+            (reading("tp1"), replace(reading("tp4"), context_limit=16384)),
+            self.co.policy.cfg,
+            ledger,
+            10,
+            "tail",
+            {},
+        )
+        self.assertEqual(result.pool_id, "tp4")
+        self.assertEqual(result.max_output_tokens, 8192)
+        self.assertEqual(result.reservation_basis, "prompt_only")
+        self.assertEqual(ledger.pending("tp4")[0], 5)
 
     def test_long_prompt_can_enter_idle_pool_instead_of_queueing_forever(self):
         source = replace(reading("tp1"), idle=True, decode_samples=0, decode_ratio=None)
