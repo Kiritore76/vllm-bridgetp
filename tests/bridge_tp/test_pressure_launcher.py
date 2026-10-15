@@ -195,6 +195,27 @@ class LauncherTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 launch.scene_result(run, "source-decode")
 
+    def test_normal_finish_rejects_accounted_but_unretired_request(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            run = root / "controller"
+            run.mkdir()
+            (run / "pressure_audit.jsonl").write_text(
+                json.dumps(
+                    dict(
+                        kind="pressure_final",
+                        outcome="COMPLETED",
+                        reservations=[dict(kind="admission", state="ACCOUNTED")],
+                    )
+                )
+                + "\n"
+            )
+            (root / "owned_shutdown_receipt.json").write_text(
+                json.dumps(dict(all_owned_groups_ended=True))
+            )
+            with self.assertRaisesRegex(RuntimeError, "outstanding reservation"):
+                launch.scene_result(run, "both-light")
+
 
 if __name__ == "__main__":
     unittest.main()

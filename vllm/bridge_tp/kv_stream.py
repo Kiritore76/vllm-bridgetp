@@ -22,6 +22,7 @@ from typing import Any
 import torch
 
 from vllm.bridge_tp.controller.anchor_selector import select_source_request_id
+from vllm.bridge_tp.delta_batching import coalesce_delta
 from vllm.bridge_tp.kv_export import (
     _copy_request_blocks,
     _estimate_dump_bytes,
@@ -85,7 +86,7 @@ def _abort_retained_gpu_senders() -> None:
 
 
 def _persistent_sender_key(
-    config: "BridgeTPStreamConfig", device: torch.device
+    config: BridgeTPStreamConfig, device: torch.device
 ) -> str:
     device_index = device.index
     if device_index is None:
@@ -101,7 +102,7 @@ def _persistent_sender_key(
 
 
 def _acquire_persistent_gpu_sender(
-    config: "BridgeTPStreamConfig", device: torch.device
+    config: BridgeTPStreamConfig, device: torch.device
 ) -> tuple[str, Any]:
     from vllm.bridge_tp.gpu_direct_history import GpuDirectHistorySender
 
@@ -658,6 +659,7 @@ class _GpuDirectHistoryPublisher:
         block_ids: list[int],
         start_token: int,
         end_token: int,
+        final_end_token: int | None = None,
     ) -> None:
         if not self.config.gpu_direct_delta:
             raise RuntimeError("GPU-direct delta is not enabled")
@@ -672,6 +674,7 @@ class _GpuDirectHistoryPublisher:
                 "start_token": start_token,
                 "end_token": end_token,
                 "ready_event": event,
+                "final_end_token": final_end_token,
             }
         )
 
@@ -687,32 +690,7 @@ class _GpuDirectHistoryPublisher:
         control/ACK cost once.
         """
 
-        merged = first
-        consumed = 1
-        while True:
-            try:
-                candidate = self.delta_queue.get_nowait()
-            except queue.Empty:
-                break
-            if candidate is None:
-                # stop_deltas() is normally called only after join(), but keep
-                # the queue accounting correct if shutdown races this drain.
-                self.delta_queue.put(None)
-                self.delta_queue.task_done()
-                break
-            if int(candidate["start_token"]) != int(merged["end_token"]):
-                self.delta_queue.task_done()
-                raise RuntimeError(
-                    "GPU-direct delta submissions are not contiguous"
-                )
-            merged = {
-                "block_ids": candidate["block_ids"],
-                "start_token": first["start_token"],
-                "end_token": candidate["end_token"],
-                "ready_event": candidate["ready_event"],
-            }
-            consumed += 1
-        return merged, consumed
+        return coalesce_delta(first, self.delta_queue)
 
     def wait_for_deltas(self) -> None:
         self.delta_queue.join()
@@ -860,6 +838,8 @@ class _GpuDirectHistoryPublisher:
                             end_token=work["end_token"],
                         )
                         record["logical_submissions"] = consumed
+                        if "tail_coalescing" in work:
+                            record["tail_coalescing"] = work["tail_coalescing"]
                         record["completed_unix_s"] = time.time()
                         self.delta_records.append(record)
                         self.delta_inflight = None
@@ -889,8 +869,9 @@ class _GpuDirectHistoryPublisher:
                         logger.exception("BridgeTP GPU-direct delta failed")
                         raise
                     finally:
-                        for _ in range(consumed):
-                            self.delta_queue.task_done()
+                        # Coalescing acknowledges extra tasks, but retains this
+                        # first one until send/ACK (or failure) has completed.
+                        self.delta_queue.task_done()
             receipt.update(
                 {
                     "status": "READY",

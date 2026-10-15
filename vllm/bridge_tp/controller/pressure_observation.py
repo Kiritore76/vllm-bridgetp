@@ -33,8 +33,11 @@ class InventoryReader:
         self.latest = None
         self.observed_at = None
         self.error = None
+        self.error_detail = None
+        self.deferred = None
 
     def poll(self, now: float) -> dict | None:
+        self.deferred = None
         if not self.path.exists():
             return None
         if self.path.stat().st_size < self.offset:
@@ -52,22 +55,64 @@ class InventoryReader:
                 if row.get("kind") == "evidence_footer":
                     if row.get("dropped") or row.get("writer_error"):
                         self.error = "inventory evidence incomplete"
+                        if self.error_detail is None:
+                            self.error_detail = self._row_diagnostic(row, now)
                     continue
                 if (
                     row.get("schema") != "PRESSURE_INVENTORY_V1"
                     or row.get("pool_id") != self.pool_id
-                    or row["sampled_at"] > now
                     or row.get("dropped_before")
                     or row.get("writer_error")
                     or row.get("inventory_error")
                 ):
-                    self.error = "inventory identity/time/integrity invalid"
+                    self.error = "inventory identity/integrity invalid"
+                    if self.error_detail is None:
+                        self.error_detail = self._row_diagnostic(row, now)
                     continue
+                if not math.isfinite(row["sampled_at"]):
+                    self.error = "inventory timestamp is not finite"
+                    if self.error_detail is None:
+                        self.error_detail = self._row_diagnostic(row, now)
+                    continue
+                if row["sampled_at"] > now:
+                    # A producer can append while this poll is reading. Keep
+                    # that line unread until the caller's time reaches it;
+                    # never use future evidence or poison subsequent polls.
+                    self.offset = start
+                    self.deferred = self._row_diagnostic(row, now)
+                    break
                 if self.latest and row["generation"] <= self.latest["generation"]:
                     raise ValueError("inventory generation did not increase")
                 self.latest = row
                 self.observed_at = now
+        # A future line does not invalidate the already accepted past prefix.
+        # The policy still checks its original timestamp/age before migration.
         return None if self.error else self.latest
+
+    def _row_diagnostic(self, row, now):
+        return dict(
+            pool_id=self.pool_id,
+            row_pool_id=row.get("pool_id"),
+            schema=row.get("schema"),
+            generation=row.get("generation"),
+            sampled_at=row.get("sampled_at"),
+            poll_unix_s=now,
+            dropped_before=row.get("dropped_before"),
+            dropped=row.get("dropped"),
+            writer_error=row.get("writer_error"),
+            inventory_error=row.get("inventory_error"),
+        )
+
+    def diagnostics(self):
+        return dict(
+            pool_id=self.pool_id,
+            path=str(self.path),
+            error=self.error,
+            error_detail=self.error_detail,
+            deferred=self.deferred,
+            last_generation=self.latest.get("generation") if self.latest else None,
+            last_sampled_at=self.latest.get("sampled_at") if self.latest else None,
+        )
 
 
 class NativeServiceWindow:

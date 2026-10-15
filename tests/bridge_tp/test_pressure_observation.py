@@ -112,7 +112,43 @@ class InventoryTests(unittest.TestCase):
             row.update(generation=2, sampled_at=11)
             with path.open("ab") as stream:
                 stream.write(json.dumps(row).encode() + b"\n")
-            self.assertIsNone(reader.poll(10.1))
+            self.assertEqual(reader.poll(10.1)["generation"], 1)
+            self.assertIsNone(reader.error)
+            self.assertEqual(reader.deferred["generation"], 2)
+            self.assertEqual(reader.poll(11)["generation"], 2)
+            self.assertIsNone(reader.deferred)
+
+    def test_concurrent_append_after_poll_start_recovers_on_next_poll(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "inventory.jsonl"
+            row = inv.inventory_snapshot(scheduler(), "tp1", 10.01)
+            row.update(generation=1, dropped_before=0)
+            path.write_text(json.dumps(row) + "\n")
+            reader = o.InventoryReader(path, "tp1")
+            self.assertIsNone(reader.poll(10))
+            self.assertEqual(reader.offset, 0)
+            self.assertIsNone(reader.error)
+            row.update(generation=2, sampled_at=10.02)
+            with path.open("a") as stream:
+                stream.write(json.dumps(row) + "\n")
+            self.assertEqual(reader.poll(10.03)["generation"], 2)
+            self.assertIsNone(reader.error)
+
+    def test_corruption_remains_fatal_and_is_not_cleared_by_later_valid_rows(self):
+        for change in ({"pool_id": "tp4"}, {"dropped_before": 1}):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as folder:
+                path = Path(folder) / "inventory.jsonl"
+                row = inv.inventory_snapshot(scheduler(), "tp1", 10)
+                row.update(generation=1, dropped_before=0)
+                path.write_text(json.dumps(row | change) + "\n")
+                reader = o.InventoryReader(path, "tp1")
+                self.assertIsNone(reader.poll(10))
+                row.update(generation=2, sampled_at=11)
+                with path.open("a") as stream:
+                    stream.write(json.dumps(row) + "\n")
+                self.assertIsNone(reader.poll(11))
+                self.assertIsNotNone(reader.error)
+                self.assertEqual(reader.diagnostics()["error_detail"]["generation"], 1)
 
 
 class NativeTests(unittest.TestCase):

@@ -6,6 +6,7 @@ import io
 import json
 import tempfile
 import unittest
+from concurrent.futures import Future
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -13,7 +14,14 @@ from unittest.mock import patch
 
 from tests.bridge_tp.test_pressure_observation import inv, scheduler
 from tools.bridge_tp.pressure_cpu import load
-from tools.bridge_tp.pressure_progress import ProgressWatch, save_progress
+from tools.bridge_tp.pressure_progress import (
+    ProgressWatch,
+    completed_streams,
+    inventory_progress,
+    save_progress,
+    stream_progress,
+    workload_progress,
+)
 
 o, p, telemetry = (
     load(name) for name in ("pressure_observation", "pressure_policy", "telemetry")
@@ -194,6 +202,75 @@ class ProgressTests(unittest.TestCase):
             save_progress(path, stage="running", submitted=1)
             self.assertEqual(json.loads(path.read_text())["submitted"], 1)
             self.assertFalse(path.with_suffix(".tmp").exists())
+
+    def test_sse_and_completion_progress_prevent_missing_inventory_false_timeout(self):
+        recorder = load("online_io").ProxyRecorder(
+            "a", load("response_proxy").ProxyMode.HOLD_BACK
+        )
+        future = Future()
+        streams = {"a": NS(future=future, recorder=recorder)}
+        watch = ProgressWatch(60)
+        watch.update(0, stream_progress(streams), work_due=True, reason="inventory")
+        recorder.on_source_token(0, 42, 59)
+        watch.update(59, stream_progress(streams), work_due=True, reason="inventory")
+        future.set_result({})
+        watch.update(118, stream_progress(streams), work_due=True, reason="inventory")
+        self.assertEqual(completed_streams(streams), 1)
+        with self.assertRaises(TimeoutError):
+            watch.update(
+                178, stream_progress(streams), work_due=True, reason="inventory"
+            )
+
+    def test_source_abort_does_not_count_an_active_target_as_completed(self):
+        source, target = Future(), Future()
+        source.set_result({})
+        stream = NS(future=source)
+        self.assertEqual(completed_streams({"a": stream}, stream, target), 0)
+        target.set_result({})
+        self.assertEqual(completed_streams({"a": stream}, stream, target), 1)
+
+    def test_prefill_computation_is_progress_even_without_generated_tokens(self):
+        row = dict(request_id="a", generated=0, computed_tokens=0)
+        inventories = [dict(pool_id="tp1", requests=[row])]
+        watch = ProgressWatch(60)
+        watch.update(
+            0, inventory_progress(inventories), work_due=True, reason="prefill"
+        )
+        row["computed_tokens"] = 2048
+        watch.update(
+            59, inventory_progress(inventories), work_due=True, reason="prefill"
+        )
+        watch.update(
+            118, inventory_progress(inventories), work_due=True, reason="prefill"
+        )
+        with self.assertRaises(TimeoutError):
+            watch.update(
+                119, inventory_progress(inventories), work_due=True, reason="prefill"
+            )
+
+    def test_inventory_availability_flapping_alone_does_not_reset_deadline(self):
+        session = NS(stream=None, target_future=None, record=None, settled=False)
+        snapshot = (("tp1", "a", 0, 2048),)
+        watch = ProgressWatch(60)
+        watch.update(
+            0,
+            workload_progress({}, snapshot, session, []),
+            work_due=True,
+            reason="inventory available",
+        )
+        watch.update(
+            59,
+            workload_progress({}, snapshot, session, []),
+            work_due=True,
+            reason="inventory unavailable",
+        )
+        with self.assertRaises(TimeoutError):
+            watch.update(
+                60,
+                workload_progress({}, snapshot, session, []),
+                work_due=True,
+                reason="inventory available again",
+            )
 
 
 if __name__ == "__main__":

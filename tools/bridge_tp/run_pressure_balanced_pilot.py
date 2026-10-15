@@ -25,7 +25,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.bridge_tp.pressure_cpu import load  # noqa: E402
 from tools.bridge_tp.pressure_progress import (  # noqa: E402
     ProgressWatch,
+    completed_streams,
+    inventory_progress,
     save_progress,
+    workload_progress,
 )
 
 p, r, o, i, s = (
@@ -298,11 +301,27 @@ def run(args, prepared):
     progress_path = args.run_dir / "pressure_progress.json"
     last_status_at = -math.inf
     last_metrics_error = {}
+    last_inventory_status = {}
+    last_inventory_progress = ()
     failure = None
     try:
         while time.monotonic() - started < args.max_seconds:
             now, elapsed = time.time(), time.monotonic() - started
             inventories = [reader.poll(now) for reader in readers]
+            for reader in readers:
+                diagnostic = reader.diagnostics()
+                status_key = (
+                    reader.error,
+                    reader.deferred.get("generation") if reader.deferred else None,
+                    reader.latest is None,
+                )
+                if last_inventory_status.get(reader.pool_id) != status_key:
+                    audit.write(dict(kind="pressure_inventory_status", **diagnostic))
+                    last_inventory_status[reader.pool_id] = status_key
+                if reader.error:
+                    raise RuntimeError(
+                        "inventory evidence invalid: " + json.dumps(diagnostic)
+                    )
             if any(v is None for v in inventories):
                 dispatch_due(
                     jobs,
@@ -318,15 +337,27 @@ def run(args, prepared):
                     stage="waiting_inventory",
                     elapsed_s=elapsed,
                     submitted=len(dispatched),
-                    completed=sum(v.future.done() for v in dispatched.values()),
+                    completed=completed_streams(
+                        dispatched, session.stream, session.target_future
+                    ),
                     total=len(jobs),
+                    visible_tokens=sum(
+                        v.recorder.progress()[0] for v in dispatched.values()
+                    ),
+                    inventory_status=[reader.diagnostics() for reader in readers],
                     reason="requests routed; migration waiting for valid inventory",
                 )
                 watch.update(
                     time.monotonic(),
-                    ("missing_inventory", len(dispatched)),
+                    workload_progress(
+                        dispatched,
+                        last_inventory_progress,
+                        session,
+                        co.ledger.entries.values(),
+                    ),
                     work_due=any(elapsed >= job["at_s"] for job in jobs),
-                    reason="missing/invalid inventory",
+                    reason="waiting for inventory reconciliation; "
+                    + json.dumps([reader.diagnostics() for reader in readers]),
                 )
                 time.sleep(args.tick_s)
                 continue
@@ -557,27 +588,15 @@ def run(args, prepared):
                 for job in jobs
                 if elapsed >= job["at_s"] and job["id"] not in dispatched
             ]
-            completed = sum(v.future.done() for v in dispatched.values())
-            marker = (
-                len(dispatched),
-                completed,
-                tuple(
-                    (pool["pool_id"], row["request_id"], row["generated"])
-                    for pool in inventories
-                    for row in pool["requests"]
-                ),
-                session.record.state.value if session.record else "no_session",
-                session.settled,
-                tuple(
-                    (
-                        row.key,
-                        row.state,
-                        row.allocated_blocks,
-                        row.prefill_observed,
-                        row.service_observed,
-                    )
-                    for row in co.ledger.entries.values()
-                ),
+            completed = completed_streams(
+                dispatched, session.stream, session.target_future
+            )
+            last_inventory_progress = inventory_progress(inventories)
+            marker = workload_progress(
+                dispatched,
+                last_inventory_progress,
+                session,
+                co.ledger.entries.values(),
             )
             pressures = [
                 p.classify(co.ledger.routing_reading(pool), co.policy.cfg, now)
@@ -621,7 +640,7 @@ def run(args, prepared):
                     due_queued
                     or len(dispatched) > completed
                     or any(
-                        row.state in {"ACTIVE", "COMMITTED"}
+                        row.state in {"ACTIVE", "COMMITTED", "ACCOUNTED"}
                         and not (
                             session.cleanup_requires_shutdown
                             and row.kind == "migration"
@@ -644,7 +663,7 @@ def run(args, prepared):
                 len(dispatched) == len(jobs)
                 and all(v.future.done() for v in dispatched.values())
                 and not any(
-                    row.state in {"ACTIVE", "COMMITTED"}
+                    row.state in {"ACTIVE", "COMMITTED", "ACCOUNTED"}
                     and not (
                         session.cleanup_requires_shutdown and row.kind == "migration"
                     )
@@ -680,7 +699,9 @@ def run(args, prepared):
             stage=outcome,
             error=failure,
             submitted=len(dispatched),
-            completed=sum(v.future.done() for v in dispatched.values()),
+            completed=completed_streams(
+                dispatched, session.stream, session.target_future
+            ),
             total=len(jobs),
             elapsed_s=round(time.monotonic() - started, 1),
         )

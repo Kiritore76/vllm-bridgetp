@@ -223,6 +223,19 @@ class IngressTests(unittest.TestCase):
         self.assertEqual(len(self.http_calls), 1)
         self.assertEqual(self.http_calls[0][0], "source")
 
+    def test_completed_stream_stays_tracked_until_fresh_inventory_confirms_absence(
+        self,
+    ):
+        self.ingress.reconcile(self.snapshot(), 10)
+        entry = self.co.ledger.entries[self.stream.reservation_key]
+        self.executor.future.set_result({"completed_unix_s": 10.1})
+        self.ingress.reconcile(self.snapshot(), 10.2)
+        self.assertEqual(entry.state, "ACCOUNTED")
+        empty = self.snapshot()
+        empty.update(sampled_at=10.3, requests=[])
+        self.ingress.reconcile(empty, 10.3)
+        self.assertEqual(entry.state, "COMPLETED")
+
     def test_long_prompt_can_enter_idle_pool_instead_of_queueing_forever(self):
         source = replace(reading("tp1"), idle=True, decode_samples=0, decode_ratio=None)
         target = replace(reading("tp4"), idle=True, decode_samples=0, decode_ratio=None)

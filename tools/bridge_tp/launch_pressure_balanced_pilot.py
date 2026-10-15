@@ -273,7 +273,7 @@ def scene_result(run_dir, name):
     if final["outcome"] not in {"COMPLETED", "COMPLETED_PENDING_OWNER_CLEANUP"}:
         raise RuntimeError("controller did not complete; keep full evidence")
     if len(starts) > 1 or any(
-        r["state"] in {"ACTIVE", "COMMITTED"}
+        r["state"] in {"ACTIVE", "COMMITTED", "ACCOUNTED"}
         and not (
             pending_shutdown
             and shutdown["all_owned_groups_ended"]
@@ -450,7 +450,9 @@ def run_scene(spec, scene, plan, common, args):
                             f"{status.get('source_zone', '?')}/"
                             f"{status.get('target_zone', '?')}"
                         ),
-                        active_tokens=status.get("active_generated", 0),
+                        active_tokens=status.get(
+                            "active_generated", status.get("visible_tokens", 0)
+                        ),
                         migration=status.get("migration", "none"),
                     )
                     if status.get("queue_reasons"):
@@ -561,6 +563,8 @@ def main():
             "tests.bridge_tp.test_rolling_cutover",
             "tests.bridge_tp.test_pressure_session",
             "tests.bridge_tp.test_pressure_bootstrap",
+            "tests.bridge_tp.test_pressure_observation",
+            "tests.bridge_tp.test_delta_batching",
             "tests.bridge_tp.test_pressure_preflight",
             "tests.bridge_tp.test_pressure_policy",
         ],

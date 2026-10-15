@@ -92,3 +92,31 @@ initial routing to construct source/target conditions. Normal routing has CPU
 regression coverage; the fixed-route pilot does not measure its effectiveness.
 The cloud entrypoint and input folder stay fixed. CPU checks do not imply a new
 GPU run or successful migration coverage.
+
+## Tail batching and inventory/progress repair
+
+Pressure thresholds, scene arrivals and serving settings stay unchanged for the
+next four-scene rerun. The sender may wait for the final computed KV boundary
+only when the unsent batch has at most 16 tokens and at most 4 tokens remain.
+This wait is bounded at 200 ms. Normal/far/large batches send immediately; already
+in-flight batches are immutable. After a bounded wait starts, its original small
+batch can absorb the remaining tail (up to 20 total tokens) without resetting
+the deadline. Contiguous slots use the last producer CUDA event. Timeout sends
+the available prefix; cancellation and queue gaps preserve termination checks.
+Sender receipts include tail_coalescing outcome/wait/limits when this wait runs.
+Exact readback and four-rank readiness remain mandatory. These transport limits
+are engineering defaults, not a claimed GPU handoff improvement.
+
+Inventory appended after a poll's time snapshot is deferred unread to the next
+poll. Future evidence is never used, and genuine identity/loss/writer corruption
+remains fatal. Diagnostics retain the pool, row generation and timestamps.
+No-progress detection includes constant-time proxy token counts, buffered target
+tokens, completed streams and prefill computed-token progress. A migrated request
+is not counted complete until its target stream completes. Inventory health and
+request progress remain distinct; missing evidence does not permit migration.
+Normal scene completion also waits for ACCOUNTED records to retire after fresh
+inventory confirms request absence; process shutdown receipts remain mandatory.
+
+Before GPU startup the launcher now also runs the inventory and pure tail queue
+regressions. A new GPU result is still required to confirm normal final cleanup,
+that a final tail actually coalesces, and its measured handoff latency.

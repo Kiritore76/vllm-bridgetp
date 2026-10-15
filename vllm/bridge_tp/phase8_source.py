@@ -276,6 +276,7 @@ class _Phase8SourceState:
         block_ids: list[int],
         start_token: int,
         end_token: int,
+        final_end_token: int | None = None,
     ) -> bool:
         with self.lifecycle_lock:
             if self.finalized or self.stopped:
@@ -286,6 +287,7 @@ class _Phase8SourceState:
                 block_ids=block_ids,
                 start_token=start_token,
                 end_token=end_token,
+                final_end_token=final_end_token,
             )
             self.delta_batches += 1
             self.delta_tokens += end_token - start_token
@@ -771,6 +773,9 @@ def maybe_publish_phase8_delta(
             block_ids=block_ids,
             start_token=start_token,
             end_token=num_computed,
+            final_end_token=(
+                int(request.num_prompt_tokens) + config.phase8_cutover_output_tokens - 1
+            ),
         )
     else:
         rank_payloads, d2h_ms = _copy_delta_rank_shards(

@@ -200,6 +200,15 @@ class ProxyRecorder:
         with self._lock:
             return self.proxy.stats()
 
+    def progress(self) -> tuple[int, int, bool]:
+        """Constant-time stream progress without copying token histories."""
+        with self._lock:
+            return (
+                len(self.proxy.emitted),
+                len(self._pending_target),
+                self.proxy.committed,
+            )
+
     def _publish(self, emitted: list[EmittedToken]) -> None:
         if self._emission_sink is None:
             return

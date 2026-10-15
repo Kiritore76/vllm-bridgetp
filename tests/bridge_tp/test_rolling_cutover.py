@@ -891,6 +891,7 @@ class TestActualSourceHook(unittest.TestCase):
             self.assertIsNone(proof["maximum_pre_freeze_delta_lag_tokens"])
             final = self.state.enqueue_gpu_delta.call_args.kwargs
             self.assertEqual(final["end_token"], proof["computed_tokens"])
+            self.assertEqual(final["final_end_token"], proof["computed_tokens"])
             self.assertFalse((self.root / "cutover_manifest.json").exists())
 
     def test_reservation_exhaustion_never_freezes_or_enqueues_out_of_range(self):
