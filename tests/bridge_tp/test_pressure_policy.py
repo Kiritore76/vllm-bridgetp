@@ -331,7 +331,6 @@ class LedgerRuntimeTests(unittest.TestCase):
             (pool(), pool("tp4", context_limit=16384)),
             now=10,
             key="admit",
-            decode_costs={"tp1": 0.1, "tp4": 0.1},
         )
         self.assertEqual(value.pool_id, "tp4")
         self.assertEqual(value.max_output_tokens, 8192)
@@ -342,12 +341,11 @@ class LedgerRuntimeTests(unittest.TestCase):
             (pool(), pool("tp4", decode_ratio=1.5, context_limit=16384)),
             now=10,
             key="admit2",
-            decode_costs={"tp1": 0.1, "tp4": 0.1},
         )
         self.assertEqual(value2.pool_id, "tp4")
         self.assertEqual(value2.max_output_tokens, 8192)
 
-    def test_shared_arrival_reservations_block_migration_capacity(self):
+    def test_migration_uses_actual_free_blocks_without_ingress_promises(self):
         target = pool("tp4", free_blocks=450)
         self.co.admission(
             "new",
@@ -356,8 +354,12 @@ class LedgerRuntimeTests(unittest.TestCase):
             (pool(decode_ratio=1.5, free_blocks=20), target),
             now=10,
             key="a",
-            decode_costs={"tp1": 0.1, "tp4": 0.1},
+            allowed_pool_id="tp4",
         )
+        self.assertEqual(self.co.ledger.pending("tp4"), (0, 0, 512))
+        result = self.co.tick(10, pool(decode_ratio=1.5), target, [candidate()])
+        self.assertEqual(result.action, "START_SHADOW")
+        target = pool("tp4", free_blocks=418)  # ingress actually allocated 32 blocks
         result = self.co.tick(10, pool(decode_ratio=1.5), target, [candidate()])
         self.assertEqual(result.action, "STAY")
         self.assertIn("physical commitments", result.candidates[0]["rejections"][0])
@@ -370,6 +372,22 @@ class LedgerRuntimeTests(unittest.TestCase):
             [candidate("a"), candidate("b")],
             {"a": r.BoundAction("a", "s1", callback)},
         )
+
+    def test_new_target_arrival_invalidates_previous_idle_for_migration(self):
+        target = pool("tp4", idle=True, decode_ratio=None, decode_samples=0)
+        self.co.admission(
+            "queued",
+            512,
+            1024,
+            (pool(), target),
+            now=10,
+            key="queued",
+            allowed_pool_id="tp4",
+        )
+        result = self.co.tick(10, pool(decode_ratio=1.5), target, [candidate()])
+        self.assertEqual(result.action, "STAY")
+        self.assertEqual(result.target.zone, "UNKNOWN")
+        self.assertEqual(self.co.ledger.pending("tp4")[:2], (0, 0))
 
     def test_same_request_action_one_active_and_idempotent_commit(self):
         calls = []

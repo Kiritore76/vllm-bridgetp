@@ -46,52 +46,49 @@ The service summary includes historical calibration provenance; original source
 paths in that provenance are not dependencies of this run. No old final benefit
 test or training features are read by this launcher.
 
-## Revised prefill and admission
+## Routing and pressure feedback
 
-The complete pending prompt backlog is observed against an 8192-token reference,
-including unobserved ingress reservations. A scheduled prefill step is compared
-with the existing 2048-token step reference. These are pressure observations,
-not hard admission limits. Missing active step evidence stays unknown.
+Ordinary ingress has no controller KV-capacity admission gate and no prompt,
+output, or decode-service reservation. The controller chooses TP1/TP4 and submits
+every due legal request once. vLLM owns its waiting queue, prefill scheduling,
+actual KV allocation, and preemption. Its existing full-input-fit scheduler check
+is retained; this controls entry into execution, not receipt of HTTP requests.
 
-Normal ingress prefers TP1. A prompt of at least 2048 tokens prefers TP4 only
-when TP1 is CRITICAL/OVERLOAD. A known prompt of at least 4096 tokens considers
-TP4 directly. These prompt boundaries are explicit draft parameters. If the
-preferred pool cannot hold the full unchanged stop cap/context or shared physical
-commitments, try the other pool. Do not shrink the output cap to fit TP1.
-max_tokens is a stop contract, not a prediction of expected output length.
+Normal routing prefers TP1. Prompts >=2048 prefer TP4 when TP1 is CRITICAL or
+OVERLOAD; known prompts >=4096 consider TP4 directly. These are draft prompt
+thresholds. The original output stop cap must fit the selected instance's
+configured context limit; try the other pool if it does not, without shrinking
+that cap. Invalid context contracts fail instead of entering a capacity queue.
 
-New ingress reserves only `ceil(prompt_tokens / block_size)` logical blocks.
-The unchanged output stop cap still participates in context feasibility, but
-future output blocks are not promised at ingress. Actual decode growth consumes
-allocator free blocks and is tracked by live capacity feedback. Migration target
-reservations retain their full prompt plus frozen output-cap commitment.
+Zero free blocks, migration commitments, overload, service lookup gaps and stale
+or missing pressure readings never prevent a new request from being submitted.
+With missing telemetry, routing uses the configured serving context limits and
+retains the TP1-first/very-long-prompt rules; new migration decisions wait for
+fresh physical and service evidence. The launcher passes the actual source and
+target serving context limits into the controller and checks published matches.
 
-Raw allocator free blocks exclude real allocations only. Effective admission
-availability subtracts all outstanding unallocated ledger promises from that
-raw value. As each prefill chunk gets blocks, reconciliation reduces the pending
-promise by the allocated amount; it is never charged twice. Preemption restores
-the unallocated prompt commitment. A prompt promise is not an allocator block
-lock and does not guarantee capacity for all subsequent decode tokens.
+Ingress records retain identity and unpublished prompt demand only, with zero
+KV blocks and zero decode-service cost. Until the request appears in scheduler
+inventory, its prompt contributes to routing pressure. Once visible, including
+while waiting with zero allocated blocks, native waiting/pending-prompt counters
+own that demand. Completion or migration retires the identity record. Preemption
+does not create an ingress capacity promise. These records cannot lock blocks.
 
-Only fresh physical inventory, shared block commitments and context feasibility
-gate ingress. Observed service pressure, waiting/backlog and lookup gaps do not
-prevent a physically feasible submission. Unknown decode cost is flagged and
-temporarily reserves a full service budget for MIGRATION feasibility until the
-new stream is observed; this does not block other feasible admissions.
+Physical free blocks, their growth rate, live ITL, waiting requests, pending
+prompt tokens and actual prefill chunks drive pressure/migration decisions.
+The scheduled step reference is 2048 tokens and the full backlog reference is
+8192 tokens. Both are observations, not ingress admission limits. Terminal
+progress distinguishes pending dispatch from engine_waiting on TP1 and TP4.
+
+Only migration targets reserve capacity, retaining the full prompt plus frozen
+output-cap commitment, four-rank readiness, ownership confirmation and source
+free-return evidence. Unknown service shapes still restrict migration feasibility.
+Exact local engine-P95 lookups are preferred; bounded heavier decode-shape
+fallbacks assume monotone cost and claim zero positive source relief. They are
+empirical proxies, not causal ITL predictions or hard bounds.
+
 The fixed routes in these four function scenes intentionally override normal
 initial routing to construct source/target conditions. Normal routing has CPU
 regression coverage; the fixed-route pilot does not measure its effectiveness.
-
-Exact local engine-P95 lookups remain the first choice. Sparse decode cells may
-use the largest P95 among supported shapes with at least as many requests and
-at least as much mean context as the query. This assumes monotone service cost
-in those two features. It is an empirical working envelope, not a hard bound or
-causal ITL prediction; contributing cell indices and observed tail maxima are
-logged. Queries beyond supported heavier shapes and mixed/recompute gaps remain
-unknown. The full post-admission step is reserved on fallback, and fallback
-migration estimates claim zero source relief. No outlier records are removed.
-
-Queue diagnostics name stale/missing physical evidence, context and pending
-physical commitments. Service cost gaps and pressure remain separately audited.
-The cloud entrypoint and input folder stay fixed. No new GPU run is implied by
-the CPU counterfactual admission checks against the previous run's snapshots.
+The cloud entrypoint and input folder stay fixed. CPU checks do not imply a new
+GPU run or successful migration coverage.

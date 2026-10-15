@@ -167,6 +167,10 @@ class LauncherTests(unittest.TestCase):
             self.assertEqual(parsed.delta_base_port, 29900)
             controller_args = launch.controller.parse_args(plan["controller_argv"][2:])
             self.assertEqual(controller_args.policy, "pressure-balanced-v1")
+            self.assertEqual(controller_args.source_context_limit, args.max_model_len)
+            self.assertEqual(
+                controller_args.target_context_limit, args.tp4_max_model_len
+            )
 
     def test_normal_eos_with_retained_promise_requires_owner_shutdown_proof(self):
         with tempfile.TemporaryDirectory() as folder:

@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU-only pressure feedback, admission, and shared future commitments.
+"""CPU-only routing, pressure feedback, and migration commitments.
 
 Thresholds are explicit draft configuration, not fitted net-benefit gates.
-One coordinator serializes admission and migration against this ledger. Physical
-free blocks never include pending prompt tokens or unallocated reservations.
+One coordinator serializes routing and migration bookkeeping. New ingress
+records carry no KV or decode promise. Physical free blocks come from allocation.
 """
 
 from __future__ import annotations
@@ -180,7 +180,7 @@ class Reservation:
 
 
 class ReservationLedger:
-    """Shared admission/migration commitments, serialized by the coordinator.
+    """Migration commitments plus zero-resource ingress observation records.
 
     Commit alone does not free a promise: release only after scheduler evidence
     accounts for its allocation and service. Cancel/failure after a possible
@@ -208,6 +208,43 @@ class ReservationLedger:
             for r in self.entries.values()
         )
 
+    def track_ingress(
+        self, key: str, request_id: str, pool_id: str, prompt_tokens: int
+    ) -> None:
+        """Track identity/unpublished prompt demand without reserving capacity."""
+        if key in self.entries or any(
+            row.request_id == request_id for row in self.entries.values()
+        ):
+            raise ValueError("ingress identity already tracked")
+        if prompt_tokens < 0:
+            raise ValueError("invalid prompt length")
+        self.entries[key] = Reservation(
+            key, request_id, pool_id, 0, 0.0, prompt_tokens, "admission"
+        )
+
+    def unobserved_ingress(self, pool_id: str) -> tuple[int, int]:
+        rows = [
+            row
+            for row in self.entries.values()
+            if row.pool_id == pool_id
+            and row.kind == "admission"
+            and row.state in {"ACTIVE", "COMMITTED"}
+            and not row.prefill_observed
+        ]
+        return len(rows), sum(row.prefill_tokens for row in rows)
+
+    def routing_reading(self, pool: PoolReading) -> PoolReading:
+        """Include dispatched ingress until it appears in scheduler inventory."""
+        count, tokens = self.unobserved_ingress(pool.pool_id)
+        return replace(
+            pool,
+            idle=pool.idle and count == 0,
+            pending_prompt_tokens=pool.pending_prompt_tokens + tokens
+            if pool.pending_prompt_tokens is not None
+            else None,
+            waiting=pool.waiting + count if pool.waiting is not None else None,
+        )
+
     def reserve(self, value: Reservation, pool: PoolReading) -> None:
         if value.key in self.entries:
             raise ValueError("reservation key already used")
@@ -224,7 +261,7 @@ class ReservationLedger:
         ):
             raise ValueError("request already reserved")
         if (
-            value.kind not in {"admission", "migration"}
+            value.kind != "migration"
             or value.blocks < 0
             or not math.isfinite(value.decode_ratio)
             or value.decode_ratio < 0
@@ -389,6 +426,8 @@ class PressurePolicy:
         candidates: list[Candidate],
     ) -> PressureDecision:
         cfg = self.cfg
+        source = self.ledger.routing_reading(source)
+        target = self.ledger.routing_reading(target)
         s, t = classify(source, cfg, now), classify(target, cfg, now)
         if self._last_tick is not None and now < self._last_tick:
             raise ValueError("decision time regressed")
@@ -458,9 +497,7 @@ class PressurePolicy:
         # Capacity bypasses persistence/cooldown, never physical feasibility.
         if t.capacity is None or "pool timestamp" in t.missing:
             return decision("target physical capacity evidence absent")
-        pending_blocks, pending_decode, pending_prefill = self.ledger.pending(
-            target.pool_id
-        )
+        pending_blocks, pending_decode, _ = self.ledger.pending(target.pool_id)
         feasible, rows = [], []
         for c in candidates:
             reasons = []
@@ -561,8 +598,7 @@ class PressurePolicy:
                     t.decode + pending_decode + c.target_decode_cost > cfg.leave_ratio
                     or t.decode + pending_decode + c.target_decode_cost
                     > max(0, s.decode - c.source_decode_relief) + cfg.imbalance_enter
-                    or (target.pending_prompt_tokens + pending_prefill)
-                    / cfg.prefill_backlog_budget
+                    or target.pending_prompt_tokens / cfg.prefill_backlog_budget
                     > cfg.spare_ratio
                 ):
                     reasons.append("post-move overload/reverse imbalance")
@@ -571,8 +607,7 @@ class PressurePolicy:
                 or t.decode is None
                 or not valid_costs
                 or t.decode + pending_decode + c.target_decode_cost > cfg.enter_ratio
-                or t.prefill + pending_prefill / cfg.prefill_backlog_budget
-                > cfg.enter_ratio
+                or t.prefill > cfg.enter_ratio
             ):
                 reasons.append("emergency target service budget unavailable")
             rows.append(
@@ -618,19 +653,16 @@ class Admission:
     request_id: str
     pool_id: str
     max_output_tokens: int
+    # Identity/visibility receipt only; no capacity is reserved for ingress.
     reservation_key: str
-    decode_cost_known: bool = True
     routing_reason: str = ""
-    reservation_basis: str = "prompt_only"
+    reservation_basis: str = "none"
 
 
-class AdmissionQueued(ValueError):
+class RoutingError(ValueError):
     def __init__(self, diagnostics):
         self.diagnostics = diagnostics
-        summary = "; ".join(
-            pool + ": " + ", ".join(row["reasons"]) for pool, row in diagnostics.items()
-        )
-        super().__init__("queue: " + summary)
+        super().__init__("no route with a feasible context/stop contract")
 
 
 def admit(
@@ -642,22 +674,24 @@ def admit(
     ledger: ReservationLedger,
     now: float,
     key: str,
-    decode_costs: dict[str, float],
     allowed_pool_id: str | None = None,
 ) -> Admission:
-    """Fix a feasible stop cap and reserve prompt blocks before dispatch.
+    """Choose an instance; leave queueing and KV allocation to vLLM.
 
-    Callers must submit the returned max_output_tokens unchanged on both pools.
-    Service pressure guides routing, never hard admission. Only fresh physical
-    capacity and context/stop feasibility gate submission. Fixed pilot routes
-    are explicit constraints used for mechanism coverage, not normal routing.
-    Decode growth consumes actual free blocks; future output is not reserved
-    for new ingress. Migration target reservations remain a separate contract.
+    Only the unchanged stop cap/context contract constrains eligible routes.
+    Free blocks, service evidence, backlog and migration commitments never gate
+    ordinary ingress. Fixed pilot routes override the usual preference.
     """
-    if prompt_tokens < 0 or requested_output <= 0:
+    if (
+        type(prompt_tokens) is not int
+        or prompt_tokens < 0
+        or type(requested_output) is not int
+        or requested_output <= 0
+    ):
         raise ValueError("invalid request lengths")
     output_cap = min(8192, requested_output)
-    source_pressure = classify(pools[0], cfg, now)
+    source = ledger.routing_reading(pools[0])
+    source_pressure = classify(source, cfg, now)
     prefer_target = prompt_tokens >= cfg.very_long_prompt_tokens or (
         prompt_tokens >= cfg.prompt_boundary
         and source_pressure.zone in {"CRITICAL", "OVERLOAD"}
@@ -674,71 +708,19 @@ def admit(
     for pool in pools:
         if allowed_pool_id is not None and pool.pool_id != allowed_pool_id:
             continue
-        p = classify(pool, cfg, now)
         reasons = []
-        if "pool timestamp" in p.missing:
-            reasons.append("physical inventory stale/future")
-        if "KV geometry" in p.missing:
-            reasons.append("KV geometry")
-        blocks, decode, pending = ledger.pending(pool.pool_id)
-        cost = decode_costs.get(pool.pool_id)
-        if cost is None or not math.isfinite(cost) or cost < 0:
-            cost = None
-        capped = output_cap
-        required = (
-            math.ceil(prompt_tokens / pool.block_size) if pool.block_size > 0 else 0
-        )
-        if pool.block_size <= 0:
-            reasons.append("KV geometry")
-        if prompt_tokens + capped > pool.context_limit:
+        if pool.context_limit <= 0 or prompt_tokens + output_cap > pool.context_limit:
             reasons.append("context/stop budget exhausted")
-        if pool.free_blocks is None or required + blocks > pool.free_blocks:
-            reasons.append("physical blocks including pending commitments")
-        backlog = (
-            None
-            if pool.pending_prompt_tokens is None
-            else (pool.pending_prompt_tokens + pending + prompt_tokens)
-        )
-        diagnostics[pool.pool_id] = dict(
-            reasons=reasons,
-            required_blocks=required,
-            reservation_basis="prompt_only",
-            pending_blocks=blocks,
-            free_blocks=pool.free_blocks,
-            projected_prompt_backlog=backlog,
-            prompt_backlog_reference=cfg.prefill_backlog_budget,
-            decode_cost=cost,
-            pending_decode=decode,
-            observed_decode=p.decode,
-            step_tokens=pool.prefill_batch_tokens,
-            waiting=pool.waiting,
-            waiting_pressure_reference=cfg.prefill_waiting_budget,
-            observed_zone=p.zone,
-            service_missing=p.missing,
-            service_constraints="routing/observation only, not admission gates",
-        )
-        if reasons:
-            continue
-        eligible.append((pool, capped, required, cost, p))
+        diagnostics[pool.pool_id] = dict(reasons=reasons)
+        if not reasons:
+            eligible.append(pool)
     if not eligible:
-        raise AdmissionQueued(diagnostics)
-    eligible.sort(key=lambda row: row[0].pool_id != preferred.pool_id)
-    pool, capped, blocks, cost, _ = eligible[0]
+        raise RoutingError(diagnostics)
+    eligible.sort(key=lambda pool: pool.pool_id != preferred.pool_id)
+    pool = eligible[0]
     if allowed_pool_id is not None:
         routing_reason = "fixed pilot route"
     elif pool.pool_id != preferred.pool_id:
-        routing_reason += "; preferred pool physically/context infeasible"
-    cost_known = cost is not None
-    ledger.reserve(
-        Reservation(
-            key,
-            request_id,
-            pool.pool_id,
-            blocks,
-            cost if cost_known else cfg.leave_ratio,
-            prompt_tokens,
-            "admission",
-        ),
-        pool,
-    )
-    return Admission(request_id, pool.pool_id, capped, key, cost_known, routing_reason)
+        routing_reason += "; preferred pool context infeasible"
+    ledger.track_ingress(key, request_id, pool.pool_id, prompt_tokens)
+    return Admission(request_id, pool.pool_id, output_cap, key, routing_reason)

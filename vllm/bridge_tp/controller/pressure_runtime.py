@@ -43,7 +43,7 @@ class PressureCoordinator:
         self._owners: dict[str, str] = {}
 
     def admission(self, *args, **kwargs):
-        """Reserve atomically; the caller dispatches with this frozen stop cap."""
+        """Route and track identity atomically, without reserving ingress KV."""
         with self._lock:
             before = self.ledger.snapshot()
             result = admit(*args, cfg=self.policy.cfg, ledger=self.ledger, **kwargs)
@@ -131,8 +131,8 @@ class PressureCoordinator:
                 "kind": "pressure_decision",
                 "unix_s": now,
                 "decision": asdict(decision),
-                "source_reading": asdict(source),
-                "target_reading": asdict(target),
+                "source_reading": asdict(self.ledger.routing_reading(source)),
+                "target_reading": asdict(self.ledger.routing_reading(target)),
                 "reservation_before": before,
                 "execution": "ADVISORY",
             }

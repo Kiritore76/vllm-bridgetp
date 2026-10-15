@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Experimental real streaming ingress backed by the pressure reservation ledger."""
+"""Route streaming requests; observe engine queueing without ingress KV promises."""
 
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ class IngressStream:
 
 
 class PressureIngress:
-    """Reserve before HTTP submission and bind only published server inventory.
+    """Route HTTP submission and bind only published server inventory.
 
     The caller owns executor shutdown and audits final stream/proxy results.
     Requests use token-ID prompts and n=1; arbitrary batching/beam/multimodal
@@ -76,7 +76,6 @@ class PressureIngress:
         self,
         request: dict,
         pools,
-        decode_costs: dict,
         *,
         emission_sink=None,
         allowed_pool_id=None,
@@ -103,7 +102,6 @@ class PressureIngress:
                 pools,
                 now=now,
                 key=key,
-                decode_costs=decode_costs,
                 allowed_pool_id=allowed_pool_id,
             )
             payload["max_tokens"] = admission.max_output_tokens
@@ -127,8 +125,8 @@ class PressureIngress:
                 finally:
                     self.service.finish(client_id)
 
-            # An exception may happen after a transport accepted work; keep the
-            # reservation until independently confirmed completion/cleanup.
+            # A transport error can follow acceptance. Retain identity tracking
+            # until completion/cleanup; this record reserves no KV capacity.
             value.future = self.executor.submit(consume)
             return value
 
@@ -169,29 +167,23 @@ class PressureIngress:
                         self.coordinator._owners.pop(entry.request_id, None)
                         entry.request_id = value.server_id
                         self.coordinator._owners[value.server_id] = value.pool_id
-                    if row["owned_blocks"] is not None:
-                        allocated = min(row["owned_blocks"], entry.blocks)
-                        if allocated < entry.allocated_blocks:
-                            # Preemption/recompute can physically free allocation:
-                            # restore its FUTURE commitment instead of losing it.
-                            entry.allocated_blocks = allocated
-                            if entry.state == "ACCOUNTED":
-                                entry.state = "COMMITTED"
-                        visible = entry.service_observed or row["generated"] >= 2
-                        if entry.state != "ACCOUNTED":
-                            self.coordinator.ledger.observe(
-                                entry.key,
-                                allocated_blocks=allocated,
-                                service_observed=visible,
-                                prefill_observed=True,
-                            )
+                    # Waiting and running requests both appear in inventory.
+                    # Native pending_prompt_tokens now owns this demand; stop
+                    # adding the unpublished prompt count. There is no ingress
+                    # block or decode promise to reconcile during preemption.
+                    if entry.state != "ACCOUNTED":
+                        self.coordinator.ledger.observe(
+                            entry.key,
+                            allocated_blocks=0,
+                            service_observed=True,
+                            prefill_observed=True,
+                        )
                     if entry.state == "ACTIVE":
                         self.coordinator.ledger.settle(
                             entry.key, "COMMITTED", evidence=True
                         )
                 elif (
-                    value.server_id
-                    and value.future is not None
+                    value.future is not None
                     and value.future.done()
                     and value.future.exception() is None
                     and inventory["sampled_at"]

@@ -16,17 +16,16 @@ They have CPU contract checks, **not GPU end-to-end acceptance**.
   capacity readings; persistence, hysteresis, cooldown, capacity fast path;
   inventory-wide filtering and a longest-remaining tier before physical release,
   transfer bytes, and stable request ID tie breaks. U is audit data, not a gate.
-- Admission preserves `min(8192, requested_output)` and checks that prompt plus
-  this unchanged stop cap fits the chosen instance's context limit. New ingress
-  reserves only `ceil(prompt_tokens / block_size)` in the shared ledger;
-  migration still reserves its full target prompt plus frozen output cap.
-  Physical free blocks are never decremented in telemetry by ledger promises.
-  Admission availability is raw free blocks minus outstanding unallocated
-  promises from both kinds. Partial allocation acknowledgements reduce only
-  the outstanding part, avoiding duplicate charges during chunked prefill.
-  Subsequent decode growth consumes physical blocks as it occurs; ingress no
-  longer guarantees capacity for the maximum future output. Accounted requests
-  remain active for restart protection until completion or migration evidence.
+- Routing preserves `min(8192, requested_output)` and checks that prompt plus
+  this unchanged stop cap fits the selected instance's configured context limit.
+  Ordinary ingress reserves no KV blocks or decode-service budget and never
+  queues outside vLLM due to capacity, overload or absent pressure telemetry.
+  vLLM owns waiting, chunked prefill allocation and preemption; its existing
+  full-input-fit check before execution is retained. Identity records carry
+  zero resource promises and track unpublished prompt demand only. Native queue
+  inventory replaces that demand once visible, even with zero allocated blocks.
+  Migration alone reserves its full target prompt plus frozen output cap;
+  settlement still requires ownership/source-release or cleanup evidence.
 - `controller/pressure_runtime.py`: serialized, in-process coordination with a
   bound callback for the selected request/session. Audit precedes START.
   Ambiguous START failures retain promises until confirmed cleanup. Commit
@@ -100,10 +99,10 @@ Experimental integration now implemented, pending actual server acceptance:
 2. `pressure_observation.py` reads complete journal lines and computes live ITL,
    slow fraction and open gaps. An older empty report additionally requires fresh
    endpoint liveness and matching free blocks, with no intervening arrival.
-3. `pressure_ingress.py` reserves before SSE submission and binds actual server
-   IDs using prompt/cap/EOS checks. Allocation, visible decode service and pending
-   prefill commitments reconcile separately. Preemption restores future promises.
-   An admitted active request can migrate while retaining its source promise.
+3. `pressure_ingress.py` routes SSE submission and binds actual server
+   IDs using prompt/cap/EOS checks, including waiting requests with no blocks.
+   Ordinary ingress tracks identity/unpublished prompt demand only. It has no
+   KV/decode promise to restore on preemption. Active streams migrate unchanged.
 4. The session adapter reuses M2, rolling reservation and four-rank ready/commit
    helpers, then requires a matching source free-return receipt. Existing pressure
    or session artifacts refuse restart; the ledger has no automatic recovery.
@@ -111,7 +110,7 @@ Experimental integration now implemented, pending actual server acceptance:
 The local service lookup is an engine-p95 proxy, not a causal native-ITL model.
 Exact unsupported cells remain unknown; the bounded empirical decode fallback
 described below is separately identified. Long prompts can join a nonidle pool
-within shared physical commitments; service gaps do not hard-gate admission.
+without an external capacity gate; vLLM schedules them when resources permit.
 The owned-process launcher and four arrival trajectories are prepared. It verifies
 committed HEAD/input/model/checkpoint identities and uses the real Linux serving/
 stager parsers before any server starts. The full original rolling regression is blocked
@@ -124,7 +123,7 @@ Four function scenarios are specified, not executed:
 | Both pools light | Fresh native and capacity readings | STAY even if TP4 is emptier |
 | Sustained source decode pressure | Two genuinely migratable requests with different KV/PMFs and supported post-move service estimates | Choose exactly one, then validate safe takeover and reobserve |
 | Source pressure, target prefill | Actual prompt allocation and native-service visibility through the prefill phase | Restrict ordinary start; re-evaluate after prefill; missing decode is not idle |
-| Source capacity warning, target arrival in flight | Target ingress uses the same commitments; no physical OOM | Reserve one migration; arrival consumes remaining budget; no duplicate START |
+| Source capacity warning, target arrival in flight | Actual target arrivals, queue pressure and migration reservation evidence | Reserve one migration; reobserve arriving work; no duplicate START |
 
 After function success, compare identical initial routing and arrival traces
 against a no-migration baseline. Keep H300 soft quality, full-request SLO,
@@ -168,21 +167,31 @@ by a one-step prefill budget; sparse three-request lookup cells also delayed
 admission. Revised pressure records actual prefill step tokens separately from
 pending full prompts. A draft 8192-token backlog reference is for pressure only;
 there is no idle-only long-prompt admission exception or service-pressure gate.
-Shared prompt/migration commitments and original output stop caps remain enforced.
-New ingress promises prompt blocks only; future decode growth is observed live.
+Ingress has no capacity admission gate. Migration commitments and original
+output stop caps remain enforced; ordinary KV allocation is owned by vLLM.
 
 For decode-only gaps, a separately audited empirical P95 envelope can use
 supported heavier request-count/mean-context shapes. It assumes monotone cost,
 is not a confidence bound, records the historical maximum as well, and never
-extends beyond a dominating observed shape. Fallback admission charges the whole
-post-admission step; fallback migration predicts no positive source relief.
+extends beyond a dominating observed shape. The fallback migration estimate
+predicts no positive source relief; ingress never charges a service promise.
 Unknown mixed/recompute costs stay unknown but do not queue feasible arrivals.
-Their temporary service reservation protects migration feasibility until actual
-stream service is observed. Decode thresholds, persistence,
+Ordinary ingress reserves no service budget. Migration feasibility still
+requires fresh measured service and supported move-cost evidence. Thresholds,
+persistence,
 cooldown, capacity guard, PMF and transport mechanism are unchanged.
 
 Normal ingress prefers TP1. Prompts >=2048 prefer TP4 when TP1 is CRITICAL or
 OVERLOAD; known prompts >=4096 consider TP4 directly. If TP1 cannot fit the
-unchanged output cap/context or physical commitments, consider TP4 rather than
-shrinking that cap. These are draft prompt thresholds, not predicted output.
+unchanged output cap/context, consider TP4 rather than shrinking that cap.
+Free KV blocks do not decide whether an ordinary request can be submitted.
+These are draft prompt thresholds, not predicted output.
 Fixed scene routes remain explicit harness constraints, not this normal routing.
+
+Ingress capacity-gate removal: due arrivals are routed even before both inventory
+journals are available, using the actual configured serving context limits.
+The controller does not retry capacity rejection or reserve prompt/output/decode
+capacity for them. Identity records retain zero resource promises and only count
+unpublished prompt demand. Engine waiting and controller pending-dispatch counts
+are distinct progress fields. Missing inventory still prevents migration START
+and remains subject to the function pilot's evidence/no-progress requirements.

@@ -87,7 +87,7 @@ class AdmissionPressureTests(unittest.TestCase):
         )
         self.lookup = load("pressure_service").LocalServiceLookup(summary)
 
-    def admit(self, ledger, request_id="new", cost=0.2, source=None):
+    def admit(self, ledger, request_id="new", source=None):
         return self.p.admit(
             request_id,
             4096,
@@ -97,45 +97,61 @@ class AdmissionPressureTests(unittest.TestCase):
             ledger,
             10,
             request_id,
-            {"tp1": cost, "tp4": 0.1},
             allowed_pool_id="tp1",
         )
 
-    def test_prompt_backlog_does_not_gate_physically_feasible_admission(self):
+    def test_zero_free_blocks_and_overload_do_not_queue_ingress(self):
         ledger = self.p.ReservationLedger()
-        source = pool(free_blocks=900)
-        self.admit(ledger, "first", source=source)
-        self.admit(ledger, "second", source=source)
-        self.assertEqual(ledger.pending("tp1"), (512, 0.4, 8192))
-        self.admit(ledger, "third", source=source)
-        self.assertEqual(ledger.pending("tp1")[0], 768)
-        self.assertEqual(ledger.pending("tp1")[2], 12288)
-        with self.assertRaises(self.p.AdmissionQueued) as caught:
-            self.admit(ledger, "fourth", source=source)
-        self.assertIn(
-            "physical blocks including pending commitments",
-            caught.exception.diagnostics["tp1"]["reasons"],
+        source = pool(
+            free_blocks=0, decode_ratio=2, waiting=20, pending_prompt_tokens=32000
         )
-        self.assertNotIn("fourth", ledger.entries)
+        for request_id in ("first", "second", "third", "fourth"):
+            result = self.admit(ledger, request_id, source=source)
+            self.assertEqual(result.pool_id, "tp1")
+            self.assertEqual(result.max_output_tokens, 4096)
+        self.assertEqual(ledger.pending("tp1"), (0, 0, 16384))
+        self.assertEqual(ledger.unobserved_ingress("tp1"), (4, 16384))
+        self.assertTrue(
+            all(row.blocks == row.decode_ratio == 0 for row in ledger.entries.values())
+        )
 
-    def test_migration_commitments_still_protect_physical_capacity(self):
+    def test_migration_commitment_does_not_block_new_ingress(self):
         ledger = self.p.ReservationLedger()
         ledger.reserve(
             self.p.Reservation("migration", "moving", "tp1", 1800, 0.1, 0, "migration"),
             pool(),
         )
-        with self.assertRaises(self.p.AdmissionQueued) as caught:
-            self.admit(ledger)
-        self.assertIn(
-            "physical blocks including pending commitments",
-            caught.exception.diagnostics["tp1"]["reasons"],
-        )
+        result = self.admit(ledger)
+        self.assertEqual(result.pool_id, "tp1")
+        self.assertEqual(ledger.pending("tp1"), (1800, 0.1, 4096))
+        self.assertEqual(ledger.entries["migration"].state, "ACTIVE")
 
-    def test_unknown_cost_never_becomes_zero(self):
+    def test_missing_inventory_does_not_create_ingress_capacity_promises(self):
         ledger = self.p.ReservationLedger()
-        admission = self.admit(ledger, cost=None)
-        self.assertFalse(admission.decode_cost_known)
-        self.assertEqual(ledger.pending("tp1")[1], config().leave_ratio)
+        result = self.admit(
+            ledger,
+            source=pool(
+                free_blocks=None, sampled_at=0, decode_ratio=None, decode_samples=0
+            ),
+        )
+        self.assertEqual(result.pool_id, "tp1")
+        self.assertEqual(result.reservation_basis, "none")
+        self.assertEqual(ledger.pending("tp1"), (0, 0, 4096))
+
+    def test_context_infeasible_is_an_error_instead_of_capacity_queue(self):
+        ledger = self.p.ReservationLedger()
+        with self.assertRaises(self.p.RoutingError):
+            self.p.admit(
+                "oversize",
+                8192,
+                8192,
+                (pool(), pool("tp4")),
+                config(),
+                ledger,
+                10,
+                "oversize",
+            )
+        self.assertEqual(ledger.entries, {})
 
     def route(self, prompt, cap=1024, source=None, target=None):
         return self.p.admit(
@@ -147,7 +163,6 @@ class AdmissionPressureTests(unittest.TestCase):
             self.p.ReservationLedger(),
             10,
             "route",
-            {},
         )
 
     def test_prefer_tp1_even_for_medium_prompt_when_not_pressured(self):
@@ -165,7 +180,7 @@ class AdmissionPressureTests(unittest.TestCase):
         self.assertEqual(result.pool_id, "tp4")
         self.assertEqual(result.max_output_tokens, 8192)
 
-    def test_unknown_service_accepts_but_stale_physical_inventory_does_not(self):
+    def test_unknown_or_stale_observations_do_not_block_routing(self):
         source = pool(
             decode_ratio=None,
             decode_samples=0,
@@ -176,7 +191,7 @@ class AdmissionPressureTests(unittest.TestCase):
         self.assertEqual(self.route(512, source=source).pool_id, "tp1")
         stale = pool(sampled_at=0)
         result = self.route(512, source=stale)
-        self.assertEqual(result.pool_id, "tp4")
+        self.assertEqual(result.pool_id, "tp1")
 
     def test_prefill_chunk_and_backlog_are_separate_pressure_axes(self):
         step = pool(pending_prompt_tokens=4096, prefill_batch_tokens=2048)
@@ -205,7 +220,6 @@ class AdmissionPressureTests(unittest.TestCase):
             ledger,
             10,
             "peer",
-            {"tp1": detail["cost"]},
             allowed_pool_id="tp1",
         )
         self.assertEqual(result.pool_id, "tp1")

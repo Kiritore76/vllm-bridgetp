@@ -54,6 +54,8 @@ def parse_args(argv=None):
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--source-inventory", type=Path, required=True)
     parser.add_argument("--target-inventory", type=Path, required=True)
+    parser.add_argument("--source-context-limit", type=int, default=8192)
+    parser.add_argument("--target-context-limit", type=int, default=16384)
     parser.add_argument("--predictor-events", type=Path, required=True)
     parser.add_argument("--predictor-sha256", required=True)
     parser.add_argument("--migration-id", required=True)
@@ -63,6 +65,8 @@ def parse_args(argv=None):
     parser.add_argument("--no-migration", action="store_true")
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
+    if min(args.source_context_limit, args.target_context_limit) <= 0:
+        parser.error("positive configured context limits required")
     if any(
         not math.isfinite(v) or v <= 0
         for v in (args.tick_s, args.max_seconds, args.no_progress_s)
@@ -133,6 +137,12 @@ def preflight(args):
         ):
             raise ValueError("invalid/duplicate arrival or stop contract")
         ids.add(job["id"])
+        limits = dict(tp1=args.source_context_limit, tp4=args.target_context_limit)
+        routes = [job["route"]] if job.get("route") else limits
+        if not any(
+            len(req["prompt"]) + req["max_tokens"] <= limits[name] for name in routes
+        ):
+            raise ValueError("arrival has no context-feasible route")
     paths = (
         args.policy_config,
         args.controller_config,
@@ -173,6 +183,62 @@ def batch(inventory, now, cfg, reading):
     ):
         return None
     return value
+
+
+def unknown_routing_pools(args, block_size):
+    """Use configured context contracts while pressure telemetry is absent."""
+    return tuple(
+        p.PoolReading(
+            pool_id=name,
+            sampled_at=0,
+            published_at=0,
+            free_blocks=None,
+            block_size=block_size,
+            context_limit=limit,
+            decode_ratio=None,
+            decode_samples=0,
+            decode_sampled_at=None,
+            idle=False,
+            pending_prompt_tokens=None,
+            waiting=None,
+            growth_blocks_s=None,
+        )
+        for name, limit in (
+            ("tp1", args.source_context_limit),
+            ("tp4", args.target_context_limit),
+        )
+    )
+
+
+def dispatch_due(jobs, dispatched, elapsed, ingress, pools, tokens, audit):
+    """Submit every due legal arrival once; engine capacity is not a gate."""
+    for value in dispatched.values():
+        if value.future.done():
+            value.future.result()
+    for job in jobs:
+        if job["id"] in dispatched or elapsed < job["at_s"]:
+            continue
+        value = ingress.submit(
+            job["request"],
+            tuple(pools),
+            allowed_pool_id=job.get("route"),
+            emission_sink=lambda token, job_id=job["id"]: tokens.submit(
+                {"kind": "visible_token", "job_id": job_id, **token}
+            ),
+        )
+        dispatched[job["id"]] = value
+        audit.write(
+            dict(
+                kind="pressure_dispatch",
+                job_id=job["id"],
+                at_s=job["at_s"],
+                actual_s=elapsed,
+                client_id=value.client_id,
+                pool=value.pool_id,
+                frozen_cap=value.payload["max_tokens"],
+                ingress_capacity_gate=False,
+            )
+        )
 
 
 def run(args, prepared):
@@ -231,8 +297,6 @@ def run(args, prepared):
     watch = ProgressWatch(args.no_progress_s)
     progress_path = args.run_dir / "pressure_progress.json"
     last_status_at = -math.inf
-    queue_reasons = {}
-    queue_details = {}
     last_metrics_error = {}
     failure = None
     try:
@@ -240,13 +304,23 @@ def run(args, prepared):
             now, elapsed = time.time(), time.monotonic() - started
             inventories = [reader.poll(now) for reader in readers]
             if any(v is None for v in inventories):
+                dispatch_due(
+                    jobs,
+                    dispatched,
+                    elapsed,
+                    ingress,
+                    unknown_routing_pools(args, controller.block_size),
+                    tokens,
+                    audit,
+                )
                 save_progress(
                     progress_path,
                     stage="waiting_inventory",
                     elapsed_s=elapsed,
                     submitted=len(dispatched),
-                    completed=0,
-                    reason="waiting for complete valid source/target inventory",
+                    completed=sum(v.future.done() for v in dispatched.values()),
+                    total=len(jobs),
+                    reason="requests routed; migration waiting for valid inventory",
                 )
                 watch.update(
                     time.monotonic(),
@@ -262,6 +336,13 @@ def run(args, prepared):
                     raise ValueError(
                         "live KV block geometry differs from pilot contract"
                     )
+                expected_context = (
+                    args.source_context_limit
+                    if raw["pool_id"] == "tp1"
+                    else args.target_context_limit
+                )
+                if raw["context_limit"] != expected_context:
+                    raise ValueError("live context limit differs from serving contract")
                 try:
                     metrics = o.scrape_inventory_metrics(scraper, raw)
                 except load("telemetry").TelemetryError as error:
@@ -320,54 +401,7 @@ def run(args, prepared):
                             "scope": "empirical budget plus configured recovery tokens",
                         }
                     )
-            for job in jobs:
-                if job["id"] in dispatched or elapsed < job["at_s"]:
-                    continue
-                cost_details = {
-                    name: lookup.admission_details(
-                        pool, shape, len(job["request"]["prompt"])
-                    )
-                    if shape
-                    else dict(cost=None, basis="missing fresh batch")
-                    for name, pool, shape in zip(
-                        ("tp1", "tp4"), ("source", "target"), shapes
-                    )
-                }
-                costs = {name: detail["cost"] for name, detail in cost_details.items()}
-                try:
-                    value = ingress.submit(
-                        job["request"],
-                        tuple(pools),
-                        costs,
-                        allowed_pool_id=job.get("route"),
-                        emission_sink=lambda token, job_id=job["id"]: tokens.submit(
-                            {"kind": "visible_token", "job_id": job_id, **token}
-                        ),
-                    )
-                except ValueError as error:
-                    if not str(error).startswith("queue:"):
-                        raise
-                    queue_reasons[job["id"]] = str(error)
-                    queue_details[job["id"]] = dict(
-                        gates=getattr(error, "diagnostics", {}),
-                        service_cost_evidence=cost_details,
-                    )
-                    continue
-                queue_reasons.pop(job["id"], None)
-                queue_details.pop(job["id"], None)
-                dispatched[job["id"]] = value
-                audit.write(
-                    dict(
-                        kind="pressure_dispatch",
-                        job_id=job["id"],
-                        at_s=job["at_s"],
-                        actual_s=elapsed,
-                        client_id=value.client_id,
-                        pool=value.pool_id,
-                        frozen_cap=value.payload["max_tokens"],
-                        service_cost_evidence=cost_details,
-                    )
-                )
+            dispatch_due(jobs, dispatched, elapsed, ingress, pools, tokens, audit)
             candidates, eos = [], {}
             for row in inventories[0]["requests"]:
                 try:
@@ -446,7 +480,7 @@ def run(args, prepared):
                 if pools[0].growth_blocks_s is not None
                 else None,
                 target_running=inventories[1]["running"],
-                target_waiting=pools[1].waiting,
+                target_waiting=co.ledger.routing_reading(pools[1]).waiting,
                 target_kv_usage_frac=1
                 - pools[1].free_blocks / inventories[1]["total_blocks"],
             )
@@ -545,6 +579,10 @@ def run(args, prepared):
                     for row in co.ledger.entries.values()
                 ),
             )
+            pressures = [
+                p.classify(co.ledger.routing_reading(pool), co.policy.cfg, now)
+                for pool in pools
+            ]
             if time.monotonic() - last_status_at >= 5:
                 last_status_at = time.monotonic()
                 status = dict(
@@ -554,14 +592,17 @@ def run(args, prepared):
                     completed=completed,
                     total=len(jobs),
                     queued=due_queued,
-                    source_zone=p.classify(pools[0], co.policy.cfg, now).zone,
-                    target_zone=p.classify(pools[1], co.policy.cfg, now).zone,
-                    source_missing=p.classify(pools[0], co.policy.cfg, now).missing,
-                    target_missing=p.classify(pools[1], co.policy.cfg, now).missing,
+                    source_zone=pressures[0].zone,
+                    target_zone=pressures[1].zone,
+                    source_missing=pressures[0].missing,
+                    target_missing=pressures[1].missing,
                     active_generated=sum(row[2] for row in marker[2]),
                     migration=marker[3],
-                    queue_reasons=dict(queue_reasons),
-                    queue_details=dict(queue_details),
+                    engine_waiting={pool.pool_id: pool.waiting for pool in pools},
+                    unobserved_ingress={
+                        pool.pool_id: co.ledger.unobserved_ingress(pool.pool_id)
+                        for pool in pools
+                    },
                     prefill={
                         pool.pool_id: dict(
                             step_tokens=pool.prefill_batch_tokens,
@@ -594,9 +635,8 @@ def run(args, prepared):
                 reason=json.dumps(
                     dict(
                         queued=due_queued,
-                        reasons=queue_reasons,
-                        source=p.classify(pools[0], co.policy.cfg, now).zone,
-                        target=p.classify(pools[1], co.policy.cfg, now).zone,
+                        source=pressures[0].zone,
+                        target=pressures[1].zone,
                     )
                 ),
             )

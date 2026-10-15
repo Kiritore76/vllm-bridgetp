@@ -4,7 +4,9 @@
 import unittest
 from concurrent.futures import Future
 from dataclasses import replace
+from types import SimpleNamespace
 
+from tools.bridge_tp import run_pressure_balanced_pilot as pilot
 from tools.bridge_tp.pressure_cpu import load
 
 p, r, o, ingress, b = (
@@ -63,7 +65,6 @@ class IngressTests(unittest.TestCase):
         self.stream = self.ingress.submit(
             dict(model="qwen", prompt=[1] * 64, max_tokens=256),
             (reading("tp1"), reading("tp4")),
-            {"tp1": 0.1, "tp4": 0.1},
         )
         self.server_id = f"cmpl-{self.stream.client_id}-0-abcdef"
 
@@ -80,8 +81,9 @@ class IngressTests(unittest.TestCase):
         row.update(kwargs)
         return dict(pool_id="tp1", sampled_at=10, generation=1, requests=[row])
 
-    def test_shared_reservation_precedes_http_and_freezes_cap(self):
+    def test_identity_tracking_precedes_http_without_reserving_capacity(self):
         self.assertEqual(len(self.co.ledger.entries), 1)
+        self.assertEqual(self.co.ledger.pending("tp1"), (0, 0, 64))
         self.assertEqual(self.http_calls, [])
         self.executor.function()
         self.assertEqual(self.http_calls[0][0], "source")
@@ -154,50 +156,72 @@ class IngressTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.ingress.reconcile(snapshot, 10)
 
-    def test_preemption_restores_future_block_commitment(self):
+    def test_preemption_never_restores_an_ingress_kv_promise(self):
         self.ingress.reconcile(self.snapshot(owned_blocks=20), 10)
         self.assertEqual(self.co.ledger.pending("tp1"), (0, 0, 0))
         self.ingress.reconcile(self.snapshot(owned_blocks=2), 10)
-        self.assertEqual(self.co.ledger.pending("tp1")[0], 2)
+        self.assertEqual(self.co.ledger.pending("tp1")[0], 0)
 
-    def test_chunked_prefill_and_decode_do_not_double_charge_blocks(self):
-        # 64 prompt tokens promise four blocks, independently of max_tokens=256.
-        ledger = self.co.ledger
-        entry = ledger.entries[self.stream.reservation_key]
-        self.assertEqual(entry.blocks, 4)
-        initial_free = reading("tp1").free_blocks
-        for allocated in (0, 2, 4, 6):
-            with self.subTest(allocated=allocated):
-                self.ingress.reconcile(
-                    self.snapshot(owned_blocks=allocated, generated=0), 10
-                )
-                raw_free = initial_free - allocated
-                pending = ledger.pending("tp1")[0]
-                self.assertEqual(pending, max(0, 4 - allocated))
-                self.assertEqual(raw_free - pending, initial_free - max(4, allocated))
-        self.ingress.reconcile(self.snapshot(owned_blocks=6, generated=20), 10)
-        self.assertEqual(entry.state, "ACCOUNTED")
-        self.assertEqual(ledger.pending("tp1"), (0, 0, 0))
+    def test_waiting_inventory_owns_prompt_demand_without_allocated_blocks(self):
+        self.assertEqual(self.co.ledger.unobserved_ingress("tp1"), (1, 64))
+        adjusted = self.co.ledger.routing_reading(reading("tp1"))
+        self.assertEqual(adjusted.pending_prompt_tokens, 64)
+        self.assertEqual(adjusted.waiting, 1)
+        self.ingress.reconcile(self.snapshot(owned_blocks=0, generated=0), 10)
+        self.assertEqual(self.co.ledger.unobserved_ingress("tp1"), (0, 0))
+        self.assertEqual(self.co.ledger.pending("tp1"), (0, 0, 0))
+        self.assertEqual(self.stream.server_id, self.server_id)
         with self.assertRaises(RuntimeError):
             self.ingress.refuse_restart_if_active()
 
-    def test_prompt_reservation_rounds_up_without_reserving_output(self):
+    def test_context_cap_routes_with_zero_free_blocks_and_no_ingress_reservation(self):
         ledger = p.ReservationLedger()
         result = p.admit(
             "tail",
             65,
             8192,
-            (reading("tp1"), replace(reading("tp4"), context_limit=16384)),
+            (
+                replace(reading("tp1"), free_blocks=0),
+                replace(reading("tp4"), context_limit=16384, free_blocks=0),
+            ),
             self.co.policy.cfg,
             ledger,
             10,
             "tail",
-            {},
         )
         self.assertEqual(result.pool_id, "tp4")
         self.assertEqual(result.max_output_tokens, 8192)
-        self.assertEqual(result.reservation_basis, "prompt_only")
-        self.assertEqual(ledger.pending("tp4")[0], 5)
+        self.assertEqual(result.reservation_basis, "none")
+        self.assertEqual(ledger.pending("tp4"), (0, 0, 65))
+
+    def test_completion_before_first_inventory_does_not_leave_tracking_active(self):
+        self.executor.future.set_result({"completed_unix_s": 9})
+        snapshot = self.snapshot()
+        snapshot["requests"] = []
+        self.ingress.reconcile(snapshot, 10)
+        entry = self.co.ledger.entries[self.stream.reservation_key]
+        self.assertEqual(entry.state, "COMPLETED")
+        self.assertEqual(self.co.ledger.unobserved_ingress("tp1"), (0, 0))
+        self.ingress.refuse_restart_if_active()
+
+    def test_due_arrival_is_dispatched_once_without_inventory_or_capacity(self):
+        args = SimpleNamespace(source_context_limit=8192, target_context_limit=16384)
+        pools = pilot.unknown_routing_pools(args, 16)
+        jobs = [
+            dict(id="due", at_s=0, request=self.stream.payload),
+            dict(id="future", at_s=20, request=self.stream.payload),
+        ]
+        dispatched = {}
+        audit = SimpleNamespace(write=self.rows.append)
+        tokens = SimpleNamespace(submit=lambda row: None)
+        for _ in range(2):
+            pilot.dispatch_due(jobs, dispatched, 10, self.ingress, pools, tokens, audit)
+        self.assertEqual(list(dispatched), ["due"])
+        self.assertEqual(dispatched["due"].pool_id, "tp1")
+        self.assertEqual(self.co.ledger.pending("tp1")[:2], (0, 0))
+        self.executor.function()
+        self.assertEqual(len(self.http_calls), 1)
+        self.assertEqual(self.http_calls[0][0], "source")
 
     def test_long_prompt_can_enter_idle_pool_instead_of_queueing_forever(self):
         source = replace(reading("tp1"), idle=True, decode_samples=0, decode_ratio=None)
@@ -211,7 +235,6 @@ class IngressTests(unittest.TestCase):
             p.ReservationLedger(),
             10,
             "long-key",
-            {"tp1": 0.1, "tp4": 0.1},
         )
         self.assertEqual(result.pool_id, "tp1")
         self.assertEqual(result.max_output_tokens, 1024)

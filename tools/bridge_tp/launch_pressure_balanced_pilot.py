@@ -230,6 +230,10 @@ def build_scene(spec, scene, run_root, common, args):
         str(run_dir / "source_inventory.jsonl"),
         "--target-inventory",
         str(run_dir / "target_inventory.jsonl"),
+        "--source-context-limit",
+        str(args.max_model_len),
+        "--target-context-limit",
+        str(args.tp4_max_model_len),
         "--predictor-events",
         str(run_dir / "predictor_events.jsonl"),
         "--predictor-sha256",
@@ -440,7 +444,8 @@ def run_scene(spec, scene, plan, common, args):
                             f"{status.get('submitted', 0)}/{status.get('total', '?')}"
                         ),
                         completed=status.get("completed", 0),
-                        queued=len(status.get("queued", [])),
+                        pending_dispatch=len(status.get("queued", [])),
+                        engine_waiting=status.get("engine_waiting", {}),
                         pools=(
                             f"{status.get('source_zone', '?')}/"
                             f"{status.get('target_zone', '?')}"
