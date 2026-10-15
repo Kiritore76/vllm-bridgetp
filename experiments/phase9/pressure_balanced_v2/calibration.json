@@ -8289,5 +8289,41 @@
       "injections_per_size": 2,
       "recovery_s": 3
     }
+  ],
+  "pressure_screen_scenes": [
+    {
+      "prompt_tokens": 2048,
+      "source_count": 3,
+      "target_count": 1,
+      "max_tokens": 2048,
+      "target_max_tokens": 4096,
+      "injection_pools": [
+        "source"
+      ],
+      "settle_s": 5,
+      "name": "source-prefill-pulse",
+      "injection_prompt_tokens": [
+        2048
+      ],
+      "injections_per_size": 1,
+      "recovery_s": 3
+    },
+    {
+      "prompt_tokens": 2048,
+      "source_count": 3,
+      "target_count": 1,
+      "max_tokens": 2048,
+      "target_max_tokens": 4096,
+      "injection_pools": [
+        "source"
+      ],
+      "settle_s": 5,
+      "name": "source-prefill-train",
+      "injection_prompt_tokens": [
+        6144
+      ],
+      "injections_per_size": 12,
+      "recovery_s": 0
+    }
   ]
 }

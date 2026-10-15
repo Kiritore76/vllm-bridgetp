@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from tools.bridge_tp import run_pressure_calibration as c
@@ -153,6 +154,106 @@ class CalibrationTests(unittest.TestCase):
                 result = c.pilot.read(root / "request_results.json")
                 self.assertEqual(result["status"], "TECHNICAL_FAILURE")
                 self.assertIn("background ended", result["error"])
+            finally:
+                work.executor.shutdown(wait=True)
+
+    def test_pressure_screen_keeps_target_free_of_injected_prefill(self):
+        class FakeWork:
+            timeout_s = 2
+
+            def __init__(self):
+                import threading
+
+                self.stop = threading.Event()
+                self.rows, self.futures, self.calls = [], [], []
+
+            def submit(self, pool, prompt, output, label):
+                self.calls.append((pool, prompt, output, label))
+                row = dict(id=label, first_token_unix_s=1, done="prefill" in label)
+                self.rows.append(row)
+                if sum("prefill" in r["id"] for r in self.rows) == 12:
+                    for r in self.rows:
+                        r["done"] = True
+                future = SimpleNamespace(done=lambda: row["done"], result=lambda: None)
+                self.futures.append(future)
+                return label, future
+
+            def snapshot(self):
+                return self.rows
+
+            def wait(self, predicate, deadline):
+                if not predicate():
+                    raise AssertionError("unexpected waiting in controlled fixture")
+
+        work = FakeWork()
+        scene = self.config["pressure_screen_scenes"][1]
+        with tempfile.TemporaryDirectory(dir=c.ROOT) as directory:
+            c.drive(work, dict(scene, settle_s=0), 1, Path(directory))
+        injections = [x for x in work.calls if "prefill" in x[3]]
+        self.assertEqual(len(injections), 12)
+        self.assertTrue(all(x[0] == "source" for x in injections))
+        target = [x for x in work.calls if x[0] == "target"]
+        self.assertEqual([x[2] for x in target], [4096])
+
+    def test_observer_persists_real_capture_time_and_metrics(self):
+        telemetry = c.load("telemetry")
+        calls = []
+        with tempfile.TemporaryDirectory(dir=c.ROOT) as directory:
+            root = Path(directory)
+            work = c.Workload(
+                self.config, root, {"source": "unused", "target": "unused"}, 1
+            )
+            for pool, label in (("source", "tp1"), ("target", "tp4")):
+                (root / f"{pool}_inventory.jsonl").write_text(
+                    json.dumps(
+                        dict(
+                            schema="PRESSURE_INVENTORY_V1",
+                            pool_id=label,
+                            generation=1,
+                            sampled_at=time.time(),
+                            block_size=16,
+                            total_blocks=1001,
+                            usage_denominator_blocks=1000,
+                            free_blocks=1000,
+                        )
+                    )
+                    + "\n"
+                )
+
+            class FakeScraper:
+                def __init__(self, url, block_size, total, timeout_s):
+                    calls.append((url, total))
+
+                def scrape(self):
+                    if len(calls) == 2:
+                        work.stop.set()
+                    return SimpleNamespace(
+                        sampled_unix_s=time.time(),
+                        num_running=0,
+                        num_waiting=0,
+                        free_kv_blocks=1000,
+                    )
+
+            receipt = dict(valid_records=0, error_records=0)
+            try:
+                with patch.object(telemetry, "MetricsScraper", FakeScraper):
+                    c.observe(work, receipt)
+                self.assertEqual(receipt["valid_records"], 2)
+                self.assertEqual(receipt["error_records"], 0)
+                self.assertEqual(receipt["valid_by_pool"], dict(source=1, target=1))
+                rows = [
+                    json.loads(line)
+                    for line in (root / "observation_events.jsonl")
+                    .read_text()
+                    .splitlines()
+                ]
+                self.assertTrue(
+                    all(
+                        r["captured_unix_s"] >= r["observed_at"] >= r["sampled_at"]
+                        for r in rows
+                    )
+                )
+                self.assertEqual([r["pool"] for r in rows], ["source", "target"])
             finally:
                 work.executor.shutdown(wait=True)
 

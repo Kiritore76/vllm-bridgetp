@@ -218,7 +218,7 @@
     "vllm/bridge_tp/controller/token_equivalence.py": "2c08c69fa0c36112d8d466a0975f5df374eb255191ea7d30d6070c8b4c307664",
     "vllm/bridge_tp/controller/__init__.py": "14372049a07f1c7659127e71461ce2cbf22742372e93395b72b374e1d2a92b3d",
     "vllm/v1/core/sched/scheduler.py": "6a5c5391ccf5d319b3dd416e51c80672ccdfca38f2e282c2e2dd7299013c05bc",
-    "tools/bridge_tp/run_pressure_pilot.sh": "339a187a6dc00c5cdce211fc73eda2fedd82876fa3539d2d1a174b4ebefa07b9",
+    "tools/bridge_tp/run_pressure_pilot.sh": "1637a771794d2c59f4301b6c794968ce764c8ba5f36859d5749e9a95c691f94b",
     "experiments/phase9/pressure_balanced_v2/both-light.json": "0227597a29fdd431f99e13965bad181bb2ef1c0c5fcb5f7aa091031d690d0ca0",
     "experiments/phase9/pressure_balanced_v2/capacity-arrival.json": "cc214b44b52f879b1c6eb1d1716c527443c5f3e84abde85e0523e0092af6b805",
     "experiments/phase9/pressure_balanced_v2/controller_template.json": "a2f28faa36e87485bd2a23545d165b3aa0ed31481d5b663852bb75a2a606fdb3",
@@ -227,9 +227,12 @@
     "experiments/phase9/pressure_balanced_v2/source-decode.json": "d724af2b65da5f67387a26e94207ac84b0b4b337ae0ec8f1b7741a045b1daf2b",
     "experiments/phase9/pressure_balanced_v2/target-prefill.json": "9e3eb9a18f4836326c5dd6cfa774e432d488e412a3264fed5fe9d978ea92c30a",
     "vllm/bridge_tp/delta_batching.py": "15b3ba56d7e65f2c22953fb6eca2eff8d29e5c5616e02ba6d8a3827f53019c43",
-    "tools/bridge_tp/run_pressure_calibration.py": "43193aaa7d3abd7f6e759e55509199561b7c16168c828a6ed8311e5e2108a584",
-    "tests/bridge_tp/test_pressure_calibration.py": "ce483e50281758c7da9ca6242cc1c7b39a314961c119d1aae3afda4463e3969f",
-    "experiments/phase9/pressure_balanced_v2/calibration.json": "a66318e4ae8188f031c2019873020c9883d19430024d46e520a7e8ab6f49f9ac"
+    "tools/bridge_tp/run_pressure_calibration.py": "2c47d7c2c5730561fdd4d084fea59e445b8d12195fe272e7c88c80beadab7000",
+    "tests/bridge_tp/test_pressure_calibration.py": "7d783100929f2b94570ab97fdca5b7f644266ec005222a9f4a59087ac8fa90cf",
+    "experiments/phase9/pressure_balanced_v2/calibration.json": "d89eace5cc1922bfc5dbc7f96e9dd669895f55eda6340b8c8518928b622c2c58",
+    "tools/bridge_tp/prefill_cost_reference.py": "9d12bbae373c2849e284599174cab1caafc0660938f8d52007d8af4543ff9a9c",
+    "tools/bridge_tp/replay_pressure_calibration.py": "d63e84a5fd50120287ba1b79fa1bee26f817eb3d52623ca78fcac5ec2a4110fb",
+    "tests/bridge_tp/test_prefill_cost_reference.py": "041268dcfa05ea323b32ac4e1c43525fc262f3774b729665037fb661fffe5127"
   },
   "server_settings": {
     "dtype": "bfloat16",

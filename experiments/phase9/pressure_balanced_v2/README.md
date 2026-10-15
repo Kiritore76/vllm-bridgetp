@@ -178,3 +178,54 @@ submitted/completed/token counts every ten seconds, finalization and cleanup.
 Do not run --full to collect this batch; --full still runs the original four
 function scenarios. Results stay outside Git; scripts and inputs replace the
 fixed tracked files in place, without another uploaded input archive.
+
+
+## Targeted pressure screening after offline calibration
+
+The broad 10-run baseline is already complete. Do not repeat it to choose
+persistence and target spare parameters. The held-repeat-out offline reference
+covers only observed token/Nd/context shapes and returns UNKNOWN outside its
+bounded support; it is not enabled in serving. The ordinary pressure gate
+replay does not invent PMFs, migration feasibility or benefits.
+
+A small follow-up separates brief source pressure from a longer train while
+the target stays lightly loaded:
+
+```bash
+bash tools/bridge_tp/run_pressure_pilot.sh --pressure-screen
+```
+
+This runs two scenes, each twice (four fresh scenes total). Both have three
+TP1 background requests (2k prompt / 2048 output) and one TP4 background request
+(2k prompt / 4096 output). After all have started, wait five seconds to clear
+the initial service window, then inject into TP1 only:
+
+- source-prefill-pulse: one 2048-prompt / 16-output request;
+- source-prefill-train: twelve successive 6144-prompt / 16-output requests,
+  waiting for each completion with no added recovery delay.
+
+All backgrounds must still be alive at every injection. This remains an
+observational no-migration batch: it supplies pressure-positive cases for
+offline persistence/spare screening, before selecting an actual migration
+comparison. Nominal train duration is not an acceptance label; inspect its real
+pressure and queue duration. It does not claim to cover emergency KV pressure.
+
+The new mode additionally records native inventory generation/observation time
+and real parsed /metrics heartbeats in controller/observation_events.jsonl.
+An old empty inventory cannot become fresh merely because replay time advances.
+Both pools must have valid observation records; scrape errors remain explicit.
+The replay tool can consume these actual capture times instead of assuming
+publication lag. Observer CPU/HTTP overhead is part of this instrumented run.
+
+Offline tools (no model/server startup) are:
+
+```bash
+.venv/bin/python -B tools/bridge_tp/replay_pressure_calibration.py \
+  --archive /path/to/returned-calibration.tar.gz --out-dir /path/to/analysis
+```
+
+Use the actual environment Python on the machine; on this GPU host it lives at
+/root/autodl-tmp/bridgetp/.venv_bridge/bin/python. The offline tool writes a
+prefill reference and held-repeat-out pressure replay, not a serving policy.
+Results are pressure-balanced-git-v2-pressure-screen-*.tar.gz outside Git.
+The normal --calibrate and original --full inputs/modes retain their meanings.

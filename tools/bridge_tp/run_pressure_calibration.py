@@ -57,13 +57,24 @@ def validate_config(config):
     ):
         raise ValueError("calibration scope differs from frozen plan")
     names = set()
-    for scene in config["scenes"]:
+    for scene in config["scenes"] + config.get("pressure_screen_scenes", []):
         if scene["name"] in names:
             raise ValueError("duplicate scene")
         names.add(scene["name"])
         if not 1 <= scene["source_count"] <= 6 or not 1 <= scene["target_count"] <= 16:
             raise ValueError("concurrency outside collection scope")
-        payload(config, scene["prompt_tokens"], scene["max_tokens"], "validate")
+        for pool in ("source", "target"):
+            payload(
+                config,
+                scene["prompt_tokens"],
+                scene.get(pool + "_max_tokens", scene["max_tokens"]),
+                "validate",
+            )
+        if set(scene.get("injection_pools", ["source", "target"])) - {
+            "source",
+            "target",
+        }:
+            raise ValueError("invalid injection pool")
         for count in scene.get("injection_prompt_tokens", []):
             payload(config, count, 16, "validate")
 
@@ -120,12 +131,18 @@ def capacity_check(scene, inventories):
     receipt = {}
     for pool, inv in zip(("source", "target"), inventories):
         count = scene[pool + "_count"]
-        tokens = scene["prompt_tokens"] + scene["max_tokens"]
+        tokens = scene["prompt_tokens"] + scene.get(
+            pool + "_max_tokens", scene["max_tokens"]
+        )
         per_request = (tokens + inv["block_size"] - 1) // inv["block_size"]
         injection = max(scene.get("injection_prompt_tokens", [0])) + (
             16 if "injection_prompt_tokens" in scene else 0
         )
-        extra = (injection + inv["block_size"] - 1) // inv["block_size"]
+        extra = (
+            (injection + inv["block_size"] - 1) // inv["block_size"]
+            if pool in scene.get("injection_pools", ["source", "target"])
+            else 0
+        )
         required = count * per_request + extra
         receipt[pool] = dict(required_blocks=required, free_blocks=inv["free_blocks"])
         if required > inv["free_blocks"]:
@@ -146,6 +163,7 @@ class Workload:
         self.stop = threading.Event()
         self.futures = []
         self.executor = ThreadPoolExecutor(max_workers=32)
+        self.observer_error = None
 
     def submit(self, pool, prompt, output, label):
         request = payload(self.config, prompt, output, label)
@@ -212,6 +230,8 @@ class Workload:
         return label, future
 
     def check(self):
+        if self.observer_error is not None:
+            raise RuntimeError(self.observer_error)
         for future in list(self.futures):
             if future.done():
                 future.result()
@@ -237,7 +257,7 @@ def drive(work, scene, repetition, root):
             work.submit(
                 pool,
                 scene["prompt_tokens"],
-                scene["max_tokens"],
+                scene.get(pool + "_max_tokens", scene["max_tokens"]),
                 f"r{repetition}-{pool}-background-{index}",
             )[0]
             for index in range(scene[pool + "_count"])
@@ -253,6 +273,8 @@ def drive(work, scene, repetition, root):
             )
 
         work.wait(ready, deadline)
+        if work.stop.wait(scene.get("settle_s", 0)):
+            raise RuntimeError("workload stopped before injection")
         for size in scene["injection_prompt_tokens"]:
             for wave in range(scene["injections_per_size"]):
                 rows = {r["id"]: r for r in work.snapshot()}
@@ -262,7 +284,7 @@ def drive(work, scene, repetition, root):
                     work.submit(
                         pool, size, 16, f"r{repetition}-{pool}-prefill-{size}-{wave}"
                     )[1]
-                    for pool in ("source", "target")
+                    for pool in scene.get("injection_pools", ["source", "target"])
                 ]
                 work.wait(lambda batch=injected: all(f.done() for f in batch), deadline)
                 for future in injected:
@@ -275,7 +297,61 @@ def drive(work, scene, repetition, root):
     )
 
 
-def run_scene(spec, config, scene, repetition, root, common, settings):
+def observe(work, receipt):
+    """Persist actual inventory observation times and independently live metrics."""
+    observation = load("pressure_observation")
+    telemetry = load("telemetry")
+    readers = {
+        pool: observation.InventoryReader(
+            work.run_dir / f"{pool}_inventory.jsonl",
+            "tp1" if pool == "source" else "tp4",
+        )
+        for pool in ("source", "target")
+    }
+    scrapers = {}
+    with (work.run_dir / "observation_events.jsonl").open("w", encoding="utf-8") as out:
+        while not work.stop.is_set():
+            for pool, reader in readers.items():
+                now = time.time()
+                try:
+                    inventory = reader.poll(now)
+                    if reader.error:
+                        work.observer_error = reader.error
+                        raise RuntimeError(reader.error)
+                    if inventory is None:
+                        continue
+                    if pool not in scrapers:
+                        scrapers[pool] = telemetry.MetricsScraper(
+                            work.urls[pool],
+                            inventory["block_size"],
+                            inventory["usage_denominator_blocks"],
+                            timeout_s=1,
+                        )
+                    metrics = observation.scrape_inventory_metrics(
+                        scrapers[pool], inventory
+                    )
+                    event = dict(
+                        pool=pool,
+                        generation=inventory["generation"],
+                        sampled_at=inventory["sampled_at"],
+                        observed_at=reader.observed_at,
+                        metrics=metrics,
+                    )
+                    receipt["valid_records"] += 1
+                    counts = receipt.setdefault("valid_by_pool", {})
+                    counts[pool] = counts.get(pool, 0) + 1
+                except Exception as error:
+                    event = dict(pool=pool, error=repr(error))
+                    receipt["error_records"] += 1
+                event["captured_unix_s"] = time.time()
+                out.write(json.dumps(event) + "\n")
+                out.flush()
+            work.stop.wait(0.2)
+
+
+def run_scene(
+    spec, config, scene, repetition, root, common, settings, capture_observations=False
+):
     from tools.bridge_tp.run_atomic_takeover import _post_json
     from tools.bridge_tp.run_phase9_cap0_noop import warmup_prompt_shapes
     from tools.bridge_tp.run_phase9_controller import RuntimeControl
@@ -305,7 +381,8 @@ def run_scene(spec, config, scene, repetition, root, common, settings):
     ).write(run_dir)
     # No controller or stager is started. Source hooks remain unarmed throughout.
     urls = {pool: plan["config"][pool + "_url"] for pool in ("source", "target")}
-    processes, work = [], None
+    processes, work, observer = [], None, None
+    observation_receipt = dict(valid_records=0, error_records=0)
     warm_requests = [
         payload(config, size, 16, "warm")
         for size in sorted(
@@ -359,6 +436,11 @@ def run_scene(spec, config, scene, repetition, root, common, settings):
             root / "measurement_window.json", {"started_unix_s": time.time()}
         )
         work = Workload(config, run_dir, urls, spec["run_timeout_s"])
+        if capture_observations:
+            observer = threading.Thread(
+                target=observe, args=(work, observation_receipt), daemon=True
+            )
+            observer.start()
         driver = threading.Thread(
             target=drive_guarded, args=(work, scene, repetition, root), daemon=True
         )
@@ -382,6 +464,11 @@ def run_scene(spec, config, scene, repetition, root, common, settings):
         result = pilot.read(root / "request_results.json")
         if result["status"] != "COMPLETED":
             raise RuntimeError(result["error"])
+        if capture_observations and not all(
+            observation_receipt.get("valid_by_pool", {}).get(pool, 0)
+            for pool in ("source", "target")
+        ):
+            raise RuntimeError("no live observation evidence recorded")
         inventories = wait_empty(run_dir, after_generations=initial_generations)
         common.write_json(root / "native_empty_receipt.json", inventories)
         window = pilot.read(root / "measurement_window.json")
@@ -409,6 +496,9 @@ def run_scene(spec, config, scene, repetition, root, common, settings):
     finally:
         if work:
             work.stop.set()
+        if observer:
+            observer.join(5)
+            common.write_json(root / "observation_receipt.json", observation_receipt)
         stage("清理本场受管进程")
         common.stop_processes(processes)
         if work:
@@ -459,12 +549,17 @@ def main():
     parser.add_argument("--spec", type=Path, required=True)
     parser.add_argument("--out-root", type=Path, required=True)
     parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument("--pressure-screen", action="store_true")
     args = parser.parse_args()
     spec = pilot.load_spec(args.spec)
     pilot.verify_spec(spec)
     config_path = args.spec.parent / "calibration.json"
     config = pilot.read(config_path)
     validate_config(config)
+    selected = (
+        config["pressure_screen_scenes"] if args.pressure_screen else config["scenes"]
+    )
+    total_scenes = len(selected) * config["repetitions"]
     common, settings = pilot.arguments(spec)
     from vllm.entrypoints.openai.cli_args import (
         make_arg_parser,
@@ -487,6 +582,7 @@ def main():
             "-m",
             "unittest",
             "tests.bridge_tp.test_pressure_calibration",
+            "tests.bridge_tp.test_prefill_cost_reference",
             "tests.bridge_tp.test_rolling_cutover",
             "tests.bridge_tp.test_pressure_observation",
             "tests.bridge_tp.test_performance_trace",
@@ -497,6 +593,16 @@ def main():
     args.out_root.mkdir(parents=True, exist_ok=False)
     common.write_json(args.out_root / "frozen_spec.json", spec)
     common.write_json(args.out_root / "calibration_config.json", config)
+    common.write_json(
+        args.out_root / "selection.json",
+        dict(
+            mode="pressure-screen" if args.pressure_screen else "calibration",
+            scenes=[s["name"] for s in selected],
+            repetitions=config["repetitions"],
+            migration_enabled=False,
+            capture_observations=args.pressure_screen,
+        ),
+    )
     (args.out_root / "gpu_inventory.txt").write_text(
         subprocess.check_output(
             ["nvidia-smi", "--query-gpu=uuid,name,memory.total", "--format=csv"],
@@ -505,9 +611,11 @@ def main():
     )
     results = []
     for repetition in range(1, config["repetitions"] + 1):
-        for scene in config["scenes"]:
+        for scene in selected:
             name = f"{scene['name']}-r{repetition}"
-            pilot.announce(name, "开始场景", number=f"{len(results) + 1}/10")
+            pilot.announce(
+                name, "开始场景", number=f"{len(results) + 1}/{total_scenes}"
+            )
             try:
                 check_gpu()
                 result = run_scene(
@@ -518,6 +626,7 @@ def main():
                     args.out_root / name,
                     common,
                     settings,
+                    capture_observations=args.pressure_screen,
                 )
             except Exception as error:
                 result = dict(status="TECHNICAL_FAILURE", error=repr(error))
@@ -528,7 +637,7 @@ def main():
                 scene=name,
                 stage="场景完成" if result["status"] == "COMPLETED" else "失败",
                 completed_scenes=len(results),
-                total_scenes=10,
+                total_scenes=total_scenes,
                 **result,
             )
             pilot.announce(name, "场景结束", **result)
