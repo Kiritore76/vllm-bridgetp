@@ -46,6 +46,36 @@ class LocalServiceLookup:
                 return cell["engine_ms"]["p95"] / 1000
         return None
 
+    def decode_envelope(self, pool, nd, kd):
+        """Empirical P95 envelope from observed heavier decode shapes.
+
+        Assumes nondecreasing cost in request count and mean context. This is
+        a bounded-domain working estimate, not a statistical/physical upper
+        bound. Preserve the observed maximum separately, including stalls.
+        """
+        if nd == kd == 0:
+            return dict(upper_s=0.0, tail_max_s=0.0, cells=[])
+        if nd <= 0 or kd < 0:
+            return None
+        cells = [
+            (index, cell)
+            for index, cell in enumerate(self.cells)
+            if cell["pool"] == pool
+            and cell["phase"] == "decode"
+            and cell["runs"] >= self.minimum_runs
+            and cell["samples"] >= self.minimum_samples
+            and cell["decode_requests"] >= nd
+            and cell["decode_requests"] > 0
+            and cell["context_sum_range"]["min"] / cell["decode_requests"] >= kd / nd
+        ]
+        if not cells:
+            return None
+        return dict(
+            upper_s=max(cell["engine_ms"]["p95"] for _, cell in cells) / 1000,
+            tail_max_s=max(cell["engine_ms"]["max"] for _, cell in cells) / 1000,
+            cells=[index for index, _ in cells],
+        )
+
     def deltas(self, source, target, request_id, reference_s=0.1):
         row = next(
             (r for r in source.get("requests", []) if r["request_id"] == request_id),
@@ -73,12 +103,25 @@ class LocalServiceLookup:
             self.estimate("target", tn + 1, tk + context, target["prefill_tokens"]),
         ]
         if any(x is None for x in v):
-            return None, None
+            # Do not infer positive source relief from a sparse lookup. Budget
+            # the entire post-move target step, rather than an optimistic delta.
+            source_support = self.decode_envelope("source", n, k)
+            target_support = self.decode_envelope("target", tn + 1, tk + context)
+            if (
+                source["prefill_tokens"]
+                or target["prefill_tokens"]
+                or (source_support is None or target_support is None)
+            ):
+                return None, None
+            return 0.0, target_support["upper_s"] / reference_s
         return max(0, v[0] - v[1]) / reference_s, max(0, v[3] - v[2]) / reference_s
 
     def admission_cost(self, pool, batch, prompt_tokens, reference_s=0.1):
+        return self.admission_details(pool, batch, prompt_tokens, reference_s)["cost"]
+
+    def admission_details(self, pool, batch, prompt_tokens, reference_s=0.1):
         if batch.get("recompute_tokens"):
-            return None
+            return dict(cost=None, basis="recompute unsupported")
         n, k, prefill = (
             batch["decode_requests"],
             batch["decode_context_sum"],
@@ -87,5 +130,15 @@ class LocalServiceLookup:
         before = self.estimate(pool, n, k, prefill)
         after = self.estimate(pool, n + 1, k + prompt_tokens, prefill)
         if before is None or after is None:
-            return None
-        return max(0, after - before) / reference_s
+            support = self.decode_envelope(pool, n + 1, k + prompt_tokens)
+            if prefill or support is None:
+                return dict(cost=None, basis="outside empirical decode support")
+            return dict(
+                cost=support["upper_s"] / reference_s,
+                basis="heavier-observed-shape P95 envelope; not a hard bound",
+                **support,
+            )
+        return dict(
+            cost=max(0, after - before) / reference_s,
+            basis="exact local P95 difference",
+        )

@@ -15,5 +15,7 @@
   "capacity_guard_blocks": 125,
   "survival_horizon": 256,
   "min_survival_lower": 0.5,
-  "length_resolution": 512
+  "length_resolution": 512,
+  "prefill_backlog_budget": 8192,
+  "very_long_prompt_tokens": 4096
 }

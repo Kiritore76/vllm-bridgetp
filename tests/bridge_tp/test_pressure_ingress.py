@@ -174,7 +174,7 @@ class IngressTests(unittest.TestCase):
             "long-key",
             {"tp1": 0.1, "tp4": 0.1},
         )
-        self.assertEqual(result.pool_id, "tp4")
+        self.assertEqual(result.pool_id, "tp1")
         self.assertEqual(result.max_output_tokens, 1024)
 
 

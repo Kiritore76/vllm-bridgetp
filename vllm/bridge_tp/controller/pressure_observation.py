@@ -207,6 +207,15 @@ def pool_reading(
     # the true completed sample count/freshness; a gap cannot fabricate samples.
     if ratio is not None:
         ratio = max(ratio, service["max_active_gap_s"] / service["reference_s"])
+    scheduled = inventory.get("last_scheduled_batch")
+    step = 0 if idle else None
+    if (
+        scheduled
+        and not scheduled.get("error")
+        and (0 <= now - scheduled["sampled_at"] <= cfg.max_age_s)
+        and not idle
+    ):
+        step = scheduled["prefill_tokens"]
     return PoolReading(
         pool_id=inventory["pool_id"],
         sampled_at=sampled_at,
@@ -223,4 +232,5 @@ def pool_reading(
         growth_blocks_s=growth_blocks_s,
         native_itl_p95_s=service["p95_s"],
         slow_interval_fraction=service["slow_fraction"],
+        prefill_batch_tokens=step,
     )

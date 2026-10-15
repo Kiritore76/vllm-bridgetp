@@ -3,7 +3,7 @@
 
 The callbacks integrate the existing M2/M3/M4 lifecycle; they must not launch a
 fresh source request, alter its stop contract, or bypass four-rank readiness.
-No production ingress currently calls this coordinator. Replay is CPU-only.
+The experimental real pilot ingress calls this coordinator. Replay is CPU-only.
 """
 
 from __future__ import annotations

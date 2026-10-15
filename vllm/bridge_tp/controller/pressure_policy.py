@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass, fields, replace
 
 from .bounded_length import BoundedLength
 
-VERSION = "pressure-balanced-v1-draft"
+VERSION = "pressure-balanced-v2-draft"
 
 
 @dataclass(frozen=True)
@@ -30,9 +30,12 @@ class PressureConfig:
     sustain_s: float = 1.0
     max_tick_gap_s: float = 0.5
     cooldown_s: float = 2.0
-    # Both prompt/prefill boundaries must be supplied from pilot calibration.
+    # Explicit draft boundaries; backlog and one scheduled step are distinct.
     prompt_boundary: int = 0
+    very_long_prompt_tokens: int = 4096
     prefill_pending_budget: int = 0
+    # Complete queued prompts have a separate, bounded backlog budget.
+    prefill_backlog_budget: int = 8192
     prefill_waiting_budget: int = 0
     capacity_guard_blocks: int = 0
     survival_horizon: int = 256
@@ -51,7 +54,9 @@ class PressureConfig:
             and self.length_resolution > 0
             and self.min_decode_samples > 0
             and self.prompt_boundary > 0
+            and self.very_long_prompt_tokens >= self.prompt_boundary
             and self.prefill_pending_budget > 0
+            and self.prefill_backlog_budget > 0
             and self.prefill_waiting_budget > 0
             and self.capacity_guard_blocks > 0
         ):
@@ -132,8 +137,14 @@ def classify(pool: PoolReading, cfg: PressureConfig, now: float) -> Pressure:
         prefill = None
         missing.append("prefill service")
     else:
+        step = pool.prefill_batch_tokens
+        if step is None and pool.pending_prompt_tokens == 0:
+            step = 0
+        if step is None or step < 0:
+            missing.append("prefill step")
         prefill = max(
-            pool.pending_prompt_tokens / cfg.prefill_pending_budget,
+            pool.pending_prompt_tokens / cfg.prefill_backlog_budget,
+            step / cfg.prefill_pending_budget if step is not None and step >= 0 else 0,
             pool.waiting / cfg.prefill_waiting_budget,
         )
     if pool.free_blocks is None or pool.free_blocks < 0:
@@ -551,7 +562,7 @@ class PressurePolicy:
                     or t.decode + pending_decode + c.target_decode_cost
                     > max(0, s.decode - c.source_decode_relief) + cfg.imbalance_enter
                     or (target.pending_prompt_tokens + pending_prefill)
-                    / cfg.prefill_pending_budget
+                    / cfg.prefill_backlog_budget
                     > cfg.spare_ratio
                 ):
                     reasons.append("post-move overload/reverse imbalance")
@@ -560,7 +571,7 @@ class PressurePolicy:
                 or t.decode is None
                 or not valid_costs
                 or t.decode + pending_decode + c.target_decode_cost > cfg.enter_ratio
-                or t.prefill + pending_prefill / cfg.prefill_pending_budget
+                or t.prefill + pending_prefill / cfg.prefill_backlog_budget
                 > cfg.enter_ratio
             ):
                 reasons.append("emergency target service budget unavailable")
@@ -608,6 +619,17 @@ class Admission:
     pool_id: str
     max_output_tokens: int
     reservation_key: str
+    decode_cost_known: bool = True
+    routing_reason: str = ""
+
+
+class AdmissionQueued(ValueError):
+    def __init__(self, diagnostics):
+        self.diagnostics = diagnostics
+        summary = "; ".join(
+            pool + ": " + ", ".join(row["reasons"]) for pool, row in diagnostics.items()
+        )
+        super().__init__("queue: " + summary)
 
 
 def admit(
@@ -625,49 +647,96 @@ def admit(
     """Fix a feasible total stop cap and reserve before dispatching a request.
 
     Callers must submit the returned max_output_tokens unchanged on both pools.
-    Pressure may override the prompt preference; overload/missing pools queue.
+    Service pressure guides routing, never hard admission. Only fresh physical
+    capacity and context/stop feasibility gate submission. Fixed pilot routes
+    are explicit constraints used for mechanism coverage, not normal routing.
     """
     if prompt_tokens < 0 or requested_output <= 0:
         raise ValueError("invalid request lengths")
     output_cap = min(8192, requested_output)
-    preferred = pools[1] if prompt_tokens >= cfg.prompt_boundary else pools[0]
-    eligible = []
+    source_pressure = classify(pools[0], cfg, now)
+    prefer_target = prompt_tokens >= cfg.very_long_prompt_tokens or (
+        prompt_tokens >= cfg.prompt_boundary
+        and source_pressure.zone in {"CRITICAL", "OVERLOAD"}
+    )
+    preferred = pools[1] if prefer_target else pools[0]
+    routing_reason = (
+        "very long known prompt"
+        if prompt_tokens >= cfg.very_long_prompt_tokens
+        else "long prompt and TP1 pressure"
+        if prefer_target
+        else "prefer TP1"
+    )
+    eligible, diagnostics = [], {}
     for pool in pools:
         if allowed_pool_id is not None and pool.pool_id != allowed_pool_id:
             continue
         p = classify(pool, cfg, now)
-        if p.missing or p.zone == "OVERLOAD":
-            continue
+        reasons = []
+        if "pool timestamp" in p.missing:
+            reasons.append("physical inventory stale/future")
+        if "KV geometry" in p.missing:
+            reasons.append("KV geometry")
         blocks, decode, pending = ledger.pending(pool.pool_id)
         cost = decode_costs.get(pool.pool_id)
         if cost is None or not math.isfinite(cost) or cost < 0:
-            continue
-        capped = min(output_cap, pool.context_limit - prompt_tokens)
-        required = math.ceil((prompt_tokens + capped) / pool.block_size)
-        if (
-            capped <= 0
-            or required + blocks > pool.free_blocks
-            or p.decode + decode + cost > cfg.leave_ratio
-            or (
-                (pool.pending_prompt_tokens + pending + prompt_tokens)
-                / cfg.prefill_pending_budget
-                > cfg.enter_ratio
-                and not (pool.idle and pending == 0 and pool.pending_prompt_tokens == 0)
-            )
-        ):
+            cost = None
+        capped = output_cap
+        required = (
+            math.ceil((prompt_tokens + capped) / pool.block_size)
+            if capped > 0 and pool.block_size > 0
+            else 0
+        )
+        if pool.block_size <= 0:
+            reasons.append("KV geometry")
+        if prompt_tokens + capped > pool.context_limit:
+            reasons.append("context/stop budget exhausted")
+        if pool.free_blocks is None or required + blocks > pool.free_blocks:
+            reasons.append("physical blocks including pending commitments")
+        backlog = (
+            None
+            if pool.pending_prompt_tokens is None
+            else (pool.pending_prompt_tokens + pending + prompt_tokens)
+        )
+        diagnostics[pool.pool_id] = dict(
+            reasons=reasons,
+            required_blocks=required,
+            pending_blocks=blocks,
+            free_blocks=pool.free_blocks,
+            projected_prompt_backlog=backlog,
+            prompt_backlog_reference=cfg.prefill_backlog_budget,
+            decode_cost=cost,
+            pending_decode=decode,
+            observed_decode=p.decode,
+            step_tokens=pool.prefill_batch_tokens,
+            waiting=pool.waiting,
+            waiting_pressure_reference=cfg.prefill_waiting_budget,
+            observed_zone=p.zone,
+            service_missing=p.missing,
+            service_constraints="routing/observation only, not admission gates",
+        )
+        if reasons:
             continue
         eligible.append((pool, capped, required, cost, p))
     if not eligible:
-        raise ValueError("queue: no feasible admission budget")
-    # Keep prompt preference unless it is critical and the alternative is spare.
-    eligible.sort(
-        key=lambda row: (row[4].zone != "SPARE", row[0].pool_id != preferred.pool_id)
-    )
+        raise AdmissionQueued(diagnostics)
+    eligible.sort(key=lambda row: row[0].pool_id != preferred.pool_id)
     pool, capped, blocks, cost, _ = eligible[0]
+    if allowed_pool_id is not None:
+        routing_reason = "fixed pilot route"
+    elif pool.pool_id != preferred.pool_id:
+        routing_reason += "; preferred pool physically/context infeasible"
+    cost_known = cost is not None
     ledger.reserve(
         Reservation(
-            key, request_id, pool.pool_id, blocks, cost, prompt_tokens, "admission"
+            key,
+            request_id,
+            pool.pool_id,
+            blocks,
+            cost if cost_known else cfg.leave_ratio,
+            prompt_tokens,
+            "admission",
         ),
         pool,
     )
-    return Admission(request_id, pool.pool_id, capped, key)
+    return Admission(request_id, pool.pool_id, capped, key, cost_known, routing_reason)

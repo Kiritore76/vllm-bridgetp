@@ -40,6 +40,7 @@ def pool(name="tp1", **kwargs):
         pending_prompt_tokens=0,
         waiting=0,
         growth_blocks_s=1.0,
+        prefill_batch_tokens=0,
     )
     return p.PoolReading(**(defaults | kwargs))
 
@@ -338,12 +339,13 @@ class LedgerRuntimeTests(unittest.TestCase):
             "small",
             512,
             8192,
-            (pool(), pool("tp4", decode_ratio=1.5)),
+            (pool(), pool("tp4", decode_ratio=1.5, context_limit=16384)),
             now=10,
             key="admit2",
             decode_costs={"tp1": 0.1, "tp4": 0.1},
         )
-        self.assertEqual(value2.max_output_tokens, 7680)
+        self.assertEqual(value2.pool_id, "tp4")
+        self.assertEqual(value2.max_output_tokens, 8192)
 
     def test_shared_arrival_reservations_block_migration_capacity(self):
         target = pool("tp4", free_blocks=500)
@@ -351,7 +353,7 @@ class LedgerRuntimeTests(unittest.TestCase):
             "new",
             512,
             6000,
-            (pool(decode_ratio=1.5), target),
+            (pool(decode_ratio=1.5, free_blocks=100), target),
             now=10,
             key="a",
             decode_costs={"tp1": 0.1, "tp4": 0.1},

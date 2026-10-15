@@ -556,6 +556,8 @@ def main():
             "tests.bridge_tp.test_rolling_cutover",
             "tests.bridge_tp.test_pressure_session",
             "tests.bridge_tp.test_pressure_bootstrap",
+            "tests.bridge_tp.test_pressure_preflight",
+            "tests.bridge_tp.test_pressure_policy",
         ],
         cwd=ROOT,
         check=True,

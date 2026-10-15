@@ -75,6 +75,21 @@ def real_heartbeat(raw, now=20):
 
 
 class BootstrapTests(unittest.TestCase):
+    def test_real_inventory_adapter_keeps_step_and_backlog_separate(self):
+        current = scheduler()
+        current.requests["a"].num_computed_tokens = 1024
+        raw = inv.inventory_snapshot(current, "tp1", 20)
+        raw["last_scheduled_batch"] = dict(prefill_tokens=2048, sampled_at=20)
+        window = o.NativeServiceWindow()
+        reading = o.pool_reading(raw, 20, window.snapshot("tp1", 20), CFG, 20)
+        self.assertEqual(reading.pending_prompt_tokens, 1024)
+        self.assertEqual(reading.prefill_batch_tokens, 2048)
+        self.assertEqual(p.classify(reading, CFG, 20).prefill, 1)
+        raw["sampled_at"] = 23
+        reading = o.pool_reading(raw, 23, window.snapshot("tp1", 23), CFG, 23)
+        self.assertIsNone(reading.prefill_batch_tokens)
+        self.assertIn("prefill step", p.classify(reading, CFG, 23).missing)
+
     def test_actual_allocator_parser_idle_heartbeat_admission(self):
         for total in (1963, 35739):
             with self.subTest(total=total):

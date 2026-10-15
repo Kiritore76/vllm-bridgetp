@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tests.bridge_tp.test_pressure_policy import config, pool
 from tools.bridge_tp import run_pressure_balanced_pilot as pilot
 from tools.bridge_tp.pressure_cpu import load
 from tools.bridge_tp.summarize_pressure_evidence import lookup_cells
@@ -15,14 +16,14 @@ def evidence():
     rows = []
     for run in ("one", "two"):
         for _ in range(5):
-            for pool, n, kd, engine in (
+            for pool_name, n, kd, engine in (
                 ("source", 1, 2048, 25),
                 ("source", 2, 4096, 30),
                 ("target", 1, 2048, 20),
             ):
                 rows.append(
                     dict(
-                        pool=pool,
+                        pool=pool_name,
                         run=run,
                         decode_requests=n,
                         decode_context_sum=kd,
@@ -73,6 +74,168 @@ class ServiceTests(unittest.TestCase):
         relief, cost = lookup.deltas(source, target, "a")
         self.assertAlmostEqual(relief, 0.05)
         self.assertAlmostEqual(cost, 0.2)
+
+
+class AdmissionPressureTests(unittest.TestCase):
+    def setUp(self):
+        self.p = load("pressure_policy")
+        root = Path(__file__).resolve().parents[2]
+        summary = json.loads(
+            (
+                root / "experiments/phase9/pressure_balanced_v2/service_evidence.json"
+            ).read_text()
+        )
+        self.lookup = load("pressure_service").LocalServiceLookup(summary)
+
+    def admit(self, ledger, request_id="new", cost=0.2, source=None):
+        return self.p.admit(
+            request_id,
+            4096,
+            4096,
+            (source or pool(), pool("tp4")),
+            config(),
+            ledger,
+            10,
+            request_id,
+            {"tp1": cost, "tp4": 0.1},
+            allowed_pool_id="tp1",
+        )
+
+    def test_prompt_backlog_does_not_gate_physically_feasible_admission(self):
+        ledger = self.p.ReservationLedger()
+        self.admit(ledger, "first")
+        self.admit(ledger, "second")
+        self.assertEqual(ledger.pending("tp1"), (1024, 0.4, 8192))
+        self.admit(ledger, "third")
+        self.assertEqual(ledger.pending("tp1")[0], 1536)
+        self.assertEqual(ledger.pending("tp1")[2], 12288)
+        with self.assertRaises(self.p.AdmissionQueued) as caught:
+            self.admit(ledger, "fourth")
+        self.assertIn(
+            "physical blocks including pending commitments",
+            caught.exception.diagnostics["tp1"]["reasons"],
+        )
+        self.assertNotIn("fourth", ledger.entries)
+
+    def test_migration_commitments_still_protect_physical_capacity(self):
+        ledger = self.p.ReservationLedger()
+        ledger.reserve(
+            self.p.Reservation("migration", "moving", "tp1", 1600, 0.1, 0, "migration"),
+            pool(),
+        )
+        with self.assertRaises(self.p.AdmissionQueued) as caught:
+            self.admit(ledger)
+        self.assertIn(
+            "physical blocks including pending commitments",
+            caught.exception.diagnostics["tp1"]["reasons"],
+        )
+
+    def test_unknown_cost_never_becomes_zero(self):
+        ledger = self.p.ReservationLedger()
+        admission = self.admit(ledger, cost=None)
+        self.assertFalse(admission.decode_cost_known)
+        self.assertEqual(ledger.pending("tp1")[1], config().leave_ratio)
+
+    def route(self, prompt, cap=1024, source=None, target=None):
+        return self.p.admit(
+            "route",
+            prompt,
+            cap,
+            (source or pool(), target or pool("tp4", context_limit=16384)),
+            config(),
+            self.p.ReservationLedger(),
+            10,
+            "route",
+            {},
+        )
+
+    def test_prefer_tp1_even_for_medium_prompt_when_not_pressured(self):
+        self.assertEqual(self.route(3072).pool_id, "tp1")
+        self.assertEqual(self.route(512, source=pool(decode_ratio=2)).pool_id, "tp1")
+
+    def test_long_prompt_prefers_tp4_only_when_tp1_pressured(self):
+        result = self.route(3072, source=pool(decode_ratio=1.5))
+        self.assertEqual(result.pool_id, "tp4")
+        self.assertIn("TP1 pressure", result.routing_reason)
+
+    def test_very_long_prompt_and_context_stop_budget_route_without_cap_shrink(self):
+        self.assertEqual(self.route(4096).pool_id, "tp4")
+        result = self.route(512, cap=8192)
+        self.assertEqual(result.pool_id, "tp4")
+        self.assertEqual(result.max_output_tokens, 8192)
+
+    def test_unknown_service_accepts_but_stale_physical_inventory_does_not(self):
+        source = pool(
+            decode_ratio=None,
+            decode_samples=0,
+            waiting=10,
+            pending_prompt_tokens=12000,
+            prefill_batch_tokens=None,
+        )
+        self.assertEqual(self.route(512, source=source).pool_id, "tp1")
+        stale = pool(sampled_at=0)
+        result = self.route(512, source=stale)
+        self.assertEqual(result.pool_id, "tp4")
+
+    def test_prefill_chunk_and_backlog_are_separate_pressure_axes(self):
+        step = pool(pending_prompt_tokens=4096, prefill_batch_tokens=2048)
+        reading = self.p.classify(step, config(), 10)
+        self.assertEqual(reading.prefill, 1.0)
+        self.assertEqual(reading.zone, "CRITICAL")
+        missing = pool(pending_prompt_tokens=4096, prefill_batch_tokens=None)
+        self.assertIn("prefill step", self.p.classify(missing, config(), 10).missing)
+        heavy = pool(pending_prompt_tokens=16384, prefill_batch_tokens=0)
+        self.assertEqual(self.p.classify(heavy, config(), 10).zone, "OVERLOAD")
+
+    def test_third_decode_request_uses_observed_heavier_shapes(self):
+        batch = dict(decode_requests=2, decode_context_sum=7000, prefill_tokens=0)
+        self.assertIsNone(self.lookup.estimate("source", 3, 9048))
+        detail = self.lookup.admission_details("source", batch, 2048)
+        self.assertGreater(detail["cost"], 0)
+        self.assertIn("not a hard bound", detail["basis"])
+        self.assertGreaterEqual(detail["tail_max_s"], detail["upper_s"])
+        ledger = self.p.ReservationLedger()
+        result = self.p.admit(
+            "peer",
+            2048,
+            2048,
+            (pool(), pool("tp4")),
+            config(),
+            ledger,
+            10,
+            "peer",
+            {"tp1": detail["cost"]},
+            allowed_pool_id="tp1",
+        )
+        self.assertEqual(result.pool_id, "tp1")
+
+    def test_envelope_never_extrapolates_beyond_observed_domain(self):
+        self.assertIsNone(self.lookup.decode_envelope("source", 7, 14000))
+        self.assertIsNone(self.lookup.decode_envelope("source", 3, 60000))
+        batch = dict(decode_requests=6, decode_context_sum=24000, prefill_tokens=0)
+        self.assertIsNone(self.lookup.admission_cost("source", batch, 2048))
+        batch.update(decode_requests=2, prefill_tokens=999)
+        self.assertIsNone(self.lookup.admission_cost("source", batch, 2048))
+
+    def test_sparse_move_estimate_cannot_invent_source_relief(self):
+        source = dict(
+            decode_requests=3,
+            decode_context_sum=9000,
+            prefill_tokens=0,
+            requests=[
+                dict(
+                    request_id="a",
+                    computed_before=3000,
+                    decode_tokens=1,
+                    prefill_tokens=0,
+                    recompute_tokens=0,
+                )
+            ],
+        )
+        target = dict(decode_requests=0, decode_context_sum=0, prefill_tokens=0)
+        relief, cost = self.lookup.deltas(source, target, "a")
+        self.assertEqual(relief, 0)
+        self.assertGreater(cost, 0)
 
 
 class PreflightTests(unittest.TestCase):

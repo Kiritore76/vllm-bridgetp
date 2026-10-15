@@ -103,8 +103,9 @@ Experimental integration now implemented, pending actual server acceptance:
    or session artifacts refuse restart; the ledger has no automatic recovery.
 
 The local service lookup is an engine-p95 proxy, not a causal native-ITL model.
-Unsupported or sparse cells return unknown. Idle pools can admit one physically
-feasible oversized prompt, avoiding permanent queues from a fixed prefill budget.
+Exact unsupported cells remain unknown; the bounded empirical decode fallback
+described below is separately identified. Long prompts can join a nonidle pool
+within shared physical commitments; service gaps do not hard-gate admission.
 The owned-process launcher and four arrival trajectories are prepared. It verifies
 committed HEAD/input/model/checkpoint identities and uses the real Linux serving/
 stager parsers before any server starts. The full original rolling regression is blocked
@@ -154,3 +155,27 @@ experiments/phase9/pressure_balanced_v2. After updating the existing branch, run
 `bash tools/bridge_tp/run_pressure_pilot.sh` for smoke or append `--full` for all
 four scenes. No input archive upload is needed. SHA checks are retained; the
 actual clean checkout HEAD and source spec digest are recorded at runtime.
+
+The four-scene run at 3a9902b completed 13 requests but produced zero migrations:
+only both-light was covered. Full prompt length had incorrectly been constrained
+by a one-step prefill budget; sparse three-request lookup cells also delayed
+admission. Revised pressure records actual prefill step tokens separately from
+pending full prompts. A draft 8192-token backlog reference is for pressure only;
+there is no idle-only long-prompt admission exception or service-pressure gate.
+Physical blocks and original output stop caps remain protected.
+
+For decode-only gaps, a separately audited empirical P95 envelope can use
+supported heavier request-count/mean-context shapes. It assumes monotone cost,
+is not a confidence bound, records the historical maximum as well, and never
+extends beyond a dominating observed shape. Fallback admission charges the whole
+post-admission step; fallback migration predicts no positive source relief.
+Unknown mixed/recompute costs stay unknown but do not queue feasible arrivals.
+Their temporary service reservation protects migration feasibility until actual
+stream service is observed. Decode thresholds, persistence,
+cooldown, capacity guard, PMF and transport mechanism are unchanged.
+
+Normal ingress prefers TP1. Prompts >=2048 prefer TP4 when TP1 is CRITICAL or
+OVERLOAD; known prompts >=4096 consider TP4 directly. If TP1 cannot fit the
+unchanged output cap/context or physical commitments, consider TP4 rather than
+shrinking that cap. These are draft prompt thresholds, not predicted output.
+Fixed scene routes remain explicit harness constraints, not this normal routing.

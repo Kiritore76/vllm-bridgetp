@@ -232,6 +232,7 @@ def run(args, prepared):
     progress_path = args.run_dir / "pressure_progress.json"
     last_status_at = -math.inf
     queue_reasons = {}
+    queue_details = {}
     last_metrics_error = {}
     failure = None
     try:
@@ -322,16 +323,17 @@ def run(args, prepared):
             for job in jobs:
                 if job["id"] in dispatched or elapsed < job["at_s"]:
                     continue
-                costs = {
-                    name: lookup.admission_cost(
+                cost_details = {
+                    name: lookup.admission_details(
                         pool, shape, len(job["request"]["prompt"])
                     )
                     if shape
-                    else None
+                    else dict(cost=None, basis="missing fresh batch")
                     for name, pool, shape in zip(
                         ("tp1", "tp4"), ("source", "target"), shapes
                     )
                 }
+                costs = {name: detail["cost"] for name, detail in cost_details.items()}
                 try:
                     value = ingress.submit(
                         job["request"],
@@ -345,12 +347,14 @@ def run(args, prepared):
                 except ValueError as error:
                     if not str(error).startswith("queue:"):
                         raise
-                    queue_reasons[job["id"]] = (
-                        f"{error}; local_service_costs={costs}; "
-                        f"route={job.get('route')}"
+                    queue_reasons[job["id"]] = str(error)
+                    queue_details[job["id"]] = dict(
+                        gates=getattr(error, "diagnostics", {}),
+                        service_cost_evidence=cost_details,
                     )
                     continue
                 queue_reasons.pop(job["id"], None)
+                queue_details.pop(job["id"], None)
                 dispatched[job["id"]] = value
                 audit.write(
                     dict(
@@ -361,6 +365,7 @@ def run(args, prepared):
                         client_id=value.client_id,
                         pool=value.pool_id,
                         frozen_cap=value.payload["max_tokens"],
+                        service_cost_evidence=cost_details,
                     )
                 )
             candidates, eos = [], {}
@@ -556,6 +561,15 @@ def run(args, prepared):
                     active_generated=sum(row[2] for row in marker[2]),
                     migration=marker[3],
                     queue_reasons=dict(queue_reasons),
+                    queue_details=dict(queue_details),
+                    prefill={
+                        pool.pool_id: dict(
+                            step_tokens=pool.prefill_batch_tokens,
+                            backlog_tokens=pool.pending_prompt_tokens,
+                            waiting=pool.waiting,
+                        )
+                        for pool in pools
+                    },
                 )
                 save_progress(progress_path, **status)
                 audit.write(dict(kind="pressure_progress", **status))
