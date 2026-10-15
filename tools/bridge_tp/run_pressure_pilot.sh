@@ -15,7 +15,8 @@ bridgetp_pressure_pilot_20261015_v2() {
     --full) mode=function; run_args=() ;;
     --calibrate) mode=calibration; run_args=(); runner=tools/bridge_tp/run_pressure_calibration.py ;;
     --pressure-screen) mode=pressure-screen; run_args=(--pressure-screen); runner=tools/bridge_tp/run_pressure_calibration.py ;;
-    *) printf 'Use no argument for smoke; use --full for four scenes or --calibrate / --pressure-screen for baseline collection.\n'; return 2 ;;
+    --compare) mode=comparison; run_args=(); runner=tools/bridge_tp/run_pressure_comparison.py ;;
+    *) printf 'Use no argument for smoke; --full, --calibrate, --pressure-screen or --compare.\n'; return 2 ;;
   esac
   [ "$#" -le 1 ] || return 2
   launcher_source="$(realpath -- "${BASH_SOURCE[0]}")" || return

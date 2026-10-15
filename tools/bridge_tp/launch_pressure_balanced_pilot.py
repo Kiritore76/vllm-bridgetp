@@ -349,7 +349,7 @@ def scene_result(run_dir, name):
     )
 
 
-def run_scene(spec, scene, plan, common, args):
+def run_scene(spec, scene, plan, common, args, *, before_shutdown=None):
     from tools.bridge_tp.run_phase9_cap0_noop import warmup_prompt_shapes
     from tools.bridge_tp.run_phase9_controller import RuntimeControl
 
@@ -478,6 +478,8 @@ def run_scene(spec, scene, plan, common, args):
             raise subprocess.CalledProcessError(
                 worker.process.returncode, plan["controller_argv"]
             )
+        if before_shutdown is not None:
+            before_shutdown(plan)
     finally:
         announce(scene["name"], "清理本场受管进程，核对退出")
         common.stop_processes(processes)

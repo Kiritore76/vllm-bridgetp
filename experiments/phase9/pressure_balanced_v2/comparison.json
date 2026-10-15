@@ -1,0 +1,341 @@
+{
+  "schema": "PRESSURE_COMPARISON_V1",
+  "source_archive": "pressure-balanced-git-v2-pressure-screen-20261015T140040Z-213461.tar.gz",
+  "source_archive_sha256": "932586f9040a28307b7a52b6f2a79cf2d7fa62c7b64c31e3e1217cf9e1cdc0ff",
+  "timestamp_field": "response.request_started_unix_s minus measurement_window.started_unix_s",
+  "policy_overrides": {
+    "sustain_s": 1.5
+  },
+  "arms": [
+    "stay",
+    "migrate"
+  ],
+  "maximum_migrations": 1,
+  "max_dispatch_lag_s": 0.5,
+  "itl_s": 0.1,
+  "slow_fraction": 0.01,
+  "recipes": [
+    {
+      "name": "source-prefill-pulse-r1",
+      "repetition": 1,
+      "kind": "pulse",
+      "arrivals": [
+        {
+          "id": "r1-source-background-0",
+          "at_s": 0.013803,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 2048
+        },
+        {
+          "id": "r1-source-background-1",
+          "at_s": 0.017493,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 2048
+        },
+        {
+          "id": "r1-source-background-2",
+          "at_s": 0.01989,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 2048
+        },
+        {
+          "id": "r1-target-background-0",
+          "at_s": 0.021375,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "r1-source-prefill-2048-0",
+          "at_s": 5.926197,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 16
+        }
+      ]
+    },
+    {
+      "name": "source-prefill-pulse-r2",
+      "repetition": 2,
+      "kind": "pulse",
+      "arrivals": [
+        {
+          "id": "r2-source-background-0",
+          "at_s": 0.00509,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 2048
+        },
+        {
+          "id": "r2-source-background-1",
+          "at_s": 0.007552,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 2048
+        },
+        {
+          "id": "r2-source-background-2",
+          "at_s": 0.008849,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 2048
+        },
+        {
+          "id": "r2-target-background-0",
+          "at_s": 0.011687,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "r2-source-prefill-2048-0",
+          "at_s": 5.91856,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 16
+        }
+      ]
+    },
+    {
+      "name": "source-prefill-train-r1",
+      "repetition": 1,
+      "kind": "train",
+      "arrivals": [
+        {
+          "id": "r1-source-background-0",
+          "at_s": 0.00484,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 2048
+        },
+        {
+          "id": "r1-source-background-1",
+          "at_s": 0.008598,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 2048
+        },
+        {
+          "id": "r1-source-background-2",
+          "at_s": 0.010464,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 2048
+        },
+        {
+          "id": "r1-target-background-0",
+          "at_s": 0.01282,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "r1-source-prefill-6144-0",
+          "at_s": 5.919692,
+          "route": "tp1",
+          "prompt_tokens": 6144,
+          "max_tokens": 16
+        },
+        {
+          "id": "r1-source-prefill-6144-1",
+          "at_s": 7.430354,
+          "route": "tp1",
+          "prompt_tokens": 6144,
+          "max_tokens": 16
+        },
+        {
+          "id": "r1-source-prefill-6144-2",
+          "at_s": 8.934119,
+          "route": "tp1",
+          "prompt_tokens": 6144,
+          "max_tokens": 16
+        },
+        {
+          "id": "r1-source-prefill-6144-3",
+          "at_s": 10.443404,
+          "route": "tp1",
+          "prompt_tokens": 6144,
+          "max_tokens": 16
+        },
+        {
+          "id": "r1-source-prefill-6144-4",
+          "at_s": 11.95437,
+          "route": "tp1",
+          "prompt_tokens": 6144,
+          "max_tokens": 16
+        },
+        {
+          "id": "r1-source-prefill-6144-5",
+          "at_s": 13.462878,
+          "route": "tp1",
+          "prompt_tokens": 6144,
+          "max_tokens": 16
+        },
+        {
+          "id": "r1-source-prefill-6144-6",
+          "at_s": 14.973986,
+          "route": "tp1",
+          "prompt_tokens": 6144,
+          "max_tokens": 16
+        },
+        {
+          "id": "r1-source-prefill-6144-7",
+          "at_s": 16.485934,
+          "route": "tp1",
+          "prompt_tokens": 6144,
+          "max_tokens": 16
+        },
+        {
+          "id": "r1-source-prefill-6144-8",
+          "at_s": 17.99533,
+          "route": "tp1",
+          "prompt_tokens": 6144,
+          "max_tokens": 16
+        },
+        {
+          "id": "r1-source-prefill-6144-9",
+          "at_s": 19.504772,
+          "route": "tp1",
+          "prompt_tokens": 6144,
+          "max_tokens": 16
+        },
+        {
+          "id": "r1-source-prefill-6144-10",
+          "at_s": 21.014884,
+          "route": "tp1",
+          "prompt_tokens": 6144,
+          "max_tokens": 16
+        },
+        {
+          "id": "r1-source-prefill-6144-11",
+          "at_s": 22.524126,
+          "route": "tp1",
+          "prompt_tokens": 6144,
+          "max_tokens": 16
+        }
+      ]
+    },
+    {
+      "name": "source-prefill-train-r2",
+      "repetition": 2,
+      "kind": "train",
+      "arrivals": [
+        {
+          "id": "r2-source-background-0",
+          "at_s": 0.01277,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 2048
+        },
+        {
+          "id": "r2-source-background-1",
+          "at_s": 0.015611,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 2048
+        },
+        {
+          "id": "r2-source-background-2",
+          "at_s": 0.017959,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 2048
+        },
+        {
+          "id": "r2-target-background-0",
+          "at_s": 0.02046,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "r2-source-prefill-6144-0",
+          "at_s": 5.927668,
+          "route": "tp1",
+          "prompt_tokens": 6144,
+          "max_tokens": 16
+        },
+        {
+          "id": "r2-source-prefill-6144-1",
+          "at_s": 7.435545,
+          "route": "tp1",
+          "prompt_tokens": 6144,
+          "max_tokens": 16
+        },
+        {
+          "id": "r2-source-prefill-6144-2",
+          "at_s": 8.944884,
+          "route": "tp1",
+          "prompt_tokens": 6144,
+          "max_tokens": 16
+        },
+        {
+          "id": "r2-source-prefill-6144-3",
+          "at_s": 10.453681,
+          "route": "tp1",
+          "prompt_tokens": 6144,
+          "max_tokens": 16
+        },
+        {
+          "id": "r2-source-prefill-6144-4",
+          "at_s": 11.959807,
+          "route": "tp1",
+          "prompt_tokens": 6144,
+          "max_tokens": 16
+        },
+        {
+          "id": "r2-source-prefill-6144-5",
+          "at_s": 13.47068,
+          "route": "tp1",
+          "prompt_tokens": 6144,
+          "max_tokens": 16
+        },
+        {
+          "id": "r2-source-prefill-6144-6",
+          "at_s": 14.980659,
+          "route": "tp1",
+          "prompt_tokens": 6144,
+          "max_tokens": 16
+        },
+        {
+          "id": "r2-source-prefill-6144-7",
+          "at_s": 16.488952,
+          "route": "tp1",
+          "prompt_tokens": 6144,
+          "max_tokens": 16
+        },
+        {
+          "id": "r2-source-prefill-6144-8",
+          "at_s": 20.256406,
+          "route": "tp1",
+          "prompt_tokens": 6144,
+          "max_tokens": 16
+        },
+        {
+          "id": "r2-source-prefill-6144-9",
+          "at_s": 21.765795,
+          "route": "tp1",
+          "prompt_tokens": 6144,
+          "max_tokens": 16
+        },
+        {
+          "id": "r2-source-prefill-6144-10",
+          "at_s": 23.2798,
+          "route": "tp1",
+          "prompt_tokens": 6144,
+          "max_tokens": 16
+        },
+        {
+          "id": "r2-source-prefill-6144-11",
+          "at_s": 24.792849,
+          "route": "tp1",
+          "prompt_tokens": 6144,
+          "max_tokens": 16
+        }
+      ]
+    }
+  ]
+}

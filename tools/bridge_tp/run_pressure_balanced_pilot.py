@@ -160,6 +160,7 @@ def preflight(args):
         },
         jobs=len(jobs),
         maximum_migrations=1,
+        migration_execution_enabled=not args.no_migration,
         mode="CPU_PREFLIGHT",
         service_estimator=(
             "observed engine-span local proxy; causal ITL delta unmeasured"
@@ -213,7 +214,9 @@ def unknown_routing_pools(args, block_size):
     )
 
 
-def dispatch_due(jobs, dispatched, elapsed, ingress, pools, tokens, audit):
+def dispatch_due(
+    jobs, dispatched, elapsed, ingress, pools, tokens, audit, *, origin_unix_s=None
+):
     """Submit every due legal arrival once; engine capacity is not a gate."""
     for value in dispatched.values():
         if value.future.done():
@@ -235,7 +238,11 @@ def dispatch_due(jobs, dispatched, elapsed, ingress, pools, tokens, audit):
                 kind="pressure_dispatch",
                 job_id=job["id"],
                 at_s=job["at_s"],
-                actual_s=elapsed,
+                actual_s=(
+                    value.dispatched_at - origin_unix_s
+                    if origin_unix_s is not None
+                    else elapsed
+                ),
                 client_id=value.client_id,
                 pool=value.pool_id,
                 frozen_cap=value.payload["max_tokens"],
@@ -295,6 +302,8 @@ def run(args, prepared):
     )
     dispatched, previous = {}, {}
     started = time.monotonic()
+    origin_unix_s = time.time()
+    audit.write(dict(kind="pressure_clock_origin", unix_s=origin_unix_s))
     last_view = None
     outcome = "FAILED_OR_INTERRUPTED"
     watch = ProgressWatch(args.no_progress_s)
@@ -331,6 +340,7 @@ def run(args, prepared):
                     unknown_routing_pools(args, controller.block_size),
                     tokens,
                     audit,
+                    origin_unix_s=origin_unix_s,
                 )
                 save_progress(
                     progress_path,
@@ -432,7 +442,16 @@ def run(args, prepared):
                             "scope": "empirical budget plus configured recovery tokens",
                         }
                     )
-            dispatch_due(jobs, dispatched, elapsed, ingress, pools, tokens, audit)
+            dispatch_due(
+                jobs,
+                dispatched,
+                time.monotonic() - started,
+                ingress,
+                pools,
+                tokens,
+                audit,
+                origin_unix_s=origin_unix_s,
+            )
             candidates, eos = [], {}
             for row in inventories[0]["requests"]:
                 try:
@@ -719,6 +738,18 @@ def run(args, prepared):
                     if value.future.done() and value.future.exception()
                     else None,
                     response=value.recorder.stats(),
+                    source_transport={
+                        key: value.future.result().get(key)
+                        for key in (
+                            "request_started_unix_s",
+                            "completed_unix_s",
+                            "ttft_ms",
+                            "e2e_ms",
+                            "finish_reason",
+                        )
+                    }
+                    if value.future.done() and value.future.exception() is None
+                    else None,
                 )
             )
         (args.run_dir / "pressure_request_results.json").write_text(

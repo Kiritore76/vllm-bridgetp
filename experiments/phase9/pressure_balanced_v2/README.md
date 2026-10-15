@@ -229,3 +229,47 @@ Use the actual environment Python on the machine; on this GPU host it lives at
 prefill reference and held-repeat-out pressure replay, not a serving policy.
 Results are pressure-balanced-git-v2-pressure-screen-*.tar.gz outside Git.
 The normal --calibrate and original --full inputs/modes retain their meanings.
+
+## Matched actual migration pilot
+
+The four pressure-screen runs are complete. The next step is:
+
+```bash
+bash tools/bridge_tp/run_pressure_pilot.sh --compare
+```
+
+This runs pulse/train × two recorded arrival traces × STAY/migration: eight
+fresh scenes. Repetition one runs STAY first; repetition two reverses the arm
+order. Both arms run the same controller, stager, predictor hooks and sampled
+performance instrumentation. STAY evaluates decisions without reserving or
+executing migration. The enabled arm executes at most one migration per scene.
+The experiment alone overrides sustain_s to 1.5 seconds; spare_ratio remains
+0.8 and all other policy/transport parameters remain unchanged. policy.json
+retains its original settings. The offline prefill cost reference stays disabled.
+
+comparison.json freezes the actual HTTP request start offsets from the returned
+140040 pressure-screen archive, with its SHA and source timestamp definition.
+Each pair uses the same arrival JSON, prompt IDs, forced output cap, seed and
+initial TP1/TP4 assignment. Later requests are due at fixed offsets, independent
+of earlier completion. This isolates migration rather than testing routing.
+The controller records actual admission time and HTTP start time; delayed
+dispatch is retained. pair_acceptance.json marks a pair unsuitable for strict
+matched benefit claims if either arm has HTTP dispatch lag above 0.5 seconds.
+Inspect actual background/injection overlap as well as the arrival receipt.
+
+comparison_metrics.json reports each request's visible TTFT, completion,
+ITL P95, slow interval fraction, migration/role and handoff. Handoff intervals
+remain in SLO counts. Analyze the migrated request and its same-ID STAY
+counterpart, the TP1 incumbents and TP4 incumbent separately. ITL >100 ms may
+account for at most 1% of intervals; no TTFT or queue target is invented.
+This forced-length performance workload does not validate natural-EOS PMF
+accuracy or prove the longest-candidate ranking optimal.
+
+Technical completion requires full contiguous outputs, the original migration
+ledger/ownership checks, native empty inventories, engine/GPU trace acceptance
+and all owned process groups ending. A STAY outcome in the enabled arm is a
+coverage observation, not a technical failure or evidence of migration benefit.
+Technical failure stops further runs and preserves one evidence archive.
+The console shows scene N/8, arm, startup/warmup, request and token progress,
+migration state, trace finalization and cleanup. Retrieve only the final
+pressure-balanced-git-v2-comparison-*.tar.gz from the existing results folder.
