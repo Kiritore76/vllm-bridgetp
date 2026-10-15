@@ -587,6 +587,7 @@ def main():
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--pressure-screen", action="store_true")
     modes.add_argument("--efficient-region", action="store_true")
+    modes.add_argument("--efficient-region-last", action="store_true")
     args = parser.parse_args()
     spec = pilot.load_spec(args.spec)
     pilot.verify_spec(spec)
@@ -596,21 +597,30 @@ def main():
     selected = (
         config["pressure_screen_scenes"] if args.pressure_screen else config["scenes"]
     )
-    if args.efficient_region:
-        from tools.bridge_tp.pressure_efficient_workload import validate_plan
+    efficient_region = args.efficient_region or args.efficient_region_last
+    repetition_ids = list(range(1, config["repetitions"] + 1))
+    if efficient_region:
+        from tools.bridge_tp.pressure_efficient_workload import (
+            collection_selection,
+            validate_plan,
+        )
 
         region = pilot.read(args.spec.parent / "efficient_region.json")
         validate_plan(region, config)
-        selected = region["scenes"]
-    capture_observations = args.pressure_screen or args.efficient_region
+        selected, repetition_ids = collection_selection(
+            region, last_only=args.efficient_region_last
+        )
+    capture_observations = args.pressure_screen or efficient_region
     mode = (
-        "efficient-region"
+        "efficient-region-last"
+        if args.efficient_region_last
+        else "efficient-region"
         if args.efficient_region
         else "pressure-screen"
         if args.pressure_screen
         else "calibration"
     )
-    total_scenes = len(selected) * config["repetitions"]
+    total_scenes = len(selected) * len(repetition_ids)
     common, settings = pilot.arguments(spec)
     from vllm.entrypoints.openai.cli_args import (
         make_arg_parser,
@@ -645,14 +655,15 @@ def main():
     args.out_root.mkdir(parents=True, exist_ok=False)
     common.write_json(args.out_root / "frozen_spec.json", spec)
     common.write_json(args.out_root / "calibration_config.json", config)
-    if args.efficient_region:
+    if efficient_region:
         common.write_json(args.out_root / "efficient_region_config.json", region)
     common.write_json(
         args.out_root / "selection.json",
         dict(
             mode=mode,
             scenes=[s["name"] for s in selected],
-            repetitions=config["repetitions"],
+            repetitions=len(repetition_ids),
+            repetition_ids=repetition_ids,
             migration_enabled=False,
             capture_observations=capture_observations,
         ),
@@ -664,10 +675,10 @@ def main():
         )
     )
     results = []
-    for repetition in range(1, config["repetitions"] + 1):
+    for repetition in repetition_ids:
         order = (
             list(reversed(selected))
-            if args.efficient_region and repetition == 2
+            if efficient_region and repetition == 2
             else selected
         )
         for scene in order:

@@ -10,6 +10,16 @@ from collections import Counter
 POOLS = ("source", "target")
 
 
+def collection_selection(plan, last_only=False):
+    """Replay the interrupted final job with its original repetition identity."""
+    if not last_only:
+        return plan["scenes"], list(range(1, plan["repetitions"] + 1))
+    selected = [s for s in plan["scenes"] if s["name"] == "region-short-n8-n24"]
+    if len(selected) != 1 or plan["repetitions"] != 2:
+        raise ValueError("interrupted scene/repetition identity differs")
+    return selected, [2]
+
+
 def validate_plan(plan, inputs):
     from tools.bridge_tp.run_pressure_calibration import payload
 

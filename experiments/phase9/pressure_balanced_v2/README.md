@@ -325,3 +325,17 @@ progress and cleanup. Retrieve only
 pressure-balanced-git-v2-efficient-region-*.tar.gz from the existing results
 folder. Existing scripts are updated in place; no new cloud input archive,
 training job, cleanup deletion or migration-policy threshold is required.
+
+To replace only the interrupted last scene from the returned 161825 batch:
+
+```bash
+bash tools/bridge_tp/run_pressure_pilot.sh --efficient-region-last
+```
+
+This selects exactly region-short-n8-n24-r2 once (console 1/1), preserving its
+original prompt IDs, seed, source Nd8 / 2048+1024 and target Nd24 / 2048+4096,
+observer, instrumentation, preflight and cleanup. The selection receipt records
+repetitions=1 and repetition_ids=[2]. It starts fresh services and writes a new
+pressure-balanced-git-v2-efficient-region-last-*.tar.gz outside the previous run.
+It neither appends to the interrupted evidence nor reruns the nine completed
+scenes. Completion and coverage still require full output and finalized traces.

@@ -55,6 +55,19 @@ class EfficientRegionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "equal total"):
             e.validate_plan(changed, self.inputs)
 
+    def test_last_only_replays_exactly_short_scene_repetition_two(self):
+        scenes, repetitions = e.collection_selection(self.plan, last_only=True)
+        jobs = [(s["name"], r) for r in repetitions for s in scenes]
+        self.assertEqual(jobs, [("region-short-n8-n24", 2)])
+        self.assertEqual(scenes[0], self.plan["scenes"][0])
+        full_scenes, full_repetitions = e.collection_selection(self.plan)
+        self.assertEqual(full_scenes, self.plan["scenes"])
+        self.assertEqual(full_repetitions, [1, 2])
+        changed = copy.deepcopy(self.plan)
+        changed["scenes"][0]["name"] = "unrelated"
+        with self.assertRaisesRegex(ValueError, "identity differs"):
+            e.collection_selection(changed, last_only=True)
+
     def test_fixed_arrivals_do_not_wait_for_previous_completion(self):
         clock = [100.0]
 
