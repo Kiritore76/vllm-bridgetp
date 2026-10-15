@@ -25,6 +25,13 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from tools.bridge_tp import run_pressure_balanced_pilot as controller  # noqa: E402
+from tools.bridge_tp.pressure_progress import save_progress  # noqa: E402
+
+
+def announce(scene, stage, **details):
+    stamp = time.strftime("%H:%M:%S")
+    fields = " ".join(f"{key}={value}" for key, value in details.items())
+    print(f"[{stamp}] [{scene}] {stage} {fields}", flush=True)
 
 
 def sha(path):
@@ -204,6 +211,8 @@ def build_scene(spec, scene, run_root, common, args):
         str(spec["run_timeout_s"]),
         "--tick-s",
         "0.2",
+        "--no-progress-s",
+        str(spec.get("no_progress_s", 60)),
     ]
     return dict(
         run_dir=run_dir,
@@ -336,6 +345,7 @@ def run_scene(spec, scene, plan, common, args):
         },
     )
     try:
+        announce(scene["name"], "启动TP4服务，等待就绪")
         target = common.start_process(
             "target TP4", plan["target_argv"], plan["target_env"], root / "target.log"
         )
@@ -343,6 +353,7 @@ def run_scene(spec, scene, plan, common, args):
         common.wait_healthy(
             plan["config"]["target_url"], target, spec["startup_timeout_s"]
         )
+        announce(scene["name"], "TP4就绪；启动TP1服务")
         source = common.start_process(
             "source TP1", plan["source_argv"], plan["source_env"], root / "source.log"
         )
@@ -350,14 +361,17 @@ def run_scene(spec, scene, plan, common, args):
         common.wait_healthy(
             plan["config"]["source_url"], source, spec["startup_timeout_s"]
         )
+        announce(scene["name"], "TP1就绪；开始warmup")
         requests = [job["request"] for job in read(scene["arrivals"])]
         for pool in ("source", "target"):
+            announce(scene["name"], "warmup", pool=pool)
             warmup_prompt_shapes(
                 plan["config"][pool + "_url"],
                 requests,
                 root / (pool + "_warmup.json"),
                 spec["run_timeout_s"],
             )
+        announce(scene["name"], "warmup完成；启动stager和正式调度器")
         stager = common.start_process(
             "stager", plan["stager_argv"], os.environ.copy(), root / "stager.log"
         )
@@ -375,22 +389,61 @@ def run_scene(spec, scene, plan, common, args):
         )
         processes.append(worker)
         deadline = time.monotonic() + spec["run_timeout_s"] + 60
+        last_progress_at = -float("inf")
         while worker.process.poll() is None:
             if time.monotonic() > deadline:
                 raise TimeoutError("owned controller deadline reached")
+            if time.monotonic() - last_progress_at >= 10:
+                last_progress_at = time.monotonic()
+                path = plan["run_dir"] / "pressure_progress.json"
+                if path.exists():
+                    status = read(path)
+                    save_progress(
+                        root.parent / "pilot_progress.json",
+                        scene=scene["name"],
+                        **status,
+                    )
+                    announce(
+                        scene["name"],
+                        status["stage"],
+                        elapsed=status.get("elapsed_s"),
+                        submitted=(
+                            f"{status.get('submitted', 0)}/{status.get('total', '?')}"
+                        ),
+                        completed=status.get("completed", 0),
+                        queued=len(status.get("queued", [])),
+                        pools=(
+                            f"{status.get('source_zone', '?')}/"
+                            f"{status.get('target_zone', '?')}"
+                        ),
+                        active_tokens=status.get("active_generated", 0),
+                        migration=status.get("migration", "none"),
+                    )
+                    if status.get("queue_reasons"):
+                        announce(
+                            scene["name"], "排队原因", reasons=status["queue_reasons"]
+                        )
+                else:
+                    announce(scene["name"], "等待controller初始化")
             final_path = plan["run_dir"] / "pressure_request_results.json"
             if final_path.exists() and worker.process.poll() is None:
                 # A failing Python process can wait for in-flight HTTP threads.
                 # The owner will stop its servers in finally, releasing them.
                 tail = (plan["run_dir"] / "pressure_audit.jsonl").read_text()
                 if '"outcome": "FAILED_OR_INTERRUPTED"' in tail:
-                    raise RuntimeError("controller failed with in-flight streams")
+                    status_path = plan["run_dir"] / "pressure_progress.json"
+                    status = read(status_path) if status_path.exists() else {}
+                    raise RuntimeError(
+                        f"controller failed: {status.get('error')}; "
+                        f"submitted={status.get('submitted', '?')}"
+                    )
             time.sleep(0.2)
         if worker.process.returncode:
             raise subprocess.CalledProcessError(
                 worker.process.returncode, plan["controller_argv"]
             )
     finally:
+        announce(scene["name"], "清理本场受管进程，核对退出")
         common.stop_processes(processes)
         ended = not any(common.process_group_alive(process) for process in processes)
         common.write_json(
@@ -420,8 +473,10 @@ def main():
     parser.add_argument("--spec", type=Path, required=True)
     parser.add_argument("--out-root", type=Path, required=True)
     parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument("--smoke-only", action="store_true")
     args = parser.parse_args()
     spec = read(args.spec)
+    announce("preflight", "核对HEAD、分支和代码/输入/模型SHA")
     verify_spec(spec)
     common, settings = arguments(spec)
     plans = [
@@ -446,19 +501,7 @@ def main():
         actual.controller_config = Path(spec["controller_config_template"])
         controller.preflight(actual)
     if args.validate_only:
-        print(
-            json.dumps(
-                [
-                    {
-                        k: str(v) if isinstance(v, Path) else v
-                        for k, v in p.items()
-                        if not k.endswith("_env")
-                    }
-                    for p in plans
-                ],
-                indent=2,
-            )
-        )
+        announce("preflight", "真实serving/stager/controller参数检查通过；尚未启动GPU")
         return 0
     archive_path = args.out_root.parent / (args.out_root.name + ".tar.gz")
     if args.out_root.exists() or archive_path.exists():
@@ -474,6 +517,7 @@ def main():
         ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"], text=True
     ).strip():
         raise RuntimeError("GPUs already have compute processes; no server was started")
+    announce("preflight", "核对GPU通过；运行rolling和会话CPU回归")
     subprocess.run(
         [
             sys.executable,
@@ -482,7 +526,7 @@ def main():
             "unittest",
             "tests.bridge_tp.test_rolling_cutover",
             "tests.bridge_tp.test_pressure_session",
-            "-v",
+            "tests.bridge_tp.test_pressure_bootstrap",
         ],
         cwd=ROOT,
         check=True,
@@ -496,7 +540,15 @@ def main():
     )
     common.write_json(args.out_root / "frozen_spec.json", spec)
     results, failures, first_error_rc = [], 0, 0
-    for scene, plan in zip(spec["scenarios"], plans):
+    selected = list(zip(spec["scenarios"], plans))
+    if args.smoke_only:
+        selected = [
+            (scene, plan) for scene, plan in selected if scene["name"] == "both-light"
+        ]
+    for index, (scene, plan) in enumerate(selected, 1):
+        announce(
+            "pilot", "开始场景", scenario=f"{index}/{len(selected)} {scene['name']}"
+        )
         try:
             result = run_scene(spec, scene, plan, common, settings)
         except Exception as error:
@@ -507,10 +559,18 @@ def main():
                 status="TECHNICAL_FAILURE", error=repr(error), returncode=real_rc
             )
         results.append(dict(scene=scene["name"], **result))
+        announce(
+            scene["name"],
+            "场景结束",
+            status=result["status"],
+            failures=failures,
+            error=result.get("error", "none"),
+        )
         common.write_json(args.out_root / "scene_results.json", results)
         if failures >= 3:
             break
     try:
+        announce("pilot", "打包原始证据", scenes=len(results), failures=failures)
         from tools.bridge_tp.result_archive import pack
 
         packed = pack(args.out_root, archive_path)

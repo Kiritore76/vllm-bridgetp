@@ -12,6 +12,20 @@ from pathlib import Path
 from .pressure_policy import PoolReading, PressureConfig
 
 
+def scrape_inventory_metrics(scraper, inventory):
+    """Use the allocator's explicit usage denominator, never its raw pool size."""
+    total = inventory["total_blocks"]
+    usable = inventory.get("usage_denominator_blocks")
+    if (
+        type(usable) is not int
+        or usable != total - 1
+        or not 0 <= inventory["free_blocks"] <= usable
+    ):
+        raise ValueError("inventory usage denominator missing/invalid")
+    scraper.total_kv_blocks = usable
+    return scraper.scrape().__dict__
+
+
 class InventoryReader:
     def __init__(self, path: Path, pool_id: str):
         self.path, self.pool_id = path, pool_id

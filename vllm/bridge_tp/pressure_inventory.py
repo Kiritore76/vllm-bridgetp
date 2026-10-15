@@ -59,6 +59,8 @@ def inventory_snapshot(scheduler, pool_id: str, now: float) -> dict:
         "sampled_at": now,
         "free_blocks": pool.get_num_free_blocks(),
         "total_blocks": pool.num_gpu_blocks,
+        # BlockPool.get_usage() excludes its permanently reserved null block.
+        "usage_denominator_blocks": pool.num_gpu_blocks - 1,
         "block_size": scheduler.block_size,
         "context_limit": scheduler.max_model_len,
         "running": len(scheduler.running),

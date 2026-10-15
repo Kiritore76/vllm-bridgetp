@@ -23,6 +23,10 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.bridge_tp.pressure_cpu import load  # noqa: E402
+from tools.bridge_tp.pressure_progress import (  # noqa: E402
+    ProgressWatch,
+    save_progress,
+)
 
 p, r, o, i, s = (
     load(name)
@@ -55,10 +59,14 @@ def parse_args(argv=None):
     parser.add_argument("--migration-id", required=True)
     parser.add_argument("--max-seconds", type=float, default=900)
     parser.add_argument("--tick-s", type=float, default=0.2)
+    parser.add_argument("--no-progress-s", type=float, default=60)
     parser.add_argument("--no-migration", action="store_true")
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
-    if args.tick_s <= 0 or args.max_seconds <= 0:
+    if any(
+        not math.isfinite(v) or v <= 0
+        for v in (args.tick_s, args.max_seconds, args.no_progress_s)
+    ):
         parser.error("positive tick and runtime required")
     if (
         args.predictor_sha256
@@ -220,11 +228,31 @@ def run(args, prepared):
     started = time.monotonic()
     last_view = None
     outcome = "FAILED_OR_INTERRUPTED"
+    watch = ProgressWatch(args.no_progress_s)
+    progress_path = args.run_dir / "pressure_progress.json"
+    last_status_at = -math.inf
+    queue_reasons = {}
+    last_metrics_error = {}
+    failure = None
     try:
         while time.monotonic() - started < args.max_seconds:
             now, elapsed = time.time(), time.monotonic() - started
             inventories = [reader.poll(now) for reader in readers]
             if any(v is None for v in inventories):
+                save_progress(
+                    progress_path,
+                    stage="waiting_inventory",
+                    elapsed_s=elapsed,
+                    submitted=len(dispatched),
+                    completed=0,
+                    reason="waiting for complete valid source/target inventory",
+                )
+                watch.update(
+                    time.monotonic(),
+                    ("missing_inventory", len(dispatched)),
+                    work_due=any(elapsed >= job["at_s"] for job in jobs),
+                    reason="missing/invalid inventory",
+                )
                 time.sleep(args.tick_s)
                 continue
             pools, shapes = [], []
@@ -233,8 +261,20 @@ def run(args, prepared):
                     raise ValueError(
                         "live KV block geometry differs from pilot contract"
                     )
-                scraper.total_kv_blocks = raw["total_blocks"]
-                metrics = scraper.scrape().__dict__
+                try:
+                    metrics = o.scrape_inventory_metrics(scraper, raw)
+                except load("telemetry").TelemetryError as error:
+                    metrics = None
+                    if now - last_metrics_error.get(raw["pool_id"], -math.inf) >= 5:
+                        audit.write(
+                            dict(
+                                kind="pressure_metrics_error",
+                                pool=raw["pool_id"],
+                                error=str(error),
+                                action="no heartbeat; do not refresh stale inventory",
+                            )
+                        )
+                        last_metrics_error[raw["pool_id"]] = now
                 now = time.time()
                 measured = service.snapshot(raw["pool_id"], now)
                 growth = None
@@ -305,7 +345,12 @@ def run(args, prepared):
                 except ValueError as error:
                     if not str(error).startswith("queue:"):
                         raise
+                    queue_reasons[job["id"]] = (
+                        f"{error}; local_service_costs={costs}; "
+                        f"route={job.get('route')}"
+                    )
                     continue
+                queue_reasons.pop(job["id"], None)
                 dispatched[job["id"]] = value
                 audit.write(
                     dict(
@@ -468,6 +513,79 @@ def run(args, prepared):
             for value in dispatched.values():
                 if value.future.done():
                     value.future.result()
+            due_queued = [
+                job["id"]
+                for job in jobs
+                if elapsed >= job["at_s"] and job["id"] not in dispatched
+            ]
+            completed = sum(v.future.done() for v in dispatched.values())
+            marker = (
+                len(dispatched),
+                completed,
+                tuple(
+                    (pool["pool_id"], row["request_id"], row["generated"])
+                    for pool in inventories
+                    for row in pool["requests"]
+                ),
+                session.record.state.value if session.record else "no_session",
+                session.settled,
+                tuple(
+                    (
+                        row.key,
+                        row.state,
+                        row.allocated_blocks,
+                        row.prefill_observed,
+                        row.service_observed,
+                    )
+                    for row in co.ledger.entries.values()
+                ),
+            )
+            if time.monotonic() - last_status_at >= 5:
+                last_status_at = time.monotonic()
+                status = dict(
+                    stage="running" if len(dispatched) > completed else "queued",
+                    elapsed_s=round(elapsed, 1),
+                    submitted=len(dispatched),
+                    completed=completed,
+                    total=len(jobs),
+                    queued=due_queued,
+                    source_zone=p.classify(pools[0], co.policy.cfg, now).zone,
+                    target_zone=p.classify(pools[1], co.policy.cfg, now).zone,
+                    source_missing=p.classify(pools[0], co.policy.cfg, now).missing,
+                    target_missing=p.classify(pools[1], co.policy.cfg, now).missing,
+                    active_generated=sum(row[2] for row in marker[2]),
+                    migration=marker[3],
+                    queue_reasons=dict(queue_reasons),
+                )
+                save_progress(progress_path, **status)
+                audit.write(dict(kind="pressure_progress", **status))
+            watch.update(
+                time.monotonic(),
+                marker,
+                work_due=bool(
+                    due_queued
+                    or len(dispatched) > completed
+                    or any(
+                        row.state in {"ACTIVE", "COMMITTED"}
+                        and not (
+                            session.cleanup_requires_shutdown
+                            and row.kind == "migration"
+                        )
+                        for row in co.ledger.entries.values()
+                    )
+                    or session.record
+                    and not session.settled
+                    and not session.cleanup_requires_shutdown
+                ),
+                reason=json.dumps(
+                    dict(
+                        queued=due_queued,
+                        reasons=queue_reasons,
+                        source=p.classify(pools[0], co.policy.cfg, now).zone,
+                        target=p.classify(pools[1], co.policy.cfg, now).zone,
+                    )
+                ),
+            )
             if (
                 len(dispatched) == len(jobs)
                 and all(v.future.done() for v in dispatched.values())
@@ -499,7 +617,19 @@ def run(args, prepared):
         raise TimeoutError(
             "pilot timed out; preserve inventory/audit and reconcile active promises"
         )
+    except BaseException as error:
+        failure = repr(error)
+        raise
     finally:
+        save_progress(
+            progress_path,
+            stage=outcome,
+            error=failure,
+            submitted=len(dispatched),
+            completed=sum(v.future.done() for v in dispatched.values()),
+            total=len(jobs),
+            elapsed_s=round(time.monotonic() - started, 1),
+        )
         results = []
         for job_id, value in dispatched.items():
             results.append(
@@ -527,6 +657,7 @@ def run(args, prepared):
                 elapsed_s=time.monotonic() - started,
                 session_settled=session.settled,
                 outcome=outcome,
+                error=failure,
                 shutdown_cleanup_required=session.cleanup_requires_shutdown,
             )
         )

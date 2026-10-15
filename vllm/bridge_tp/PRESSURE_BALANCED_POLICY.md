@@ -135,4 +135,16 @@ Linux dependency-backed serving validation and the full rolling regression remai
 mandatory pre-GPU gates. Normal EOS before binding retains uncertain migration
 commitments until all owned process groups end; it is a coverage gap, not a
 technical failure. This first pilot owns fresh groups with at most one migration
-per scene. No GPU job has run.
+per scene. First-run results and required fixes are described below.
+
+First function pilot (68fe581) exposed an idle bootstrap defect: the allocator's
+usage denominator excludes its null block, but the controller used total pool
+blocks. Three scenes dispatched zero requests and failed; the fourth never ran.
+Inventory now explicitly publishes usage_denominator_blocks, and the pressure
+metrics adapter uses it. Matching fresh idle evidence remains mandatory.
+Short metrics failures omit the heartbeat; stale inventory is never refreshed.
+Controller status is saved every five seconds and shown by the launcher every
+ten seconds. Due work without token/admission/completion/session progress for
+60 seconds fails with queue diagnostics; future arrivals alone do not time out.
+Use --smoke-only for a single both-light admission check before rerunning the
+four-scene pilot. Code/identity/parser gates still cover the full frozen spec.
