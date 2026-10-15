@@ -7,12 +7,14 @@ bridgetp_pressure_pilot_20261015_v2() {
   local repo="$base/vllm_bridge"
   local branch=bridgetp/predictor-nonuniform84-20261010
   local input="$repo/experiments/phase9/pressure_balanced_v2"
-  local stamp backup origin batch console rc pack_rc mode launcher_source
+  local stamp backup origin batch console rc pack_rc mode launcher_source runner
   local -a run_args
+  runner=tools/bridge_tp/launch_pressure_balanced_pilot.py
   case "${1:---smoke-only}" in
     --smoke-only) mode=smoke; run_args=(--smoke-only) ;;
     --full) mode=function; run_args=() ;;
-    *) printf 'Use no argument for smoke; use --full for four scenes.\n'; return 2 ;;
+    --calibrate) mode=calibration; run_args=(); runner=tools/bridge_tp/run_pressure_calibration.py ;;
+    *) printf 'Use no argument for smoke; use --full for four scenes or --calibrate for baseline collection.\n'; return 2 ;;
   esac
   [ "$#" -le 1 ] || return 2
   launcher_source="$(realpath -- "${BASH_SOURCE[0]}")" || return
@@ -51,7 +53,7 @@ bridgetp_pressure_pilot_20261015_v2() {
   mkdir -p "$base/results" || return
   [ ! -e "$batch" ] && [ ! -e "${batch}.tar.gz" ] && [ ! -e "$console" ] || return 1
   # Actual serving/stager parsers and all code/input/model identities, no servers.
-  python -B tools/bridge_tp/launch_pressure_balanced_pilot.py \
+  python -B "$runner" \
     --spec "$input/pilot_spec.json" --out-root "$batch" "${run_args[@]}" --validate-only \
     2>&1 | tee "$console"
   rc=${PIPESTATUS[0]}
@@ -59,7 +61,7 @@ bridgetp_pressure_pilot_20261015_v2() {
     printf 'Pre-GPU validation failed rc=%s; no GPU servers started; log=%s\n' "$rc" "$console"
   else
     # Full original rolling CPU regression is a mandatory gate inside the launcher.
-    python -B tools/bridge_tp/launch_pressure_balanced_pilot.py \
+    python -B "$runner" \
       --spec "$input/pilot_spec.json" --out-root "$batch" "${run_args[@]}" \
       2>&1 | tee -a "$console"
     rc=${PIPESTATUS[0]}

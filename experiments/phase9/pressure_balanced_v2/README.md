@@ -120,3 +120,61 @@ inventory confirms request absence; process shutdown receipts remain mandatory.
 Before GPU startup the launcher now also runs the inventory and pure tail queue
 regressions. A new GPU result is still required to confirm normal final cleanup,
 that a final tail actually coalesces, and its measured handoff latency.
+
+
+## Pressure and output-length calibration (no migration)
+
+Use the same fixed entry point, with tracked `calibration.json` inputs:
+
+```bash
+bash tools/bridge_tp/run_pressure_pilot.sh --calibrate
+```
+
+This supersedes the unexecuted local 8-scene/16-run draft. Only five missing
+shapes run, each twice with the same token inputs and seed. Fresh server groups
+are owned per repetition. The source control is unarmed; no controller or
+stager is started, so no migration can be selected. Existing serving settings,
+source predictor and target connector are retained. Runtime records the actual
+HEAD, all canonical SHA, native inventory, complete client token timestamps,
+sampled engine/four-rank GPU traces and explicit trace finalization receipts.
+A test-shape capacity check includes the full output bounds and one injection;
+this is a collection precheck, not an online ingress admission gate.
+
+| Scene | Prompt tokens | TP1 / TP4 requests | Output stop cap |
+|---|---:|---:|---:|
+| output-short | 2048 | 1 / 1 | 128 |
+| output-long | 2048 | 1 / 1 | 6144 |
+| decode-high-2k | 2048 | 6 / 16 | 2048 |
+| decode-high-6k | 6144 | 3 / 16 | 2048 |
+| mixed-prefill | 2048 background | 3 / 8 background | 6144 background |
+
+In mixed-prefill, inject 512/1024/2048/4096/6144 prompt requests twice each,
+with output cap 16, one per pool at a time, separated by completion plus three
+seconds. Backgrounds must still be alive before each injection. Analyze actual
+scheduled chunks and actual concurrent decode, not nominal shape labels.
+All outputs use ignore_eos=true only for controlled performance measurements;
+this does not validate natural-EOS remaining-length prediction or migration
+candidate selection. This batch is screening, not a final threshold benchmark.
+A completed collection still needs actual Nd/context/chunk coverage analysis.
+
+Reuse instead of recollecting:
+- The 103928 both-light pilot provides the 1024-output reference, including its
+  common stall; retain the anomaly rather than deleting the run.
+- That pilot's natural requests provide current-version EOS/predictor records;
+  its capacity-arrival provides long-output and KV-growth observations.
+- The three service_evidence archives contain 59,419 descriptive scheduler
+  batch observations. Historical six-STAY data supply decode/prefill cost
+  references. Split STAY/START and code versions before service-SLO analysis;
+  never treat these batches as independent runs or GPU span as visible ITL.
+
+SLO remains visible ITL 100 ms with at most 1% slow intervals. TTFT and queue
+wait are measured without inventing thresholds. No pressure/routing/PMF
+threshold changes or predictor training are included. A technical failure stops
+remaining scenes, preserves partial request tokens and packs one evidence
+archive. Normal completion requires every forced stream to reach its cap,
+advanced native inventory to be empty, performance trace integrity checks and
+owned process-group shutdown. Console reports scene N/10, startup, warmup,
+submitted/completed/token counts every ten seconds, finalization and cleanup.
+Do not run --full to collect this batch; --full still runs the original four
+function scenarios. Results stay outside Git; scripts and inputs replace the
+fixed tracked files in place, without another uploaded input archive.
