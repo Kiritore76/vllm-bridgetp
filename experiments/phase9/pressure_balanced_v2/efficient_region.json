@@ -1,0 +1,75 @@
+{
+  "schema": "PRESSURE_EFFICIENT_REGION_V1",
+  "migration_enabled": false,
+  "repetitions": 2,
+  "itl_s": 0.1,
+  "slow_fraction": 0.01,
+  "scenes": [
+    {
+      "name": "region-short-n8-n24",
+      "efficient_region": true,
+      "prompt_tokens": 2048,
+      "max_tokens": 1024,
+      "target_max_tokens": 4096,
+      "source_count": 8,
+      "target_count": 24,
+      "headroom_blocks": 125,
+      "min_common_decode_s": 20
+    },
+    {
+      "name": "region-mid-n4-n24",
+      "efficient_region": true,
+      "prompt_tokens": 4096,
+      "max_tokens": 2048,
+      "target_max_tokens": 4096,
+      "source_count": 4,
+      "target_count": 24,
+      "headroom_blocks": 125,
+      "min_common_decode_s": 20
+    },
+    {
+      "name": "region-mid-n6-n32",
+      "efficient_region": true,
+      "prompt_tokens": 4096,
+      "source_prompt_tokens": 3840,
+      "max_tokens": 1024,
+      "target_max_tokens": 4096,
+      "source_count": 6,
+      "target_count": 32,
+      "headroom_blocks": 125,
+      "min_common_decode_s": 20
+    },
+    {
+      "name": "region-prefill-frequent",
+      "efficient_region": true,
+      "prompt_tokens": 2048,
+      "max_tokens": 4096,
+      "target_max_tokens": 6144,
+      "source_count": 3,
+      "target_count": 8,
+      "headroom_blocks": 125,
+      "min_common_decode_s": 20,
+      "settle_s": 5,
+      "injection_prompt_tokens": [1024],
+      "injection_max_tokens": 1,
+      "max_inflight_injections": 2,
+      "fixed_schedule": {"interval_s": 2, "count": 24, "duration_s": 48, "max_dispatch_lag_s": 0.5}
+    },
+    {
+      "name": "region-prefill-coarse",
+      "efficient_region": true,
+      "prompt_tokens": 2048,
+      "max_tokens": 4096,
+      "target_max_tokens": 6144,
+      "source_count": 3,
+      "target_count": 8,
+      "headroom_blocks": 125,
+      "min_common_decode_s": 20,
+      "settle_s": 5,
+      "injection_prompt_tokens": [4096],
+      "injection_max_tokens": 1,
+      "max_inflight_injections": 2,
+      "fixed_schedule": {"interval_s": 8, "count": 6, "duration_s": 48, "max_dispatch_lag_s": 0.5}
+    }
+  ]
+}

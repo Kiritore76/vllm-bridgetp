@@ -131,19 +131,25 @@ def capacity_check(scene, inventories):
     receipt = {}
     for pool, inv in zip(("source", "target"), inventories):
         count = scene[pool + "_count"]
-        tokens = scene["prompt_tokens"] + scene.get(
+        tokens = scene.get(pool + "_prompt_tokens", scene["prompt_tokens"]) + scene.get(
             pool + "_max_tokens", scene["max_tokens"]
         )
         per_request = (tokens + inv["block_size"] - 1) // inv["block_size"]
         injection = max(scene.get("injection_prompt_tokens", [0])) + (
-            16 if "injection_prompt_tokens" in scene else 0
+            scene.get("injection_max_tokens", 16)
+            if "injection_prompt_tokens" in scene
+            else 0
         )
         extra = (
             (injection + inv["block_size"] - 1) // inv["block_size"]
             if pool in scene.get("injection_pools", ["source", "target"])
             else 0
         )
-        required = count * per_request + extra
+        required = (
+            count * per_request
+            + extra * scene.get("max_inflight_injections", 1)
+            + scene.get("headroom_blocks", 0)
+        )
         receipt[pool] = dict(required_blocks=required, free_blocks=inv["free_blocks"])
         if required > inv["free_blocks"]:
             raise ValueError(
@@ -155,15 +161,16 @@ def capacity_check(scene, inventories):
 class Workload:
     """Bounded SSE clients, per-request durable tokens and concise progress."""
 
-    def __init__(self, config, run_dir, urls, timeout_s):
+    def __init__(self, config, run_dir, urls, timeout_s, max_workers=32):
         self.config, self.run_dir, self.urls = config, run_dir, urls
         self.timeout_s = timeout_s
         self.lock = threading.Lock()
         self.records = {}
         self.stop = threading.Event()
         self.futures = []
-        self.executor = ThreadPoolExecutor(max_workers=32)
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.observer_error = None
+        self.phase = "background"
 
     def submit(self, pool, prompt, output, label):
         request = payload(self.config, prompt, output, label)
@@ -177,6 +184,7 @@ class Workload:
             submitted_unix_s=time.time(),
             tokens=0,
             first_token_unix_s=None,
+            last_token_unix_s=None,
             done=False,
             error=None,
         )
@@ -198,6 +206,7 @@ class Workload:
                         )
                         with self.lock:
                             row["tokens"] = index + 1
+                            row["last_token_unix_s"] = timestamp
                             if row["first_token_unix_s"] is None:
                                 row["first_token_unix_s"] = timestamp
 
@@ -386,7 +395,12 @@ def run_scene(
     warm_requests = [
         payload(config, size, 16, "warm")
         for size in sorted(
-            {scene["prompt_tokens"], *scene.get("injection_prompt_tokens", [])}
+            {
+                scene["prompt_tokens"],
+                scene.get("source_prompt_tokens", scene["prompt_tokens"]),
+                scene.get("target_prompt_tokens", scene["prompt_tokens"]),
+                *scene.get("injection_prompt_tokens", []),
+            }
         )
     ]
     for pool in ("source", "target"):
@@ -435,7 +449,13 @@ def run_scene(
         common.write_json(
             root / "measurement_window.json", {"started_unix_s": time.time()}
         )
-        work = Workload(config, run_dir, urls, spec["run_timeout_s"])
+        work = Workload(
+            config,
+            run_dir,
+            urls,
+            spec["run_timeout_s"],
+            max_workers=64 if scene.get("efficient_region") else 32,
+        )
         if capture_observations:
             observer = threading.Thread(
                 target=observe, args=(work, observation_receipt), daemon=True
@@ -453,6 +473,7 @@ def run_scene(
                 submitted=len(rows),
                 completed=sum(r["done"] for r in rows),
                 visible_tokens=sum(r["tokens"] for r in rows),
+                phase=work.phase,
             )
             save_progress(root.parent / "pilot_progress.json", **status)
             pilot.announce(
@@ -487,9 +508,16 @@ def run_scene(
                 raise RuntimeError("trace finalization failed")
             receipt = verify_pool(run_dir / "performance_trace" / pool, ranks)
             common.write_json(root / f"{pool}_trace_acceptance.json", receipt)
+        coverage = "inspect actual Nd/chunks/context"
+        if scene.get("efficient_region"):
+            from tools.bridge_tp.pressure_efficient_workload import assess_coverage
+
+            receipt = assess_coverage(root, scene)
+            common.write_json(root / "efficient_region_coverage.json", receipt)
+            coverage = receipt["status"]
         return dict(
             status="COMPLETED",
-            coverage="inspect actual Nd/chunks/context",
+            coverage=coverage,
             requests=len(work.records),
             migration_starts=0,
         )
@@ -520,7 +548,14 @@ def run_scene(
 
 def drive_guarded(work, scene, repetition, root):
     try:
-        drive(work, scene, repetition, root)
+        if scene.get("efficient_region"):
+            from tools.bridge_tp.pressure_efficient_workload import (
+                drive as drive_region,
+            )
+
+            drive_region(work, scene, repetition, root)
+        else:
+            drive(work, scene, repetition, root)
     except Exception as error:
         io.atomic_json_dump(
             {
@@ -549,7 +584,9 @@ def main():
     parser.add_argument("--spec", type=Path, required=True)
     parser.add_argument("--out-root", type=Path, required=True)
     parser.add_argument("--validate-only", action="store_true")
-    parser.add_argument("--pressure-screen", action="store_true")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--pressure-screen", action="store_true")
+    modes.add_argument("--efficient-region", action="store_true")
     args = parser.parse_args()
     spec = pilot.load_spec(args.spec)
     pilot.verify_spec(spec)
@@ -558,6 +595,20 @@ def main():
     validate_config(config)
     selected = (
         config["pressure_screen_scenes"] if args.pressure_screen else config["scenes"]
+    )
+    if args.efficient_region:
+        from tools.bridge_tp.pressure_efficient_workload import validate_plan
+
+        region = pilot.read(args.spec.parent / "efficient_region.json")
+        validate_plan(region, config)
+        selected = region["scenes"]
+    capture_observations = args.pressure_screen or args.efficient_region
+    mode = (
+        "efficient-region"
+        if args.efficient_region
+        else "pressure-screen"
+        if args.pressure_screen
+        else "calibration"
     )
     total_scenes = len(selected) * config["repetitions"]
     common, settings = pilot.arguments(spec)
@@ -582,6 +633,7 @@ def main():
             "-m",
             "unittest",
             "tests.bridge_tp.test_pressure_calibration",
+            "tests.bridge_tp.test_pressure_efficient_workload",
             "tests.bridge_tp.test_prefill_cost_reference",
             "tests.bridge_tp.test_rolling_cutover",
             "tests.bridge_tp.test_pressure_observation",
@@ -593,14 +645,16 @@ def main():
     args.out_root.mkdir(parents=True, exist_ok=False)
     common.write_json(args.out_root / "frozen_spec.json", spec)
     common.write_json(args.out_root / "calibration_config.json", config)
+    if args.efficient_region:
+        common.write_json(args.out_root / "efficient_region_config.json", region)
     common.write_json(
         args.out_root / "selection.json",
         dict(
-            mode="pressure-screen" if args.pressure_screen else "calibration",
+            mode=mode,
             scenes=[s["name"] for s in selected],
             repetitions=config["repetitions"],
             migration_enabled=False,
-            capture_observations=args.pressure_screen,
+            capture_observations=capture_observations,
         ),
     )
     (args.out_root / "gpu_inventory.txt").write_text(
@@ -611,7 +665,12 @@ def main():
     )
     results = []
     for repetition in range(1, config["repetitions"] + 1):
-        for scene in selected:
+        order = (
+            list(reversed(selected))
+            if args.efficient_region and repetition == 2
+            else selected
+        )
+        for scene in order:
             name = f"{scene['name']}-r{repetition}"
             pilot.announce(
                 name, "开始场景", number=f"{len(results) + 1}/{total_scenes}"
@@ -626,7 +685,7 @@ def main():
                     args.out_root / name,
                     common,
                     settings,
-                    capture_observations=args.pressure_screen,
+                    capture_observations=capture_observations,
                 )
             except Exception as error:
                 result = dict(status="TECHNICAL_FAILURE", error=repr(error))

@@ -273,3 +273,55 @@ Technical failure stops further runs and preserves one evidence archive.
 The console shows scene N/8, arm, startup/warmup, request and token progress,
 migration state, trace finalization and cleanup. Retrieve only the final
 pressure-balanced-git-v2-comparison-*.tar.gz from the existing results folder.
+
+## Efficient operating-region gaps
+
+```bash
+bash tools/bridge_tp/run_pressure_pilot.sh --efficient-region
+```
+
+This collects five new shapes, each twice (ten fresh scenes); repetition two
+reverses their order. It does not rerun the original ten-scene baseline.
+Migration remains unarmed, no controller/stager starts, and the existing
+four-layer bucket predictor and server settings remain unchanged. ITL uses
+100 ms / 1%; TTFT and queue remain measured curves without a new SLO target.
+
+| Shape | TP1 backgrounds: count × prompt/output | TP4 backgrounds: count × prompt/output |
+|---|---|---|
+| short | 8 × 2048/1024 | 24 × 2048/4096 |
+| mid | 4 × 4096/2048 | 24 × 4096/4096 |
+| mid high | 6 × 3840/1024 | 32 × 4096/4096 |
+| frequent prefill | 3 × 2048/4096 | 8 × 2048/6144 |
+| coarse prefill | same as frequent | same as frequent |
+
+The 3840 prompt keeps TP1 Nd6 within its measured KV budget while outputs grow
+into the 4k context band. Fit on actual live context, not the initial prompt.
+Before load submission each scene checks the full forced-length test envelope
+against native free blocks, including two overlapping injections and 125 spare
+blocks. This is experimental shape validation, not an online admission gate.
+An infeasible shape stops the batch without silently reducing N or output.
+
+Both prefill contrasts start five seconds after every background has its first
+token. For 48 seconds, frequent sends 1024 prompt tokens every two seconds
+(24 arrivals per pool); coarse sends 4096 every eight seconds (six arrivals per
+pool). Each offers 24576 prompt tokens per pool, with one output token per
+injection. Arrival offsets are fixed independently of completion; more than two
+outstanding injections stops the invalid test. Equal prompt totals do not ensure
+equal measured prefill duty. Compare observed duty and interruption exposure;
+report background goodoutput separately from total goodoutput because injection
+counts differ. These are diagnostic workloads, not matched migration arms.
+
+The client has 64 workers so Nd6+Nd32 is not limited by a 32-thread client queue.
+Every scene saves complete token streams, HTTP timing, native inventories,
+metrics observations, engine traces and all five GPU ranks. After finalizing
+traces, efficient_region_coverage.json checks at least 20 seconds of common
+background output, actual native Nd and dispatch lag (0.5 s maximum). Missing
+coverage is explicitly COVERAGE_GAP even when all requests completed correctly;
+it must not be used to declare a calibrated working point. Context support and
+5/10/20-second fit windows still need offline analysis.
+
+The console shows scene N/10, startup/warmup, controlled phase, request/token
+progress and cleanup. Retrieve only
+pressure-balanced-git-v2-efficient-region-*.tar.gz from the existing results
+folder. Existing scripts are updated in place; no new cloud input archive,
+training job, cleanup deletion or migration-policy threshold is required.
