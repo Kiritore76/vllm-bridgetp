@@ -36,7 +36,15 @@
     "legacy_reference_sha256": "2d71a7686196294d66e280d8e337e7570610498490c55a73414d9d1a22d613f2",
     "interrupted_prefix_excluded": true,
     "migration_arms_excluded": true,
-    "new_sustained_pilot_excluded": true
+    "new_sustained_pilot_excluded": true,
+    "nd2_supplement": {
+      "archive": "pressure-balanced-git-v2-health-nd2-20261016T033757Z-36267.tar.gz",
+      "sha256": "1e82634108326cb9515e34c2993db347165f64f74a778e41d693e7332afaa0bb",
+      "checkout_head": "f1cc96d6f56039358c8364d3db0cde71e9dca352",
+      "all_runs_retained": true,
+      "windows": 31,
+      "use": "opt-in health-screen retest; two-run operating points, not capacity ceilings"
+    }
   },
   "cells": [
     {
@@ -1272,6 +1280,226 @@
         "max": 560.7
       },
       "maximum_gap_changed_windows": 0
+    },
+    {
+      "pool": "source",
+      "nd": 2,
+      "context_bin": 1,
+      "context_tokens": [
+        2048,
+        4095
+      ],
+      "runs": 2,
+      "seconds": 80,
+      "windows": 8,
+      "health_status": "REFERENCE",
+      "health_reason": "two measured Nd2 runs; working point, not maximum capacity",
+      "window_goodoutput": {
+        "n": 2,
+        "median": 75.75,
+        "min": 75.5,
+        "max": 76.0
+      },
+      "raw_output": {
+        "n": 2,
+        "median": 75.75,
+        "min": 75.5,
+        "max": 76.0
+      },
+      "minimum_window_goodoutput_s": 74.6,
+      "quality_below95_windows": 0,
+      "maximum_gap_changed_windows": 0,
+      "run_points": [
+        {
+          "run": "health-nd2-r1",
+          "windows": 4,
+          "causal_maxgap_good": 76.0,
+          "raw_rate": 76.0
+        },
+        {
+          "run": "health-nd2-r2",
+          "windows": 4,
+          "causal_maxgap_good": 75.5,
+          "raw_rate": 75.5
+        }
+      ],
+      "relative_run_spread": 0.006600660066006601
+    },
+    {
+      "pool": "source",
+      "nd": 2,
+      "context_bin": 2,
+      "context_tokens": [
+        4096,
+        6143
+      ],
+      "runs": 2,
+      "seconds": 90,
+      "windows": 9,
+      "health_status": "REFERENCE",
+      "health_reason": "two measured Nd2 runs; working point, not maximum capacity",
+      "window_goodoutput": {
+        "n": 2,
+        "median": 74.2,
+        "min": 74.0,
+        "max": 74.4
+      },
+      "raw_output": {
+        "n": 2,
+        "median": 74.2,
+        "min": 74.0,
+        "max": 74.4
+      },
+      "minimum_window_goodoutput_s": 73.4,
+      "quality_below95_windows": 0,
+      "maximum_gap_changed_windows": 0,
+      "run_points": [
+        {
+          "run": "health-nd2-r1",
+          "windows": 4,
+          "causal_maxgap_good": 74.4,
+          "raw_rate": 74.4
+        },
+        {
+          "run": "health-nd2-r2",
+          "windows": 5,
+          "causal_maxgap_good": 74.0,
+          "raw_rate": 74.0
+        }
+      ],
+      "relative_run_spread": 0.005390835579514901
+    },
+    {
+      "pool": "target",
+      "nd": 2,
+      "context_bin": 1,
+      "context_tokens": [
+        2048,
+        4095
+      ],
+      "runs": 2,
+      "seconds": 40,
+      "windows": 4,
+      "health_status": "REFERENCE",
+      "health_reason": "two measured Nd2 runs; working point, not maximum capacity",
+      "window_goodoutput": {
+        "n": 2,
+        "median": 125.7,
+        "min": 125.0,
+        "max": 126.4
+      },
+      "raw_output": {
+        "n": 2,
+        "median": 125.7,
+        "min": 125.0,
+        "max": 126.4
+      },
+      "minimum_window_goodoutput_s": 125.0,
+      "quality_below95_windows": 0,
+      "maximum_gap_changed_windows": 0,
+      "run_points": [
+        {
+          "run": "health-nd2-r1",
+          "windows": 2,
+          "causal_maxgap_good": 125.0,
+          "raw_rate": 125.0
+        },
+        {
+          "run": "health-nd2-r2",
+          "windows": 2,
+          "causal_maxgap_good": 126.4,
+          "raw_rate": 126.4
+        }
+      ],
+      "relative_run_spread": 0.011137629276054143
+    },
+    {
+      "pool": "target",
+      "nd": 2,
+      "context_bin": 2,
+      "context_tokens": [
+        4096,
+        6143
+      ],
+      "runs": 2,
+      "seconds": 40,
+      "windows": 4,
+      "health_status": "REFERENCE",
+      "health_reason": "two measured Nd2 runs; working point, not maximum capacity",
+      "window_goodoutput": {
+        "n": 2,
+        "median": 124.05,
+        "min": 123.0,
+        "max": 125.1
+      },
+      "raw_output": {
+        "n": 2,
+        "median": 124.05,
+        "min": 123.0,
+        "max": 125.1
+      },
+      "minimum_window_goodoutput_s": 120.6,
+      "quality_below95_windows": 0,
+      "maximum_gap_changed_windows": 0,
+      "run_points": [
+        {
+          "run": "health-nd2-r1",
+          "windows": 2,
+          "causal_maxgap_good": 123.0,
+          "raw_rate": 123.0
+        },
+        {
+          "run": "health-nd2-r2",
+          "windows": 2,
+          "causal_maxgap_good": 125.1,
+          "raw_rate": 125.1
+        }
+      ],
+      "relative_run_spread": 0.01692865779927444
+    },
+    {
+      "pool": "target",
+      "nd": 2,
+      "context_bin": 3,
+      "context_tokens": [
+        6144,
+        8191
+      ],
+      "runs": 2,
+      "seconds": 60,
+      "windows": 6,
+      "health_status": "REFERENCE",
+      "health_reason": "two measured Nd2 runs; working point, not maximum capacity",
+      "window_goodoutput": {
+        "n": 2,
+        "median": 124.9,
+        "min": 124.8,
+        "max": 125.0
+      },
+      "raw_output": {
+        "n": 2,
+        "median": 124.9,
+        "min": 124.8,
+        "max": 125.0
+      },
+      "minimum_window_goodoutput_s": 124.8,
+      "quality_below95_windows": 0,
+      "maximum_gap_changed_windows": 0,
+      "run_points": [
+        {
+          "run": "health-nd2-r1",
+          "windows": 3,
+          "causal_maxgap_good": 124.8,
+          "raw_rate": 124.8
+        },
+        {
+          "run": "health-nd2-r2",
+          "windows": 3,
+          "causal_maxgap_good": 125.0,
+          "raw_rate": 125.0
+        }
+      ],
+      "relative_run_spread": 0.0016012810248198785
     }
   ],
   "kv": {

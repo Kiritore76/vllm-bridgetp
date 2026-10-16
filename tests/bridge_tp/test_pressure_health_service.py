@@ -239,6 +239,50 @@ class HealthObservationTests(unittest.TestCase):
         self.assertFalse(h.supported_after(ref, 25, 7000))
         self.assertTrue(h.supported_after(ref, 2, 5000))
 
+    def test_Nd2_supplement_is_exact_and_keeps_unknown_shapes_unknown(self):
+        ref = reference()
+        expected = {
+            ("source", 1): 75.75,
+            ("source", 2): 74.2,
+            ("target", 1): 125.7,
+            ("target", 2): 124.05,
+            ("target", 3): 124.9,
+        }
+        self.assertEqual(len(ref["cells"]), 27)
+        self.assertEqual(
+            sum(c["health_status"] == "REFERENCE" for c in ref["cells"]), 25
+        )
+        for (pool_name, cb), good in expected.items():
+            cell = h.lookup(ref, pool_name, 2, cb * 2048)
+            self.assertEqual(cell["runs"], 2)
+            self.assertGreaterEqual(cell["windows"], 4)
+            self.assertEqual(cell["window_goodoutput"]["median"], good)
+            self.assertAlmostEqual(
+                h.efficiency(ref, pool_name, 2, cb * 2048, good)["eta"], 1
+            )
+        self.assertIsNone(h.lookup(ref, "source", 2, 6144))
+        self.assertIsNone(h.lookup(ref, "target", 2, 2047))
+        self.assertIsNone(h.lookup(ref, "target", 32, 5000))
+        self.assertFalse(ref["deployment_ready"])
+
+    def test_Nd2_shape_transition_waits_for_its_own_closed_window(self):
+        tokens = h.TokenWindows()
+        tracker = h.HealthTracker(reference(), 0, tokens)
+        for index in range(21):
+            tracker.observe(self.raw(index, index * 0.5), index * 0.5)
+        tracker.observe(self.raw(21, 10.1, nd=2), 10.1)
+        self.assertEqual(tracker.snapshot("tp1", 10.1)["health_status"], "UNKNOWN")
+        for request in ("a", "b"):
+            tokens.arrive(request, "tp1", 10)
+            for index in range(400):
+                tokens.token(request, 10.01 + index * 0.025)
+        for index in range(1, 21):
+            now = 10 + index * 0.5
+            tracker.observe(self.raw(21 + index, now, nd=2), now)
+        value = tracker.snapshot("tp1", 20)
+        self.assertEqual(value["health_status"], "SUPPORTED")
+        self.assertAlmostEqual(value["health_eta"], 80 / 75.75)
+
 
 class HealthPreflightTests(unittest.TestCase):
     def test_actual_controller_requires_versioned_reference_and_persistence(self):

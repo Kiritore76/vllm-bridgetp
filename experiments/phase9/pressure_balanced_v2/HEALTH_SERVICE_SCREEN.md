@@ -20,6 +20,24 @@ Nd8/context4k..6k 364.20 to 362.425 tokens/s. The other 20 medians are unchanged
 Migration arms, interrupted prefixes and later sustained outcomes do not enter
 this reference. Reference lookup requires exact Nd and 2048-token context bin.
 
+The Nd2 retest adds five repeated points from the standalone no-migration
+supplement `pressure-balanced-git-v2-health-nd2-20261016T033757Z-36267.tar.gz`
+(SHA256 `1e82634108326cb9515e34c2993db347165f64f74a778e41d693e7332afaa0bb`).
+Both runs and all 31 qualified windows are retained. TP1 Nd2 reference values
+are 75.75 / 74.20 tokens/s in context bins 2k..4k / 4k..6k; TP4 values are
+125.70 / 124.05 / 124.90 in bins 2k..4k / 4k..6k / 6k..8k. Original 22 cells
+are unchanged: 27 total, 25 usable, with Nd32 still isolated. These are measured
+working points; no new threshold fit or capacity-ceiling claim is made.
+
+Use the same `--health-screen` entry and the same four recipes and policy
+thresholds for the retest. Check that source/target Nd2 health recovers after
+the migration and a qualifying ten-second window closes. A transitional
+UNKNOWN window remains expected; missing source Nd2 contexts above 6143 tokens
+remain UNKNOWN. Inspect both pools' `pressure_decision` readings and native
+inventory timestamps, then check matched arrivals, finalization and full-drain
+goodoutput. This rerun still permits only one migration per scene and does
+not establish a long-duration or repeated migration benefit.
+
 For a supported current shape:
 
     eta = observed past-window goodoutput / same-shape pure-decode reference
