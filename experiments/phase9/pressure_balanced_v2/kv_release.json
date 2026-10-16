@@ -1,0 +1,116 @@
+{
+  "schema": "PRESSURE_KV_RELEASE_V1",
+  "arms": [
+    "stay",
+    "migrate"
+  ],
+  "maximum_migrations": 1,
+  "policy_overrides": {
+    "capacity_only": true,
+    "capacity_lookahead_s": 16.86410117149353
+  },
+  "itl_s": 0.1,
+  "slow_fraction": 0.01,
+  "max_dispatch_lag_s": 0.5,
+  "minimum_remaining_at_start": 1024,
+  "recipes": [
+    {
+      "name": "kv-release-r1",
+      "kind": "kv-release",
+      "repetition": 1,
+      "arrivals": [
+        {
+          "id": "r1-target-background-0",
+          "at_s": 0,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 6144
+        },
+        {
+          "id": "r1-source-background-0",
+          "at_s": 5.0,
+          "route": "tp1",
+          "prompt_tokens": 4096,
+          "max_tokens": 3072
+        },
+        {
+          "id": "r1-source-background-1",
+          "at_s": 5.02,
+          "route": "tp1",
+          "prompt_tokens": 4096,
+          "max_tokens": 3072
+        },
+        {
+          "id": "r1-source-background-2",
+          "at_s": 5.04,
+          "route": "tp1",
+          "prompt_tokens": 4096,
+          "max_tokens": 3072
+        },
+        {
+          "id": "r1-source-background-3",
+          "at_s": 5.06,
+          "route": "tp1",
+          "prompt_tokens": 4096,
+          "max_tokens": 3072
+        },
+        {
+          "id": "r1-source-background-4",
+          "at_s": 5.08,
+          "route": "tp1",
+          "prompt_tokens": 4096,
+          "max_tokens": 3072
+        }
+      ]
+    },
+    {
+      "name": "kv-release-r2",
+      "kind": "kv-release",
+      "repetition": 2,
+      "arrivals": [
+        {
+          "id": "r2-target-background-0",
+          "at_s": 0,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 6144
+        },
+        {
+          "id": "r2-source-background-0",
+          "at_s": 5.0,
+          "route": "tp1",
+          "prompt_tokens": 4096,
+          "max_tokens": 3072
+        },
+        {
+          "id": "r2-source-background-1",
+          "at_s": 5.02,
+          "route": "tp1",
+          "prompt_tokens": 4096,
+          "max_tokens": 3072
+        },
+        {
+          "id": "r2-source-background-2",
+          "at_s": 5.04,
+          "route": "tp1",
+          "prompt_tokens": 4096,
+          "max_tokens": 3072
+        },
+        {
+          "id": "r2-source-background-3",
+          "at_s": 5.06,
+          "route": "tp1",
+          "prompt_tokens": 4096,
+          "max_tokens": 3072
+        },
+        {
+          "id": "r2-source-background-4",
+          "at_s": 5.08,
+          "route": "tp1",
+          "prompt_tokens": 4096,
+          "max_tokens": 3072
+        }
+      ]
+    }
+  ]
+}

@@ -2,6 +2,41 @@
 """Offline health lookup and independent physical-KV warning, without START."""
 
 import math
+from collections import deque
+
+
+class NativeDecodeGrowth:
+    """Past-only generated-token growth; do not extrapolate prefill bursts."""
+
+    def __init__(self, window_s=2.0, minimum_span_s=0.5):
+        self.window_s, self.minimum_span_s = window_s, minimum_span_s
+        self.history = deque()
+        self.generation = None
+        self.rate = None
+
+    def update(self, inventory):
+        generation = inventory["generation"]
+        if generation == self.generation:
+            return self.rate
+        stamp = inventory["sampled_at"]
+        if self.history and stamp < self.history[-1][0]:
+            raise ValueError("native generation time regressed")
+        self.generation = generation
+        while self.history and stamp - self.history[0][0] > self.window_s:
+            self.history.popleft()
+        current = {r["request_id"]: r["generated"] for r in inventory["requests"]}
+        self.history.append((stamp, current))
+        span = stamp - self.history[0][0]
+        self.rate = None
+        if span >= self.minimum_span_s:
+            produced = 0
+            for (_, before), (_, after) in zip(self.history, list(self.history)[1:]):
+                for key in before.keys() & after.keys():
+                    if after[key] < before[key]:
+                        raise ValueError("native generated tokens regressed")
+                    produced += after[key] - before[key]
+            self.rate = produced / span / inventory["block_size"]
+        return self.rate
 
 
 def build_reference(cells, windows, *, provenance, release_budget_s, diagnostic_shapes):

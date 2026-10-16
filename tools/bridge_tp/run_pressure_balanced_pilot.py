@@ -22,6 +22,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from tools.bridge_tp import pressure_health_reference as health  # noqa: E402
 from tools.bridge_tp.pressure_cpu import load  # noqa: E402
 from tools.bridge_tp.pressure_progress import (  # noqa: E402
     ProgressWatch,
@@ -122,6 +123,8 @@ def preflight(args):
     lookup.release_budget = evidence["source_release_summary"]["start_to_release_s"][
         "max"
     ]
+    if cfg.capacity_lookahead_s and cfg.capacity_lookahead_s != lookup.release_budget:
+        raise ValueError("KV pilot must use the frozen START-to-source-release budget")
     jobs = read(args.arrivals)
     if not isinstance(jobs, list) or not jobs:
         raise ValueError("arrivals must be a nonempty list")
@@ -301,6 +304,7 @@ def run(args, prepared):
         args.predictor_events, args.predictor_sha256
     )
     dispatched, previous = {}, {}
+    growth_readers = {pool: health.NativeDecodeGrowth() for pool in ("tp1", "tp4")}
     started = time.monotonic()
     origin_unix_s = time.time()
     audit.write(dict(kind="pressure_clock_origin", unix_s=origin_unix_s))
@@ -409,6 +413,17 @@ def run(args, prepared):
                             0, (prior["free_blocks"] - raw["free_blocks"]) / dt
                         )
                 previous[raw["pool_id"]] = raw
+                if cfg.capacity_lookahead_s > 0:
+                    growth = growth_readers[raw["pool_id"]].update(raw)
+                    audit.write(
+                        dict(
+                            kind="pressure_metrics_sample",
+                            unix_s=time.time(),
+                            pool=raw["pool_id"],
+                            generation=raw["generation"],
+                            metrics=metrics,
+                        )
+                    )
                 pool = o.pool_reading(
                     raw,
                     reader.observed_at,
@@ -418,6 +433,13 @@ def run(args, prepared):
                     growth_blocks_s=growth,
                     heartbeat=metrics,
                 )
+                if cfg.capacity_lookahead_s > 0:
+                    pool = replace(
+                        pool,
+                        unallocated_prompt_blocks=health.unallocated_prompt_blocks(
+                            raw["requests"], raw["block_size"]
+                        ),
+                    )
                 pools.append(pool)
                 shapes.append(batch(raw, now, cfg, pool))
                 if 0 <= now - pool.sampled_at <= cfg.max_age_s:

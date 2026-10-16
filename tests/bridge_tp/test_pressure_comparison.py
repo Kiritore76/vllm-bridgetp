@@ -47,7 +47,10 @@ class ComparisonTests(unittest.TestCase):
         sampling = worker.load("sampling_contract")
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            policy = compare.pilot.read(BUNDLE / "policy.json") | {"sustain_s": 1.5}
+            policy = (
+                compare.pilot.read(BUNDLE / "policy.json")
+                | self.config["policy_overrides"]
+            )
             (root / "policy.json").write_text(json.dumps(policy), encoding="utf-8")
             for recipe in self.config["recipes"]:
                 jobs = compare.arrivals(self.inputs, recipe)

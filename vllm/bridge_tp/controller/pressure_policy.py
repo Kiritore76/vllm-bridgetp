@@ -38,6 +38,9 @@ class PressureConfig:
     prefill_backlog_budget: int = 8192
     prefill_waiting_budget: int = 0
     capacity_guard_blocks: int = 0
+    # Opt-in KV-release pilot only; existing modes retain zero lookahead.
+    capacity_lookahead_s: float = 0.0
+    capacity_only: bool = False
     survival_horizon: int = 256
     min_survival_lower: float = 0.5
     length_resolution: int = 512
@@ -59,6 +62,8 @@ class PressureConfig:
             and self.prefill_backlog_budget > 0
             and self.prefill_waiting_budget > 0
             and self.capacity_guard_blocks > 0
+            and type(self.capacity_only) is bool
+            and (not self.capacity_only or self.capacity_lookahead_s > 0)
         ):
             raise ValueError(
                 "explicit calibrated/draft budgets and hysteresis required"
@@ -95,6 +100,7 @@ class PoolReading:
     actual_decode_context: int | None = None
     prefill_batch_tokens: int | None = None
     prefill_batch_s: float | None = None
+    unallocated_prompt_blocks: int | None = None
 
 
 @dataclass(frozen=True)
@@ -152,6 +158,22 @@ def classify(pool: PoolReading, cfg: PressureConfig, now: float) -> Pressure:
         missing.append("physical free blocks")
     else:
         capacity = cfg.capacity_guard_blocks / max(1, pool.free_blocks)
+        if (
+            cfg.capacity_lookahead_s > 0
+            and pool.growth_blocks_s is not None
+            and math.isfinite(pool.growth_blocks_s)
+            and pool.growth_blocks_s >= 0
+            and type(pool.unallocated_prompt_blocks) is int
+            and pool.unallocated_prompt_blocks >= 0
+        ):
+            capacity = (
+                cfg.capacity_guard_blocks
+                + pool.unallocated_prompt_blocks
+                + math.ceil(
+                    pool.growth_blocks_s
+                    * (cfg.capacity_lookahead_s + now - pool.sampled_at)
+                )
+            ) / max(1, pool.free_blocks)
     values = (decode, prefill, capacity)
     if any(v is not None and v >= cfg.enter_ratio for v in values):
         zone = "OVERLOAD"
@@ -439,9 +461,14 @@ class PressurePolicy:
         emergency = (
             s.capacity is not None
             and s.capacity >= 1
-            and source.growth_blocks_s is not None
-            and math.isfinite(source.growth_blocks_s)
-            and source.growth_blocks_s > 0
+            and (
+                cfg.capacity_lookahead_s > 0
+                or (
+                    source.growth_blocks_s is not None
+                    and math.isfinite(source.growth_blocks_s)
+                    and source.growth_blocks_s > 0
+                )
+            )
         )
         required = (
             max(1, cfg.capacity_guard_blocks - source.free_blocks) if emergency else 0
@@ -473,6 +500,9 @@ class PressurePolicy:
             self._since = None
             return decision("migration channel occupied")
         if not emergency:
+            if cfg.capacity_only:
+                self._since = None
+                return decision("KV-only pilot; capacity warning absent")
             active_source = [v for v in (s.decode, s.prefill) if v is not None]
             active_target = [v for v in (t.decode, t.prefill) if v is not None]
             threshold = cfg.leave_ratio if self._latched else cfg.enter_ratio
@@ -549,8 +579,21 @@ class PressurePolicy:
             if c.transfer_bytes is None or c.transfer_bytes < 0:
                 reasons.append("transfer size unknown")
             needed_release = required
+            growth_known = (
+                source.growth_blocks_s is not None
+                and math.isfinite(source.growth_blocks_s)
+                and source.growth_blocks_s >= 0
+            )
+            extra_prompt = (
+                source.unallocated_prompt_blocks if cfg.capacity_lookahead_s > 0 else 0
+            )
+            projection_known = (
+                growth_known and type(extra_prompt) is int and extra_prompt >= 0
+            )
+            age = now - source.sampled_at if cfg.capacity_lookahead_s > 0 else 0
             if (
                 emergency
+                and projection_known
                 and c.estimated_release_s is not None
                 and math.isfinite(c.estimated_release_s)
                 and c.estimated_release_s >= 0
@@ -560,7 +603,8 @@ class PressurePolicy:
                     math.ceil(
                         cfg.capacity_guard_blocks
                         - source.free_blocks
-                        + source.growth_blocks_s * c.estimated_release_s
+                        + extra_prompt
+                        + source.growth_blocks_s * (c.estimated_release_s + age)
                     ),
                 )
             if emergency and (c.releasable_blocks or 0) < needed_release:
@@ -568,10 +612,12 @@ class PressurePolicy:
             # guard is an early warning; do not reject merely for U>1 or
             # release later than guard. Physical exhaustion is separate.
             if emergency and (
-                c.estimated_release_s is None
+                not projection_known
+                or c.estimated_release_s is None
                 or not math.isfinite(c.estimated_release_s)
                 or c.estimated_release_s < 0
-                or c.estimated_release_s * source.growth_blocks_s >= source.free_blocks
+                or extra_prompt + (c.estimated_release_s + age) * source.growth_blocks_s
+                >= source.free_blocks
             ):
                 reasons.append("cannot establish release before physical exhaustion")
             remaining = c.remaining

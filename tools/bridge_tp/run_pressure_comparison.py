@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Eight fresh, fixed-arrival STAY/migration runs; no online cost-model change."""
+"""Fixed-arrival STAY/migration pairs, including the four-run KV-release pilot."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from tools.bridge_tp import launch_pressure_balanced_pilot as pilot  # noqa: E402
+from tools.bridge_tp import pressure_kv_pilot as kv  # noqa: E402
 from tools.bridge_tp import run_pressure_calibration as calibration  # noqa: E402
 from tools.bridge_tp.pressure_progress import save_progress  # noqa: E402
 
@@ -139,6 +140,13 @@ def finalize(plan, common):
         )
 
 
+def check_kv_shape(plan, jobs, common):
+    result = kv.capacity_shape(calibration.wait_empty(plan["run_dir"]), jobs)
+    common.write_json(plan["run_dir"].parent / "kv_capacity_shape.json", result)
+    if result["status"] != "VALID":
+        raise RuntimeError("actual KV capacity does not match the frozen experiment")
+
+
 def percentile(values, q):
     if not values:
         return None
@@ -235,14 +243,18 @@ def main():
     parser.add_argument("--spec", type=Path, required=True)
     parser.add_argument("--out-root", type=Path, required=True)
     parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument("--kv-release", action="store_true")
     args = parser.parse_args()
     spec = pilot.load_spec(args.spec)
     pilot.announce("comparison", "核对checkout、代码、固定输入及模型SHA")
     pilot.verify_spec(spec)
-    config = pilot.read(args.spec.parent / "comparison.json")
+    config = pilot.read(
+        args.spec.parent / ("kv_release.json" if args.kv_release else "comparison.json")
+    )
     inputs = pilot.read(args.spec.parent / "calibration.json")
     calibration.validate_config(inputs)
-    validate(config, inputs)
+    (kv.validate if args.kv_release else validate)(config, inputs)
+    total = 2 * len(config["recipes"])
     common, settings = pilot.arguments(spec)
     from tools.bridge_tp import phase8_stager
     from vllm.entrypoints.openai.cli_args import (
@@ -266,7 +278,8 @@ def main():
             pilot.controller.preflight(actual)
     if args.validate_only:
         pilot.announce(
-            "comparison", "8场输入/serving/stager/controller参数检查通过；尚未启动GPU"
+            "comparison",
+            f"{total}场输入/serving/stager/controller参数检查通过；尚未启动GPU",
         )
         return 0
     calibration.check_gpu()
@@ -281,6 +294,8 @@ def main():
                 "tests.bridge_tp." + name
                 for name in (
                     "test_pressure_comparison",
+                    "test_pressure_kv_pilot",
+                    "test_pressure_health_reference",
                     "test_pressure_policy",
                     "test_pressure_preflight",
                     "test_pressure_session",
@@ -308,7 +323,7 @@ def main():
     results = []
     for recipe, arm, scene, plan in plans:
         pilot.announce(
-            scene["name"], "开始对照场景", number=f"{len(results) + 1}/8", arm=arm
+            scene["name"], "开始对照场景", number=f"{len(results) + 1}/{total}", arm=arm
         )
         try:
             calibration.check_gpu()
@@ -319,8 +334,33 @@ def main():
                 common,
                 settings,
                 before_shutdown=lambda plan: finalize(plan, common),
+                before_workload=(
+                    lambda plan, arrivals_path=scene["arrivals"]: check_kv_shape(
+                        plan, pilot.read(arrivals_path), common
+                    )
+                )
+                if args.kv_release
+                else None,
             )
             result = assess(plan, pilot.read(scene["arrivals"]), arm, config, common)
+            if args.kv_release:
+                pilot.scene_result(plan["run_dir"], "kv-release")
+                audit = [
+                    json.loads(line)
+                    for line in (plan["run_dir"] / "pressure_audit.jsonl")
+                    .read_text()
+                    .splitlines()
+                ]
+                coverage = kv.assess(
+                    audit,
+                    pilot.read(plan["run_dir"].parent / "comparison_metrics.json"),
+                    arm,
+                    config["minimum_remaining_at_start"],
+                )
+                common.write_json(
+                    plan["run_dir"].parent / "kv_release_metrics.json", coverage
+                )
+                result["coverage"] = coverage["coverage"]
         except Exception as error:
             result = dict(status="TECHNICAL_FAILURE", error=repr(error))
         results.append(
@@ -332,7 +372,7 @@ def main():
             scene=scene["name"],
             stage="场景结束",
             completed_scenes=len(results),
-            total_scenes=8,
+            total_scenes=total,
             **result,
         )
         pilot.announce(scene["name"], "场景结束", **result)
@@ -350,7 +390,7 @@ def main():
         for recipe in config["recipes"]
     ]
     common.write_json(args.out_root / "pair_acceptance.json", pairs)
-    pilot.announce("comparison", "8场完成；检查实际迁移覆盖与迟发后再评估收益")
+    pilot.announce("comparison", f"{total}场完成；检查实际迁移覆盖与迟发后再评估收益")
     return 0
 
 

@@ -349,7 +349,9 @@ def scene_result(run_dir, name):
     )
 
 
-def run_scene(spec, scene, plan, common, args, *, before_shutdown=None):
+def run_scene(
+    spec, scene, plan, common, args, *, before_shutdown=None, before_workload=None
+):
     from tools.bridge_tp.run_phase9_cap0_noop import warmup_prompt_shapes
     from tools.bridge_tp.run_phase9_controller import RuntimeControl
 
@@ -404,6 +406,8 @@ def run_scene(spec, scene, plan, common, args, *, before_shutdown=None):
                 root / (pool + "_warmup.json"),
                 spec["run_timeout_s"],
             )
+        if before_workload is not None:
+            before_workload(plan)
         announce(scene["name"], "warmup完成；启动stager和正式调度器")
         stager = common.start_process(
             "stager", plan["stager_argv"], os.environ.copy(), root / "stager.log"
