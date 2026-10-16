@@ -377,6 +377,7 @@ def main():
                     "test_pressure_policy",
                     "test_pressure_preflight",
                     "test_pressure_session",
+                    "test_pressure_cancel",
                     "test_pressure_sessions",
                     "test_pressure_bootstrap",
                     "test_pressure_observation",

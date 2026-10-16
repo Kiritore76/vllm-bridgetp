@@ -75,6 +75,8 @@ class RequestFreezeGate:
         self._mtime_ns = -1
         self._request_id: str | None = None
         self._recorded_frozen_request_id: str | None = None
+        self._control_identity = None
+        self._control_parent_identity = None
         self._request_prefix = os.getenv(
             "BRIDGETP_STREAM_SOURCE_REQUEST_ID_PREFIX", ""
         ).strip()
@@ -94,11 +96,31 @@ class RequestFreezeGate:
         try:
             stat = self.control_path.stat()
         except FileNotFoundError:
+            if self._request_id is not None:
+                try:
+                    parent = self.control_path.parent.stat()
+                except FileNotFoundError:
+                    return
+                if (parent.st_dev, parent.st_ino) != self._control_parent_identity:
+                    # A confirmed-clean session was rotated before this
+                    # scheduler observed RESUME; do not keep its request frozen.
+                    self._request_id = None
+                    self._recorded_frozen_request_id = None
+                    self._mtime_ns = -1
+                    self._control_identity = None
             return
-        if stat.st_mtime_ns == self._mtime_ns:
+        identity = (stat.st_dev, stat.st_ino)
+        if stat.st_mtime_ns == self._mtime_ns and identity == self._control_identity:
             return
         value = json.loads(self.control_path.read_text(encoding="utf-8"))
         self._mtime_ns = stat.st_mtime_ns
+        self._control_identity = identity
+        parent = self.control_path.parent.stat()
+        self._control_parent_identity = (parent.st_dev, parent.st_ino)
+        # A new control file may freeze the SAME live request after a cleaned
+        # cancellation. Cache the file identity without resolving a symlink on
+        # every request in every scheduler step.
+        self._recorded_frozen_request_id = None
         if value.get("action") == "FREEZE":
             self._request_id = str(value["request_id"])
         else:

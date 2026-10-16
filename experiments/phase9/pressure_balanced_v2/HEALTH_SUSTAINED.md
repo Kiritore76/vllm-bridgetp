@@ -44,7 +44,11 @@ directory and unique identity. Old target futures, capacity commitments,
 ownership and completion remain independently tracked. A new service transfer
 rechecks current health and requires a fresh3s hold. KV relief bypasses hold
 and cooldown, never physical, target service or channel safety. It does not
-interrupt an in-flight transfer. Uncertain/cancelled sessions block reuse.
+interrupt an in-flight transfer. Uncertain cleanup blocks reuse. Confirmed
+cancellation can rotate while the source continues on TP1; this requires matching
+source/stager cleanup, target abort and fresh absence, all five channel IDLE
+receipts and clean stager exit. See `PARAMETER_STATUS_CN.md` for the new opt-in
+pre-freeze cancellation rules and remaining GPU acceptance requirements.
 
 Keep one reusable receive buffer per target rank across sessions instead of
 releasing it when an older request completes: an old completion must not touch

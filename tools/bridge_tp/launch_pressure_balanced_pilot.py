@@ -546,6 +546,7 @@ def run_scene(
                             f"{status.get('migrations_released', 0)}/"
                             f"{status.get('migrations_started', 0)}"
                         ),
+                        cancelled=status.get("migrations_cancelled", 0),
                     )
                     if status.get("queue_reasons"):
                         announce(

@@ -347,6 +347,7 @@ def _run(args, prepared):
         reconcile_log_interval_s=1.0 if cfg.health_service else 0,
     )
     session = PressureSessions(
+        persistent_cleanup=cfg.shadow_cancel,
         maximum_migrations=args.maximum_migrations,
         run_dir=args.run_dir,
         migration_id=args.migration_id,
@@ -698,6 +699,22 @@ def _run(args, prepared):
                 "policy.tick", co.tick, now, pools[0], pools[1], candidates, actions
             )
             if session.record is not None and not session.settled:
+                session.poll_cancel(inventories[1], now, cfg.max_age_s)
+                session.reconsider(
+                    now,
+                    co.ledger.routing_reading(pools[0]),
+                    co.ledger.routing_reading(pools[1]),
+                    next(
+                        (
+                            c
+                            for c in candidates
+                            if c.request_id == session.record.request_id
+                        ),
+                        None,
+                    ),
+                    co.policy.cfg,
+                    target_inventory=inventories[1],
+                )
                 progress = session.old.read_source_progress(
                     session.run_dir, session.stream.payload, now
                 )
@@ -715,14 +732,17 @@ def _run(args, prepared):
                         "source ended before selected progress was published"
                     )
             for previous_session in session.sessions:
+                if previous_session.record is None:
+                    continue
+                entry = co.ledger.entries[previous_session.migration_id]
                 if previous_session.target_future is not None and (
                     previous_session.target_future.done()
                 ):
                     previous_session.target_future.result()
-                    service.finish(previous_session.stream.recorder.target_service_id)
-                if previous_session.record is None:
-                    continue
-                entry = co.ledger.entries[previous_session.migration_id]
+                    if entry.state in {"COMMITTED", "ACCOUNTED", "COMPLETED"}:
+                        service.finish(
+                            previous_session.stream.recorder.target_service_id
+                        )
                 prefix = (
                     f"cmpl-bridgetp-phase9-target-{previous_session.run_dir.name}-0-"
                 )
@@ -803,6 +823,13 @@ def _run(args, prepared):
                         in {"COMMITTED", "ACCOUNTED", "COMPLETED"}
                         for s in session.sessions
                     ),
+                    migrations_cancelled=sum(
+                        s.record is not None
+                        and co.ledger.entries[s.migration_id].state == "CANCELLED"
+                        for s in session.sessions
+                    ),
+                    migration_cancelling=session.cancel_future is not None
+                    and not session.settled,
                     engine_waiting={pool.pool_id: pool.waiting for pool in pools},
                     unobserved_ingress={
                         pool.pool_id: co.ledger.unobserved_ingress(pool.pool_id)

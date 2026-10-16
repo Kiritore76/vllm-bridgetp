@@ -47,6 +47,9 @@ class PressureConfig:
     survival_horizon: int = 256
     min_survival_lower: float = 0.5
     length_resolution: int = 512
+    shadow_cancel: bool = False
+    cancel_sustain_s: float = 3.0
+    cancel_recover_eta: float = 1.0
 
     def __post_init__(self) -> None:
         if any(not math.isfinite(v) or v < 0 for v in asdict(self).values()):
@@ -67,6 +70,15 @@ class PressureConfig:
             and self.capacity_guard_blocks > 0
             and type(self.capacity_only) is bool
             and type(self.health_service) is bool
+            and type(self.shadow_cancel) is bool
+            and self.cancel_sustain_s > 0
+            and (
+                not self.shadow_cancel
+                or (
+                    self.health_service
+                    and self.cancel_recover_eta > self.health_min_efficiency
+                )
+            )
             and 0 < self.health_min_efficiency <= 1
             and 0 < self.health_target_load < 1
             and not (self.health_service and self.capacity_only)
@@ -478,6 +490,11 @@ class PressurePolicy:
         self._last_tick: float | None = None
         self._last_start = -math.inf
         self._latched = False
+        self._retry_after: dict[str, float] = {}
+
+    def note_cancelled(self, request_id: str, now: float) -> None:
+        self._retry_after[request_id] = now + self.cfg.cooldown_s
+        self.note_started(now)
 
     def note_started(self, now: float) -> None:
         self._last_start = now
@@ -586,6 +603,8 @@ class PressurePolicy:
         feasible, rows = [], []
         for c in candidates:
             reasons = []
+            if now < self._retry_after.get(c.request_id, -math.inf):
+                reasons.append("cancelled request cooling down")
             if not c.action_available:
                 reasons.append("no bound source stream/action adapter")
             cap = max(0, min(8192, c.max_output_tokens) - c.generated)
@@ -826,7 +845,7 @@ def admit(
     preferred = pools[1] if prefer_target else pools[0]
     routing_reason = (
         "very long known prompt"
-        if prompt_tokens >= cfg.very_long_prompt_tokens
+        if prefer_target and prompt_tokens >= cfg.very_long_prompt_tokens
         else "long prompt and TP1 pressure"
         if prefer_target
         else "prefer TP1"

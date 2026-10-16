@@ -34,7 +34,8 @@ class PressureSessions:
     Rotation requires source release, native target progress, all five channel
     IDLE receipts, scheduler finalization and clean stager completion. Uncertain
     cancellation blocks rotation until owner shutdown. No session files are
-    overwritten or deleted, and no request is migrated twice.
+    overwritten or deleted. Only a confirmed cancelled source may be retried;
+    committed requests retain their target ownership.
     """
 
     def __init__(self, *, maximum_migrations=1, **kwargs):
@@ -75,22 +76,29 @@ class PressureSessions:
             return False
         if self.maximum and len(self.sessions) >= self.maximum:
             return False
-        if self.cleanup_requires_shutdown or self.target_future is None:
+        if self.cleanup_requires_shutdown:
             return False
-        if not self.stream.future.done():
-            return False
-        self.stream.future.result()
         entry = self.coordinator.ledger.entries[self.migration_id]
-        if entry.state not in {"COMMITTED", "ACCOUNTED", "COMPLETED"}:
-            return False
-        if not entry.service_observed:
-            return False
+        cancelled = entry.state == "CANCELLED"
+        if not cancelled:
+            if self.target_future is None or not self.stream.future.done():
+                return False
+            self.stream.future.result()
+            if entry.state not in {"COMMITTED", "ACCOUNTED", "COMPLETED"}:
+                return False
+            if not entry.service_observed:
+                return False
         paths = [self.run_dir / "gpu_direct_sender.json"] + [
             self.run_dir / "persistent_channel_receipts" / f"tp_rank_{rank}.json"
             for rank in range(4)
         ]
         paths += [
-            self.run_dir / "rolling_target_finalized.json",
+            self.run_dir
+            / (
+                "stager_cleanup_receipt.json"
+                if cancelled
+                else "rolling_target_finalized.json"
+            ),
             self.run_dir / "pressure_stager_receipt.json",
         ]
         if not all(path.is_file() for path in paths):
@@ -129,6 +137,7 @@ class PressureSessions:
             dict(
                 kind="pressure_channel_reused",
                 previous_migration_id=old_id,
+                previous_outcome="CANCELLED" if cancelled else "COMMITTED",
                 migration_id=self.migration_id,
                 run_dir=str(self.run_dir),
             )
@@ -137,6 +146,9 @@ class PressureSessions:
 
     def close(self):
         for session in self.sessions:
+            cleanup_executor = getattr(session, "cleanup_executor", None)
+            if cleanup_executor is not None:
+                cleanup_executor.shutdown(wait=False, cancel_futures=False)
             session.adapter.close()
 
 

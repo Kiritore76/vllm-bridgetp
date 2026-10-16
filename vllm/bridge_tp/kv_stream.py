@@ -50,6 +50,7 @@ logger = init_logger(__name__)
 
 _TRUE = {"1", "true", "yes", "on"}
 _published_request_ids: set[str] = set()
+_published_sessions: dict[str, tuple[str, Path]] = {}
 _disabled_after_error = False
 _publishers: list[_RankPublisher] = []
 _retained_gpu_senders: list[Any] = []
@@ -946,6 +947,9 @@ def _publish_request(
         raise ValueError("BridgeTP Phase 6 does not support speculative decoding")
     if not kv_caches:
         raise RuntimeError("The source has no initialized KV-cache tensors")
+    # Background send/cleanup threads must never follow migration_active after
+    # a completed or cancelled session rotates to a different request.
+    config = replace(config, run_dir=config.run_dir.resolve(strict=True))
 
     request_index = input_batch.req_id_to_index[request_id]
     request = requests[request_id]
@@ -1256,6 +1260,7 @@ def _publish_request(
             config.run_dir / "takeover_state.json",
         )
     _published_request_ids.add(request_id)
+    _published_sessions[request_id] = (config.migration_id, config.run_dir.resolve())
     if config.phase8_enabled and not config.stop_and_copy:
         from vllm.bridge_tp.phase8_source import start_phase8_source
 
@@ -1359,6 +1364,31 @@ def _publish_source_progress(
     )
 
 
+def _allow_cancelled_republish(config, request_id):
+    """Retry a live source only in a fresh, previously cleaned session."""
+    previous = _published_sessions.get(request_id)
+    if previous is None or previous[0] == config.migration_id:
+        return False
+    migration_id, directory = previous
+    if directory == config.run_dir.resolve():
+        raise RuntimeError("cancel retry requires a fresh session directory")
+    cleanup_path = directory / "source_cleanup_receipt.json"
+    state_path = directory / "takeover_state.json"
+    if not cleanup_path.is_file() or not state_path.is_file():
+        return False
+    cleanup = json.loads(cleanup_path.read_text(encoding="utf-8"))
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    return (
+        cleanup.get("status") == "CLEANED"
+        and cleanup.get("migration_id") == migration_id
+        and cleanup.get("component") == "source_delta_mirror"
+        and state.get("state") == "CANCELLED"
+        and state.get("migration_id") == migration_id
+        and state.get("source_request_id") == request_id
+        and state.get("source_abort_dispatched") is False
+    )
+
+
 def maybe_publish_kv_stream(
     *,
     kv_caches: list[torch.Tensor],
@@ -1384,6 +1414,8 @@ def maybe_publish_kv_stream(
             # Retire only that request-local marker; the process-lifetime GPU
             # sender and communicator remain in the persistent registry.
             _published_request_ids.intersection_update(requests)
+            for finished_id in set(_published_sessions) - set(requests):
+                _published_sessions.pop(finished_id)
         request_ids = input_batch.req_ids
         request_id = select_source_request_id(
             request_ids,
@@ -1410,6 +1442,12 @@ def maybe_publish_kv_stream(
             )
         if not config.armed:
             return
+        if (
+            config.persistent_channel
+            and request_id in _published_request_ids
+            and _allow_cancelled_republish(config, request_id)
+        ):
+            _published_request_ids.remove(request_id)
         if request_id in _published_request_ids:
             if config.phase8_enabled:
                 from vllm.bridge_tp.phase8_source import maybe_publish_phase8_delta

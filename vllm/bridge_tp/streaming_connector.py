@@ -1170,7 +1170,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         tp_rank: int,
     ) -> bool:
         """Drain an unadmitted cancelled session and release its GPU buffer."""
-        run_dir = self.manifest_path.parent
+        run_dir = self.manifest_path.parent.resolve()
         state_path = run_dir / "takeover_state.json"
         control_path = run_dir / "runtime_control.json"
         if not state_path.is_file() or not control_path.is_file():
@@ -1568,6 +1568,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         receiver: Any | None = None
         device: torch.device | None = None
         tp_rank: int | None = None
+        restore_stream = None
         try:
             manifest = self._load_manifest()
             tp_rank = get_tp_group().rank_in_group
@@ -2305,23 +2306,47 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     )
             self._completed_recvs.add(request_id)
         except _ShadowCancelled as error:
-            if receiver is not None:
-                receiver.close()
-                if self.persistent_channel:
-                    with self._persistent_gpu_receiver_lock:
-                        if self._persistent_gpu_receiver is receiver:
-                            self._persistent_gpu_receiver = None
+            try:
+                self._finish_cancelled_receiver(
+                    receiver, request_id=request_id,
+                    source_request_id=session_request_id,
+                    migration_id=request.migration_id, tp_rank=tp_rank,
+                )
+                if restore_stream is not None:
+                    restore_stream.synchronize()
+                # Do not expose cancelled, partly copied KV as decode-ready.
+                # Scheduler abort retains its blocks until this receive ends.
+                abort_path = self.manifest_path.parent / "target_abort_receipt.json"
+                abort_deadline = time.monotonic() + self.socket_timeout_s
+                while True:
+                    if abort_path.is_file():
+                        aborted = _load_json(abort_path)
+                        if (
+                            aborted.get("target_request_id") == request_id
+                            and aborted.get("migration_id") == request.migration_id
+                            and aborted.get("status") == "ABORTED"
+                        ):
+                            break
+                    if time.monotonic() >= abort_deadline:
+                        raise TimeoutError("cancelled target abort not confirmed")
+                    time.sleep(0.005)
+            except BaseException as cleanup_error:
+                self._load_errors[request_id] = cleanup_error
+                return
             _atomic_json_dump(
                 {
                     "format_version": 1,
                     "status": "CLEANED",
+                    "migration_id": request.migration_id,
                     "target_request_id": request_id,
+                    "tp_rank": tp_rank,
                     "reason": str(error),
                     "updated_unix_s": time.time(),
                 },
                 self.manifest_path.parent
                 / "gpu_cleanup_receipts"
-                / f"{_safe_name(request_id)}.json",
+                / _safe_name(request_id)
+                / f"tp_rank_{tp_rank}.json",
             )
             self._completed_recvs.add(request_id)
         except BaseException as error:
@@ -2343,6 +2368,27 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                         if self._persistent_gpu_receiver is receiver:
                             self._persistent_gpu_receiver = None
             self._load_errors[request_id] = error
+
+    def _finish_cancelled_receiver(
+        self, receiver, *, request_id, source_request_id, migration_id, tp_rank,
+    ):
+        if receiver is None:
+            return
+        if not self.persistent_channel or receiver.lifecycle is None:
+            receiver.close()
+            return
+        # A cancelled request is a session boundary, not channel shutdown.
+        while receiver.lifecycle.active_session is not None:
+            delta = receiver.receive_delta(migration_id=migration_id, rank=tp_rank)
+            if delta is not None:
+                receiver.acknowledge_delta(
+                    start_token=delta.start_token, end_token=delta.end_token,
+                )
+        self._record_persistent_receiver_idle(
+            receiver, target_request_id=request_id,
+            session_request_id=source_request_id,
+            migration_id=migration_id, tp_rank=tp_rank,
+        )
 
     def get_finished(
         self, finished_req_ids: set[str]
@@ -2367,6 +2413,27 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         """Drop request-local bookkeeping while retaining channel resources."""
         del block_ids
         request_id = request.request_id
+        if self.gpu_resident_shadow and self.takeover_control_path is not None:
+            path = self.takeover_control_path
+            if path.is_file():
+                state = _load_json(path)
+                expected = (
+                    f"cmpl-bridgetp-phase9-target-{self.manifest_path.parent.name}-0"
+                )
+                if (
+                    state.get("state") == "CANCELLED"
+                    and request_id.startswith(expected)
+                    and str(request.status.name) == "FINISHED_ABORTED"
+                ):
+                    _atomic_json_dump(
+                        {
+                            "status": "ABORTED",
+                            "migration_id": state["migration_id"],
+                            "target_request_id": request_id,
+                            "completed_unix_s": time.time(),
+                        },
+                        self.manifest_path.parent / "target_abort_receipt.json",
+                    )
         # The communicator remains pooled, but its previous request's packed
         # receive tensor must not stay live after the request is gone.
         self._release_persistent_payload_buffer(request_id)

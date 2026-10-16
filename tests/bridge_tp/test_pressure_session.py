@@ -140,6 +140,8 @@ class SessionTests(unittest.TestCase):
         )
 
     def tearDown(self):
+        if self.driver.cleanup_executor is not None:
+            self.driver.cleanup_executor.shutdown(wait=True)
         self.temp.cleanup()
 
     def test_three_ranks_do_not_commit_then_four_ranks_commit_and_set_seam(self):
@@ -186,7 +188,9 @@ class SessionTests(unittest.TestCase):
         self.driver.adapter.wait_for_preparing_binding = lambda **kwargs: None
         self.driver.adapter.disarm = lambda **kwargs: None
         self.source.future.set_result({"finish_reason": "stop"})
+
         self.driver.tick(self.view, self.snapshot)
+        self.driver.cancel_future.result(timeout=2)
         self.assertTrue(self.driver.cleanup_requires_shutdown)
         self.assertFalse(self.driver.settled)
         self.assertFalse(self.settlements)

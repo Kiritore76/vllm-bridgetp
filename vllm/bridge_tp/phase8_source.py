@@ -296,14 +296,15 @@ class _Phase8SourceState:
 
     def _watch_cleanup(self) -> None:
         cleanup_path = self.config.run_dir / "cleanup_request.json"
-        while not self.finalized and not cleanup_path.exists():
+        # A cleanup request may race the final freeze/manifest publication.
+        # Stay alive until ownership commits, even after delta work ended.
+        while not cleanup_path.exists():
+            state_path = self.config.run_dir / "takeover_state.json"
+            if state_path.is_file():
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                if state.get("state") == "COMMITTED":
+                    return
             time.sleep(0.05)
-        if not cleanup_path.exists() or self.finalized:
-            return
-        if self.finalizing:
-            # The cutover finalizer owns cleanup once the exact boundary has
-            # been published.  Do not drain or stop its delta queue twice.
-            return
         try:
             # Prevent later decode iterations from enqueueing deltas after the
             # worker queues have been drained.  This matters when Phase 9
@@ -311,11 +312,29 @@ class _Phase8SourceState:
             # the request.
             with self.lifecycle_lock:
                 self.finalized = True
+                finalizing = self.finalizing
+            # Finalizer owns its queued work until its finally block runs.
+            if finalizing:
+                deadline = time.monotonic() + self.config.socket_timeout_s
+                while self.finalizing:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("cancel waits for source finalizer")
+                    time.sleep(0.005)
             self.wait_for_acks()
             self.stop_workers()
+            self.wait_for_acks()  # Includes END_SESSION and four IDLE ACKs.
             request = json.loads(cleanup_path.read_text(encoding="utf-8"))
             reason = request.get("reason", "source ended before cutover")
             cancelled_history_ranks = self.cancel_deferred_history(str(reason))
+            if not request.get("abort_source", True):
+                _atomic_json_dump(
+                    {
+                        "format_version": 1, "action": "RESUME",
+                        "request_id": self.request_id,
+                        "reason": "shadow cleanup completed before ownership commit",
+                    },
+                    self.config.run_dir / "request_freeze_control.json",
+                )
             _atomic_json_dump(
                 {
                     "format_version": 1,
@@ -429,6 +448,10 @@ def _copy_delta_rank_shards(
     return rank_layers, (time.perf_counter() - started) * 1000
 
 
+class _ShadowAbandoned(RuntimeError):
+    """Expected cancellation racing a not-yet-committed freeze."""
+
+
 def _wait_for_scheduler_freeze(
     state: _Phase8SourceState,
     *,
@@ -441,7 +464,7 @@ def _wait_for_scheduler_freeze(
     deadline = time.monotonic() + state.config.socket_timeout_s
     while time.monotonic() < deadline:
         if cleanup_path.exists():
-            raise RuntimeError("migration was abandoned before source freeze")
+            raise _ShadowAbandoned("migration was abandoned before source freeze")
         if frozen_path.exists():
             receipt = json.loads(frozen_path.read_text(encoding="utf-8"))
             if receipt.get("request_id") == state.request_id:
@@ -485,7 +508,7 @@ def _finalize_cutover(
     delta_drain_completed_unix_ns = time.time_ns()
     delta_drain_completed_monotonic_ns = time.monotonic_ns()
     if (config.run_dir / "cleanup_request.json").exists():
-        raise RuntimeError("migration was abandoned during final delta drain")
+        raise _ShadowAbandoned("migration was abandoned during final delta drain")
     # S_NEW starts its historical copy only at the irreversible boundary.
     state.start_history_transfer()
     with state.lifecycle_lock:
@@ -596,6 +619,11 @@ def _background_finalize_cutover(**kwargs: Any) -> None:
     state: _Phase8SourceState = kwargs["state"]
     try:
         _finalize_cutover(**kwargs)
+    except _ShadowAbandoned:
+        logger.info("BridgeTP finalizer drained for explicit shadow cancellation")
+        with state.lifecycle_lock:
+            state.finalized = True
+        state.stop_workers()
     except Exception as error:
         logger.exception("BridgeTP background final delta failed")
         if (state.config.run_dir / "cutover_manifest.json").exists():
@@ -625,6 +653,9 @@ def _background_finalize_cutover(**kwargs: Any) -> None:
         with state.lifecycle_lock:
             state.finalized = True
         state.stop_workers()
+    finally:
+        with state.lifecycle_lock:
+            state.finalizing = False
 
 
 def maybe_publish_phase8_delta(
@@ -813,6 +844,12 @@ def maybe_publish_phase8_delta(
     from vllm.bridge_tp.request_freeze import enabled_from_env, request_freeze
 
     freeze_request = None
+    with state.lifecycle_lock:
+        if state.finalized or (config.run_dir / "cleanup_request.json").exists():
+            return
+        # Claim finalization before publishing FREEZE. The cleanup watcher
+        # waits for this owner and publishes RESUME only after it has finished.
+        state.finalizing = True
     if enabled_from_env() and not getattr(config, "stop_and_copy", False):
         freeze_request = request_freeze(
             config.run_dir,
@@ -840,7 +877,11 @@ def maybe_publish_phase8_delta(
     }
     if freeze_request is None:
         # Preserve Bridge mode's existing synchronous cutover semantics.
-        _finalize_cutover(**finalizer_kwargs)
+        try:
+            _finalize_cutover(**finalizer_kwargs)
+        finally:
+            with state.lifecycle_lock:
+                state.finalizing = False
         return
     with state.lifecycle_lock:
         state.finalizing = True

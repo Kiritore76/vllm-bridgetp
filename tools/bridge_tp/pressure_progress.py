@@ -69,7 +69,11 @@ def workload_progress(dispatched, last_inventory, session, reservations):
         if hasattr(session, "sessions")
         else completed_streams(dispatched, session.stream, session.target_future),
         last_inventory,
-        session.record.state.value if session.record else "no_session",
+        "CANCELLING"
+        if getattr(session, "cancel_future", None) is not None and not session.settled
+        else session.record.state.value
+        if session.record
+        else "no_session",
         session.settled,
         tuple(
             (
