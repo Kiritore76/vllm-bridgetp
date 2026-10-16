@@ -48,8 +48,11 @@ def capture(proc_root, cgroup_root, filesystem):
             name: optional_text(cgroup_root / name)
             for name in (
                 "cpu.stat",
+                "cpu.max",
+                "cpuset.cpus.effective",
                 "memory.events",
                 "memory.current",
+                "memory.max",
                 "pids.current",
                 "cpu/cpu.stat",
                 "memory/memory.failcnt",
@@ -59,6 +62,7 @@ def capture(proc_root, cgroup_root, filesystem):
 
 
 def gpu_sample():
+    started = time.monotonic()
     try:
         result = subprocess.run(
             [
@@ -71,9 +75,58 @@ def gpu_sample():
             timeout=3,
             check=True,
         )
-        return dict(rows=list(csv.reader(result.stdout.splitlines())), error=None)
+        return dict(
+            rows=list(csv.reader(result.stdout.splitlines())),
+            error=None,
+            duration_s=time.monotonic() - started,
+        )
     except (OSError, subprocess.SubprocessError) as error:
-        return dict(rows=None, error=repr(error))
+        return dict(rows=None, error=repr(error), duration_s=time.monotonic() - started)
+
+
+def process_samples(registry, proc_root=Path("/proc")):
+    """Follow only registered owned roots and their current Linux children."""
+    if registry is None or not registry.exists():
+        return []
+    roots = json.loads(registry.read_text())
+    pending = [(r["pid"], r["name"]) for r in roots]
+    seen, result = set(), []
+    while pending:
+        pid, role = pending.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        directory = proc_root / str(pid)
+        stat = optional_text(directory / "stat")
+        if stat is None:
+            continue
+        status = optional_text(directory / "status") or ""
+        result.append(
+            dict(
+                pid=pid,
+                role=role,
+                stat=stat,
+                wchan=optional_text(directory / "wchan"),
+                schedstat=optional_text(directory / "schedstat"),
+                io=optional_text(directory / "io"),
+                status=[
+                    line
+                    for line in status.splitlines()
+                    if line.startswith(
+                        (
+                            "State:",
+                            "VmRSS:",
+                            "Threads:",
+                            "voluntary_ctxt_switches:",
+                            "nonvoluntary_ctxt_switches:",
+                        )
+                    )
+                ],
+            )
+        )
+        children = optional_text(directory / "task" / str(pid) / "children") or ""
+        pending.extend((int(child), role + ":child") for child in children.split())
+    return result
 
 
 def validate_journal(path):
@@ -101,6 +154,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--stop-file", type=Path, required=True)
+    parser.add_argument("--process-file", type=Path)
     args = parser.parse_args()
     if os.name != "posix":
         raise RuntimeError("Linux monitor required")
@@ -136,6 +190,9 @@ def main():
         try:
             while not stopping and not args.stop_file.exists():
                 row = capture(Path("/proc"), Path("/sys/fs/cgroup"), args.output.parent)
+                process_started = time.monotonic()
+                row["processes"] = process_samples(args.process_file)
+                row["process_capture_s"] = time.monotonic() - process_started
                 stamp = row["monotonic_s"]
                 row.update(
                     kind="host_sample",

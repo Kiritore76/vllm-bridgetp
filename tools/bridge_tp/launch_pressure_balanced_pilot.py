@@ -10,6 +10,7 @@ Linux dependency/rolling checks precede GPU startup.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import hashlib
 import json
@@ -357,12 +358,33 @@ def scene_result(run_dir, name):
 
 
 def run_scene(
-    spec, scene, plan, common, args, *, before_shutdown=None, before_workload=None
+    spec,
+    scene,
+    plan,
+    common,
+    args,
+    *,
+    before_shutdown=None,
+    before_workload=None,
+    diagnose_pauses=False,
 ):
     from tools.bridge_tp.run_phase9_cap0_noop import warmup_prompt_shapes
     from tools.bridge_tp.run_phase9_controller import RuntimeControl
 
     root, processes = plan["run_dir"].parent, []
+    monitor = None
+
+    def publish_processes():
+        if diagnose_pauses:
+            common.write_json(
+                root / "owned_processes.json",
+                [
+                    dict(name=p.name, pid=p.process.pid)
+                    for p in processes
+                    if p is not monitor
+                ],
+            )
+
     plan["run_dir"].mkdir(parents=True, exist_ok=False)
     common.write_json(plan["config_path"], plan["config"])
     RuntimeControl(
@@ -387,11 +409,31 @@ def run_scene(
         },
     )
     try:
+        if diagnose_pauses:
+            publish_processes()
+            monitor = common.start_process(
+                "host monitor",
+                [
+                    sys.executable,
+                    "-B",
+                    str(ROOT / "tools/bridge_tp/monitor_pressure_host.py"),
+                    "--output",
+                    str(root / "host_monitor.jsonl"),
+                    "--stop-file",
+                    str(root / "host_monitor.stop"),
+                    "--process-file",
+                    str(root / "owned_processes.json"),
+                ],
+                os.environ.copy(),
+                root / "host_monitor.log",
+            )
+            processes.append(monitor)
         announce(scene["name"], "启动TP4服务，等待就绪")
         target = common.start_process(
             "target TP4", plan["target_argv"], plan["target_env"], root / "target.log"
         )
         processes.append(target)
+        publish_processes()
         common.wait_healthy(
             plan["config"]["target_url"], target, spec["startup_timeout_s"]
         )
@@ -400,6 +442,7 @@ def run_scene(
             "source TP1", plan["source_argv"], plan["source_env"], root / "source.log"
         )
         processes.append(source)
+        publish_processes()
         common.wait_healthy(
             plan["config"]["source_url"], source, spec["startup_timeout_s"]
         )
@@ -420,18 +463,25 @@ def run_scene(
             "stager", plan["stager_argv"], os.environ.copy(), root / "stager.log"
         )
         processes.append(stager)
+        publish_processes()
         checked = controller.parse_args(
             plan["controller_argv"][2:] + ["--validate-only"]
         )
         controller.preflight(checked)
         (root / "controller_config.sha256").write_text(sha(plan["config_path"]) + "\n")
+        worker_env = os.environ.copy()
+        if diagnose_pauses:
+            worker_env["BRIDGETP_PRESSURE_DIAGNOSTICS"] = str(
+                plan["run_dir"] / "pressure_timing.jsonl"
+            )
         worker = common.start_process(
             "pressure controller",
             plan["controller_argv"],
-            os.environ.copy(),
+            worker_env,
             root / "controller.log",
         )
         processes.append(worker)
+        publish_processes()
         deadline = time.monotonic() + spec["run_timeout_s"] + 60
         last_progress_at = -float("inf")
         while worker.process.poll() is None:
@@ -494,6 +544,10 @@ def run_scene(
         if before_shutdown is not None:
             before_shutdown(plan)
     finally:
+        if monitor:
+            (root / "host_monitor.stop").touch()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                monitor.process.wait(timeout=8)
         announce(scene["name"], "清理本场受管进程，核对退出")
         common.stop_processes(processes)
         ended = not any(common.process_group_alive(process) for process in processes)
@@ -515,6 +569,22 @@ def run_scene(
         if not ended:
             raise RuntimeError(
                 "owned server groups did not terminate; commitments unresolved"
+            )
+        if monitor:
+            from tools.bridge_tp.monitor_pressure_host import validate_journal
+            from tools.bridge_tp.pressure_cpu import load
+
+            if monitor.process.returncode != 0:
+                raise RuntimeError("host monitor failed; preserve evidence")
+            common.write_json(
+                root / "host_monitor_receipt.json",
+                validate_journal(root / "host_monitor.jsonl"),
+            )
+            common.write_json(
+                root / "pressure_timing_receipt.json",
+                load("pause_diagnostics").verify(
+                    plan["run_dir"] / "pressure_timing.jsonl"
+                ),
             )
     return scene_result(plan["run_dir"], scene["name"])
 

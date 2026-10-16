@@ -5,11 +5,14 @@ import json
 import os
 from pathlib import Path
 
+from tools.bridge_tp.pressure_cpu import load
+
 
 def save_progress(path: Path, **status):
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(status, ensure_ascii=False), encoding="utf-8")
-    os.replace(temporary, path)
+    with load("pause_diagnostics").span("progress.write_replace"):
+        temporary.write_text(json.dumps(status, ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary, path)
 
 
 def stream_progress(dispatched, target_future=None):

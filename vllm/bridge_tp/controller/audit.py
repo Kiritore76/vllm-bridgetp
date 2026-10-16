@@ -18,6 +18,8 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+from .pause_diagnostics import span
+
 
 class AuditLog:
     def __init__(self, path: str | os.PathLike[str], run_metadata: dict | None = None):
@@ -31,11 +33,14 @@ class AuditLog:
     def write(self, record: dict[str, Any]) -> None:
         payload = dict(record)
         payload.setdefault("unix_s", time.time())
-        line = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
-        with self._lock:
-            self._handle.write(line + "\n")
-            self._handle.flush()
-            os.fsync(self._handle.fileno())
+        with span("audit.serialize"):
+            line = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        with span("audit.lock_and_sync"), self._lock:
+            with span("audit.write_flush"):
+                self._handle.write(line + "\n")
+                self._handle.flush()
+            with span("audit.fsync"):
+                os.fsync(self._handle.fileno())
 
     def close(self) -> None:
         with self._lock:

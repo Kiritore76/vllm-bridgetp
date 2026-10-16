@@ -14,6 +14,7 @@ import atexit
 import hashlib
 import json
 import math
+import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -264,6 +265,27 @@ def dispatch_due(
 
 
 def run(args, prepared):
+    diagnostic_path = os.environ.get("BRIDGETP_PRESSURE_DIAGNOSTICS")
+    if not diagnostic_path:
+        return _run(args, prepared)
+    from vllm.bridge_tp.async_journal import AsyncJournal
+    from vllm.bridge_tp.controller import pause_diagnostics as native_diagnostics
+
+    args.run_dir.mkdir(parents=True, exist_ok=True)
+    observer = load("pause_diagnostics").TimingObserver(
+        AsyncJournal(Path(diagnostic_path))
+    )
+    try:
+        with (
+            load("pause_diagnostics").installed(observer),
+            native_diagnostics.installed(observer),
+        ):
+            return _run(args, prepared)
+    finally:
+        observer.close()
+
+
+def _run(args, prepared):
     from tools.bridge_tp.pressure_session import RollingPressureSession
     from vllm.bridge_tp.async_journal import AsyncJournal
 
@@ -337,8 +359,12 @@ def run(args, prepared):
     failure = None
     try:
         while time.monotonic() - started < args.max_seconds:
+            load("pause_diagnostics").tick()
             now, elapsed = time.time(), time.monotonic() - started
-            inventories = [reader.poll(now) for reader in readers]
+            inventories = [
+                load("pause_diagnostics").call("inventory.poll", reader.poll, now)
+                for reader in readers
+            ]
             for reader in readers:
                 diagnostic = reader.diagnostics()
                 status_key = (
@@ -407,7 +433,9 @@ def run(args, prepared):
                 if raw["context_limit"] != expected_context:
                     raise ValueError("live context limit differs from serving contract")
                 try:
-                    metrics = o.scrape_inventory_metrics(scraper, raw)
+                    metrics = load("pause_diagnostics").call(
+                        "metrics.scrape", o.scrape_inventory_metrics, scraper, raw
+                    )
                 except load("telemetry").TelemetryError as error:
                     metrics = None
                     if now - last_metrics_error.get(raw["pool_id"], -math.inf) >= 5:
@@ -553,7 +581,9 @@ def run(args, prepared):
                     )
                 )
                 eos[row["request_id"]] = row["ignore_eos"]
-            candidates = co.with_predictions(
+            candidates = load("pause_diagnostics").call(
+                "predictor.read",
+                co.with_predictions,
                 candidates,
                 predictor,
                 now,
@@ -604,7 +634,9 @@ def run(args, prepared):
                     for c in candidates
                 }
             )
-            co.tick(now, pools[0], pools[1], candidates, actions)
+            load("pause_diagnostics").call(
+                "policy.tick", co.tick, now, pools[0], pools[1], candidates, actions
+            )
             if session.record is not None and not session.settled:
                 progress = session.old.read_source_progress(
                     args.run_dir, session.stream.payload, now
@@ -615,7 +647,9 @@ def run(args, prepared):
                 ):
                     last_view = progress
                 if last_view is not None:
-                    session.tick(last_view, runtime)
+                    load("pause_diagnostics").call(
+                        "migration.tick", session.tick, last_view, runtime
+                    )
                 elif session.stream.future.done():
                     session.cancel(
                         "source ended before selected progress was published"

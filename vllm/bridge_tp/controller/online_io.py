@@ -13,6 +13,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from .pause_diagnostics import span
 from .response_proxy import EmittedToken, ProxyMode, ResponseProxy
 from .sampling_contract import (
     freeze_strict_greedy_sampling,
@@ -34,11 +35,13 @@ def atomic_json_dump(value: dict[str, Any], path: str | Path) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(target.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, target)
+    with span("atomic_json.serialize_write"):
+        temporary.write_text(
+            json.dumps(value, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    with span("atomic_json.replace"):
+        os.replace(temporary, target)
 
 
 def post_streaming_completion(

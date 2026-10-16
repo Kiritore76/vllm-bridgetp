@@ -128,3 +128,35 @@ Local reproduction scripts and detailed outputs live under
 `D:/work/bridgetp/control/pressure_health_service_stage_20261016` and its report.
 Actual serving-parser validation, full rolling CPU gate and GPU acceptance
 must be run on the cloud host before interpreting this screen.
+
+## Pause diagnosis in the same four-run screen
+
+`--health-screen` now also owns a nice(10) host monitor. Load/CPU/memory/PSI,
+disk/cgroup counters and registered owned process trees are sampled every2s;
+GPU queries every10s have a3s timeout and report their own duration. Per-process
+stat/status/wchan/io/schedstat helps distinguish CPU scheduling and storage
+waits from absent application work. Process enumeration follows only registered
+server/stager/controller roots and their current children, not unrelated jobs.
+Sampling gaps remain data; no seed search or slow-run deletion is performed.
+
+Only this screen enables controller `pressure_timing.jsonl`. It uses bounded
+asynchronous evidence and records operation summaries about once per second,
+plus operations taking at least100ms (tick intervals at least500ms). Timed
+paths include inventory, metrics, predictor reads, policy/migration ticks,
+progress snapshots, atomic JSON writes/replaces, and audit serialization,
+write/flush/fsync and enclosing lock time. Thread CPU time accompanies operation
+wall time; tick intervals include intentional tick sleep. Nested durations
+overlap and must not be added. Both controller helper module namespaces use the
+same observer so migration helper writes remain visible.
+
+Audit fsync frequency and atomic-write semantics remain unchanged. Timings
+observe the possible cause rather than assume synchronous I/O is responsible.
+The four recipes, seeds, health reference, thresholds, goodoutput scoring and
+single-migration limit are unchanged. Other pilot modes do not enable timing.
+
+Each scene must save `host_monitor_receipt.json` and
+`pressure_timing_receipt.json`, with finalized journals and no timing drops or
+writer errors. Monitor failure is a technical failure after owned cleanup.
+The monitor stops through an owned stop file before process-group cleanup;
+this adds no unrelated process termination. All records remain in the existing
+single `pressure-balanced-git-v2-health-screen-*.tar.gz` archive.

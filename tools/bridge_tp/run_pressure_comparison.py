@@ -361,6 +361,7 @@ def main():
                     "test_pressure_kv_pilot",
                     "test_pressure_sustained",
                     "test_pressure_health_service",
+                    "test_pressure_pause_diagnostics",
                     "test_pressure_health_screen",
                     "test_pressure_health_reference",
                     "test_pressure_policy",
@@ -400,6 +401,7 @@ def main():
                 plan,
                 common,
                 settings,
+                diagnose_pauses=args.health_screen,
                 before_shutdown=lambda plan: finalize(plan, common),
                 before_workload=(
                     lambda plan, arrivals_path=scene["arrivals"]: (
