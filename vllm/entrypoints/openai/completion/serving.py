@@ -370,8 +370,10 @@ class OpenAIServingCompletion(OpenAIServing):
                             not delta_text
                             and not delta_token_ids
                             and not previous_num_tokens[i]
+                            and output.finish_reason is None
                         ):
-                            # Chunked prefill case, don't return empty chunks
+                            # Suppress intermediate prefill chunks, but preserve
+                            # terminal abort/stop/error even before the first token.
                             continue
 
                     if request.logprobs is not None:

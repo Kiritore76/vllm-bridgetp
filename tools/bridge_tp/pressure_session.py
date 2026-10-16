@@ -436,6 +436,20 @@ class RollingPressureSession:
             response = self.target_future.result()
             if response.get("token_ids"):
                 raise ValueError("cancelled shadow emitted target tokens")
+            if response.get("finish_reason") != "abort":
+                raise ValueError("cancelled target lacks terminal abort response")
+            path = self.run_dir / "target_abort_receipt.json"
+            if not path.is_file():
+                return
+            aborted = self.old.load_json(path)
+            expected = f"cmpl-bridgetp-phase9-target-{self.run_dir.name}-0-"
+            if (
+                aborted.get("status") != "ABORTED"
+                or aborted.get("migration_id") != self.migration_id
+                or not aborted.get("target_request_id", "").startswith(expected)
+                or aborted.get("completed_unix_s", 0) < self.cancel_started_at
+            ):
+                raise ValueError("cancelled target abort receipt identity differs")
         prefix = f"cmpl-bridgetp-phase9-target-{self.run_dir.name}-0"
         if (
             inventory["pool_id"] != "tp4"

@@ -2,6 +2,7 @@
 """Pre-freeze policy, cleanup ownership and route boundaries without CUDA."""
 
 import ast
+import io
 import json
 import tempfile
 import threading
@@ -64,22 +65,20 @@ class CancelPolicyTests(unittest.TestCase):
             self.policy = c.ShadowCancellation()
             self.assertIsNone(self.sustained(source=source))
 
-    def test_target_pressure_cancels_even_when_KV_warning_remains(self):
-        self.assertEqual(
+    def test_target_pressure_cannot_cancel_while_KV_warning_remains(self):
+        self.assertIsNone(
             self.sustained(
                 source=dict(free_blocks=250, growth_blocks_s=10),
                 target=dict(health_eta=0.7),
             ),
-            "target pressure increased",
         )
 
     def test_unknown_target_does_not_mean_pressure_increased(self):
         self.assertIsNone(self.sustained(target=dict(health_status="UNKNOWN")))
 
-    def test_short_prediction_requires_upper_bound_not_lower_bound(self):
-        self.assertEqual(
+    def test_short_prediction_never_overrides_source_pressure(self):
+        self.assertIsNone(
             self.sustained(cand=dict(remaining=length(mean=20))),
-            "remaining work too short",
         )
         # Ambiguous bin straddles the horizon: lower=0, upper=1.
         ambiguous = load("bounded_length").bounded_length(
@@ -92,10 +91,9 @@ class CancelPolicyTests(unittest.TestCase):
         self.policy = c.ShadowCancellation()
         self.assertIsNone(self.sustained(cand=dict(remaining=ambiguous)))
 
-    def test_stop_cap_short_cancels_without_prediction(self):
-        self.assertEqual(
+    def test_stop_cap_short_does_not_cancel_while_source_needs_relief(self):
+        self.assertIsNone(
             self.sustained(cand=dict(generated=5900, prediction_status="STALE")),
-            "remaining work too short",
         )
 
     def test_spike_gap_unknown_and_freeze_reset_confirmation(self):
@@ -111,6 +109,49 @@ class CancelPolicyTests(unittest.TestCase):
         self.assertIsNone(self.sustained(source=dict(health_eta=1), reversible=False))
         self.cfg = replace(self.cfg, shadow_cancel=False)
         self.assertIsNone(self.sustained(source=dict(health_eta=1)))
+
+    def test_same_closed_window_cannot_confirm_recovery_by_repolling(self):
+        for now in (10 + i * 0.2 for i in range(21)):
+            self.assertIsNone(
+                self.decide(
+                    now,
+                    source=dict(
+                        health_eta=1,
+                        health_sampled_at=10,
+                    ),
+                )
+            )
+        self.assertEqual(
+            self.decide(
+                14.2,
+                source=dict(
+                    health_eta=1,
+                    health_sampled_at=14,
+                ),
+            ),
+            "source service and projected KV recovered",
+        )
+
+    def test_mixed_window_or_bad_decode_never_proves_recovery(self):
+        for changes in (
+            dict(health_eta=1, health_mixed_window=True),
+            dict(health_eta=1, decode_ratio=1.1),
+            dict(health_eta=1, decode_ratio=None),
+        ):
+            self.policy = c.ShadowCancellation()
+            self.assertIsNone(self.sustained(source=changes))
+
+    def test_target_worse_or_short_output_still_cancels_only_after_source_recovers(
+        self,
+    ):
+        self.assertIn(
+            "recovered",
+            self.sustained(
+                source=dict(health_eta=1),
+                target=dict(health_eta=0.7),
+                cand=dict(remaining=length(mean=20)),
+            ),
+        )
 
     def test_own_shadow_queue_is_excluded_but_external_prefill_is_not(self):
         target = reading_at("tp4", waiting=2, pending_prompt_tokens=4500)
@@ -334,6 +375,37 @@ class CleanupTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "HTTP failed"):
             self.driver.poll_cancel(inventory, 12)
 
+    def test_target_abort_requires_terminal_stream_and_native_receipt(self):
+        inventory = self.setup_receipts()
+        d = self.driver
+        d.target_future = Future()
+        d.target_future.set_result(dict(token_ids=[], finish_reason="abort"))
+        d.poll_cancel(inventory, 12)
+        self.assertFalse(d.settled)
+        self.write(
+            "target_abort_receipt.json",
+            dict(
+                status="ABORTED",
+                migration_id="s1",
+                completed_unix_s=11,
+                target_request_id=f"cmpl-bridgetp-phase9-target-{d.run_dir.name}-0-abc",
+            ),
+        )
+        d.poll_cancel(inventory, 12)
+        self.assertTrue(d.settled)
+
+    def test_unexpected_empty_disconnect_is_still_failure(self):
+        inventory = self.setup_receipts()
+        d = self.driver
+        d.target_future = Future()
+        d.target_future.set_exception(
+            RuntimeError("streaming response ended before completion")
+        )
+        with self.assertRaisesRegex(RuntimeError, "ended before completion"):
+            d.poll_cancel(inventory, 12)
+        self.assertFalse(d.settled)
+        self.assertFalse(self.fixture.settlements)
+
     def test_source_drain_precedes_target_abort(self):
         order = []
         adapter = self.driver.adapter
@@ -407,7 +479,7 @@ class ReceiverCancelTests(unittest.TestCase):
             connector = NS(
                 gpu_resident_shadow=True,
                 takeover_control_path=control,
-                manifest_path=root / "session_manifest.json",
+                manifest_path=root / "migration_active" / "session_manifest.json",
                 _release_persistent_payload_buffer=Mock(),
                 _pending_requests={},
                 _active_requests={},
@@ -483,6 +555,138 @@ class ReceiverCancelTests(unittest.TestCase):
         receiver.acknowledge_delta.assert_called_once_with(start_token=10, end_token=20)
         receiver.close.assert_not_called()
         connector._record_persistent_receiver_idle.assert_called_once()
+
+
+class EmptyTerminalStreamTests(unittest.TestCase):
+    def stream(self, finish_reason):
+        path = ROOT / "vllm/entrypoints/openai/completion/serving.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        node = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.AsyncFunctionDef)
+            and n.name == "completion_stream_generator"
+        )
+        node.returns = None
+        for arg in node.args.args + node.args.kwonlyargs:
+            arg.annotation = None
+
+        class Message(NS):
+            def model_dump_json(self, **kwargs):
+                return json.dumps(vars(self), default=vars)
+
+        context = dict(
+            CompletionStreamResponse=Message,
+            CompletionResponseStreamChoice=Message,
+            UsageInfo=Message,
+            should_include_usage=lambda *a: (False, False),
+            as_list=list,
+            GenerationError=RuntimeError,
+            logger=Mock(),
+        )
+        exec(
+            compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"),
+            context,
+        )
+
+        async def results():
+            for reason in (None, finish_reason):
+                yield (
+                    0,
+                    NS(
+                        prompt_token_ids=[1, 2],
+                        prompt_logprobs=None,
+                        num_cached_tokens=0,
+                        prompt="",
+                        outputs=[
+                            NS(
+                                index=0,
+                                text="",
+                                token_ids=[],
+                                logprobs=None,
+                                finish_reason=reason,
+                                stop_reason=None,
+                            )
+                        ],
+                    ),
+                )
+
+        server = NS(
+            enable_force_include_usage=False,
+            enable_prompt_tokens_details=False,
+            system_fingerprint=None,
+            _raise_if_error=Mock(),
+            create_streaming_error_response=lambda error: json.dumps(
+                dict(error=str(error))
+            ),
+        )
+        request = NS(
+            n=1,
+            stream_options=None,
+            max_tokens=100,
+            echo=False,
+            return_token_ids=True,
+            logprobs=None,
+        )
+
+        async def collect():
+            return [
+                chunk
+                async for chunk in context["completion_stream_generator"](
+                    server,
+                    request,
+                    [],
+                    results(),
+                    "cmpl-target",
+                    0,
+                    "model",
+                    1,
+                    None,
+                    NS(),
+                )
+            ]
+
+        # The mocked engine yields synchronously. Drive the real async
+        # generator without opening the Windows event loop's network sockets.
+        coroutine = collect()
+        try:
+            coroutine.send(None)
+        except StopIteration as done:
+            return done.value
+        finally:
+            coroutine.close()
+        raise AssertionError("unexpected asynchronous IO in stream fixture")
+
+    def test_empty_abort_keeps_terminal_choice_and_strict_reader_accepts(self):
+        chunks = self.stream("abort")
+        self.assertEqual(len(chunks), 2)  # Intermediate prefill stays suppressed.
+        response = json.loads(chunks[0][6:])
+        self.assertEqual(response["choices"][0]["finish_reason"], "abort")
+        self.assertEqual(response["choices"][0]["token_ids"], [])
+        self.assertEqual(chunks[1], "data: [DONE]\n\n")
+        sink = Mock()
+        wire = io.BytesIO("".join(chunks).encode())
+        with patch("urllib.request.urlopen", return_value=wire):
+            result = session_tests.io.post_streaming_completion(
+                "http://localhost", dict(prompt=[1], max_tokens=100), 1, sink
+            )
+        self.assertEqual(result["finish_reason"], "abort")
+        self.assertEqual(result["token_ids"], [])
+        sink.assert_not_called()
+
+    def test_empty_stop_keeps_terminal_choice(self):
+        response = json.loads(self.stream("stop")[0][6:])
+        self.assertEqual(response["choices"][0]["finish_reason"], "stop")
+
+    def test_done_without_finish_reason_is_still_rejected(self):
+        wire = io.BytesIO(b"data: [DONE]\n\n")
+        with (
+            patch("urllib.request.urlopen", return_value=wire),
+            self.assertRaisesRegex(RuntimeError, "ended before completion"),
+        ):
+            session_tests.io.post_streaming_completion(
+                "http://localhost", dict(prompt=[1], max_tokens=100), 1, Mock()
+            )
 
 
 def actual_method(path, name, context):

@@ -2414,11 +2414,11 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         del block_ids
         request_id = request.request_id
         if self.gpu_resident_shadow and self.takeover_control_path is not None:
-            path = self.takeover_control_path
+            path = self.takeover_control_path.resolve()
             if path.is_file():
                 state = _load_json(path)
                 expected = (
-                    f"cmpl-bridgetp-phase9-target-{self.manifest_path.parent.name}-0"
+                    f"cmpl-bridgetp-phase9-target-{path.parent.name}-0-"
                 )
                 if (
                     state.get("state") == "CANCELLED"
@@ -2432,7 +2432,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                             "target_request_id": request_id,
                             "completed_unix_s": time.time(),
                         },
-                        self.manifest_path.parent / "target_abort_receipt.json",
+                        path.parent / "target_abort_receipt.json",
                     )
         # The communicator remains pooled, but its previous request's packed
         # receive tensor must not stay live after the request is gone.

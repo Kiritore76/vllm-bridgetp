@@ -80,7 +80,7 @@
     "tools/bridge_tp/prepare_tracea_oasst_arrivals.py": "998f2194c83b7e9729b1c6ffaaf4fdb757d98d3da83a77ad320eafd952f73ad1",
     "tools/bridge_tp/pressure_cpu.py": "311147165fdf14300811fb81be335b0ae42fe2a17914b966256233f960135f00",
     "tools/bridge_tp/pressure_progress.py": "7d4b4f25321dc29826ffbab86df8cf139fbcb9b1f23a6d4c8c4f4c9f4e839ab0",
-    "tools/bridge_tp/pressure_session.py": "f99327365d9df69cefe4e74a23f74d2a7a60c03b8efb543b2e759c5baa7d6580",
+    "tools/bridge_tp/pressure_session.py": "6bcb5e37a074bb37d6917a6eb11c07cb06b1bb4c2f3c8a703f8ca3578dde6537",
     "tools/bridge_tp/probe_logit_ulp.py": "ca19b2d75dca3da0616f6489a6cbc8f8769a2ed7ddda535d159435d65443c60f",
     "tools/bridge_tp/probe_token_divergence.py": "d2f90aec828e9f4abc6c76632da48f7c0c05d831297a1181b69fa78a78ffbce3",
     "tools/bridge_tp/reclassify_phase9_load_pilot.py": "81b5c85aa54cfef893187f49ec31394dfb31efec43628966cf3339dc28e9991b",
@@ -182,7 +182,7 @@
     "vllm/bridge_tp/rolling_cutover.py": "6680703ed954622a88c9803b9ab63bdbae6f4f74354b778b78fdbec32599d158",
     "vllm/bridge_tp/runtime_control.py": "d9f396b855f17ac33a676e59aca014e3a2609b96660d0e46f2513b29115e88f7",
     "vllm/bridge_tp/shadow_transfer_protocol.py": "fdd6f3d6839fa35c01cd165ad0251ccb0f4112a89cc2e94c8846b7e435fadeac",
-    "vllm/bridge_tp/streaming_connector.py": "08016a4dfe5affd8876e889704937cf09ff0e7737dbcf62cfb8d93d0fe631f80",
+    "vllm/bridge_tp/streaming_connector.py": "4b4947cef35693b69d6748b816f1539d7382f4ae9442d7992ac59b37c3e2eb09",
     "vllm/bridge_tp/stream_protocol.py": "8f2f15bbc005b778c2b68b7fd1c0a3c3583fda66feca70f8ec27346619381271",
     "vllm/bridge_tp/takeover_api.py": "81d2909d3d40633f66fb612cfd4a02b24e2feb0581d163151c9c4cc08d55ef3f",
     "vllm/bridge_tp/__init__.py": "3ffd9c3646257f2f954d336022cb2ee840a35e156a7b725a7ab9b0e6ce651f56",
@@ -272,10 +272,11 @@
     "tools/bridge_tp/pressure_sessions.py": "3c934dfa943a7be4c8f03c09e15163b860afddb32e6211e73fd266e1ef1679c6",
     "tests/bridge_tp/test_pressure_sessions.py": "01c9c3875318a43d6050b2c2ece3ec37639a3222653053089ff0eea3ff763135",
     "experiments/phase9/pressure_balanced_v2/EVALUATION_STANDARD_CN.md": "fedf01ecfabb244f2c198cf0c4763a63741061c2323ee3888f2c0c837ee3cad8",
-    "experiments/phase9/pressure_balanced_v2/PARAMETER_STATUS_CN.md": "2e004b0f46315adb8872130660f84f7377f07c1686c13bee1803179ee1174905",
-    "vllm/bridge_tp/controller/pressure_cancel.py": "74213cd875212ce094dff82fa8d8b56c9f6ad44713158508d6dd6703769f8915",
-    "tests/bridge_tp/test_pressure_cancel.py": "87d2d327f21420808a67b6f35ec3b7b99459c198b39f743543bc72394956459f",
-    "tests/bridge_tp/test_pressure_session.py": "fcf52f37402f858bd911c1fd14b1c83d535be83c5bb69691a32c35c67a6d66ff"
+    "experiments/phase9/pressure_balanced_v2/PARAMETER_STATUS_CN.md": "a1a570c6f8db0100fb107b95ae0e2efcfe99f63cf085842af9e5815b4badb1ed",
+    "vllm/bridge_tp/controller/pressure_cancel.py": "fc753a086bebfd2ba9a76bc0c56925fd899c8c2684fd60d39914f0cd3a185b73",
+    "tests/bridge_tp/test_pressure_cancel.py": "73a9ee3a909095d65c3b296dce6d26014147f088489637ad249117f01308aa51",
+    "tests/bridge_tp/test_pressure_session.py": "fcf52f37402f858bd911c1fd14b1c83d535be83c5bb69691a32c35c67a6d66ff",
+    "vllm/entrypoints/openai/completion/serving.py": "bdcdee5d2b900db19ce6e2cd8d70064e752633a5174c162191a8ac93b4e83c3f"
   },
   "server_settings": {
     "dtype": "bfloat16",
