@@ -32,7 +32,8 @@
     "capacity_only": false,
     "shadow_cancel": true,
     "cancel_sustain_s": 3.0,
-    "cancel_recover_eta": 1.0
+    "cancel_recover_eta": 1.0,
+    "pressure_routing": true
   },
   "itl_s": 0.1,
   "slow_fraction": 0.01,

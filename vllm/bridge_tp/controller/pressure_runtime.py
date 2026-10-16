@@ -52,6 +52,14 @@ class PressureCoordinator:
                 {
                     "kind": "pressure_admission",
                     "admission": asdict(result),
+                    "pool_readings": [
+                        asdict(pool)
+                        for pool in (args[3] if len(args) > 3 else kwargs["pools"])
+                    ],
+                    "routing_config": asdict(self.policy.cfg),
+                    "decision_unix_s": kwargs.get(
+                        "now", args[4] if len(args) > 4 else None
+                    ),
                     "config_sha256": self.policy.cfg.sha256,
                     "reservation_before": before,
                     "reservation_after": self.ledger.snapshot(),

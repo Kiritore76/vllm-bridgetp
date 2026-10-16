@@ -42,6 +42,8 @@ class PressureConfig:
     capacity_lookahead_s: float = 0.0
     capacity_only: bool = False
     health_service: bool = False
+    # Route from passive health/KV evidence, without fixed prompt cutoffs.
+    pressure_routing: bool = False
     health_min_efficiency: float = 0.9
     health_target_load: float = 0.8
     survival_horizon: int = 256
@@ -70,6 +72,8 @@ class PressureConfig:
             and self.capacity_guard_blocks > 0
             and type(self.capacity_only) is bool
             and type(self.health_service) is bool
+            and type(self.pressure_routing) is bool
+            and (not self.pressure_routing or self.health_service)
             and type(self.shadow_cancel) is bool
             and self.cancel_sustain_s > 0
             and (
@@ -791,6 +795,48 @@ class Admission:
     reservation_key: str
     routing_reason: str = ""
     reservation_basis: str = "none"
+    routing_capacity: dict | None = None
+
+
+def prompt_fit(pool, prompt_tokens, ledger, cfg, now):
+    """Route using physical blocks minus only unpublished/unallocated demand."""
+    if (
+        pool.block_size <= 0
+        or pool.free_blocks is None
+        or pool.free_blocks < 0
+        or not all(
+            math.isfinite(t) and 0 <= now - t <= cfg.max_age_s
+            for t in (pool.sampled_at, pool.published_at)
+        )
+    ):
+        return dict(status="UNKNOWN", required_blocks=None, available_blocks=None)
+    required = math.ceil(prompt_tokens / pool.block_size)
+    unpublished = sum(
+        math.ceil(row.prefill_tokens / pool.block_size)
+        for row in ledger.entries.values()
+        if row.pool_id == pool.pool_id
+        and row.kind == "admission"
+        and row.state in {"ACTIVE", "COMMITTED"}
+        and not row.prefill_observed
+    )
+    pending_blocks = ledger.pending(pool.pool_id)[0]
+    native = pool.unallocated_prompt_blocks
+    known = type(native) is int and native >= 0
+    # Missing native demand still permits NO_FIT from an upper bound on free,
+    # but never permits declaring FIT. Allocated native blocks are already out.
+    available = max(
+        0, pool.free_blocks - unpublished - pending_blocks - (native if known else 0)
+    )
+    status = "NO_FIT" if available < required else "FIT" if known else "UNKNOWN"
+    return dict(
+        status=status,
+        required_blocks=required,
+        available_blocks=available,
+        native_unallocated_blocks=native,
+        unpublished_prompt_blocks=unpublished,
+        migration_pending_blocks=pending_blocks,
+        prefix_cache_credit=0,
+    )
 
 
 class RoutingError(ValueError):
@@ -813,8 +859,8 @@ def admit(
     """Choose an instance; leave queueing and KV allocation to vLLM.
 
     Only the unchanged stop cap/context contract constrains eligible routes.
-    Free blocks, service evidence, backlog and migration commitments never gate
-    ordinary ingress. Fixed pilot routes override the usual preference.
+    Prompt fit chooses between instances but never gates ordinary ingress.
+    Fixed pilot routes override the usual preference.
     """
     if (
         type(prompt_tokens) is not int
@@ -842,6 +888,8 @@ def admit(
             prompt_tokens >= cfg.very_long_prompt_tokens
             or (prompt_tokens >= cfg.prompt_boundary and source_needs_relief)
         )
+        if cfg.pressure_routing:
+            prefer_target = source_needs_relief and health_spare(target, cfg, now)
     preferred = pools[1] if prefer_target else pools[0]
     routing_reason = (
         "very long known prompt"
@@ -850,6 +898,8 @@ def admit(
         if prefer_target
         else "prefer TP1"
     )
+    if cfg.pressure_routing:
+        routing_reason = "TP1 pressure and TP4 spare" if prefer_target else "prefer TP1"
     eligible, diagnostics = [], {}
     for pool in pools:
         if allowed_pool_id is not None and pool.pool_id != allowed_pool_id:
@@ -862,6 +912,20 @@ def admit(
             eligible.append(pool)
     if not eligible:
         raise RoutingError(diagnostics)
+    capacity = {
+        pool.pool_id: prompt_fit(pool, prompt_tokens, ledger, cfg, now)
+        for pool in pools
+    }
+    other_fit = [pool for pool in eligible if capacity[pool.pool_id]["status"] == "FIT"]
+    if (
+        allowed_pool_id is None
+        and capacity[preferred.pool_id]["status"] == "NO_FIT"
+        and other_fit
+    ):
+        preferred = other_fit[0]
+        routing_reason = "other pool cannot fit prompt; prompt capacity fallback"
+    elif all(capacity[pool.pool_id]["status"] == "NO_FIT" for pool in eligible):
+        routing_reason += "; neither pool fits prompt now; native queue"
     eligible.sort(key=lambda pool: pool.pool_id != preferred.pool_id)
     pool = eligible[0]
     if allowed_pool_id is not None:
@@ -869,4 +933,11 @@ def admit(
     elif pool.pool_id != preferred.pool_id:
         routing_reason += "; preferred pool context infeasible"
     ledger.track_ingress(key, request_id, pool.pool_id, prompt_tokens)
-    return Admission(request_id, pool.pool_id, output_cap, key, routing_reason)
+    return Admission(
+        request_id,
+        pool.pool_id,
+        output_cap,
+        key,
+        routing_reason,
+        routing_capacity=capacity,
+    )

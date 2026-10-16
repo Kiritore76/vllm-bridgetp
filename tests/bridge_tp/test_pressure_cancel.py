@@ -557,6 +557,141 @@ class ReceiverCancelTests(unittest.TestCase):
         connector._record_persistent_receiver_idle.assert_called_once()
 
 
+class PromptCapacityBoundaryTests(unittest.TestCase):
+    def route(self, source_blocks, target_blocks, prompt=2047, **target_changes):
+        source = reading_at(free_blocks=source_blocks, health_eta=1)
+        target = reading_at("tp4", free_blocks=target_blocks, **target_changes)
+        return p.admit(
+            "r",
+            prompt,
+            1024,
+            (source, target),
+            health_tests.HealthPolicyTests().cfg(),
+            p.ReservationLedger(),
+            10,
+            "k",
+        )
+
+    def test_prompt_block_rounding_and_exact_fit_bypass_length_health_rules(self):
+        self.assertEqual(self.route(127, 128).pool_id, "tp4")
+        self.assertEqual(self.route(128, 128).pool_id, "tp1")
+        self.assertEqual(self.route(127, 128, health_eta=0.5, waiting=2).pool_id, "tp4")
+        result = self.route(0, 0)
+        self.assertEqual(result.pool_id, "tp1")
+        self.assertEqual(result.reservation_basis, "none")
+        self.assertIn("native queue", result.routing_reason)
+
+    def test_unpublished_prompt_and_migration_demand_count_once(self):
+        cfg = health_tests.HealthPolicyTests().cfg()
+        ledger = p.ReservationLedger()
+        ledger.track_ingress("a", "a", "tp1", 17)
+        ledger.track_ingress("b", "b", "tp1", 17)
+        source = reading_at(
+            free_blocks=132, pending_prompt_tokens=4000, unallocated_prompt_blocks=0
+        )
+        fit = p.prompt_fit(source, 2048, ledger, cfg, 10)
+        self.assertEqual(fit["available_blocks"], 128)
+        self.assertEqual(fit["status"], "FIT")
+        ledger.entries["a"].prefill_observed = True
+        self.assertEqual(
+            p.prompt_fit(source, 2048, ledger, cfg, 10)["available_blocks"], 130
+        )
+        ledger.reserve(
+            p.Reservation("m", "other", "tp1", 10, 0.1, 0, "migration"), source
+        )
+        ledger.observe("m", allocated_blocks=6, service_observed=False)
+        self.assertEqual(
+            p.prompt_fit(source, 2048, ledger, cfg, 10)["available_blocks"], 126
+        )
+
+    def test_stale_or_unknown_target_cannot_be_assumed_to_fit(self):
+        cfg = health_tests.HealthPolicyTests().cfg()
+        source, target = (
+            reading_at(free_blocks=0),
+            reading_at("tp4", unallocated_prompt_blocks=None),
+        )
+        result = p.admit(
+            "r", 1024, 1024, (source, target), cfg, p.ReservationLedger(), 10, "k"
+        )
+        self.assertEqual(result.pool_id, "tp1")
+        self.assertEqual(result.routing_capacity["tp4"]["status"], "UNKNOWN")
+        self.assertEqual(
+            p.prompt_fit(target, 1024, p.ReservationLedger(), cfg, 13)["status"],
+            "UNKNOWN",
+        )
+
+    def test_pressure_routing_ignores_fixed_prompt_cutoffs_and_records_inputs(self):
+        cfg = replace(health_tests.HealthPolicyTests().cfg(), pressure_routing=True)
+        for prompt in (1, 1024, 2047, 2048, 4096, 6144):
+            for source_eta, expected in ((1.0, "tp1"), (0.7, "tp4")):
+                audit = []
+                coordinator = load("pressure_runtime").PressureCoordinator(
+                    cfg, audit.append
+                )
+                result = coordinator.admission(
+                    "r",
+                    prompt,
+                    1024,
+                    (reading_at(health_eta=source_eta), reading_at("tp4")),
+                    now=10,
+                    key="k",
+                )
+                self.assertEqual(result.pool_id, expected)
+                self.assertEqual(audit[0]["decision_unix_s"], 10)
+                self.assertEqual(audit[0]["pool_readings"][0]["health_eta"], source_eta)
+                self.assertTrue(audit[0]["routing_config"]["pressure_routing"])
+
+    def test_pressure_routing_requires_target_evidence_and_respects_fixed_routes(self):
+        cfg = replace(health_tests.HealthPolicyTests().cfg(), pressure_routing=True)
+        for changes in (
+            dict(health_status="UNKNOWN"),
+            dict(health_eta=0.5),
+            dict(health_load=0.9),
+            dict(waiting=1),
+        ):
+            result = p.admit(
+                "r",
+                6144,
+                1024,
+                (reading_at(), reading_at("tp4", **changes)),
+                cfg,
+                p.ReservationLedger(),
+                10,
+                "k",
+            )
+            self.assertEqual(result.pool_id, "tp1")
+        result = p.admit(
+            "r",
+            1,
+            1024,
+            (reading_at(), reading_at("tp4")),
+            cfg,
+            p.ReservationLedger(),
+            10,
+            "k",
+            "tp1",
+        )
+        self.assertEqual(result.pool_id, "tp1")
+
+    def test_pressure_routing_capacity_overrides_health_but_unknown_is_not_free(self):
+        cfg = replace(health_tests.HealthPolicyTests().cfg(), pressure_routing=True)
+        result = p.admit(
+            "r",
+            17,
+            1024,
+            (reading_at(free_blocks=1), reading_at("tp4", health_eta=0.5)),
+            cfg,
+            p.ReservationLedger(),
+            10,
+            "k",
+        )
+        self.assertEqual(result.pool_id, "tp4")
+        self.assertEqual(result.routing_capacity["tp1"]["required_blocks"], 2)
+        self.assertEqual(result.reservation_basis, "none")
+        with self.assertRaises(ValueError):
+            replace(cfg, health_service=False)
+
+
 class CancelSmokePlanTests(unittest.TestCase):
     def test_selects_only_original_KV_recipe_and_separates_mechanism_test(self):
         from tools.bridge_tp import pressure_health_screen as screen
