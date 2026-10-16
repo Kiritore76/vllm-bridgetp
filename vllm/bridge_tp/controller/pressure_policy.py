@@ -855,6 +855,8 @@ def admit(
     now: float,
     key: str,
     allowed_pool_id: str | None = None,
+    routing_strategy: str = "pressure",
+    routing_weights: tuple[float, float] = (1.0, 1.0),
 ) -> Admission:
     """Choose an instance; leave queueing and KV allocation to vLLM.
 
@@ -870,6 +872,12 @@ def admit(
     ):
         raise ValueError("invalid request lengths")
     output_cap = min(8192, requested_output)
+    if routing_strategy not in {"pressure", "weighted-round-robin", "least-inflight"}:
+        raise ValueError("unknown routing strategy")
+    if len(routing_weights) != 2 or any(
+        not math.isfinite(w) or w <= 0 for w in routing_weights
+    ):
+        raise ValueError("routing weights must be positive and finite")
     source = ledger.routing_reading(pools[0])
     target = ledger.routing_reading(pools[1])
     source_pressure = classify(source, cfg, now)
@@ -900,6 +908,22 @@ def admit(
     )
     if cfg.pressure_routing:
         routing_reason = "TP1 pressure and TP4 spare" if prefer_target else "prefer TP1"
+    if routing_strategy != "pressure":
+        counts = [
+            sum(
+                row.pool_id == pool.pool_id
+                and row.kind == "admission"
+                and (
+                    routing_strategy == "weighted-round-robin"
+                    or row.state in {"ACTIVE", "COMMITTED", "ACCOUNTED"}
+                )
+                for row in ledger.entries.values()
+            )
+            for pool in pools
+        ]
+        index = min(range(2), key=lambda i: (counts[i] + 1) / routing_weights[i])
+        preferred = pools[index]
+        routing_reason = routing_strategy
     eligible, diagnostics = [], {}
     for pool in pools:
         if allowed_pool_id is not None and pool.pool_id != allowed_pool_id:

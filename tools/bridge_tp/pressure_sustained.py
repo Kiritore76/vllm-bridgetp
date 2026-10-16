@@ -71,19 +71,41 @@ def validate(config, inputs):
             raise ValueError("require 17 arrivals before the fixed cutoff")
 
 
+def valid_output(row, request, natural_eos=False):
+    """Require complete indexed output; an ordinary EOS may precede the cap."""
+    emitted = row["response"]["emitted"]
+    count, cap = len(emitted), request["max_tokens"]
+    valid_length = count == cap
+    if natural_eos:
+        transport = row.get("source_transport") or {}
+        reason = transport.get("finish_reason")
+        valid_length = (
+            row.get("source_done") is True
+            and 0 < count <= cap
+            and (
+                reason == "stop"
+                or (reason == "length" and count == cap)
+                or (reason == "abort" and row["response"]["committed"])
+            )
+        )
+    return (
+        not row["source_error"]
+        and valid_length
+        and [t["index"] for t in emitted] == list(range(count))
+    )
+
+
 def score(rows, config):
     """Count only window tokens; quality uses every completed visible interval."""
     horizon = config["horizon_s"]
-    origin = min(r["source_transport"]["request_started_unix_s"] for r in rows)
+    origin = config.get("origin_unix_s")
+    if origin is None:
+        origin = min(r["source_transport"]["request_started_unix_s"] for r in rows)
     records, bins, active = [], set(), []
     pools = dict(tp1=0.0, tp4=0.0)
     for row in rows:
         emitted = row["response"]["emitted"]
-        if (
-            row["source_error"]
-            or len(emitted) != row["request"]["max_tokens"]
-            or [t["index"] for t in emitted] != list(range(len(emitted)))
-        ):
+        if not valid_output(row, row["request"], config.get("natural_eos", False)):
             raise ValueError("incomplete request cannot be scored as a service zero")
         times = [t["unix_s"] for t in emitted]
         start = row["source_transport"]["request_started_unix_s"]

@@ -34,19 +34,34 @@ class BoundAction:
 
 
 class PressureCoordinator:
-    def __init__(self, cfg: PressureConfig, audit: Callable[[dict], None]) -> None:
+    def __init__(
+        self,
+        cfg: PressureConfig,
+        audit: Callable[[dict], None],
+        *,
+        routing_strategy="pressure",
+        routing_weights=(1.0, 1.0),
+    ) -> None:
         self.ledger = ReservationLedger()
         self.policy = PressurePolicy(cfg, self.ledger)
         self.audit = audit
         self._lock = threading.RLock()
         self._sessions: dict[str, tuple[str, str]] = {}
         self._owners: dict[str, str] = {}
+        self.routing_strategy, self.routing_weights = routing_strategy, routing_weights
 
     def admission(self, *args, **kwargs):
         """Route and track identity atomically, without reserving ingress KV."""
         with self._lock:
             before = self.ledger.snapshot()
-            result = admit(*args, cfg=self.policy.cfg, ledger=self.ledger, **kwargs)
+            result = admit(
+                *args,
+                cfg=self.policy.cfg,
+                ledger=self.ledger,
+                routing_strategy=self.routing_strategy,
+                routing_weights=self.routing_weights,
+                **kwargs,
+            )
             self._owners[result.request_id] = result.pool_id
             self.audit(
                 {
@@ -57,6 +72,8 @@ class PressureCoordinator:
                         for pool in (args[3] if len(args) > 3 else kwargs["pools"])
                     ],
                     "routing_config": asdict(self.policy.cfg),
+                    "routing_strategy": self.routing_strategy,
+                    "routing_weights": self.routing_weights,
                     "decision_unix_s": kwargs.get(
                         "now", args[4] if len(args) > 4 else None
                     ),

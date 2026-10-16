@@ -108,3 +108,61 @@ Offline tests separately cover healthy recovery, persisting service/KV pressure,
 UNKNOWN/stale observations, repeated reads of one closed window and freeze gates.
 Natural pressure recovery before freeze remains a later coverage study; do not
 relax cancellation rules or cherry-pick seeds to force it.
+
+## Pool comparison with automatic routing and natural EOS (2026-10-16)
+
+`bash tools/bridge_tp/run_pressure_pilot.sh --pool-compare` runs12 scenes:
+weighted round-robin, normalized least-inflight, pressure routing without
+migration (`stay`), and pressure routing with migration (`migrate`), three
+repetitions each. Each repetition uses one shared arrivals file and rotates arm
+order. Only `migrate` may start a shadow. All arms use the same instrumented
+vLLM, default FCFS, continuous batching, disabled prefix cache, native KV
+observations, predictor instrumentation, service settings and capacity fallback.
+This measures policy effects; it is not an unmodified upstream vLLM overhead
+comparison. GPU allocation remains one TP1 plus one TP4 on five GPUs.
+
+The weights are frozen before execution: for each instance, take the median of
+the measured peak healthy goodoutput in the shared2k and4k context bins of
+health_reference_v2: TP1=231.0625, TP4=597.4625. Source cells and reference SHA
+are saved. These are empirical capacity proxies, not maximum sustainable
+capacities. Weighted round-robin minimizes (historical admissions+1)/weight;
+least-inflight minimizes (currently tracked unfinished admissions+1)/weight.
+Both operate on the same serialized ingress ledger; both retain prompt-fit and
+context fallback. Neither consults future arrivals or true output lengths.
+
+No new pressure probes or calibration traffic: reuse the tracked natural-long,
+natural-small-kv, short-source, short-target and target-long-prefill prompts,
+enable natural EOS for all, and keep their original output caps. Each of three
+predeclared seeds shuffles15 copies of these five templates, yielding75 normal
+arrivals every4s from0 to296s. Requests have no fixed pool. No padding is added
+and no synthetic single-token competition stream is injected. This is an
+initial controlled workload at0.25 requests/s, not a representative production
+trace, a calibrated saturation level or a sweep of low/high load and bursts.
+Those follow after observing this comparison. Do not claim a capacity ceiling
+or global superiority from this one rate and five templates.
+
+Use the same300s cutoff from the controller clock origin in every arm, drain
+fully, and retain full-request ITL/max-gap penalties including drain. Record
+raw output, soft goodoutput, hard SLO attainment and request/token goodput,
+TTFT/latency, queue observations, initial routing counts, migration and release
+counts, native-empty/ledger/shutdown evidence. Reuse the existing archive and
+progress output. A source stream must terminate normally, or be aborted only
+as part of a committed migration; missing completion or partial length output
+is an error. Actual natural outputs and per-request token hashes are retained;
+output differences between arms must be examined before attributing throughput
+changes to scheduling. There is no forced minimum number of migrations.
+
+`pool_comparison_acceptance.json` reports every repetition, pair deltas and
+output parity. Late dispatch over0.5s yields a nonzero final return code and
+preserves the evidence. Low utilization is recorded, not removed or presented
+as saturated capacity. Technical failures stop subsequent scenes and still
+produce the wrapper's single evidence archive. Inspect all repetitions,
+including unfavorable outcomes, before choosing follow-up arrival rates.
+
+Optional first-stage ablation only:
+`bash tools/bridge_tp/run_pressure_pilot.sh --pool-compare-pair` runs six scenes,
+the same three pressure-routing STAY/migration pairs. Choose one command;
+running both repeats those pairs. Full mode is roughly1.5–3h and pair mode
+45–90min, depending on model startup, EOS lengths and drain; neither estimate
+has been measured for this new workload. CPU and real parser preflight gates
+run before GPU startup. Five GPUs must be idle; no unrelated processes are killed.

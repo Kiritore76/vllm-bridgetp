@@ -70,6 +70,12 @@ def parse_args(argv=None):
     parser.add_argument("--no-progress-s", type=float, default=60)
     parser.add_argument("--no-migration", action="store_true")
     parser.add_argument(
+        "--routing-strategy",
+        default="pressure",
+        choices=["pressure", "weighted-round-robin", "least-inflight"],
+    )
+    parser.add_argument("--routing-weights", type=float, nargs=2, default=[1.0, 1.0])
+    parser.add_argument(
         "--maximum-migrations",
         type=int,
         default=1,
@@ -96,6 +102,10 @@ def parse_args(argv=None):
 
 
 def preflight(args):
+    if any(not math.isfinite(w) or w <= 0 for w in args.routing_weights):
+        raise ValueError("routing weights must be positive and finite")
+    if args.routing_strategy != "pressure" and not args.no_migration:
+        raise ValueError("baseline routing requires migration disabled")
     cfg = p.PressureConfig(**read(args.policy_config))
     if args.test_only_cancel_first_shadow and (
         not cfg.shadow_cancel or args.maximum_migrations != 0 or args.no_migration
@@ -191,6 +201,8 @@ def preflight(args):
         migration_execution_enabled=not args.no_migration,
         mode="CPU_PREFLIGHT",
         test_only_cancel_first_shadow=args.test_only_cancel_first_shadow,
+        routing_strategy=args.routing_strategy,
+        routing_weights=args.routing_weights,
         service_estimator=(
             "observed engine-span local proxy; causal ITL delta unmeasured"
         ),
@@ -339,7 +351,12 @@ def _run(args, prepared):
         else load("audit").AuditLog(audit_path, receipt)
     )
     tokens = AsyncJournal(args.run_dir / "native_tokens.jsonl")
-    co = r.PressureCoordinator(cfg, audit.write)
+    co = r.PressureCoordinator(
+        cfg,
+        audit.write,
+        routing_strategy=args.routing_strategy,
+        routing_weights=tuple(args.routing_weights),
+    )
     health_module = load("pressure_health") if cfg.health_service else None
     health_tokens = health_module.TokenWindows() if cfg.health_service else None
     service = o.NativeServiceWindow(health_observer=health_tokens)

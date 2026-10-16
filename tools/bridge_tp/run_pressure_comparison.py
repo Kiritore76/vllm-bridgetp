@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
+import random
 import secrets
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -74,17 +77,146 @@ def validate(config, inputs):
 
 
 def arrivals(inputs, recipe):
+    if "jobs" in recipe:
+        return copy.deepcopy(recipe["jobs"])
     return [
         dict(
             id=row["id"],
             at_s=row["at_s"],
-            route=row["route"],
+            route=row.get("route"),
             request=calibration.payload(
                 inputs, row["prompt_tokens"], row["max_tokens"], row["id"]
             ),
         )
         for row in recipe["arrivals"]
     ]
+
+
+def pool_comparison_config(bundle, *, pair_only=False):
+    """Reuse tracked prompts and measured weights; never issue calibration probes."""
+    reference_path = bundle / "health_reference_v2.json"
+    reference = pilot.read(reference_path)
+    weights = []
+    weight_cells = []
+    for pool in ("source", "target"):
+        peaks = []
+        for context_bin in (1, 2):
+            cells = [
+                c
+                for c in reference["cells"]
+                if c["pool"] == pool
+                and c["context_bin"] == context_bin
+                and c["health_status"] == "REFERENCE"
+            ]
+            peak = max(cells, key=lambda c: c["window_goodoutput"]["median"])
+            peaks.append(peak["window_goodoutput"]["median"])
+            weight_cells.append(peak)
+        weights.append(statistics.median(peaks))
+    templates = (
+        pilot.read(bundle / "source-decode.json")[:2]
+        + pilot.read(bundle / "both-light.json")
+        + pilot.read(bundle / "target-prefill.json")[-1:]
+    )
+    recipes = []
+    for repetition in (1, 2, 3):
+        rng = random.Random(20261016 + repetition)
+        order = list(range(len(templates))) * 15
+        rng.shuffle(order)
+        jobs = []
+        for i, selected in enumerate(order):
+            request = copy.deepcopy(templates[selected]["request"])
+            request.update(
+                ignore_eos=False,
+                seed=20261016 + repetition,
+                stream=True,
+                return_token_ids=True,
+            )
+            jobs.append(
+                dict(
+                    id=f"r{repetition}-request-{i}",
+                    at_s=i * 4,
+                    route=None,
+                    request=request,
+                )
+            )
+        recipes.append(
+            dict(
+                name=f"pool-mixed-r{repetition}",
+                repetition=repetition,
+                kind="pool",
+                jobs=jobs,
+            )
+        )
+    return dict(
+        schema="PRESSURE_POOL_COMPARISON_V1",
+        pool_comparison=True,
+        arms=["stay", "migrate"]
+        if pair_only
+        else ["weighted", "least", "stay", "migrate"],
+        maximum_migrations=0,
+        natural_eos=True,
+        policy_overrides=pilot.read(bundle / "health_service_policy.json"),
+        horizon_s=300,
+        metric=sustained.METRIC,
+        maximum_gap_s=1,
+        itl_s=0.1,
+        slow_fraction=0.01,
+        max_dispatch_lag_s=0.5,
+        routing_weights=weights,
+        weight_cells=weight_cells,
+        reference_sha256=hashlib.sha256(reference_path.read_bytes()).hexdigest(),
+        weight_basis="median of measured peak G in shared 2k/4k context bins; "
+        "a frozen capacity proxy, not a maximum-capacity claim",
+        workload_scope="75 arrivals at 0.25 requests/s through296s; five reused "
+        "prompt templates, natural EOS; preliminary comparison, "
+        "not a production trace or a calibrated saturation level",
+        recipes=recipes,
+    )
+
+
+def pool_acceptance(root, results, config, common):
+    """Retain all repetitions, output differences and incomplete load coverage."""
+    groups = []
+    for recipe in config["recipes"]:
+        arms = {r["arm"]: r for r in results if r["pair"] == recipe["name"]}
+        stay, move = arms["stay"], arms["migrate"]
+        parity = {
+            arm: dict(
+                differing_requests=sum(
+                    value != stay["token_hashes"].get(key)
+                    for key, value in row["token_hashes"].items()
+                ),
+                full_output_tokens=row["full_output_tokens"],
+                delta_full_output_tokens=row["full_output_tokens"]
+                - stay["full_output_tokens"],
+            )
+            for arm, row in arms.items()
+        }
+        groups.append(
+            dict(
+                repetition=recipe["repetition"],
+                arrivals_valid=all(r["fixed_arrivals_valid"] for r in arms.values()),
+                arms=arms,
+                output_parity_vs_pressure_stay=parity,
+                identical_output_for_migration_pair=(
+                    move["token_hashes"] == stay["token_hashes"]
+                ),
+                migration_delta_G=move["G300"] - stay["G300"],
+                migration_relative_delta=move["G300"] / stay["G300"] - 1
+                if stay["G300"] > 0
+                else None,
+            )
+        )
+    common.write_json(
+        root / "pool_comparison_acceptance.json",
+        dict(
+            schema=config["schema"],
+            repetitions=groups,
+            note="Do not select favorable repetitions or infer sustainable capacity "
+            "from this single arrival rate. Inspect token parity and queues.",
+        ),
+    )
+    return 0 if all(g["arrivals_valid"] for g in groups) else 1
 
 
 def build_plans(spec, config, inputs, root, common, settings):
@@ -104,6 +236,10 @@ def build_plans(spec, config, inputs, root, common, settings):
     for recipe in config["recipes"]:
         # Counterbalance run order while keeping each pair adjacent.
         arms = ["stay", "migrate"] if recipe["repetition"] == 1 else ["migrate", "stay"]
+        if config.get("pool_comparison"):
+            base = config["arms"]
+            offset = (recipe["repetition"] - 1) % len(base)
+            arms = base[offset:] + base[:offset]
         path = root / (recipe["name"] + "_arrivals.json")
         common.write_json(path, arrivals(inputs, recipe))
         for arm in arms:
@@ -111,10 +247,21 @@ def build_plans(spec, config, inputs, root, common, settings):
                 continue
             scene = dict(name=recipe["name"] + "-" + arm, arrivals=str(path))
             plan = pilot.build_scene(local_spec, scene, root, common, settings)
-            if arm == "stay":
+            if arm != "migrate":
                 plan["controller_argv"].append("--no-migration")
             elif config.get("test_only_cancel_smoke"):
                 plan["controller_argv"].append("--test-only-cancel-first-shadow")
+            if config.get("pool_comparison"):
+                strategy = {
+                    "weighted": "weighted-round-robin",
+                    "least": "least-inflight",
+                }.get(arm, "pressure")
+                plan["controller_argv"] += [
+                    "--routing-strategy",
+                    strategy,
+                    "--routing-weights",
+                    *map(str, config["routing_weights"]),
+                ]
             for pool in ("source", "target"):
                 plan[pool + "_env"].update(
                     BRIDGETP_PERFORMANCE_TRACE_DIR=str(
@@ -201,7 +348,7 @@ def percentile(values, q):
     return ordered[round((len(ordered) - 1) * q)]
 
 
-def result_metrics(rows, jobs, origin, lag_budget):
+def result_metrics(rows, jobs, origin, lag_budget, natural_eos=False):
     planned = {j["id"]: j for j in jobs}
     if len(rows) != len(planned) or {r["job_id"] for r in rows} != set(planned):
         raise RuntimeError("missing/duplicate request result")
@@ -211,11 +358,9 @@ def result_metrics(rows, jobs, origin, lag_budget):
         emitted = row["response"]["emitted"]
         transport = row.get("source_transport")
         if (
-            row["source_error"]
+            not sustained.valid_output(row, job["request"], natural_eos)
             or not transport
-            or len(emitted) != job["request"]["max_tokens"]
-            or [t["index"] for t in emitted] != list(range(len(emitted)))
-            or row["initial_pool"] != job["route"]
+            or (job.get("route") is not None and row["initial_pool"] != job["route"])
         ):
             raise RuntimeError("incomplete output, wrong route or transport failure")
         times = [t["unix_s"] for t in emitted]
@@ -256,9 +401,9 @@ def assess(plan, jobs, arm, config, common):
     ]
     starts = [r for r in audit if r.get("kind") == "pressure_actual_start"]
     maximum = config["maximum_migrations"]
-    if (maximum and len(starts) > maximum) or (arm == "stay" and starts):
+    if (maximum and len(starts) > maximum) or (arm != "migrate" and starts):
         raise RuntimeError("comparison arm violated migration limit")
-    if arm == "stay" and any(r.get("execution") == "RESERVED" for r in audit):
+    if arm != "migrate" and any(r.get("execution") == "RESERVED" for r in audit):
         raise RuntimeError("STAY arm reserved a migration")
     origin = next(
         r["unix_s"] for r in audit if r.get("kind") == "pressure_clock_origin"
@@ -268,6 +413,7 @@ def assess(plan, jobs, arm, config, common):
         jobs,
         origin,
         config["max_dispatch_lag_s"],
+        config.get("natural_eos", False),
     )
     common.write_json(run_dir.parent / "comparison_metrics.json", metrics)
     common.write_json(
@@ -298,9 +444,12 @@ def main():
     modes.add_argument("--health-sustained", action="store_true")
     modes.add_argument("--health-kv-only", action="store_true")
     modes.add_argument("--cancel-smoke", action="store_true")
+    modes.add_argument("--pool-compare", action="store_true")
+    modes.add_argument("--pool-compare-pair", action="store_true")
     args = parser.parse_args()
+    pool_mode = args.pool_compare or args.pool_compare_pair
     repeated = args.health_sustained or args.health_kv_only or args.cancel_smoke
-    health_mode = args.health_screen or repeated
+    health_mode = args.health_screen or repeated or pool_mode
     spec = pilot.load_spec(args.spec)
     pilot.announce("comparison", "核对checkout、代码、固定输入及模型SHA")
     pilot.verify_spec(spec)
@@ -325,7 +474,12 @@ def main():
         validator = health_screen.validate
     if repeated:
         validator = health_screen.validate_sustained
-    validator(config, inputs)
+    if pool_mode:
+        config = pool_comparison_config(
+            args.spec.parent, pair_only=args.pool_compare_pair
+        )
+    else:
+        validator(config, inputs)
     if health_mode and config["policy_overrides"] != pilot.read(
         args.spec.parent / "health_service_policy.json"
     ):
@@ -439,7 +593,7 @@ def main():
                         common,
                     )
                 )
-                if kv_mode or health_mode
+                if (kv_mode or health_mode) and not pool_mode
                 else None,
             )
             result = assess(plan, pilot.read(scene["arrivals"]), arm, config, common)
@@ -452,22 +606,30 @@ def main():
                     .splitlines()
                 ]
                 coverage = (
-                    (
-                        health_screen.assess_repeated
-                        if repeated
-                        else health_screen.assess
-                    )(
-                        audit,
-                        pilot.read(plan["run_dir"].parent / "comparison_metrics.json"),
-                        recipe["kind"],
-                        arm,
-                    )
-                    if health_mode
-                    else kv.assess(
-                        audit,
-                        pilot.read(plan["run_dir"].parent / "comparison_metrics.json"),
-                        arm,
-                        config["minimum_remaining_at_start"],
+                    dict(coverage="AUTOMATIC_ROUTING_COMPARISON")
+                    if pool_mode
+                    else (
+                        (
+                            health_screen.assess_repeated
+                            if repeated
+                            else health_screen.assess
+                        )(
+                            audit,
+                            pilot.read(
+                                plan["run_dir"].parent / "comparison_metrics.json"
+                            ),
+                            recipe["kind"],
+                            arm,
+                        )
+                        if health_mode
+                        else kv.assess(
+                            audit,
+                            pilot.read(
+                                plan["run_dir"].parent / "comparison_metrics.json"
+                            ),
+                            arm,
+                            config["minimum_remaining_at_start"],
+                        )
                     )
                 )
                 common.write_json(
@@ -486,9 +648,16 @@ def main():
                         natural_cancellation_validated=False,
                     )
                 if args.sustained or health_mode:
+                    scoring = dict(config)
+                    if pool_mode:
+                        scoring["origin_unix_s"] = next(
+                            r["unix_s"]
+                            for r in audit
+                            if r.get("kind") == "pressure_clock_origin"
+                        )
                     score = sustained.score(
                         pilot.read(plan["run_dir"] / "pressure_request_results.json"),
-                        config,
+                        scoring,
                     )
                     score["queue_observations"] = sustained.queue_summary(
                         audit, score["origin_unix_s"], config["horizon_s"]
@@ -505,6 +674,25 @@ def main():
                         slo_token_goodput=score["slo_token_goodput"],
                         load_coverage=score["load_coverage"],
                     )
+                    if pool_mode:
+                        rows = pilot.read(
+                            plan["run_dir"] / "pressure_request_results.json"
+                        )
+                        result["full_output_tokens"] = sum(
+                            len(r["response"]["emitted"]) for r in rows
+                        )
+                        result["token_hashes"] = {
+                            r["job_id"]: hashlib.sha256(
+                                json.dumps(
+                                    [t["token_id"] for t in r["response"]["emitted"]]
+                                ).encode()
+                            ).hexdigest()
+                            for r in rows
+                        }
+                        result["initial_routes"] = {
+                            pool: sum(r["initial_pool"] == pool for r in rows)
+                            for pool in ("tp1", "tp4")
+                        }
         except Exception as error:
             result = dict(status="TECHNICAL_FAILURE", error=repr(error))
         results.append(
@@ -520,6 +708,7 @@ def main():
             **result,
         )
         console = dict(result)
+        console.pop("token_hashes", None)
         slo = console.pop("slo_attainment", None)
         if slo is not None:
             for label in ("all_requests", "decode_requests"):
@@ -531,6 +720,8 @@ def main():
     if args.cancel_smoke:
         pilot.announce("cancel-smoke", "清理专项结束；不作为自然触发或收益对照")
         return 0 if results[0]["coverage"] == "CANCEL_AND_REUSE_OBSERVED" else 1
+    if pool_mode:
+        return pool_acceptance(args.out_root, results, config, common)
     pairs = [
         dict(
             pair=recipe["name"],
