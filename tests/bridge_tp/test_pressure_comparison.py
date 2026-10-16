@@ -84,6 +84,8 @@ class ComparisonTests(unittest.TestCase):
                         "--no-migration",
                     ]
                 )
+                if policy.get("health_service"):
+                    args.health_reference = BUNDLE / "health_reference_v2.json"
                 prepared = worker.preflight(args)
                 self.assertEqual(prepared[-1]["jobs"], len(jobs))
                 self.assertFalse(prepared[-1]["migration_execution_enabled"])

@@ -122,7 +122,9 @@ class NativeServiceWindow:
     Completed-request averages and final quality weights never enter decisions.
     """
 
-    def __init__(self, window_s=3.0, itl_reference_s=0.1, slow_budget=0.01):
+    def __init__(
+        self, window_s=3.0, itl_reference_s=0.1, slow_budget=0.01, health_observer=None
+    ):
         if window_s <= 0 or itl_reference_s <= 0 or not 0 < slow_budget <= 1:
             raise ValueError("invalid native service window")
         self.window_s, self.reference, self.slow_budget = (
@@ -134,6 +136,7 @@ class NativeServiceWindow:
         self._active = {}
         self._arrivals = {"tp1": -math.inf, "tp4": -math.inf}
         self._lock = threading.RLock()
+        self.health_observer = health_observer
 
     def arrive(self, request_id, pool_id, now):
         with self._lock:
@@ -141,6 +144,8 @@ class NativeServiceWindow:
                 raise ValueError("duplicate request or unknown pool")
             self._active[request_id] = (pool_id, now, None)
             self._arrivals[pool_id] = max(now, self._arrivals[pool_id])
+            if self.health_observer is not None:
+                self.health_observer.arrive(request_id, pool_id, now)
 
     def token(self, request_id, now):
         with self._lock:
@@ -150,10 +155,14 @@ class NativeServiceWindow:
             if last is not None:
                 self._intervals[pool].append((now, now - last, request_id))
             self._active[request_id] = (pool, arrived, now)
+            if self.health_observer is not None:
+                self.health_observer.token(request_id, now)
 
     def finish(self, request_id):
         with self._lock:
             self._active.pop(request_id, None)
+            if self.health_observer is not None:
+                self.health_observer.finish(request_id)
 
     def snapshot(self, pool_id, now):
         with self._lock:

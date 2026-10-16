@@ -54,6 +54,7 @@ def parse_args(argv=None):
     parser.add_argument("--policy-config", type=Path, required=True)
     parser.add_argument("--controller-config", type=Path, required=True)
     parser.add_argument("--service-evidence", type=Path, required=True)
+    parser.add_argument("--health-reference", type=Path)
     parser.add_argument("--arrivals", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--source-inventory", type=Path, required=True)
@@ -86,6 +87,14 @@ def parse_args(argv=None):
 
 def preflight(args):
     cfg = p.PressureConfig(**read(args.policy_config))
+    if cfg.health_service:
+        if args.health_reference is None:
+            raise ValueError("health service mode requires a frozen V2 reference")
+        load("pressure_health").HealthTracker(read(args.health_reference), 0, None)
+        if cfg.sustain_s < 10 or not cfg.capacity_lookahead_s:
+            raise ValueError(
+                "health mode requires 10s persistence and independent KV lookahead"
+            )
     raw = read(args.controller_config)
     # Reuse only mechanism geometry/transport rates. The legacy config loader
     # enforces benefit-model calibration and must not gate this new policy.
@@ -154,7 +163,7 @@ def preflight(args):
         args.controller_config,
         args.service_evidence,
         args.arrivals,
-    )
+    ) + ((args.health_reference,) if cfg.health_service else ())
     receipt = dict(
         policy=p.VERSION,
         policy_config_sha256=cfg.sha256,
@@ -275,7 +284,9 @@ def run(args, prepared):
     audit = load("audit").AuditLog(args.run_dir / "pressure_audit.jsonl", receipt)
     tokens = AsyncJournal(args.run_dir / "native_tokens.jsonl")
     co = r.PressureCoordinator(cfg, audit.write)
-    service = o.NativeServiceWindow()
+    health_module = load("pressure_health") if cfg.health_service else None
+    health_tokens = health_module.TokenWindows() if cfg.health_service else None
+    service = o.NativeServiceWindow(health_observer=health_tokens)
     executor = ThreadPoolExecutor(max_workers=max(4, len(jobs) + 1))
     ingress = i.PressureIngress(
         co, service, executor, controller.source_url, controller.target_url
@@ -307,6 +318,13 @@ def run(args, prepared):
     growth_readers = {pool: health.NativeDecodeGrowth() for pool in ("tp1", "tp4")}
     started = time.monotonic()
     origin_unix_s = time.time()
+    health_tracker = (
+        health_module.HealthTracker(
+            read(args.health_reference), origin_unix_s, health_tokens
+        )
+        if cfg.health_service
+        else None
+    )
     audit.write(dict(kind="pressure_clock_origin", unix_s=origin_unix_s))
     last_view = None
     outcome = "FAILED_OR_INTERRUPTED"
@@ -433,6 +451,11 @@ def run(args, prepared):
                     growth_blocks_s=growth,
                     heartbeat=metrics,
                 )
+                if health_tracker is not None:
+                    health_tracker.observe(raw, now)
+                    pool = replace(
+                        pool, **health_tracker.snapshot(raw["pool_id"], now, pool.idle)
+                    )
                 if cfg.capacity_lookahead_s > 0:
                     pool = replace(
                         pool,
@@ -513,6 +536,19 @@ def run(args, prepared):
                         migrating=bool(
                             session.record
                             and session.record.request_id == row["request_id"]
+                        ),
+                        target_health_after_supported=(
+                            health_module.supported_after(
+                                health_tracker.reference,
+                                shapes[1]["decode_requests"] + 1,
+                                (
+                                    shapes[1]["decode_context_sum"]
+                                    + row["computed_tokens"]
+                                )
+                                / (shapes[1]["decode_requests"] + 1),
+                            )
+                            if health_tracker is not None and shapes[1]
+                            else False
                         ),
                     )
                 )
@@ -672,6 +708,15 @@ def run(args, prepared):
                         for pool in pools
                     },
                 )
+                if cfg.health_service:
+                    status["health"] = {
+                        pool.pool_id: dict(
+                            status=pool.health_status,
+                            eta=pool.health_eta,
+                            load=pool.health_load,
+                        )
+                        for pool in pools
+                    }
                 save_progress(progress_path, **status)
                 audit.write(dict(kind="pressure_progress", **status))
             watch.update(

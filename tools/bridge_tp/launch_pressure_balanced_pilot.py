@@ -67,6 +67,8 @@ def load_spec(path):
 
     for key in ("policy_config", "service_evidence", "controller_config_template"):
         spec[key] = resolve(spec[key])
+    if spec.get("health_reference"):
+        spec["health_reference"] = resolve(spec["health_reference"])
     for scene in spec["scenarios"]:
         scene["arrivals"] = resolve(scene["arrivals"])
     return spec
@@ -247,6 +249,8 @@ def build_scene(spec, scene, run_root, common, args):
         "--no-progress-s",
         str(spec.get("no_progress_s", 60)),
     ]
+    if spec.get("health_reference"):
+        argv.extend(["--health-reference", spec["health_reference"]])
     return dict(
         run_dir=run_dir,
         config=config,
@@ -289,7 +293,10 @@ def scene_result(run_dir, name):
         if r["decision"]["source"]["zone"] == "SPARE"
         and r["decision"]["target"]["zone"] == "SPARE"
     ]
-    if any(r["execution"] == "RESERVED" for r in light):
+    if any(
+        r["execution"] == "RESERVED" and r["decision"].get("service_path") != "health"
+        for r in light
+    ):
         raise RuntimeError("actually light pools started migration")
     if name == "both-light":
         covered = bool(light) and not starts
@@ -463,6 +470,8 @@ def run_scene(
                         announce(
                             scene["name"], "排队原因", reasons=status["queue_reasons"]
                         )
+                    if status.get("health"):
+                        announce(scene["name"], "健康参考", pools=status["health"])
                 else:
                     announce(scene["name"], "等待controller初始化")
             final_path = plan["run_dir"] / "pressure_request_results.json"

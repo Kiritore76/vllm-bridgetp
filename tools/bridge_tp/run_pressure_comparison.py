@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from tools.bridge_tp import launch_pressure_balanced_pilot as pilot  # noqa: E402
+from tools.bridge_tp import pressure_health_screen as health_screen  # noqa: E402
 from tools.bridge_tp import pressure_kv_pilot as kv  # noqa: E402
 from tools.bridge_tp import pressure_sustained as sustained  # noqa: E402
 from tools.bridge_tp import run_pressure_calibration as calibration  # noqa: E402
@@ -93,6 +94,11 @@ def build_plans(spec, config, inputs, root, common, settings):
     common.write_json(policy_path, policy)
     local_spec = copy.deepcopy(spec)
     local_spec["policy_config"] = str(policy_path)
+    if policy.get("health_service"):
+        local_spec["health_reference"] = str(
+            Path(spec.get("service_evidence", spec["policy_config"])).parent
+            / "health_reference_v2.json"
+        )
     plans = []
     for recipe in config["recipes"]:
         # Counterbalance run order while keeping each pair adjacent.
@@ -149,6 +155,38 @@ def check_kv_shape(plan, jobs, common):
     common.write_json(plan["run_dir"].parent / "kv_capacity_shape.json", result)
     if result["status"] != "VALID":
         raise RuntimeError("actual KV capacity does not match the frozen experiment")
+
+
+def check_health_shape(plan, jobs, common):
+    import math
+
+    source, target = calibration.wait_empty(plan["run_dir"])
+    source_jobs = [j["request"] for j in jobs if j["at_s"] < 10 and j["route"] == "tp1"]
+    target_jobs = [j["request"] for j in jobs if j["at_s"] < 10 and j["route"] == "tp4"]
+
+    def full(req):
+        return math.ceil((len(req["prompt"]) + req["max_tokens"]) / 16)
+
+    needed_source = sum(map(full, source_jobs)) + 128 + 125
+    needed_target = sum(map(full, target_jobs)) + max(map(full, source_jobs)) + 125
+    valid = (
+        source["block_size"] == target["block_size"] == 16
+        and needed_source <= source["free_blocks"]
+        and needed_target <= target["free_blocks"]
+    )
+    common.write_json(
+        plan["run_dir"].parent / "health_capacity_shape.json",
+        dict(
+            valid=valid,
+            source_required_blocks=needed_source,
+            target_required_blocks=needed_target,
+            source_free_blocks=source["free_blocks"],
+            target_free_blocks=target["free_blocks"],
+            note="experimental isolation check, not an ingress reservation",
+        ),
+    )
+    if not valid:
+        raise RuntimeError("health screen lacks the intended KV headroom")
 
 
 def percentile(values, q):
@@ -250,6 +288,7 @@ def main():
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--kv-release", action="store_true")
     modes.add_argument("--sustained", action="store_true")
+    modes.add_argument("--health-screen", action="store_true")
     args = parser.parse_args()
     spec = pilot.load_spec(args.spec)
     pilot.announce("comparison", "核对checkout、代码、固定输入及模型SHA")
@@ -259,6 +298,8 @@ def main():
         if args.sustained
         else ("kv_release.json" if args.kv_release else "comparison.json")
     )
+    if args.health_screen:
+        name = "health_screen.json"
     config = pilot.read(args.spec.parent / name)
     inputs = pilot.read(args.spec.parent / "calibration.json")
     calibration.validate_config(inputs)
@@ -267,7 +308,15 @@ def main():
         if args.sustained
         else (kv.validate if args.kv_release else validate)
     )
+    if args.health_screen:
+        validator = health_screen.validate
     validator(config, inputs)
+    if args.health_screen and config["policy_overrides"] != pilot.read(
+        args.spec.parent / "health_service_policy.json"
+    ):
+        raise ValueError(
+            "health screen policy differs from frozen experimental settings"
+        )
     kv_mode = args.kv_release or args.sustained
     total = 2 * len(config["recipes"])
     common, settings = pilot.arguments(spec)
@@ -311,6 +360,8 @@ def main():
                     "test_pressure_comparison",
                     "test_pressure_kv_pilot",
                     "test_pressure_sustained",
+                    "test_pressure_health_service",
+                    "test_pressure_health_screen",
                     "test_pressure_health_reference",
                     "test_pressure_policy",
                     "test_pressure_preflight",
@@ -351,15 +402,15 @@ def main():
                 settings,
                 before_shutdown=lambda plan: finalize(plan, common),
                 before_workload=(
-                    lambda plan, arrivals_path=scene["arrivals"]: check_kv_shape(
-                        plan, pilot.read(arrivals_path), common
-                    )
+                    lambda plan, arrivals_path=scene["arrivals"]: (
+                        check_health_shape if args.health_screen else check_kv_shape
+                    )(plan, pilot.read(arrivals_path), common)
                 )
-                if kv_mode
+                if kv_mode or args.health_screen
                 else None,
             )
             result = assess(plan, pilot.read(scene["arrivals"]), arm, config, common)
-            if kv_mode:
+            if kv_mode or args.health_screen:
                 pilot.scene_result(plan["run_dir"], "kv-release")
                 audit = [
                     json.loads(line)
@@ -367,17 +418,26 @@ def main():
                     .read_text()
                     .splitlines()
                 ]
-                coverage = kv.assess(
-                    audit,
-                    pilot.read(plan["run_dir"].parent / "comparison_metrics.json"),
-                    arm,
-                    config["minimum_remaining_at_start"],
+                coverage = (
+                    health_screen.assess(
+                        audit,
+                        pilot.read(plan["run_dir"].parent / "comparison_metrics.json"),
+                        recipe["kind"],
+                        arm,
+                    )
+                    if args.health_screen
+                    else kv.assess(
+                        audit,
+                        pilot.read(plan["run_dir"].parent / "comparison_metrics.json"),
+                        arm,
+                        config["minimum_remaining_at_start"],
+                    )
                 )
                 common.write_json(
                     plan["run_dir"].parent / "kv_release_metrics.json", coverage
                 )
                 result["coverage"] = coverage["coverage"]
-                if args.sustained:
+                if args.sustained or args.health_screen:
                     score = sustained.score(
                         pilot.read(plan["run_dir"] / "pressure_request_results.json"),
                         config,
@@ -421,7 +481,7 @@ def main():
         )
         for recipe in config["recipes"]
     ]
-    if args.sustained:
+    if args.sustained or args.health_screen:
         for pair in pairs:
             arms = {r["arm"]: r for r in results if r["pair"] == pair["pair"]}
             stay, move = arms["stay"]["G300"], arms["migrate"]["G300"]

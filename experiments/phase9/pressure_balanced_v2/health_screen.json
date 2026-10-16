@@ -1,0 +1,694 @@
+{
+  "schema": "PRESSURE_HEALTH_SCREEN_V1",
+  "arms": [
+    "stay",
+    "migrate"
+  ],
+  "maximum_migrations": 1,
+  "policy_overrides": {
+    "max_age_s": 2.0,
+    "min_decode_samples": 20,
+    "spare_ratio": 0.8,
+    "enter_ratio": 1.2,
+    "leave_ratio": 1.0,
+    "imbalance_enter": 0.4,
+    "imbalance_leave": 0.2,
+    "sustain_s": 10,
+    "max_tick_gap_s": 0.5,
+    "cooldown_s": 2.0,
+    "prompt_boundary": 2048,
+    "prefill_pending_budget": 2048,
+    "prefill_waiting_budget": 4,
+    "capacity_guard_blocks": 125,
+    "survival_horizon": 256,
+    "min_survival_lower": 0.5,
+    "length_resolution": 512,
+    "prefill_backlog_budget": 8192,
+    "very_long_prompt_tokens": 4096,
+    "health_service": true,
+    "health_min_efficiency": 0.9,
+    "health_target_load": 0.8,
+    "capacity_lookahead_s": 16.86410117149353,
+    "capacity_only": false
+  },
+  "itl_s": 0.1,
+  "slow_fraction": 0.01,
+  "max_dispatch_lag_s": 0.5,
+  "minimum_remaining_at_start": 1024,
+  "recipes": [
+    {
+      "name": "health-target-spare",
+      "kind": "spare",
+      "repetition": 1,
+      "arrivals": [
+        {
+          "id": "spare-target-background-0",
+          "at_s": 0.0,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 6144
+        },
+        {
+          "id": "spare-source-background-0",
+          "at_s": 5.0,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "spare-source-background-1",
+          "at_s": 5.02,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "spare-source-background-2",
+          "at_s": 5.04,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "spare-source-prefill-0",
+          "at_s": 20,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-1",
+          "at_s": 22,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-2",
+          "at_s": 24,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-3",
+          "at_s": 26,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-4",
+          "at_s": 28,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-5",
+          "at_s": 30,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-6",
+          "at_s": 32,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-7",
+          "at_s": 34,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-8",
+          "at_s": 36,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-9",
+          "at_s": 38,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-10",
+          "at_s": 40,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-11",
+          "at_s": 42,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-12",
+          "at_s": 44,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-13",
+          "at_s": 46,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-14",
+          "at_s": 48,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-15",
+          "at_s": 50,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-16",
+          "at_s": 52,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-17",
+          "at_s": 54,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-18",
+          "at_s": 56,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-19",
+          "at_s": 58,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-20",
+          "at_s": 60,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-21",
+          "at_s": 62,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-22",
+          "at_s": 64,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-23",
+          "at_s": 66,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-24",
+          "at_s": 68,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-25",
+          "at_s": 70,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-26",
+          "at_s": 72,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-27",
+          "at_s": 74,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-28",
+          "at_s": 76,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "spare-source-prefill-29",
+          "at_s": 78,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        }
+      ]
+    },
+    {
+      "name": "health-target-busy",
+      "kind": "busy",
+      "repetition": 2,
+      "arrivals": [
+        {
+          "id": "busy-target-background-0",
+          "at_s": 0.0,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "busy-target-background-1",
+          "at_s": 0.02,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "busy-target-background-2",
+          "at_s": 0.04,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "busy-target-background-3",
+          "at_s": 0.06,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "busy-target-background-4",
+          "at_s": 0.08,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "busy-target-background-5",
+          "at_s": 0.1,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "busy-target-background-6",
+          "at_s": 0.12,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "busy-target-background-7",
+          "at_s": 0.14,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "busy-target-background-8",
+          "at_s": 0.16,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "busy-target-background-9",
+          "at_s": 0.18,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "busy-target-background-10",
+          "at_s": 0.2,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "busy-target-background-11",
+          "at_s": 0.22,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "busy-target-background-12",
+          "at_s": 0.24,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "busy-target-background-13",
+          "at_s": 0.26,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "busy-target-background-14",
+          "at_s": 0.28,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "busy-target-background-15",
+          "at_s": 0.3,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "busy-target-background-16",
+          "at_s": 0.32,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "busy-target-background-17",
+          "at_s": 0.34,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "busy-target-background-18",
+          "at_s": 0.36,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "busy-target-background-19",
+          "at_s": 0.38,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "busy-target-background-20",
+          "at_s": 0.4,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "busy-target-background-21",
+          "at_s": 0.42,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "busy-target-background-22",
+          "at_s": 0.44,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "busy-target-background-23",
+          "at_s": 0.46,
+          "route": "tp4",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "busy-source-background-0",
+          "at_s": 5.0,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "busy-source-background-1",
+          "at_s": 5.02,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "busy-source-background-2",
+          "at_s": 5.04,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 4096
+        },
+        {
+          "id": "busy-source-prefill-0",
+          "at_s": 20,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-1",
+          "at_s": 22,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-2",
+          "at_s": 24,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-3",
+          "at_s": 26,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-4",
+          "at_s": 28,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-5",
+          "at_s": 30,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-6",
+          "at_s": 32,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-7",
+          "at_s": 34,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-8",
+          "at_s": 36,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-9",
+          "at_s": 38,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-10",
+          "at_s": 40,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-11",
+          "at_s": 42,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-12",
+          "at_s": 44,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-13",
+          "at_s": 46,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-14",
+          "at_s": 48,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-15",
+          "at_s": 50,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-16",
+          "at_s": 52,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-17",
+          "at_s": 54,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-18",
+          "at_s": 56,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-19",
+          "at_s": 58,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-20",
+          "at_s": 60,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-21",
+          "at_s": 62,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-22",
+          "at_s": 64,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-23",
+          "at_s": 66,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-24",
+          "at_s": 68,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-25",
+          "at_s": 70,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-26",
+          "at_s": 72,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-27",
+          "at_s": 74,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-28",
+          "at_s": 76,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        },
+        {
+          "id": "busy-source-prefill-29",
+          "at_s": 78,
+          "route": "tp1",
+          "prompt_tokens": 2048,
+          "max_tokens": 1
+        }
+      ]
+    }
+  ],
+  "horizon_s": 300,
+  "metric": "ITL100MS_SLOW1PCT_MAXGAP1S_MIN_WEIGHT_V1",
+  "maximum_gap_s": 1
+}

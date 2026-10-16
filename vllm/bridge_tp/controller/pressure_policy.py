@@ -41,6 +41,9 @@ class PressureConfig:
     # Opt-in KV-release pilot only; existing modes retain zero lookahead.
     capacity_lookahead_s: float = 0.0
     capacity_only: bool = False
+    health_service: bool = False
+    health_min_efficiency: float = 0.9
+    health_target_load: float = 0.8
     survival_horizon: int = 256
     min_survival_lower: float = 0.5
     length_resolution: int = 512
@@ -63,6 +66,10 @@ class PressureConfig:
             and self.prefill_waiting_budget > 0
             and self.capacity_guard_blocks > 0
             and type(self.capacity_only) is bool
+            and type(self.health_service) is bool
+            and 0 < self.health_min_efficiency <= 1
+            and 0 < self.health_target_load < 1
+            and not (self.health_service and self.capacity_only)
             and (not self.capacity_only or self.capacity_lookahead_s > 0)
         ):
             raise ValueError(
@@ -101,6 +108,11 @@ class PoolReading:
     prefill_batch_tokens: int | None = None
     prefill_batch_s: float | None = None
     unallocated_prompt_blocks: int | None = None
+    health_status: str = "UNKNOWN"
+    health_eta: float | None = None
+    health_load: float | None = None
+    health_sampled_at: float | None = None
+    health_mixed_window: bool = False
 
 
 @dataclass(frozen=True)
@@ -110,6 +122,36 @@ class Pressure:
     capacity: float | None
     zone: str
     missing: tuple[str, ...]
+
+
+def health_valid(pool, cfg, now):
+    return (
+        pool.health_status in {"SUPPORTED", "IDLE"}
+        and pool.health_eta is not None
+        and math.isfinite(pool.health_eta)
+        and pool.health_eta >= 0
+        and pool.health_load is not None
+        and math.isfinite(pool.health_load)
+        and 0 <= pool.health_load <= 1
+        and pool.health_sampled_at is not None
+        and 0 <= now - pool.health_sampled_at <= 12
+        and all(
+            math.isfinite(t) and 0 <= now - t <= cfg.max_age_s
+            for t in (pool.sampled_at, pool.published_at)
+        )
+    )
+
+
+def health_spare(pool, cfg, now):
+    current = classify(pool, cfg, now)
+    return (
+        health_valid(pool, cfg, now)
+        and pool.health_eta >= cfg.health_min_efficiency
+        and pool.health_load <= cfg.health_target_load
+        and pool.pending_prompt_tokens == pool.waiting == 0
+        and current.decode is not None
+        and current.decode <= cfg.leave_ratio
+    )
 
 
 def classify(pool: PoolReading, cfg: PressureConfig, now: float) -> Pressure:
@@ -406,6 +448,7 @@ class Candidate:
     prediction_lag: int | None = None
     action_available: bool = True
     inventory_reference: str | None = None
+    target_health_after_supported: bool = False
 
     def audit(self) -> dict:
         return {
@@ -425,6 +468,7 @@ class PressureDecision:
     required_release_blocks: int = 0
     version: str = VERSION
     config_sha256: str = ""
+    service_path: str = "legacy"
 
 
 class PressurePolicy:
@@ -453,7 +497,8 @@ class PressurePolicy:
         s, t = classify(source, cfg, now), classify(target, cfg, now)
         if self._last_tick is not None and now < self._last_tick:
             raise ValueError("decision time regressed")
-        if self._last_tick is not None and now - self._last_tick > cfg.max_tick_gap_s:
+        allowed_tick_gap = cfg.max_age_s if cfg.health_service else cfg.max_tick_gap_s
+        if self._last_tick is not None and now - self._last_tick > allowed_tick_gap:
             self._since = None
         self._last_tick = now
         if len({c.request_id for c in candidates}) != len(candidates):
@@ -494,6 +539,9 @@ class PressurePolicy:
                 emergency,
                 required,
                 config_sha256=cfg.sha256,
+                service_path="health"
+                if cfg.health_service and not emergency
+                else "legacy",
             )
 
         if not self.ledger.channel_available(target.pool_id):
@@ -513,6 +561,13 @@ class PressurePolicy:
                 and max(active_source) >= threshold
                 and max(active_source) - max(active_target) >= gap
             )
+            if cfg.health_service:
+                needed = (
+                    health_valid(source, cfg, now)
+                    and source.health_status == "SUPPORTED"
+                    and source.health_eta < cfg.health_min_efficiency
+                    and health_spare(target, cfg, now)
+                )
             if not needed:
                 self._since = None
                 self._latched = False
@@ -638,7 +693,21 @@ class PressurePolicy:
                 v is not None and math.isfinite(v) and v >= 0 for v in costs
             )
             if not emergency:
-                if not valid_costs or s.decode is None or t.decode is None:
+                if cfg.health_service:
+                    if (
+                        not c.target_health_after_supported
+                        or not valid_costs
+                        or t.decode is None
+                        or t.prefill is None
+                        or t.decode + pending_decode + c.target_decode_cost
+                        > cfg.leave_ratio
+                        or target.pending_prompt_tokens
+                        or target.waiting
+                    ):
+                        reasons.append(
+                            "post-move health support/service budget missing"
+                        )
+                elif not valid_costs or s.decode is None or t.decode is None:
                     reasons.append("post-move service estimate missing")
                 elif (
                     t.decode + pending_decode + c.target_decode_cost > cfg.leave_ratio
@@ -737,11 +806,23 @@ def admit(
         raise ValueError("invalid request lengths")
     output_cap = min(8192, requested_output)
     source = ledger.routing_reading(pools[0])
+    target = ledger.routing_reading(pools[1])
     source_pressure = classify(source, cfg, now)
     prefer_target = prompt_tokens >= cfg.very_long_prompt_tokens or (
         prompt_tokens >= cfg.prompt_boundary
         and source_pressure.zone in {"CRITICAL", "OVERLOAD"}
     )
+    if cfg.health_service:
+        source_needs_relief = (
+            source_pressure.capacity is not None and source_pressure.capacity >= 1
+        ) or (
+            health_valid(source, cfg, now)
+            and source.health_eta < cfg.health_min_efficiency
+        )
+        prefer_target = health_spare(target, cfg, now) and (
+            prompt_tokens >= cfg.very_long_prompt_tokens
+            or (prompt_tokens >= cfg.prompt_boundary and source_needs_relief)
+        )
     preferred = pools[1] if prefer_target else pools[0]
     routing_reason = (
         "very long known prompt"

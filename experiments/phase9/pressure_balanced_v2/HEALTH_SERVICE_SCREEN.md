@@ -1,0 +1,112 @@
+# Health-reference service-path screen
+
+Cloud entry: `bash tools/bridge_tp/run_pressure_pilot.sh --health-screen`.
+This is an opt-in experiment. Existing function, KV-release and sustained modes
+retain their policy settings. No production switch, automatic cloud GPU run,
+new predictor, transport change, or ordinary-ingress KV admission gate is added.
+
+## Health quantities
+
+`health_reference_v2.json` re-scores the five original calibration archives.
+Only past-window intervals enter the ten-second score: per request take the
+minimum of the 100ms/1% slow-interval weight and 1s/maximum-gap weight, including
+right-censored unfinished output gaps. Do not use eventual full-request quality
+in online decisions. Whole-run G300 remains a separate, full-drain outcome.
+
+There are 22 repeated operating points, 20 usable and 2 TP4 Nd32 diagnostic
+points kept isolated. Of 504 re-scored windows, 20 changed. Two reference
+medians changed: target Nd24/context2k..4k 613.60 to 613.40, and target
+Nd8/context4k..6k 364.20 to 362.425 tokens/s. The other 20 medians are unchanged.
+Migration arms, interrupted prefixes and later sustained outcomes do not enter
+this reference. Reference lookup requires exact Nd and 2048-token context bin.
+
+For a supported current shape:
+
+    eta = observed past-window goodoutput / same-shape pure-decode reference
+    reference_load = same-shape reference / best measured reference in context bin
+
+The second quantity is relative to measured working points, not a fraction of
+true hardware capacity. A high goodoutput source is not marked unhealthy just
+because its ITL is higher. Prefill interference may reduce eta below the pure
+decode baseline; mixed windows are marked explicitly rather than silently
+claimed to be calibrated mixed-prefill capacity.
+
+Actual SSE callbacks feed an additional causal observer. Native inventory
+generations establish window shape: at least 80% same Nd/context bin, with
+no observation gap over 2s and no stale current shape. Startup, unsupported
+shapes and missing data return UNKNOWN. A fresh native-confirmed idle pool is
+handled explicitly. Diagnostic Nd32 never becomes a spare capacity reference.
+
+## Experimental trigger
+
+`health_service_policy.json` enables both the service path and independent KV
+lookahead. Defaults in existing modes remain unchanged.
+
+- Source eta below 0.90, target eta at least 0.90 and target reference_load at
+  most 0.80 must persist for 10s, normally requiring two closed windows.
+- These 0.90/0.80/10s settings are explicit engineering choices, not fitted
+  optimal thresholds. Unknown health never establishes target spare status.
+- Closed-window persistence tolerates polling jitter up to the existing2s
+  freshness limit; a longer gap resets it. Legacy modes retain their0.5s limit.
+- Target current service and queue evidence must also be acceptable; an old
+  healthy window cannot override an ongoing slow output gap or fresh ingress.
+- For service START, additionally require a repeated heavier target shape in
+  the same post-move mean-context bin. This monotonic support assumption is
+  recorded explicitly; it does not interpolate unseen goodoutput or predict
+  migration benefit. The original engine-step budget and physical migration
+  promises still apply, together with ownership, context, remaining-life,
+  unique release and channel checks.
+- KV guard remains 2000 tokens and release budget 16.86410117149353 s. A KV
+  warning may evaluate candidates even with UNKNOWN service health. Neither
+  path forces START. Source-to-target only, at most one session per scene.
+- Optional new-ingress routing prefers TP1; long prompts consider TP4 when
+  source health/KV needs relief, and very long prompts consider TP4 directly,
+  provided the target has known spare evidence. Context fallback remains.
+  Pressure never rejects ordinary ingress. Fixed pilot routes override this
+  preference; therefore this GPU screen does not validate automatic routing.
+
+## Four fresh runs
+
+Two target conditions, one STAY/migrate pair each, not two repeats of one
+workload. Counterbalanced order: spare STAY then migrate; busy migrate then
+STAY. Each pair uses identical frozen arrivals. There is no forced overload or
+artificial injected ITL in the GPU workload.
+
+- Source: 3 background requests at 5,5.02,5.04s, prompt2048/output4096.
+- Source-only prefill competition: prompt2048/output1 at 20,22,...,78s (30).
+- Spare target: one prompt2048/output6144 at 0s.
+- Busy target: 24 prompt2048/output4096 arrivals at 0,0.02,...,0.46s.
+
+These make 34/57 requests per arm. Fresh post-warmup capacity must cover all
+source background stop caps plus one injection and guard, and target caps
+plus one migrated request and guard. This verifies intended KV headroom;
+it does not reserve ingress KV. The longer prefill train is chosen to cover
+two complete health windows. Historical audit found only two instantaneous
+service opportunities and zero sustained opportunities, so the new coverage
+must be measured, not assumed.
+
+Spare-arm acceptance requires one health-path move (not KV-path), commit,
+source release and at least1024 remaining tokens at selection. Busy arm must
+show simultaneous source efficiency loss and known target busy/inefficient
+evidence without START. Any busy-arm START fails the screen. Missing coverage
+is reported as COVERAGE_GAP. Both arms fully drain and finalize native/GPU
+evidence and owned cleanup. Paired arrivals must remain within0.5s.
+
+G300/raw rate and old ITL-only score are still saved, but this short function
+screen may underfill300s. Do not call function coverage a sustained throughput
+or net-benefit validation. Progress additionally prints each pool's health
+status, eta and reference load. There is no general multishot controller yet.
+
+## Local audit
+
+The past-window support audit is not an exact native-observer replay or an
+independent holdout: 216 source windows, 186 supported/30 unknown; target
+183 supported/105 unknown. Mixed windows are compared to supported pure-decode
+reference shapes and marked mixed online. There are29 source eta<0.9 windows,
+2 contemporaneous opportunities, zero satisfying two-window persistence.
+No historical migration is inferred or counted from those opportunities.
+
+Local reproduction scripts and detailed outputs live under
+`D:/work/bridgetp/control/pressure_health_service_stage_20261016` and its report.
+Actual serving-parser validation, full rolling CPU gate and GPU acceptance
+must be run on the cloud host before interpreting this screen.
