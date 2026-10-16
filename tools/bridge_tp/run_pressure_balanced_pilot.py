@@ -291,11 +291,22 @@ def _run(args, prepared):
 
     cfg, controller, lookup, jobs, receipt = prepared
     receipt = receipt | {"mode": "ONLINE_FUNCTION_PILOT"}
+    if cfg.health_service:
+        receipt["observation_sampling"] = dict(
+            metrics_interval_s=1.0,
+            metrics_socket_timeout_s=0.75,
+            metrics_log_interval_s=1.0,
+            unchanged_reconcile_log_interval_s=1.0,
+            observation_flush_interval_s=1.0,
+            inventory_and_migration_tick_s=args.tick_s,
+        )
     args.run_dir.mkdir(parents=True, exist_ok=True)
     if any(
         (args.run_dir / name).exists()
         for name in (
             "pressure_audit.jsonl",
+            "pressure_audit_durable.jsonl",
+            "pressure_io_receipt.json",
             "native_tokens.jsonl",
             "pressure_request_results.json",
         )
@@ -303,7 +314,14 @@ def _run(args, prepared):
         raise FileExistsError(
             "pressure pilot restart requires a fresh, reconciled run directory"
         )
-    audit = load("audit").AuditLog(args.run_dir / "pressure_audit.jsonl", receipt)
+    audit_path = args.run_dir / "pressure_audit.jsonl"
+    audit = (
+        load("pressure_io").PressureAudit(
+            audit_path, AsyncJournal(audit_path, flush_interval_s=1.0), receipt
+        )
+        if cfg.health_service
+        else load("audit").AuditLog(audit_path, receipt)
+    )
     tokens = AsyncJournal(args.run_dir / "native_tokens.jsonl")
     co = r.PressureCoordinator(cfg, audit.write)
     health_module = load("pressure_health") if cfg.health_service else None
@@ -311,7 +329,12 @@ def _run(args, prepared):
     service = o.NativeServiceWindow(health_observer=health_tokens)
     executor = ThreadPoolExecutor(max_workers=max(4, len(jobs) + 1))
     ingress = i.PressureIngress(
-        co, service, executor, controller.source_url, controller.target_url
+        co,
+        service,
+        executor,
+        controller.source_url,
+        controller.target_url,
+        reconcile_log_interval_s=1.0 if cfg.health_service else 0,
     )
     session = RollingPressureSession(
         run_dir=args.run_dir,
@@ -327,7 +350,12 @@ def _run(args, prepared):
         o.InventoryReader(args.target_inventory, "tp4"),
     )
     scrapers = tuple(
-        load("telemetry").MetricsScraper(url, controller.block_size, total)
+        load("telemetry").MetricsScraper(
+            url,
+            controller.block_size,
+            total,
+            timeout_s=0.75 if cfg.health_service else 2.0,
+        )
         for url, total in (
             (controller.source_url, controller.tp1_total_kv_blocks),
             (controller.target_url, controller.tp4_total_kv_blocks),
@@ -354,10 +382,21 @@ def _run(args, prepared):
     progress_path = args.run_dir / "pressure_progress.json"
     last_status_at = -math.inf
     last_metrics_error = {}
+    last_metrics_logged = {}
+    background_metrics = []
     last_inventory_status = {}
     last_inventory_progress = ()
     failure = None
     try:
+        if cfg.health_service:
+            for scraper in scrapers:
+                background_metrics.append(
+                    load("pressure_io").BackgroundMetrics(
+                        lambda raw, scraper=scraper: load("pause_diagnostics").call(
+                            "metrics.scrape", o.scrape_inventory_metrics, scraper, raw
+                        )
+                    )
+                )
         while time.monotonic() - started < args.max_seconds:
             load("pause_diagnostics").tick()
             now, elapsed = time.time(), time.monotonic() - started
@@ -420,7 +459,9 @@ def _run(args, prepared):
                 time.sleep(args.tick_s)
                 continue
             pools, shapes = [], []
-            for reader, raw, scraper in zip(readers, inventories, scrapers):
+            for pool_index, (reader, raw, scraper) in enumerate(
+                zip(readers, inventories, scrapers)
+            ):
                 if raw["block_size"] != controller.block_size:
                     raise ValueError(
                         "live KV block geometry differs from pilot contract"
@@ -433,9 +474,14 @@ def _run(args, prepared):
                 if raw["context_limit"] != expected_context:
                     raise ValueError("live context limit differs from serving contract")
                 try:
-                    metrics = load("pause_diagnostics").call(
-                        "metrics.scrape", o.scrape_inventory_metrics, scraper, raw
-                    )
+                    if cfg.health_service:
+                        sampler = background_metrics[pool_index]
+                        sampler.update_inventory(raw)
+                        metrics = sampler.snapshot(time.time(), cfg.max_age_s)
+                    else:
+                        metrics = load("pause_diagnostics").call(
+                            "metrics.scrape", o.scrape_inventory_metrics, scraper, raw
+                        )
                 except load("telemetry").TelemetryError as error:
                     metrics = None
                     if now - last_metrics_error.get(raw["pool_id"], -math.inf) >= 5:
@@ -461,15 +507,20 @@ def _run(args, prepared):
                 previous[raw["pool_id"]] = raw
                 if cfg.capacity_lookahead_s > 0:
                     growth = growth_readers[raw["pool_id"]].update(raw)
-                    audit.write(
-                        dict(
-                            kind="pressure_metrics_sample",
-                            unix_s=time.time(),
-                            pool=raw["pool_id"],
-                            generation=raw["generation"],
-                            metrics=metrics,
+                    if (
+                        not cfg.health_service
+                        or now - last_metrics_logged.get(raw["pool_id"], -math.inf) >= 1
+                    ):
+                        last_metrics_logged[raw["pool_id"]] = now
+                        audit.write(
+                            dict(
+                                kind="pressure_metrics_sample",
+                                unix_s=time.time(),
+                                pool=raw["pool_id"],
+                                generation=raw["generation"],
+                                metrics=metrics,
+                            )
                         )
-                    )
                 pool = o.pool_reading(
                     raw,
                     reader.observed_at,
@@ -875,8 +926,16 @@ def _run(args, prepared):
             tokens.close()
         else:
             atexit.register(tokens.close)
-        session.adapter.close()
-        audit.close()
+        try:
+            session.adapter.close()
+        finally:
+            try:
+                for sampler in background_metrics:
+                    sampler.stop.set()
+                for sampler in background_metrics:
+                    sampler.close()
+            finally:
+                audit.close()
 
 
 def main(argv=None):

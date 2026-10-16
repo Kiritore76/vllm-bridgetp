@@ -81,6 +81,29 @@ class IngressTests(unittest.TestCase):
         row.update(kwargs)
         return dict(pool_id="tp1", sampled_at=10, generation=1, requests=[row])
 
+    def test_reconcile_coalesces_logs_but_not_state_changes(self):
+        self.ingress.reconcile_log_interval_s = 1
+        self.ingress.reconcile(self.snapshot(), 10)
+
+        def events():
+            return [
+                r for r in self.rows if r.get("kind") == "pressure_ingress_reconcile"
+            ]
+
+        self.assertTrue(events()[-1]["state_changed"])
+        self.ingress.reconcile(self.snapshot(), 10.2)
+        self.assertEqual(len(events()), 1)
+        self.ingress.reconcile(self.snapshot(), 11.1)
+        self.assertEqual(len(events()), 2)
+        self.assertEqual(events()[-1]["suppressed_unchanged"], 1)
+        self.executor.future.set_result(dict(completed_unix_s=11.15))
+        self.ingress.reconcile(
+            dict(pool_id="tp1", sampled_at=11.2, generation=2, requests=[]), 11.2
+        )
+        self.assertEqual(len(events()), 3)
+        self.assertTrue(events()[-1]["state_changed"])
+        self.assertEqual(events()[-1]["reservation"]["state"], "COMPLETED")
+
     def test_identity_tracking_precedes_http_without_reserving_capacity(self):
         self.assertEqual(len(self.co.ledger.entries), 1)
         self.assertEqual(self.co.ledger.pending("tp1"), (0, 0, 64))

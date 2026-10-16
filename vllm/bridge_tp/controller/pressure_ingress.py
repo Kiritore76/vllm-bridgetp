@@ -65,12 +65,16 @@ class PressureIngress:
         *,
         post=post_streaming_completion,
         clock=time.time,
+        reconcile_log_interval_s=0,
     ):
         self.coordinator, self.service, self.executor = coordinator, service, executor
         self.urls = {"tp1": source_url, "tp4": target_url}
         self.timeout_s, self.post, self.clock = timeout_s, post, clock
         self.streams = {}
         self._lock = threading.RLock()
+        self.reconcile_log_interval_s = reconcile_log_interval_s
+        self._reconcile_logged_at = {}
+        self._reconcile_suppressed = {}
 
     def submit(
         self,
@@ -141,6 +145,7 @@ class PressureIngress:
                 entry = self.coordinator.ledger.entries[value.reservation_key]
                 if entry.state in {"MOVED", "COMPLETED", "CANCELLED", "FAILED"}:
                     continue
+                before = (value.server_id, dict(vars(entry)))
                 # vLLM completion creates cmpl-<client-id>-<prompt-index>-<suffix>.
                 # Random client IDs prevent prefix collisions; require one match
                 # and verify its original length/stop contract before rebinding.
@@ -192,6 +197,18 @@ class PressureIngress:
                     self.coordinator.ledger.retire_admission(
                         entry.key, "COMPLETED", evidence=True
                     )
+                changed = before != (value.server_id, dict(vars(entry)))
+                if (
+                    not changed
+                    and now
+                    - self._reconcile_logged_at.get(value.client_id, -float("inf"))
+                    < self.reconcile_log_interval_s
+                ):
+                    self._reconcile_suppressed[value.client_id] = (
+                        self._reconcile_suppressed.get(value.client_id, 0) + 1
+                    )
+                    continue
+                self._reconcile_logged_at[value.client_id] = now
                 self.coordinator.audit(
                     {
                         "kind": "pressure_ingress_reconcile",
@@ -199,6 +216,10 @@ class PressureIngress:
                         "client_id": value.client_id,
                         "server_id": value.server_id,
                         "inventory_generation": inventory["generation"],
+                        "state_changed": changed,
+                        "suppressed_unchanged": self._reconcile_suppressed.pop(
+                            value.client_id, 0
+                        ),
                         "reservation": dict(vars(entry)),
                     }
                 )

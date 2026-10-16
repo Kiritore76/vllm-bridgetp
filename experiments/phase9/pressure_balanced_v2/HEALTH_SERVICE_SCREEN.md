@@ -149,8 +149,9 @@ wall time; tick intervals include intentional tick sleep. Nested durations
 overlap and must not be added. Both controller helper module namespaces use the
 same observer so migration helper writes remain visible.
 
-Audit fsync frequency and atomic-write semantics remain unchanged. Timings
-observe the possible cause rather than assume synchronous I/O is responsible.
+The initial diagnostic revision kept audit fsync frequency unchanged. The
+observation-I/O optimization below now reduces syncs in health mode. Atomic
+JSON write semantics remain unchanged. Timings observe the remaining causes.
 The four recipes, seeds, health reference, thresholds, goodoutput scoring and
 single-migration limit are unchanged. Other pilot modes do not enable timing.
 
@@ -160,3 +161,40 @@ writer errors. Monitor failure is a technical failure after owned cleanup.
 The monitor stops through an owned stop file before process-group cleanup;
 this adds no unrelated process termination. All records remain in the existing
 single `pressure-balanced-git-v2-health-screen-*.tar.gz` archive.
+
+## Observation I/O optimization
+
+Health-service mode now uses one bounded background metrics sampler per pool:
+one request at a time, about once per second after the previous request ends,
+HTTP socket timeout0.75s. The controller reads memory without waiting for HTTP.
+Cache timestamps conservatively use the earlier of response timestamp and
+request start; reading the cache never refreshes age. Failed, future or older
+than max_age_s samples are unavailable. Native inventory validation, KV growth,
+in-memory ingress reconciliation, health-window collection and migration ticks
+retain their original cadence and freshness requirements.
+
+Unchanged ingress reconciliation logs are limited to once per second per
+request, with suppressed counts. Binding/ownership/reservation-state changes
+are recorded immediately. Metrics sample logs are limited to once per second
+per pool. Memory reconciliation itself still executes every controller tick.
+
+`pressure_audit.jsonl` remains the full, analysis-compatible timeline, now
+written through the existing bounded AsyncJournal with a1s flush interval.
+It includes the existing integrity footer; loss/write errors fail collection.
+Pure metrics/progress/unchanged reconciliation use only this async path.
+Every decision, binding/state change, admission, dispatch, ownership event,
+migration start/commit/cancel/release and all unknown event kinds additionally
+use synchronous AuditLog in `pressure_audit_durable.jsonl` before returning.
+Critical persistence is independent of the async observation queue. An abrupt
+crash may lose recent async observations; retain both files for diagnosis.
+The controller still refuses uncertain restart and does not recover from a
+partial observation timeline.
+
+Normal shutdown drains observations and writes `controller/pressure_io_receipt.json`
+with total records, critical fsync count and dropped count. The metrics workers
+must stop before successful shutdown. Legacy non-health modes retain their
+original audit and polling behavior. Seeds, four recipes, threshold values,
+health references, token timestamp evidence and scoring are unchanged. Compare
+fsync counts, tick gaps, dispatch lag and full-pool goodoutput in the same
+four-run `--health-screen`; neither lower logging overhead nor removal of all
+GPU stalls is asserted before that GPU rerun.
