@@ -3,6 +3,8 @@
 Evaluation definitions and SLO attainment are frozen in
 [EVALUATION_STANDARD_CN.md](EVALUATION_STANDARD_CN.md). Report raw throughput,
 latency, soft goodoutput, and both all-request and multi-token SLO attainment.
+Current calibration gaps and the deferred TP4 prefill experiment are recorded
+in [PARAMETER_STATUS_CN.md](PARAMETER_STATUS_CN.md).
 
 Run the existing tracked wrapper:
 `bash tools/bridge_tp/run_pressure_pilot.sh --health-sustained`.

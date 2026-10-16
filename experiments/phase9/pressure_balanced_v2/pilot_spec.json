@@ -267,11 +267,12 @@
     "tests/bridge_tp/test_pressure_ingress.py": "93aaaf9ba5937cb30a87a37047585e833cd45ee40fa3166408f85dd8337261e3",
     "tests/bridge_tp/test_pressure_io.py": "655ace9e967491b70bdfac95836ebf05f72da617f5e4ff30823b3e09b1c7b3d8",
     "vllm/bridge_tp/controller/pressure_io.py": "e6a4e2b20555d5dd58e2c98f706ecda48a0e9e257bdf8fcc97b230df7b23f707",
-    "experiments/phase9/pressure_balanced_v2/HEALTH_SUSTAINED.md": "ce6c5a625a24b3329d893af4da68310be558c22bf17cfa63730a4fc6db40d2b7",
+    "experiments/phase9/pressure_balanced_v2/HEALTH_SUSTAINED.md": "a8bf45ad581767bfccbc9382dbb690f92ac9416274ff8f712e671b2d83fe2481",
     "experiments/phase9/pressure_balanced_v2/health_sustained.json": "e15619f202ae03d8930452aacee573c3ec997d5893ba604fc43e1c553b4730f3",
     "tools/bridge_tp/pressure_sessions.py": "abab72c090b690def06f3bc036cffdee7dcfe770f559c407e4301b8eb9fc4c7b",
     "tests/bridge_tp/test_pressure_sessions.py": "01c9c3875318a43d6050b2c2ece3ec37639a3222653053089ff0eea3ff763135",
-    "experiments/phase9/pressure_balanced_v2/EVALUATION_STANDARD_CN.md": "fedf01ecfabb244f2c198cf0c4763a63741061c2323ee3888f2c0c837ee3cad8"
+    "experiments/phase9/pressure_balanced_v2/EVALUATION_STANDARD_CN.md": "fedf01ecfabb244f2c198cf0c4763a63741061c2323ee3888f2c0c837ee3cad8",
+    "experiments/phase9/pressure_balanced_v2/PARAMETER_STATUS_CN.md": "3a50a4fcae5bf283a0ad1061b0441fe492fa0217dcde03b32353e996207ac36b"
   },
   "server_settings": {
     "dtype": "bfloat16",
