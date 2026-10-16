@@ -17,11 +17,12 @@ bridgetp_pressure_pilot_20261015_v2() {
     --pressure-screen) mode=pressure-screen; run_args=(--pressure-screen); runner=tools/bridge_tp/run_pressure_calibration.py ;;
     --efficient-region) mode=efficient-region; run_args=(--efficient-region); runner=tools/bridge_tp/run_pressure_calibration.py ;;
     --efficient-region-last) mode=efficient-region-last; run_args=(--efficient-region-last); runner=tools/bridge_tp/run_pressure_calibration.py ;;
+    --health-nd2) mode=health-nd2; run_args=(--health-nd2); runner=tools/bridge_tp/run_pressure_calibration.py ;;
     --compare) mode=comparison; run_args=(); runner=tools/bridge_tp/run_pressure_comparison.py ;;
     --kv-release) mode=kv-release; run_args=(--kv-release); runner=tools/bridge_tp/run_pressure_comparison.py ;;
     --sustained) mode=sustained; run_args=(--sustained); runner=tools/bridge_tp/run_pressure_comparison.py ;;
     --health-screen) mode=health-screen; run_args=(--health-screen); runner=tools/bridge_tp/run_pressure_comparison.py ;;
-    *) printf 'Use no argument for smoke; --full, --calibrate, --pressure-screen, --efficient-region, --efficient-region-last, --compare, --kv-release, --sustained or --health-screen.\n'; return 2 ;;
+    *) printf 'Use no argument for smoke; --full, --calibrate, --pressure-screen, --efficient-region, --efficient-region-last, --health-nd2, --compare, --kv-release, --sustained or --health-screen.\n'; return 2 ;;
   esac
   [ "$#" -le 1 ] || return 2
   launcher_source="$(realpath -- "${BASH_SOURCE[0]}")" || return

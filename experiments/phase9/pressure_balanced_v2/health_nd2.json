@@ -1,0 +1,23 @@
+{
+  "schema": "PRESSURE_HEALTH_ND2_V1",
+  "migration_enabled": false,
+  "repetitions": 2,
+  "seed": 20261015,
+  "itl_s": 0.1,
+  "slow_fraction": 0.01,
+  "maximum_gap_s": 1,
+  "scenes": [
+    {
+      "name": "health-nd2",
+      "efficient_region": true,
+      "health_nd2": true,
+      "prompt_tokens": 2048,
+      "max_tokens": 4096,
+      "target_max_tokens": 6144,
+      "source_count": 2,
+      "target_count": 2,
+      "headroom_blocks": 125,
+      "min_common_decode_s": 20
+    }
+  ]
+}

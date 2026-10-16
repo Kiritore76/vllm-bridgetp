@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import json
+import os
 import secrets
 import subprocess
 import sys
@@ -391,6 +393,7 @@ def run_scene(
     # No controller or stager is started. Source hooks remain unarmed throughout.
     urls = {pool: plan["config"][pool + "_url"] for pool in ("source", "target")}
     processes, work, observer = [], None, None
+    host_monitor = None
     observation_receipt = dict(valid_records=0, error_records=0)
     warm_requests = [
         payload(config, size, 16, "warm")
@@ -427,6 +430,22 @@ def run_scene(
     )
     common.write_json(root / "recipe.json", scene)
     try:
+        if scene.get("health_nd2"):
+            host_monitor = common.start_process(
+                "host monitor",
+                [
+                    sys.executable,
+                    "-B",
+                    str(ROOT / "tools/bridge_tp/monitor_pressure_host.py"),
+                    "--output",
+                    str(root / "host_monitor.jsonl"),
+                    "--stop-file",
+                    str(root / "host_monitor.stop"),
+                ],
+                os.environ.copy(),
+                root / "host_monitor.log",
+            )
+            processes.append(host_monitor)
         for pool in ("target", "source"):
             stage("启动服务", pool=pool)
             process = common.start_process(
@@ -454,7 +473,11 @@ def run_scene(
             run_dir,
             urls,
             spec["run_timeout_s"],
-            max_workers=64 if scene.get("efficient_region") else 32,
+            max_workers=4
+            if scene.get("health_nd2")
+            else 64
+            if scene.get("efficient_region")
+            else 32,
         )
         if capture_observations:
             observer = threading.Thread(
@@ -515,6 +538,13 @@ def run_scene(
             receipt = assess_coverage(root, scene)
             common.write_json(root / "efficient_region_coverage.json", receipt)
             coverage = receipt["status"]
+        if scene.get("health_nd2"):
+            from tools.bridge_tp.pressure_health_nd2 import coverage as nd2_coverage
+
+            receipt = nd2_coverage(root, scene)
+            common.write_json(root / "health_nd2_coverage.json", receipt)
+            if receipt["status"] != "COVERED":
+                coverage = "COVERAGE_GAP"
         return dict(
             status="COMPLETED",
             coverage=coverage,
@@ -527,6 +557,10 @@ def run_scene(
         if observer:
             observer.join(5)
             common.write_json(root / "observation_receipt.json", observation_receipt)
+        if host_monitor:
+            (root / "host_monitor.stop").touch()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                host_monitor.process.wait(timeout=8)
         stage("清理本场受管进程")
         common.stop_processes(processes)
         if work:
@@ -544,6 +578,15 @@ def run_scene(
         )
         if not ended:
             raise RuntimeError("owned process groups did not end")
+        if host_monitor:
+            from tools.bridge_tp.monitor_pressure_host import validate_journal
+
+            if host_monitor.process.returncode != 0:
+                raise RuntimeError("host monitor failed; retain all evidence")
+            common.write_json(
+                root / "host_monitor_receipt.json",
+                validate_journal(root / "host_monitor.jsonl"),
+            )
 
 
 def drive_guarded(work, scene, repetition, root):
@@ -588,6 +631,7 @@ def main():
     modes.add_argument("--pressure-screen", action="store_true")
     modes.add_argument("--efficient-region", action="store_true")
     modes.add_argument("--efficient-region-last", action="store_true")
+    modes.add_argument("--health-nd2", action="store_true")
     args = parser.parse_args()
     spec = pilot.load_spec(args.spec)
     pilot.verify_spec(spec)
@@ -597,7 +641,9 @@ def main():
     selected = (
         config["pressure_screen_scenes"] if args.pressure_screen else config["scenes"]
     )
-    efficient_region = args.efficient_region or args.efficient_region_last
+    efficient_region = (
+        args.efficient_region or args.efficient_region_last or args.health_nd2
+    )
     repetition_ids = list(range(1, config["repetitions"] + 1))
     if efficient_region:
         from tools.bridge_tp.pressure_efficient_workload import (
@@ -605,14 +651,23 @@ def main():
             validate_plan,
         )
 
-        region = pilot.read(args.spec.parent / "efficient_region.json")
-        validate_plan(region, config)
-        selected, repetition_ids = collection_selection(
-            region, last_only=args.efficient_region_last
-        )
+        if args.health_nd2:
+            from tools.bridge_tp.pressure_health_nd2 import validate as validate_nd2
+
+            region = pilot.read(args.spec.parent / "health_nd2.json")
+            validate_nd2(region, config)
+            selected, repetition_ids = region["scenes"], [1, 2]
+        else:
+            region = pilot.read(args.spec.parent / "efficient_region.json")
+            validate_plan(region, config)
+            selected, repetition_ids = collection_selection(
+                region, last_only=args.efficient_region_last
+            )
     capture_observations = args.pressure_screen or efficient_region
     mode = (
-        "efficient-region-last"
+        "health-nd2"
+        if args.health_nd2
+        else "efficient-region-last"
         if args.efficient_region_last
         else "efficient-region"
         if args.efficient_region
@@ -643,6 +698,7 @@ def main():
             "-m",
             "unittest",
             "tests.bridge_tp.test_pressure_calibration",
+            "tests.bridge_tp.test_pressure_health_nd2",
             "tests.bridge_tp.test_pressure_efficient_workload",
             "tests.bridge_tp.test_prefill_cost_reference",
             "tests.bridge_tp.test_rolling_cutover",
