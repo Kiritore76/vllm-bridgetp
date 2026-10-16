@@ -23,7 +23,9 @@ bridgetp_pressure_pilot_20261015_v2() {
     --sustained) mode=sustained; run_args=(--sustained); runner=tools/bridge_tp/run_pressure_comparison.py ;;
     --health-screen) mode=health-screen; run_args=(--health-screen); runner=tools/bridge_tp/run_pressure_comparison.py ;;
     --health-sustained) mode=health-sustained; run_args=(--health-sustained); runner=tools/bridge_tp/run_pressure_comparison.py ;;
-    *) printf 'Use no argument for smoke; --full, --calibrate, --pressure-screen, --efficient-region, --efficient-region-last, --health-nd2, --compare, --kv-release, --sustained, --health-screen or --health-sustained.\n'; return 2 ;;
+    --health-kv-only) mode=health-kv-only; run_args=(--health-kv-only); runner=tools/bridge_tp/run_pressure_comparison.py ;;
+    --cancel-smoke) mode=cancel-smoke; run_args=(--cancel-smoke); runner=tools/bridge_tp/run_pressure_comparison.py ;;
+    *) printf 'Use no argument for smoke; --full, --calibrate, --pressure-screen, --efficient-region, --efficient-region-last, --health-nd2, --compare, --kv-release, --sustained, --health-screen, --health-sustained, --health-kv-only or --cancel-smoke.\n'; return 2 ;;
   esac
   [ "$#" -le 1 ] || return 2
   launcher_source="$(realpath -- "${BASH_SOURCE[0]}")" || return

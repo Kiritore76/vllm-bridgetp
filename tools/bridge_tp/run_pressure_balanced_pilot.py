@@ -76,6 +76,7 @@ def parse_args(argv=None):
         help="0 permits repeated serialized migrations",
     )
     parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument("--test-only-cancel-first-shadow", action="store_true")
     args = parser.parse_args(argv)
     if args.maximum_migrations < 0:
         parser.error("maximum migrations must be nonnegative")
@@ -96,6 +97,10 @@ def parse_args(argv=None):
 
 def preflight(args):
     cfg = p.PressureConfig(**read(args.policy_config))
+    if args.test_only_cancel_first_shadow and (
+        not cfg.shadow_cancel or args.maximum_migrations != 0 or args.no_migration
+    ):
+        raise ValueError("cancel smoke requires active repeated shadow cleanup")
     if args.maximum_migrations != 1 and not cfg.health_service:
         raise ValueError("repeated migrations require the health policy")
     if cfg.health_service:
@@ -185,6 +190,7 @@ def preflight(args):
         maximum_migrations=args.maximum_migrations,
         migration_execution_enabled=not args.no_migration,
         mode="CPU_PREFLIGHT",
+        test_only_cancel_first_shadow=args.test_only_cancel_first_shadow,
         service_estimator=(
             "observed engine-span local proxy; causal ITL delta unmeasured"
         ),
@@ -700,6 +706,12 @@ def _run(args, prepared):
             )
             if session.record is not None and not session.settled:
                 session.poll_cancel(inventories[1], now, cfg.max_age_s)
+                if args.test_only_cancel_first_shadow:
+                    from tools.bridge_tp.pressure_health_screen import (
+                        inject_cancel_smoke,
+                    )
+
+                    inject_cancel_smoke(session, inventories[1], now, audit)
                 session.reconsider(
                     now,
                     co.ledger.routing_reading(pools[0]),

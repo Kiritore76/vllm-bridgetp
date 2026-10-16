@@ -71,3 +71,40 @@ preserves dirty work and stops, cleans only owned groups, removes only the
 runtime active symlink after groups end, and packs all real session directories
 once in `pressure-balanced-git-v2-health-sustained-*.tar.gz`. CPU checks do not
 establish GPU acceptance; return that archive for analysis.
+
+
+## Follow-up: two-wave KV regression, then cancellation mechanism smoke
+
+Use the existing wrapper; no separate input package or cloud helper script:
+
+- `bash tools/bridge_tp/run_pressure_pilot.sh --health-kv-only`: validate the full
+  frozen matrix, then select only its original `health-kv-r2` recipe. Fresh
+  migrate and STAY arms use unchanged prompts, stops, timing and policy. Two
+  scenes, approximately15–25 minutes including startup and drain. Inspect both
+  KV waves, actual source release, preemption, cancellation decisions, full
+  visible output, native empty and final ledger. This is a finite functional
+  pair, not a saturated capacity measurement. Do not splice an old STAY arm.
+- After reviewing that archive, `bash tools/bridge_tp/run_pressure_pilot.sh
+  --cancel-smoke` runs just one diagnostic migration arm using the same two-wave
+  workload (approximately8–15 minutes). Only the first naturally STARTed shadow
+  is eligible for the test cancellation: target must be admitted with zero
+  output, its identity visible in fresh native inventory, all four initial
+  history stage receipts present, and no freeze selected. It does not force
+  START, slow the transport, disable pressure gates or change the online policy.
+
+The diagnostic records `pressure_test_cancel_injected`, `test_only=true` and
+`natural_cancellation_validated=false`. It requires confirmed cleanup, a matching
+native target abort receipt, channel reuse from CANCELLED and a later successful
+migration/release. Existing completion/ledger/native-empty checks still apply.
+Missing a safe injection window or later natural START is COVERAGE_GAP, not
+success. The diagnostic exits nonzero on missing coverage, and its results have
+no paired benefit comparison. Do not interpret test cancellation under KV risk
+as permission for the production policy to cancel then.
+
+Both modes run CPU regressions first, show the usual concise progress and create
+one `pressure-balanced-git-v2-health-kv-only-*.tar.gz` or
+`pressure-balanced-git-v2-cancel-smoke-*.tar.gz` under the existing results folder.
+Offline tests separately cover healthy recovery, persisting service/KV pressure,
+UNKNOWN/stale observations, repeated reads of one closed window and freeze gates.
+Natural pressure recovery before freeze remains a later coverage study; do not
+relax cancellation rules or cherry-pick seeds to force it.

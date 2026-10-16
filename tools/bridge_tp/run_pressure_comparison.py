@@ -107,10 +107,14 @@ def build_plans(spec, config, inputs, root, common, settings):
         path = root / (recipe["name"] + "_arrivals.json")
         common.write_json(path, arrivals(inputs, recipe))
         for arm in arms:
+            if arm not in config["arms"]:
+                continue
             scene = dict(name=recipe["name"] + "-" + arm, arrivals=str(path))
             plan = pilot.build_scene(local_spec, scene, root, common, settings)
             if arm == "stay":
                 plan["controller_argv"].append("--no-migration")
+            elif config.get("test_only_cancel_smoke"):
+                plan["controller_argv"].append("--test-only-cancel-first-shadow")
             for pool in ("source", "target"):
                 plan[pool + "_env"].update(
                     BRIDGETP_PERFORMANCE_TRACE_DIR=str(
@@ -292,8 +296,11 @@ def main():
     modes.add_argument("--sustained", action="store_true")
     modes.add_argument("--health-screen", action="store_true")
     modes.add_argument("--health-sustained", action="store_true")
+    modes.add_argument("--health-kv-only", action="store_true")
+    modes.add_argument("--cancel-smoke", action="store_true")
     args = parser.parse_args()
-    health_mode = args.health_screen or args.health_sustained
+    repeated = args.health_sustained or args.health_kv_only or args.cancel_smoke
+    health_mode = args.health_screen or repeated
     spec = pilot.load_spec(args.spec)
     pilot.announce("comparison", "核对checkout、代码、固定输入及模型SHA")
     pilot.verify_spec(spec)
@@ -304,7 +311,7 @@ def main():
     )
     if args.health_screen:
         name = "health_screen.json"
-    if args.health_sustained:
+    if repeated:
         name = "health_sustained.json"
     config = pilot.read(args.spec.parent / name)
     inputs = pilot.read(args.spec.parent / "calibration.json")
@@ -316,7 +323,7 @@ def main():
     )
     if args.health_screen:
         validator = health_screen.validate
-    if args.health_sustained:
+    if repeated:
         validator = health_screen.validate_sustained
     validator(config, inputs)
     if health_mode and config["policy_overrides"] != pilot.read(
@@ -325,8 +332,10 @@ def main():
         raise ValueError(
             "health screen policy differs from frozen experimental settings"
         )
+    if args.health_kv_only or args.cancel_smoke:
+        config = health_screen.select_kv_test(config, cancel_smoke=args.cancel_smoke)
     kv_mode = args.kv_release or args.sustained
-    total = 2 * len(config["recipes"])
+    total = len(config["arms"]) * len(config["recipes"])
     common, settings = pilot.arguments(spec)
     from tools.bridge_tp import phase8_stager
     from vllm.entrypoints.openai.cli_args import (
@@ -445,7 +454,7 @@ def main():
                 coverage = (
                     (
                         health_screen.assess_repeated
-                        if args.health_sustained
+                        if repeated
                         else health_screen.assess
                     )(
                         audit,
@@ -465,6 +474,17 @@ def main():
                     plan["run_dir"].parent / "kv_release_metrics.json", coverage
                 )
                 result["coverage"] = coverage["coverage"]
+                if args.cancel_smoke:
+                    coverage = health_screen.assess_cancel_smoke(audit, plan["run_dir"])
+                    common.write_json(
+                        plan["run_dir"].parent / "cancel_smoke_acceptance.json",
+                        coverage,
+                    )
+                    result.update(
+                        coverage=coverage["coverage"],
+                        test_only=True,
+                        natural_cancellation_validated=False,
+                    )
                 if args.sustained or health_mode:
                     score = sustained.score(
                         pilot.read(plan["run_dir"] / "pressure_request_results.json"),
@@ -508,6 +528,9 @@ def main():
         pilot.announce(scene["name"], "场景结束", **console)
         if result["status"] != "COMPLETED":
             return 1
+    if args.cancel_smoke:
+        pilot.announce("cancel-smoke", "清理专项结束；不作为自然触发或收益对照")
+        return 0 if results[0]["coverage"] == "CANCEL_AND_REUSE_OBSERVED" else 1
     pairs = [
         dict(
             pair=recipe["name"],
@@ -543,12 +566,13 @@ def main():
                     for arm, r in arms.items()
                 },
             )
-            if args.health_sustained:
+            if repeated:
                 pair["paired_measurement_valid"] = pair["fixed_arrivals_valid"] and all(
                     r["load_coverage"] == "COVERED" for r in arms.values()
                 )
                 pair["note"] = (
-                    "two pairs; inspect stalls and actual START before benefit claim"
+                    "inspect complete pairs, stalls and actual START "
+                    "before benefit claim"
                 )
     common.write_json(args.out_root / "pair_acceptance.json", pairs)
     pilot.announce("comparison", f"{total}场完成；检查实际迁移覆盖与迟发后再评估收益")

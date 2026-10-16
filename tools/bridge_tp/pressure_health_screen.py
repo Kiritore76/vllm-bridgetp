@@ -160,6 +160,105 @@ def validate_sustained(config, inputs):
             raise ValueError("require151 arrivals through298s, then full drain")
 
 
+def select_kv_test(config, *, cancel_smoke=False):
+    """Select from the already validated full matrix without mutating its inputs."""
+    import copy
+
+    selected = copy.deepcopy(config)
+    selected["recipes"] = [r for r in selected["recipes"] if r["kind"] == "kv"]
+    if len(selected["recipes"]) != 1:
+        raise ValueError("require the single frozen two-wave KV recipe")
+    selected["selection"] = "cancel-smoke" if cancel_smoke else "health-kv-only"
+    selected["test_only_cancel_smoke"] = cancel_smoke
+    if cancel_smoke:
+        selected["arms"] = ["migrate"]
+    return selected
+
+
+def inject_cancel_smoke(sequence, inventory, now, audit):
+    """Exercise cleanup, never force START or change the online pressure policy."""
+    import json
+
+    s = sequence.sessions[0]
+    if (
+        len(sequence.sessions) != 1
+        or s.record is None
+        or s.settled
+        or s.cancel_future is not None
+        or s.target_future is None
+        or s.target_future.done()
+        or not s.reversible()
+        or not 0 <= now - inventory["sampled_at"] <= 2
+    ):
+        return False
+    prefix = f"cmpl-bridgetp-phase9-target-{s.run_dir.name}-0-"
+    targets = [r for r in inventory["requests"] if r["request_id"].startswith(prefix)]
+    if len(targets) != 1 or targets[0]["generated"] != 0:
+        return False
+    for rank in range(4):
+        path = s.run_dir / "initial_stage_receipts" / f"tp_rank_{rank}.json"
+        if not path.is_file():
+            return False
+        row = json.loads(path.read_text())
+        if row.get("migration_id") != s.migration_id or row.get("status") != "STAGED":
+            raise ValueError("cancel smoke stage receipt identity differs")
+    if not s.reversible():
+        return False  # Source may have selected its boundary during the reads.
+    audit.write(
+        dict(
+            kind="pressure_test_cancel_injected",
+            migration_id=s.migration_id,
+            request_id=s.record.request_id,
+            test_only=True,
+            natural_cancellation_validated=False,
+            target_request_id=targets[0]["request_id"],
+        )
+    )
+    s.cancel("TEST_ONLY admitted pre-freeze shadow cleanup")
+    return True
+
+
+def assess_cancel_smoke(audit, run_dir):
+    """Require confirmed cancellation AND later actual migration on the same run."""
+    import json
+
+    injected = [v for v in audit if v.get("kind") == "pressure_test_cancel_injected"]
+    cancelled = [v for v in audit if v.get("kind") == "pressure_cancel_confirmed"]
+    releases = [
+        v for v in audit if v.get("kind") == "pressure_source_release_confirmed"
+    ]
+    observed = False
+    if len(injected) == len(cancelled) == 1:
+        first, done = injected[0], cancelled[0]
+        if first["migration_id"] != done["migration_id"]:
+            raise ValueError("test cancellation identity differs")
+        native = json.loads(
+            (run_dir / "sessions/migration-0001/target_abort_receipt.json").read_text()
+        )
+        if native.get("target_request_id") != first["target_request_id"]:
+            raise ValueError("test target abort identity differs")
+        later = any(
+            v["unix_s"] > done["unix_s"] and v["migration_id"] != done["migration_id"]
+            for v in releases
+        )
+        reused = any(
+            v.get("kind") == "pressure_channel_reused"
+            and v.get("previous_migration_id") == first["migration_id"]
+            and v.get("previous_outcome") == "CANCELLED"
+            for v in audit
+        )
+        observed = later and reused
+    return dict(
+        coverage="CANCEL_AND_REUSE_OBSERVED" if observed else "COVERAGE_GAP",
+        injected=len(injected),
+        confirmed_cancelled=len(cancelled),
+        later_releases=len(releases),
+        test_only=True,
+        natural_cancellation_validated=False,
+        benefit_comparison=False,
+    )
+
+
 def matrix_arrivals(kind):
     if kind == "busy":
         return arrivals("busy")

@@ -557,6 +557,149 @@ class ReceiverCancelTests(unittest.TestCase):
         connector._record_persistent_receiver_idle.assert_called_once()
 
 
+class CancelSmokePlanTests(unittest.TestCase):
+    def test_selects_only_original_KV_recipe_and_separates_mechanism_test(self):
+        from tools.bridge_tp import pressure_health_screen as screen
+
+        bundle = ROOT / "experiments/phase9/pressure_balanced_v2"
+        original = json.loads((bundle / "health_sustained.json").read_text())
+        selected = screen.select_kv_test(original)
+        self.assertEqual(selected["arms"], ["stay", "migrate"])
+        self.assertEqual(len(selected["recipes"]), 1)
+        self.assertEqual(selected["recipes"][0], original["recipes"][-1])
+        smoke = screen.select_kv_test(original, cancel_smoke=True)
+        self.assertEqual(smoke["arms"], ["migrate"])
+        self.assertTrue(smoke["test_only_cancel_smoke"])
+        self.assertEqual(len(original["recipes"]), 5)
+
+    def test_injection_waits_for_natural_START_admitted_target_and_four_ranks(self):
+        from tools.bridge_tp import pressure_health_screen as screen
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            s = NS(
+                run_dir=root,
+                record=NS(request_id="source"),
+                migration_id="m1",
+                settled=False,
+                cancel_future=None,
+                target_future=Future(),
+                reversible=lambda: True,
+                cancel=Mock(),
+            )
+            sequence = NS(sessions=[s])
+            inventory = dict(
+                sampled_at=10,
+                requests=[
+                    dict(
+                        request_id=f"cmpl-bridgetp-phase9-target-{root.name}-0-abc",
+                        generated=0,
+                    )
+                ],
+            )
+            audit = NS(write=Mock())
+            self.assertFalse(screen.inject_cancel_smoke(sequence, inventory, 10, audit))
+            for rank in range(4):
+                session_tests.io.atomic_json_dump(
+                    dict(status="STAGED", migration_id="m1"),
+                    root / "initial_stage_receipts" / f"tp_rank_{rank}.json",
+                )
+            self.assertTrue(screen.inject_cancel_smoke(sequence, inventory, 10, audit))
+            s.cancel.assert_called_once()
+            self.assertTrue(audit.write.call_args.args[0]["test_only"])
+            s.cancel.reset_mock()
+            s.reversible = lambda: False
+            self.assertFalse(screen.inject_cancel_smoke(sequence, inventory, 10, audit))
+            s.cancel.assert_not_called()
+
+    def test_no_injection_is_coverage_gap_not_pass(self):
+        from tools.bridge_tp import pressure_health_screen as screen
+
+        result = screen.assess_cancel_smoke([], ROOT)
+        self.assertEqual(result["coverage"], "COVERAGE_GAP")
+        self.assertFalse(result["natural_cancellation_validated"])
+        self.assertFalse(result["benefit_comparison"])
+
+    def test_mechanism_acceptance_requires_release_after_confirmed_cancel(self):
+        from tools.bridge_tp import pressure_health_screen as screen
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            session_tests.io.atomic_json_dump(
+                dict(target_request_id="target1"),
+                root / "sessions/migration-0001/target_abort_receipt.json",
+            )
+            audit = [
+                dict(
+                    kind="pressure_test_cancel_injected",
+                    migration_id="m1",
+                    target_request_id="target1",
+                ),
+                dict(kind="pressure_cancel_confirmed", migration_id="m1", unix_s=20),
+                dict(
+                    kind="pressure_channel_reused",
+                    previous_migration_id="m1",
+                    previous_outcome="CANCELLED",
+                ),
+            ]
+            self.assertEqual(
+                screen.assess_cancel_smoke(audit, root)["coverage"], "COVERAGE_GAP"
+            )
+            audit.append(
+                dict(
+                    kind="pressure_source_release_confirmed",
+                    migration_id="m2",
+                    unix_s=30,
+                )
+            )
+            self.assertEqual(
+                screen.assess_cancel_smoke(audit, root)["coverage"],
+                "CANCEL_AND_REUSE_OBSERVED",
+            )
+
+    def test_actual_plan_propagates_diagnostic_flag_only_in_smoke(self):
+        from tools.bridge_tp import pressure_health_screen as screen
+        from tools.bridge_tp import run_pressure_comparison as compare
+
+        bundle = ROOT / "experiments/phase9/pressure_balanced_v2"
+        config = json.loads((bundle / "health_sustained.json").read_text())
+        inputs = json.loads((bundle / "calibration.json").read_text())
+
+        def build(spec, scene, root, *args):
+            return dict(
+                run_dir=root / scene["name"] / "controller",
+                controller_argv=["python", "controller"],
+                source_env={},
+                target_env={},
+            )
+
+        for smoke, count in ((False, 2), (True, 1)):
+            with (
+                tempfile.TemporaryDirectory() as temp,
+                patch.object(compare.pilot, "build_scene", side_effect=build),
+            ):
+                common = NS(
+                    write_json=lambda path, value: path.write_text(json.dumps(value))
+                )
+                plans = compare.build_plans(
+                    dict(policy_config=str(bundle / "policy.json")),
+                    screen.select_kv_test(config, cancel_smoke=smoke),
+                    inputs,
+                    Path(temp),
+                    common,
+                    None,
+                )
+                self.assertEqual(len(plans), count)
+                for _, arm, _, plan in plans:
+                    self.assertEqual(
+                        "--test-only-cancel-first-shadow" in plan["controller_argv"],
+                        smoke,
+                    )
+                    self.assertEqual(
+                        "--no-migration" in plan["controller_argv"], arm == "stay"
+                    )
+
+
 class EmptyTerminalStreamTests(unittest.TestCase):
     def stream(self, finish_reason):
         path = ROOT / "vllm/entrypoints/openai/completion/serving.py"
