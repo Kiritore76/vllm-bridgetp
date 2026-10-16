@@ -218,7 +218,7 @@
     "vllm/bridge_tp/controller/token_equivalence.py": "2c08c69fa0c36112d8d466a0975f5df374eb255191ea7d30d6070c8b4c307664",
     "vllm/bridge_tp/controller/__init__.py": "14372049a07f1c7659127e71461ce2cbf22742372e93395b72b374e1d2a92b3d",
     "vllm/v1/core/sched/scheduler.py": "6a5c5391ccf5d319b3dd416e51c80672ccdfca38f2e282c2e2dd7299013c05bc",
-    "tools/bridge_tp/run_pressure_pilot.sh": "f7ba2d07c334ea2a17193cdef56e35433f428350bda6ddbac57a8735e5123527",
+    "tools/bridge_tp/run_pressure_pilot.sh": "105fe0d1fb3e78a3be40235de285088a886dda6a83795ac0c69548b48f48d9df",
     "experiments/phase9/pressure_balanced_v2/both-light.json": "0227597a29fdd431f99e13965bad181bb2ef1c0c5fcb5f7aa091031d690d0ca0",
     "experiments/phase9/pressure_balanced_v2/capacity-arrival.json": "cc214b44b52f879b1c6eb1d1716c527443c5f3e84abde85e0523e0092af6b805",
     "experiments/phase9/pressure_balanced_v2/controller_template.json": "a2f28faa36e87485bd2a23545d165b3aa0ed31481d5b663852bb75a2a606fdb3",
@@ -233,7 +233,7 @@
     "tools/bridge_tp/prefill_cost_reference.py": "9d12bbae373c2849e284599174cab1caafc0660938f8d52007d8af4543ff9a9c",
     "tools/bridge_tp/replay_pressure_calibration.py": "d63e84a5fd50120287ba1b79fa1bee26f817eb3d52623ca78fcac5ec2a4110fb",
     "tests/bridge_tp/test_prefill_cost_reference.py": "041268dcfa05ea323b32ac4e1c43525fc262f3774b729665037fb661fffe5127",
-    "tools/bridge_tp/run_pressure_comparison.py": "f2bad4615b30efac9f423e9a60cb548d5afb660c2ba697221ba45cabbc1303df",
+    "tools/bridge_tp/run_pressure_comparison.py": "3bc552075df3777d96a295661d77c219ea5708814b46ec86fd5a85c533512005",
     "experiments/phase9/pressure_balanced_v2/comparison.json": "a258bb1d00ed1c2670e544866a47298eac69056f2e8d2a62e5f4e3ed5a0521f9",
     "experiments/phase9/pressure_balanced_v2/README.md": "19f2c9325647455b9eaabbe5ee406dd2375a4d352a2465e9f3adb31e8360ca44",
     "tests/bridge_tp/test_pressure_comparison.py": "1eff0fa8472f4aa18594fefd2d72edfbe2971273b713cd0d6a2d49288aa732d7",
@@ -244,7 +244,11 @@
     "experiments/phase9/pressure_balanced_v2/KV_RELEASE_PILOT.md": "085f7638b130887a6fc7552dd77fa27bfade7c932d2da7dd9f75d29d33fcae13",
     "experiments/phase9/pressure_balanced_v2/kv_release.json": "a6afdac03b94db4f4e72b43b2a9ed83a931a5c83618dfe03b00a3e300dbbb059",
     "tests/bridge_tp/test_pressure_kv_pilot.py": "37151824c782e4f74be53074ea6a767b9e0305c1c36906909c57958b4c90af73",
-    "tools/bridge_tp/pressure_kv_pilot.py": "6fe2c35e864240166de7cfdc64a7c9a8bf700703fa51de7e3e9bce5f3f446e11"
+    "tools/bridge_tp/pressure_kv_pilot.py": "6fe2c35e864240166de7cfdc64a7c9a8bf700703fa51de7e3e9bce5f3f446e11",
+    "experiments/phase9/pressure_balanced_v2/SUSTAINED_PILOT.md": "aa93a31920b21e7ded2903c4f50880f732d920b6fdcbbdbcf39e8526cb318b0a",
+    "experiments/phase9/pressure_balanced_v2/sustained.json": "52853ca7f9114f62046f34680734102f1397c3dca4eebdf74cece5d617f4f78b",
+    "tests/bridge_tp/test_pressure_sustained.py": "110c5ebdd550d303589726756a588e5f266246ee28f79f04e4c6c4c36db8c615",
+    "tools/bridge_tp/pressure_sustained.py": "8d3653c4b50448cb70da87569e71a2085fbdf4f8d7ae0d45fff5223a16ed9b5c"
   },
   "server_settings": {
     "dtype": "bfloat16",

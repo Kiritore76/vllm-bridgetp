@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT))
 
 from tools.bridge_tp import launch_pressure_balanced_pilot as pilot  # noqa: E402
 from tools.bridge_tp import pressure_kv_pilot as kv  # noqa: E402
+from tools.bridge_tp import pressure_sustained as sustained  # noqa: E402
 from tools.bridge_tp import run_pressure_calibration as calibration  # noqa: E402
 from tools.bridge_tp.pressure_progress import save_progress  # noqa: E402
 
@@ -141,6 +142,9 @@ def finalize(plan, common):
 
 
 def check_kv_shape(plan, jobs, common):
+    # Only the initial pressure stratum must fit the one-offload shape.
+    # Later arrivals are submitted normally; they never get an admission gate.
+    jobs = [job for job in jobs if job["at_s"] < 10]
     result = kv.capacity_shape(calibration.wait_empty(plan["run_dir"]), jobs)
     common.write_json(plan["run_dir"].parent / "kv_capacity_shape.json", result)
     if result["status"] != "VALID":
@@ -243,17 +247,28 @@ def main():
     parser.add_argument("--spec", type=Path, required=True)
     parser.add_argument("--out-root", type=Path, required=True)
     parser.add_argument("--validate-only", action="store_true")
-    parser.add_argument("--kv-release", action="store_true")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--kv-release", action="store_true")
+    modes.add_argument("--sustained", action="store_true")
     args = parser.parse_args()
     spec = pilot.load_spec(args.spec)
     pilot.announce("comparison", "核对checkout、代码、固定输入及模型SHA")
     pilot.verify_spec(spec)
-    config = pilot.read(
-        args.spec.parent / ("kv_release.json" if args.kv_release else "comparison.json")
+    name = (
+        "sustained.json"
+        if args.sustained
+        else ("kv_release.json" if args.kv_release else "comparison.json")
     )
+    config = pilot.read(args.spec.parent / name)
     inputs = pilot.read(args.spec.parent / "calibration.json")
     calibration.validate_config(inputs)
-    (kv.validate if args.kv_release else validate)(config, inputs)
+    validator = (
+        sustained.validate
+        if args.sustained
+        else (kv.validate if args.kv_release else validate)
+    )
+    validator(config, inputs)
+    kv_mode = args.kv_release or args.sustained
     total = 2 * len(config["recipes"])
     common, settings = pilot.arguments(spec)
     from tools.bridge_tp import phase8_stager
@@ -295,6 +310,7 @@ def main():
                 for name in (
                     "test_pressure_comparison",
                     "test_pressure_kv_pilot",
+                    "test_pressure_sustained",
                     "test_pressure_health_reference",
                     "test_pressure_policy",
                     "test_pressure_preflight",
@@ -339,11 +355,11 @@ def main():
                         plan, pilot.read(arrivals_path), common
                     )
                 )
-                if args.kv_release
+                if kv_mode
                 else None,
             )
             result = assess(plan, pilot.read(scene["arrivals"]), arm, config, common)
-            if args.kv_release:
+            if kv_mode:
                 pilot.scene_result(plan["run_dir"], "kv-release")
                 audit = [
                     json.loads(line)
@@ -361,6 +377,22 @@ def main():
                     plan["run_dir"].parent / "kv_release_metrics.json", coverage
                 )
                 result["coverage"] = coverage["coverage"]
+                if args.sustained:
+                    score = sustained.score(
+                        pilot.read(plan["run_dir"] / "pressure_request_results.json"),
+                        config,
+                    )
+                    score["queue_observations"] = sustained.queue_summary(
+                        audit, score["origin_unix_s"], config["horizon_s"]
+                    )
+                    common.write_json(
+                        plan["run_dir"].parent / "sustained_goodoutput.json", score
+                    )
+                    result.update(
+                        G300=score["goodoutput_tokens_s"],
+                        old_itl_G300=score["old_itl_G"],
+                        load_coverage=score["load_coverage"],
+                    )
         except Exception as error:
             result = dict(status="TECHNICAL_FAILURE", error=repr(error))
         results.append(
@@ -389,6 +421,18 @@ def main():
         )
         for recipe in config["recipes"]
     ]
+    if args.sustained:
+        for pair in pairs:
+            arms = {r["arm"]: r for r in results if r["pair"] == pair["pair"]}
+            stay, move = arms["stay"]["G300"], arms["migrate"]["G300"]
+            pair.update(
+                stay_G300=stay,
+                migrate_G300=move,
+                delta_G300=move - stay,
+                relative_delta=move / stay - 1 if stay > 0 else None,
+                load_coverage={arm: r["load_coverage"] for arm, r in arms.items()},
+                migration_coverage=arms["migrate"]["coverage"],
+            )
     common.write_json(args.out_root / "pair_acceptance.json", pairs)
     pilot.announce("comparison", f"{total}场完成；检查实际迁移覆盖与迟发后再评估收益")
     return 0
