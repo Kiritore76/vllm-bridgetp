@@ -1,5 +1,9 @@
 # Health policy repeated migration matrix
 
+Evaluation definitions and SLO attainment are frozen in
+[EVALUATION_STANDARD_CN.md](EVALUATION_STANDARD_CN.md). Report raw throughput,
+latency, soft goodoutput, and both all-request and multi-token SLO attainment.
+
 Run the existing tracked wrapper:
 `bash tools/bridge_tp/run_pressure_pilot.sh --health-sustained`.
 This replaces the previous four-run health sustained plan. Historical KV-only

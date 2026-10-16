@@ -100,6 +100,9 @@ def score(rows, config):
         max_gap = max(gaps, default=0)
         gap_weight = min(1, config["maximum_gap_s"] / max_gap) if max_gap else 1
         weight = min(old_weight, gap_weight)
+        slo_itl_pass = fraction <= config["slow_fraction"]
+        slo_gap_pass = max_gap <= config["maximum_gap_s"]
+        slo_pass = slo_itl_pass and slo_gap_pass
         selected = [t for t in emitted if origin <= t["unix_s"] < origin + horizon]
         for token in selected:
             bins.add(int((token["unix_s"] - origin) // 10))
@@ -118,8 +121,16 @@ def score(rows, config):
                 window_tokens=len(selected),
                 drain_tokens=len(emitted) - len(selected),
                 ttft_s=times[0] - start,
+                e2e_s=times[-1] - start,
+                tpot_s=(times[-1] - times[0]) / len(gaps) if gaps else None,
+                intervals=len(gaps),
+                slow_intervals=slow,
                 slow_fraction=fraction,
                 maximum_gap_s=max_gap,
+                slo_itl_pass=slo_itl_pass,
+                slo_maximum_gap_pass=slo_gap_pass,
+                slo_pass=slo_pass,
+                in_arrival_cohort=origin <= start < origin + horizon,
                 itl_weight=old_weight,
                 maximum_gap_weight=gap_weight,
                 final_weight=weight,
@@ -134,6 +145,32 @@ def score(rows, config):
         end = max(end, b)
     raw = sum(r["window_tokens"] for r in records)
     good = sum(r["good_tokens"] for r in records)
+    cohort = [r for r in records if r["in_arrival_cohort"]]
+
+    def attainment(group):
+        passed = sum(r["slo_pass"] for r in group)
+        return dict(
+            requests=len(group),
+            passed=passed,
+            rate=passed / len(group) if group else None,
+        )
+
+    slo = dict(
+        definition="slow_interval_fraction<=limit AND maximum_gap<=limit",
+        quality_scope="full request including drain; TTFT/queue excluded",
+        cohort="actual request start in fixed measurement window",
+        itl_s=config["itl_s"],
+        slow_fraction=config["slow_fraction"],
+        maximum_gap_s=config["maximum_gap_s"],
+        all_requests=attainment(cohort),
+        decode_requests=attainment([r for r in cohort if r["intervals"] > 0]),
+        single_token_requests=attainment([r for r in cohort if r["intervals"] == 0]),
+        by_initial_pool={
+            pool: attainment([r for r in cohort if r["initial_pool"] == pool])
+            for pool in pools
+        },
+        excluded_late_requests=len(records) - len(cohort),
+    )
     if abs(sum(pools.values()) - good) > 1e-6:
         raise ValueError("pool goodoutput accounting mismatch")
     return dict(
@@ -147,6 +184,15 @@ def score(rows, config):
         old_itl_G=sum(r["old_good_tokens"] for r in records) / horizon,
         good_tokens=good,
         goodoutput_tokens_s=good / horizon,
+        slo_attainment=slo,
+        # Completion goodput counts only completions before cutoff; token
+        # goodput counts only window tokens. Neither credits drain production.
+        slo_request_goodput=sum(
+            r["slo_pass"] and r["completed_offset_s"] < horizon for r in cohort
+        )
+        / horizon,
+        slo_token_goodput=sum(r["window_tokens"] for r in records if r["slo_pass"])
+        / horizon,
         actual_pool_G={p: v / horizon for p, v in pools.items()},
         inflight_fraction=busy / horizon,
         output_10s_bins=len(bins),
@@ -156,7 +202,7 @@ def score(rows, config):
         else "COVERAGE_GAP",
         last_output_offset_s=max(r["completed_offset_s"] for r in records),
         request_rows=records,
-        note="one KV move under continued arrivals; repeated migration untested",
+        note="measured output and quality; actual migration coverage is separate",
     )
 
 

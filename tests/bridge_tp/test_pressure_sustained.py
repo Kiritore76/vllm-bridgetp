@@ -108,6 +108,47 @@ class ScoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             s.score([row], self.config)
 
+    def test_attainment_keeps_single_token_prefill_separate_from_decode(self):
+        times = [101 + i / 64 for i in range(100)]
+        good = self.row(times + [times[-1] + 0.5])
+        bad = self.row(times + [times[-1] + 1.5], True)
+        bad["job_id"] = "bad"
+        single = self.row([101])
+        single["job_id"] = "prefill-only"
+        score = s.score([good, bad, single], self.config)
+        slo = score["slo_attainment"]
+        self.assertEqual(slo["all_requests"], dict(requests=3, passed=2, rate=2 / 3))
+        self.assertEqual(slo["decode_requests"], dict(requests=2, passed=1, rate=0.5))
+        self.assertEqual(slo["single_token_requests"]["requests"], 1)
+        self.assertIsNone(slo["by_initial_pool"]["tp4"]["rate"])
+        # Exactly 1% slow intervals is allowed, but a 1.5s gap is not.
+        self.assertTrue(score["request_rows"][1]["slo_itl_pass"])
+        self.assertFalse(score["request_rows"][1]["slo_maximum_gap_pass"])
+        self.assertAlmostEqual(score["slo_token_goodput"], 102 / 300)
+        self.assertAlmostEqual(score["slo_request_goodput"], 2 / 300)
+        self.assertGreater(score["goodoutput_tokens_s"], score["slo_token_goodput"])
+
+    def test_attainment_uses_full_drain_but_goodput_excludes_drain_completions(self):
+        config = self.config | dict(horizon_s=2)
+        good = self.row([101 + i / 64 for i in range(200)])
+        late = self.row([103])
+        late["source_transport"]["request_started_unix_s"] = 103
+        late["job_id"] = "late"
+        score = s.score([good, late], config)
+        self.assertEqual(score["slo_attainment"]["all_requests"]["rate"], 1)
+        self.assertEqual(score["slo_attainment"]["excluded_late_requests"], 1)
+        self.assertEqual(score["slo_request_goodput"], 0)
+        self.assertEqual(score["slo_token_goodput"], 32)
+        single = s.score([self.row([101])], self.config)
+        self.assertIsNone(single["slo_attainment"]["decode_requests"]["rate"])
+
+    def test_drain_violation_changes_slo_attainment(self):
+        config = self.config | dict(horizon_s=2)
+        row = self.row([101 + i / 64 for i in range(200)] + [106])
+        score = s.score([row], config)
+        self.assertEqual(score["slo_attainment"]["all_requests"]["rate"], 0)
+        self.assertEqual(score["slo_token_goodput"], 0)
+
     def test_coverage_requires_output_in_every_bin(self):
         times = [101 + i * 0.05 for i in range(5981)]
         score = s.score([self.row(times)], self.config)

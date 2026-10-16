@@ -478,6 +478,10 @@ def main():
                     result.update(
                         G300=score["goodoutput_tokens_s"],
                         old_itl_G300=score["old_itl_G"],
+                        raw_tokens_s=score["raw_rate"],
+                        slo_attainment=score["slo_attainment"],
+                        slo_request_goodput=score["slo_request_goodput"],
+                        slo_token_goodput=score["slo_token_goodput"],
                         load_coverage=score["load_coverage"],
                     )
         except Exception as error:
@@ -494,7 +498,13 @@ def main():
             total_scenes=total,
             **result,
         )
-        pilot.announce(scene["name"], "场景结束", **result)
+        console = dict(result)
+        slo = console.pop("slo_attainment", None)
+        if slo is not None:
+            for label in ("all_requests", "decode_requests"):
+                group = slo[label]
+                console["slo_" + label] = f"{group['passed']}/{group['requests']}"
+        pilot.announce(scene["name"], "场景结束", **console)
         if result["status"] != "COMPLETED":
             return 1
     pairs = [
@@ -519,6 +529,18 @@ def main():
                 relative_delta=move / stay - 1 if stay > 0 else None,
                 load_coverage={arm: r["load_coverage"] for arm, r in arms.items()},
                 migration_coverage=arms["migrate"]["coverage"],
+                quality_metrics={
+                    arm: {
+                        key: r[key]
+                        for key in (
+                            "raw_tokens_s",
+                            "slo_attainment",
+                            "slo_request_goodput",
+                            "slo_token_goodput",
+                        )
+                    }
+                    for arm, r in arms.items()
+                },
             )
             if args.health_sustained:
                 pair["paired_measurement_valid"] = pair["fixed_arrivals_valid"] and all(
