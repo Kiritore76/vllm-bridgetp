@@ -289,7 +289,9 @@ def main():
     modes.add_argument("--kv-release", action="store_true")
     modes.add_argument("--sustained", action="store_true")
     modes.add_argument("--health-screen", action="store_true")
+    modes.add_argument("--health-sustained", action="store_true")
     args = parser.parse_args()
+    health_mode = args.health_screen or args.health_sustained
     spec = pilot.load_spec(args.spec)
     pilot.announce("comparison", "核对checkout、代码、固定输入及模型SHA")
     pilot.verify_spec(spec)
@@ -300,6 +302,8 @@ def main():
     )
     if args.health_screen:
         name = "health_screen.json"
+    if args.health_sustained:
+        name = "health_sustained.json"
     config = pilot.read(args.spec.parent / name)
     inputs = pilot.read(args.spec.parent / "calibration.json")
     calibration.validate_config(inputs)
@@ -310,8 +314,10 @@ def main():
     )
     if args.health_screen:
         validator = health_screen.validate
+    if args.health_sustained:
+        validator = health_screen.validate_sustained
     validator(config, inputs)
-    if args.health_screen and config["policy_overrides"] != pilot.read(
+    if health_mode and config["policy_overrides"] != pilot.read(
         args.spec.parent / "health_service_policy.json"
     ):
         raise ValueError(
@@ -403,18 +409,18 @@ def main():
                 plan,
                 common,
                 settings,
-                diagnose_pauses=args.health_screen,
+                diagnose_pauses=health_mode,
                 before_shutdown=lambda plan: finalize(plan, common),
                 before_workload=(
                     lambda plan, arrivals_path=scene["arrivals"]: (
-                        check_health_shape if args.health_screen else check_kv_shape
+                        check_health_shape if health_mode else check_kv_shape
                     )(plan, pilot.read(arrivals_path), common)
                 )
-                if kv_mode or args.health_screen
+                if kv_mode or health_mode
                 else None,
             )
             result = assess(plan, pilot.read(scene["arrivals"]), arm, config, common)
-            if kv_mode or args.health_screen:
+            if kv_mode or health_mode:
                 pilot.scene_result(plan["run_dir"], "kv-release")
                 audit = [
                     json.loads(line)
@@ -429,7 +435,7 @@ def main():
                         recipe["kind"],
                         arm,
                     )
-                    if args.health_screen
+                    if health_mode
                     else kv.assess(
                         audit,
                         pilot.read(plan["run_dir"].parent / "comparison_metrics.json"),
@@ -441,7 +447,7 @@ def main():
                     plan["run_dir"].parent / "kv_release_metrics.json", coverage
                 )
                 result["coverage"] = coverage["coverage"]
-                if args.sustained or args.health_screen:
+                if args.sustained or health_mode:
                     score = sustained.score(
                         pilot.read(plan["run_dir"] / "pressure_request_results.json"),
                         config,
@@ -485,7 +491,7 @@ def main():
         )
         for recipe in config["recipes"]
     ]
-    if args.sustained or args.health_screen:
+    if args.sustained or health_mode:
         for pair in pairs:
             arms = {r["arm"]: r for r in results if r["pair"] == pair["pair"]}
             stay, move = arms["stay"]["G300"], arms["migrate"]["G300"]
@@ -497,6 +503,13 @@ def main():
                 load_coverage={arm: r["load_coverage"] for arm, r in arms.items()},
                 migration_coverage=arms["migrate"]["coverage"],
             )
+            if args.health_sustained:
+                pair["paired_measurement_valid"] = pair["fixed_arrivals_valid"] and all(
+                    r["load_coverage"] == "COVERED" for r in arms.values()
+                )
+                pair["note"] = (
+                    "two pairs; inspect stalls and actual START before benefit claim"
+                )
     common.write_json(args.out_root / "pair_acceptance.json", pairs)
     pilot.announce("comparison", f"{total}场完成；检查实际迁移覆盖与迟发后再评估收益")
     return 0

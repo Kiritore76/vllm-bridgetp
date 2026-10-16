@@ -71,6 +71,83 @@ def validate(config, inputs):
         build(inputs, recipe)
 
 
+def sustained_arrivals(repetition):
+    """Continue arrivals through the cutoff, preserving the proven first phase."""
+    rows = [
+        dict(
+            id=f"r{repetition}-target-background-{i}",
+            at_s=i * 90,
+            route="tp4",
+            prompt_tokens=2048,
+            max_tokens=6144,
+        )
+        for i in range(4)
+    ]
+    rows += [
+        dict(
+            id=f"r{repetition}-source-background-{i}",
+            at_s=5 + i * 0.02,
+            route="tp1",
+            prompt_tokens=2048,
+            max_tokens=4096,
+        )
+        for i in range(3)
+    ]
+    rows += [
+        dict(
+            id=f"r{repetition}-source-arrival-{i}",
+            at_s=110 + i * 55,
+            route="tp1",
+            prompt_tokens=2048,
+            max_tokens=4096,
+        )
+        for i in range(4)
+    ]
+    rows += [
+        dict(
+            id=f"r{repetition}-source-prefill-{i}",
+            at_s=20 + i * 2,
+            route="tp1",
+            prompt_tokens=2048,
+            max_tokens=1,
+        )
+        for i in range(140)
+    ]
+    return sorted(rows, key=lambda r: r["at_s"])
+
+
+def validate_sustained(config, inputs):
+    from tools.bridge_tp.run_pressure_comparison import arrivals as build
+
+    if (
+        config["schema"] != "PRESSURE_HEALTH_SUSTAINED_V1"
+        or config["arms"] != ["stay", "migrate"]
+        or config["maximum_migrations"] != 1
+        or config["horizon_s"] != 300
+        or config["metric"] != METRIC
+        or config["maximum_gap_s"] != 1
+        or config["itl_s"] != 0.1
+        or config["slow_fraction"] != 0.01
+        or config["max_dispatch_lag_s"] != 0.5
+        or config["minimum_remaining_at_start"] != 1024
+        or config["policy_overrides"].get("health_service") is not True
+        or config["policy_overrides"].get("capacity_only") is not False
+        or config["policy_overrides"].get("health_min_efficiency") != 0.9
+        or config["policy_overrides"].get("health_target_load") != 0.8
+        or config["policy_overrides"].get("sustain_s") != 10
+        or config["policy_overrides"].get("capacity_lookahead_s") != RELEASE_BUDGET_S
+        or [(r["name"], r["kind"], r["repetition"]) for r in config["recipes"]]
+        != [(f"health-sustained-r{i}", "spare", i) for i in (1, 2)]
+    ):
+        raise ValueError("health sustained plan differs from frozen four-run protocol")
+    for recipe in config["recipes"]:
+        if recipe["arrivals"] != sustained_arrivals(recipe["repetition"]):
+            raise ValueError("health sustained arrivals differ")
+        jobs = build(inputs, recipe)
+        if len(jobs) != 151 or jobs[-1]["at_s"] != 298:
+            raise ValueError("require151 arrivals through298s, then full drain")
+
+
 def assess(audit, metrics, kind, arm):
     starts = [r for r in audit if r.get("kind") == "pressure_actual_start"]
     releases = [
