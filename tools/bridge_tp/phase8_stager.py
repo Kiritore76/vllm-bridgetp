@@ -630,8 +630,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv=None) -> None:
+    args = parse_args(argv)
     args.run_dir.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + args.timeout_s
     cleanup_path = args.run_dir / "cleanup_request.json"

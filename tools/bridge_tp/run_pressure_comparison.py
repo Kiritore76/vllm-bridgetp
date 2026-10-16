@@ -94,6 +94,7 @@ def build_plans(spec, config, inputs, root, common, settings):
     common.write_json(policy_path, policy)
     local_spec = copy.deepcopy(spec)
     local_spec["policy_config"] = str(policy_path)
+    local_spec["maximum_migrations"] = config["maximum_migrations"]
     if policy.get("health_service"):
         local_spec["health_reference"] = str(
             Path(spec.get("service_evidence", spec["policy_config"])).parent
@@ -250,7 +251,8 @@ def assess(plan, jobs, arm, config, common):
         for line in (run_dir / "pressure_audit.jsonl").read_text().splitlines()
     ]
     starts = [r for r in audit if r.get("kind") == "pressure_actual_start"]
-    if len(starts) > 1 or (arm == "stay" and starts):
+    maximum = config["maximum_migrations"]
+    if (maximum and len(starts) > maximum) or (arm == "stay" and starts):
         raise RuntimeError("comparison arm violated migration limit")
     if arm == "stay" and any(r.get("execution") == "RESERVED" for r in audit):
         raise RuntimeError("STAY arm reserved a migration")
@@ -375,6 +377,7 @@ def main():
                     "test_pressure_policy",
                     "test_pressure_preflight",
                     "test_pressure_session",
+                    "test_pressure_sessions",
                     "test_pressure_bootstrap",
                     "test_pressure_observation",
                     "test_rolling_cutover",
@@ -412,9 +415,19 @@ def main():
                 diagnose_pauses=health_mode,
                 before_shutdown=lambda plan: finalize(plan, common),
                 before_workload=(
-                    lambda plan, arrivals_path=scene["arrivals"]: (
-                        check_health_shape if health_mode else check_kv_shape
-                    )(plan, pilot.read(arrivals_path), common)
+                    lambda plan, arrivals_path=scene["arrivals"], kind=recipe["kind"]: (
+                        check_kv_shape
+                        if kind == "kv"
+                        else check_health_shape
+                        if health_mode
+                        else check_kv_shape
+                    )(
+                        plan,
+                        [j for j in pilot.read(arrivals_path) if j["at_s"] < 10]
+                        if kind == "kv"
+                        else pilot.read(arrivals_path),
+                        common,
+                    )
                 )
                 if kv_mode or health_mode
                 else None,
@@ -429,7 +442,11 @@ def main():
                     .splitlines()
                 ]
                 coverage = (
-                    health_screen.assess(
+                    (
+                        health_screen.assess_repeated
+                        if args.health_sustained
+                        else health_screen.assess
+                    )(
                         audit,
                         pilot.read(plan["run_dir"].parent / "comparison_metrics.json"),
                         recipe["kind"],

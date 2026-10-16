@@ -6,7 +6,7 @@
   "leave_ratio": 1.0,
   "imbalance_enter": 0.4,
   "imbalance_leave": 0.2,
-  "sustain_s": 10,
+  "sustain_s": 3,
   "max_tick_gap_s": 0.5,
   "cooldown_s": 2.0,
   "prompt_boundary": 2048,

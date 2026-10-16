@@ -44,7 +44,10 @@ def _atomic_json_dump(value: dict[str, Any], path: Path) -> None:
 def _configured_session() -> tuple[Path, str]:
     run_dir_value = os.getenv("BRIDGETP_TAKEOVER_RUN_DIR", "").strip()
     migration_id = os.getenv("BRIDGETP_TAKEOVER_MIGRATION_ID", "").strip()
-    persistent = os.getenv("BRIDGETP_PERSISTENT_CHANNEL", "").strip().lower() in {
+    persistent = os.getenv(
+        "BRIDGETP_TAKEOVER_PERSISTENT_CHANNEL",
+        os.getenv("BRIDGETP_PERSISTENT_CHANNEL", ""),
+    ).strip().lower() in {
         "1",
         "true",
         "yes",
@@ -58,6 +61,9 @@ def _configured_session() -> tuple[Path, str]:
     run_dir = Path(run_dir_value)
     if persistent:
         try:
+            # Pin this API operation to the immutable active session directory.
+            # A later channel reuse must not redirect its receipt or request ID.
+            run_dir = run_dir.resolve(strict=True)
             active = _load_json(run_dir / "session_manifest.json")
             migration_id = str(active["migration_id"])
         except (OSError, KeyError, TypeError, ValueError) as error:

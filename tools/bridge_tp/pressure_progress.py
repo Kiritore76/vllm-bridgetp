@@ -28,6 +28,16 @@ def stream_progress(dispatched, target_future=None):
 
 def completed_streams(dispatched, target_stream=None, target_future=None):
     """A migrated request completes when its target stream also completes."""
+    sessions = getattr(target_stream, "sessions", None)
+    if sessions is not None:
+        pending = {
+            id(s.stream)
+            for s in sessions
+            if s.target_future is not None and not s.target_future.done()
+        }
+        return sum(
+            s.future.done() and id(s) not in pending for s in dispatched.values()
+        )
     return sum(
         stream.future.done()
         and (
@@ -55,7 +65,9 @@ def workload_progress(dispatched, last_inventory, session, reservations):
     """One marker for healthy and unavailable inventory, without poll timestamps."""
     return (
         len(dispatched),
-        completed_streams(dispatched, session.stream, session.target_future),
+        completed_streams(dispatched, session)
+        if hasattr(session, "sessions")
+        else completed_streams(dispatched, session.stream, session.target_future),
         last_inventory,
         session.record.state.value if session.record else "no_session",
         session.settled,
@@ -70,6 +82,13 @@ def workload_progress(dispatched, last_inventory, session, reservations):
             for row in reservations
         ),
         stream_progress(dispatched, session.target_future),
+        tuple(
+            (
+                s.migration_id,
+                s.target_future.done() if s.target_future is not None else None,
+            )
+            for s in getattr(session, "sessions", [])
+        ),
     )
 
 

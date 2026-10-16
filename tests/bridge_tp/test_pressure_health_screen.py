@@ -66,6 +66,11 @@ class HealthSustainedInputs(unittest.TestCase):
         patterns = []
         for recipe in self.config["recipes"]:
             jobs = compare.arrivals(self.inputs, recipe)
+            if recipe["kind"] != "spare":
+                self.assertEqual(
+                    recipe["arrivals"], screen.matrix_arrivals(recipe["kind"])
+                )
+                continue
             self.assertEqual(len(jobs), 151)
             self.assertEqual(sum(j["request"]["max_tokens"] for j in jobs), 53388)
             self.assertEqual(jobs[-1]["at_s"], 298)

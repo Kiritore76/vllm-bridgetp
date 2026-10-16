@@ -138,6 +138,8 @@ def arguments(spec):
 
 def build_scene(spec, scene, run_root, common, args):
     run_dir = run_root / scene["name"] / "controller"
+    multiple = spec.get("maximum_migrations", 1) != 1
+    mechanism_dir = run_dir / "migration_active" if multiple else run_dir
     config_path = run_root / scene["name"] / "controller_config.json"
     config = read(spec["controller_config_template"])
     config.update(
@@ -153,7 +155,7 @@ def build_scene(spec, scene, run_root, common, args):
     try:
         for key in inherited:
             os.environ.pop(key)
-        source = common.source_environment(args, scene["name"], run_dir)
+        source = common.source_environment(args, scene["name"], mechanism_dir)
     finally:
         os.environ.update(inherited)
     source.update(
@@ -177,15 +179,17 @@ def build_scene(spec, scene, run_root, common, args):
         CUDA_VISIBLE_DEVICES=args.tp4_gpus,
         OMP_NUM_THREADS="1",
         BRIDGETP_TAKEOVER_ENABLED="1",
-        BRIDGETP_TAKEOVER_RUN_DIR=str(run_dir),
+        BRIDGETP_TAKEOVER_RUN_DIR=str(mechanism_dir),
         BRIDGETP_TAKEOVER_MIGRATION_ID=scene["name"],
         BRIDGETP_PRESSURE_INVENTORY_PATH=str(run_dir / "target_inventory.jsonl"),
         BRIDGETP_PRESSURE_POOL="tp4",
     )
+    if multiple:
+        target["BRIDGETP_TAKEOVER_PERSISTENT_CHANNEL"] = "1"
     target_argv = common.server_command(args, 4, args.tp4_port) + [
         "--kv-transfer-config",
         common.target_connector(
-            run_dir,
+            mechanism_dir,
             gpu_resident_shadow=True,
             persistent_channel=True,
             ready_sync_mode="STREAM_EVENT",
@@ -196,12 +200,22 @@ def build_scene(spec, scene, run_root, common, args):
             gpu_direct_base_port=args.gpu_direct_base_port,
         ),
     ]
+    if multiple:
+        connector = json.loads(target_argv[-1])
+        # Reuse one bounded receive buffer. Old decode completions must not
+        # release or write cleanup receipts for a newer active transfer.
+        connector["kv_connector_extra_config"][
+            "bridgetp_release_persistent_payload_buffer"
+        ] = False
+        target_argv[-1] = json.dumps(connector)
     source_argv = common.server_command(args, 1, args.tp1_port)
     stager_argv = [
         sys.executable,
-        str(common.STAGER),
+        str(ROOT / "tools/bridge_tp/pressure_sessions.py")
+        if multiple
+        else str(common.STAGER),
         "--run-dir",
-        str(run_dir),
+        str(mechanism_dir),
         "--delta-host",
         "127.0.0.1",
         "--delta-base-port",
@@ -252,6 +266,8 @@ def build_scene(spec, scene, run_root, common, args):
     ]
     if spec.get("health_reference"):
         argv.extend(["--health-reference", spec["health_reference"]])
+    if multiple:
+        argv.extend(["--maximum-migrations", str(spec["maximum_migrations"])])
     return dict(
         run_dir=run_dir,
         config=config,
@@ -277,14 +293,19 @@ def scene_result(run_dir, name):
     pending_shutdown = final.get("shutdown_cleanup_required", False)
     if final["outcome"] not in {"COMPLETED", "COMPLETED_PENDING_OWNER_CLEANUP"}:
         raise RuntimeError("controller did not complete; keep full evidence")
-    if len(starts) > 1 or any(
-        r["state"] in {"ACTIVE", "COMMITTED", "ACCOUNTED"}
-        and not (
-            pending_shutdown
-            and shutdown["all_owned_groups_ended"]
-            and r["kind"] == "migration"
+    maximum = final.get("maximum_migrations", 1)
+    if (
+        (maximum and len(starts) > maximum)
+        or len({r["migration_id"] for r in starts}) != len(starts)
+        or any(
+            r["state"] in {"ACTIVE", "COMMITTED", "ACCOUNTED"}
+            and not (
+                pending_shutdown
+                and shutdown["all_owned_groups_ended"]
+                and r["kind"] == "migration"
+            )
+            for r in final["reservations"]
         )
-        for r in final["reservations"]
     ):
         raise RuntimeError("duplicate START or outstanding reservation")
     decisions = [r for r in rows if r.get("kind") == "pressure_decision"]
@@ -386,12 +407,18 @@ def run_scene(
             )
 
     plan["run_dir"].mkdir(parents=True, exist_ok=False)
+    mechanism_dir = plan["run_dir"]
+    multiple = "--maximum-migrations" in plan["controller_argv"]
+    if multiple:
+        from tools.bridge_tp.pressure_sessions import initialize
+
+        mechanism_dir = initialize(plan["run_dir"])
     common.write_json(plan["config_path"], plan["config"])
     RuntimeControl(
         armed=False,
         migration_id=scene["name"],
         source_request_id_prefix="pressure-unselected-" + secrets.token_hex(16),
-    ).write(plan["run_dir"])
+    ).write(mechanism_dir)
     common.write_json(
         root / "effective_argv.json",
         {k: v for k, v in plan.items() if k.endswith("_argv")},
@@ -515,6 +542,10 @@ def run_scene(
                             "active_generated", status.get("visible_tokens", 0)
                         ),
                         migration=status.get("migration", "none"),
+                        migrated=(
+                            f"{status.get('migrations_released', 0)}/"
+                            f"{status.get('migrations_started', 0)}"
+                        ),
                     )
                     if status.get("queue_reasons"):
                         announce(
@@ -570,6 +601,14 @@ def run_scene(
             raise RuntimeError(
                 "owned server groups did not terminate; commitments unresolved"
             )
+        if multiple:
+            active = plan["run_dir"] / "migration_active"
+            if active.is_symlink():
+                common.write_json(
+                    plan["run_dir"] / "migration_active_final.json",
+                    dict(target=str(active.resolve()), owned_groups_ended=True),
+                )
+                active.unlink()
         if monitor:
             from tools.bridge_tp.monitor_pressure_host import validate_journal
             from tools.bridge_tp.pressure_cpu import load
@@ -647,6 +686,7 @@ def main():
             "unittest",
             "tests.bridge_tp.test_rolling_cutover",
             "tests.bridge_tp.test_pressure_session",
+            "tests.bridge_tp.test_pressure_sessions",
             "tests.bridge_tp.test_pressure_bootstrap",
             "tests.bridge_tp.test_pressure_observation",
             "tests.bridge_tp.test_delta_batching",

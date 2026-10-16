@@ -61,8 +61,8 @@ handled explicitly. Diagnostic Nd32 never becomes a spare capacity reference.
 lookahead. Defaults in existing modes remain unchanged.
 
 - Source eta below 0.90, target eta at least 0.90 and target reference_load at
-  most 0.80 must persist for 10s, normally requiring two closed windows.
-- These 0.90/0.80/10s settings are explicit engineering choices, not fitted
+  most 0.80 must persist for 3s after valid closed-window evidence becomes available.
+- These 0.90/0.80/3s settings are explicit engineering choices, not fitted
   optimal thresholds. Unknown health never establishes target spare status.
 - Closed-window persistence tolerates polling jitter up to the existing2s
   freshness limit; a longer gap resets it. Legacy modes retain their0.5s limit.

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Experimental single-session pressure pilot with multiple existing source streams.
+"""Pressure pilot with optional serialized persistent-channel migrations.
 
 The workload generator knows arrivals; the policy receives only due admissions,
 published inventory, current stream windows and per-request frozen PMFs. Run
@@ -69,8 +69,16 @@ def parse_args(argv=None):
     parser.add_argument("--tick-s", type=float, default=0.2)
     parser.add_argument("--no-progress-s", type=float, default=60)
     parser.add_argument("--no-migration", action="store_true")
+    parser.add_argument(
+        "--maximum-migrations",
+        type=int,
+        default=1,
+        help="0 permits repeated serialized migrations",
+    )
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
+    if args.maximum_migrations < 0:
+        parser.error("maximum migrations must be nonnegative")
     if min(args.source_context_limit, args.target_context_limit) <= 0:
         parser.error("positive configured context limits required")
     if any(
@@ -88,13 +96,15 @@ def parse_args(argv=None):
 
 def preflight(args):
     cfg = p.PressureConfig(**read(args.policy_config))
+    if args.maximum_migrations != 1 and not cfg.health_service:
+        raise ValueError("repeated migrations require the health policy")
     if cfg.health_service:
         if args.health_reference is None:
             raise ValueError("health service mode requires a frozen V2 reference")
         load("pressure_health").HealthTracker(read(args.health_reference), 0, None)
-        if cfg.sustain_s < 10 or not cfg.capacity_lookahead_s:
+        if cfg.sustain_s < 3 or not cfg.capacity_lookahead_s:
             raise ValueError(
-                "health mode requires 10s persistence and independent KV lookahead"
+                "health mode requires >=3s persistence and independent KV lookahead"
             )
     raw = read(args.controller_config)
     # Reuse only mechanism geometry/transport rates. The legacy config loader
@@ -172,7 +182,7 @@ def preflight(args):
             str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths
         },
         jobs=len(jobs),
-        maximum_migrations=1,
+        maximum_migrations=args.maximum_migrations,
         migration_execution_enabled=not args.no_migration,
         mode="CPU_PREFLIGHT",
         service_estimator=(
@@ -286,7 +296,7 @@ def run(args, prepared):
 
 
 def _run(args, prepared):
-    from tools.bridge_tp.pressure_session import RollingPressureSession
+    from tools.bridge_tp.pressure_sessions import PressureSessions
     from vllm.bridge_tp.async_journal import AsyncJournal
 
     cfg, controller, lookup, jobs, receipt = prepared
@@ -336,7 +346,8 @@ def _run(args, prepared):
         controller.target_url,
         reconcile_log_interval_s=1.0 if cfg.health_service else 0,
     )
-    session = RollingPressureSession(
+    session = PressureSessions(
+        maximum_migrations=args.maximum_migrations,
         run_dir=args.run_dir,
         migration_id=args.migration_id,
         config=controller,
@@ -434,9 +445,7 @@ def _run(args, prepared):
                     stage="waiting_inventory",
                     elapsed_s=elapsed,
                     submitted=len(dispatched),
-                    completed=completed_streams(
-                        dispatched, session.stream, session.target_future
-                    ),
+                    completed=completed_streams(dispatched, session),
                     total=len(jobs),
                     visible_tokens=sum(
                         v.recorder.progress()[0] for v in dispatched.values()
@@ -610,7 +619,7 @@ def _run(args, prepared):
                         cost,
                         release_budget,
                         finished=stream.future.done() if stream is not None else False,
-                        action_available=stream is not None,
+                        action_available=stream is not None and session.ready_for_start,
                         inventory_reference=f"{args.source_inventory}:{inventories[0]['generation']}",
                         migrating=bool(
                             session.record
@@ -656,7 +665,7 @@ def _run(args, prepared):
             )
             runtime = load("manager_m0").RuntimeSnapshot(
                 unix_s=now,
-                migration_id=args.migration_id,
+                migration_id=session.migration_id,
                 request_id=None,
                 state="LOCAL",
                 generated_tokens=None,
@@ -675,11 +684,11 @@ def _run(args, prepared):
             )
             actions = (
                 None
-                if args.no_migration or session.record is not None or not source_rates
+                if args.no_migration or not session.ready_for_start or not source_rates
                 else {
                     c.request_id: r.BoundAction(
                         c.request_id,
-                        args.migration_id,
+                        session.migration_id,
                         lambda c=c, runtime=runtime: session.start(c, runtime),
                     )
                     for c in candidates
@@ -690,7 +699,7 @@ def _run(args, prepared):
             )
             if session.record is not None and not session.settled:
                 progress = session.old.read_source_progress(
-                    args.run_dir, session.stream.payload, now
+                    session.run_dir, session.stream.payload, now
                 )
                 if (
                     progress is not None
@@ -705,12 +714,18 @@ def _run(args, prepared):
                     session.cancel(
                         "source ended before selected progress was published"
                     )
-            if session.target_future is not None and session.target_future.done():
-                session.target_future.result()
-                service.finish(session.stream.recorder.target_service_id)
-            if session.record is not None:
-                entry = co.ledger.entries[args.migration_id]
-                prefix = f"cmpl-bridgetp-phase9-target-{args.run_dir.name}-0-"
+            for previous_session in session.sessions:
+                if previous_session.target_future is not None and (
+                    previous_session.target_future.done()
+                ):
+                    previous_session.target_future.result()
+                    service.finish(previous_session.stream.recorder.target_service_id)
+                if previous_session.record is None:
+                    continue
+                entry = co.ledger.entries[previous_session.migration_id]
+                prefix = (
+                    f"cmpl-bridgetp-phase9-target-{previous_session.run_dir.name}-0-"
+                )
                 targets = [
                     row
                     for row in inventories[1]["requests"]
@@ -733,15 +748,17 @@ def _run(args, prepared):
                     )
                 if (
                     not targets
-                    and session.settled
-                    and session.target_future is not None
-                    and session.target_future.done()
-                    and not session.target_future.exception()
+                    and previous_session.settled
+                    and previous_session.target_future is not None
+                    and previous_session.target_future.done()
+                    and not previous_session.target_future.exception()
                     and pools[1].sampled_at
-                    > session.target_future.result()["completed_unix_s"]
+                    > previous_session.target_future.result()["completed_unix_s"]
                     and entry.state in {"COMMITTED", "ACCOUNTED"}
                 ):
                     co.ledger.complete(entry.key, evidence=True)
+            if session.rotate():
+                last_view = None
             for value in dispatched.values():
                 if value.future.done():
                     value.future.result()
@@ -750,9 +767,7 @@ def _run(args, prepared):
                 for job in jobs
                 if elapsed >= job["at_s"] and job["id"] not in dispatched
             ]
-            completed = completed_streams(
-                dispatched, session.stream, session.target_future
-            )
+            completed = completed_streams(dispatched, session)
             last_inventory_progress = inventory_progress(inventories)
             marker = workload_progress(
                 dispatched,
@@ -779,6 +794,15 @@ def _run(args, prepared):
                     target_missing=pressures[1].missing,
                     active_generated=sum(row[2] for row in marker[2]),
                     migration=marker[3],
+                    migrations_started=sum(
+                        s.record is not None for s in session.sessions
+                    ),
+                    migrations_released=sum(
+                        s.settled
+                        and co.ledger.entries[s.migration_id].state
+                        in {"COMMITTED", "ACCOUNTED", "COMPLETED"}
+                        for s in session.sessions
+                    ),
                     engine_waiting={pool.pool_id: pool.waiting for pool in pools},
                     unobserved_ingress={
                         pool.pool_id: co.ledger.unobserved_ingress(pool.pool_id)
@@ -840,15 +864,19 @@ def _run(args, prepared):
                     )
                     for row in co.ledger.entries.values()
                 )
-                and (
-                    session.record is None
+                and all(
+                    previous_session.record is None
                     or (
-                        (session.settled or session.cleanup_requires_shutdown)
+                        (
+                            previous_session.settled
+                            or previous_session.cleanup_requires_shutdown
+                        )
                         and (
-                            session.target_future is None
-                            or session.target_future.done()
+                            previous_session.target_future is None
+                            or previous_session.target_future.done()
                         )
                     )
+                    for previous_session in session.sessions
                 )
             ):
                 outcome = (
@@ -870,9 +898,7 @@ def _run(args, prepared):
             stage=outcome,
             error=failure,
             submitted=len(dispatched),
-            completed=completed_streams(
-                dispatched, session.stream, session.target_future
-            ),
+            completed=completed_streams(dispatched, session),
             total=len(jobs),
             elapsed_s=round(time.monotonic() - started, 1),
         )
@@ -914,6 +940,16 @@ def _run(args, prepared):
                 dispatched=list(dispatched),
                 elapsed_s=time.monotonic() - started,
                 session_settled=session.settled,
+                maximum_migrations=args.maximum_migrations,
+                sessions=[
+                    dict(
+                        migration_id=s.migration_id,
+                        started=s.record is not None,
+                        settled=s.settled,
+                        run_dir=str(s.run_dir),
+                    )
+                    for s in session.sessions
+                ],
                 outcome=outcome,
                 error=failure,
                 shutdown_cleanup_required=session.cleanup_requires_shutdown,
@@ -921,13 +957,16 @@ def _run(args, prepared):
         )
         executor.shutdown(wait=False, cancel_futures=True)
         if all(v.future.done() for v in dispatched.values()) and (
-            session.target_future is None or session.target_future.done()
+            all(
+                s.target_future is None or s.target_future.done()
+                for s in session.sessions
+            )
         ):
             tokens.close()
         else:
             atexit.register(tokens.close)
         try:
-            session.adapter.close()
+            session.close()
         finally:
             try:
                 for sampler in background_metrics:

@@ -27,7 +27,7 @@ class HealthPolicyTests(unittest.TestCase):
             health_service=True,
             health_min_efficiency=0.9,
             health_target_load=0.8,
-            sustain_s=10,
+            sustain_s=3,
             capacity_lookahead_s=16.86410117149353,
         )
 
@@ -71,6 +71,50 @@ class HealthPolicyTests(unittest.TestCase):
         self.assertFalse(result.capacity_path)
         self.assertEqual(result.service_path, "health")
         self.assertEqual(result.source.zone, "SPARE")
+
+    def test_service_waits_three_seconds_and_restarts_confirmation_after_start(self):
+        policy = p.PressurePolicy(self.cfg(), p.ReservationLedger())
+
+        def decide(now):
+            return policy.decide(
+                now,
+                self.reading(now=now),
+                self.reading("tp4", now=now),
+                [
+                    candidate(
+                        sampled_at=now,
+                        published_at=now,
+                        target_health_after_supported=True,
+                    )
+                ],
+            )
+
+        for index in range(15):
+            self.assertEqual(decide(10 + index * 0.2).action, "STAY")
+        self.assertEqual(decide(13).action, "START_SHADOW")
+        policy.note_started(13)
+        for index in range(15):
+            self.assertEqual(decide(13.2 + index * 0.2).action, "STAY")
+        self.assertEqual(decide(16.3).action, "START_SHADOW")
+
+    def test_KV_warning_bypasses_confirmation_and_cooldown_but_not_channel(self):
+        ledger = p.ReservationLedger()
+        policy = p.PressurePolicy(self.cfg(), ledger)
+        policy.note_started(9.9)
+        source = self.reading(
+            free_blocks=250, growth_blocks_s=10, health_status="UNKNOWN"
+        )
+        target = self.reading("tp4", health_status="UNKNOWN", decode_ratio=0.9)
+        request = candidate(estimated_release_s=self.cfg().capacity_lookahead_s)
+        result = policy.decide(10, source, target, [request])
+        self.assertEqual(result.action, "START_SHADOW")
+        self.assertTrue(result.capacity_path)
+        ledger.reserve(
+            p.Reservation("busy", "another", "tp4", 10, 0.1, 0, "migration"), target
+        )
+        result = policy.decide(10.1, source, target, [request])
+        self.assertEqual(result.reason, "migration channel occupied")
+        self.assertEqual(result.action, "STAY")
 
     def test_closed_window_persistence_tolerates_subsecond_poll_jitter(self):
         policy = p.PressurePolicy(self.cfg(), p.ReservationLedger())
@@ -333,7 +377,7 @@ class HealthPreflightTests(unittest.TestCase):
             args.health_reference = BUNDLE / "health_reference_v2.json"
             policy["sustain_s"] = 1
             (root / "policy.json").write_text(json.dumps(policy))
-            with self.assertRaisesRegex(ValueError, "10s persistence"):
+            with self.assertRaisesRegex(ValueError, ">=3s persistence"):
                 worker.preflight(args)
 
 

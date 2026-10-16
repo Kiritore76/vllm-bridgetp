@@ -1,46 +1,63 @@
-# Health policy sustained paired pilot
+# Health policy repeated migration matrix
 
-Cloud: `bash tools/bridge_tp/run_pressure_pilot.sh --health-sustained`.
-This reuses the existing wrapper, tracked token prompts and single evidence
-archive. Old `--sustained` remains the historical KV-only workload; this entry
-explicitly uses health_service_policy.json and the updated health_reference_v2.
+Run the existing tracked wrapper:
+`bash tools/bridge_tp/run_pressure_pilot.sh --health-sustained`.
+This replaces the previous four-run health sustained plan. Historical KV-only
+`--sustained` and single-move `--health-screen` entries remain separate.
 
-Four fresh runs: repetition1 STAY then migrate; repetition2 migrate then STAY.
-Each repetition uses identical prompt tokens, seed20261015 and arrival pattern.
-151 requests per run / 53388 full-output tokens. Keep one migration maximum,
-0.90 efficiency,0.80 target load,10s persistence,125-block guard and the measured
-16.86410117149353s KV lookahead. No forced START and no new ingress reservation.
-Background metrics, async observation logging and host/timing diagnostics stay
-enabled in both arms.
+Use efficiency0.90, target load0.80 and **3s persistence**, retaining the closed
+10s causal health window,125-block guard and measured16.86410117149353s
+START-to-source-release lookahead. These remain engineering choices rather
+than fitted optimal thresholds. No future-output ingress reservation gate.
+Keep the existing bucket remaining-length predictor.
 
-The opening service-pressure phase matches the validated spare-target screen:
-source3 requests prompt2048/output4096 at5,5.02,5.04s; target1 request
-prompt2048/output6144 at0s. Continue the workload with:
+Ten fresh runs (five STAY/migrate pairs):
 
-- TP4 prompt2048/output6144 at90,180,270s.
-- TP1 prompt2048/output4096 at110,165,220,275s.
-- TP1 competition prompt2048/output1 every2s from20 through298s (140 requests).
+| Scenario | Runs | Expected observation |
+| --- | --- | --- |
+| Sustained service pressure, repetitions1/2 | 4 | At least two service migrations if measured eligibility persists |
+| Both lightly loaded | 2 | No migration |
+| Source pressure, busy target | 2 | Busy-target gate; no service migration |
+| Two source KV-pressure waves | 2 | At least two KV migrations if physical/cost gates permit |
 
-This is a measured trial workload, not a fitted optimal arrival rate. Initial
-post-warmup headroom check is unchanged: source1405 blocks, target1021 blocks.
-Later requests enter vLLM normally and may queue or preempt; no claim is made
-that every future full stop cap fits simultaneously. Exact unsupported
-Nd/context shapes remain UNKNOWN; all such intervals remain in evidence.
+STAY precedes migrate in repetition1; repetition2 reverses order. Each pair
+shares exact prompt token lists, greedy sampling, seed20261015 and arrivals.
+Sustained cases retain151 requests/53388 output tokens per run: target
+2048/6144 at0/90/180/270s; source3 requests2048/4096 at5/5.02/5.04s, four more
+at110/165/220/275s, plus source2048/1 every2s from20 through298s. Busy retains
+24 target requests,3 source requests and30 prefill competitors. Light has one
+target2048/6144 and one source2048/4096. KV has one target2048/6144 plus two
+waves of five source4096/3072 at5s and170s (0.02s within each wave).
 
-Score the first300s using existing full-request ITL100ms/slow1%/maxgap1s weight.
-Fully drain all requests; drain gaps affect quality but drain tokens stay out
-of the300s numerator. TTFT has no new penalty. Require actual arrival lag<=0.5s,
-in-flight coverage>=95% and output in all30 ten-second bins in both arms for
-a usable paired measurement. Intended coverage is never treated as measured
-coverage. Inspect actual START path, remaining life, commit/source release,
-pool-level goodoutput, queue/preemption/native shape evidence and diagnostics.
+Maximum migrations0 means no per-run count limit. Transfers are serialized:
+require source KV release and stream termination, native target decode,
+finalized boundary, clean stager completion, source channel IDLE and all four target
+channels IDLE before switching the active session. The old target response
+may keep decoding during the next transfer. Each transfer has an immutable
+directory and unique identity. Old target futures, capacity commitments,
+ownership and completion remain independently tracked. A new service transfer
+rechecks current health and requires a fresh3s hold. KV relief bypasses hold
+and cooldown, never physical, target service or channel safety. It does not
+interrupt an in-flight transfer. Uncertain/cancelled sessions block reuse.
 
-The workload tests the benefit of the current single-session policy under
-continued arrivals. It does not validate multishot migration or automatic
-ingress routing, and two pairs do not establish a universal optimal threshold.
-Missing migrations/coverage are reported, never discarded or retried by seed.
+Keep one reusable receive buffer per target rank across sessions instead of
+releasing it when an older request completes: an old completion must not touch
+a newer buffer or receipt directory. Buffer size follows the largest received
+request, not the sum of migrated requests, and owned worker shutdown frees it.
+Inspect GPU memory across sessions. Target prefill/scheduling budget is unchanged.
 
-Allow roughly35–45 minutes for four server startups,300s windows and full drain;
-the existing900s per-run timeout remains. Progress and packing use the existing
-entry. Return `pressure-balanced-git-v2-health-sustained-*.tar.gz` from
-`/root/autodl-tmp/bridgetp/results`.
+Score the first300s with full-request ITL100ms/slow1%/maxgap1s. Drain gaps affect
+quality; drain tokens stay out of the numerator. Retain TTFT, raw throughput,
+preemption, release, handoff and host/timing evidence. Sustained comparisons
+require arrival lag<=0.5s, active coverage>=95% and output in all30 ten-second
+bins in both arms. Other cases primarily test function/safety. Missing repeated
+START is COVERAGE_GAP; never force migration, cherry-pick seeds or hide invalid
+arms. No automatic ingress routing or universal optimum claim.
+
+Progress shows scene number, submitted/completed requests, phase and
+released/started migrations. Allow roughly70–100 minutes including ten server
+startups and full drain; each run still has a900s deadline. Existing wrapper
+preserves dirty work and stops, cleans only owned groups, removes only the
+runtime active symlink after groups end, and packs all real session directories
+once in `pressure-balanced-git-v2-health-sustained-*.tar.gz`. CPU checks do not
+establish GPU acceptance; return that archive for analysis.

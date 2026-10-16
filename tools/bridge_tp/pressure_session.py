@@ -3,8 +3,8 @@
 
 No benefit policy is called. M2, rolling reservation, target construction and
 four-rank direct takeover are reused from the validated single-session runner.
-This driver requires a fresh mechanism directory per pilot process; it refuses
-to rotate/reuse old session artifacts or restart an uncertain session.
+Each driver requires a fresh mechanism directory. PressureSessions coordinates
+sequential drivers without reusing artifacts or restarting uncertain sessions.
 """
 
 from __future__ import annotations
@@ -76,7 +76,7 @@ class RollingPressureSession:
         RuntimeControl = self.old.RuntimeControl
 
         if self.record is not None:
-            raise ValueError("one session per function-pilot process")
+            raise ValueError("one session per migration driver")
         stream = self.ingress.for_server_id(candidate.request_id)
         cap = stream.payload["max_tokens"]
         if candidate.max_output_tokens != cap or cap > 8192:
@@ -243,6 +243,8 @@ class RollingPressureSession:
         self.audit.write(
             {
                 "kind": "pressure_source_release_confirmed",
+                "migration_id": self.migration_id,
+                "request_id": self.record.request_id,
                 "receipt": release,
                 "actual_released_blocks": None,
                 "count_evidence": "free-return proven; released block count unknown",
