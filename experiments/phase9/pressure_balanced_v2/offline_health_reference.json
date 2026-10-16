@@ -1,0 +1,1664 @@
+{
+  "schema": "PRESSURE_HEALTH_REFERENCE_V1",
+  "deployment_ready": false,
+  "context_bin_tokens": 2048,
+  "window_s": 10,
+  "itl_s": 0.1,
+  "slow_fraction": 0.01,
+  "curve": "closed-window ITL discounted output, per-run then cross-run median",
+  "no_interpolation_or_extrapolation": true,
+  "no_admission_reservation": true,
+  "unknown_health_never_suppresses_KV_warning": true,
+  "upper_capacity_boundaries": "UNKNOWN; working points are not maximum batch",
+  "provenance": {
+    "sources": [
+      {
+        "archive": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar.gz",
+        "sha256": "d1b884e015fc30ed60f8cd8e0d80661a2610ff0030679b8332cad5b618680f55",
+        "runs": 10,
+        "pool_traces_verified": 20,
+        "full_streams": 152
+      },
+      {
+        "archive": "pressure-balanced-git-v2-pressure-screen-20261015T140040Z-213461.tar.gz",
+        "sha256": "932586f9040a28307b7a52b6f2a79cf2d7fa62c7b64c31e3e1217cf9e1cdc0ff",
+        "runs": 4,
+        "pool_traces_verified": 8,
+        "full_streams": 42
+      },
+      {
+        "archive": "pressure-balanced-git-v2-comparison-20261015T144833Z-222610.tar.gz",
+        "sha256": "a6129280cc47a98c94d28cacc34bee4736bdb96f7172aa76efc8eb9fbed9e93e",
+        "runs": 8,
+        "pool_traces_verified": 16,
+        "full_streams": 84
+      },
+      {
+        "archive": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar.gz",
+        "sha256": "58de0b647a503a3eea9a8c915d87512bfcfb98a8e685715b1fac2a990e3dd637",
+        "runs": 9,
+        "pool_traces_verified": 18,
+        "full_streams": 328
+      },
+      {
+        "archive": "pressure-balanced-git-v2-efficient-region-last-20261015T234804Z-1591.tar.gz",
+        "sha256": "979b46cfcf3f7d8af5c2c1c35294a9291ffe5411b03c0533cf4473fef275c5d0",
+        "runs": 1,
+        "pool_traces_verified": 2,
+        "full_streams": 32
+      }
+    ],
+    "input_sha256": {
+      "cells": "9f8e58fd26c518754aaba6ca5eaad7873628f621f0d58e4bb71940b5048a9f0e",
+      "windows": "44b5012b98500b5f9ee9fb99e1e3151168c745b8ccd42d852e3789fd43eca788",
+      "service_evidence": "101b6cd005bf9d031bf3ca71df61628c078baeff4decf56e4488f02b943f40fd"
+    },
+    "diagnostic_shapes": [
+      [
+        "target",
+        32,
+        2
+      ],
+      [
+        "target",
+        32,
+        3
+      ]
+    ]
+  },
+  "cells": [
+    {
+      "pool": "source",
+      "nd": 1,
+      "context_bin": 1,
+      "context_tokens": [
+        2048,
+        4095
+      ],
+      "runs": 2,
+      "seconds": 80,
+      "window_goodoutput": {
+        "n": 2,
+        "median": 38.575,
+        "min": 38.5,
+        "max": 38.650000000000006
+      },
+      "raw_output": {
+        "n": 2,
+        "median": 38.575,
+        "min": 38.5,
+        "max": 38.650000000000006
+      },
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point; not a capacity ceiling",
+      "windows": 8,
+      "quality_below95_windows": 0,
+      "minimum_window_goodoutput_s": 38.4,
+      "run_points": [
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/output-long-r1",
+          "windows": 4,
+          "seconds": 40,
+          "good": 38.5,
+          "raw": 38.5,
+          "causal_good": 38.5,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/output-long-r2",
+          "windows": 4,
+          "seconds": 40,
+          "good": 38.650000000000006,
+          "raw": 38.650000000000006,
+          "causal_good": 38.650000000000006,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        }
+      ]
+    },
+    {
+      "pool": "source",
+      "nd": 3,
+      "context_bin": 1,
+      "context_tokens": [
+        2048,
+        4095
+      ],
+      "runs": 10,
+      "seconds": 300,
+      "window_goodoutput": {
+        "n": 10,
+        "median": 109.94999999999999,
+        "min": 104.1,
+        "max": 110.55
+      },
+      "raw_output": {
+        "n": 10,
+        "median": 109.94999999999999,
+        "min": 104.1,
+        "max": 110.55
+      },
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point; not a capacity ceiling",
+      "windows": 30,
+      "quality_below95_windows": 1,
+      "minimum_window_goodoutput_s": 60.8634,
+      "run_points": [
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/mixed-prefill-r1",
+          "windows": 1,
+          "seconds": 10,
+          "good": 108.9,
+          "raw": 108.9,
+          "causal_good": 108.9,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/mixed-prefill-r2",
+          "windows": 1,
+          "seconds": 10,
+          "good": 108.9,
+          "raw": 108.9,
+          "causal_good": 108.9,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-pressure-screen-20261015T140040Z-213461.tar/source-prefill-pulse-r1",
+          "windows": 4,
+          "seconds": 40,
+          "good": 110.55,
+          "raw": 110.55,
+          "causal_good": 110.55,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-pressure-screen-20261015T140040Z-213461.tar/source-prefill-pulse-r2",
+          "windows": 4,
+          "seconds": 40,
+          "good": 110.55,
+          "raw": 110.55,
+          "causal_good": 110.55,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-pressure-screen-20261015T140040Z-213461.tar/source-prefill-train-r1",
+          "windows": 3,
+          "seconds": 30,
+          "good": 61.3381754385965,
+          "raw": 109.8,
+          "causal_good": 109.8,
+          "causal_retention": 1.0,
+          "retention": 0.558635477582846,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-pressure-screen-20261015T140040Z-213461.tar/source-prefill-train-r2",
+          "windows": 3,
+          "seconds": 30,
+          "good": 61.50576608187134,
+          "raw": 110.1,
+          "causal_good": 110.1,
+          "causal_retention": 1.0,
+          "retention": 0.558635477582846,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-comparison-20261015T144833Z-222610.tar/source-prefill-pulse-r1-stay",
+          "windows": 4,
+          "seconds": 40,
+          "good": 110.25,
+          "raw": 110.25,
+          "causal_good": 110.25,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-comparison-20261015T144833Z-222610.tar/source-prefill-pulse-r2-stay",
+          "windows": 4,
+          "seconds": 40,
+          "good": 110.25,
+          "raw": 110.25,
+          "causal_good": 110.25,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-comparison-20261015T144833Z-222610.tar/source-prefill-train-r1-stay",
+          "windows": 3,
+          "seconds": 30,
+          "good": 61.3381754385965,
+          "raw": 109.8,
+          "causal_good": 109.8,
+          "causal_retention": 1.0,
+          "retention": 0.558635477582846,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-comparison-20261015T144833Z-222610.tar/source-prefill-train-r2-stay",
+          "windows": 3,
+          "seconds": 30,
+          "good": 51.601148709585935,
+          "raw": 104.1,
+          "causal_good": 104.1,
+          "causal_retention": 1.0,
+          "retention": 0.49568826810361133,
+          "duty": 0.0
+        }
+      ]
+    },
+    {
+      "pool": "source",
+      "nd": 6,
+      "context_bin": 1,
+      "context_tokens": [
+        2048,
+        4095
+      ],
+      "runs": 2,
+      "seconds": 100,
+      "window_goodoutput": {
+        "n": 2,
+        "median": 204.3,
+        "min": 203.4,
+        "max": 205.2
+      },
+      "raw_output": {
+        "n": 2,
+        "median": 204.3,
+        "min": 203.4,
+        "max": 205.2
+      },
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point; not a capacity ceiling",
+      "windows": 10,
+      "quality_below95_windows": 0,
+      "minimum_window_goodoutput_s": 199.2,
+      "run_points": [
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/decode-high-2k-r1",
+          "windows": 5,
+          "seconds": 50,
+          "good": 204.37550442427707,
+          "raw": 205.2,
+          "causal_good": 205.2,
+          "causal_retention": 1.0,
+          "retention": 0.9959819903717206,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/decode-high-2k-r2",
+          "windows": 5,
+          "seconds": 50,
+          "good": 202.75495035315106,
+          "raw": 203.4,
+          "causal_good": 203.4,
+          "causal_retention": 1.0,
+          "retention": 0.9968286644697691,
+          "duty": 0.0
+        }
+      ]
+    },
+    {
+      "pool": "source",
+      "nd": 8,
+      "context_bin": 1,
+      "context_tokens": [
+        2048,
+        4095
+      ],
+      "runs": 2,
+      "seconds": 40,
+      "window_goodoutput": {
+        "n": 2,
+        "median": 268.35,
+        "min": 264.8,
+        "max": 271.9
+      },
+      "raw_output": {
+        "n": 2,
+        "median": 268.35,
+        "min": 264.8,
+        "max": 271.9
+      },
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point; not a capacity ceiling",
+      "windows": 4,
+      "quality_below95_windows": 0,
+      "minimum_window_goodoutput_s": 264.8,
+      "run_points": [
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar/region-short-n8-n24-r1",
+          "windows": 2,
+          "seconds": 20,
+          "good": 241.9075467374434,
+          "raw": 264.8,
+          "causal_good": 264.8,
+          "causal_retention": 1.0,
+          "retention": 0.9135481372259947,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-last-20261015T234804Z-1591.tar/region-short-n8-n24-r2",
+          "windows": 2,
+          "seconds": 20,
+          "good": 248.44219311575313,
+          "raw": 271.9,
+          "causal_good": 271.9,
+          "causal_retention": 1.0,
+          "retention": 0.9137262138890843,
+          "duty": 0.0
+        }
+      ]
+    },
+    {
+      "pool": "source",
+      "nd": 1,
+      "context_bin": 2,
+      "context_tokens": [
+        4096,
+        6143
+      ],
+      "runs": 2,
+      "seconds": 80,
+      "window_goodoutput": {
+        "n": 2,
+        "median": 38.35,
+        "min": 38.25,
+        "max": 38.45
+      },
+      "raw_output": {
+        "n": 2,
+        "median": 38.35,
+        "min": 38.25,
+        "max": 38.45
+      },
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point; not a capacity ceiling",
+      "windows": 8,
+      "quality_below95_windows": 0,
+      "minimum_window_goodoutput_s": 36.6,
+      "run_points": [
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/output-long-r1",
+          "windows": 4,
+          "seconds": 40,
+          "good": 38.25,
+          "raw": 38.25,
+          "causal_good": 38.25,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/output-long-r2",
+          "windows": 4,
+          "seconds": 40,
+          "good": 38.45,
+          "raw": 38.45,
+          "causal_good": 38.45,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        }
+      ]
+    },
+    {
+      "pool": "source",
+      "nd": 3,
+      "context_bin": 2,
+      "context_tokens": [
+        4096,
+        6143
+      ],
+      "runs": 6,
+      "seconds": 310,
+      "window_goodoutput": {
+        "n": 6,
+        "median": 106.0,
+        "min": 105.0,
+        "max": 106.9
+      },
+      "raw_output": {
+        "n": 6,
+        "median": 106.0,
+        "min": 105.0,
+        "max": 106.9
+      },
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point; not a capacity ceiling",
+      "windows": 31,
+      "quality_below95_windows": 0,
+      "minimum_window_goodoutput_s": 96.9,
+      "run_points": [
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/mixed-prefill-r1",
+          "windows": 5,
+          "seconds": 50,
+          "good": 106.9,
+          "raw": 106.9,
+          "causal_good": 106.9,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/mixed-prefill-r2",
+          "windows": 6,
+          "seconds": 60,
+          "good": 105.9,
+          "raw": 105.9,
+          "causal_good": 105.9,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar/region-prefill-coarse-r1",
+          "windows": 5,
+          "seconds": 50,
+          "good": 106.5,
+          "raw": 106.5,
+          "causal_good": 106.5,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar/region-prefill-coarse-r2",
+          "windows": 5,
+          "seconds": 50,
+          "good": 105.6,
+          "raw": 105.6,
+          "causal_good": 105.6,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar/region-prefill-frequent-r1",
+          "windows": 5,
+          "seconds": 50,
+          "good": 106.1,
+          "raw": 106.1,
+          "causal_good": 106.1,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar/region-prefill-frequent-r2",
+          "windows": 5,
+          "seconds": 50,
+          "good": 105.0,
+          "raw": 105.0,
+          "causal_good": 105.0,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        }
+      ]
+    },
+    {
+      "pool": "source",
+      "nd": 4,
+      "context_bin": 2,
+      "context_tokens": [
+        4096,
+        6143
+      ],
+      "runs": 2,
+      "seconds": 100,
+      "window_goodoutput": {
+        "n": 2,
+        "median": 138.2,
+        "min": 137.2,
+        "max": 139.2
+      },
+      "raw_output": {
+        "n": 2,
+        "median": 138.2,
+        "min": 137.2,
+        "max": 139.2
+      },
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point; not a capacity ceiling",
+      "windows": 10,
+      "quality_below95_windows": 0,
+      "minimum_window_goodoutput_s": 130.8,
+      "run_points": [
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar/region-mid-n4-n24-r1",
+          "windows": 5,
+          "seconds": 50,
+          "good": 139.1446297668126,
+          "raw": 139.2,
+          "causal_good": 139.2,
+          "causal_retention": 1.0,
+          "retention": 0.9996022253362976,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar/region-mid-n4-n24-r2",
+          "windows": 5,
+          "seconds": 50,
+          "good": 137.13798713442293,
+          "raw": 137.2,
+          "causal_good": 137.2,
+          "causal_retention": 1.0,
+          "retention": 0.9995480111838405,
+          "duty": 0.0
+        }
+      ]
+    },
+    {
+      "pool": "source",
+      "nd": 6,
+      "context_bin": 2,
+      "context_tokens": [
+        4096,
+        6143
+      ],
+      "runs": 2,
+      "seconds": 40,
+      "window_goodoutput": {
+        "n": 2,
+        "median": 193.775,
+        "min": 192.9,
+        "max": 194.65
+      },
+      "raw_output": {
+        "n": 2,
+        "median": 193.775,
+        "min": 192.9,
+        "max": 194.65
+      },
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point; not a capacity ceiling",
+      "windows": 4,
+      "quality_below95_windows": 0,
+      "minimum_window_goodoutput_s": 190.8,
+      "run_points": [
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar/region-mid-n6-n32-r1",
+          "windows": 2,
+          "seconds": 20,
+          "good": 175.29454413399597,
+          "raw": 192.9,
+          "causal_good": 192.9,
+          "causal_retention": 1.0,
+          "retention": 0.9087327326801242,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar/region-mid-n6-n32-r2",
+          "windows": 2,
+          "seconds": 20,
+          "good": 174.66164515010774,
+          "raw": 194.65,
+          "causal_good": 194.65,
+          "causal_retention": 1.0,
+          "retention": 0.8973114177652435,
+          "duty": 0.0
+        }
+      ]
+    },
+    {
+      "pool": "source",
+      "nd": 1,
+      "context_bin": 3,
+      "context_tokens": [
+        6144,
+        8191
+      ],
+      "runs": 2,
+      "seconds": 100,
+      "window_goodoutput": {
+        "n": 2,
+        "median": 37.9,
+        "min": 37.8,
+        "max": 38.0
+      },
+      "raw_output": {
+        "n": 2,
+        "median": 37.9,
+        "min": 37.8,
+        "max": 38.0
+      },
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point; not a capacity ceiling",
+      "windows": 10,
+      "quality_below95_windows": 0,
+      "minimum_window_goodoutput_s": 32.9,
+      "run_points": [
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/output-long-r1",
+          "windows": 5,
+          "seconds": 50,
+          "good": 37.8,
+          "raw": 37.8,
+          "causal_good": 37.8,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/output-long-r2",
+          "windows": 5,
+          "seconds": 50,
+          "good": 38.0,
+          "raw": 38.0,
+          "causal_good": 38.0,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        }
+      ]
+    },
+    {
+      "pool": "source",
+      "nd": 3,
+      "context_bin": 3,
+      "context_tokens": [
+        6144,
+        8191
+      ],
+      "runs": 4,
+      "seconds": 210,
+      "window_goodoutput": {
+        "n": 4,
+        "median": 102.65,
+        "min": 102.3,
+        "max": 103.2
+      },
+      "raw_output": {
+        "n": 4,
+        "median": 102.65,
+        "min": 102.3,
+        "max": 103.2
+      },
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point; not a capacity ceiling",
+      "windows": 21,
+      "quality_below95_windows": 1,
+      "minimum_window_goodoutput_s": 48.0615,
+      "run_points": [
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/decode-high-6k-r1",
+          "windows": 5,
+          "seconds": 50,
+          "good": 103.2,
+          "raw": 103.2,
+          "causal_good": 103.2,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/decode-high-6k-r2",
+          "windows": 5,
+          "seconds": 50,
+          "good": 102.3,
+          "raw": 102.3,
+          "causal_good": 102.3,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/mixed-prefill-r1",
+          "windows": 5,
+          "seconds": 50,
+          "good": 102.9,
+          "raw": 102.9,
+          "causal_good": 102.9,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/mixed-prefill-r2",
+          "windows": 6,
+          "seconds": 60,
+          "good": 102.4,
+          "raw": 102.4,
+          "causal_good": 102.4,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        }
+      ]
+    },
+    {
+      "pool": "target",
+      "nd": 1,
+      "context_bin": 1,
+      "context_tokens": [
+        2048,
+        4095
+      ],
+      "runs": 10,
+      "seconds": 200,
+      "window_goodoutput": {
+        "n": 10,
+        "median": 70.525,
+        "min": 61.75,
+        "max": 70.85
+      },
+      "raw_output": {
+        "n": 10,
+        "median": 70.525,
+        "min": 61.75,
+        "max": 70.85
+      },
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point; not a capacity ceiling",
+      "windows": 20,
+      "quality_below95_windows": 0,
+      "minimum_window_goodoutput_s": 53.5,
+      "run_points": [
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/output-long-r1",
+          "windows": 2,
+          "seconds": 20,
+          "good": 70.75,
+          "raw": 70.75,
+          "causal_good": 70.75,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/output-long-r2",
+          "windows": 2,
+          "seconds": 20,
+          "good": 70.4,
+          "raw": 70.4,
+          "causal_good": 70.4,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-pressure-screen-20261015T140040Z-213461.tar/source-prefill-pulse-r1",
+          "windows": 2,
+          "seconds": 20,
+          "good": 70.4,
+          "raw": 70.4,
+          "causal_good": 70.4,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-pressure-screen-20261015T140040Z-213461.tar/source-prefill-pulse-r2",
+          "windows": 2,
+          "seconds": 20,
+          "good": 70.75,
+          "raw": 70.75,
+          "causal_good": 70.75,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-pressure-screen-20261015T140040Z-213461.tar/source-prefill-train-r1",
+          "windows": 2,
+          "seconds": 20,
+          "good": 70.7,
+          "raw": 70.7,
+          "causal_good": 70.7,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-pressure-screen-20261015T140040Z-213461.tar/source-prefill-train-r2",
+          "windows": 2,
+          "seconds": 20,
+          "good": 61.75,
+          "raw": 61.75,
+          "causal_good": 61.75,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-comparison-20261015T144833Z-222610.tar/source-prefill-pulse-r1-stay",
+          "windows": 2,
+          "seconds": 20,
+          "good": 70.85,
+          "raw": 70.85,
+          "causal_good": 70.85,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-comparison-20261015T144833Z-222610.tar/source-prefill-pulse-r2-stay",
+          "windows": 2,
+          "seconds": 20,
+          "good": 70.25,
+          "raw": 70.25,
+          "causal_good": 70.25,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-comparison-20261015T144833Z-222610.tar/source-prefill-train-r1-stay",
+          "windows": 2,
+          "seconds": 20,
+          "good": 70.65,
+          "raw": 70.65,
+          "causal_good": 70.65,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-comparison-20261015T144833Z-222610.tar/source-prefill-train-r2-stay",
+          "windows": 2,
+          "seconds": 20,
+          "good": 70.05000000000001,
+          "raw": 70.05000000000001,
+          "causal_good": 70.05000000000001,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        }
+      ]
+    },
+    {
+      "pool": "target",
+      "nd": 16,
+      "context_bin": 1,
+      "context_tokens": [
+        2048,
+        4095
+      ],
+      "runs": 2,
+      "seconds": 80,
+      "window_goodoutput": {
+        "n": 2,
+        "median": 606.0,
+        "min": 605.6,
+        "max": 606.4000000000001
+      },
+      "raw_output": {
+        "n": 2,
+        "median": 606.0,
+        "min": 605.6,
+        "max": 606.4000000000001
+      },
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point; not a capacity ceiling",
+      "windows": 8,
+      "quality_below95_windows": 0,
+      "minimum_window_goodoutput_s": 598.4,
+      "run_points": [
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/decode-high-2k-r1",
+          "windows": 4,
+          "seconds": 40,
+          "good": 211.5913022401628,
+          "raw": 606.4000000000001,
+          "causal_good": 606.4000000000001,
+          "causal_retention": 1.0,
+          "retention": 0.3489302477575244,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/decode-high-2k-r2",
+          "windows": 4,
+          "seconds": 40,
+          "good": 211.6319472774023,
+          "raw": 605.6,
+          "causal_good": 605.6,
+          "causal_retention": 1.0,
+          "retention": 0.3494583013167145,
+          "duty": 0.0
+        }
+      ]
+    },
+    {
+      "pool": "target",
+      "nd": 24,
+      "context_bin": 1,
+      "context_tokens": [
+        2048,
+        4095
+      ],
+      "runs": 2,
+      "seconds": 150,
+      "window_goodoutput": {
+        "n": 2,
+        "median": 613.5999999999999,
+        "min": 610.4,
+        "max": 616.8
+      },
+      "raw_output": {
+        "n": 2,
+        "median": 613.5999999999999,
+        "min": 610.4,
+        "max": 616.8
+      },
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point; not a capacity ceiling",
+      "windows": 15,
+      "quality_below95_windows": 1,
+      "minimum_window_goodoutput_s": 111.39199999999998,
+      "run_points": [
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar/region-short-n8-n24-r1",
+          "windows": 8,
+          "seconds": 80,
+          "good": 123.8153520409584,
+          "raw": 610.4,
+          "causal_good": 610.4,
+          "causal_retention": 1.0,
+          "retention": 0.2028950489362112,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-last-20261015T234804Z-1591.tar/region-short-n8-n24-r2",
+          "windows": 7,
+          "seconds": 70,
+          "good": 122.06378410727476,
+          "raw": 616.8,
+          "causal_good": 616.8,
+          "causal_retention": 1.0,
+          "retention": 0.1978984826641938,
+          "duty": 0.0
+        }
+      ]
+    },
+    {
+      "pool": "target",
+      "nd": 1,
+      "context_bin": 2,
+      "context_tokens": [
+        4096,
+        6143
+      ],
+      "runs": 10,
+      "seconds": 230,
+      "window_goodoutput": {
+        "n": 10,
+        "median": 70.325,
+        "min": 66.9,
+        "max": 71.05
+      },
+      "raw_output": {
+        "n": 10,
+        "median": 70.325,
+        "min": 66.9,
+        "max": 71.05
+      },
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point; not a capacity ceiling",
+      "windows": 23,
+      "quality_below95_windows": 0,
+      "minimum_window_goodoutput_s": 53.8,
+      "run_points": [
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/output-long-r1",
+          "windows": 3,
+          "seconds": 30,
+          "good": 70.3,
+          "raw": 70.3,
+          "causal_good": 70.3,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/output-long-r2",
+          "windows": 3,
+          "seconds": 30,
+          "good": 70.6,
+          "raw": 70.6,
+          "causal_good": 70.6,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-pressure-screen-20261015T140040Z-213461.tar/source-prefill-pulse-r1",
+          "windows": 2,
+          "seconds": 20,
+          "good": 70.5,
+          "raw": 70.5,
+          "causal_good": 70.5,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-pressure-screen-20261015T140040Z-213461.tar/source-prefill-pulse-r2",
+          "windows": 2,
+          "seconds": 20,
+          "good": 70.35,
+          "raw": 70.35,
+          "causal_good": 70.35,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-pressure-screen-20261015T140040Z-213461.tar/source-prefill-train-r1",
+          "windows": 2,
+          "seconds": 20,
+          "good": 70.30000000000001,
+          "raw": 70.30000000000001,
+          "causal_good": 70.30000000000001,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-pressure-screen-20261015T140040Z-213461.tar/source-prefill-train-r2",
+          "windows": 2,
+          "seconds": 20,
+          "good": 69.85,
+          "raw": 69.85,
+          "causal_good": 69.85,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-comparison-20261015T144833Z-222610.tar/source-prefill-pulse-r1-stay",
+          "windows": 2,
+          "seconds": 20,
+          "good": 71.05,
+          "raw": 71.05,
+          "causal_good": 71.05,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-comparison-20261015T144833Z-222610.tar/source-prefill-pulse-r2-stay",
+          "windows": 2,
+          "seconds": 20,
+          "good": 70.4,
+          "raw": 70.4,
+          "causal_good": 70.4,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-comparison-20261015T144833Z-222610.tar/source-prefill-train-r1-stay",
+          "windows": 2,
+          "seconds": 20,
+          "good": 70.15,
+          "raw": 70.15,
+          "causal_good": 70.15,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-comparison-20261015T144833Z-222610.tar/source-prefill-train-r2-stay",
+          "windows": 3,
+          "seconds": 30,
+          "good": 66.9,
+          "raw": 66.9,
+          "causal_good": 66.9,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        }
+      ]
+    },
+    {
+      "pool": "target",
+      "nd": 8,
+      "context_bin": 2,
+      "context_tokens": [
+        4096,
+        6143
+      ],
+      "runs": 6,
+      "seconds": 240,
+      "window_goodoutput": {
+        "n": 6,
+        "median": 364.2,
+        "min": 360.4,
+        "max": 393.2
+      },
+      "raw_output": {
+        "n": 6,
+        "median": 364.2,
+        "min": 360.4,
+        "max": 393.2
+      },
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point; not a capacity ceiling",
+      "windows": 24,
+      "quality_below95_windows": 0,
+      "minimum_window_goodoutput_s": 335.2,
+      "run_points": [
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/mixed-prefill-r1",
+          "windows": 4,
+          "seconds": 40,
+          "good": 201.81829141409284,
+          "raw": 391.6,
+          "causal_good": 391.6,
+          "causal_retention": 1.0,
+          "retention": 0.5153684663281226,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/mixed-prefill-r2",
+          "windows": 4,
+          "seconds": 40,
+          "good": 204.34148409515737,
+          "raw": 393.2,
+          "causal_good": 393.2,
+          "causal_retention": 1.0,
+          "retention": 0.5196884132633708,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar/region-prefill-coarse-r1",
+          "windows": 4,
+          "seconds": 40,
+          "good": 146.85963316336762,
+          "raw": 360.85,
+          "causal_good": 360.85,
+          "causal_retention": 1.0,
+          "retention": 0.40690031364569734,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar/region-prefill-coarse-r2",
+          "windows": 4,
+          "seconds": 40,
+          "good": 147.68160416647612,
+          "raw": 364.0,
+          "causal_good": 364.0,
+          "causal_retention": 1.0,
+          "retention": 0.4057186927650443,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar/region-prefill-frequent-r1",
+          "windows": 4,
+          "seconds": 40,
+          "good": 146.18893650549123,
+          "raw": 360.4,
+          "causal_good": 360.4,
+          "causal_retention": 1.0,
+          "retention": 0.4056296795379889,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar/region-prefill-frequent-r2",
+          "windows": 4,
+          "seconds": 40,
+          "good": 148.30170227791126,
+          "raw": 364.4,
+          "causal_good": 364.4,
+          "causal_retention": 1.0,
+          "retention": 0.40697503369349963,
+          "duty": 0.0
+        }
+      ]
+    },
+    {
+      "pool": "target",
+      "nd": 24,
+      "context_bin": 2,
+      "context_tokens": [
+        4096,
+        6143
+      ],
+      "runs": 4,
+      "seconds": 310,
+      "window_goodoutput": {
+        "n": 4,
+        "median": 581.5250000000001,
+        "min": 576.0,
+        "max": 588.0
+      },
+      "raw_output": {
+        "n": 4,
+        "median": 581.5250000000001,
+        "min": 576.0,
+        "max": 588.0
+      },
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point; not a capacity ceiling",
+      "windows": 31,
+      "quality_below95_windows": 3,
+      "minimum_window_goodoutput_s": 127.30799999999999,
+      "run_points": [
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar/region-mid-n4-n24-r1",
+          "windows": 7,
+          "seconds": 70,
+          "good": 88.50188514348571,
+          "raw": 578.4,
+          "causal_good": 578.4,
+          "causal_retention": 1.0,
+          "retention": 0.1530115579935783,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar/region-mid-n4-n24-r2",
+          "windows": 8,
+          "seconds": 80,
+          "good": 92.24218367441219,
+          "raw": 584.6500000000001,
+          "causal_good": 584.6500000000001,
+          "causal_retention": 1.0,
+          "retention": 0.15770082490615617,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar/region-short-n8-n24-r1",
+          "windows": 9,
+          "seconds": 90,
+          "good": 116.86754818725765,
+          "raw": 576.0,
+          "causal_good": 576.0,
+          "causal_retention": 1.0,
+          "retention": 0.2028950489362112,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-last-20261015T234804Z-1591.tar/region-short-n8-n24-r2",
+          "windows": 7,
+          "seconds": 70,
+          "good": 116.36430780654595,
+          "raw": 588.0,
+          "causal_good": 588.0,
+          "causal_retention": 1.0,
+          "retention": 0.19789848266419371,
+          "duty": 0.0
+        }
+      ]
+    },
+    {
+      "pool": "target",
+      "nd": 32,
+      "context_bin": 2,
+      "context_tokens": [
+        4096,
+        6143
+      ],
+      "runs": 2,
+      "seconds": 200,
+      "window_goodoutput": {
+        "n": 2,
+        "median": 241.46800000000002,
+        "min": 238.79119999999992,
+        "max": 244.1448000000001
+      },
+      "raw_output": {
+        "n": 2,
+        "median": 591.3,
+        "min": 589.0,
+        "max": 593.6
+      },
+      "health_status": "DIAGNOSTIC_ONLY",
+      "health_reason": "unresolved target delivery anomaly",
+      "windows": 20,
+      "quality_below95_windows": 17,
+      "minimum_window_goodoutput_s": 89.30400000000006,
+      "run_points": [
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar/region-mid-n6-n32-r1",
+          "windows": 10,
+          "seconds": 100,
+          "good": 65.90414659555698,
+          "raw": 589.0,
+          "causal_good": 244.1448000000001,
+          "causal_retention": 0.4142500000000001,
+          "retention": 0.11191002325974583,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar/region-mid-n6-n32-r2",
+          "windows": 10,
+          "seconds": 100,
+          "good": 64.54420153973496,
+          "raw": 593.6,
+          "causal_good": 238.79119999999992,
+          "causal_retention": 0.4097499999999999,
+          "retention": 0.10873349315993086,
+          "duty": 0.0
+        }
+      ]
+    },
+    {
+      "pool": "target",
+      "nd": 1,
+      "context_bin": 3,
+      "context_tokens": [
+        6144,
+        8191
+      ],
+      "runs": 2,
+      "seconds": 50,
+      "window_goodoutput": {
+        "n": 2,
+        "median": 68.775,
+        "min": 67.6,
+        "max": 69.95
+      },
+      "raw_output": {
+        "n": 2,
+        "median": 68.775,
+        "min": 67.6,
+        "max": 69.95
+      },
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point; not a capacity ceiling",
+      "windows": 5,
+      "quality_below95_windows": 0,
+      "minimum_window_goodoutput_s": 65.0,
+      "run_points": [
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/output-long-r1",
+          "windows": 3,
+          "seconds": 30,
+          "good": 67.6,
+          "raw": 67.6,
+          "causal_good": 67.6,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/output-long-r2",
+          "windows": 2,
+          "seconds": 20,
+          "good": 69.95,
+          "raw": 69.95,
+          "causal_good": 69.95,
+          "causal_retention": 1.0,
+          "retention": 1.0,
+          "duty": 0.0
+        }
+      ]
+    },
+    {
+      "pool": "target",
+      "nd": 8,
+      "context_bin": 3,
+      "context_tokens": [
+        6144,
+        8191
+      ],
+      "runs": 6,
+      "seconds": 240,
+      "window_goodoutput": {
+        "n": 6,
+        "median": 356.20000000000005,
+        "min": 353.6,
+        "max": 382.79999999999995
+      },
+      "raw_output": {
+        "n": 6,
+        "median": 356.20000000000005,
+        "min": 353.6,
+        "max": 382.79999999999995
+      },
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point; not a capacity ceiling",
+      "windows": 24,
+      "quality_below95_windows": 0,
+      "minimum_window_goodoutput_s": 348.0,
+      "run_points": [
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/mixed-prefill-r1",
+          "windows": 4,
+          "seconds": 40,
+          "good": 196.25231197774912,
+          "raw": 380.79999999999995,
+          "causal_good": 380.79999999999995,
+          "causal_retention": 1.0,
+          "retention": 0.5153684663281227,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/mixed-prefill-r2",
+          "windows": 4,
+          "seconds": 40,
+          "good": 198.93672459721833,
+          "raw": 382.79999999999995,
+          "causal_good": 382.79999999999995,
+          "causal_retention": 1.0,
+          "retention": 0.5196884132633708,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar/region-prefill-coarse-r1",
+          "windows": 4,
+          "seconds": 40,
+          "good": 144.3087321840421,
+          "raw": 354.55,
+          "causal_good": 354.55,
+          "causal_retention": 1.0,
+          "retention": 0.40690031364569734,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar/region-prefill-coarse-r2",
+          "windows": 4,
+          "seconds": 40,
+          "good": 144.27356714724974,
+          "raw": 355.6,
+          "causal_good": 355.6,
+          "causal_retention": 1.0,
+          "retention": 0.4057186927650443,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar/region-prefill-frequent-r1",
+          "windows": 4,
+          "seconds": 40,
+          "good": 143.43065468463288,
+          "raw": 353.6,
+          "causal_good": 353.6,
+          "causal_retention": 1.0,
+          "retention": 0.4056296795379889,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar/region-prefill-frequent-r2",
+          "windows": 4,
+          "seconds": 40,
+          "good": 145.20869202184065,
+          "raw": 356.8,
+          "causal_good": 356.8,
+          "causal_retention": 1.0,
+          "retention": 0.40697503369349963,
+          "duty": 0.0
+        }
+      ]
+    },
+    {
+      "pool": "target",
+      "nd": 16,
+      "context_bin": 3,
+      "context_tokens": [
+        6144,
+        8191
+      ],
+      "runs": 2,
+      "seconds": 100,
+      "window_goodoutput": {
+        "n": 2,
+        "median": 557.5999999999999,
+        "min": 556.8,
+        "max": 558.4
+      },
+      "raw_output": {
+        "n": 2,
+        "median": 557.5999999999999,
+        "min": 556.8,
+        "max": 558.4
+      },
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point; not a capacity ceiling",
+      "windows": 10,
+      "quality_below95_windows": 0,
+      "minimum_window_goodoutput_s": 548.8,
+      "run_points": [
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/decode-high-6k-r1",
+          "windows": 5,
+          "seconds": 50,
+          "good": 121.9862808443547,
+          "raw": 558.4,
+          "causal_good": 558.4,
+          "causal_retention": 1.0,
+          "retention": 0.2184568066696897,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-calibration-20261015T115636Z-190925.tar/decode-high-6k-r2",
+          "windows": 5,
+          "seconds": 50,
+          "good": 121.54489941588012,
+          "raw": 556.8,
+          "causal_good": 556.8,
+          "causal_retention": 1.0,
+          "retention": 0.21829184521530198,
+          "duty": 0.0
+        }
+      ]
+    },
+    {
+      "pool": "target",
+      "nd": 24,
+      "context_bin": 3,
+      "context_tokens": [
+        6144,
+        8191
+      ],
+      "runs": 2,
+      "seconds": 160,
+      "window_goodoutput": {
+        "n": 2,
+        "median": 553.95,
+        "min": 549.9,
+        "max": 558.0
+      },
+      "raw_output": {
+        "n": 2,
+        "median": 553.95,
+        "min": 549.9,
+        "max": 558.0
+      },
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point; not a capacity ceiling",
+      "windows": 16,
+      "quality_below95_windows": 1,
+      "minimum_window_goodoutput_s": 408.6080000000003,
+      "run_points": [
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar/region-mid-n4-n24-r1",
+          "windows": 8,
+          "seconds": 80,
+          "good": 84.14494392180427,
+          "raw": 549.9,
+          "causal_good": 549.9,
+          "causal_retention": 1.0,
+          "retention": 0.1530115579935783,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar/region-mid-n4-n24-r2",
+          "windows": 8,
+          "seconds": 80,
+          "good": 87.99706029763513,
+          "raw": 558.0,
+          "causal_good": 558.0,
+          "causal_retention": 1.0,
+          "retention": 0.15770082490615617,
+          "duty": 0.0
+        }
+      ]
+    },
+    {
+      "pool": "target",
+      "nd": 32,
+      "context_bin": 3,
+      "context_tokens": [
+        6144,
+        8191
+      ],
+      "runs": 2,
+      "seconds": 220,
+      "window_goodoutput": {
+        "n": 2,
+        "median": 555.55,
+        "min": 550.4,
+        "max": 560.7
+      },
+      "raw_output": {
+        "n": 2,
+        "median": 559.65,
+        "min": 556.8,
+        "max": 562.5
+      },
+      "health_status": "DIAGNOSTIC_ONLY",
+      "health_reason": "unresolved target delivery anomaly",
+      "windows": 22,
+      "quality_below95_windows": 8,
+      "minimum_window_goodoutput_s": 196.00000000000003,
+      "run_points": [
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar/region-mid-n6-n32-r1",
+          "windows": 11,
+          "seconds": 110,
+          "good": 62.31150095102648,
+          "raw": 556.8,
+          "causal_good": 550.4,
+          "causal_retention": 1.0,
+          "retention": 0.11191002325974583,
+          "duty": 0.0
+        },
+        {
+          "run": "pressure-balanced-git-v2-efficient-region-20261015T161825Z-1726-partial-20261015T232847Z.tar/region-mid-n6-n32-r2",
+          "windows": 11,
+          "seconds": 110,
+          "good": 61.17194886716893,
+          "raw": 562.5,
+          "causal_good": 560.7,
+          "causal_retention": 1.0,
+          "retention": 0.10873349315993087,
+          "duty": 0.0
+        }
+      ]
+    }
+  ],
+  "kv": {
+    "guard_tokens": 2000,
+    "release_budget_s": 16.86410117149353,
+    "budget_basis": "historical START-to-source-release observed maximum",
+    "budget_is_guaranteed_upper_bound": false,
+    "warning": "free <= guard + unallocated_prompt_blocks + ceil(decode_growth * (observation_age + release))",
+    "low_free_trigger_independent_of_positive_growth": true,
+    "candidate_physical_and_service_checks_still_required": true
+  }
+}
