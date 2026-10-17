@@ -654,7 +654,11 @@ class PressurePolicy:
                 or not 0 < c.releasable_blocks <= c.owned_blocks
             ):
                 reasons.append("physical release unknown/empty")
-            if c.transfer_bytes is None or c.transfer_bytes < 0:
+            if (
+                c.transfer_bytes is None
+                or not math.isfinite(c.transfer_bytes)
+                or c.transfer_bytes < 0
+            ):
                 reasons.append("transfer size unknown")
             needed_release = required
             growth_known = (
@@ -709,6 +713,16 @@ class PressurePolicy:
             )
             if not valid_prediction and not emergency:
                 reasons.append("prediction missing/stale/cap mismatch")
+            if not emergency and (
+                c.estimated_release_s is None
+                or not math.isfinite(c.estimated_release_s)
+                or c.estimated_release_s < 0
+            ):
+                reasons.append("release time estimate unavailable")
+            if emergency and not valid_prediction and cap <= cfg.survival_horizon:
+                # A missing predictor is not evidence that a short stop budget
+                # can survive transport. Keep emergency fallback explicit.
+                reasons.append("stop budget cannot cover migration horizon")
             if summary and summary["p_gt_bounds"][0] < cfg.min_survival_lower:
                 reasons.append("insufficient sustained work probability")
             costs = (c.source_decode_relief, c.target_decode_cost)
@@ -762,25 +776,58 @@ class PressurePolicy:
                 feasible.append((c, summary))
         if not feasible:
             return decision("no feasible candidate", rows=rows)
-        # Compare to the longest candidate, then treat differences below the
-        # predictor's configured resolution as one tier (no boundary artifacts).
         predicted = [(c, summary) for c, summary in feasible if summary]
-        if predicted:
+        if emergency:
+            # Known adequate survival takes precedence over the explicit
+            # emergency-only missing-prediction fallback. All candidates have
+            # already passed candidate-specific release size/deadline checks.
+            tier = [c for c, _ in predicted] if predicted else [c for c, _ in feasible]
+
+            def rank(c):
+                return (
+                    c.estimated_release_s,
+                    c.transfer_bytes,
+                    -c.releasable_blocks,
+                    c.request_id,
+                )
+
+            policy = "KV: survival evidence, release time, bytes, release, id"
+        else:
+            # Service relief should persist. Predictions within the configured
+            # resolution form one tier; KV size is not the service tie-breaker.
             longest = max(summary["mean"] for _, summary in predicted)
             tier = [
                 c
                 for c, summary in predicted
                 if longest - summary["mean"] <= cfg.length_resolution
             ]
-        else:
-            tier = [c for c, _ in feasible]
-        selected = min(
-            tier, key=lambda c: (-c.releasable_blocks, c.transfer_bytes, c.request_id)
-        )
+
+            def rank(c):
+                return (
+                    -c.source_decode_relief,
+                    c.target_decode_cost,
+                    c.estimated_release_s,
+                    c.transfer_bytes,
+                    c.request_id,
+                )
+
+            policy = (
+                "service: longest tier, source relief, target cost, "
+                "release time, bytes, id"
+            )
+        selected = min(tier, key=rank)
+        eligible_ids = {c.request_id for c in tier}
+        by_id = {c.request_id: c for c in candidates}
+        for row in rows:
+            c = by_id[row["request"]["request_id"]]
+            row["selection_policy"] = policy
+            row["selection_eligible"] = c.request_id in eligible_ids
+            row["selection_key"] = (
+                list(rank(c)) if c.request_id in eligible_ids else None
+            )
+            row["selected"] = c.request_id == selected.request_id
         return decision(
-            "capacity relief"
-            if emergency
-            else "sustained pressure; longest tier, release, bytes, id",
+            "capacity relief" if emergency else "sustained pressure; " + policy,
             selected.request_id,
             rows,
         )

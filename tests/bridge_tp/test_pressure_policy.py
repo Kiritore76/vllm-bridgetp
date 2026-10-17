@@ -212,13 +212,129 @@ class PressureTests(unittest.TestCase):
         result = self.decide(candidates=[short, candidate("long")])
         self.assertEqual(result.request_id, "long")
 
-    def test_near_length_ties_choose_release_then_bytes_then_id(self):
+    def test_near_length_ties_choose_service_cost_then_bytes_then_id(self):
         a = candidate("a", remaining=length(4100), releasable_blocks=70)
         z = candidate("z", remaining=length(4096), transfer_bytes=2000)
-        self.assertEqual(self.decide(candidates=[a, z]).request_id, "z")
+        self.assertEqual(self.decide(candidates=[a, z]).request_id, "a")
         self.assertEqual(
             self.decide(candidates=[candidate("z"), candidate("a")]).request_id, "a"
         )
+
+    def test_service_tier_prefers_source_relief_not_largest_KV(self):
+        light = candidate(
+            "light",
+            releasable_blocks=40,
+            owned_blocks=40,
+            source_decode_relief=0.6,
+            target_decode_cost=0.1,
+            transfer_bytes=1000,
+        )
+        heavy = candidate(
+            "heavy", source_decode_relief=0.2, target_decode_cost=0.1, transfer_bytes=1
+        )
+        result = self.decide(candidates=[heavy, light])
+        self.assertEqual(result.request_id, "light")
+        selected = next(r for r in result.candidates if r["selected"])
+        self.assertIn("service:", selected["selection_policy"])
+
+    def test_service_tier_prefers_lower_target_cost_before_release_bytes(self):
+        costly = candidate("costly", target_decode_cost=0.4, transfer_bytes=1)
+        cheap = candidate(
+            "cheap",
+            target_decode_cost=0.1,
+            transfer_bytes=1000,
+            releasable_blocks=40,
+            owned_blocks=40,
+        )
+        self.assertEqual(self.decide(candidates=[costly, cheap]).request_id, "cheap")
+
+    def test_KV_prefers_timely_sufficient_release_not_longest_remaining(self):
+        fast = candidate(
+            "fast",
+            remaining=length(1024),
+            releasable_blocks=40,
+            owned_blocks=40,
+            estimated_release_s=1,
+            transfer_bytes=2000,
+        )
+        long = candidate(
+            "long", remaining=length(5000), estimated_release_s=4, transfer_bytes=1000
+        )
+        source = pool(free_blocks=100)
+        self.assertEqual(
+            self.decide(source=source, candidates=[long, fast]).request_id, "fast"
+        )
+        # The same two requests under service pressure keep the longest tier.
+        self.assertEqual(self.decide(candidates=[long, fast]).request_id, "long")
+
+    def test_KV_same_release_budget_prefers_less_transport_not_larger_KV(self):
+        small = candidate(
+            "small", releasable_blocks=40, owned_blocks=40, transfer_bytes=1000
+        )
+        large = candidate("large", releasable_blocks=80, transfer_bytes=2000)
+        result = self.decide(source=pool(free_blocks=100), candidates=[large, small])
+        self.assertEqual(result.request_id, "small")
+        selected = next(r for r in result.candidates if r["selected"])
+        self.assertIn("KV:", selected["selection_policy"])
+
+    def test_KV_short_or_insufficient_or_too_late_candidates_still_rejected(self):
+        requests = [
+            candidate("short", remaining=length(20), estimated_release_s=0.1),
+            candidate("small", releasable_blocks=20, estimated_release_s=0.1),
+            candidate("late", estimated_release_s=101),
+            candidate("safe"),
+        ]
+        result = self.decide(source=pool(free_blocks=100), candidates=requests)
+        self.assertEqual(result.request_id, "safe")
+        for row in result.candidates:
+            if row["request"]["request_id"] != "safe":
+                self.assertTrue(row["rejections"])
+                self.assertFalse(row["selection_eligible"])
+
+    def test_KV_missing_prediction_is_last_resort_and_short_stop_is_rejected(self):
+        unknown = candidate(
+            "unknown",
+            remaining=None,
+            prediction_status="UNAVAILABLE",
+            estimated_release_s=0.1,
+        )
+        result = self.decide(
+            source=pool(free_blocks=100), candidates=[unknown, candidate("known")]
+        )
+        self.assertEqual(result.request_id, "known")
+        short = candidate(
+            "short",
+            remaining=None,
+            prediction_status="UNAVAILABLE",
+            max_output_tokens=200,
+        )
+        result = self.decide(source=pool(free_blocks=100), candidates=[short])
+        self.assertEqual(result.action, "STAY")
+        self.assertIn(
+            "stop budget cannot cover migration horizon",
+            result.candidates[0]["rejections"],
+        )
+
+    def test_service_requires_known_release_budget(self):
+        for budget in (None, math.nan, math.inf, -1):
+            result = self.decide(candidates=[candidate(estimated_release_s=budget)])
+            self.assertEqual(result.action, "STAY")
+
+    def test_invalid_transport_sizes_never_enter_either_ranking(self):
+        for source in (pool(decode_ratio=1.5), pool(free_blocks=100)):
+            for size in (None, math.nan, math.inf, -1):
+                result = self.decide(
+                    source=source, candidates=[candidate(transfer_bytes=size)]
+                )
+                self.assertEqual(result.action, "STAY")
+
+    def test_path_selection_is_stable_under_input_order(self):
+        requests = [candidate("a"), candidate("b")]
+        for source in (pool(decode_ratio=1.5), pool(free_blocks=100)):
+            for order in (requests, list(reversed(requests))):
+                self.assertEqual(
+                    self.decide(source=source, candidates=order).request_id, "a"
+                )
 
     def test_target_overload_missing_and_prefill_are_not_idle(self):
         for target in (

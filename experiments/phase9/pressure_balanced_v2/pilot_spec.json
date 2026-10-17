@@ -206,7 +206,7 @@
     "vllm/bridge_tp/controller/predictor.py": "f134fdf282bceee20a007768cabb3d5ee1ce9d68c4201027c5b2f5f64197f29f",
     "vllm/bridge_tp/controller/pressure_ingress.py": "b63297e23ac5664296fb37c8de99853388bb0bec1f4424a494599deaf137baeb",
     "vllm/bridge_tp/controller/pressure_observation.py": "7eb488db90d045048e0e0e49e0d7d4547e191c8d314d9e832826d9ee9d51cb53",
-    "vllm/bridge_tp/controller/pressure_policy.py": "4456727e480e623af3b8fd28d365cf03289f106c82fe324b7a7b107e18fa689e",
+    "vllm/bridge_tp/controller/pressure_policy.py": "35a8f86e9a19f38c02a7181a0b35fea22cbf1c288953c74100c9ec6b4841764b",
     "vllm/bridge_tp/controller/pressure_runtime.py": "023b0483931be3cb993e03d75884721722ee99915a982a89e9a82335745dd7d2",
     "vllm/bridge_tp/controller/pressure_service.py": "e2d537e473026842ee1f8bf6d5b43e860d3f25dab44d66d7be61a4ff9508f143",
     "vllm/bridge_tp/controller/rate_controller.py": "01f9efbbc2065f8f3d1e0202fe2eae303d2d45c3f9cdcd185209d675055471f1",
@@ -272,11 +272,12 @@
     "tools/bridge_tp/pressure_sessions.py": "3c934dfa943a7be4c8f03c09e15163b860afddb32e6211e73fd266e1ef1679c6",
     "tests/bridge_tp/test_pressure_sessions.py": "01c9c3875318a43d6050b2c2ece3ec37639a3222653053089ff0eea3ff763135",
     "experiments/phase9/pressure_balanced_v2/EVALUATION_STANDARD_CN.md": "fedf01ecfabb244f2c198cf0c4763a63741061c2323ee3888f2c0c837ee3cad8",
-    "experiments/phase9/pressure_balanced_v2/PARAMETER_STATUS_CN.md": "8577479141904f05af2d4fa5b5a2356ce134ddc24c19e59ca2812ab429890470",
+    "experiments/phase9/pressure_balanced_v2/PARAMETER_STATUS_CN.md": "2f077f3658a7d9bc2433e7c26bd204fbba653e5f99241c89e849d8d0906b2c59",
     "vllm/bridge_tp/controller/pressure_cancel.py": "fc753a086bebfd2ba9a76bc0c56925fd899c8c2684fd60d39914f0cd3a185b73",
     "tests/bridge_tp/test_pressure_cancel.py": "0e1100bdc23010c75581b5474ad2139caac95c8b04a4e99a06d23b40829e5fa6",
     "tests/bridge_tp/test_pressure_session.py": "fcf52f37402f858bd911c1fd14b1c83d535be83c5bb69691a32c35c67a6d66ff",
-    "vllm/entrypoints/openai/completion/serving.py": "bdcdee5d2b900db19ce6e2cd8d70064e752633a5174c162191a8ac93b4e83c3f"
+    "vllm/entrypoints/openai/completion/serving.py": "bdcdee5d2b900db19ce6e2cd8d70064e752633a5174c162191a8ac93b4e83c3f",
+    "tests/bridge_tp/test_pressure_policy.py": "d23a11ed9c31b43f241c7229feea0e927e4d278f071559b1fdb2dee037845005"
   },
   "server_settings": {
     "dtype": "bfloat16",
