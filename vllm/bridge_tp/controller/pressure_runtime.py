@@ -63,26 +63,25 @@ class PressureCoordinator:
                 **kwargs,
             )
             self._owners[result.request_id] = result.pool_id
-            self.audit(
-                {
-                    "kind": "pressure_admission",
-                    "admission": asdict(result),
-                    "pool_readings": [
-                        asdict(pool)
-                        for pool in (args[3] if len(args) > 3 else kwargs["pools"])
-                    ],
-                    "routing_config": asdict(self.policy.cfg),
-                    "routing_strategy": self.routing_strategy,
-                    "routing_weights": self.routing_weights,
-                    "decision_unix_s": kwargs.get(
-                        "now", args[4] if len(args) > 4 else None
-                    ),
-                    "config_sha256": self.policy.cfg.sha256,
-                    "reservation_before": before,
-                    "reservation_after": self.ledger.snapshot(),
-                }
-            )
-            return result
+            record = {
+                "kind": "pressure_admission",
+                "admission": asdict(result),
+                "pool_readings": [
+                    asdict(pool)
+                    for pool in (args[3] if len(args) > 3 else kwargs["pools"])
+                ],
+                "routing_config": asdict(self.policy.cfg),
+                "routing_strategy": self.routing_strategy,
+                "routing_weights": self.routing_weights,
+                "decision_unix_s": kwargs.get(
+                    "now", args[4] if len(args) > 4 else None
+                ),
+                "config_sha256": self.policy.cfg.sha256,
+                "reservation_before": before,
+                "reservation_after": self.ledger.snapshot(),
+            }
+        self.audit(record)
+        return result
 
     @staticmethod
     def with_predictions(
@@ -145,6 +144,7 @@ class PressureCoordinator:
         actions=None is advisory replay. Sessions that may have STARTed remain
         reserved after exceptions until authoritative cleanup is supplied.
         """
+        action = None
         with self._lock:
             for c in candidates:
                 owner = self._owners.get(c.request_id)
@@ -163,65 +163,70 @@ class PressureCoordinator:
             }
             if decision.request_id is None or actions is None:
                 record["reservation_after"] = self.ledger.snapshot()
-                self.audit(record)
-                return decision
-            selected = next(
-                c for c in candidates if c.request_id == decision.request_id
-            )
-            action = actions.get(selected.request_id)
-            if action is None or action.request_id != selected.request_id:
-                raise ValueError("selected request has no matching action binding")
-            if action.session_id in self._sessions:
-                raise ValueError("session already used")
-            evidence = next(
-                r
-                for r in decision.candidates
-                if r["request"]["request_id"] == selected.request_id
-            )
-            self.ledger.reserve(
-                Reservation(
-                    action.session_id,
+            else:
+                selected = next(
+                    c for c in candidates if c.request_id == decision.request_id
+                )
+                action = actions.get(selected.request_id)
+                if action is None or action.request_id != selected.request_id:
+                    raise ValueError("selected request has no matching action binding")
+                if action.session_id in self._sessions:
+                    raise ValueError("session already used")
+                evidence = next(
+                    r
+                    for r in decision.candidates
+                    if r["request"]["request_id"] == selected.request_id
+                )
+                self.ledger.reserve(
+                    Reservation(
+                        action.session_id,
+                        selected.request_id,
+                        target.pool_id,
+                        evidence["target_required_blocks"],
+                        selected.target_decode_cost,
+                        0,
+                        "migration",
+                    ),
+                    target,
+                )
+                self._sessions[action.session_id] = (
                     selected.request_id,
                     target.pool_id,
-                    evidence["target_required_blocks"],
-                    selected.target_decode_cost,
-                    0,
-                    "migration",
-                ),
-                target,
-            )
-            self._sessions[action.session_id] = (selected.request_id, target.pool_id)
-            self._owners.setdefault(selected.request_id, source.pool_id)
-            record.update(
-                {
-                    "session_id": action.session_id,
-                    "execution": "RESERVED",
-                    "reservation_after": self.ledger.snapshot(),
-                }
-            )
-            # Audit errors prevent START and retain the commitment for recovery.
-            self.audit(record)
-            try:
-                action.start()
-            except BaseException:
-                self.audit(
+                )
+                self._owners.setdefault(selected.request_id, source.pool_id)
+                record.update(
                     {
-                        "kind": "pressure_start_uncertain",
                         "session_id": action.session_id,
-                        "request_id": selected.request_id,
+                        "execution": "RESERVED",
+                        "reservation_after": self.ledger.snapshot(),
                     }
                 )
-                raise
-            self.policy.note_started(now)
+        # Audit errors prevent START and retain the commitment for recovery.
+        self.audit(record)
+        if action is None:
+            return decision
+        try:
+            action.start()
+        except BaseException:
             self.audit(
                 {
-                    "kind": "pressure_start_published",
-                    "unix_s": now,
+                    "kind": "pressure_start_uncertain",
                     "session_id": action.session_id,
                     "request_id": selected.request_id,
                 }
             )
-            return decision
+            raise
+        with self._lock:
+            self.policy.note_started(now)
+        self.audit(
+            {
+                "kind": "pressure_start_published",
+                "unix_s": now,
+                "session_id": action.session_id,
+                "request_id": selected.request_id,
+            }
+        )
+        return decision
 
     def finish(
         self,
@@ -256,18 +261,17 @@ class PressureCoordinator:
                         self.ledger.retire_admission(
                             row.key, "MOVED", evidence=evidence
                         )
-            self.audit(
-                {
-                    "kind": "pressure_settlement",
-                    "session_id": session_id,
-                    "request_id": request_id,
-                    "outcome": outcome,
-                    "ownership_confirmed": ownership_confirmed,
-                    "source_release_confirmed": source_release_confirmed,
-                    "cleanup_confirmed": cleanup_confirmed,
-                    "reservation_after": self.ledger.snapshot(),
-                }
-            )
+            record = {
+                "kind": "pressure_settlement",
+                "session_id": session_id,
+                "request_id": request_id,
+                "outcome": outcome,
+                "ownership_confirmed": ownership_confirmed,
+                "source_release_confirmed": source_release_confirmed,
+                "cleanup_confirmed": cleanup_confirmed,
+                "reservation_after": self.ledger.snapshot(),
+            }
+        self.audit(record)
 
 
 def json_reference(row: dict) -> str:

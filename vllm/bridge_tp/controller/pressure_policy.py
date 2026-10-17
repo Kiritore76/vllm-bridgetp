@@ -302,7 +302,7 @@ class ReservationLedger:
     def pending(self, pool_id: str) -> tuple[int, float, int]:
         rows = [
             r
-            for r in self.entries.values()
+            for r in tuple(self.entries.values())
             if r.pool_id == pool_id and r.state in {"ACTIVE", "COMMITTED"}
         ]
         return (
@@ -314,7 +314,7 @@ class ReservationLedger:
     def channel_available(self, pool_id: str) -> bool:
         return not any(
             r.pool_id == pool_id and r.kind == "migration" and r.state == "ACTIVE"
-            for r in self.entries.values()
+            for r in tuple(self.entries.values())
         )
 
     def track_ingress(
@@ -322,7 +322,7 @@ class ReservationLedger:
     ) -> None:
         """Track identity/unpublished prompt demand without reserving capacity."""
         if key in self.entries or any(
-            row.request_id == request_id for row in self.entries.values()
+            row.request_id == request_id for row in tuple(self.entries.values())
         ):
             raise ValueError("ingress identity already tracked")
         if prompt_tokens < 0:
@@ -334,7 +334,7 @@ class ReservationLedger:
     def unobserved_ingress(self, pool_id: str) -> tuple[int, int]:
         rows = [
             row
-            for row in self.entries.values()
+            for row in tuple(self.entries.values())
             if row.pool_id == pool_id
             and row.kind == "admission"
             and row.state in {"ACTIVE", "COMMITTED"}
@@ -349,7 +349,7 @@ class ReservationLedger:
         if value and value.get("status") == "OBSERVED":
             extra = sum(
                 workload.slot_cost(value["profile"], row.prefill_tokens)[0]
-                for row in self.entries.values()
+                for row in tuple(self.entries.values())
                 if row.pool_id == pool.pool_id
                 and row.kind == "admission"
                 and row.state in {"ACTIVE", "COMMITTED"}
@@ -368,7 +368,7 @@ class ReservationLedger:
                 pool.unallocated_prompt_blocks
                 + sum(
                     math.ceil(row.prefill_tokens / pool.block_size)
-                    for row in self.entries.values()
+                    for row in tuple(self.entries.values())
                     if row.pool_id == pool.pool_id
                     and row.kind == "admission"
                     and row.state in {"ACTIVE", "COMMITTED"}
@@ -396,7 +396,7 @@ class ReservationLedger:
                 and r.pool_id != value.pool_id
                 and r.state == "COMMITTED"
             )
-            for r in self.entries.values()
+            for r in tuple(self.entries.values())
         ):
             raise ValueError("request already reserved")
         if (
@@ -495,7 +495,7 @@ class ReservationLedger:
             row.state = "ACCOUNTED"
 
     def snapshot(self) -> list[dict]:
-        return [asdict(r) for r in self.entries.values()]
+        return [asdict(r) for r in tuple(self.entries.values())]
 
 
 @dataclass(frozen=True)

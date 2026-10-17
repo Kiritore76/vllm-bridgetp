@@ -292,6 +292,9 @@ def dispatch_due(
                 pool=value.pool_id,
                 frozen_cap=value.payload["max_tokens"],
                 ingress_capacity_gate=False,
+                dispatch_entered_unix_s=value.dispatch_entered_at,
+                admission_finished_unix_s=value.admission_finished_at,
+                executor_submitted_unix_s=value.executor_submitted_at,
             )
         )
 
@@ -331,6 +334,9 @@ def _run(args, prepared):
             unchanged_reconcile_log_interval_s=1.0,
             observation_flush_interval_s=1.0,
             inventory_and_migration_tick_s=args.tick_s,
+            arrival_scheduler="independent_monotonic_thread",
+            inventory_cache_poll_s=0.05,
+            arrival_observation_io="async_identity_only; migration remains durable",
         )
     args.run_dir.mkdir(parents=True, exist_ok=True)
     if any(
@@ -444,10 +450,45 @@ def _run(args, prepared):
     last_metrics_error = {}
     last_metrics_logged = {}
     background_metrics = []
+    background_inventory = []
+    dispatcher = None
     last_inventory_status = {}
     last_inventory_progress = ()
     failure = None
     try:
+        for reader in readers:
+            background_inventory.append(
+                load("pressure_io").BackgroundInventory(
+                    reader,
+                    lambda now, reader=reader: load("pause_diagnostics").call(
+                        "inventory.poll", reader.poll, now
+                    ),
+                )
+            )
+        readers = tuple(background_inventory)
+
+        def submit_arrival(job, pools):
+            submitted = {}
+            dispatch_due(
+                [job],
+                submitted,
+                time.monotonic() - started,
+                ingress,
+                pools,
+                tokens,
+                audit,
+                origin_unix_s=origin_unix_s,
+            )
+            return submitted[job["id"]]
+
+        dispatcher = load("pressure_dispatch").ScheduledDispatch(
+            jobs,
+            submit_arrival,
+            unknown_routing_pools(args, controller.block_size),
+            started,
+            args.max_seconds,
+        )
+        dispatcher.start()
         if cfg.health_service:
             for scraper in scrapers:
                 background_metrics.append(
@@ -459,11 +500,9 @@ def _run(args, prepared):
                 )
         while time.monotonic() - started < args.max_seconds:
             load("pause_diagnostics").tick()
+            dispatched = dispatcher.snapshot()
             now, elapsed = time.time(), time.monotonic() - started
-            inventories = [
-                load("pause_diagnostics").call("inventory.poll", reader.poll, now)
-                for reader in readers
-            ]
+            inventories = [reader.poll(now) for reader in readers]
             for reader in readers:
                 diagnostic = reader.diagnostics()
                 status_key = (
@@ -479,16 +518,7 @@ def _run(args, prepared):
                         "inventory evidence invalid: " + json.dumps(diagnostic)
                     )
             if any(v is None for v in inventories):
-                dispatch_due(
-                    jobs,
-                    dispatched,
-                    elapsed,
-                    ingress,
-                    unknown_routing_pools(args, controller.block_size),
-                    tokens,
-                    audit,
-                    origin_unix_s=origin_unix_s,
-                )
+                dispatcher.publish(unknown_routing_pools(args, controller.block_size))
                 save_progress(
                     progress_path,
                     stage="waiting_inventory",
@@ -508,7 +538,7 @@ def _run(args, prepared):
                         dispatched,
                         last_inventory_progress,
                         session,
-                        co.ledger.entries.values(),
+                        tuple(co.ledger.entries.values()),
                     ),
                     work_due=any(elapsed >= job["at_s"] for job in jobs),
                     reason="waiting for inventory reconciliation; "
@@ -633,16 +663,8 @@ def _run(args, prepared):
                             "scope": "empirical budget plus configured recovery tokens",
                         }
                     )
-            dispatch_due(
-                jobs,
-                dispatched,
-                time.monotonic() - started,
-                ingress,
-                pools,
-                tokens,
-                audit,
-                origin_unix_s=origin_unix_s,
-            )
+            dispatcher.publish(pools)
+            dispatched = dispatcher.snapshot()
             candidates, eos = [], {}
             for row in inventories[0]["requests"]:
                 try:
@@ -838,13 +860,16 @@ def _run(args, prepared):
                     and 0 <= now - pools[1].sampled_at <= cfg.max_age_s
                     and targets[0]["owned_blocks"] is not None
                 ):
-                    co.ledger.observe(
-                        entry.key,
-                        allocated_blocks=min(targets[0]["owned_blocks"], entry.blocks),
-                        service_observed=entry.service_observed
-                        or targets[0]["generated"] >= 2,
-                        prefill_observed=True,
-                    )
+                    with co._lock:
+                        co.ledger.observe(
+                            entry.key,
+                            allocated_blocks=min(
+                                targets[0]["owned_blocks"], entry.blocks
+                            ),
+                            service_observed=entry.service_observed
+                            or targets[0]["generated"] >= 2,
+                            prefill_observed=True,
+                        )
                 if (
                     not targets
                     and previous_session.settled
@@ -855,7 +880,8 @@ def _run(args, prepared):
                     > previous_session.target_future.result()["completed_unix_s"]
                     and entry.state in {"COMMITTED", "ACCOUNTED"}
                 ):
-                    co.ledger.complete(entry.key, evidence=True)
+                    with co._lock:
+                        co.ledger.complete(entry.key, evidence=True)
             if session.rotate():
                 last_view = None
             for value in dispatched.values():
@@ -872,7 +898,7 @@ def _run(args, prepared):
                 dispatched,
                 last_inventory_progress,
                 session,
-                co.ledger.entries.values(),
+                tuple(co.ledger.entries.values()),
             )
             pressures = [
                 p.classify(co.ledger.routing_reading(pool), co.policy.cfg, now)
@@ -958,7 +984,7 @@ def _run(args, prepared):
                             session.cleanup_requires_shutdown
                             and row.kind == "migration"
                         )
-                        for row in co.ledger.entries.values()
+                        for row in tuple(co.ledger.entries.values())
                     )
                     or session.record
                     and not session.settled
@@ -980,7 +1006,7 @@ def _run(args, prepared):
                     and not (
                         session.cleanup_requires_shutdown and row.kind == "migration"
                     )
-                    for row in co.ledger.entries.values()
+                    for row in tuple(co.ledger.entries.values())
                 )
                 and all(
                     previous_session.record is None
@@ -1011,6 +1037,15 @@ def _run(args, prepared):
         failure = repr(error)
         raise
     finally:
+        dispatch_stop_error = None
+        if dispatcher is not None:
+            try:
+                dispatcher.close()
+            except RuntimeError as error:
+                dispatch_stop_error = error
+                failure = failure or repr(error)
+                outcome = "FAILED_OR_INTERRUPTED"
+            dispatched = dispatcher.snapshot(check=False)
         save_progress(
             progress_path,
             stage=outcome,
@@ -1046,6 +1081,14 @@ def _run(args, prepared):
                     }
                     if value.future.done() and value.future.exception() is None
                     else None,
+                    dispatch_timing=dict(
+                        planned_unix_s=origin_unix_s
+                        + next(job["at_s"] for job in jobs if job["id"] == job_id),
+                        dispatch_entered_unix_s=value.dispatch_entered_at,
+                        admission_finished_unix_s=value.admission_finished_at,
+                        executor_submitted_unix_s=value.executor_submitted_at,
+                        http_thread_started_unix_s=value.http_thread_started_at,
+                    ),
                 )
             )
         (args.run_dir / "pressure_request_results.json").write_text(
@@ -1087,12 +1130,22 @@ def _run(args, prepared):
             session.close()
         finally:
             try:
-                for sampler in background_metrics:
+                for sampler in background_metrics + background_inventory:
                     sampler.stop.set()
-                for sampler in background_metrics:
-                    sampler.close()
+                close_errors = []
+                for sampler in background_metrics + background_inventory:
+                    try:
+                        sampler.close()
+                    except RuntimeError as error:
+                        close_errors.append(error)
             finally:
                 audit.close()
+            if close_errors:
+                raise RuntimeError("background observation shutdown failed") from (
+                    close_errors[0]
+                )
+        if dispatch_stop_error is not None:
+            raise dispatch_stop_error
 
 
 def main(argv=None):

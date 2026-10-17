@@ -190,3 +190,22 @@ eta as the only health verdict. The terminal remains concise and one archive
 is created underresults withprefixpressure-balanced-git-v2-workload-pilot-.
 If this passes, use--pool-compare for the12-scene four-arm comparison; select
 new load levels only after reviewing the small pilot, not by chasing a win.
+
+
+## Arrival-isolation repeat (2026-10-17)
+
+Repeat the existing `--workload-pilot` after pulling the arrival-isolation fix.
+It still runs two fresh STAY/MIGRATE scenes with the original 75 arrivals,
+300s scoring window, routing/migration settings, 0.5s dispatch gate and full
+drain/trace/ledger/owned-process checks. No extra cloud helper or probe is added.
+
+Arrival submission now uses an independent monotonic scheduler. Inventory is
+read in per-pool workers and routing uses age-preserving cached readings. The
+control loop, migration START and synchronous critical fsync no longer hold
+the arrival routing/observation lock across slow I/O. Identity-only admissions
+are async observations in health mode; migration critical records stay durable.
+
+Inspect each request's `dispatch_timing` together with existing HTTP transport
+timestamps. A shared host or GIL stall can still delay both threads/services;
+this repair isolates control I/O and does not certify the previous 30s output
+pause fixed. Keep both arrival validity and visible output gaps in acceptance.

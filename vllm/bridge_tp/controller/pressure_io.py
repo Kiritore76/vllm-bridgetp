@@ -13,7 +13,14 @@ from .telemetry import TelemetryError
 class PressureAudit:
     """Keep the complete async timeline and a separate durable critical journal."""
 
-    OBSERVATIONS = {"pressure_metrics_sample", "pressure_progress"}
+    # Admission tracks identity/unpublished prompt demand, with zero reserved
+    # KV. It does not transfer ownership. Migration START/settlement still fsync.
+    OBSERVATIONS = {
+        "pressure_metrics_sample",
+        "pressure_progress",
+        "pressure_admission",
+        "pressure_dispatch",
+    }
 
     def __init__(self, path, journal, metadata):
         self.path, self.journal = path, journal
@@ -22,11 +29,12 @@ class PressureAudit:
         self.records = 0
         self.closed = False
         self.lock = threading.Lock()
+        self.critical_lock = threading.Lock()
         self.write(
             dict(
                 kind="run_metadata",
                 **metadata,
-                observation_io="bounded_async_with_durable_critical_v1",
+                observation_io="bounded_async_with_durable_critical_v2",
             )
         )
 
@@ -39,17 +47,22 @@ class PressureAudit:
             payload.get("kind") == "pressure_ingress_reconcile"
             and payload.get("state_changed") is False
         )
+        if not observation:
+            # Do not hold the observation queue lock across fsync. A slow
+            # migration journal must not delay unrelated arrivals.
+            with self.critical_lock:
+                if self.closed:
+                    raise RuntimeError("pressure audit is closed")
+                self.durable.write(payload)
+                self.critical_records += 1
         with self.lock:
             if self.closed:
                 raise RuntimeError("pressure audit is closed")
-            if not observation:
-                self.durable.write(payload)
-                self.critical_records += 1
             self.journal.submit(payload)
             self.records += 1
 
     def close(self):
-        with self.lock:
+        with self.critical_lock, self.lock:
             if self.closed:
                 return
             self.closed = True
@@ -69,6 +82,65 @@ class PressureAudit:
             )
         finally:
             self.durable.close()
+
+
+class BackgroundInventory:
+    """Single journal reader with bounded work and a nonblocking cached poll.
+
+    Reading/parsing takes place outside the cache lock. Integrity failures are
+    sticky and raised to the controller; records are never skipped to catch up.
+    """
+
+    def __init__(self, reader, poll, interval_s=0.05):
+        self.reader, self.read, self.interval_s = reader, poll, interval_s
+        self.pool_id = reader.pool_id
+        self.lock = threading.Lock()
+        self.stop = threading.Event()
+        self.cached = (None, None, reader.diagnostics(), None)
+        self.observed_at = None
+        self.error = None
+        self.diagnostic = reader.diagnostics()
+        self.thread = threading.Thread(
+            target=self._run, name=f"pressure-inventory-{self.pool_id}", daemon=True
+        )
+        self.thread.start()
+
+    def _run(self):
+        while not self.stop.is_set():
+            try:
+                value = self.read(time.time())
+                state = (
+                    value,
+                    self.reader.observed_at,
+                    self.reader.diagnostics(),
+                    None,
+                )
+            except BaseException as error:
+                state = (None, None, self.reader.diagnostics(), error)
+                self.stop.set()
+            with self.lock:
+                self.cached = state
+            self.stop.wait(self.interval_s)
+
+    def poll(self, now):
+        with self.lock:
+            value, observed, diagnostic, error = self.cached
+        if error is not None:
+            raise RuntimeError("background inventory failed") from error
+        self.observed_at, self.diagnostic = observed, diagnostic
+        self.error = diagnostic["error"]
+        self.deferred = diagnostic["deferred"]
+        self.latest = value
+        return value if value is None or value["sampled_at"] <= now else None
+
+    def diagnostics(self):
+        return dict(self.diagnostic)
+
+    def close(self):
+        self.stop.set()
+        self.thread.join(3)
+        if self.thread.is_alive():
+            raise RuntimeError("background inventory did not stop")
 
 
 class BackgroundMetrics:

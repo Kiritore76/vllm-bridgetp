@@ -703,6 +703,7 @@ def main():
             "tests.bridge_tp.test_delta_batching",
             "tests.bridge_tp.test_pressure_preflight",
             "tests.bridge_tp.test_pressure_policy",
+            "tests.bridge_tp.test_pressure_dispatch",
         ],
         cwd=ROOT,
         check=True,

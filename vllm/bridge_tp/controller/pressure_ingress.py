@@ -43,6 +43,10 @@ class IngressStream:
     dispatched_at: float
     future: object = None
     server_id: str | None = None
+    dispatch_entered_at: float | None = None
+    admission_finished_at: float | None = None
+    executor_submitted_at: float | None = None
+    http_thread_started_at: float | None = None
 
 
 class PressureIngress:
@@ -84,6 +88,7 @@ class PressureIngress:
         emission_sink=None,
         allowed_pool_id=None,
     ) -> IngressStream:
+        entered = self.clock()
         prompt = request.get("prompt")
         if (
             not isinstance(prompt, list)
@@ -116,9 +121,12 @@ class PressureIngress:
             value = IngressStream(
                 client_id, admission.pool_id, payload, key, recorder, now
             )
+            value.dispatch_entered_at = entered
+            value.admission_finished_at = self.clock()
             self.streams[client_id] = value
 
             def consume():
+                value.http_thread_started_at = self.clock()
                 try:
                     return self.post(
                         self.urls[value.pool_id],
@@ -131,6 +139,7 @@ class PressureIngress:
 
             # A transport error can follow acceptance. Retain identity tracking
             # until completion/cleanup; this record reserves no KV capacity.
+            value.executor_submitted_at = self.clock()
             value.future = self.executor.submit(consume)
             return value
 
@@ -138,6 +147,7 @@ class PressureIngress:
         cfg = self.coordinator.policy.cfg
         if not 0 <= now - inventory["sampled_at"] <= cfg.max_age_s:
             raise ValueError("cannot reconcile stale/future inventory")
+        records = []
         with self._lock, self.coordinator._lock:
             for value in self.streams.values():
                 if value.pool_id != inventory["pool_id"]:
@@ -209,7 +219,7 @@ class PressureIngress:
                     )
                     continue
                 self._reconcile_logged_at[value.client_id] = now
-                self.coordinator.audit(
+                records.append(
                     {
                         "kind": "pressure_ingress_reconcile",
                         "unix_s": now,
@@ -223,9 +233,12 @@ class PressureIngress:
                         "reservation": dict(vars(entry)),
                     }
                 )
+        for record in records:
+            self.coordinator.audit(record)
 
     def for_server_id(self, request_id: str) -> IngressStream:
-        matches = [v for v in self.streams.values() if v.server_id == request_id]
+        with self._lock:
+            matches = [v for v in self.streams.values() if v.server_id == request_id]
         if len(matches) != 1:
             raise ValueError("selected request is not bound to one existing stream")
         return matches[0]
