@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import math
 import threading
+import time
 from collections import deque
 from pathlib import Path
 
@@ -27,7 +28,17 @@ def scrape_inventory_metrics(scraper, inventory):
 
 
 class InventoryReader:
-    def __init__(self, path: Path, pool_id: str):
+    def __init__(
+        self,
+        path: Path,
+        pool_id: str,
+        *,
+        max_records=128,
+        max_bytes=2**21,
+        max_poll_s=0.02,
+    ):
+        if min(max_records, max_bytes, max_poll_s) <= 0:
+            raise ValueError("positive inventory poll budgets required")
         self.path, self.pool_id = path, pool_id
         self.offset = 0
         self.latest = None
@@ -35,6 +46,12 @@ class InventoryReader:
         self.error = None
         self.error_detail = None
         self.deferred = None
+        self.max_records, self.max_bytes, self.max_poll_s = (
+            max_records,
+            max_bytes,
+            max_poll_s,
+        )
+        self.backlog_bytes = 0
 
     def poll(self, now: float) -> dict | None:
         self.deferred = None
@@ -44,13 +61,24 @@ class InventoryReader:
             raise ValueError("inventory journal was truncated")
         with self.path.open("rb") as stream:
             stream.seek(self.offset)
+            started = time.monotonic()
+            records, initial = 0, self.offset
             while True:
+                if records and (
+                    records >= self.max_records
+                    or stream.tell() - initial >= self.max_bytes
+                    or time.monotonic() - started >= self.max_poll_s
+                ):
+                    break
                 start = stream.tell()
-                line = stream.readline()
+                line = stream.readline(self.max_bytes + 1)
+                if len(line) > self.max_bytes:
+                    raise ValueError("inventory record exceeds poll byte budget")
                 if not line or not line.endswith(b"\n"):
                     self.offset = start
                     break
                 self.offset = stream.tell()
+                records += 1
                 row = json.loads(line)
                 if row.get("kind") == "evidence_footer":
                     if row.get("dropped") or row.get("writer_error"):
@@ -85,6 +113,7 @@ class InventoryReader:
                     raise ValueError("inventory generation did not increase")
                 self.latest = row
                 self.observed_at = now
+            self.backlog_bytes = max(0, self.path.stat().st_size - self.offset)
         # A future line does not invalidate the already accepted past prefix.
         # The policy still checks its original timestamp/age before migration.
         return None if self.error else self.latest
@@ -112,6 +141,7 @@ class InventoryReader:
             deferred=self.deferred,
             last_generation=self.latest.get("generation") if self.latest else None,
             last_sampled_at=self.latest.get("sampled_at") if self.latest else None,
+            backlog_bytes=self.backlog_bytes,
         )
 
 

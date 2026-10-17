@@ -29,7 +29,12 @@
     "health_min_efficiency": 0.9,
     "health_target_load": 0.8,
     "capacity_lookahead_s": 16.86410117149353,
-    "capacity_only": false
+    "capacity_only": false,
+    "shadow_cancel": true,
+    "cancel_sustain_s": 3.0,
+    "cancel_recover_eta": 1.0,
+    "pressure_routing": true,
+    "workload_pressure": true
   },
   "itl_s": 0.1,
   "slow_fraction": 0.01,

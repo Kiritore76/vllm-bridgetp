@@ -166,3 +166,27 @@ running both repeats those pairs. Full mode is roughly1.5–3h and pair mode
 45–90min, depending on model startup, EOS lengths and drain; neither estimate
 has been measured for this new workload. CPU and real parser preflight gates
 run before GPU startup. Five GPUs must be idle; no unrelated processes are killed.
+
+
+## Workload-pressure repair pilot (2026-10-17)
+
+`bash tools/bridge_tp/run_pressure_pilot.sh --workload-pilot` selects only the
+first fresh natural-EOS repetition of the pool comparison and runs STAY and
+migration arms (two scenes,75 identical planned arrivals each). It uses the
+new workload_pressure profile and retains all latency/output-parity, fixed
+300s scoring, full drain, native-empty, ledger, trace and owned-process checks.
+There is no forced START, workload padding or online pressure probe. The two
+arms share the same file; both are new runs, never splice old STAY evidence.
+
+Inspect passive_pressure_coverage, routing reasons, service/KV migration paths,
+preemptions, actual output lengths, goodoutput and hard SLO. A scene without
+START is valid functional data but cannot validate migration coverage or
+benefit. The small pilot is a regression stage, not a full three-repeat result.
+Expect roughly15–30min for two startups,300s arrival windows and drain, subject
+to actual EOS lengths and platform performance; this estimate is unmeasured.
+
+Progress now shows native workload pressure rather than treating a missing
+eta as the only health verdict. The terminal remains concise and one archive
+is created underresults withprefixpressure-balanced-git-v2-workload-pilot-.
+If this passes, use--pool-compare for the12-scene four-arm comparison; select
+new load levels only after reviewing the small pilot, not by chasing a win.

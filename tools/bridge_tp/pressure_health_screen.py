@@ -386,7 +386,7 @@ def assess(audit, metrics, kind, arm):
     service_moves = [
         r
         for r in reserved
-        if r["decision"].get("service_path") == "health"
+        if r["decision"].get("service_path") in {"health", "workload"}
         and not r["decision"]["capacity_path"]
     ]
     remaining = None

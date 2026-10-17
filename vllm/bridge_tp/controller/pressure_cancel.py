@@ -4,6 +4,7 @@
 import math
 from dataclasses import replace
 
+from . import pressure_workload as workload
 from .pressure_policy import classify, health_valid
 
 
@@ -62,6 +63,23 @@ class ShadowCancellation:
                 and s.decode <= cfg.leave_ratio
                 and source.waiting == source.pending_prompt_tokens == 0
             )
+            if cfg.workload_pressure:
+                recovered = (
+                    projected_kv_known
+                    and s.capacity is not None
+                    and s.capacity <= cfg.spare_ratio
+                    and workload.valid(source, cfg, now)
+                    and source.workload["load"] <= cfg.spare_ratio
+                    and source.workload["prefill_s"] == 0
+                    and source.decode_ratio is not None
+                    and math.isfinite(source.decode_ratio)
+                    and source.decode_ratio <= cfg.leave_ratio
+                    and source.decode_samples >= cfg.min_decode_samples
+                    and source.decode_sampled_at is not None
+                    and 0 <= now - source.decode_sampled_at <= cfg.max_age_s
+                    and source.prefill_batch_tokens == 0
+                    and source.waiting == source.pending_prompt_tokens == 0
+                )
             # A slower target or short prediction does not remove the need
             # for source capacity/service relief. Cancel only after BOTH have
             # recovered. Actual EOS/mechanism exhaustion has separate cleanup.
@@ -74,12 +92,23 @@ class ShadowCancellation:
             or not 0 <= now - self.last_tick <= cfg.max_age_s
         ):
             self.since = now if reason else None
-            self.first_health_window = source.health_sampled_at if reason else None
+            self.first_health_window = (
+                source.workload["sampled_at"]
+                if cfg.workload_pressure and reason
+                else source.health_sampled_at
+                if reason
+                else None
+            )
         self.reason, self.last_tick = reason, now
         if (
             reason
             and now - self.since >= cfg.cancel_sustain_s
-            and source.health_sampled_at > self.first_health_window
+            and (
+                source.workload["sampled_at"]
+                if cfg.workload_pressure
+                else source.health_sampled_at
+            )
+            > self.first_health_window
         ):
             return reason
         return None

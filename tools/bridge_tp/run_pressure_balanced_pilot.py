@@ -155,6 +155,10 @@ def preflight(args):
     ).validate()
     evidence = read(args.service_evidence)
     lookup = s.LocalServiceLookup(evidence)
+    if cfg.workload_pressure:
+        load("pressure_workload").build_profiles(
+            read(args.health_reference), evidence, cfg.health_min_efficiency
+        )
     lookup.release_budget = evidence["source_release_summary"]["start_to_release_s"][
         "max"
     ]
@@ -405,11 +409,32 @@ def _run(args, prepared):
     origin_unix_s = time.time()
     health_tracker = (
         health_module.HealthTracker(
-            read(args.health_reference), origin_unix_s, health_tokens
+            read(args.health_reference),
+            origin_unix_s,
+            health_tokens,
+            cache_closed_windows=cfg.workload_pressure,
         )
         if cfg.health_service
         else None
     )
+    workload_module = load("pressure_workload") if cfg.workload_pressure else None
+    workload_profiles = (
+        workload_module.build_profiles(
+            read(args.health_reference),
+            read(args.service_evidence),
+            cfg.health_min_efficiency,
+        )
+        if workload_module is not None
+        else None
+    )
+    if workload_profiles is not None:
+        audit.write(
+            dict(
+                kind="pressure_workload_profiles",
+                profiles=workload_profiles,
+                basis="existing repeated evidence; no probing requests",
+            )
+        )
     audit.write(dict(kind="pressure_clock_origin", unix_s=origin_unix_s))
     last_view = None
     outcome = "FAILED_OR_INTERRUPTED"
@@ -568,6 +593,15 @@ def _run(args, prepared):
                     pool = replace(
                         pool, **health_tracker.snapshot(raw["pool_id"], now, pool.idle)
                     )
+                if workload_module is not None:
+                    pool = replace(
+                        pool,
+                        workload=workload_module.observe(
+                            workload_profiles[raw["pool_id"]],
+                            raw | {"sampled_at": pool.sampled_at},
+                            now,
+                        ),
+                    )
                 if cfg.capacity_lookahead_s > 0:
                     pool = replace(
                         pool,
@@ -615,11 +649,27 @@ def _run(args, prepared):
                     stream = ingress.for_server_id(row["request_id"])
                 except ValueError:
                     stream = None
-                relief, cost = (
-                    lookup.deltas(shapes[0], shapes[1], row["request_id"])
-                    if all(shapes)
-                    else (None, None)
-                )
+                if workload_module is not None:
+                    relief, cost = (
+                        tuple(
+                            workload_module.slot_cost(
+                                workload_profiles[name],
+                                max(row["prompt_tokens"], row["computed_tokens"]),
+                            )[0]
+                            for name in ("tp1", "tp4")
+                        )
+                        if all(
+                            workload_module.valid(pool, co.policy.cfg, now)
+                            for pool in pools
+                        )
+                        else (None, None)
+                    )
+                else:
+                    relief, cost = (
+                        lookup.deltas(shapes[0], shapes[1], row["request_id"])
+                        if all(shapes)
+                        else (None, None)
+                    )
                 release_budget = lookup.release_budget
                 candidates.append(
                     p.Candidate(
@@ -879,8 +929,20 @@ def _run(args, prepared):
                             status=pool.health_status,
                             eta=pool.health_eta,
                             load=pool.health_load,
+                            reason=pool.health_reason,
                         )
                         for pool in pools
+                    }
+                if cfg.workload_pressure:
+                    status["workload_pressure"] = {
+                        pool.pool_id: dict(
+                            status=(pool.workload or {}).get("status", "UNKNOWN"),
+                            reason=(pool.workload or {}).get("reason"),
+                            load=(pool.workload or {}).get("load"),
+                            prefill_s=(pool.workload or {}).get("prefill_s"),
+                            kv_pressure=pressures[index].capacity,
+                        )
+                        for index, pool in enumerate(pools)
                     }
                 save_progress(progress_path, **status)
                 audit.write(dict(kind="pressure_progress", **status))

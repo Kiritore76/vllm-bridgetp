@@ -115,7 +115,7 @@ class TokenWindows:
 
 
 class HealthTracker:
-    def __init__(self, reference, origin, tokens):
+    def __init__(self, reference, origin, tokens, *, cache_closed_windows=False):
         if (
             reference.get("schema") != "PRESSURE_HEALTH_REFERENCE_V2"
             or reference.get("metric") != "CAUSAL_10S_ITL100MS_SLOW1PCT_MAXGAP1S_V1"
@@ -136,6 +136,8 @@ class HealthTracker:
             raise ValueError("invalid repeated reference cells")
         self.reference, self.origin, self.tokens = reference, origin, tokens
         self.samples = {pool: collections.deque() for pool in ("tp1", "tp4")}
+        self.cache_closed_windows = cache_closed_windows
+        self.closed_cache = {}
 
     def observe(self, raw, now):
         pool = raw["pool_id"]
@@ -162,6 +164,16 @@ class HealthTracker:
             history.popleft()
 
     def snapshot(self, pool, now, idle=False):
+        if not self.cache_closed_windows or idle:
+            return self._snapshot(pool, now, idle)
+        key = (pool, math.floor((now - self.origin) / 10))
+        previous = self.closed_cache.get(pool)
+        if previous is None or previous[0] != key:
+            previous = (key, self._snapshot(pool, now))
+            self.closed_cache[pool] = previous
+        return dict(previous[1])
+
+    def _snapshot(self, pool, now, idle=False):
         if idle:
             return dict(
                 health_status="IDLE",
@@ -169,6 +181,7 @@ class HealthTracker:
                 health_load=0.0,
                 health_sampled_at=now,
                 health_mixed_window=False,
+                health_reason="fresh empty scheduler and endpoint",
             )
         right = self.origin + math.floor((now - self.origin) / 10) * 10
         unknown = dict(
@@ -177,6 +190,7 @@ class HealthTracker:
             health_load=None,
             health_sampled_at=right,
             health_mixed_window=False,
+            health_reason="closed reference window not ready",
         )
         if right - self.origin < 10:
             return unknown
@@ -188,10 +202,12 @@ class HealthTracker:
             or rows[-1][0] < right - 2
             or any(b[0] - a[0] > 2 for a, b in zip(rows, rows[1:]))
         ):
-            return unknown
+            return dict(unknown, health_reason="reference window sampling gap")
         valid = [r for r in rows if r[2] is not None]
         if not valid:
-            return unknown
+            return dict(
+                unknown, health_reason="no fresh decode shape in reference window"
+            )
         nd, nd_count = collections.Counter(r[2][0] for r in valid).most_common(1)[0]
         context_bin, bin_count = collections.Counter(
             int(r[2][1] // 2048) for r in valid
@@ -205,7 +221,10 @@ class HealthTracker:
             or int(current[2][1] // 2048) != context_bin
             or now - current[0] > 2
         ):
-            return unknown
+            return dict(
+                unknown,
+                health_reason="reference shape changed or below 80% sample purity",
+            )
         measured = self.tokens.score(pool, left, right)
         value = efficiency(
             self.reference,
@@ -222,4 +241,5 @@ class HealthTracker:
             health_load=value.get("reference_load"),
             health_sampled_at=right,
             health_mixed_window=any(r[3] for r in rows),
+            health_reason=value.get("reason", "exact repeated-shape reference"),
         )

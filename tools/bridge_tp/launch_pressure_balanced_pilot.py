@@ -316,7 +316,8 @@ def scene_result(run_dir, name):
         and r["decision"]["target"]["zone"] == "SPARE"
     ]
     if any(
-        r["execution"] == "RESERVED" and r["decision"].get("service_path") != "health"
+        r["execution"] == "RESERVED"
+        and r["decision"].get("service_path") not in {"health", "workload"}
         for r in light
     ):
         raise RuntimeError("actually light pools started migration")
@@ -552,7 +553,16 @@ def run_scene(
                         announce(
                             scene["name"], "排队原因", reasons=status["queue_reasons"]
                         )
-                    if status.get("health"):
+                    if status.get("workload_pressure"):
+                        announce(
+                            scene["name"],
+                            "负载压力",
+                            pools={
+                                key: {k: v for k, v in value.items() if k != "reason"}
+                                for key, value in status["workload_pressure"].items()
+                            },
+                        )
+                    elif status.get("health"):
                         announce(scene["name"], "健康参考", pools=status["health"])
                 else:
                     announce(scene["name"], "等待controller初始化")

@@ -446,8 +446,9 @@ def main():
     modes.add_argument("--cancel-smoke", action="store_true")
     modes.add_argument("--pool-compare", action="store_true")
     modes.add_argument("--pool-compare-pair", action="store_true")
+    modes.add_argument("--workload-pilot", action="store_true")
     args = parser.parse_args()
-    pool_mode = args.pool_compare or args.pool_compare_pair
+    pool_mode = args.pool_compare or args.pool_compare_pair or args.workload_pilot
     repeated = args.health_sustained or args.health_kv_only or args.cancel_smoke
     health_mode = args.health_screen or repeated or pool_mode
     spec = pilot.load_spec(args.spec)
@@ -476,8 +477,13 @@ def main():
         validator = health_screen.validate_sustained
     if pool_mode:
         config = pool_comparison_config(
-            args.spec.parent, pair_only=args.pool_compare_pair
+            args.spec.parent, pair_only=args.pool_compare_pair or args.workload_pilot
         )
+        if args.workload_pilot:
+            config["recipes"] = config["recipes"][:1]
+            config["scope"] = (
+                "one fresh natural-EOS STAY/migration pair; no forced START"
+            )
     else:
         validator(config, inputs)
     if health_mode and config["policy_overrides"] != pilot.read(
@@ -532,6 +538,7 @@ def main():
                     "test_pressure_kv_pilot",
                     "test_pressure_sustained",
                     "test_pressure_health_service",
+                    "test_pressure_workload",
                     "test_pressure_pause_diagnostics",
                     "test_pressure_io",
                     "test_pressure_ingress",
@@ -693,6 +700,34 @@ def main():
                             pool: sum(r["initial_pool"] == pool for r in rows)
                             for pool in ("tp1", "tp4")
                         }
+                        if config["policy_overrides"].get("workload_pressure"):
+                            admissions = [
+                                r
+                                for r in audit
+                                if r.get("kind") == "pressure_admission"
+                            ]
+                            result["passive_pressure_coverage"] = {
+                                pool: dict(
+                                    observed=sum(
+                                        (
+                                            r["pool_readings"][index].get("workload")
+                                            or {}
+                                        ).get("status")
+                                        == "OBSERVED"
+                                        for r in admissions
+                                    ),
+                                    admissions=len(admissions),
+                                )
+                                for index, pool in enumerate(("tp1", "tp4"))
+                            }
+                            result["migration_paths"] = {
+                                name: sum(
+                                    r.get("execution") == "RESERVED"
+                                    and r["decision"]["capacity_path"] == is_kv
+                                    for r in audit
+                                )
+                                for name, is_kv in (("KV", True), ("service", False))
+                            }
         except Exception as error:
             result = dict(status="TECHNICAL_FAILURE", error=repr(error))
         results.append(

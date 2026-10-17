@@ -26,5 +26,6 @@
   "shadow_cancel": true,
   "cancel_sustain_s": 3.0,
   "cancel_recover_eta": 1.0,
-  "pressure_routing": true
+  "pressure_routing": true,
+  "workload_pressure": true
 }

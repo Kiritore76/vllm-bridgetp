@@ -13,6 +13,7 @@ import json
 import math
 from dataclasses import asdict, dataclass, fields, replace
 
+from . import pressure_workload as workload
 from .bounded_length import BoundedLength
 
 VERSION = "pressure-balanced-v2-draft"
@@ -44,6 +45,7 @@ class PressureConfig:
     health_service: bool = False
     # Route from passive health/KV evidence, without fixed prompt cutoffs.
     pressure_routing: bool = False
+    workload_pressure: bool = False
     health_min_efficiency: float = 0.9
     health_target_load: float = 0.8
     survival_horizon: int = 256
@@ -74,6 +76,11 @@ class PressureConfig:
             and type(self.health_service) is bool
             and type(self.pressure_routing) is bool
             and (not self.pressure_routing or self.health_service)
+            and type(self.workload_pressure) is bool
+            and (
+                not self.workload_pressure
+                or (self.health_service and self.sustain_s > 0)
+            )
             and type(self.shadow_cancel) is bool
             and self.cancel_sustain_s > 0
             and (
@@ -129,6 +136,8 @@ class PoolReading:
     health_load: float | None = None
     health_sampled_at: float | None = None
     health_mixed_window: bool = False
+    health_reason: str = "not observed"
+    workload: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -160,6 +169,18 @@ def health_valid(pool, cfg, now):
 
 def health_spare(pool, cfg, now):
     current = classify(pool, cfg, now)
+    if cfg.workload_pressure:
+        return (
+            workload.valid(pool, cfg, now)
+            and pool.workload["load"] <= cfg.health_target_load
+            and pool.pending_prompt_tokens == pool.waiting == 0
+            and current.decode is not None
+            and current.decode <= cfg.leave_ratio
+            and current.prefill is not None
+            and current.prefill <= cfg.spare_ratio
+            and current.capacity is not None
+            and current.capacity < 1
+        )
     return (
         health_valid(pool, cfg, now)
         and pool.health_eta >= cfg.health_min_efficiency
@@ -211,6 +232,14 @@ def classify(pool: PoolReading, cfg: PressureConfig, now: float) -> Pressure:
             step / cfg.prefill_pending_budget if step is not None and step >= 0 else 0,
             pool.waiting / cfg.prefill_waiting_budget,
         )
+    if cfg.workload_pressure and workload.valid(pool, cfg, now):
+        decode = max(decode or 0, pool.workload["load"])
+        prefill = pool.workload["prefill_s"] / cfg.sustain_s
+        missing = [
+            v
+            for v in missing
+            if v not in {"decode service", "prefill service", "prefill step"}
+        ]
     if pool.free_blocks is None or pool.free_blocks < 0:
         capacity = None
         missing.append("physical free blocks")
@@ -316,8 +345,38 @@ class ReservationLedger:
     def routing_reading(self, pool: PoolReading) -> PoolReading:
         """Include dispatched ingress until it appears in scheduler inventory."""
         count, tokens = self.unobserved_ingress(pool.pool_id)
+        value = pool.workload
+        if value and value.get("status") == "OBSERVED":
+            extra = sum(
+                workload.slot_cost(value["profile"], row.prefill_tokens)[0]
+                for row in self.entries.values()
+                if row.pool_id == pool.pool_id
+                and row.kind == "admission"
+                and row.state in {"ACTIVE", "COMMITTED"}
+                and not row.prefill_observed
+            )
+            value = dict(
+                value,
+                load=value["load"] + extra,
+                prefill_s=value["prefill_s"]
+                + tokens * value["profile"]["prefill_s_per_token"],
+            )
         return replace(
             pool,
+            workload=value,
+            unallocated_prompt_blocks=(
+                pool.unallocated_prompt_blocks
+                + sum(
+                    math.ceil(row.prefill_tokens / pool.block_size)
+                    for row in self.entries.values()
+                    if row.pool_id == pool.pool_id
+                    and row.kind == "admission"
+                    and row.state in {"ACTIVE", "COMMITTED"}
+                    and not row.prefill_observed
+                )
+                if pool.unallocated_prompt_blocks is not None and pool.block_size > 0
+                else pool.unallocated_prompt_blocks
+            ),
             idle=pool.idle and count == 0,
             pending_prompt_tokens=pool.pending_prompt_tokens + tokens
             if pool.pending_prompt_tokens is not None
@@ -560,7 +619,7 @@ class PressurePolicy:
                 emergency,
                 required,
                 config_sha256=cfg.sha256,
-                service_path="health"
+                service_path=("workload" if cfg.workload_pressure else "health")
                 if cfg.health_service and not emergency
                 else "legacy",
             )
@@ -588,6 +647,17 @@ class PressurePolicy:
                     and source.health_status == "SUPPORTED"
                     and source.health_eta < cfg.health_min_efficiency
                     and health_spare(target, cfg, now)
+                )
+            if cfg.workload_pressure:
+                needed = (
+                    workload.valid(source, cfg, now)
+                    and health_spare(target, cfg, now)
+                    and (
+                        source.workload["load"] >= cfg.leave_ratio
+                        or source.workload["prefill_s"] / cfg.sustain_s
+                        >= cfg.leave_ratio
+                        or (s.decode is not None and s.decode >= cfg.enter_ratio)
+                    )
                 )
             if not needed:
                 self._since = None
@@ -732,7 +802,10 @@ class PressurePolicy:
             if not emergency:
                 if cfg.health_service:
                     if (
-                        not c.target_health_after_supported
+                        (
+                            not cfg.workload_pressure
+                            and not c.target_health_after_supported
+                        )
                         or not valid_costs
                         or t.decode is None
                         or t.prefill is None
@@ -843,6 +916,7 @@ class Admission:
     routing_reason: str = ""
     reservation_basis: str = "none"
     routing_capacity: dict | None = None
+    routing_pressure: dict | None = None
 
 
 def prompt_fit(pool, prompt_tokens, ledger, cfg, now):
@@ -946,6 +1020,7 @@ def admit(
         if cfg.pressure_routing:
             prefer_target = source_needs_relief and health_spare(target, cfg, now)
     preferred = pools[1] if prefer_target else pools[0]
+    projected = None
     routing_reason = (
         "very long known prompt"
         if prefer_target and prompt_tokens >= cfg.very_long_prompt_tokens
@@ -955,6 +1030,56 @@ def admit(
     )
     if cfg.pressure_routing:
         routing_reason = "TP1 pressure and TP4 spare" if prefer_target else "prefer TP1"
+    if cfg.workload_pressure and routing_strategy == "pressure":
+        projected = {}
+        for reading in (source, target):
+            pending_blocks, pending_decode, _ = ledger.pending(reading.pool_id)
+            service = workload.projected(
+                reading, prompt_tokens, cfg, now, pending_decode
+            )
+            capacity = classify(reading, cfg, now).capacity
+            if capacity is not None and reading.free_blocks is not None:
+                capacity += (
+                    pending_blocks + math.ceil(prompt_tokens / reading.block_size)
+                ) / max(1, reading.free_blocks)
+            projected[reading.pool_id] = dict(
+                service=service,
+                capacity=capacity,
+                score=max(service, capacity or 0) if service is not None else None,
+            )
+        a, b = (projected[pool.pool_id]["score"] for pool in pools)
+        ac, bc = (projected[pool.pool_id]["capacity"] for pool in pools)
+        if (
+            a is not None
+            and b is not None
+            and ac is not None
+            and bc is not None
+            and ac >= 1 > bc
+        ):
+            preferred = pools[1]
+            routing_reason = "TP1 projected KV warning; TP4 physical headroom"
+        elif a is not None and a <= cfg.leave_ratio:
+            preferred = pools[0]
+            routing_reason = "TP1 projected workload and KV within efficient budget"
+        elif b is not None and (a is None or b < a):
+            preferred = pools[1]
+            routing_reason = "lower projected pressure on TP4"
+        elif a is not None:
+            preferred = pools[0]
+            routing_reason = "lower projected pressure on TP1"
+        else:
+            counts = [
+                sum(
+                    row.pool_id == pool.pool_id
+                    and row.kind == "admission"
+                    and row.state in {"ACTIVE", "COMMITTED", "ACCOUNTED"}
+                    for row in ledger.entries.values()
+                )
+                for pool in pools
+            ]
+            index = min(range(2), key=lambda i: (counts[i] + 1) / routing_weights[i])
+            preferred = pools[index]
+            routing_reason = "telemetry unavailable; normalized least-inflight fallback"
     if routing_strategy != "pressure":
         counts = [
             sum(
@@ -1011,4 +1136,5 @@ def admit(
         key,
         routing_reason,
         routing_capacity=capacity,
+        routing_pressure=projected,
     )
