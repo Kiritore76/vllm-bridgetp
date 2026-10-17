@@ -37,7 +37,9 @@ from train_length_predictor import load_examples, read_jsonl, sha256_file
 ROOT = Path(__file__).resolve().parents[2]
 BRANCH = "bridgetp/pressure-balanced-controller"
 REFERENCE_SHA = "dbe02d968e19c32d69deaa9a37748e9ca68f506807b220c114d22a4e2845c8a7"
-REFERENCE_DIR = "predictor-risk76-mlp2-mlp4-v1-20261011T093049Z-1353/train-mlp4-50pct"
+REFERENCE_CHECKPOINT = (
+    ROOT / "experiments/phase9/pressure_balanced_v2/artifacts/predictor_distribution.pt"
+)
 
 
 def write(path, value):
@@ -347,10 +349,7 @@ def main():
 
     torch.set_num_threads(4)
     args.out_dir.mkdir(parents=True, exist_ok=False)
-    reference = (
-        args.reference_checkpoint
-        or args.results / REFERENCE_DIR / "predictor_distribution.pt"
-    )
+    reference = args.reference_checkpoint or REFERENCE_CHECKPOINT
     if sha256_file(reference) != REFERENCE_SHA:
         raise ValueError("reference classifier differs")
     write(

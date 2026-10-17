@@ -66,8 +66,25 @@ def load_spec(path):
         resolved.relative_to(ROOT)
         return str(resolved)
 
-    for key in ("policy_config", "service_evidence", "controller_config_template"):
+    for key in (
+        "policy_config",
+        "service_evidence",
+        "controller_config_template",
+        "checkpoint",
+    ):
         spec[key] = resolve(spec[key])
+    subprocess.run(
+        [
+            "git",
+            "ls-files",
+            "--error-unmatch",
+            "--",
+            Path(spec["checkpoint"]).relative_to(ROOT).as_posix(),
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+    )
     if spec.get("health_reference"):
         spec["health_reference"] = resolve(spec["health_reference"])
     for scene in spec["scenarios"]:

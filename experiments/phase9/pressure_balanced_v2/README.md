@@ -5,7 +5,10 @@ and launcher are versioned together. No separate input archive or file upload is
 needed. The workload remains the same as the v2 pilot. Decode/migration trigger
 thresholds are unchanged; revised prefill admission and service support are below.
 These reused development-family inputs are for function checks, not independent
-benefit evaluation. Model weights, predictor checkpoint and results stay outside Git.
+benefit evaluation. The frozen 6,422,081-byte predictor checkpoint is tracked at
+`artifacts/predictor_distribution.pt`. Its original SHA remains unchanged.
+The launcher resolves it against the repository root and requires Git tracking;
+no old results directory is needed. Large model weights and results stay outside Git.
 
 On the existing five-A100 server, update the clean checkout on
 `bridgetp/pressure-balanced-controller` using SSH22, then run from
@@ -22,7 +25,7 @@ formal requests and FUNCTION_OBSERVED before running the four function scenes:
 bash tools/bridge_tp/run_pressure_pilot.sh --full
 ```
 
-The launcher preserves the original venv/model/checkpoint paths and five-GPU
+The launcher preserves the original venv/model paths and repository predictor and five-GPU
 checks. It validates file/input/model SHA, actual serving/stager argv and the
 rolling/session/bootstrap CPU regression before starting servers. Dirty work is
 backed up and the run stops without reset/stash/clean. All result paths are fresh.

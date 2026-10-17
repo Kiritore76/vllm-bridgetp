@@ -114,7 +114,7 @@ export BRIDGETP_DUMP_STRICT=1
 
 ## 6. 文档与历史维护
 
-后续修改直接更新本README和必要的实验契约，不再在Python包中新增按日期/阶段命名的计划、验证结果或指标修订副本。结果报告保留在工作区`control/`，大数据、模型、checkpoint与压缩结果不提交Git。
+后续修改直接更新本README和必要的实验契约，不再在Python包中新增按日期/阶段命名的计划、验证结果或指标修订副本。结果报告保留在工作区`control/`，大数据、大模型与压缩结果不提交Git。当前开发分支固定使用的小型分类预测器权重纳入Git，位于`experiments/phase9/pressure_balanced_v2/artifacts/predictor_distribution.pt`，大小6,422,081字节；运行时从仓库根目录解析并核验SHA，不再依赖旧results目录。
 
 旧文件覆盖了Phase1至9、M0、GoodOutput各版、Shadow与remote-attention研究路线；删除的是这些历史说明，不是相应Python实现或实验输入。需要查阅删除前版本时，在仓库中执行：
 

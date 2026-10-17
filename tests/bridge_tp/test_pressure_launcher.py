@@ -71,6 +71,7 @@ class LauncherTests(unittest.TestCase):
                 policy_config="policy.json",
                 service_evidence="evidence.json",
                 controller_config_template="controller.json",
+                checkpoint="artifacts/predictor.pt",
                 scenarios=[dict(name="both-light", arrivals="arrivals.json")],
             )
             path.write_text(json.dumps(spec), encoding="utf-8")
@@ -85,6 +86,11 @@ class LauncherTests(unittest.TestCase):
             self.assertEqual(resolved["expected_head"], "abc123")
             self.assertEqual(resolved["bundle_spec_sha256"], launch.sha(path))
             self.assertEqual(resolved["policy_config"], str(root / "policy.json"))
+            self.assertEqual(
+                resolved["checkpoint"], str(root / "artifacts/predictor.pt")
+            )
+            self.assertEqual(tracked.call_count, 2)
+            self.assertEqual(tracked.call_args.args[0][-1], "artifacts/predictor.pt")
             self.assertEqual(
                 resolved["scenarios"][0]["arrivals"], str(root / "arrivals.json")
             )
@@ -112,6 +118,33 @@ class LauncherTests(unittest.TestCase):
                 self.assertRaises(ValueError),
             ):
                 launch.load_spec(path)
+
+    def test_git_bundle_checkpoint_cannot_escape_checkout(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as folder:
+            root = Path(folder).resolve()
+            path = root / "pilot_spec.json"
+            for checkpoint in ("../outside.pt", str(root.parent / "outside.pt")):
+                with self.subTest(checkpoint=checkpoint):
+                    path.write_text(
+                        json.dumps(
+                            dict(
+                                identity_mode="git-tracked-bundle-v1",
+                                policy_config="policy.json",
+                                service_evidence="evidence.json",
+                                controller_config_template="controller.json",
+                                checkpoint=checkpoint,
+                            )
+                        )
+                    )
+                    with (
+                        patch.object(launch, "ROOT", root),
+                        patch.object(launch.subprocess, "run"),
+                        patch.object(
+                            launch.subprocess, "check_output", return_value="abc123\n"
+                        ),
+                        self.assertRaises(ValueError),
+                    ):
+                        launch.load_spec(path)
 
     def test_legacy_frozen_external_spec_keeps_exact_head_contract(self):
         with tempfile.TemporaryDirectory() as folder:
