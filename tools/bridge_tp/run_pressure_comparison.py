@@ -92,7 +92,9 @@ def arrivals(inputs, recipe):
     ]
 
 
-def pool_comparison_config(bundle, *, pair_only=False, first_repetition_only=False):
+def pool_comparison_config(
+    bundle, *, pair_only=False, first_repetition_only=False, migrate_only=False
+):
     """Reuse tracked prompts and measured weights; never issue calibration probes."""
     reference_path = bundle / "health_reference_v2.json"
     reference = pilot.read(reference_path)
@@ -147,12 +149,14 @@ def pool_comparison_config(bundle, *, pair_only=False, first_repetition_only=Fal
                 jobs=jobs,
             )
         )
-    if first_repetition_only:
+    if first_repetition_only or migrate_only:
         recipes = recipes[:1]
     return dict(
         schema="PRESSURE_POOL_COMPARISON_V1",
         pool_comparison=True,
-        arms=["stay", "migrate"]
+        arms=["migrate"]
+        if migrate_only
+        else ["stay", "migrate"]
         if pair_only
         else ["weighted", "least", "stay", "migrate"],
         maximum_migrations=0,
@@ -181,6 +185,19 @@ def pool_acceptance(root, results, config, common):
     groups = []
     for recipe in config["recipes"]:
         arms = {r["arm"]: r for r in results if r["pair"] == recipe["name"]}
+        if config["arms"] == ["migrate"]:
+            groups.append(
+                dict(
+                    repetition=recipe["repetition"],
+                    arrivals_valid=all(
+                        r["fixed_arrivals_valid"] for r in arms.values()
+                    ),
+                    arms=arms,
+                    comparison_available=False,
+                    note="single-arm pause retest; no paired benefit estimate",
+                )
+            )
+            continue
         stay, move = arms["stay"], arms["migrate"]
         parity = {
             arm: dict(
@@ -448,12 +465,14 @@ def main():
     modes.add_argument("--cancel-smoke", action="store_true")
     modes.add_argument("--pool-compare", action="store_true")
     modes.add_argument("--pool-compare-r1", action="store_true")
+    modes.add_argument("--pool-compare-r1-migrate", action="store_true")
     modes.add_argument("--pool-compare-pair", action="store_true")
     modes.add_argument("--workload-pilot", action="store_true")
     args = parser.parse_args()
     pool_mode = (
         args.pool_compare
         or args.pool_compare_r1
+        or args.pool_compare_r1_migrate
         or args.pool_compare_pair
         or args.workload_pilot
     )
@@ -488,6 +507,7 @@ def main():
             args.spec.parent,
             pair_only=args.pool_compare_pair or args.workload_pilot,
             first_repetition_only=args.pool_compare_r1,
+            migrate_only=args.pool_compare_r1_migrate,
         )
         if args.workload_pilot:
             config["recipes"] = config["recipes"][:1]

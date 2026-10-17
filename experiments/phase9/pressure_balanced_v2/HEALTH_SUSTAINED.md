@@ -310,3 +310,7 @@ This selector does not force migrations, relax the 1s arrival limit or change
 the existing CPU, host, GC and GPU tracing. The original failed run remains
 evidence; a successful retest does not establish the cause of its shared pause.
 All four scenes run through complete drain and are packaged automatically.
+
+For a single MIGRATE pause retest use `--pool-compare-r1-migrate`. It
+selects exactly the same first-seed jobs, retains all telemetry and complete
+drain, and reports arrival validity without inventing a STAY comparison.

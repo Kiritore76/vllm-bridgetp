@@ -17,6 +17,23 @@ BUNDLE = ROOT / "experiments/phase9/pressure_balanced_v2"
 
 
 class ComparisonTests(unittest.TestCase):
+    def test_migrate_retest_uses_exact_r1_jobs_and_has_no_paired_benefit(self):
+        full = compare.pool_comparison_config(BUNDLE)
+        selected = compare.pool_comparison_config(BUNDLE, migrate_only=True)
+        self.assertEqual(selected["recipes"], full["recipes"][:1])
+        self.assertEqual(selected["arms"], ["migrate"])
+        written = []
+        common = SimpleNamespace(write_json=lambda path, value: written.append(value))
+        for valid in (True, False):
+            rows = [
+                dict(arm="migrate", pair="pool-mixed-r1", fixed_arrivals_valid=valid)
+            ]
+            rc = compare.pool_acceptance(Path("unused"), rows, selected, common)
+            self.assertEqual(rc, 0 if valid else 1)
+            result = written[-1]["repetitions"][0]
+            self.assertFalse(result["comparison_available"])
+            self.assertNotIn("migration_delta_G", result)
+
     def test_r1_retest_preserves_all_four_arms_and_exact_first_seed_inputs(self):
         full = compare.pool_comparison_config(BUNDLE)
         selected = compare.pool_comparison_config(BUNDLE, first_repetition_only=True)
