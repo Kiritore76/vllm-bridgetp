@@ -94,6 +94,8 @@ GPU残留进程清理前必须核对PID、父进程、进程组、命令及本�
 
 历史D3中052的pending-tail边界修复补跑不能直接与旧HEAD的49条混成同版本正式50条队列；需要恢复旧手册或结论时使用其对应Git版本。单点agreement、合成CUDA/NCCL或远端Attention实验不能外推为真实请求SLO、最大容量或跨平台统计结论。
 
+logits诊断需显式核对请求ID过滤、捕获索引集合与global offset，分别识别control和迁移流；不能沿用旧实验的固定token ID、K、KV块数或本机trace路径。拓扑probe对共同prefix的重算不等同于迁移请求在原数值状态下的现场logits。
+
 旧收益模型入口仍需真实`calibration_source`并回放检查边界；压力入口不会把旧收益模型参数伪装成当前压力指标。保留旧代码用于复现，不继续使用旧阶段文档作为现行配置来源。
 
 ### 请求级导出诊断
@@ -121,6 +123,4 @@ git log --all -- vllm/bridge_tp
 git show cb1476f:vllm/bridge_tp/PHASE1_9_OVERVIEW.md
 ```
 
-具体结果必须回到对应归档和SHA，不从历史文档的“已通过”“尚未执行”等文字推断当前系统状态。本地未提交的手册/分析稿先保留，不能被文档清理连同用户工作覆盖。
-
-本地旧分支中保留的未提交工作稿：PHASE9_NUMERICAL_FIDELITY_RUNBOOK.md、PHASE9_SERVER_TEST.md、PHASE9_DIVERGENCE_ANALYSIS.md；本次清理未修改其内容。
+具体结果必须回到对应归档和SHA，不从历史文档的“已通过”“尚未执行”等文字推断当前系统状态。未提交工作清理前先比对并备份；有用说明合并到本文件后再删除原稿。
