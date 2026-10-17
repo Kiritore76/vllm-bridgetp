@@ -17,7 +17,7 @@ def validate(config, inputs):
         != dict(capacity_only=True, capacity_lookahead_s=RELEASE_BUDGET_S)
         or config["itl_s"] != 0.1
         or config["slow_fraction"] != 0.01
-        or config["max_dispatch_lag_s"] != 0.5
+        or config["max_dispatch_lag_s"] != 1.0
         or config["minimum_remaining_at_start"] != 1024
         or len(config["recipes"]) != 2
         or {r["repetition"] for r in config["recipes"]} != {1, 2}

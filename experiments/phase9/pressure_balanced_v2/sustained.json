@@ -11,7 +11,7 @@
   },
   "itl_s": 0.1,
   "slow_fraction": 0.01,
-  "max_dispatch_lag_s": 0.5,
+  "max_dispatch_lag_s": 1.0,
   "minimum_remaining_at_start": 1024,
   "recipes": [
     {

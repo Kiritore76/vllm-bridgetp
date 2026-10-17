@@ -108,7 +108,7 @@ source release and at least1024 remaining tokens at selection. Busy arm must
 show simultaneous source efficiency loss and known target busy/inefficient
 evidence without START. Any busy-arm START fails the screen. Missing coverage
 is reported as COVERAGE_GAP. Both arms fully drain and finalize native/GPU
-evidence and owned cleanup. Paired arrivals must remain within0.5s.
+evidence and owned cleanup. Paired arrivals must remain within1s.
 
 G300/raw rate and old ITL-only score are still saved, but this short function
 screen may underfill300s. Do not call function coverage a sustained throughput

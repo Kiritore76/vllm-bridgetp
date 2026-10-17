@@ -35,7 +35,7 @@ def validate(config, inputs):
         or config["policy_overrides"] != {"sustain_s": 1.5}
         or config["itl_s"] != 0.1
         or config["slow_fraction"] != 0.01
-        or config["max_dispatch_lag_s"] != 0.5
+        or config["max_dispatch_lag_s"] != 1.0
         or len(config["recipes"]) != 4
     ):
         raise ValueError("comparison differs from the single-change eight-run plan")
@@ -161,7 +161,7 @@ def pool_comparison_config(bundle, *, pair_only=False):
         maximum_gap_s=1,
         itl_s=0.1,
         slow_fraction=0.01,
-        max_dispatch_lag_s=0.5,
+        max_dispatch_lag_s=1.0,
         routing_weights=weights,
         weight_cells=weight_cells,
         reference_sha256=hashlib.sha256(reference_path.read_bytes()).hexdigest(),

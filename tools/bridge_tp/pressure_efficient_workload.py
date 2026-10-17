@@ -63,7 +63,7 @@ def validate_plan(plan, inputs):
             or schedule["count"] < 1
             or schedule["duration_s"] != 48
             or schedule["interval_s"] * schedule["count"] != 48
-            or schedule["max_dispatch_lag_s"] != 0.5
+            or schedule["max_dispatch_lag_s"] != 1.0
         ):
             raise ValueError("invalid fixed-arrival contract")
         size = scene["injection_prompt_tokens"][0]

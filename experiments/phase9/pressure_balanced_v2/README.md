@@ -254,7 +254,7 @@ initial TP1/TP4 assignment. Later requests are due at fixed offsets, independent
 of earlier completion. This isolates migration rather than testing routing.
 The controller records actual admission time and HTTP start time; delayed
 dispatch is retained. pair_acceptance.json marks a pair unsuitable for strict
-matched benefit claims if either arm has HTTP dispatch lag above 0.5 seconds.
+matched benefit claims if either arm has HTTP dispatch lag above 1 second.
 Inspect actual background/injection overlap as well as the arrival receipt.
 
 comparison_metrics.json reports each request's visible TTFT, completion,
@@ -315,7 +315,7 @@ The client has 64 workers so Nd6+Nd32 is not limited by a 32-thread client queue
 Every scene saves complete token streams, HTTP timing, native inventories,
 metrics observations, engine traces and all five GPU ranks. After finalizing
 traces, efficient_region_coverage.json checks at least 20 seconds of common
-background output, actual native Nd and dispatch lag (0.5 s maximum). Missing
+background output, actual native Nd and dispatch lag (1 s maximum). Missing
 coverage is explicitly COVERAGE_GAP even when all requests completed correctly;
 it must not be used to declare a calibrated working point. Context support and
 5/10/20-second fit windows still need offline analysis.

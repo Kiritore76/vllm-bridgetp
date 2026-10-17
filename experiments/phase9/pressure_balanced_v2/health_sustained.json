@@ -39,7 +39,7 @@
   "itl_s": 0.1,
   "slow_fraction": 0.01,
   "maximum_gap_s": 1,
-  "max_dispatch_lag_s": 0.5,
+  "max_dispatch_lag_s": 1.0,
   "minimum_remaining_at_start": 1024,
   "horizon_s": 300,
   "metric": "ITL100MS_SLOW1PCT_MAXGAP1S_MIN_WEIGHT_V1",

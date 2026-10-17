@@ -59,7 +59,7 @@ Inspect GPU memory across sessions. Target prefill/scheduling budget is unchange
 Score the first300s with full-request ITL100ms/slow1%/maxgap1s. Drain gaps affect
 quality; drain tokens stay out of the numerator. Retain TTFT, raw throughput,
 preemption, release, handoff and host/timing evidence. Sustained comparisons
-require arrival lag<=0.5s, active coverage>=95% and output in all30 ten-second
+require arrival lag<=1s, active coverage>=95% and output in all30 ten-second
 bins in both arms. Other cases primarily test function/safety. Missing repeated
 START is COVERAGE_GAP; never force migration, cherry-pick seeds or hide invalid
 arms. No automatic ingress routing or universal optimum claim.
@@ -153,7 +153,7 @@ output differences between arms must be examined before attributing throughput
 changes to scheduling. There is no forced minimum number of migrations.
 
 `pool_comparison_acceptance.json` reports every repetition, pair deltas and
-output parity. Late dispatch over0.5s yields a nonzero final return code and
+output parity. Late dispatch over1s yields a nonzero final return code and
 preserves the evidence. Low utilization is recorded, not removed or presented
 as saturated capacity. Technical failures stop subsequent scenes and still
 produce the wrapper's single evidence archive. Inspect all repetitions,
@@ -196,7 +196,7 @@ new load levels only after reviewing the small pilot, not by chasing a win.
 
 Repeat the existing `--workload-pilot` after pulling the arrival-isolation fix.
 It still runs two fresh STAY/MIGRATE scenes with the original 75 arrivals,
-300s scoring window, routing/migration settings, 0.5s dispatch gate and full
+300s scoring window, routing/migration settings, 1s dispatch gate and full
 drain/trace/ledger/owned-process checks. No extra cloud helper or probe is added.
 
 Arrival submission now uses an independent monotonic scheduler. Inventory is

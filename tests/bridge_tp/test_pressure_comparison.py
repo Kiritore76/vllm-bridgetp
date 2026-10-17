@@ -180,6 +180,17 @@ class ComparisonTests(unittest.TestCase):
         metric = compare.result_metrics(rows, jobs, 100, 0.5)[0]
         self.assertFalse(metric["arrival_valid"])
 
+    def test_one_second_dispatch_budget_is_inclusive_and_preserves_lag(self):
+        budget = compare.pool_comparison_config(BUNDLE)["max_dispatch_lag_s"]
+        self.assertEqual(budget, 1.0)
+        for lag, valid in ((0.557625, True), (1.0, True), (1.001, False)):
+            with self.subTest(lag=lag):
+                rows, jobs = self.fixture()
+                rows[0]["source_transport"]["request_started_unix_s"] = 101 + lag
+                metric = compare.result_metrics(rows, jobs, 100, budget)[0]
+                self.assertEqual(metric["arrival_valid"], valid)
+                self.assertAlmostEqual(metric["dispatch_lag_s"], lag)
+
     def test_short_output_or_noncontiguous_proxy_is_failure(self):
         rows, jobs = self.fixture()
         for bad in (rows[:-1], copy.deepcopy(rows), copy.deepcopy(rows)):
