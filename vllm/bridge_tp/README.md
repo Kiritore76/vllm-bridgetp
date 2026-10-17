@@ -6,7 +6,7 @@
 
 BridgeTP在vLLM之上实现TP1/TP4实例间分流，以及TP1请求的滚动KV搬运、目标接管与源端释放。实例内部排队、prefill、decode和抢占仍由vLLM调度。当前压力控制器不增加“预留完整未来输出后才允许请求进入”的外部准入门槛。
 
-当前开发分支为`bridgetp/predictor-nonuniform84-20261010`。旧`bridgetp/m5-predictor-integration`等分支保留的是历史控制器；不能因为看到同名README就认为该checkout具备最新压力入口。切换前先保存并核对工作区，禁止覆盖未提交修改。
+当前开发分支为`bridgetp/pressure-balanced-controller`。旧`bridgetp/m5-predictor-integration`等分支保留的是历史控制器；不能因为看到同名README就认为该checkout具备最新压力入口。切换前先保存并核对工作区，禁止覆盖未提交修改。
 
 | 功能 | 当前入口 |
 |---|---|
@@ -37,7 +37,7 @@ BridgeTP在vLLM之上实现TP1/TP4实例间分流，以及TP1请求的滚动KV�
 - 当前pressure pilot使用FULL_SPEED：速率0表示不限速，history pacing关闭。最终边界合并等待与带宽限速是不同机制，不得静默恢复限速。
 - 旧health参考UNKNOWN不等于新workload压力不可用；新库存缺失/过期时必须记录并按归一化最少在途回退。缺少迁移证据时不启动实际迁移。
 
-配置数值以[`health_service_policy.json`](https://github.com/Kiritore76/vllm-bridgetp/blob/bridgetp/predictor-nonuniform84-20261010/experiments/phase9/pressure_balanced_v2/health_service_policy.json)和对应运行包为准；参考推导、场景契约见[`HEALTH_SUSTAINED.md`](https://github.com/Kiritore76/vllm-bridgetp/blob/bridgetp/predictor-nonuniform84-20261010/experiments/phase9/pressure_balanced_v2/HEALTH_SUSTAINED.md)。修改被SHA清单覆盖的代码、输入或配置后，要同步更新清单并完成CPU检查。
+配置数值以[`health_service_policy.json`](https://github.com/Kiritore76/vllm-bridgetp/blob/bridgetp/pressure-balanced-controller/experiments/phase9/pressure_balanced_v2/health_service_policy.json)和对应运行包为准；参考推导、场景契约见[`HEALTH_SUSTAINED.md`](https://github.com/Kiritore76/vllm-bridgetp/blob/bridgetp/pressure-balanced-controller/experiments/phase9/pressure_balanced_v2/HEALTH_SUSTAINED.md)。修改被SHA清单覆盖的代码、输入或配置后，要同步更新清单并完成CPU检查。
 
 ## 3. 运行与结果收集
 
@@ -45,7 +45,7 @@ BridgeTP在vLLM之上实现TP1/TP4实例间分流，以及TP1请求的滚动KV�
 
 ```bash
 cd /root/autodl-tmp/bridgetp/vllm_bridge
-git pull --ff-only origin bridgetp/predictor-nonuniform84-20261010 &&
+git pull --ff-only origin bridgetp/pressure-balanced-controller &&
 bash tools/bridge_tp/run_pressure_pilot.sh --pool-compare
 ```
 
@@ -69,7 +69,7 @@ GPU残留进程清理前必须核对PID、父进程、进程组、命令及本�
 
 ## 4. 评测规则与证据边界
 
-当前压力实验定义集中在[`EVALUATION_STANDARD_CN.md`](https://github.com/Kiritore76/vllm-bridgetp/blob/bridgetp/predictor-nonuniform84-20261010/experiments/phase9/pressure_balanced_v2/EVALUATION_STANDARD_CN.md)，不得混用历史v1至v6的TTFT/E2E/50ms门槛。
+当前压力实验定义集中在[`EVALUATION_STANDARD_CN.md`](https://github.com/Kiritore76/vllm-bridgetp/blob/bridgetp/pressure-balanced-controller/experiments/phase9/pressure_balanced_v2/EVALUATION_STANDARD_CN.md)，不得混用历史v1至v6的TTFT/E2E/50ms门槛。
 
 - 每场公共窗口300秒，吞吐只计窗口内客户端实际输出token，不计prompt与窗口外drain；完整收尾质量仍作用于窗口内token。
 - 软权重`w=min(1,0.01/f,1/m)`，f为完整请求超过100ms的输出间隔比例，m为最大间隔秒数；分母为0的项按1处理。软goodoutput是窗口内token乘权重后除以时间。
