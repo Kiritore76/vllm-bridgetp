@@ -367,3 +367,22 @@ workload模式不再因load/prefill单独偏高启动，需同时有新鲜输出
 和评分不变。KV预测耗尽仍直接绕过服务确认，保留安全优先级。新计数字段缺失
 时仅阻止普通服务迁移，不伪造历史证据。该策略为待pilot验证的工程收紧，
 不能用离线门槛回放推断未迁移后的压力、路由或goodoutput。
+
+
+## 2026-10-17：恢复用户要求的全速搬运
+
+此前pilot启动器错误启用了BRIDGETP_GPU_DIRECT_HISTORY_PACING=1，且M2会
+动态发布0.5/2.4/8GiB/s，054648包并非全速搬运证据。恢复FULL_SPEED：
+启动环境显式history pacing=0、BRIDGETP_STREAM_RATE_GIB_S=0；控制器
+arm和后续tick都发布rate_gib_s=0（协议语义为不限速），不实例化/调用M2。
+历史与delta的带宽节流均关闭；原有批量合并、边界等待与持久信道不变。
+模板和build_scene均显式FULL_SPEED，避免继承环境或旧模板悄悄启用节流。
+
+前端显示迁移全速模式，收尾生成full_speed_receipt.json：实际速率日志须
+为FULL_SPEED/0，runtime control不能包含非零限速；所有实际history sender
+回执必须history_pacing_enabled=false、sleep_ms=0、pacing_chunk_count=0。
+不满足则本场失败；无迁移不算全速传输性能覆盖。旧正数M2参数只供显式
+ADAPTIVE兼容模式读取，在FULL_SPEED下不生效；不以8GiB/s冒充全速。
+
+先按原--workload-pilot跑一对STAY/MIGRATE，使用852ba87的启动门槛修复。
+与054648相比同时有门槛与搬运模式变化，不能将全部差异归因于单项修改。

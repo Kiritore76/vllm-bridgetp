@@ -143,6 +143,7 @@ def build_scene(spec, scene, run_root, common, args):
     config_path = run_root / scene["name"] / "controller_config.json"
     config = read(spec["controller_config_template"])
     config.update(
+        transfer_mode="FULL_SPEED",
         source_url=f"http://127.0.0.1:{args.tp1_port}",
         target_url=f"http://127.0.0.1:{args.tp4_port}",
         run_dir=str(run_dir),
@@ -162,7 +163,8 @@ def build_scene(spec, scene, run_root, common, args):
         VLLM_DISABLE_COMPILE_CACHE="1",
         BRIDGETP_SHADOW_STRATEGY="S_NEW_OLD",
         BRIDGETP_REQUEST_FREEZE_ENABLED="1",
-        BRIDGETP_GPU_DIRECT_HISTORY_PACING="1",
+        BRIDGETP_GPU_DIRECT_HISTORY_PACING="0",
+        BRIDGETP_STREAM_RATE_GIB_S="0",
         BRIDGETP_PREDICTOR_LIVE_CHECKPOINT=spec["checkpoint"],
         BRIDGETP_PREDICTOR_LIVE_SHA256=spec["checkpoint_sha256"],
         BRIDGETP_PREDICTOR_LIVE_EVENTS=str(run_dir / "predictor_events.jsonl"),
@@ -278,6 +280,48 @@ def build_scene(spec, scene, run_root, common, args):
         target_argv=target_argv,
         stager_argv=stager_argv,
         controller_argv=argv,
+    )
+
+
+def verify_full_speed(run_dir):
+    """Validate actual controls and history receipts, not only launch intent."""
+    starts = 0
+    with (run_dir / "pressure_audit.jsonl").open(encoding="utf-8") as stream:
+        for line in stream:
+            row = json.loads(line)
+            if row.get("kind") == "pressure_actual_start":
+                rate = row["rate"]
+                starts += 1
+            elif row.get("kind") == "pressure_m2_rate":
+                rate = row["decision"]
+            else:
+                continue
+            if rate["profile"] != "FULL_SPEED" or rate["rate_bytes_s"] != 0:
+                raise RuntimeError("full-speed run published a rate limit")
+    controls = list(run_dir.glob("sessions/*/runtime_control.json"))
+    controls += list(run_dir.glob("runtime_control.json"))
+    for path in controls:
+        if read(path).get("rate_gib_s") not in (None, 0):
+            raise RuntimeError("full-speed runtime control contains a rate limit")
+    senders = list(run_dir.glob("sessions/*/gpu_direct_sender.json"))
+    senders += list(run_dir.glob("gpu_direct_sender.json"))
+    ranks = 0
+    for path in senders:
+        for rank in read(path)["ranks"]:
+            if (
+                rank.get("history_pacing_enabled") is not False
+                or rank.get("history_pacing_sleep_ms") != 0
+                or rank.get("history_pacing_chunk_count") != 0
+            ):
+                raise RuntimeError("full-speed history receipt reports pacing")
+            ranks += 1
+    return dict(
+        status="COMPLETED",
+        transfer_mode="FULL_SPEED",
+        actual_starts=starts,
+        history_sender_receipts=len(senders),
+        history_rank_receipts=ranks,
+        note="zero means unlimited; no migration is not transport coverage",
     )
 
 
@@ -415,8 +459,11 @@ def run_scene(
 
         mechanism_dir = initialize(plan["run_dir"])
     common.write_json(plan["config_path"], plan["config"])
+    if plan["config"].get("transfer_mode") == "FULL_SPEED":
+        announce(scene["name"], "迁移全速：历史pacing关闭，M2动态限速关闭")
     RuntimeControl(
         armed=False,
+        rate_gib_s=0 if plan["config"].get("transfer_mode") == "FULL_SPEED" else None,
         migration_id=scene["name"],
         source_request_id_prefix="pressure-unselected-" + secrets.token_hex(16),
     ).write(mechanism_dir)
@@ -583,6 +630,12 @@ def run_scene(
             raise subprocess.CalledProcessError(
                 worker.process.returncode, plan["controller_argv"]
             )
+        if plan["config"].get("transfer_mode") == "FULL_SPEED":
+            common.write_json(
+                plan["run_dir"] / "full_speed_receipt.json",
+                verify_full_speed(plan["run_dir"]),
+            )
+            announce(scene["name"], "全速检查通过：历史pacing关闭，运行时限速为0")
         if before_shutdown is not None:
             before_shutdown(plan)
     finally:

@@ -64,5 +64,6 @@
     "per_running_s": 0.0
   },
   "ready_notification_mode": "UDP",
-  "ready_notification_port": 30300
+  "ready_notification_port": 30300,
+  "transfer_mode": "FULL_SPEED"
 }

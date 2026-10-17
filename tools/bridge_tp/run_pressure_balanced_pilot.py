@@ -136,6 +136,7 @@ def preflight(args):
             )
         },
         rate=SimpleNamespace(**raw["rate"]),
+        transfer_mode=raw.get("transfer_mode", "ADAPTIVE"),
         policy=SimpleNamespace(kv_bytes_per_token=raw["policy"]["kv_bytes_per_token"]),
         ready_notification_mode=raw.get("ready_notification_mode", "FILE_POLL"),
         ready_notification_port=raw.get("ready_notification_port", 0),
@@ -148,11 +149,14 @@ def preflight(args):
         or controller.policy.kv_bytes_per_token <= 0
     ):
         raise ValueError("pilot geometry/2000-token guard contract differs")
-    load("manager_m2").M2RateConfig(
-        low_bytes_s=controller.rate.b_min_bytes_s,
-        medium_bytes_s=controller.rate.b_start_bytes_s,
-        high_bytes_s=controller.rate.b_max_bytes_s,
-    ).validate()
+    if controller.transfer_mode not in {"FULL_SPEED", "ADAPTIVE"}:
+        raise ValueError("unknown pressure transfer_mode")
+    if controller.transfer_mode == "ADAPTIVE":
+        load("manager_m2").M2RateConfig(
+            low_bytes_s=controller.rate.b_min_bytes_s,
+            medium_bytes_s=controller.rate.b_start_bytes_s,
+            high_bytes_s=controller.rate.b_max_bytes_s,
+        ).validate()
     evidence = read(args.service_evidence)
     lookup = s.LocalServiceLookup(evidence)
     if cfg.workload_pressure:

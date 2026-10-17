@@ -96,11 +96,18 @@ class RollingPressureSession:
         self.machine = old.MigrationStateMachine(
             audit.write, allow_shadow_takeover=True
         )
-        self.m2 = old.M2RateController(
-            old.M2RateConfig(
-                low_bytes_s=config.rate.b_min_bytes_s,
-                medium_bytes_s=config.rate.b_start_bytes_s,
-                high_bytes_s=config.rate.b_max_bytes_s,
+        self.transfer_mode = getattr(config, "transfer_mode", "ADAPTIVE")
+        if self.transfer_mode not in {"FULL_SPEED", "ADAPTIVE"}:
+            raise ValueError("unknown pressure transfer_mode")
+        self.m2 = (
+            None
+            if self.transfer_mode == "FULL_SPEED"
+            else old.M2RateController(
+                old.M2RateConfig(
+                    low_bytes_s=config.rate.b_min_bytes_s,
+                    medium_bytes_s=config.rate.b_start_bytes_s,
+                    high_bytes_s=config.rate.b_max_bytes_s,
+                )
             )
         )
         self.record = None
@@ -113,6 +120,15 @@ class RollingPressureSession:
         self.cancel_reason = None
         self.cancel_started_at = None
         self.cancel_policy = load("pressure_cancel").ShadowCancellation()
+
+    def _rate_decision(self, snapshot, *, before_start=False):
+        if self.transfer_mode == "FULL_SPEED":
+            # RuntimeControl uses zero to mean unlimited, not paused. Do not
+            # invoke M2: neither initial arming nor later ticks may downshift.
+            return load("manager_m2").M2RateDecision(
+                "HOLD", "FULL_SPEED", 0.0, "full speed; rate limiting disabled"
+            )
+        return self.m2.decide(snapshot, before_start=before_start)
 
     def reversible(self):
         return (
@@ -191,7 +207,7 @@ class RollingPressureSession:
             target_request_admitted=False,
             note="pressure selected existing request",
         ).write(self.run_dir)
-        rate = self.m2.decide(snapshot, before_start=True)
+        rate = self._rate_decision(snapshot, before_start=True)
         self.adapter.arm_shadow(
             candidate.generated + 1,
             rate.rate_bytes_s / 1024**3,
@@ -213,6 +229,7 @@ class RollingPressureSession:
                 "request_id": candidate.request_id,
                 "migration_id": self.migration_id,
                 "rate": rate.to_json(),
+                "transfer_mode": self.transfer_mode,
             }
         )
 
@@ -237,7 +254,7 @@ class RollingPressureSession:
             self.cancel("source completed before takeover")
             return
         snapshot = replace(snapshot, state=record.state.value)
-        rate = self.m2.decide(snapshot)
+        rate = self._rate_decision(snapshot)
         self.adapter.set_rate(rate.rate_bytes_s / 1024**3, note=rate.reason)
         self.audit.write({"kind": "pressure_m2_rate", "decision": rate.to_json()})
         reason = self.old.step_rolling_shadow(

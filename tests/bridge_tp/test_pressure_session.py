@@ -10,6 +10,7 @@ import unittest
 from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace as NS
+from unittest.mock import Mock
 
 from tools.bridge_tp.pressure_cpu import load
 from tools.bridge_tp.pressure_session import RollingPressureSession
@@ -34,7 +35,7 @@ class Adapter:
         self.arm = args
 
     def set_rate(self, *args, **kwargs):
-        pass
+        self.last_rate = args[0]
 
     def wait_for_target_ready(self, timeout):
         return len(self.ranks) == 4, self.ranks, "test CPU receipts"
@@ -154,6 +155,37 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(self.driver.adapter.commits, 1)
         self.assertTrue(self.recorder.proxy.committed)
         self.assertFalse(self.settlements)  # commit alone does not establish release
+
+    def test_full_speed_arms_and_ticks_with_unlimited_rate_without_M2(self):
+        old = self.driver
+        backend = NS(
+            **(
+                vars(old.old)
+                | {
+                    "M2RateController": Mock(
+                        side_effect=AssertionError("full speed must not instantiate M2")
+                    )
+                }
+            )
+        )
+        self.driver = RollingPressureSession(
+            run_dir=self.path / "full-speed",
+            migration_id="full-speed",
+            config=NS(**(vars(old.config) | {"transfer_mode": "FULL_SPEED"})),
+            coordinator=old.coordinator,
+            ingress=old.ingress,
+            executor=old.executor,
+            audit=self.audit,
+            backend=backend,
+        )
+        self.driver.start(self.candidate, self.snapshot)
+        self.assertEqual(self.driver.adapter.arm[1], 0)
+        self.assertIsNone(self.driver.m2)
+        self.driver.tick(self.view, self.snapshot)
+        self.assertEqual(self.driver.adapter.last_rate, 0)
+        self.assertEqual(
+            self.driver._rate_decision(self.snapshot).profile, "FULL_SPEED"
+        )
 
     def test_release_requires_matching_owner_and_request(self):
         self.driver.adapter.ranks = {0, 1, 2, 3}

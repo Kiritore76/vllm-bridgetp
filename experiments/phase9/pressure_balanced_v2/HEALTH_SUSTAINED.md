@@ -260,3 +260,20 @@ callbacks; no extra GPU probes. Missing counters fail closed for service moves.
 KV emergencies bypass the confirmation. Routing, candidate ranking, shadow
 cancellation and quality scoring retain their previous contracts. Inspect starts,
 cancellations, new sample evidence, target execution gaps, G300 and SLO together.
+
+
+## Full-speed transport correction (2026-10-17)
+
+The pressure pilot now explicitly selects FULL_SPEED: source history pacing=0,
+base rate=0 and every runtime control rate=0 (unlimited). M2 is bypassed entirely
+in this mode, including initial arming and later ticks. Positive adaptive rate
+profiles remain available only to explicit legacy ADAPTIVE configurations.
+History and delta bandwidth throttles are disabled; delta coalescing and final
+boundary waits are not bandwidth throttles and remain unchanged.
+
+Repeat --workload-pilot once. Check full_speed_receipt.json and actual sender
+receipts: pacing=false, accumulated pacing sleep=0, chunk_count=0, runtime rate=0.
+Any contradiction fails the scene. A STAY run with no transfers is not transport
+coverage. Prior 054648 evidence used pacing and must not be called full speed.
+The current revision also contains the independent service confirmation change,
+so this repeat cannot isolate the performance effect of transport mode alone.
