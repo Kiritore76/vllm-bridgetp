@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from functools import partial
 
 from .online_io import ProxyRecorder, post_streaming_completion
 from .response_proxy import ProxyMode
@@ -15,7 +16,12 @@ from .sampling_contract import freeze_strict_greedy_sampling
 
 class ObservedRecorder(ProxyRecorder):
     def __init__(self, external_id, service, pool_id, clock, emission_sink=None):
-        super().__init__(external_id, ProxyMode.HOLD_BACK, emission_sink=emission_sink)
+        super().__init__(
+            external_id,
+            ProxyMode.HOLD_BACK,
+            emission_sink=emission_sink,
+            compact_history=True,
+        )
         self.service, self.pool_id, self.clock = service, pool_id, clock
         self.service_id = external_id
         self.target_service_id = external_id + ":target"
@@ -67,13 +73,20 @@ class PressureIngress:
         target_url,
         timeout_s=1800,
         *,
-        post=post_streaming_completion,
+        post=None,
         clock=time.time,
         reconcile_log_interval_s=0,
     ):
         self.coordinator, self.service, self.executor = coordinator, service, executor
         self.urls = {"tp1": source_url, "tp4": target_url}
-        self.timeout_s, self.post, self.clock = timeout_s, post, clock
+        self.timeout_s, self.clock = timeout_s, clock
+        # Complete visible tokens already live in the recorder and journal.
+        # Keeping nested SSE chunk dicts in every Future duplicates that data.
+        self.post = (
+            partial(post_streaming_completion, retain_chunks=False)
+            if post is None
+            else post
+        )
         self.streams = {}
         self._lock = threading.RLock()
         self.reconcile_log_interval_s = reconcile_log_interval_s

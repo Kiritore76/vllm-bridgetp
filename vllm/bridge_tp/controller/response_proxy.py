@@ -29,6 +29,8 @@ worth measuring rather than an implementation detail.
 
 from __future__ import annotations
 
+from array import array
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -50,12 +52,50 @@ class EmittedToken:
     origin: str  # "source" or "target"
 
 
+class CompactTokens(Sequence):
+    """Lossless token history without one long-lived GC object per token.
+
+    The migration seam retains random access to every token ID. Full reporting
+    materializes the original records; live storage is three primitive arrays.
+    """
+
+    def __init__(self):
+        self.ids = array("q")
+        self.times = array("d")
+        self.origins = bytearray()
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(len(self)))]
+        if index < 0:
+            index += len(self)
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        return EmittedToken(
+            index,
+            self.ids[index],
+            self.times[index],
+            "target" if self.origins[index] else "source",
+        )
+
+    def append(self, token):
+        if token.index != len(self) or token.origin not in {"source", "target"}:
+            raise StreamViolation("invalid compact token index/origin")
+        stamp = float(token.unix_s)
+        self.ids.append(token.token_id)
+        self.times.append(stamp)
+        self.origins.append(token.origin == "target")
+
+
 @dataclass
 class ResponseProxy:
     external_request_id: str
     mode: ProxyMode = ProxyMode.HOLD_BACK
 
-    emitted: list[EmittedToken] = field(default_factory=list)
+    emitted: list[EmittedToken] | CompactTokens = field(default_factory=list)
     cutover_index: int | None = None
     committed: bool = False
     finished_reason: str = ""
@@ -70,6 +110,8 @@ class ResponseProxy:
     @property
     def high_water(self) -> int:
         """Next global index the client expects."""
+        if isinstance(self.emitted, CompactTokens):
+            return len(self.emitted)
         return self.emitted[-1].index + 1 if self.emitted else 0
 
     def _emit(

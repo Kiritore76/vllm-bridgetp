@@ -83,6 +83,7 @@ def post_streaming_completion(
                     "request_started_unix_s": request_started_unix_s,
                     "completed_unix_s": time.time(),
                     "chunks": chunks,
+                    "chunks_retained": retain_chunks,
                 },
                 failure_path,
             )
@@ -147,6 +148,7 @@ def post_streaming_completion(
         ),
         "e2e_ms": (completed_monotonic - request_started_monotonic) * 1000,
         "chunks": chunks,
+        "chunks_retained": retain_chunks,
     }
 
 
@@ -158,8 +160,15 @@ class ProxyRecorder:
         external_request_id: str,
         mode: ProxyMode,
         emission_sink: Callable[[dict[str, Any]], None] | None = None,
+        *,
+        compact_history: bool = False,
     ) -> None:
         self.proxy = ResponseProxy(external_request_id, mode)
+        self.compact_history = compact_history
+        if compact_history:
+            from .response_proxy import CompactTokens
+
+            self.proxy.emitted = CompactTokens()
         self._emission_sink = emission_sink
         self._lock = threading.Lock()
         self._target_offset: int | None = None

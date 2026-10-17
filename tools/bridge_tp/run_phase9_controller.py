@@ -33,13 +33,14 @@ from tools.bridge_tp.experiment_probability_gate import (  # noqa: E402
     urgency_eligibility,
 )
 from tools.bridge_tp.risk_observation import build_risk_observation  # noqa: E402
-from tools.bridge_tp.target_observation import (  # noqa: E402
-    TargetObserver, state_eligibility,
-)
 from tools.bridge_tp.risk_urgency import (  # noqa: E402
     DecodeRateTracker,
     build_snapshot,
     release_calibration,
+)
+from tools.bridge_tp.target_observation import (  # noqa: E402
+    TargetObserver,
+    state_eligibility,
 )
 from vllm.bridge_tp.controller.action_adapter import (  # noqa: E402
     ActionAdapter,
@@ -571,7 +572,12 @@ def recorded_completion(
     """Retain service failures and visible tokens even before the first tick."""
     try:
         return post_streaming_completion(
-            base_url, payload, timeout_s, token_sink, failure_path=response_path
+            base_url,
+            payload,
+            timeout_s,
+            token_sink,
+            failure_path=response_path,
+            retain_chunks=not getattr(recorder, "compact_history", False),
         )
     finally:
         atomic_json_dump(

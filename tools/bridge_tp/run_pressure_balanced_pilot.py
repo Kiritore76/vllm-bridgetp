@@ -327,6 +327,12 @@ def _run(args, prepared):
 
     cfg, controller, lookup, jobs, receipt = prepared
     receipt = receipt | {"mode": "ONLINE_FUNCTION_PILOT"}
+    receipt["stream_storage"] = dict(
+        token_history="lossless_primitive_arrays",
+        transport_chunks_retained=False,
+        full_visible_token_journal=True,
+        gc_policy="unchanged",
+    )
     if cfg.health_service:
         receipt["observation_sampling"] = dict(
             metrics_interval_s=1.0,

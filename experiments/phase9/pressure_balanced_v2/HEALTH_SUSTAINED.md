@@ -230,3 +230,18 @@ and GC evidence; workers record read/parse/GC independently. Abnormal observer
 exit, corrupt evidence or missing shutdown receipt fails the run. Children
 inherit the Linux controller process group and also stop on parent stdin EOF.
 The small CPU-held-GIL regression proves process separation, not GPU benefit.
+
+
+## Compact retained history repeat (2026-10-17)
+
+Repeat the same --workload-pilot. Pressure source/target transports no longer
+retain duplicate nested SSE chunks in Futures. The response proxy retains all
+token IDs, original timestamps and origins in primitive arrays and exports the
+same full response records. The token journal and failure/timing contracts stay
+in place; chunks_retained explicitly marks transport retention. Other proxy
+modes/default callers retain their previous storage behavior.
+
+Inspect controller generation-2 GC, arrival timing, visible gaps, handoff and
+G300/SLO. No GC disabling, timestamp rewriting, policy threshold changes or new
+GPU probes are included. Exact historical response replay and a synthetic heap
+benchmark validate representation/retention, not GPU performance improvement.
