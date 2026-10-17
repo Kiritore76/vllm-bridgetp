@@ -17,6 +17,15 @@ BUNDLE = ROOT / "experiments/phase9/pressure_balanced_v2"
 
 
 class ComparisonTests(unittest.TestCase):
+    def test_r1_retest_preserves_all_four_arms_and_exact_first_seed_inputs(self):
+        full = compare.pool_comparison_config(BUNDLE)
+        selected = compare.pool_comparison_config(BUNDLE, first_repetition_only=True)
+        expected = copy.deepcopy(full)
+        expected["recipes"] = full["recipes"][:1]
+        self.assertEqual(selected, expected)
+        self.assertEqual(selected["arms"], ["weighted", "least", "stay", "migrate"])
+        self.assertEqual(len(selected["recipes"][0]["jobs"]), 75)
+
     def setUp(self):
         self.config = compare.pilot.read(BUNDLE / "comparison.json")
         self.inputs = compare.pilot.read(BUNDLE / "calibration.json")

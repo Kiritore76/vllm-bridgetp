@@ -92,7 +92,7 @@ def arrivals(inputs, recipe):
     ]
 
 
-def pool_comparison_config(bundle, *, pair_only=False):
+def pool_comparison_config(bundle, *, pair_only=False, first_repetition_only=False):
     """Reuse tracked prompts and measured weights; never issue calibration probes."""
     reference_path = bundle / "health_reference_v2.json"
     reference = pilot.read(reference_path)
@@ -147,6 +147,8 @@ def pool_comparison_config(bundle, *, pair_only=False):
                 jobs=jobs,
             )
         )
+    if first_repetition_only:
+        recipes = recipes[:1]
     return dict(
         schema="PRESSURE_POOL_COMPARISON_V1",
         pool_comparison=True,
@@ -445,10 +447,16 @@ def main():
     modes.add_argument("--health-kv-only", action="store_true")
     modes.add_argument("--cancel-smoke", action="store_true")
     modes.add_argument("--pool-compare", action="store_true")
+    modes.add_argument("--pool-compare-r1", action="store_true")
     modes.add_argument("--pool-compare-pair", action="store_true")
     modes.add_argument("--workload-pilot", action="store_true")
     args = parser.parse_args()
-    pool_mode = args.pool_compare or args.pool_compare_pair or args.workload_pilot
+    pool_mode = (
+        args.pool_compare
+        or args.pool_compare_r1
+        or args.pool_compare_pair
+        or args.workload_pilot
+    )
     repeated = args.health_sustained or args.health_kv_only or args.cancel_smoke
     health_mode = args.health_screen or repeated or pool_mode
     spec = pilot.load_spec(args.spec)
@@ -477,7 +485,9 @@ def main():
         validator = health_screen.validate_sustained
     if pool_mode:
         config = pool_comparison_config(
-            args.spec.parent, pair_only=args.pool_compare_pair or args.workload_pilot
+            args.spec.parent,
+            pair_only=args.pool_compare_pair or args.workload_pilot,
+            first_repetition_only=args.pool_compare_r1,
         )
         if args.workload_pilot:
             config["recipes"] = config["recipes"][:1]

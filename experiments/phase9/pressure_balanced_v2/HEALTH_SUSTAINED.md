@@ -299,3 +299,14 @@ Relief remains active across migration completion; source service, workload and
 KV must stay recovered for the existing sustain period before NORMAL routing
 returns. Admission and decision records include epoch snapshots; progress displays
 relief phase. Full-speed transport, shadow cancellation and scoring are unchanged.
+
+### First-seed four-arm retest (2026-10-17)
+
+`bash tools/bridge_tp/run_pressure_pilot.sh --pool-compare-r1` repeats only
+`pool-mixed-r1`, preserving its exact 75 requests, arrival times, natural EOS,
+seed, measured routing weights and all four arms in the original order.
+It uses the current unchanged pressure policy and full-speed transport.
+This selector does not force migrations, relax the 1s arrival limit or change
+the existing CPU, host, GC and GPU tracing. The original failed run remains
+evidence; a successful retest does not establish the cause of its shared pause.
+All four scenes run through complete drain and are packaged automatically.
