@@ -245,3 +245,18 @@ Inspect controller generation-2 GC, arrival timing, visible gaps, handoff and
 G300/SLO. No GC disabling, timestamp rewriting, policy threshold changes or new
 GPU probes are included. Exact historical response replay and a synthetic heap
 benchmark validate representation/retention, not GPU performance improvement.
+
+
+## Independent service degradation confirmation (2026-10-17)
+
+Repeat --workload-pilot with unchanged inputs and scoring. Workload/prefill load
+alone no longer starts service migration. Fresh quality degradation must persist,
+with a new disjoint interval cohort (minimum 20 completed samples, slow fraction
+at least 1.2 times the configured slow budget). High workload needs one full
+confirmation window; low workload quality-only needs two. Each window is at
+least max(sustain_s, live service window): currently 3 seconds, so earliest
+confirmation is approximately 3/6 seconds. Counts come from existing token
+callbacks; no extra GPU probes. Missing counters fail closed for service moves.
+KV emergencies bypass the confirmation. Routing, candidate ranking, shadow
+cancellation and quality scoring retain their previous contracts. Inspect starts,
+cancellations, new sample evidence, target execution gaps, G300 and SLO together.

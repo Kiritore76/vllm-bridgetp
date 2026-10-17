@@ -138,6 +138,7 @@ class PoolReading:
     health_mixed_window: bool = False
     health_reason: str = "not observed"
     workload: dict | None = None
+    service_evidence: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -554,6 +555,53 @@ class PressurePolicy:
         self._last_start = -math.inf
         self._latched = False
         self._retry_after: dict[str, float] = {}
+        self._service_confirmation = None
+
+    def _confirm_new_service_intervals(self, source, now, required_windows):
+        """Require disjoint, newly observed bad windows before service moves."""
+        evidence = source.service_evidence or {}
+        count = evidence.get("interval_count")
+        slow = evidence.get("slow_interval_count")
+        window = evidence.get("window_s")
+        budget = evidence.get("slow_budget")
+        valid = (
+            type(count) is int
+            and type(slow) is int
+            and 0 <= slow <= count
+            and isinstance(window, (int, float))
+            and math.isfinite(window)
+            and window > 0
+            and isinstance(budget, (int, float))
+            and math.isfinite(budget)
+            and 0 < budget < 1
+        )
+        if not valid:
+            self._service_confirmation = None
+            return False
+        period = max(self.cfg.sustain_s, window)
+        previous = self._service_confirmation
+        if previous is None:
+            self._service_confirmation = (now, count, slow, 0, window, budget)
+            return False
+        since, old_count, old_slow, passed, old_window, old_budget = previous
+        if (
+            count < old_count
+            or slow < old_slow
+            or (window, budget) != (old_window, old_budget)
+        ):
+            self._service_confirmation = (now, count, slow, 0, window, budget)
+            return False
+        if now - since >= period:
+            samples, bad = count - old_count, slow - old_slow
+            passed = (
+                passed + 1
+                if samples >= self.cfg.min_decode_samples
+                and 0 <= bad <= samples
+                and bad / samples >= budget * self.cfg.enter_ratio
+                else 0
+            )
+            self._service_confirmation = (now, count, slow, passed, window, budget)
+        return passed >= required_windows
 
     def note_cancelled(self, request_id: str, now: float) -> None:
         self._retry_after[request_id] = now + self.cfg.cooldown_s
@@ -563,6 +611,7 @@ class PressurePolicy:
         self._last_start = now
         self._since = None
         self._latched = False
+        self._service_confirmation = None
 
     def decide(
         self,
@@ -580,6 +629,7 @@ class PressurePolicy:
         allowed_tick_gap = cfg.max_age_s if cfg.health_service else cfg.max_tick_gap_s
         if self._last_tick is not None and now - self._last_tick > allowed_tick_gap:
             self._since = None
+            self._service_confirmation = None
         self._last_tick = now
         if len({c.request_id for c in candidates}) != len(candidates):
             raise ValueError("duplicate candidate identity")
@@ -595,6 +645,8 @@ class PressurePolicy:
                 )
             )
         )
+        if emergency:
+            self._service_confirmation = None
         required = (
             max(1, cfg.capacity_guard_blocks - source.free_blocks) if emergency else 0
         )
@@ -626,6 +678,7 @@ class PressurePolicy:
 
         if not self.ledger.channel_available(target.pool_id):
             self._since = None
+            self._service_confirmation = None
             return decision("migration channel occupied")
         if not emergency:
             if cfg.capacity_only:
@@ -649,23 +702,39 @@ class PressurePolicy:
                     and health_spare(target, cfg, now)
                 )
             if cfg.workload_pressure:
+                quality_bad = (
+                    source.decode_ratio is not None
+                    and math.isfinite(source.decode_ratio)
+                    and source.decode_ratio >= cfg.enter_ratio
+                    and source.decode_samples >= cfg.min_decode_samples
+                    and source.decode_sampled_at is not None
+                    and 0 <= now - source.decode_sampled_at <= cfg.max_age_s
+                )
                 needed = (
                     workload.valid(source, cfg, now)
                     and health_spare(target, cfg, now)
-                    and (
-                        source.workload["load"] >= cfg.leave_ratio
-                        or source.workload["prefill_s"] / cfg.sustain_s
-                        >= cfg.leave_ratio
-                        or (s.decode is not None and s.decode >= cfg.enter_ratio)
-                    )
+                    and quality_bad
                 )
             if not needed:
                 self._since = None
                 self._latched = False
+                self._service_confirmation = None
                 return decision("source relief or target spare evidence absent")
             self._latched = True
             if self._since is None:
                 self._since = now
+            if cfg.workload_pressure:
+                busy = (
+                    source.workload["load"] >= cfg.leave_ratio
+                    or source.workload["prefill_s"] / cfg.sustain_s >= cfg.leave_ratio
+                )
+                # Over-efficient workload needs quality confirmation too. At low
+                # workload require an extra independent window, not an old gap
+                # surviving in overlapping snapshots. KV bypasses this entirely.
+                if not self._confirm_new_service_intervals(
+                    source, now, 1 if busy else 2
+                ):
+                    return decision("awaiting independent service degradation windows")
             if now - self._since < cfg.sustain_s:
                 return decision("imbalance not sustained")
             if now - self._last_start < cfg.cooldown_s:

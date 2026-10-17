@@ -170,6 +170,7 @@ class NativeServiceWindow:
             slow_budget,
         )
         self._intervals = {name: deque() for name in ("tp1", "tp4")}
+        self._counts = {name: [0, 0] for name in ("tp1", "tp4")}
         self._active = {}
         self._arrivals = {"tp1": -math.inf, "tp4": -math.inf}
         self._lock = threading.RLock()
@@ -191,6 +192,8 @@ class NativeServiceWindow:
                 raise ValueError("stream token time regressed")
             if last is not None:
                 self._intervals[pool].append((now, now - last, request_id))
+                self._counts[pool][0] += 1
+                self._counts[pool][1] += int(now - last > self.reference)
             self._active[request_id] = (pool, arrived, now)
             if self.health_observer is not None:
                 self.health_observer.token(request_id, now)
@@ -233,7 +236,15 @@ class NativeServiceWindow:
             for captured, interval, request_id in intervals:
                 if captured <= now:
                     request_intervals.setdefault(request_id, []).append(interval)
+            # Lifetime counters let the policy confirm NEW completed intervals,
+            # rather than repeatedly counting the same sliding-window outlier.
+            future = [v for v in intervals if v[0] > now]
             return dict(
+                interval_count=self._counts[pool_id][0] - len(future),
+                slow_interval_count=self._counts[pool_id][1]
+                - sum(v[1] > self.reference for v in future),
+                window_s=self.window_s,
+                slow_budget=self.slow_budget,
                 samples=len(values),
                 latest_at=max(v[0] for v in intervals if v[0] <= now)
                 if values
@@ -315,6 +326,12 @@ def pool_reading(
         block_size=inventory["block_size"],
         context_limit=inventory["context_limit"],
         decode_ratio=ratio,
+        service_evidence=dict(
+            interval_count=service.get("interval_count"),
+            slow_interval_count=service.get("slow_interval_count"),
+            window_s=service.get("window_s"),
+            slow_budget=service.get("slow_budget"),
+        ),
         decode_samples=service["samples"],
         decode_sampled_at=service["latest_at"],
         idle=idle,

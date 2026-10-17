@@ -54,6 +54,20 @@ def reading(name="tp1", now=10, load=0.2, **kwargs):
     )
 
 
+def degraded(now, load=1.25, count=None, slow=None):
+    return reading(
+        now=now,
+        load=load,
+        decode_ratio=2,
+        service_evidence=dict(
+            interval_count=100 + int((now - 10) * 100) if count is None else count,
+            slow_interval_count=10 + int((now - 10) * 2) if slow is None else slow,
+            window_s=3,
+            slow_budget=0.01,
+        ),
+    )
+
+
 class WorkloadTests(unittest.TestCase):
     def test_reference_diagnostic_has_reason_and_is_cached_only_when_opted_in(self):
         h = load("pressure_health")
@@ -125,7 +139,7 @@ class WorkloadTests(unittest.TestCase):
         for now in (10, 11, 12, 13):
             result = policy.decide(
                 now,
-                reading(now=now, load=1.25),
+                degraded(now),
                 reading("tp4", now=now),
                 [candidate(sampled_at=now, published_at=now)],
             )
@@ -151,11 +165,113 @@ class WorkloadTests(unittest.TestCase):
         for now in (10, 11, 12, 13):
             result = policy.decide(
                 now,
-                reading(now=now, load=1.25),
+                degraded(now),
                 reading("tp4", now=now),
                 [candidate(sampled_at=now, published_at=now, target_decode_cost=0.9)],
             )
         self.assertEqual(result.action, "STAY")
+
+    def test_high_workload_without_service_degradation_does_not_migrate(self):
+        policy = p.PressurePolicy(cfg(), p.ReservationLedger())
+        for now in range(10, 18):
+            result = policy.decide(
+                now,
+                reading(now=now, load=1.5),
+                reading("tp4", now=now),
+                [candidate(sampled_at=now, published_at=now)],
+            )
+            self.assertEqual(result.action, "STAY")
+
+    def test_old_bad_samples_and_active_gap_cannot_confirm_new_degradation(self):
+        for slow in (10, 11):
+            policy = p.PressurePolicy(cfg(), p.ReservationLedger())
+            for now in range(10, 18):
+                result = policy.decide(
+                    now,
+                    degraded(
+                        now,
+                        count=100 + (now - 10) * 100,
+                        slow=10 if now == 10 else slow,
+                    ),
+                    reading("tp4", now=now),
+                    [candidate(sampled_at=now, published_at=now)],
+                )
+                self.assertEqual(result.action, "STAY")
+
+    def test_low_workload_quality_requires_two_independent_windows(self):
+        policy = p.PressurePolicy(cfg(), p.ReservationLedger())
+        for now in range(10, 17):
+            result = policy.decide(
+                now,
+                degraded(now, load=0.7),
+                reading("tp4", now=now),
+                [candidate(sampled_at=now, published_at=now)],
+            )
+            self.assertEqual(result.action, "START_SHADOW" if now == 16 else "STAY")
+
+    def test_missing_or_reset_counters_and_observation_gaps_restart_confirmation(self):
+        for bad in (
+            None,
+            dict(interval_count=1, slow_interval_count=0, window_s=3, slow_budget=0.01),
+        ):
+            policy = p.PressurePolicy(cfg(), p.ReservationLedger())
+            for now in (10, 11, 12):
+                policy.decide(now, degraded(now), reading("tp4", now=now), [])
+            from dataclasses import replace
+
+            result = policy.decide(
+                13,
+                replace(degraded(13), service_evidence=bad),
+                reading("tp4", now=13),
+                [candidate(sampled_at=13, published_at=13)],
+            )
+            self.assertEqual(result.action, "STAY")
+        policy = p.PressurePolicy(cfg(), p.ReservationLedger())
+        policy.decide(10, degraded(10), reading("tp4", now=10), [])
+        result = policy.decide(
+            14,
+            degraded(14),
+            reading("tp4", now=14),
+            [candidate(sampled_at=14, published_at=14)],
+        )
+        self.assertEqual(result.action, "STAY")
+
+    def test_low_workload_bad_windows_must_be_consecutive_and_disjoint(self):
+        policy = p.PressurePolicy(cfg(), p.ReservationLedger())
+        for now in range(10, 23):
+            # Bad [10,13], healthy [13,16], then bad [16,19] and [19,22].
+            elapsed_bad = min(now - 10, 3) + max(0, now - 16)
+            result = policy.decide(
+                now,
+                degraded(now, load=0.7, slow=10 + 2 * elapsed_bad),
+                reading("tp4", now=now),
+                [candidate(sampled_at=now, published_at=now)],
+            )
+            self.assertEqual(result.action, "START_SHADOW" if now == 22 else "STAY")
+
+    def test_KV_emergency_does_not_wait_for_quality_or_new_sample_confirmation(self):
+        result = p.PressurePolicy(cfg(), p.ReservationLedger()).decide(
+            10,
+            reading(free_blocks=100, growth_blocks_s=10),
+            reading("tp4"),
+            [candidate()],
+        )
+        self.assertTrue(result.capacity_path)
+        self.assertEqual(result.action, "START_SHADOW")
+
+    def test_native_service_counts_only_new_completed_intervals(self):
+        service = o.NativeServiceWindow()
+        service.arrive("r", "tp1", 10)
+        service.token("r", 10)
+        service.token("r", 10.2)
+        service.token("r", 10.25)
+        first = service.snapshot("tp1", 10.3)
+        later = service.snapshot("tp1", 14)
+        self.assertEqual(first["interval_count"], 2)
+        self.assertEqual(first["slow_interval_count"], 1)
+        self.assertEqual(later["interval_count"], 2)
+        self.assertEqual(later["slow_interval_count"], 1)
+        self.assertEqual(later["samples"], 0)
 
     def test_same_prompt_routes_by_projected_pressure_and_KV_risk(self):
         for source, expected in (
