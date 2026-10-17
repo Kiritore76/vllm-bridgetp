@@ -8,7 +8,7 @@ These reused development-family inputs are for function checks, not independent
 benefit evaluation. Model weights, predictor checkpoint and results stay outside Git.
 
 On the existing five-A100 server, update the clean checkout on
-`bridgetp/predictor-nonuniform84-20261010` using SSH22, then run from
+`bridgetp/pressure-balanced-controller` using SSH22, then run from
 `/root/autodl-tmp/bridgetp/vllm_bridge`:
 
 ```bash

@@ -35,7 +35,7 @@ from run_predictor_nonuniform84_training import (
 from train_length_predictor import load_examples, read_jsonl, sha256_file
 
 ROOT = Path(__file__).resolve().parents[2]
-BRANCH = "bridgetp/predictor-nonuniform84-20261010"
+BRANCH = "bridgetp/pressure-balanced-controller"
 REFERENCE_SHA = "dbe02d968e19c32d69deaa9a37748e9ca68f506807b220c114d22a4e2845c8a7"
 REFERENCE_DIR = "predictor-risk76-mlp2-mlp4-v1-20261011T093049Z-1353/train-mlp4-50pct"
 

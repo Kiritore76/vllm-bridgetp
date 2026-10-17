@@ -4,7 +4,7 @@ bridgetp_predictor_length_regression() {
   local repo=/root/autodl-tmp/bridgetp/vllm_bridge
   local results=/root/autodl-tmp/bridgetp/results
   local py=/root/autodl-tmp/bridgetp/.venv_bridge/bin/python
-  local branch=bridgetp/predictor-nonuniform84-20261010
+  local branch=bridgetp/pressure-balanced-controller
   local head out stamp rc pack_rc
   cd "$repo" || return
   [ "$(git rev-parse --show-toplevel)" = "$repo" ] || return 1

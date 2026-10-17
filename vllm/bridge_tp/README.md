@@ -6,7 +6,7 @@
 
 BridgeTP在vLLM之上实现TP1/TP4实例间分流，以及TP1请求的滚动KV搬运、目标接管与源端释放。实例内部排队、prefill、decode和抢占仍由vLLM调度。当前压力控制器不增加“预留完整未来输出后才允许请求进入”的外部准入门槛。
 
-当前开发分支为`bridgetp/predictor-nonuniform84-20261010`。旧`bridgetp/m5-predictor-integration`等分支保留的是历史控制器；不能因为看到同名README就认为该checkout具备最新压力入口。切换前先保存并核对工作区，禁止覆盖未提交修改。
+当前开发分支为`bridgetp/pressure-balanced-controller`。旧`bridgetp/m5-predictor-integration`等分支保留的是历史控制器；不能因为看到同名README就认为该checkout具备最新压力入口。切换前先保存并核对工作区，禁止覆盖未提交修改。
 
 | 功能 | 当前入口 |
 |---|---|
@@ -45,7 +45,7 @@ BridgeTP在vLLM之上实现TP1/TP4实例间分流，以及TP1请求的滚动KV�
 
 ```bash
 cd /root/autodl-tmp/bridgetp/vllm_bridge
-git pull --ff-only origin bridgetp/predictor-nonuniform84-20261010 &&
+git pull --ff-only origin bridgetp/pressure-balanced-controller &&
 bash tools/bridge_tp/run_pressure_pilot.sh --pool-compare
 ```
 

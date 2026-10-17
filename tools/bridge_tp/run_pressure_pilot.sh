@@ -5,7 +5,7 @@
 bridgetp_pressure_pilot_20261015_v2() {
   local base=/root/autodl-tmp/bridgetp
   local repo="$base/vllm_bridge"
-  local branch=bridgetp/predictor-nonuniform84-20261010
+  local branch=bridgetp/pressure-balanced-controller
   local input="$repo/experiments/phase9/pressure_balanced_v2"
   local stamp backup origin batch console rc pack_rc mode launcher_source runner
   local -a run_args
