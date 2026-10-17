@@ -326,6 +326,7 @@ def pool_reading(
         block_size=inventory["block_size"],
         context_limit=inventory["context_limit"],
         decode_ratio=ratio,
+        prefill_generation=inventory.get("prefill_generation"),
         service_evidence=dict(
             interval_count=service.get("interval_count"),
             slow_interval_count=service.get("slow_interval_count"),

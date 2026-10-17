@@ -30,6 +30,7 @@ TOP_FIELDS = (
     "running",
     "waiting",
     "pending_prompt_tokens",
+    "prefill_generation",
     "dropped_before",
     "writer_error",
     "inventory_error",

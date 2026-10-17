@@ -277,3 +277,25 @@ Any contradiction fails the scene. A STAY run with no transfers is not transport
 coverage. Prior 054648 evidence used pacing and must not be called full speed.
 The current revision also contains the independent service confirmation change,
 so this repeat cannot isolate the performance effect of transport mode alone.
+
+
+## Router relief before ordinary service migration (2026-10-17)
+
+The workload pilot enables routing_relief. An overloaded/degraded source creates
+an intervention epoch, acknowledged by the coordinator's pressure router. Safe
+TP4 post-arrival budget and physical prompt fit allow diversion; unsafe or fixed
+routes retain existing admission behavior and reset the quiet-window barrier.
+No external admission gate is added.
+
+Only fresh source publication after router acknowledgement/last source admission,
+no unpublished ingress, no pending/running prefill, and a native prefill generation
+allow the independent 3s quality confirmation to start. Every new prefill batch
+increments a scalar before inventory metadata throttling; observation changes reset
+the confirmation. Ordinary moves still require source load>=1 and new degraded
+samples. No-arrival periods can qualify without inventing a redirect. Missing
+new evidence fails closed. KV emergencies bypass the gate.
+
+Relief remains active across migration completion; source service, workload and
+KV must stay recovered for the existing sustain period before NORMAL routing
+returns. Admission and decision records include epoch snapshots; progress displays
+relief phase. Full-speed transport, shadow cancellation and scoring are unchanged.

@@ -54,14 +54,31 @@ class PressureCoordinator:
         """Route and track identity atomically, without reserving ingress KV."""
         with self._lock:
             before = self.ledger.snapshot()
+            pools = args[3] if len(args) > 3 else kwargs["pools"]
+            now = kwargs.get("now", args[4] if len(args) > 4 else None)
+            self.policy.observe_relief(now, pools[0])
+            if self.routing_strategy == "pressure":
+                self.policy.relief.acknowledge(now)
+            relief = self.policy.relief.snapshot()
             result = admit(
                 *args,
                 cfg=self.policy.cfg,
                 ledger=self.ledger,
                 routing_strategy=self.routing_strategy,
                 routing_weights=self.routing_weights,
+                routing_relief=relief,
                 **kwargs,
             )
+            if self.policy.cfg.routing_relief:
+                self.policy.relief.admitted(
+                    result.pool_id,
+                    args[1] if len(args) > 1 else kwargs["prompt_tokens"],
+                    now,
+                    result.routing_reason.startswith("router relief epoch"),
+                )
+                if result.pool_id == pools[0].pool_id:
+                    self.policy._since = None
+                    self.policy._service_confirmation = None
             self._owners[result.request_id] = result.pool_id
             record = {
                 "kind": "pressure_admission",
@@ -73,6 +90,8 @@ class PressureCoordinator:
                 "routing_config": asdict(self.policy.cfg),
                 "routing_strategy": self.routing_strategy,
                 "routing_weights": self.routing_weights,
+                "routing_relief": relief,
+                "routing_relief_after": self.policy.relief.snapshot(),
                 "decision_unix_s": kwargs.get(
                     "now", args[4] if len(args) > 4 else None
                 ),
@@ -151,6 +170,9 @@ class PressureCoordinator:
                 if owner is not None and owner != c.owner:
                     raise ValueError("inventory contradicts confirmed ownership")
             before = self.ledger.snapshot()
+            self.policy.observe_relief(now, source)
+            if self.routing_strategy == "pressure":
+                self.policy.relief.acknowledge(now)
             decision = self.policy.decide(now, source, target, candidates)
             record = {
                 "kind": "pressure_decision",
@@ -160,6 +182,7 @@ class PressureCoordinator:
                 "target_reading": asdict(self.ledger.routing_reading(target)),
                 "reservation_before": before,
                 "execution": "ADVISORY",
+                "routing_relief": self.policy.relief.snapshot(),
             }
             if decision.request_id is None or actions is None:
                 record["reservation_after"] = self.ledger.snapshot()

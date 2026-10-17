@@ -539,6 +539,7 @@ def main():
                     "test_pressure_sustained",
                     "test_pressure_health_service",
                     "test_pressure_workload",
+                    "test_pressure_relief",
                     "test_pressure_pause_diagnostics",
                     "test_pressure_io",
                     "test_pressure_dispatch",

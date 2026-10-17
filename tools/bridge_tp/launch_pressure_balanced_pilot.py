@@ -595,6 +595,9 @@ def run_scene(
                             f"{status.get('migrations_started', 0)}"
                         ),
                         cancelled=status.get("migrations_cancelled", 0),
+                        relief=(status.get("routing_relief") or {}).get(
+                            "phase", "NORMAL"
+                        ),
                     )
                     if status.get("queue_reasons"):
                         announce(

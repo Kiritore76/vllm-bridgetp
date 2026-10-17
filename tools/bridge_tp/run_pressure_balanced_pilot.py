@@ -970,6 +970,7 @@ def _run(args, prepared):
                         for pool in pools
                     }
                 if cfg.workload_pressure:
+                    status["routing_relief"] = co.policy.relief.snapshot()
                     status["workload_pressure"] = {
                         pool.pool_id: dict(
                             status=(pool.workload or {}).get("status", "UNKNOWN"),

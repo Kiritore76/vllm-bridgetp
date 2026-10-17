@@ -34,7 +34,8 @@
     "cancel_sustain_s": 3.0,
     "cancel_recover_eta": 1.0,
     "pressure_routing": true,
-    "workload_pressure": true
+    "workload_pressure": true,
+    "routing_relief": true
   },
   "itl_s": 0.1,
   "slow_fraction": 0.01,

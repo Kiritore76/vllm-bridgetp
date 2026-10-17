@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass, fields, replace
 
 from . import pressure_workload as workload
 from .bounded_length import BoundedLength
+from .pressure_relief import RoutingRelief
 
 VERSION = "pressure-balanced-v2-draft"
 
@@ -46,6 +47,7 @@ class PressureConfig:
     # Route from passive health/KV evidence, without fixed prompt cutoffs.
     pressure_routing: bool = False
     workload_pressure: bool = False
+    routing_relief: bool = False
     health_min_efficiency: float = 0.9
     health_target_load: float = 0.8
     survival_horizon: int = 256
@@ -77,6 +79,8 @@ class PressureConfig:
             and type(self.pressure_routing) is bool
             and (not self.pressure_routing or self.health_service)
             and type(self.workload_pressure) is bool
+            and type(self.routing_relief) is bool
+            and (not self.routing_relief or self.workload_pressure)
             and (
                 not self.workload_pressure
                 or (self.health_service and self.sustain_s > 0)
@@ -139,6 +143,7 @@ class PoolReading:
     health_reason: str = "not observed"
     workload: dict | None = None
     service_evidence: dict | None = None
+    prefill_generation: int | None = None
 
 
 @dataclass(frozen=True)
@@ -556,6 +561,30 @@ class PressurePolicy:
         self._latched = False
         self._retry_after: dict[str, float] = {}
         self._service_confirmation = None
+        self.relief = RoutingRelief()
+
+    def observe_relief(self, now, source):
+        if not self.cfg.routing_relief:
+            return
+        source = self.ledger.routing_reading(source)
+        quality_bad = (
+            source.decode_ratio is not None
+            and math.isfinite(source.decode_ratio)
+            and source.decode_ratio >= self.cfg.enter_ratio
+            and source.decode_samples >= self.cfg.min_decode_samples
+            and source.decode_sampled_at is not None
+            and 0 <= now - source.decode_sampled_at <= self.cfg.max_age_s
+        )
+        if self.relief.update(
+            source,
+            classify(source, self.cfg, now),
+            self.ledger,
+            self.cfg,
+            now,
+            quality_bad,
+        ):
+            self._since = None
+            self._service_confirmation = None
 
     def _confirm_new_service_intervals(self, source, now, required_windows):
         """Require disjoint, newly observed bad windows before service moves."""
@@ -621,15 +650,17 @@ class PressurePolicy:
         candidates: list[Candidate],
     ) -> PressureDecision:
         cfg = self.cfg
+        if self._last_tick is not None and now < self._last_tick:
+            raise ValueError("decision time regressed")
+        self.observe_relief(now, source)
         source = self.ledger.routing_reading(source)
         target = self.ledger.routing_reading(target)
         s, t = classify(source, cfg, now), classify(target, cfg, now)
-        if self._last_tick is not None and now < self._last_tick:
-            raise ValueError("decision time regressed")
         allowed_tick_gap = cfg.max_age_s if cfg.health_service else cfg.max_tick_gap_s
         if self._last_tick is not None and now - self._last_tick > allowed_tick_gap:
             self._since = None
             self._service_confirmation = None
+            self.relief.recovery_since = None
         self._last_tick = now
         if len({c.request_id for c in candidates}) != len(candidates):
             raise ValueError("duplicate candidate identity")
@@ -681,6 +712,16 @@ class PressurePolicy:
             self._service_confirmation = None
             return decision("migration channel occupied")
         if not emergency:
+            if cfg.routing_relief and (
+                not self.relief.active or not self.relief.confirming
+            ):
+                self._since = None
+                self._service_confirmation = None
+                return decision("router relief not settled; " + self.relief.phase)
+            if cfg.routing_relief and source.workload["load"] < cfg.leave_ratio:
+                self._since = None
+                self._service_confirmation = None
+                return decision("source workload recovered after router relief")
             if cfg.capacity_only:
                 self._since = None
                 return decision("KV-only pilot; capacity warning absent")
@@ -1047,6 +1088,7 @@ def admit(
     allowed_pool_id: str | None = None,
     routing_strategy: str = "pressure",
     routing_weights: tuple[float, float] = (1.0, 1.0),
+    routing_relief: dict | None = None,
 ) -> Admission:
     """Choose an instance; leave queueing and KV allocation to vLLM.
 
@@ -1192,6 +1234,26 @@ def admit(
     elif all(capacity[pool.pool_id]["status"] == "NO_FIT" for pool in eligible):
         routing_reason += "; neither pool fits prompt now; native queue"
     eligible.sort(key=lambda pool: pool.pool_id != preferred.pool_id)
+    # Prefer relief only with fresh post-arrival target budget AND physical fit.
+    # Never force a context-infeasible target, and never gate external ingress.
+    if (
+        cfg.routing_relief
+        and routing_strategy == "pressure"
+        and allowed_pool_id is None
+        and routing_relief
+        and routing_relief.get("active")
+        and projected
+        and pools[1] in eligible
+        and health_spare(target, cfg, now)
+        and capacity[pools[1].pool_id]["status"] == "FIT"
+        and projected[pools[1].pool_id]["score"] is not None
+        and projected[pools[1].pool_id]["score"] <= cfg.leave_ratio
+        and projected[pools[1].pool_id]["capacity"] is not None
+        and projected[pools[1].pool_id]["capacity"] < 1
+    ):
+        preferred = pools[1]
+        eligible.sort(key=lambda pool: pool.pool_id != preferred.pool_id)
+        routing_reason = "router relief epoch; TP4 projected budget and prompt fit"
     pool = eligible[0]
     if allowed_pool_id is not None:
         routing_reason = "fixed pilot route"

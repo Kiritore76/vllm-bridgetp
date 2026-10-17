@@ -69,6 +69,11 @@ def inventory_snapshot(scheduler, pool_id: str, now: float) -> dict:
             max(0, row["prompt_tokens"] - row["computed_tokens"]) for row in rows
         ),
         "requests": rows,
+        "prefill_generation": getattr(
+            getattr(scheduler, "_bridgetp_pressure_inventory", None),
+            "prefill_generation",
+            None,
+        ),
         "last_scheduled_batch": getattr(
             scheduler._bridgetp_pressure_inventory, "batch", None
         )
@@ -90,6 +95,7 @@ class InventoryPublisher:
         self.batch = None
         self.last_batch_sample = -float("inf")
         self.last_membership = None
+        self.prefill_generation = 0
         atexit.register(self.journal.close)
 
     @classmethod
@@ -137,6 +143,14 @@ class InventoryPublisher:
 
     def record_batch(self, requests, output):
         now = time.time()
+        # Scalar only, before the metadata sampling gate: even a short prefill
+        # between publications must invalidate the controller's quiet window.
+        if any(
+            count > 0
+            and requests[key].num_computed_tokens < requests[key].num_prompt_tokens
+            for key, count in output.num_scheduled_tokens.items()
+        ):
+            self.prefill_generation += 1
         if now - self.last_batch_sample < self.interval_s:
             return
         from vllm.bridge_tp.performance_trace import batch_composition
