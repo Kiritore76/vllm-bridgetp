@@ -314,6 +314,7 @@ def run(args, prepared):
         with (
             load("pause_diagnostics").installed(observer),
             native_diagnostics.installed(observer),
+            load("pause_diagnostics").GCMonitor(observer),
         ):
             return _run(args, prepared)
     finally:
@@ -336,6 +337,7 @@ def _run(args, prepared):
             inventory_and_migration_tick_s=args.tick_s,
             arrival_scheduler="independent_monotonic_thread",
             inventory_cache_poll_s=0.05,
+            inventory_observer="exec_cpu_process_per_pool; compact_latest_snapshot",
             arrival_observation_io="async_identity_only; migration remains durable",
         )
     args.run_dir.mkdir(parents=True, exist_ok=True)
@@ -389,10 +391,6 @@ def _run(args, prepared):
         ingress=ingress,
         executor=executor,
         audit=audit,
-    )
-    readers = (
-        o.InventoryReader(args.source_inventory, "tp1"),
-        o.InventoryReader(args.target_inventory, "tp4"),
     )
     scrapers = tuple(
         load("telemetry").MetricsScraper(
@@ -456,13 +454,15 @@ def _run(args, prepared):
     last_inventory_progress = ()
     failure = None
     try:
-        for reader in readers:
+        for path, pool_id in (
+            (args.source_inventory, "tp1"),
+            (args.target_inventory, "tp4"),
+        ):
             background_inventory.append(
-                load("pressure_io").BackgroundInventory(
-                    reader,
-                    lambda now, reader=reader: load("pause_diagnostics").call(
-                        "inventory.poll", reader.poll, now
-                    ),
+                load("pressure_inventory_process").ProcessInventory(
+                    path,
+                    pool_id,
+                    args.run_dir,
                 )
             )
         readers = tuple(background_inventory)
@@ -1046,6 +1046,17 @@ def _run(args, prepared):
                 failure = failure or repr(error)
                 outcome = "FAILED_OR_INTERRUPTED"
             dispatched = dispatcher.snapshot(check=False)
+        close_errors = []
+        for sampler in background_metrics + background_inventory:
+            sampler.stop.set()
+        for sampler in background_metrics + background_inventory:
+            try:
+                sampler.close()
+            except RuntimeError as error:
+                close_errors.append(error)
+        if close_errors:
+            failure = failure or repr(close_errors[0])
+            outcome = "FAILED_OR_INTERRUPTED"
         save_progress(
             progress_path,
             stage=outcome,
@@ -1129,21 +1140,11 @@ def _run(args, prepared):
         try:
             session.close()
         finally:
-            try:
-                for sampler in background_metrics + background_inventory:
-                    sampler.stop.set()
-                close_errors = []
-                for sampler in background_metrics + background_inventory:
-                    try:
-                        sampler.close()
-                    except RuntimeError as error:
-                        close_errors.append(error)
-            finally:
-                audit.close()
-            if close_errors:
-                raise RuntimeError("background observation shutdown failed") from (
-                    close_errors[0]
-                )
+            audit.close()
+        if close_errors:
+            raise RuntimeError("background observation shutdown failed") from (
+                close_errors[0]
+            )
         if dispatch_stop_error is not None:
             raise dispatch_stop_error
 

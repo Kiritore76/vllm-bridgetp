@@ -10,6 +10,7 @@ import time
 from collections import deque
 from pathlib import Path
 
+from .pause_diagnostics import span
 from .pressure_policy import PoolReading, PressureConfig
 
 
@@ -55,12 +56,16 @@ class InventoryReader:
 
     def poll(self, now: float) -> dict | None:
         self.deferred = None
-        if not self.path.exists():
-            return None
-        if self.path.stat().st_size < self.offset:
-            raise ValueError("inventory journal was truncated")
-        with self.path.open("rb") as stream:
-            stream.seek(self.offset)
+        with span("inventory.stat"):
+            if not self.path.exists():
+                return None
+            if self.path.stat().st_size < self.offset:
+                raise ValueError("inventory journal was truncated")
+        with span("inventory.open"):
+            stream = self.path.open("rb")
+        with stream:
+            with span("inventory.seek"):
+                stream.seek(self.offset)
             started = time.monotonic()
             records, initial = 0, self.offset
             while True:
@@ -71,7 +76,8 @@ class InventoryReader:
                 ):
                     break
                 start = stream.tell()
-                line = stream.readline(self.max_bytes + 1)
+                with span("inventory.read_record"):
+                    line = stream.readline(self.max_bytes + 1)
                 if len(line) > self.max_bytes:
                     raise ValueError("inventory record exceeds poll byte budget")
                 if not line or not line.endswith(b"\n"):
@@ -79,7 +85,8 @@ class InventoryReader:
                     break
                 self.offset = stream.tell()
                 records += 1
-                row = json.loads(line)
+                with span("inventory.parse_record"):
+                    row = json.loads(line)
                 if row.get("kind") == "evidence_footer":
                     if row.get("dropped") or row.get("writer_error"):
                         self.error = "inventory evidence incomplete"

@@ -2,12 +2,84 @@
 """Opt-in timing evidence; producers aggregate without doing disk I/O."""
 
 import contextlib
+import gc
 import json
 import os
 import threading
 import time
 
 _observer = None
+_gc_monitor = None
+
+
+class GCMonitor:
+    """Record collections without logging, locking or doing I/O in callbacks."""
+
+    def __init__(self, observer):
+        from collections import deque
+
+        self.observer = observer
+        self.events = deque()
+        self.active = None
+        self.overflow = False
+        self.callback = self._callback
+
+    def _callback(self, phase, info):
+        if phase == "start":
+            self.active = (
+                time.time(),
+                time.monotonic(),
+                time.thread_time(),
+                info["generation"],
+                threading.current_thread().name,
+            )
+        elif self.active is not None:
+            wall, start, cpu, generation, thread = self.active
+            self.active = None
+            if len(self.events) >= 4096:
+                self.overflow = True
+                return
+            self.events.append(
+                (
+                    wall,
+                    time.monotonic() - start,
+                    time.thread_time() - cpu,
+                    generation,
+                    thread,
+                )
+            )
+
+    def flush(self):
+        if self.overflow:
+            raise RuntimeError("GC timing evidence overflow")
+        while self.events:
+            wall, duration, cpu, generation, thread = self.events.popleft()
+            self.observer.record(f"gc.generation_{generation}", wall, duration, cpu)
+            if duration >= 0.1:
+                self.observer.journal.submit(
+                    dict(
+                        kind="gc_collection",
+                        pid=os.getpid(),
+                        generation=generation,
+                        started_unix_s=wall,
+                        duration_s=duration,
+                        thread_cpu_s=cpu,
+                        thread=thread,
+                    )
+                )
+
+    def __enter__(self):
+        global _gc_monitor
+        self.previous = _gc_monitor
+        _gc_monitor = self
+        gc.callbacks.append(self.callback)
+        return self
+
+    def __exit__(self, *_):
+        global _gc_monitor
+        gc.callbacks.remove(self.callback)
+        _gc_monitor = self.previous
+        self.flush()
 
 
 class TimingObserver:
@@ -117,6 +189,8 @@ def call(name, function, *args, **kwargs):
 
 
 def tick():
+    if _gc_monitor is not None:
+        _gc_monitor.flush()
     if _observer is not None:
         _observer.tick()
 

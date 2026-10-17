@@ -41,8 +41,12 @@ class ScheduledDispatch:
                 due = self.origin + job["at_s"]
                 if due >= self.deadline:
                     break
-                if self.stop.wait(max(0, due - time.monotonic())):
-                    return
+                while True:
+                    remaining = due - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    if self.stop.wait(remaining):
+                        return
                 if self.stop.is_set() or time.monotonic() >= self.deadline:
                     return
                 with self.lock:

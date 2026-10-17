@@ -31,99 +31,86 @@ d, i, o, r, io = (
 
 
 class DispatchTests(unittest.TestCase):
-    def test_blocked_control_and_inventory_do_not_delay_arrivals(self):
-        entered, release = threading.Event(), threading.Event()
+    def test_blocked_control_does_not_delay_arrivals(self):
         sent = threading.Event()
         rows, calls = [], []
         cfg = config(sustain_s=0)
         co = r.PressureCoordinator(cfg, rows.append)
-        with tempfile.TemporaryDirectory() as directory:
-            reader = o.InventoryReader(Path(directory) / "inventory.jsonl", "tp1")
+        with ThreadPoolExecutor(max_workers=4) as executor:
 
-            def blocked_poll(now):
-                entered.set()
-                release.wait(3)
-                return None
+            def post(url, payload, timeout, sink):
+                calls.append(payload["request_id"])
+                if len(calls) == 3:
+                    sent.set()
+                return dict(completed_unix_s=time.time())
 
-            inventory = io.BackgroundInventory(reader, blocked_poll)
-            with ThreadPoolExecutor(max_workers=4) as executor:
-
-                def post(url, payload, timeout, sink):
-                    calls.append(payload["request_id"])
-                    if len(calls) == 3:
-                        sent.set()
-                    return dict(completed_unix_s=time.time())
-
-                ingress = i.PressureIngress(
-                    co,
-                    o.NativeServiceWindow(),
-                    executor,
-                    "source",
-                    "target",
-                    post=post,
+            ingress = i.PressureIngress(
+                co,
+                o.NativeServiceWindow(),
+                executor,
+                "source",
+                "target",
+                post=post,
+            )
+            jobs = [
+                dict(
+                    id=str(n),
+                    at_s=n * 0.03,
+                    request=dict(model="qwen", prompt=[1], max_tokens=8),
                 )
-                jobs = [
-                    dict(
-                        id=str(n),
-                        at_s=n * 0.03,
-                        request=dict(model="qwen", prompt=[1], max_tokens=8),
-                    )
-                    for n in range(3)
-                ]
-                origin, unix = time.monotonic(), time.time()
+                for n in range(3)
+            ]
+            origin, unix = time.monotonic(), time.time()
 
-                def submit(job, pools):
-                    dispatched = {}
-                    pilot.dispatch_due(
-                        [job],
-                        dispatched,
-                        time.monotonic() - origin,
-                        ingress,
-                        pools,
-                        journal_sink,
-                        audit,
-                        origin_unix_s=unix,
-                    )
-                    return dispatched[job["id"]]
-
-                class Sink:
-                    def submit(self, row):
-                        pass
-
-                class Audit:
-                    def write(self, row):
-                        rows.append(row)
-
-                journal_sink, audit = Sink(), Audit()
-                dispatcher = d.ScheduledDispatch(
-                    jobs,
-                    submit,
-                    (pool(), pool("tp4")),
-                    origin,
-                    3,
+            def submit(job, pools):
+                dispatched = {}
+                pilot.dispatch_due(
+                    [job],
+                    dispatched,
+                    time.monotonic() - origin,
+                    ingress,
+                    pools,
+                    journal_sink,
+                    audit,
+                    origin_unix_s=unix,
                 )
-                try:
-                    self.assertTrue(entered.wait(1))
-                    self.assertIsNone(inventory.poll(time.time()))
-                    dispatcher.start()
-                    # The test/control thread and inventory remain blocked.
-                    self.assertTrue(sent.wait(1))
-                    self.assertFalse(release.is_set())
-                    self.assertEqual(len(calls), len(set(calls)))
-                finally:
-                    dispatcher.close()
-                    release.set()
-                    inventory.close()
-                streams = dispatcher.snapshot()
-                self.assertEqual(len(streams), 3)
-                for value in streams.values():
-                    value.future.result()
-                    self.assertLessEqual(
-                        value.dispatch_entered_at, value.admission_finished_at
-                    )
-                    self.assertLessEqual(
-                        value.executor_submitted_at, value.http_thread_started_at
-                    )
+                return dispatched[job["id"]]
+
+            class Sink:
+                def submit(self, row):
+                    pass
+
+            class Audit:
+                def write(self, row):
+                    rows.append(row)
+
+            journal_sink, audit = Sink(), Audit()
+            dispatcher = d.ScheduledDispatch(
+                jobs,
+                submit,
+                (pool(), pool("tp4")),
+                origin,
+                3,
+            )
+            try:
+                dispatcher.start()
+                # The test/control thread waits instead of dispatching.
+                arrived = sent.wait(1)
+                dispatcher.snapshot()
+                self.assertTrue(arrived)
+                self.assertEqual(len(calls), len(set(calls)))
+            finally:
+                dispatcher.close()
+            streams = dispatcher.snapshot()
+            self.assertEqual(len(streams), 3)
+            for value in streams.values():
+                value.future.result()
+                self.assertLessEqual(
+                    value.dispatch_entered_at, value.admission_finished_at
+                )
+                self.assertLessEqual(
+                    value.executor_submitted_at, value.http_thread_started_at
+                )
 
     def test_migration_start_does_not_hold_routing_lock(self):
         entered, release = threading.Event(), threading.Event()
@@ -253,20 +240,6 @@ class DispatchTests(unittest.TestCase):
         dispatcher.close()
         self.assertFalse(dispatcher.thread.is_alive())
 
-    def test_background_inventory_error_propagates_without_refreshing_cache(self):
-        with tempfile.TemporaryDirectory() as directory:
-            reader = o.InventoryReader(Path(directory) / "inventory.jsonl", "tp1")
-            published = dict(sampled_at=10)
-            reader.observed_at = 11
-            with patch.object(io.threading.Thread, "start"):
-                cache = io.BackgroundInventory(reader, lambda now: published)
-            cache.cached = (published, 11, reader.diagnostics(), None)
-            self.assertEqual(cache.poll(100)["sampled_at"], 10)
-            self.assertEqual(cache.observed_at, 11)
-            cache.cached = (None, None, reader.diagnostics(), ValueError("truncated"))
-            with self.assertRaisesRegex(RuntimeError, "background inventory failed"):
-                cache.poll(100)
-
     def test_pilot_wiring_drains_and_saves_timing_after_control_pause(self):
         calls, all_sent, control_paused = [], threading.Event(), threading.Event()
 
@@ -282,6 +255,9 @@ class DispatchTests(unittest.TestCase):
                 self.observed_at = now
                 self.generation += 1
                 return dict(
+                    schema="PRESSURE_INVENTORY_V1",
+                    dropped_before=0,
+                    writer_error=None,
                     pool_id=self.pool_id,
                     sampled_at=now,
                     generation=self.generation,
@@ -310,14 +286,24 @@ class DispatchTests(unittest.TestCase):
             close=lambda: None,
         )
 
+        write_lock = threading.Lock()
+
+        def publish(url, after=-float("inf")):
+            while time.time() <= after:
+                time.sleep(0.001)
+            value = inventory_readers[url].poll(time.time())
+            with (root / url).open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(value) + "\n")
+
         def post(url, payload, timeout, sink):
             calls.append(payload["request_id"])
             if len(calls) == 3:
                 all_sent.set()
             sink(0, 42, time.time())
-            return dict(
-                request_started_unix_s=time.time(), completed_unix_s=time.time()
-            )
+            completed = time.time()
+            with write_lock:
+                publish(url, after=completed)
+            return dict(request_started_unix_s=completed, completed_unix_s=completed)
 
         actual_tick = r.PressureCoordinator.tick
 
@@ -334,6 +320,12 @@ class DispatchTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            inventory_readers = {
+                "source": Reader(None, "tp1"),
+                "target": Reader(None, "tp4"),
+            }
+            publish("source")
+            publish("target")
             args = NS(
                 run_dir=root,
                 source_inventory=root / "source",
@@ -373,7 +365,6 @@ class DispatchTests(unittest.TestCase):
                     "tools.bridge_tp.pressure_sessions.PressureSessions",
                     return_value=session,
                 ),
-                patch.object(o, "InventoryReader", Reader),
                 patch.object(o, "scrape_inventory_metrics", return_value=None),
                 patch.object(i, "PressureIngress", side_effect=make_ingress),
                 patch.object(r.PressureCoordinator, "tick", slow_tick),

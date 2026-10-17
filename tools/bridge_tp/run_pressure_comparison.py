@@ -542,6 +542,7 @@ def main():
                     "test_pressure_pause_diagnostics",
                     "test_pressure_io",
                     "test_pressure_dispatch",
+                    "test_pressure_inventory_process",
                     "test_pressure_ingress",
                     "test_pressure_health_screen",
                     "test_pressure_health_reference",

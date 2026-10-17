@@ -704,6 +704,7 @@ def main():
             "tests.bridge_tp.test_pressure_preflight",
             "tests.bridge_tp.test_pressure_policy",
             "tests.bridge_tp.test_pressure_dispatch",
+            "tests.bridge_tp.test_pressure_inventory_process",
         ],
         cwd=ROOT,
         check=True,

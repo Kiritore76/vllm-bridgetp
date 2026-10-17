@@ -209,3 +209,24 @@ Inspect each request's `dispatch_timing` together with existing HTTP transport
 timestamps. A shared host or GIL stall can still delay both threads/services;
 this repair isolates control I/O and does not certify the previous 30s output
 pause fixed. Keep both arrival validity and visible output gaps in acceptance.
+
+
+## Isolated inventory-process repeat (2026-10-17)
+
+Use the same `--workload-pilot` after pulling the inventory-process fix. The
+two fresh STAY/MIGRATE scenes retain all 75 arrivals, routing/migration rules,
+300s scoring and full drain. The user-requested dispatch limit is now 1s;
+ITL 100ms/1%, maximum output gap 1s and penalty definitions are unchanged.
+
+The internal observe_pressure_inventory.py worker is a required component,
+not a separate experiment launcher. Each pool reads/validates its complete raw
+journal in an exec'd CPU-only process and sends bounded compact snapshots.
+The parent retains a latest cache with original evidence timestamps. Block
+lists remain in the raw evidence; no request is removed from policy inputs.
+
+Inspect inventory_tp1/tp4_process_receipt.json, worker.log and timing.jsonl
+beside the existing controller evidence. Parent timing also includes IPC decode
+and GC evidence; workers record read/parse/GC independently. Abnormal observer
+exit, corrupt evidence or missing shutdown receipt fails the run. Children
+inherit the Linux controller process group and also stop on parent stdin EOF.
+The small CPU-held-GIL regression proves process separation, not GPU benefit.

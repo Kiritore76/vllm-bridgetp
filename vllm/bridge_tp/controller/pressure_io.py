@@ -84,65 +84,6 @@ class PressureAudit:
             self.durable.close()
 
 
-class BackgroundInventory:
-    """Single journal reader with bounded work and a nonblocking cached poll.
-
-    Reading/parsing takes place outside the cache lock. Integrity failures are
-    sticky and raised to the controller; records are never skipped to catch up.
-    """
-
-    def __init__(self, reader, poll, interval_s=0.05):
-        self.reader, self.read, self.interval_s = reader, poll, interval_s
-        self.pool_id = reader.pool_id
-        self.lock = threading.Lock()
-        self.stop = threading.Event()
-        self.cached = (None, None, reader.diagnostics(), None)
-        self.observed_at = None
-        self.error = None
-        self.diagnostic = reader.diagnostics()
-        self.thread = threading.Thread(
-            target=self._run, name=f"pressure-inventory-{self.pool_id}", daemon=True
-        )
-        self.thread.start()
-
-    def _run(self):
-        while not self.stop.is_set():
-            try:
-                value = self.read(time.time())
-                state = (
-                    value,
-                    self.reader.observed_at,
-                    self.reader.diagnostics(),
-                    None,
-                )
-            except BaseException as error:
-                state = (None, None, self.reader.diagnostics(), error)
-                self.stop.set()
-            with self.lock:
-                self.cached = state
-            self.stop.wait(self.interval_s)
-
-    def poll(self, now):
-        with self.lock:
-            value, observed, diagnostic, error = self.cached
-        if error is not None:
-            raise RuntimeError("background inventory failed") from error
-        self.observed_at, self.diagnostic = observed, diagnostic
-        self.error = diagnostic["error"]
-        self.deferred = diagnostic["deferred"]
-        self.latest = value
-        return value if value is None or value["sampled_at"] <= now else None
-
-    def diagnostics(self):
-        return dict(self.diagnostic)
-
-    def close(self):
-        self.stop.set()
-        self.thread.join(3)
-        if self.thread.is_alive():
-            raise RuntimeError("background inventory did not stop")
-
-
 class BackgroundMetrics:
     """At most one in-flight HTTP call per pool; cached reads never renew age."""
 
