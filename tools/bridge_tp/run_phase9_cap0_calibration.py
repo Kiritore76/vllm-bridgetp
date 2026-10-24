@@ -271,7 +271,7 @@ def wait_pair(
 def server_command(args: argparse.Namespace, tp: int, port: int) -> list[str]:
     max_model_len = (
         getattr(args, "tp4_max_model_len", None) or args.max_model_len
-        if tp == 4 else args.max_model_len
+        if tp > 1 else args.max_model_len
     )
     return [
         str(args.python_bin),
@@ -466,7 +466,7 @@ def source_environment(
             "BRIDGETP_STREAM_RUN_DIR": str(controller_dir),
             "BRIDGETP_STREAM_HOST": "127.0.0.1",
             "BRIDGETP_STREAM_BASE_PORT": str(args.snapshot_port),
-            "BRIDGETP_STREAM_TARGET_TP": "4",
+            "BRIDGETP_STREAM_TARGET_TP": str(getattr(args, "target_tp_size", 4)),
             "BRIDGETP_STREAM_HEAD_AXIS": "3",
             "BRIDGETP_STREAM_EXPECTED_KV_HEADS": str(kv_heads),
             "BRIDGETP_STREAM_AFTER_OUTPUT_TOKENS": "128",

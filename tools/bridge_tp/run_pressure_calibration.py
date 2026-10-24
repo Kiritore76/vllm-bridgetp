@@ -394,6 +394,7 @@ def run_scene(
     urls = {pool: plan["config"][pool + "_url"] for pool in ("source", "target")}
     processes, work, observer = [], None, None
     host_monitor = None
+    lifecycle_events = []
     observation_receipt = dict(valid_records=0, error_records=0)
     warm_requests = [
         payload(config, size, 16, "warm")
@@ -447,12 +448,14 @@ def run_scene(
             )
             processes.append(host_monitor)
         for pool in ("target", "source"):
+            load_started = time.time()
             stage("启动服务", pool=pool)
             process = common.start_process(
                 pool, plan[pool + "_argv"], plan[pool + "_env"], root / f"{pool}.log"
             )
             processes.append(process)
             common.wait_healthy(urls[pool], process, spec["startup_timeout_s"])
+            healthy_at = time.time()
             stage("暖机", pool=pool)
             warmup_prompt_shapes(
                 urls[pool],
@@ -460,6 +463,11 @@ def run_scene(
                 root / f"{pool}_warmup.json",
                 spec["run_timeout_s"],
             )
+            lifecycle_events.append(dict(
+                pool=pool, load_started_unix_s=load_started,
+                healthy_unix_s=healthy_at, warm_ready_unix_s=time.time(),
+            ))
+            common.write_json(root / "lifecycle_events.json", lifecycle_events)
         inventories = wait_empty(run_dir)
         initial_generations = [r["generation"] for r in inventories]
         common.write_json(
@@ -518,7 +526,8 @@ def run_scene(
         window = pilot.read(root / "measurement_window.json")
         window["ended_unix_s"] = time.time()
         common.write_json(root / "measurement_window.json", window)
-        for pool, ranks in (("source", 1), ("target", 4)):
+        for pool, ranks in (("source", 1),
+                            ("target", getattr(settings, "target_tp_size", 4))):
             stage("收尾性能轨迹", pool=pool)
             result = _post_json(
                 urls[pool],

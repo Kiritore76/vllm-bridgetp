@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from ..runtime_control import RuntimeControl
+from .tp_geometry import session_target_tp
 
 
 class ActionError(RuntimeError):
@@ -132,6 +133,10 @@ class ActionAdapter:
             ready_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             ready_socket.bind((ready_notification_host, ready_notification_port))
             self._ready_socket = ready_socket
+
+    @property
+    def target_tp_size(self):
+        return session_target_tp(self.run_dir)
 
     @property
     def binding(self) -> SessionBinding:
@@ -305,7 +310,7 @@ class ActionAdapter:
         if not receipt_dir.is_dir():
             return False, set(), "initial GPU-history receipts not created yet"
         buffered: set[int] = set()
-        for rank in range(4):
+        for rank in range(self.target_tp_size):
             path = receipt_dir / f"tp_rank_{rank}.json"
             if not path.is_file():
                 continue
@@ -325,11 +330,12 @@ class ActionAdapter:
                     return False, buffered, f"rank {rank} initial GPU readback FAILED"
                 buffered.add(rank)
         return (
-            len(buffered) == 4,
+            len(buffered) == self.target_tp_size,
             buffered,
-            "all four ranks initial history GPU-buffered"
-            if len(buffered) == 4
-            else f"{len(buffered)}/4 ranks initial history GPU-buffered",
+            "all target ranks initial history GPU-buffered"
+            if len(buffered) == self.target_tp_size
+            else (f"{len(buffered)}/{self.target_tp_size} ranks "
+                  "initial history GPU-buffered"),
         )
 
     def poll_initial_history_gpu_ready(self) -> tuple[bool, set[int], str]:
@@ -351,7 +357,7 @@ class ActionAdapter:
         if not receipt_dir.is_dir():
             return False, set(), "initial GPU-history receipts not created yet"
         ready: set[int] = set()
-        for rank in range(4):
+        for rank in range(self.target_tp_size):
             path = receipt_dir / f"tp_rank_{rank}.json"
             if not path.is_file():
                 continue
@@ -367,11 +373,11 @@ class ActionAdapter:
                 return False, ready, f"rank {rank} initial GPU history readback FAILED"
             ready.add(rank)
         return (
-            len(ready) == 4,
+            len(ready) == self.target_tp_size,
             ready,
-            "all four ranks initial history GPU-ready"
-            if len(ready) == 4
-            else f"{len(ready)}/4 ranks initial history GPU-ready",
+            "all target ranks initial history GPU-ready"
+            if len(ready) == self.target_tp_size
+            else f"{len(ready)}/{self.target_tp_size} ranks initial history GPU-ready",
         )
 
     def poll_delta_gpu_resident_progress(
@@ -387,7 +393,7 @@ class ActionAdapter:
         if binding is None:
             return False, {}, "session manifest not created yet"
         progress: dict[int, int] = {}
-        for rank in range(4):
+        for rank in range(self.target_tp_size):
             initial_path = (
                 self.run_dir / "gpu_initial_receipts" / f"tp_rank_{rank}.json"
             )
@@ -450,7 +456,7 @@ class ActionAdapter:
             return False, set(), f"expected 1 target dir, found {len(target_dirs)}"
 
         ready: set[int] = set()
-        for rank in range(4):
+        for rank in range(self.target_tp_size):
             sender_path = sender_dir / f"tp_rank_{rank}.json"
             receiver_path = target_dirs[0] / f"tp_rank_{rank}.json"
             if not (sender_path.exists() and receiver_path.exists()):
@@ -478,11 +484,11 @@ class ActionAdapter:
                 return False, ready, f"rank {rank} payload byte count mismatch"
             ready.add(rank)
         return (
-            len(ready) == 4,
+            len(ready) == self.target_tp_size,
             ready,
-            "all four ranks ready"
-            if len(ready) == 4
-            else (f"{len(ready)}/4 ranks ready"),
+            "all target ranks ready"
+            if len(ready) == self.target_tp_size
+            else (f"{len(ready)}/{self.target_tp_size} ranks ready"),
         )
 
     def wait_for_target_ready(
@@ -512,7 +518,7 @@ class ActionAdapter:
                 if result[0]:
                     self._authoritative_ready_unix_s = time.time()
                 return result
-            latch_armed = len(self._ready_notification_ranks) == 4
+            latch_armed = len(self._ready_notification_ranks) == self.target_tp_size
             if latch_armed and self._ready_latch_armed_unix_s is None:
                 self._ready_latch_armed_unix_s = time.time()
             socket_timeout = remaining
@@ -560,7 +566,7 @@ class ActionAdapter:
             json.JSONDecodeError,
         ):
             return False
-        if not 0 <= rank < 4:
+        if not 0 <= rank < self.target_tp_size:
             return False
         if (
             self.expected_migration_id

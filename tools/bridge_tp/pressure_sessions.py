@@ -9,6 +9,8 @@ import sys
 import time
 from pathlib import Path
 
+from tools.bridge_tp.pressure_cpu import load
+
 
 def publish_active(root, directory):
     root, directory = Path(root).resolve(), Path(directory).resolve()
@@ -90,7 +92,7 @@ class PressureSessions:
                 return False
         paths = [self.run_dir / "gpu_direct_sender.json"] + [
             self.run_dir / "persistent_channel_receipts" / f"tp_rank_{rank}.json"
-            for rank in range(4)
+            for rank in range(load("tp_geometry").session_target_tp(self.run_dir))
         ]
         paths += [
             self.run_dir
@@ -105,7 +107,8 @@ class PressureSessions:
             return False
         rows = [json.loads(path.read_text()) for path in paths]
         sender, *rest = rows
-        targets, finalized, stager = rest[:4], rest[4], rest[5]
+        count = load("tp_geometry").session_target_tp(self.run_dir)
+        targets, finalized, stager = rest[:count], rest[count], rest[count + 1]
         if (
             sender.get("communicator_lifecycle") != "PERSISTENT_CHANNEL_IDLE"
             or sender.get("migration_id") != self.migration_id

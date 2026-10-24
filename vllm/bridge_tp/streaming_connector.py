@@ -312,8 +312,9 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             else "BridgeTP D3 Phase 6"
         )
         parallel = vllm_config.parallel_config
-        if parallel.tensor_parallel_size != 4:
-            raise ValueError("BridgeTP Phase 6 requires tensor_parallel_size=4")
+        if parallel.tensor_parallel_size not in (2, 4):
+            raise ValueError("BridgeTP requires tensor_parallel_size=2 or 4")
+        self._target_tp_size = parallel.tensor_parallel_size
         if parallel.pipeline_parallel_size != 1:
             raise ValueError("BridgeTP Phase 6 does not support pipeline parallelism")
         if len(kv_cache_config.kv_cache_groups) != 1:
@@ -537,7 +538,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         required = {
             "protocol_version": PROTOCOL_VERSION,
             "source_tp_size": 1,
-            "target_tp_size": 4,
+            "target_tp_size": self._target_tp_size,
             "pending_known_tokens": 1,
         }
         for key, value in required.items():
@@ -558,8 +559,8 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         ranks = manifest.get("ranks")
         if not isinstance(ranks, list) or [
             int(record["target_tp_rank"]) for record in ranks
-        ] != list(range(4)):
-            raise ValueError("Phase 6 manifest does not contain ranks 0..3")
+        ] != list(range(self._target_tp_size)):
+            raise ValueError("Stream manifest target rank set differs")
         known = list(manifest["all_known_token_ids"])
         computed = list(manifest["computed_token_ids"])
         pending = list(manifest["pending_token_ids"])
@@ -908,7 +909,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 "protocol_version": PROTOCOL_VERSION,
                 "migration_id": request.migration_id,
                 "source_request_id": request.source_request_id,
-                "target_tp_size": 4,
+                "target_tp_size": self._target_tp_size,
                 "target_tp_rank": tp_rank,
                 "num_computed_tokens": request.num_computed_tokens,
                 "pending_known_tokens": 1,
@@ -942,7 +943,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 "format_version": 1,
                 "migration_id": request.migration_id,
                 "source_request_id": request.source_request_id,
-                "target_tp_size": 4,
+                "target_tp_size": self._target_tp_size,
                 "target_tp_rank": tp_rank,
                 "block_axis": int(manifest["block_axis"]),
                 "block_size": int(manifest["block_size"]),

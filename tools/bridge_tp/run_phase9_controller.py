@@ -1763,6 +1763,7 @@ def main() -> None:
         record = machine.create(
             args.migration_id or "dry-run",
             first_progress.request_id,
+            expected_ranks=config.target_tp_size,
         )
         tp1 = MetricsScraper(
             config.source_url,
@@ -2154,7 +2155,7 @@ def main() -> None:
                             ):
                                 manifest = load_json(manifest_path)
                                 ranks = manifest.get("ranks") or []
-                                if len(ranks) == 4 and all(
+                                if len(ranks) == config.target_tp_size and all(
                                     "payload_bytes" in rank for rank in ranks
                                 ):
                                     m0_history_total_bytes = sum(

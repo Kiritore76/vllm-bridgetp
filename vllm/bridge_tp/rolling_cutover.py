@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .controller.tp_geometry import session_target_tp
+
 MECHANISM = "ROLLING_NO_HISTORY_WAIT_V1"
 
 
@@ -23,7 +25,7 @@ def read_json(path: Path) -> dict[str, Any]:
 def resident_progress(run_dir: Path, migration_id: str) -> tuple[bool, int | None]:
     """Use only four exact resident histories and contiguous applied deltas."""
     ends = []
-    for rank in range(4):
+    for rank in range(session_target_tp(run_dir)):
         initial = read_json(run_dir / "gpu_initial_receipts" / f"tp_rank_{rank}.json")
         if (
             initial.get("migration_id") != migration_id
@@ -365,7 +367,7 @@ def rolling_evidence_errors(
             or not first_s <= s["selected_unix_s"] <= freeze_unix_s
         ):
             errors.append("rolling freeze lacks a matching pre-freeze applied proof")
-        for rank in range(4):
+        for rank in range(session_target_tp(run_dir)):
             h = read_json(run_dir / "gpu_initial_receipts" / f"tp_rank_{rank}.json")
             if (
                 h.get("migration_id") != identity

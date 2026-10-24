@@ -138,12 +138,19 @@ def arguments(spec):
     values = copy.deepcopy(spec["server_settings"])
     values.update(model_path=Path(spec["model_path"]), python_bin=Path(sys.executable))
     args = SimpleNamespace(**values)
+    target_tp = getattr(args, "target_tp_size", 4)
+    if target_tp not in (2, 4):
+        raise ValueError("target TP must be 2 or 4")
+    devices = args.tp4_gpus.split(",")
+    if (len(devices) != target_tp or len(set(devices)) != target_tp
+            or args.tp1_gpu in devices):
+        raise ValueError("source/target GPUs must be disjoint and match TP")
     if (
         args.dtype != "bfloat16"
         or args.max_model_len != 8192
         or args.tp4_max_model_len != 16384
-        or args.tp1_gpu != "0"
-        or args.tp4_gpus != "1,2,3,4"
+        or (target_tp == 4 and args.tp1_gpu != "0")
+        or (target_tp == 4 and args.tp4_gpus != "1,2,3,4")
         or not args.persistent_channel
         or not args.preconnect_persistent_channel
         or not args.gpu_direct_history
@@ -154,6 +161,7 @@ def arguments(spec):
 
 
 def build_scene(spec, scene, run_root, common, args):
+    target_tp = getattr(args, "target_tp_size", 4)
     run_dir = run_root / scene["name"] / "controller"
     multiple = spec.get("maximum_migrations", 1) != 1
     mechanism_dir = run_dir / "migration_active" if multiple else run_dir
@@ -161,6 +169,7 @@ def build_scene(spec, scene, run_root, common, args):
     config = read(spec["controller_config_template"])
     config.update(
         transfer_mode="FULL_SPEED",
+        target_tp_size=target_tp,
         source_url=f"http://127.0.0.1:{args.tp1_port}",
         target_url=f"http://127.0.0.1:{args.tp4_port}",
         run_dir=str(run_dir),
@@ -177,6 +186,7 @@ def build_scene(spec, scene, run_root, common, args):
     finally:
         os.environ.update(inherited)
     source.update(
+        BRIDGETP_STREAM_TARGET_TP=str(target_tp),
         VLLM_DISABLE_COMPILE_CACHE="1",
         BRIDGETP_SHADOW_STRATEGY="S_NEW_OLD",
         BRIDGETP_REQUEST_FREEZE_ENABLED="1",
@@ -195,6 +205,7 @@ def build_scene(spec, scene, run_root, common, args):
         if key.startswith("BRIDGETP_"):
             target.pop(key)
     target.update(
+        BRIDGETP_STREAM_TARGET_TP=str(target_tp),
         CUDA_VISIBLE_DEVICES=args.tp4_gpus,
         OMP_NUM_THREADS="1",
         BRIDGETP_TAKEOVER_ENABLED="1",
@@ -205,7 +216,7 @@ def build_scene(spec, scene, run_root, common, args):
     )
     if multiple:
         target["BRIDGETP_TAKEOVER_PERSISTENT_CHANNEL"] = "1"
-    target_argv = common.server_command(args, 4, args.tp4_port) + [
+    target_argv = common.server_command(args, target_tp, args.tp4_port) + [
         "--kv-transfer-config",
         common.target_connector(
             mechanism_dir,

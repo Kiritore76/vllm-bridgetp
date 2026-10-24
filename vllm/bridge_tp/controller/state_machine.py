@@ -59,7 +59,7 @@ class MigrationRecord:
 
     @property
     def all_ranks_ready(self) -> bool:
-        return len(self.ranks_ready) >= self.expected_ranks
+        return self.ranks_ready == set(range(self.expected_ranks))
 
     @property
     def is_terminal(self) -> bool:
@@ -81,17 +81,22 @@ class MigrationStateMachine:
         self._allow_shadow_takeover = bool(allow_shadow_takeover)
 
     # ---- lifecycle ----------------------------------------------------
-    def create(self, migration_id: str, request_id: str) -> MigrationRecord:
+    def create(self, migration_id: str, request_id: str,
+               expected_ranks: int = 4) -> MigrationRecord:
+        if type(expected_ranks) is not int or expected_ranks not in (2, 4):
+            raise ValueError("target rank count must be 2 or 4")
         with self._lock:
             existing = self._records.get(migration_id)
             if existing is not None:
-                if existing.request_id != request_id:
+                if (existing.request_id != request_id
+                        or existing.expected_ranks != expected_ranks):
                     raise IllegalTransition(
                         f"migration {migration_id} already bound to "
                         f"{existing.request_id}"
                     )
                 return existing
             record = MigrationRecord(migration_id, request_id)
+            record.expected_ranks = expected_ranks
             self._records[migration_id] = record
             return record
 
@@ -110,6 +115,8 @@ class MigrationStateMachine:
     def mark_rank_ready(self, migration_id: str, rank: int) -> MigrationRecord:
         with self._lock:
             record = self._require(migration_id)
+            if type(rank) is not int or not 0 <= rank < record.expected_ranks:
+                raise ValueError("ready rank outside configured target geometry")
             record.ranks_ready.add(int(rank))
             return record
 

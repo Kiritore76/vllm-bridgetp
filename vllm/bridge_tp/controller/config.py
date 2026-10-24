@@ -46,6 +46,7 @@ class ControllerConfig:
     # endpoints
     source_url: str = "http://127.0.0.1:8001"
     target_url: str = "http://127.0.0.1:8200"
+    target_tp_size: int = 4
     run_dir: str = "./run"
 
     # pool geometry, needed to turn KV usage fraction into free tokens
@@ -119,6 +120,9 @@ class ControllerConfig:
         return config
 
     def validate(self) -> None:
+        from .tp_geometry import validate_target_tp
+
+        validate_target_tp(self.target_tp_size)
         if self.tp1_total_kv_blocks <= 0 or self.tp4_total_kv_blocks <= 0:
             raise ValueError(
                 "tp1_total_kv_blocks and tp4_total_kv_blocks must be measured from "

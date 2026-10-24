@@ -20,6 +20,7 @@ from typing import Any
 
 import torch
 
+from vllm.bridge_tp.controller.tp_geometry import validate_target_tp
 from vllm.bridge_tp.runtime_control import RuntimeControl
 from vllm.bridge_tp.stream_protocol import (
     PROTOCOL_VERSION,
@@ -227,7 +228,7 @@ class _DeltaReceivers:
         self.stop = threading.Event()
         self.lock = threading.Lock()
         self.by_rank: list[dict[int, dict[str, Any]]] = [
-            {} for _ in range(4)
+            {} for _ in range(validate_target_tp(self.manifest["target_tp_size"]))
         ]
         # GPU-resident Shadow needs a digest of history followed by every
         # delta at cutover. Retain only the much smaller delta wire images;
@@ -235,14 +236,14 @@ class _DeltaReceivers:
         # soon as it arrives. This avoids rereading thousands of queue files
         # while the source request is frozen.
         self.wire_by_rank: list[dict[int, bytes]] = [
-            {} for _ in range(4)
+            {} for _ in range(validate_target_tp(self.manifest["target_tp_size"]))
         ]
         self.errors: list[str] = []
         self.listeners: list[socket.socket] = []
         self.threads: list[threading.Thread] = []
 
     def start(self) -> None:
-        for rank in range(4):
+        for rank in range(validate_target_tp(self.manifest["target_tp_size"])):
             listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind((self.host, self.base_port + rank))
@@ -641,6 +642,7 @@ def main(argv=None) -> None:
         _cleanup(args.run_dir, str(request.get("reason")), 0, 0)
         return
     manifest = _load_json(manifest_path)
+    target_tp = validate_target_tp(manifest["target_tp_size"])
     if manifest.get("phase") != "BridgeTP D3 Phase 8":
         raise ValueError("CPU stager requires a Phase 8 source manifest")
 
@@ -695,10 +697,10 @@ def main(argv=None) -> None:
                 ),
                 wire_bytes=int(manifest["ranks"][rank]["raw_tensor_bytes"]),
             )
-            for rank in range(4)
+            for rank in range(target_tp)
         ]
     else:
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        with ThreadPoolExecutor(max_workers=target_tp) as executor:
             initial = list(
                 executor.map(
                     lambda rank: _receive_initial_rank(
@@ -708,7 +710,7 @@ def main(argv=None) -> None:
                         args.timeout_s,
                         live_gpu_queue,
                     ),
-                    range(4),
+                    range(target_tp),
                 )
             )
 
@@ -719,14 +721,14 @@ def main(argv=None) -> None:
         initial.clear()
         for value in delta_receivers.by_rank:
             value.clear()
-        _cleanup(args.run_dir, str(request.get("reason")), 4, delta_count)
+        _cleanup(args.run_dir, str(request.get("reason")), target_tp, delta_count)
         return
     cutover = _load_json(cutover_path)
     delta_receivers.close()
 
     if args.gpu_resident_shadow:
         ranks: list[dict[str, Any]] = []
-        for rank in range(4):
+        for rank in range(target_tp):
             if gpu_direct_delta:
                 ranks.append(
                     _build_direct_gpu_rank_record(
@@ -822,7 +824,7 @@ def main(argv=None) -> None:
 
     assembled_by_rank: list[dict[str, torch.Tensor]] = []
     coverage_by_rank: list[list[list[int]]] = []
-    for rank in range(4):
+    for rank in range(target_tp):
         assembled, coverage = _assemble_rank(
             initial=initial[rank].payload,
             deltas=delta_receivers.by_rank[rank],
@@ -845,7 +847,7 @@ def main(argv=None) -> None:
                 "format_version": 1,
                 "migration_id": manifest["migration_id"],
                 "source_request_id": manifest["source_request_id"],
-                "target_tp_size": 4,
+                "target_tp_size": target_tp,
                 "target_tp_rank": rank,
                 "block_axis": manifest["block_axis"],
                 "block_size": manifest["block_size"],
@@ -867,7 +869,7 @@ def main(argv=None) -> None:
             "protocol_version": PROTOCOL_VERSION,
             "migration_id": manifest["migration_id"],
             "source_request_id": manifest["source_request_id"],
-            "target_tp_size": 4,
+            "target_tp_size": target_tp,
             "target_tp_rank": rank,
             "num_computed_tokens": cutover["num_computed_tokens"],
             "pending_known_tokens": 1,

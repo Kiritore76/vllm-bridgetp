@@ -16,6 +16,7 @@ from typing import Any
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 
+from vllm.bridge_tp.controller.tp_geometry import session_target_tp
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -97,17 +98,19 @@ def _validate_body(
 def _validate_target_ready(
     run_dir: Path, migration_id: str
 ) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+    if session_target_tp(run_dir) != int(os.getenv("BRIDGETP_STREAM_TARGET_TP", "4")):
+        raise ValueError("session target geometry differs from configured transport")
     phase8 = (run_dir / "staging_manifest.json").exists()
     sender_dir = (
         run_dir / "stage_delivery_receipts" if phase8 else run_dir / "sender_receipts"
     )
-    senders = [_load_json(sender_dir / f"tp_rank_{rank}.json") for rank in range(4)]
+    senders = [_load_json(sender_dir / f"tp_rank_{rank}.json") for rank in range(session_target_tp(run_dir))]
     receiver_root = run_dir / "receiver_receipts"
     target_dirs = sorted(path for path in receiver_root.iterdir() if path.is_dir())
     if len(target_dirs) != 1:
         raise ValueError("Phase 7 requires exactly one target request directory")
     receivers = [
-        _load_json(target_dirs[0] / f"tp_rank_{rank}.json") for rank in range(4)
+        _load_json(target_dirs[0] / f"tp_rank_{rank}.json") for rank in range(session_target_tp(run_dir))
     ]
     target_request_ids = {str(receipt["target_request_id"]) for receipt in receivers}
     if len(target_request_ids) != 1:

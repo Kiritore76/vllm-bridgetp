@@ -23,7 +23,7 @@ def channel_idle(run_dir, migration_id, request_id):
 
     paths = [run_dir / "gpu_direct_sender.json"] + [
         run_dir / "persistent_channel_receipts" / f"tp_rank_{rank}.json"
-        for rank in range(4)
+        for rank in range(load("tp_geometry").session_target_tp(run_dir))
     ]
     if not all(path.is_file() for path in paths):
         return False
@@ -188,7 +188,10 @@ class RollingPressureSession:
             raise ValueError("source ended or has no safe output budget")
         now = time.time()
         self.stream = stream
-        self.record = self.machine.create(self.migration_id, candidate.request_id)
+        self.record = self.machine.create(
+            self.migration_id, candidate.request_id,
+            expected_ranks=getattr(self.config, "target_tp_size", 4),
+        )
         self.old.atomic_json_dump(stream.payload, self.run_dir / "source_request.json")
         self.old.atomic_json_dump(
             {

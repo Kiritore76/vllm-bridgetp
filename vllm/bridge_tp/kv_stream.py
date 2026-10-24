@@ -318,8 +318,10 @@ class BridgeTPStreamConfig:
                 os.getenv("BRIDGETP_CHANNEL_GENERATION", "0")
             ),
         )
-        if config.target_tp_size != 4:
-            raise ValueError("BridgeTP Phase 6 currently requires target TP=4")
+        if config.target_tp_size not in (2, 4):
+            raise ValueError("BridgeTP streaming requires target TP=2 or TP=4")
+        if config.expected_kv_heads % config.target_tp_size:
+            raise ValueError("KV heads must divide over target TP ranks")
         if not 0 < config.chunk_bytes <= 16 * 1024 * 1024:
             raise ValueError("BRIDGETP_STREAM_CHUNK_BYTES must be in [1, 16 MiB]")
         config.validate_boundaries()

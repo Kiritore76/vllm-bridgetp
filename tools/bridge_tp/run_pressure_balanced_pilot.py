@@ -137,6 +137,9 @@ def preflight(args):
         },
         rate=SimpleNamespace(**raw["rate"]),
         transfer_mode=raw.get("transfer_mode", "ADAPTIVE"),
+        target_tp_size=load("tp_geometry").validate_target_tp(
+            raw.get("target_tp_size", 4)
+        ),
         policy=SimpleNamespace(kv_bytes_per_token=raw["policy"]["kv_bytes_per_token"]),
         ready_notification_mode=raw.get("ready_notification_mode", "FILE_POLL"),
         ready_notification_port=raw.get("ready_notification_port", 0),
@@ -158,6 +161,12 @@ def preflight(args):
             high_bytes_s=controller.rate.b_max_bytes_s,
         ).validate()
     evidence = read(args.service_evidence)
+    if controller.target_tp_size == 2 and (
+        evidence.get("target_tp_size") != 2
+        or (args.health_reference
+            and read(args.health_reference).get("target_tp_size") != 2)
+    ):
+        raise ValueError("TP2 requires explicitly identified TP2 service profiles")
     lookup = s.LocalServiceLookup(evidence)
     if cfg.workload_pressure:
         load("pressure_workload").build_profiles(

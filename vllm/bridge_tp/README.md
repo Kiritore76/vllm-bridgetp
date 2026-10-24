@@ -1,5 +1,42 @@
 # BridgeTP：开发与运行说明
 
+## TP2 开发分支（2026-10-24）
+
+`bridgetp/tp2-reconfiguration` 在现有代码目录开发。TP4 参数原文及文件
+SHA 已单独冻结；TP2 不沿用 TP4 的目标服务/迁移成本 profile。旧五卡
+wrapper 仍检查原分支，不可直接用它启动四卡 TP2。
+
+- `tools/bridge_tp/run_tp2_cpu_checks.py --output <new-dir>`：真实 CPU 模块
+  回归，绕过 CUDA 包启动；不代表 GPU 验收。
+- `tools/bridge_tp/run_tp2_calibration.py --model-path <model> --out-root <new-dir>`：
+  四张 A100 PCIe 40GB，GPU0/1为 TP2，GPU2为 TP1，GPU3空闲。
+  `--validate-only` 只检查输入；`--scene tp2-nd2` 先跑一个双重复小批。
+  完整首批10单元，采集真实请求、原生库存、性能轨迹及启动暖机时间。
+- `tools/bridge_tp/summarize_tp2_calibration.py --input <run-dir> --output <new-json>`：
+  汇总工作点和 prefill，未测的迁移/重建/收益仍为 null；输出不是可部署
+  profile，不能直接替换旧 service_evidence。
+- `tools/bridge_tp/run_tp2_migration_smoke.py --model-path <model>
+  --out-root <new-dir> --history-tokens 128`：显式触发一条真实 TP1→TP2 迁移，
+  复用现有滚动执行、原生目标分配和精确提交/释放门槛，验证完整输出及通道
+  IDLE；不代表压力策略自然触发。`2048` 为另一预注册历史大小。先只跑128，
+  审查证据后再跑另一单元；两场不能提供繁忙目标的通用成本支持。
+- `tools/bridge_tp/run_tp_bundle_drain.py --edge L1A-L2 --model-path <model>
+  --out-root <new-dir>`：真实四卡自然排空生命周期试验。另支持
+  `L0-L1A`、`L1A-L0`、`L2-L1A`；`--empty` 做空载循环。
+  到达线程独立于回收/加载；转换期间只回收指定 bundle。
+  此入口使用明确的循环固定路由，没有启用 frozen fast 策略或迁移通道，
+  只能验证生命周期，不能抵扣正式压力静态/转换对照。
+
+传输发送、接收、stager、全 rank 回执门槛及会话轮换已增加 TP2 几何支持，
+默认仍为 TP4；真实 TP2 KV 接管尚未验证。新增实例注册表、租约和承诺、
+手工转换状态机及纯快照规划器的 CPU 契约已实现。多源通信通道退役、
+冻结压力路由接入注册表、规划器驱动真实辅助迁移及正式矩阵尚未接通，
+不得把 CPU fixture 或固定路由 DRAIN 称作完整系统验收。
+
+规划器只在手工会话内运行，未知排队/阶段时间和 NET 成本保持 UNKNOWN。
+串行搬运使用 START 到源释放及清理时间；延后启动超出测量支持时拒绝
+估计。SHADOW 不修改准入或引擎。首次销毁后进入完成或恢复流程。
+
 更新：2026-10-17。本目录只维护这一份模块说明。阶段计划、旧实验结果和旧版指标文档已从代码目录移除；历史版本可通过Git查看。实验输入、JSON配置与必需的运行契约仍位于`experiments/phase9/`，分析报告及结果包不放进源码目录。
 
 ## 1. 当前系统与代码入口
