@@ -39,6 +39,55 @@ oasst = load_module(
 
 
 class TestPredictorCapture(unittest.TestCase):
+    def test_offline_capture_overrides_automatic_or_explicit_v2_runner(self):
+        for before in (
+            {},
+            {"VLLM_USE_V2_MODEL_RUNNER": "1"},
+            {"VLLM_USE_V2_MODEL_RUNNER": "0"},
+        ):
+            environment = {**before, "UNRELATED": "preserve"}
+            runner.configure_offline_runner(environment)
+            self.assertEqual(environment["VLLM_USE_V2_MODEL_RUNNER"], "0")
+            self.assertEqual(environment["UNRELATED"], "preserve")
+
+    def test_inactive_v2_capture_path_rejected_before_generation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            with self.assertRaisesRegex(RuntimeError, "writer was not initialized"):
+                runner.check_capture_writer(path)
+            self.assertFalse((path / "features.sqlite3").exists())
+
+    def test_per_request_guard_requires_prefill_decode_and_matching_width(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            writer = capture.PredictorFeatureCapture(path, 20)
+            try:
+                runner.check_capture_writer(path)
+                label = dict(request_id="external", output_tokens=40)
+                with self.assertRaisesRegex(RuntimeError, "missing or invalid"):
+                    runner.check_request_capture(path, label, 20, 4096)
+                for count, phase in ((0, "PREFILL_COMPLETE"), (20, "DECODE")):
+                    writer.database.execute(
+                        "INSERT INTO samples (request_id, generated_tokens, phase, "
+                        "hidden_size, hidden_fp16, captured_unix_ns) "
+                        "VALUES (?,?,?,?,?,?)",
+                        ("external-abcdef12", count, phase, 4096, bytes(8192), 1),
+                    )
+                    writer.database.commit()
+                    if count == 0:
+                        with self.assertRaisesRegex(
+                            RuntimeError, "decode features missing"
+                        ):
+                            runner.check_request_capture(path, label, 20, 4096)
+                        runner.check_request_capture(
+                            path, {**label, "output_tokens": 6}, 20, 4096
+                        )
+                runner.check_request_capture(path, label, 20, 4096)
+                with self.assertRaisesRegex(RuntimeError, "missing or invalid"):
+                    runner.check_request_capture(path, label, 20, 5120)
+            finally:
+                writer.database.close()
+
     def test_capture_writes_sqlite_rows_auditable_by_runner(self):
         class FakeStates:
             ndim = 2

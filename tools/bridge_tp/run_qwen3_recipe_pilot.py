@@ -172,6 +172,11 @@ def main(argv=None):
     parser.add_argument("--installation-record", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--batch-index", type=int, choices=range(4), default=0)
+    parser.add_argument(
+        "--probe-only",
+        action="store_true",
+        help="capture two short probes before repeating the 12 requests",
+    )
     args = parser.parse_args(argv)
     args.output = args.output.resolve()
     archive_path = Path(str(args.output) + ".tar.gz")
@@ -223,10 +228,23 @@ def main(argv=None):
         with DATA.open(encoding="utf-8") as stream:
             candidates = [json.loads(line) for line in stream if line.strip()]
         batch = balanced_batches(candidates)[args.batch_index]
+        if args.probe_only:
+            batch = [
+                next(r for r in batch if r["candidate_group"] == "controlled"),
+                next(
+                    r
+                    for r in batch
+                    if r["candidate_group"] == "oasst_natural" and r["lang"] == "en"
+                ),
+            ]
         from transformers import AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
         rows, cap = render_budget(batch, tokenizer)
+        if args.probe_only:
+            cap = 128
+            for row in rows:
+                row["planned_output_cap"] = cap
         input_path = args.output / "requests.jsonl"
         input_path.write_text(
             "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows),
@@ -238,7 +256,9 @@ def main(argv=None):
             dict(
                 revision=revision,
                 batch_index=args.batch_index,
-                requests=12,
+                requests=len(rows),
+                probe_only=args.probe_only,
+                model_runner="V1",
                 groups=dict(Counter(r["candidate_group"] for r in rows)),
                 languages=dict(Counter(r["lang"] for r in rows)),
                 thinking_mode="disabled",
@@ -289,13 +309,14 @@ def main(argv=None):
         env = {k: v for k, v in os.environ.items() if not k.startswith("BRIDGETP_")}
         env.update(
             CUDA_VISIBLE_DEVICES="0",
+            VLLM_USE_V2_MODEL_RUNNER="0",
             PYTHONDONTWRITEBYTECODE="1",
             PYTHONUNBUFFERED="1",
             OMP_NUM_THREADS="1",
         )
         from tools.bridge_tp import run_phase9_cap0_calibration as common
 
-        print(f"[进度] 单卡首批12条；总上下文16384，实际输出上限{cap}", flush=True)
+        print(f"[进度] 单卡{len(rows)}条；总上下文16384，实际输出上限{cap}", flush=True)
         print(f"[进度] 采集日志：{args.output / 'capture.log'}", flush=True)
         process = common.start_process(
             "qwen3-recipe-pilot", command, env, args.output / "capture.log"
@@ -312,7 +333,8 @@ def main(argv=None):
         summary = read(args.output / "capture/summary.json")
         if (
             summary["hidden_size"] != 4096
-            or summary["phases"].get("PREFILL_COMPLETE") != 12
+            or summary["phases"].get("PREFILL_COMPLETE") != len(rows)
+            or not summary["phases"].get("DECODE", 0)
         ):
             raise ValueError("Qwen3 feature width/prefill coverage differs")
         with (args.output / "capture/labels.jsonl").open(encoding="utf-8") as stream:

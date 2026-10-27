@@ -20,6 +20,12 @@ required by that batch's longest prompt. Total context is 16384.
 One batch captures real hidden states and output tokens on a single 4090D;
 it does not train or qualify a predictor. Successful and failed runs are
 archived with raw features, labels, decoded output, logs and provenance.
+Offline capture explicitly pins `VLLM_USE_V2_MODEL_RUNNER=0`: these BridgeTP
+hooks are implemented in `gpu_model_runner.py` (V1), while Qwen3 may otherwise
+select V2 automatically. Capture checks writer initialization before generation
+and requires each completed request's prefill/decode samples immediately.
+Use `--probe-only` first to run two selected requests capped at 128 output
+tokens, and require both prefill and decode evidence before repeating a full batch.
 
 ## Historical Qwen2 smoke
 

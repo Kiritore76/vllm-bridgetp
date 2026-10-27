@@ -127,7 +127,7 @@
     "tools/bridge_tp/run_phase9_interference_sweep.py": "10325f0330bda40b4c8f983b76e4ade044ed0920fa1820842ffad20d439a83fa",
     "tools/bridge_tp/run_phase9_tpot_sweep.py": "3aef20f11e133ce5eff589f5dd5ac4da01fab297387cb9b3c07a40cdc4dd5f14",
     "tools/bridge_tp/run_predictor_ablation_a100.py": "732a66da461f2c60363b081ee76fac5d2b4252b5fe22e56ad5f49025171d3864",
-    "tools/bridge_tp/run_predictor_capture.py": "54c4431a5d91c2f02049f147a3009306ed00d71c82c62b5c3a18cdcfc49542f6",
+    "tools/bridge_tp/run_predictor_capture.py": "708a56d0608f29a1d5162119fca90fd26c166dde8959547f2f6e0d632073cd8f",
     "tools/bridge_tp/run_predictor_formal_collection.py": "667efef601b57c10de46948a90bf7300a3c627abc49794d1f06ff7b9fe8a1d44",
     "tools/bridge_tp/run_predictor_large_a100.py": "37ae5678477e02d3b18380452b446fdb017389bcc32a80b52ad5a85a7c73434b",
     "tools/bridge_tp/run_predictor_layer_probe_a100.py": "6ba847481ad7224b0a6a927083dc96d64b7a50ef605597d0ea3c85f1b446ff9c",
@@ -305,11 +305,12 @@
     "tools/bridge_tp/prepare_4090d_qwen3.py": "a7a3b8aa520cc4b53eb15afa789deecbbd91a18368f363e7a0f1dce55717ead5",
     "tools/bridge_tp/run_4090d_qwen3_smoke.py": "cc9b24f4e498c7b5f744683ba5c8effc0ea1d7a9c84e070055d41243637df9b7",
     "tests/bridge_tp/test_4090d_qwen3.py": "e9b0cf6fdba3da01acd0ec19f9bd18be03c4493829a4e82a4a5d89c91ac11638",
-    "tools/bridge_tp/predictor_data/README.md": "efe8eb048c395d06d1a78d1c43cf7cd59e00ff9f2a7c6f2d8ec6c5fa5b7eb07a",
-    "tools/bridge_tp/run_qwen3_recipe_pilot.py": "175ee84a29a64b7f121dcb1693bcace6c40ab259f68f5494c8a08a6ee37b13a4",
+    "tools/bridge_tp/predictor_data/README.md": "ec2d847b9ff6c6b372328d5f74ee0a705fbb8de9c937c9d39b4883977eaba56c",
+    "tools/bridge_tp/run_qwen3_recipe_pilot.py": "549c0eba54868e2f117f6786e1d1bbf730037a370d3f4faef61ffe05be9e1c35",
     "tests/bridge_tp/test_qwen3_recipe_pilot.py": "314240085e3095181bc55a8e73f1b2ad3a15e6e8e9391f82605a135ca8c7451d",
     "tools/bridge_tp/predictor_data/qwen3_recipe_pilot48_20261027.jsonl": "19016b758454ce4ea44dc78bc6bdd8fac5cd1ba22d79a0717fe09d3da7939d20",
-    "tools/bridge_tp/predictor_data/qwen3_recipe_pilot48_20261027.manifest.json": "37598819745b6e03ca4b91d9285e268a0e2ecf2c3413eefd0918aedb51679923"
+    "tools/bridge_tp/predictor_data/qwen3_recipe_pilot48_20261027.manifest.json": "37598819745b6e03ca4b91d9285e268a0e2ecf2c3413eefd0918aedb51679923",
+    "tests/bridge_tp/test_predictor_capture.py": "b841741e55f0177ea25f32ab52de40c405c2afb593e304e47181159163173ca9"
   },
   "server_settings": {
     "dtype": "bfloat16",

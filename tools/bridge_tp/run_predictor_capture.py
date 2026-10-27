@@ -189,6 +189,51 @@ def iter_feature_rows(feature_dir: Path):
                 )
 
 
+def configure_offline_runner(environment):
+    """Offline capture hooks currently live only in GPUModelRunner V1."""
+    environment["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+
+
+def check_capture_writer(feature_dir: Path):
+    """Reject an inactive capture path before generating the first request."""
+    database_path = feature_dir / "features.sqlite3"
+    if not database_path.is_file():
+        raise RuntimeError(
+            "predictor feature writer was not initialized; "
+            "offline capture requires VLLM_USE_V2_MODEL_RUNNER=0"
+        )
+    with closing(sqlite3.connect(database_path)) as database:
+        database.execute("SELECT request_id FROM samples LIMIT 1").fetchall()
+
+
+def check_request_capture(feature_dir: Path, label: dict, interval: int, width: int):
+    """Require real prefill/decode samples for this completed request immediately."""
+    check_capture_writer(feature_dir)
+    request_id = label["request_id"]
+    with closing(sqlite3.connect(feature_dir / "features.sqlite3")) as database:
+        rows = database.execute(
+            "SELECT request_id, generated_tokens, phase, hidden_size, "
+            "length(hidden_fp16) FROM samples WHERE request_id = ? "
+            "OR substr(request_id, 1, ?) = ?",
+            (request_id, len(request_id) + 1, request_id + "-"),
+        ).fetchall()
+    rows = [
+        row for row in rows if label_for_engine_request(row[0], {request_id: label})
+    ]
+    if not rows or any(row[3] != width or row[4] != 2 * width for row in rows):
+        raise RuntimeError(
+            f"missing or invalid hidden samples for request {request_id}"
+        )
+    if sum(row[1] == 0 and row[2] == "PREFILL_COMPLETE" for row in rows) != 1:
+        raise RuntimeError(
+            f"prefill feature missing/duplicated for request {request_id}"
+        )
+    if label["output_tokens"] > interval and not any(
+        row[1] > 0 and row[2] == "DECODE" for row in rows
+    ):
+        raise RuntimeError(f"decode features missing for request {request_id}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
@@ -272,6 +317,7 @@ def main() -> None:
                 )
     args.out_dir.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(args.input, args.out_dir / "input_requests.jsonl")
+    configure_offline_runner(os.environ)
     features = args.out_dir / ("layers" if args.feature_layers else "features")
     os.environ["BRIDGETP_PREDICTOR_CAPTURE_DIR"] = str(features.resolve())
     os.environ["BRIDGETP_PREDICTOR_CAPTURE_INTERVAL"] = str(args.interval)
@@ -299,6 +345,8 @@ def main() -> None:
         "feature_layers": layers,
         "requests": len(requests),
         "max_num_seqs": 1,
+        "model_runner": "V1",
+        "VLLM_USE_V2_MODEL_RUNNER": "0",
         "generation_contract": dict(
             thinking_mode=args.thinking_mode,
             temperature=args.temperature,
@@ -333,6 +381,15 @@ def main() -> None:
         ),
     )
     tokenizer = llm.get_tokenizer()
+    if llm.llm_engine.vllm_config.use_v2_model_runner:
+        raise RuntimeError("offline predictor capture unexpectedly selected V2 runner")
+    capture_directories = (
+        [features / layer.replace(":", "") / "features" for layer in layers]
+        if args.feature_layers
+        else [features]
+    )
+    for directory in capture_directories:
+        check_capture_writer(directory)
     emit(f"模型就绪，准备采集{len(requests)}条请求")
     sampling = SamplingParams(
         max_tokens=args.max_tokens,
@@ -391,6 +448,10 @@ def main() -> None:
             labels[result.request_id] = label
             handle.write(json.dumps(label, ensure_ascii=False) + "\n")
             handle.flush()
+            for directory in capture_directories:
+                check_request_capture(
+                    directory, label, args.interval, config["hidden_size"]
+                )
     emit("请求采集完成，正在核对特征与标签")
     if args.feature_layers:
         summaries = {}
