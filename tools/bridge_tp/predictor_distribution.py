@@ -1,7 +1,7 @@
 """Discrete remaining-length distributions and offline risk evaluation.
 
-Each category ends at an inclusive token bound. The final category is an
-open-ended tail. Queries between bounds return probability bounds rather than
+Each category ends at an inclusive token bound, with an optional open tail.
+Queries between bounds return probability bounds rather than
 claiming knowledge of the within-category distribution.
 """
 
@@ -38,6 +38,13 @@ def nonuniform24k100_upper_edges() -> np.ndarray:
             np.arange(8704, 16385, 512, dtype=np.int64),
             np.arange(17408, 24577, 1024, dtype=np.int64),
         )
+    )
+
+
+def nonuniform16k91_upper_edges() -> np.ndarray:
+    """Return 91 finite categories through 16384, without an overflow head."""
+    return np.concatenate(
+        (risk76_upper_edges(), np.arange(8704, 16385, 512, dtype=np.int64))
     )
 
 
@@ -102,11 +109,11 @@ def category_targets(remaining: np.ndarray, edges: np.ndarray) -> np.ndarray:
 def probability_gt_bounds(
     probabilities: np.ndarray, edges: np.ndarray, horizon: float
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return lower/upper bounds on P(N > horizon), including the open tail."""
+    """Return bounds within the distribution's declared support."""
     validate_edges(edges)
     p = np.asarray(probabilities)
     if (
-        p.shape[-1] != len(edges) + 1
+        p.shape[-1] not in (len(edges), len(edges) + 1)
         or not np.isfinite(p).all()
         or (p < 0).any()
         or not np.allclose(p.sum(axis=-1), 1, atol=1e-6)
@@ -121,7 +128,9 @@ def probability_gt_bounds(
         return np.zeros(shape), np.zeros(shape)
     category = int(np.searchsorted(edges, horizon, side="left"))
     if category == len(edges):
-        return np.zeros(shape), p[..., -1]
+        return np.zeros(shape), (
+            p[..., -1] if p.shape[-1] > len(edges) else np.zeros(shape)
+        )
     lower = p[..., category + 1 :].sum(axis=-1)
     if horizon == edges[category]:
         return lower, lower

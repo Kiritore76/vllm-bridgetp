@@ -24,6 +24,7 @@ def main():
     parser.add_argument("--expected-gpu-name", default="NVIDIA A100-PCIE-40GB")
     parser.add_argument("--feature-layer", default="decoder:31")
     parser.add_argument("--max-model-len", type=int, default=16384)
+    parser.add_argument("--max-num-batched-tokens", type=int)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument(
         "--thinking-mode", choices=("auto", "enabled", "disabled"), default="auto"
@@ -94,6 +95,12 @@ def main():
                 "--thinking-mode",
                 args.thinking_mode,
             ]
+            if args.max_num_batched_tokens is not None:
+                command += [
+                    "--max-num-batched-tokens",
+                    str(args.max_num_batched_tokens),
+                ]
+            command += ["--save-token-ids"]
             subprocess.run(command, check=True)
         # Completed shards must pass a fresh label/index/SQLite audit.
         input_copy = out / "input_requests.jsonl"
@@ -113,7 +120,8 @@ def main():
             != args.thinking_mode
         ):
             raise ValueError(f"completed shard identity differs: {out}")
-        input_rows = [json.loads(line) for line in source.read_text().splitlines()]
+        with source.open(encoding="utf-8") as stream:
+            input_rows = [json.loads(line) for line in stream]
         expected_ids = {r["id"] for r in input_rows}
         actual_ids = {r["input_id"] for r in data["labels"]}
         if len(expected_ids) != shard["rows"] or actual_ids != expected_ids:

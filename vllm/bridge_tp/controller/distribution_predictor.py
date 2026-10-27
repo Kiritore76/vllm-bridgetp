@@ -45,8 +45,14 @@ class DistributionPredictor:
             raise ValueError("predictor feature layer differs")
         if checkpoint.get("model_config_sha256") != model_config_sha256:
             raise ValueError("predictor base model config differs")
-        if checkpoint.get("overflow_category") is not True:
-            raise ValueError("predictor needs an open tail category")
+        if type(checkpoint.get("overflow_category")) is not bool:
+            raise ValueError("predictor must declare overflow category policy")
+        self.overflow_category = checkpoint["overflow_category"]
+        self.support_scope = checkpoint.get("support_scope", "unbounded_with_open_tail")
+        if not self.overflow_category and checkpoint.get("support_scope") != (
+            "natural_eos_within_finite_support"
+        ):
+            raise ValueError("finite predictor must declare its conditional support")
         self.feature_layer = feature_layer
         self.model_type = model_type
         self.checkpoint_sha256 = checkpoint_sha256
@@ -102,7 +108,9 @@ class DistributionPredictor:
                 (nn.Linear(input_width, next_width), nn.GELU(), nn.Dropout(dropout))
             )
             input_width = next_width
-        layers.append(nn.Linear(input_width, edges.numel() + 1))
+        layers.append(
+            nn.Linear(input_width, edges.numel() + int(self.overflow_category))
+        )
         self.model = nn.Sequential(*layers).to(self.device)
         self.model.load_state_dict(checkpoint["state_dict"], strict=True)
         self.model.eval()
@@ -149,9 +157,10 @@ class DistributionPredictor:
     def probability_gt_bounds(
         self, probabilities: torch.Tensor, horizons: torch.Tensor | float
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return lower and conservative upper bounds for P(remaining > H)."""
+        """Return bounds within the checkpoint's support, conditional if finite."""
         edges = self.category_upper_edges
-        if probabilities.ndim != 2 or probabilities.shape[1] != edges.numel() + 1:
+        categories = edges.numel() + int(self.overflow_category)
+        if probabilities.ndim != 2 or probabilities.shape[1] != categories:
             raise ValueError("predictor probability shape differs")
         if probabilities.device != self.device:
             raise ValueError("predictor probability device differs")
@@ -164,8 +173,8 @@ class DistributionPredictor:
         count = edges.numel()
         tail = probabilities.flip(-1).cumsum(-1).flip(-1)
         tail = torch.cat((tail, torch.zeros_like(tail[:, :1])), dim=1)
-        low = tail.gather(1, (category + 1).clamp(max=count + 1)[:, None])[:, 0]
-        upper = tail.gather(1, category.clamp(max=count)[:, None])[:, 0]
+        low = tail.gather(1, (category + 1).clamp(max=categories)[:, None])[:, 0]
+        upper = tail.gather(1, category.clamp(max=categories)[:, None])[:, 0]
         exact = (category < count) & (
             h == edges[category.clamp(max=count - 1)].to(torch.float64)
         )

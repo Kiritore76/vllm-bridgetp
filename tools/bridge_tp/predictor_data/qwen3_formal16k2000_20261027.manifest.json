@@ -1,0 +1,87 @@
+{
+  "rows": 2000,
+  "sha256": "2ec4b49b79b15f36dfe04ae2186143090fa4808deb318668811178d6ce57b953",
+  "sources": [
+    {
+      "name": "dolly",
+      "source": "databricks/databricks-dolly-15k",
+      "url": "https://huggingface.co/datasets/databricks/databricks-dolly-15k/resolve/bdd27f4d94b9c1f951818a7da7fd7aeea5dbff1a/databricks-dolly-15k.jsonl",
+      "revision": "bdd27f4d94b9c1f951818a7da7fd7aeea5dbff1a",
+      "license": "CC-BY-SA-3.0",
+      "sha256": "2df9083338b4abd6bceb5635764dab5d833b393b55759dffb0959b6fcbf794ec",
+      "bytes": 13085339,
+      "file": "dolly.jsonl"
+    },
+    {
+      "name": "gsm8k",
+      "source": "openai/gsm8k",
+      "url": "https://huggingface.co/datasets/openai/gsm8k/resolve/740312add88f781978c0658806c59bc2815b9866/main/train-00000-of-00001.parquet",
+      "revision": "740312add88f781978c0658806c59bc2815b9866",
+      "license": "MIT",
+      "sha256": "ea82612ea9582142387730c793eb67d3b12849002bc0b7fa6f8efafa7351419d",
+      "bytes": 2306545,
+      "file": "gsm8k.parquet"
+    },
+    {
+      "name": "mbpp",
+      "source": "google-research-datasets/mbpp",
+      "url": "https://huggingface.co/datasets/google-research-datasets/mbpp/resolve/4bb6404fdc6cacfda99d4ac4205087b89d32030c/full/train-00000-of-00001.parquet",
+      "revision": "4bb6404fdc6cacfda99d4ac4205087b89d32030c",
+      "license": "CC-BY-4.0",
+      "sha256": "09d125ca31edacb7800be8c67c45abff618faf0214ff551291817d06bdb914ae",
+      "bytes": 87223,
+      "file": "mbpp.parquet"
+    },
+    {
+      "name": "oasst1",
+      "file": "D:\\work\\bridgetp\\control\\inputs\\2023-04-12_oasst_prompts.messages.jsonl.gz",
+      "sha256": "621ccd86a6ef320ca4e24c137121bd4b39bcc7a0df839f0897fcc965ef2076ed",
+      "source": "OpenAssistant/oasst1",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "longwriter6k",
+      "file": "D:\\work\\bridgetp\\control\\datasets\\longwriter6k_20261011\\long.jsonl",
+      "sha256": "baac20a6fe9fc9d8ad600c8f1e98214f4b9590d810c9c9c875237d57b8342f52",
+      "source": "zai-org/LongWriter-6k",
+      "revision": "0db15c0624f19d63e2efe1021595af933cc5b6cc",
+      "license": "Apache-2.0"
+    }
+  ],
+  "source_counts": {
+    "databricks/databricks-dolly-15k": 450,
+    "google-research-datasets/mbpp": 300,
+    "zai-org/LongWriter-6k": 500,
+    "OpenAssistant/oasst1": 500,
+    "openai/gsm8k": 250
+  },
+  "split_counts": {
+    "test": 200,
+    "train": 1600,
+    "validation": 200
+  },
+  "language_counts": {
+    "en": 1650,
+    "zh": 350
+  },
+  "task_counts": {
+    "open_qa": 56,
+    "coding": 300,
+    "classification": 56,
+    "summarization": 56,
+    "information_extraction": 56,
+    "long_writing": 500,
+    "general_instruction": 500,
+    "brainstorming": 58,
+    "math": 250,
+    "closed_qa": 56,
+    "general_qa": 56,
+    "creative_writing": 56
+  },
+  "excluded_pilot_trees": 60,
+  "source_tree_split_disjoint": true,
+  "label_rule": "local Qwen3 natural EOS only; references never used as labels",
+  "budget_status": "REQUIRES_QWEN3_TOKENIZER_MATERIALIZATION",
+  "buckets": "nonuniform16k91",
+  "overflow_category": false
+}

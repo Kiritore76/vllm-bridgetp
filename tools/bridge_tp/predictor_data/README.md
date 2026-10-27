@@ -76,3 +76,27 @@ assistant replies are not included or used as length labels.
 The source archive and larger generated corpora remain outside this Git
 repository. For the 160-request pilot, transfer the local generated file or
 prepare it from the pinned source on a machine with dataset access.
+# Qwen3 formal 16K corpus (2026-10-27)
+
+`qwen3_formal16k2000_20261027.jsonl` freezes 2000 public instructions with
+1600/200/200 source-tree-disjoint train/validation/test requests. The matching
+manifest pins source revisions, raw file digests, attribution and licenses.
+Reference answers are omitted; character lengths are selection proxies only.
+No local model output lengths or coverage claims are supplied by this corpus.
+
+Attribution and source-specific terms remain applicable to selected instructions:
+OpenAssistant ([Apache-2.0](https://huggingface.co/datasets/OpenAssistant/oasst1)),
+Databricks ([CC-BY-SA-3.0](https://huggingface.co/datasets/databricks/databricks-dolly-15k)),
+Google Research ([CC-BY-4.0](https://huggingface.co/datasets/google-research-datasets/mbpp)),
+OpenAI ([MIT](https://huggingface.co/datasets/openai/gsm8k)), and
+Z.ai ([Apache-2.0](https://huggingface.co/datasets/zai-org/LongWriter-6k)).
+Modifications consist of selection, task formatting, metadata and predictor split
+assignment; the data is not relicensed as vLLM source code. Dolly-derived records
+retain CC-BY-SA-3.0. Keep this attribution and the provenance manifest with copies.
+
+`prepare_qwen3_formal16k.py` renders with the installed Qwen3 tokenizer, freezes
+context eligibility and generation caps before collection, and produces inputs
+for `run_predictor_formal_collection.py`. Train new Qwen3 weights from scratch
+with `--bucket-profile nonuniform16k91 --network-depth 4`: 91 finite categories,
+maximum inclusive bound 16384, no overflow category. Whole capped requests remain
+diagnostic evidence and are excluded from this finite-support training.

@@ -21,6 +21,7 @@ from predictor_distribution import (
     default_upper_edges,
     distribution_nll,
     km_conditional_survival,
+    nonuniform16k91_upper_edges,
     nonuniform24k100_upper_edges,
     nonuniform84_upper_edges,
     probability_remaining_gt,
@@ -31,6 +32,36 @@ from predictor_distribution import (
 from predictor_network import build_mlp, hidden_widths
 from predictor_progress import EpochProgress, emit
 from train_length_predictor import load_examples, read_jsonl, sha256_file
+
+
+def finite_support_examples(data: dict, maximum: int = 16384) -> tuple[dict, dict]:
+    """Exclude whole censored/out-of-domain requests; preserve the capture audit."""
+    excluded = {
+        row["input_id"]: (
+            "censored" if not row["natural_finish"] else "output_exceeds_support"
+        )
+        for row in data["labels"]
+        if not row["natural_finish"] or row["output_tokens"] > maximum
+    }
+    keep = ~np.isin(data["requests"], list(excluded))
+    if data["censored"][keep].any() or (data["remaining"][keep] > maximum).any():
+        raise ValueError("finite support labels disagree with captured states")
+    filtered = {
+        key: value[keep]
+        if isinstance(value, np.ndarray) and value.ndim and len(value) == len(keep)
+        else value
+        for key, value in data.items()
+    }
+    filtered["labels"] = [
+        row for row in data["labels"] if row["input_id"] not in excluded
+    ]
+    return filtered, {
+        "maximum_tokens": maximum,
+        "retained_requests": len(set(filtered["requests"])),
+        "excluded_requests": excluded,
+        "excluded_samples": int((~keep).sum()),
+        "rule": "whole requests; natural EOS only; never relabel a cap as EOS",
+    }
 
 
 def validation_groups(
@@ -100,13 +131,29 @@ def fit_distribution(
         or not math.isfinite(weight_decay)
         or weight_decay < 0
         or bucket_profile
-        not in ("parent", "nonuniform84", "risk76", "nonuniform24k100")
+        not in (
+            "parent",
+            "nonuniform84",
+            "risk76",
+            "nonuniform24k100",
+            "nonuniform16k91",
+        )
         or not 0 <= head_warmup_epochs < epochs
         or not math.isfinite(head_learning_rate)
         or head_learning_rate <= 0
         or network_depth not in (2, 4)
     ):
         raise ValueError("dropout must be in [0, 1); weight decay must be nonnegative")
+    overflow_category = bucket_profile != "nonuniform16k91"
+    support_selection = None
+    if not overflow_category:
+        if warmstart_checkpoint is not None or reference_checkpoint is not None:
+            raise ValueError("finite-support classifiers must train from scratch")
+        if training_weights is not None or diagnostic_groups is not None:
+            raise ValueError(
+                "finite-support filtering requires unweighted raw examples"
+            )
+        data, support_selection = finite_support_examples(data)
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     device = torch.device(device_name)
@@ -199,8 +246,11 @@ def fit_distribution(
         if bucket_profile == "risk76"
         else nonuniform24k100_upper_edges()
         if bucket_profile == "nonuniform24k100"
+        else nonuniform16k91_upper_edges()
+        if bucket_profile == "nonuniform16k91"
         else default_upper_edges(preflight["max_tokens"], bin_step)
     )
+    categories = len(edges) + int(overflow_category)
     targets = category_targets(data["remaining"], edges)
     weight = np.zeros(len(targets), dtype=np.float64)
     if training_weights is None:
@@ -238,14 +288,14 @@ def fit_distribution(
     target = torch.from_numpy(targets).to(device)
     censored = torch.from_numpy(data["censored"]).to(device)
     model = build_mlp(
-        features.shape[1], hidden_width, len(edges) + 1, dropout, network_depth
+        features.shape[1], hidden_width, categories, dropout, network_depth
     ).to(device)
     exact_train = train & ~data["censored"]
     prior = (
         np.bincount(
             targets[exact_train],
             weights=weight[exact_train] / weight[exact_train].sum(),
-            minlength=len(edges) + 1,
+            minlength=categories,
         )
         + 0.001
     )
@@ -376,7 +426,10 @@ def fit_distribution(
                     "feature_std": torch.from_numpy(feature_std),
                     "position_log_scale": position_scale,
                     "category_upper_edges": torch.from_numpy(edges),
-                    "overflow_category": True,
+                    "overflow_category": overflow_category,
+                    "support_scope": "unbounded_with_open_tail"
+                    if overflow_category
+                    else "natural_eos_within_finite_support",
                     "temperature": 1.0,
                     "training_revision": revision,
                     "capture_revision": preflight["revision"],
@@ -389,7 +442,9 @@ def fit_distribution(
                     "feature_semantics": preflight.get(
                         "feature_semantics", "last token after final model norm"
                     ),
-                    "query_rule": "P(N>H) upper bound; open tail is not forced to zero",
+                    "query_rule": "P(N>H) upper bound; open tail is not forced to zero"
+                    if overflow_category
+                    else "conditional on natural EOS within finite support",
                 },
                 checkpoint_path,
             )
@@ -675,12 +730,16 @@ def fit_distribution(
         },
         "device": str(device),
         "category_upper_edges": edges.tolist(),
-        "overflow_category": True,
-        "open_tail_lower_inclusive": int(edges[-1]) + 1,
+        "overflow_category": overflow_category,
+        "open_tail_lower_inclusive": int(edges[-1]) + 1 if overflow_category else None,
+        "support_scope": checkpoint["support_scope"],
+        "support_selection": support_selection,
         "censored_training_requests": sum(
             not x["natural_finish"] for x in train_labels
         ),
-        "censor_rule": "known lower bound coarsened to its containing category",
+        "censor_rule": "known lower bound coarsened to its containing category"
+        if overflow_category
+        else "excluded whole capped requests; raw capture retained for diagnostics",
         "selection_validation_request_ids": sorted(set(data["requests"][selection])),
         "calibration_validation_request_ids": sorted(
             set(data["requests"][calibration])
@@ -781,7 +840,13 @@ def main() -> None:
     parser.add_argument("--tail-edges", nargs="+", type=int)
     parser.add_argument(
         "--bucket-profile",
-        choices=("parent", "nonuniform84", "risk76", "nonuniform24k100"),
+        choices=(
+            "parent",
+            "nonuniform84",
+            "risk76",
+            "nonuniform24k100",
+            "nonuniform16k91",
+        ),
         default="parent",
     )
     parser.add_argument("--head-warmup-epochs", type=int, default=0)
@@ -821,6 +886,8 @@ def main() -> None:
         )
     if args.tail_edges and not args.warmstart_checkpoint:
         parser.error("tail edges require warmstart checkpoint")
+    if args.bucket_profile == "nonuniform16k91" and args.warmstart_checkpoint:
+        parser.error("finite-support classifiers must train from scratch")
     if args.bucket_profile == "nonuniform84" and (
         not args.warmstart_checkpoint or args.tail_edges or args.head_warmup_epochs < 1
     ):
@@ -932,6 +999,12 @@ def main() -> None:
         split: len(set(data["requests"][(data["splits"] == split) & ~data["censored"]]))
         for split in ("train", "validation", "test")
     }
+    if args.bucket_profile == "nonuniform16k91":
+        finite, _ = finite_support_examples(data)
+        counts = {
+            split: len(set(finite["requests"][finite["splits"] == split]))
+            for split in ("train", "validation", "test")
+        }
     if counts["train"] < 100 or counts["validation"] < 40 or counts["test"] < 20:
         parser.error(f"too few complete requests: {counts}")
     import torch

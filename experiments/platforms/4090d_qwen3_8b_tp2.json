@@ -3,8 +3,20 @@
   "platform_id": "4090d24-qwen3-8b-tp2-v1",
   "gpu_count": 4,
   "gpu_family": "RTX4090D",
-  "memory_mib_range": [23000, 25000],
-  "bundles": {"A": ["0", "1"], "B": ["2", "3"]},
+  "memory_mib_range": [
+    23000,
+    25000
+  ],
+  "bundles": {
+    "A": [
+      "0",
+      "1"
+    ],
+    "B": [
+      "2",
+      "3"
+    ]
+  },
   "target_tp": 2,
   "model_id": "Qwen/Qwen3-8B",
   "huggingface_revision": "b968826d9c46dd6066d109eabc6255188de91218",
@@ -18,22 +30,31 @@
   },
   "dtype": "bfloat16",
   "model_native_context_tokens": 32768,
-  "service_max_model_len": {"tp1": 16384, "tp2": 32768},
+  "service_max_model_len": {
+    "tp1": 16384,
+    "tp2": 32768
+  },
   "migration_common_max_model_len": 16384,
-  "capture_max_model_len": 24576,
-  "predictor_supported_domain_target": "24K capture plan; requires real length coverage validation",
+  "capture_max_model_len": 16384,
+  "predictor_supported_domain_target": "natural EOS output <=16384 tokens; finite conditional predictor; coverage requires validation",
   "gpu_memory_utilization": 0.88,
   "thinking_mode": "disabled",
-  "sampling": {"temperature": 0.0, "top_p": 1.0, "ignore_eos": false},
+  "sampling": {
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "ignore_eos": false
+  },
   "predictor": {
     "feature_layer": "decoder:31",
     "network_depth": 4,
     "hidden_width": 256,
-    "bucket_profile": "nonuniform24k100",
-    "categories": 100,
-    "bucket_edges_path": "experiments/platforms/qwen3_nonuniform24k100.json",
+    "bucket_profile": "nonuniform16k91",
+    "categories": 91,
+    "bucket_edges_path": "experiments/platforms/qwen3_nonuniform16k91.json",
     "checkpoint": null,
-    "status": "REQUIRES_NEW_MODEL_CAPTURE_AND_TRAINING"
+    "status": "REQUIRES_NEW_MODEL_CAPTURE_AND_TRAINING",
+    "overflow_category": false,
+    "maximum_remaining_tokens": 16384
   },
   "measured_profiles": {
     "tp1_kv_blocks": null,
