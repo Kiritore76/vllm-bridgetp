@@ -114,6 +114,18 @@ class RecipePilotTests(unittest.TestCase):
                 row["tokenizer_budget_status"], "VALIDATED_QWEN3_NON_THINKING"
             )
 
+    def test_24k_collection_reserves_more_output_without_breaking_16k_baseline(self):
+        batch, _, _ = load_batch("diverse12", 0)
+        extended, cap = render_budget(batch, Tokenizer(), 24576)
+        self.assertGreater(cap, 20000)
+        self.assertLessEqual(cap, 24064)
+        self.assertTrue(
+            all(r["planned_prompt_tokens"] + cap <= 24576 for r in extended)
+        )
+        baseline, old_cap = render_budget(batch, Tokenizer(), 16384)
+        self.assertLessEqual(old_cap, 15872)
+        self.assertEqual([r["id"] for r in baseline], [r["id"] for r in extended])
+
     def test_infeasible_long_prompt_is_not_truncated_or_silently_dropped(self):
         for count in (9000, 17000):
             rows = copy.deepcopy(self.rows[:1])

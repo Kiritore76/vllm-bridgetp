@@ -125,7 +125,10 @@ def render_budget(rows, tokenizer, max_model_len=16384):
             tokenizer_budget_status="VALIDATED_QWEN3_NON_THINKING",
         )
         rendered.append(item)
-    cap = min(15872, min(max_model_len - r["planned_prompt_tokens"] for r in rendered))
+    cap = min(
+        max_model_len - 512,
+        min(max_model_len - r["planned_prompt_tokens"] for r in rendered),
+    )
     if cap < 8192:
         raise ValueError("pilot output headroom below 8K; review long input separately")
     for row in rendered:
@@ -152,7 +155,18 @@ def summarize(rows, labels, tokenizer):
             next(
                 (
                     str(edge)
-                    for edge in (128, 512, 1024, 2048, 4096, 8192, 12288, 16384)
+                    for edge in (
+                        128,
+                        512,
+                        1024,
+                        2048,
+                        4096,
+                        8192,
+                        12288,
+                        16384,
+                        20480,
+                        24576,
+                    )
                     if length <= edge
                 ),
                 "overflow",
@@ -209,6 +223,9 @@ def main(argv=None):
     parser.add_argument("--batch-index", type=int, choices=range(4), default=0)
     parser.add_argument(
         "--profile", choices=("recipe48", "diverse12"), default="recipe48"
+    )
+    parser.add_argument(
+        "--max-model-len", type=int, choices=(16384, 24576), default=16384
     )
     parser.add_argument(
         "--probe-only",
@@ -277,7 +294,7 @@ def main(argv=None):
         from transformers import AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
-        rows, cap = render_budget(batch, tokenizer)
+        rows, cap = render_budget(batch, tokenizer, args.max_model_len)
         if args.probe_only:
             cap = 128
             for row in rows:
@@ -300,7 +317,7 @@ def main(argv=None):
                 groups=dict(Counter(r["candidate_group"] for r in rows)),
                 languages=dict(Counter(r["lang"] for r in rows)),
                 thinking_mode="disabled",
-                max_model_len=16384,
+                max_model_len=args.max_model_len,
                 max_tokens=cap,
                 prompt_tokens=[r["planned_prompt_tokens"] for r in rows],
                 candidate_sha256=sha(candidate_path),
@@ -334,7 +351,7 @@ def main(argv=None):
             "--max-tokens",
             str(cap),
             "--max-model-len",
-            "16384",
+            str(args.max_model_len),
             "--max-num-batched-tokens",
             "2048",
             "--gpu-memory-utilization",
@@ -354,7 +371,11 @@ def main(argv=None):
         )
         from tools.bridge_tp import run_phase9_cap0_calibration as common
 
-        print(f"[进度] 单卡{len(rows)}条；总上下文16384，实际输出上限{cap}", flush=True)
+        print(
+            f"[进度] 单卡{len(rows)}条；总上下文{args.max_model_len}，"
+            f"实际输出上限{cap}",
+            flush=True,
+        )
         print(f"[进度] 采集日志：{args.output / 'capture.log'}", flush=True)
         process = common.start_process(
             "qwen3-recipe-pilot", command, env, args.output / "capture.log"

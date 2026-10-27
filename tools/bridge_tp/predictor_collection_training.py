@@ -153,6 +153,9 @@ def load_collection_examples(
     preflight = dict(preflights[0])
     preflight["input_sha256"] = expected_recipe_sha256
     preflight["max_tokens"] = max(p["max_tokens"] for p in preflights)
+    preflight["max_model_len"] = max(
+        p.get("max_model_len", p["max_tokens"]) for p in preflights
+    )
     preflight["collection_provenance"] = {
         "batch": str(batch.resolve()),
         "manifest_sha256": sha256_file(inputs / "manifest.json"),

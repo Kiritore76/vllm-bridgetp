@@ -24,6 +24,7 @@ TESTS = [
     "predictor_formal_corpus",
     "predictor_collection_training",
     "predictor_risk76",
+    "predictor_nonuniform24k",
     "predictor_mlp4_scratch",
     "tp2_reconfiguration",
     "pressure_session",

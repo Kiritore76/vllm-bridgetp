@@ -21,6 +21,7 @@ from predictor_distribution import (
     default_upper_edges,
     distribution_nll,
     km_conditional_survival,
+    nonuniform24k114_upper_edges,
     nonuniform84_upper_edges,
     probability_remaining_gt,
     request_weights,
@@ -98,7 +99,8 @@ def fit_distribution(
         or not 0 <= dropout < 1
         or not math.isfinite(weight_decay)
         or weight_decay < 0
-        or bucket_profile not in ("parent", "nonuniform84", "risk76")
+        or bucket_profile
+        not in ("parent", "nonuniform84", "risk76", "nonuniform24k114")
         or not 0 <= head_warmup_epochs < epochs
         or not math.isfinite(head_learning_rate)
         or head_learning_rate <= 0
@@ -152,8 +154,11 @@ def fit_distribution(
     original_parent = None
     parent_temperature = None
     parent_categories = None
-    if bucket_profile == "risk76" and warmstart_checkpoint is not None:
-        raise ValueError("risk76 classifiers must train from scratch")
+    if (
+        bucket_profile in ("risk76", "nonuniform24k114")
+        and warmstart_checkpoint is not None
+    ):
+        raise ValueError(f"{bucket_profile} classifiers must train from scratch")
     if warmstart_checkpoint:
         from predictor_warmstart import expand_tail, load_warmstart, rebuild_output_head
 
@@ -192,6 +197,8 @@ def fit_distribution(
         if bucket_profile == "nonuniform84"
         else risk76_upper_edges()
         if bucket_profile == "risk76"
+        else nonuniform24k114_upper_edges()
+        if bucket_profile == "nonuniform24k114"
         else default_upper_edges(preflight["max_tokens"], bin_step)
     )
     targets = category_targets(data["remaining"], edges)
@@ -346,7 +353,8 @@ def fit_distribution(
                         if bucket_profile in ("nonuniform84", "risk76") or not parent
                         else "parent head",
                         "tail_initialization": "not used for new classifier"
-                        if bucket_profile in ("nonuniform84", "risk76")
+                        if bucket_profile
+                        in ("nonuniform84", "risk76", "nonuniform24k114")
                         else "equal split preserving parent calibrated sums",
                     },
                     "format_version": 2,
@@ -373,6 +381,8 @@ def fit_distribution(
                     "training_revision": revision,
                     "capture_revision": preflight["revision"],
                     "capture_input_sha256": preflight["input_sha256"],
+                    "capture_max_model_len": preflight.get("max_model_len"),
+                    "bucket_profile": bucket_profile,
                     "model_config_sha256": preflight["model_config_sha256"],
                     "generation_contract": preflight.get("generation_contract"),
                     "feature_layer": preflight.get("feature_layer", "final"),
@@ -423,6 +433,9 @@ def fit_distribution(
             8192,
             12288,
             16384,
+            18432,
+            20480,
+            24576,
         )
         if h in edges
     ]
@@ -501,7 +514,10 @@ def fit_distribution(
                 calibrated_p[mask], mask
             )
     common_comparison = None
-    if bucket_profile in ("nonuniform84", "risk76") and original_parent is not None:
+    if (
+        bucket_profile in ("nonuniform84", "risk76", "nonuniform24k114")
+        and original_parent is not None
+    ):
         old_edges = original_parent["category_upper_edges"].numpy()
         common_edges = edges[np.isin(edges, old_edges)]
         old_model = build_mlp(
@@ -765,7 +781,7 @@ def main() -> None:
     parser.add_argument("--tail-edges", nargs="+", type=int)
     parser.add_argument(
         "--bucket-profile",
-        choices=("parent", "nonuniform84", "risk76"),
+        choices=("parent", "nonuniform84", "risk76", "nonuniform24k114"),
         default="parent",
     )
     parser.add_argument("--head-warmup-epochs", type=int, default=0)
@@ -795,8 +811,14 @@ def main() -> None:
         parser.error("training dimensions and learning-rate must be positive")
     if bool(args.warmstart_checkpoint) != bool(args.warmstart_sha256):
         parser.error("warmstart checkpoint and SHA must be provided together")
-    if args.bucket_profile == "risk76" and args.warmstart_checkpoint:
-        parser.error("risk76 classifiers train from scratch, without parent weights")
+    if (
+        args.bucket_profile in ("risk76", "nonuniform24k114")
+        and args.warmstart_checkpoint
+    ):
+        parser.error(
+            f"{args.bucket_profile} classifiers train from scratch, "
+            "without parent weights"
+        )
     if args.tail_edges and not args.warmstart_checkpoint:
         parser.error("tail edges require warmstart checkpoint")
     if args.bucket_profile == "nonuniform84" and (

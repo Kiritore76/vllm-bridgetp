@@ -30,6 +30,18 @@ def risk76_upper_edges() -> np.ndarray:
     return edges[edges <= 8192]
 
 
+def nonuniform24k114_upper_edges() -> np.ndarray:
+    """Preserve short precision, refine the 16K frontier, retain an open tail."""
+    return np.concatenate(
+        (
+            risk76_upper_edges(),
+            np.arange(8704, 12289, 512, dtype=np.int64),
+            np.arange(12544, 18433, 256, dtype=np.int64),
+            np.arange(19456, 24577, 1024, dtype=np.int64),
+        )
+    )
+
+
 def aggregate_probabilities(
     probabilities: np.ndarray,
     source_edges: np.ndarray,

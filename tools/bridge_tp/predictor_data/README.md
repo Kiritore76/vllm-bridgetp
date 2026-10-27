@@ -43,6 +43,23 @@ not an observed length. This 50% coding diagnostic allocation is not a
 claim about production traffic proportions. Generated source code is stored
 as response data and is not automatically executed.
 
+### 24K capture and nonuniform remaining-length categories
+
+The pilot accepts `--max-model-len 24576` as an explicit opt-in. It uses the
+same fixed instructions but reserves an output cap of at most 24064, reduced
+for the longest rendered prompt. The 16K default remains reproducible.
+First validate model initialization and feature capture with the short
+`recipe48 --probe-only --max-model-len 24576` probe; this checks the 24K engine
+configuration, not actual 24K-length generation. Then collect diverse tasks.
+
+Scratch training supports `--bucket-profile nonuniform24k114`: 113 finite
+inclusive bounds through 24576 plus one open tail, with 256-token widths
+from 12288 to 18432 around the TP1 frontier. This is a proposed geometry,
+not evidence that the model has observed sufficient natural long outputs.
+All inherited features, normalization, calibration and head weights must be
+regenerated for Qwen3. Existing valid 16K Qwen3 captures retain value within
+their observed domain; censored outputs retain only lower-bound labels.
+
 ## Historical Qwen2 smoke
 
 `oasst1_smoke16.jsonl` contains 16 public root user prompts from
