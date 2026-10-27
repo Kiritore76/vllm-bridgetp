@@ -195,7 +195,7 @@ def serialized(rows):
     ).encode("utf-8")
 
 
-def materialize(row, tokenizer):
+def materialize(row, tokenizer, thinking_mode="auto"):
     """Fit reference notes using the actual model tokenizer and chat template."""
     target, cap = CONTEXT[row["context_group"]]
     instruction = row["instruction"]
@@ -215,6 +215,11 @@ def materialize(row, tokenizer):
             [{"role": "user", "content": content}],
             tokenize=False,
             add_generation_prompt=True,
+            **(
+                {}
+                if thinking_mode == "auto"
+                else {"enable_thinking": thinking_mode == "enabled"}
+            ),
         )
 
     prompt = render("")
@@ -242,6 +247,8 @@ def materialize(row, tokenizer):
         raise ValueError(f"invalid prompt reservation: {row['id']} {count}+{cap}")
     result = {k: v for k, v in row.items() if k != "instruction"}
     result.update(prompt=prompt, planned_prompt_tokens=count, planned_output_cap=cap)
+    if thinking_mode != "auto":
+        result["thinking_mode"] = thinking_mode
     return result
 
 
@@ -249,6 +256,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument(
+        "--thinking-mode", choices=("auto", "enabled", "disabled"), default="auto"
+    )
     parser.add_argument(
         "--profile", choices=("formal600", "long300"), default="formal600"
     )
@@ -264,7 +274,9 @@ def main():
     (args.out_dir / "recipe.jsonl").write_bytes(raw)
     pools = defaultdict(list)
     for n, row in enumerate(rows, 1):
-        pools[row["context_group"]].append(materialize(row, tokenizer))
+        pools[row["context_group"]].append(
+            materialize(row, tokenizer, args.thinking_mode)
+        )
         if n % 60 == 0:
             print(f"[进度] 输入准备 {n}/{len(rows)}", flush=True)
     shards = []
@@ -291,6 +303,7 @@ def main():
             )
     manifest = {
         "profile": args.profile,
+        "thinking_mode": args.thinking_mode,
         "rows": len(rows),
         "trees": len({r["source_tree_id"] for r in rows}),
         "recipe_sha256": hashlib.sha256(raw).hexdigest(),

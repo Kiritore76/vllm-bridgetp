@@ -1,0 +1,46 @@
+{
+  "schema": "BRIDGETP_PLATFORM_V1",
+  "platform_id": "4090d24-qwen3-8b-tp2-v1",
+  "gpu_count": 4,
+  "gpu_family": "RTX4090D",
+  "memory_mib_range": [23000, 25000],
+  "bundles": {"A": ["0", "1"], "B": ["2", "3"]},
+  "target_tp": 2,
+  "model_id": "Qwen/Qwen3-8B",
+  "huggingface_revision": "b968826d9c46dd6066d109eabc6255188de91218",
+  "model_type": "qwen3",
+  "model_geometry": {
+    "hidden_size": 4096,
+    "num_hidden_layers": 36,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 8,
+    "head_dim": 128
+  },
+  "dtype": "bfloat16",
+  "model_native_context_tokens": 32768,
+  "service_max_model_len": {"tp1": 16384, "tp2": 32768},
+  "migration_common_max_model_len": 16384,
+  "capture_max_model_len": 16384,
+  "gpu_memory_utilization": 0.88,
+  "thinking_mode": "disabled",
+  "sampling": {"temperature": 0.0, "top_p": 1.0, "ignore_eos": false},
+  "predictor": {
+    "feature_layer": "decoder:31",
+    "network_depth": 4,
+    "hidden_width": 256,
+    "bucket_profile": "risk76",
+    "checkpoint": null,
+    "status": "REQUIRES_NEW_MODEL_CAPTURE_AND_TRAINING"
+  },
+  "measured_profiles": {
+    "tp1_kv_blocks": null,
+    "tp2_kv_blocks": null,
+    "guard_blocks": null,
+    "workload": null,
+    "prefill": null,
+    "source_release_s": null,
+    "rebuild_ready_s": null
+  },
+  "precompiled_source_base": "0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665",
+  "status": "DEPLOYMENT_CONTRACT_GPU_UNVERIFIED"
+}

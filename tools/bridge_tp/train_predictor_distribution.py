@@ -374,6 +374,7 @@ def fit_distribution(
                     "capture_revision": preflight["revision"],
                     "capture_input_sha256": preflight["input_sha256"],
                     "model_config_sha256": preflight["model_config_sha256"],
+                    "generation_contract": preflight.get("generation_contract"),
                     "feature_layer": preflight.get("feature_layer", "final"),
                     "feature_semantics": preflight.get(
                         "feature_semantics", "last token after final model norm"
@@ -746,6 +747,7 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--hidden-width", type=int, default=256)
+    parser.add_argument("--network-depth", type=int, choices=(2, 4), default=2)
     parser.add_argument("--learning-rate", type=float, default=0.001)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--weight-decay", type=float, default=0.01)
@@ -884,7 +886,12 @@ def main() -> None:
             ):
                 parser.error("replay input SHA256 differs")
             replay_data = load_examples(args.replay_run_dir, include_censored=True)
-        for key in ["feature_layer", "feature_semantics", "model_config_sha256"]:
+        for key in [
+            "feature_layer",
+            "feature_semantics",
+            "model_config_sha256",
+            "generation_contract",
+        ]:
             if replay_meta.get(key) != preflight.get(key):
                 parser.error(f"replay {key} differs")
         known_test_ids.update(replay_data["requests"][replay_data["splits"] == "test"])
@@ -938,6 +945,7 @@ def main() -> None:
         epochs=args.epochs,
         batch_size=args.batch_size,
         hidden_width=args.hidden_width,
+        network_depth=args.network_depth,
         learning_rate=args.learning_rate,
         dropout=args.dropout,
         weight_decay=args.weight_decay,

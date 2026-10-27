@@ -21,9 +21,18 @@ def main():
     parser.add_argument("--expected-gpu-count", type=int, required=True)
     parser.add_argument("--shard-stop", type=int, default=3)
     parser.add_argument("--expected-requests", type=int)
+    parser.add_argument("--expected-gpu-name", default="NVIDIA A100-PCIE-40GB")
+    parser.add_argument("--feature-layer", default="decoder:31")
+    parser.add_argument("--max-model-len", type=int, default=16384)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
+    parser.add_argument(
+        "--thinking-mode", choices=("auto", "enabled", "disabled"), default="auto"
+    )
     args = parser.parse_args()
     inputs = args.batch / "inputs"
     manifest = json.loads((inputs / "manifest.json").read_text())
+    if manifest.get("thinking_mode", "auto") != args.thinking_mode:
+        raise ValueError("input and collection thinking modes differ")
     total = manifest["rows"]
     if total != sum(s["rows"] for s in manifest["shards"]):
         raise ValueError("manifest request count differs from shards")
@@ -69,19 +78,21 @@ def main():
                 "--expected-input-sha256",
                 shard["sha256"],
                 "--expected-gpu-name",
-                "NVIDIA A100-PCIE-40GB",
+                args.expected_gpu_name,
                 "--expected-gpu-count",
                 str(args.expected_gpu_count),
                 "--feature-layer",
-                "decoder:31",
+                args.feature_layer,
                 "--interval",
                 "20",
                 "--max-model-len",
-                "16384",
+                str(args.max_model_len),
                 "--max-tokens",
                 str(shard["max_tokens"]),
                 "--gpu-memory-utilization",
-                "0.85",
+                str(args.gpu_memory_utilization),
+                "--thinking-mode",
+                args.thinking_mode,
             ]
             subprocess.run(command, check=True)
         # Completed shards must pass a fresh label/index/SQLite audit.
@@ -97,6 +108,9 @@ def main():
             preflight["revision"] != args.expected_revision
             or preflight["input_sha256"] != shard["sha256"]
             or len(data["labels"]) != shard["rows"]
+            or preflight.get("feature_layer") != args.feature_layer
+            or preflight.get("generation_contract", {}).get("thinking_mode", "auto")
+            != args.thinking_mode
         ):
             raise ValueError(f"completed shard identity differs: {out}")
         input_rows = [json.loads(line) for line in source.read_text().splitlines()]

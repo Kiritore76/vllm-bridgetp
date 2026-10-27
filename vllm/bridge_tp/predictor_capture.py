@@ -125,7 +125,7 @@ class PredictorFeatureCapture:
         return cls(Path(directory), interval, feature_layer)
 
     def attach_model(self, model: "torch.nn.Module") -> None:
-        """Observe a Qwen2 decoder block without modifying its output."""
+        """Observe a Qwen2/Qwen3 decoder block without changing its output."""
         if self.layer_index is None:
             return
         if self._layer_hook is not None:
@@ -135,11 +135,11 @@ class PredictorFeatureCapture:
             module
             for name, module in model.named_modules()
             if (name == suffix or name.endswith("." + suffix))
-            and module.__class__.__name__ == "Qwen2DecoderLayer"
+            and module.__class__.__name__ in {"Qwen2DecoderLayer", "Qwen3DecoderLayer"}
         ]
         if len(candidates) != 1:
             raise ValueError(
-                "intermediate capture needs one matching Qwen2 decoder block"
+                "intermediate capture needs one matching Qwen2/Qwen3 decoder block"
             )
         self._layer_hook = candidates[0].register_forward_hook(self._observe_decoder)
 
@@ -363,14 +363,19 @@ class PredictorLiveObserver(PredictorFeatureCapture):
         self._worker.start()
 
     def attach_model(self, model: "torch.nn.Module") -> None:
-        """Check the exact Qwen2 layer contract; do not install a Python hook."""
+        """Check the supported residual/aux-output contract without Python hooks."""
+        supported = {
+            ("Qwen2ForCausalLM", "Qwen2Model"),
+            ("Qwen3ForCausalLM", "Qwen3Model"),
+        }
         if (
-            model.__class__.__name__ != "Qwen2ForCausalLM"
-            or model.model.__class__.__name__ != "Qwen2Model"
+            (model.__class__.__name__, model.model.__class__.__name__) not in supported
             or not hasattr(model, "set_aux_hidden_state_layers")
             or self.layer_index >= model.model.config.num_hidden_layers
         ):
-            raise ValueError("live predictor requires Qwen2 decoder:31 aux output")
+            raise ValueError(
+                "live predictor requires Qwen2/Qwen3 decoder:31 aux output"
+            )
 
     def sample_aux_states(
         self,
@@ -432,14 +437,20 @@ class PredictorLiveObserver(PredictorFeatureCapture):
             ready = torch.cuda.Event()
             ready.record(torch.cuda.current_stream())
         try:
-            boundaries = [{
-                "phase": row.phase,
-                "computed_prompt_tokens": int(computed_prompt_tokens[row.batch_index]),
-                "scheduled_tokens": int(scheduled_tokens[row.batch_index]),
-                "prompt_tokens": int(prompt_tokens[row.batch_index]),
-            } for row in rows]
-            self._pending.put_nowait((
-                snapshot, ready, rows, captured_unix_ns, boundaries))
+            boundaries = [
+                {
+                    "phase": row.phase,
+                    "computed_prompt_tokens": int(
+                        computed_prompt_tokens[row.batch_index]
+                    ),
+                    "scheduled_tokens": int(scheduled_tokens[row.batch_index]),
+                    "prompt_tokens": int(prompt_tokens[row.batch_index]),
+                }
+                for row in rows
+            ]
+            self._pending.put_nowait(
+                (snapshot, ready, rows, captured_unix_ns, boundaries)
+            )
         except queue.Full as exc:
             raise RuntimeError("live predictor event queue is full") from exc
         for row in rows:
@@ -491,19 +502,24 @@ class PredictorLiveObserver(PredictorFeatureCapture):
                             feature = snapshot.to(torch.float16).cpu()
                     else:
                         feature = snapshot.to(torch.float16).cpu()
-                    self._feature_journal.submit(feature_id, {
-                        "hidden_fp16": feature,
-                        "generated_tokens": counts.cpu(), "probabilities": host,
-                        "request_ids": [row.request_id for row in rows],
-                        "captured_unix_ns": captured_unix_ns,
-                        "checkpoint_sha256": self.predictor.checkpoint_sha256,
-                        "feature_layer": self.feature_layer,
-                        "sampling_boundaries": boundaries,
-                        "model_config_sha256": self.predictor.model_config_sha256,
-                        "model_type": self.predictor.model_type,
-                        "category_upper_edges": (
-                            self.predictor.category_upper_edges.cpu()),
-                    })
+                    self._feature_journal.submit(
+                        feature_id,
+                        {
+                            "hidden_fp16": feature,
+                            "generated_tokens": counts.cpu(),
+                            "probabilities": host,
+                            "request_ids": [row.request_id for row in rows],
+                            "captured_unix_ns": captured_unix_ns,
+                            "checkpoint_sha256": self.predictor.checkpoint_sha256,
+                            "feature_layer": self.feature_layer,
+                            "sampling_boundaries": boundaries,
+                            "model_config_sha256": self.predictor.model_config_sha256,
+                            "model_type": self.predictor.model_type,
+                            "category_upper_edges": (
+                                self.predictor.category_upper_edges.cpu()
+                            ),
+                        },
+                    )
                 self._publish(rows, host.tolist(), captured_unix_ns, feature_id)
                 if (
                     self._diagnostic_dir
@@ -534,8 +550,13 @@ class PredictorLiveObserver(PredictorFeatureCapture):
             finally:
                 self._pending.task_done()
 
-    def _publish(self, rows, probability_rows, captured_unix_ns: int,
-                 feature_id: str | None = None) -> None:
+    def _publish(
+        self,
+        rows,
+        probability_rows,
+        captured_unix_ns: int,
+        feature_id: str | None = None,
+    ) -> None:
         published_unix_ns = time.time_ns()
         for row, probabilities in zip(rows, probability_rows):
             if (

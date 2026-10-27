@@ -142,12 +142,19 @@ class MLPScratchTests(unittest.TestCase):
                         runtime,
                     )
 
-                    with self.assertRaisesRegex(ValueError, "unsupported predictor"):
-                        runtime.DistributionPredictor(
-                            out / "predictor_distribution.pt",
-                            checkpoint_sha256=report["checkpoint_sha256"],
-                            model_config_sha256="base",
-                        )
+                    predictor = runtime.DistributionPredictor(
+                        out / "predictor_distribution.pt",
+                        checkpoint_sha256=report["checkpoint_sha256"],
+                        model_config_sha256="base",
+                    )
+                    self.assertEqual(predictor.network_depth, 4)
+                    np.testing.assert_allclose(
+                        predictor.probabilities(
+                            torch.tensor(data["hidden"]), torch.zeros(10)
+                        ).numpy(),
+                        p,
+                        atol=1e-6,
+                    )
                 self.assertEqual(
                     hashlib.sha256(reference.read_bytes()).hexdigest(), sha
                 )

@@ -206,6 +206,9 @@ def main() -> None:
     parser.add_argument("--limit", type=int)
     parser.add_argument("--feature-layer", default="final")
     parser.add_argument(
+        "--thinking-mode", choices=("auto", "enabled", "disabled"), default="auto"
+    )
+    parser.add_argument(
         "--save-token-ids",
         action="store_true",
         help="diagnostic only: retain output IDs for paired replay",
@@ -230,6 +233,8 @@ def main() -> None:
     if not model_config.is_file():
         parser.error(f"model config missing: {model_config}")
     config = json.loads(model_config.read_text())
+    if config.get("model_type") == "qwen3" and args.thinking_mode == "auto":
+        parser.error("Qwen3 capture requires an explicit thinking mode")
     layers = (
         args.feature_layers.split(",") if args.feature_layers else [args.feature_layer]
     )
@@ -243,7 +248,7 @@ def main() -> None:
             prefix not in ("decoder", "mlp")
             or not separator
             or not value.isdecimal()
-            or config.get("model_type") != "qwen2"
+            or config.get("model_type") not in {"qwen2", "qwen3"}
             or int(value) >= config["num_hidden_layers"]
         ):
             parser.error("intermediate capture needs decoder:<index> or mlp:<index>")
@@ -256,7 +261,14 @@ def main() -> None:
     ):
         parser.error(f"GPU inventory differs: {gpu_names}")
     requests = load_requests(args.input, args.limit)
+    if config.get("model_type") == "qwen3":
+        for row in requests:
+            if "prompt" in row and row.get("thinking_mode") != args.thinking_mode:
+                parser.error(
+                    "Qwen3 pre-rendered prompts must identify their thinking mode"
+                )
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(args.input, args.out_dir / "input_requests.jsonl")
     features = args.out_dir / ("layers" if args.feature_layers else "features")
     os.environ["BRIDGETP_PREDICTOR_CAPTURE_DIR"] = str(features.resolve())
     os.environ["BRIDGETP_PREDICTOR_CAPTURE_INTERVAL"] = str(args.interval)
@@ -283,6 +295,11 @@ def main() -> None:
         "feature_layers": layers,
         "requests": len(requests),
         "max_num_seqs": 1,
+        "generation_contract": dict(
+            thinking_mode=args.thinking_mode,
+            temperature=args.temperature,
+            ignore_eos=False,
+        ),
     }
     (args.out_dir / "preflight.json").write_text(
         json.dumps(preflight, indent=2, ensure_ascii=False) + "\n",
@@ -318,7 +335,14 @@ def main() -> None:
                 row["prompt"]
                 if "prompt" in row
                 else tokenizer.apply_chat_template(
-                    row["messages"], tokenize=False, add_generation_prompt=True
+                    row["messages"],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    **(
+                        {}
+                        if args.thinking_mode == "auto"
+                        else {"enable_thinking": args.thinking_mode == "enabled"}
+                    ),
                 )
             )
             prompt_tokens = len(tokenizer.encode(prompt))

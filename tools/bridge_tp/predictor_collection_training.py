@@ -81,7 +81,12 @@ def load_collection_examples(
         ):
             raise ValueError("collection shard capture identity differs")
         if preflights:
-            for key in ("model_config_sha256", "feature_layer", "feature_semantics"):
+            for key in (
+                "model_config_sha256",
+                "feature_layer",
+                "feature_semantics",
+                "generation_contract",
+            ):
                 if meta.get(key) != preflights[0].get(key):
                     raise ValueError(f"incompatible collection {key}")
         copied = out / "input_requests.jsonl"

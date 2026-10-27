@@ -17,6 +17,13 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 TESTS = [
+    "4090d_qwen3",
+    "predictor_capture",
+    "predictor_layer_probe",
+    "predictor_formal_corpus",
+    "predictor_collection_training",
+    "predictor_risk76",
+    "predictor_mlp4_scratch",
     "tp2_reconfiguration",
     "pressure_session",
     "pressure_sessions",
