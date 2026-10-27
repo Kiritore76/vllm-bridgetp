@@ -27,6 +27,7 @@ TESTS = [
     "predictor_risk76",
     "predictor_nonuniform24k",
     "predictor_nonuniform16k",
+    "predictor_nonuniform8k",
     "predictor_distribution",
     "distribution_predictor_runtime",
     "predictor_mlp4_scratch",

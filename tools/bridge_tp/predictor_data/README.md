@@ -76,7 +76,17 @@ assistant replies are not included or used as length labels.
 The source archive and larger generated corpora remain outside this Git
 repository. For the 160-request pilot, transfer the local generated file or
 prepare it from the pinned source on a machine with dataset access.
-# Qwen3 formal 16K corpus (2026-10-27)
+# Active Qwen3 predictor profile (2026-10-28)
+
+Train from the existing frozen capture with `--bucket-profile nonuniform8k62`
+and `--network-depth 4`: 62 finite classes, maximum remaining length 8192, no overflow.
+The 4K-8K tail has upper bounds 5120, 6144, 8192. TP1/TP2 service contexts are
+8192/16384. Historical capture inputs and their 16K capture context remain frozen;
+the capture-time 91-class plan below is superseded for current training. Exclude
+whole capped and out-of-domain requests, retain their diagnostic provenance, and
+report per-bin independent request support alongside conditional metrics.
+
+# Qwen3 formal 16K corpus (2026-10-27, historical capture plan)
 
 `qwen3_formal16k2000_20261027.jsonl` freezes 2000 public instructions with
 1600/200/200 source-tree-disjoint train/validation/test requests. The matching

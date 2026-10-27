@@ -15,6 +15,7 @@ def load_collection_examples(
     expected_recipe_sha256: str,
     expected_feature_layer: str,
     require_complete: bool = True,
+    progress: bool = False,
 ) -> tuple[dict, dict]:
     """Validate a collection and concatenate its completed, distinct requests.
 
@@ -25,6 +26,7 @@ def load_collection_examples(
         expected_feature_layer: Representation required by the parent model.
         require_complete: Require all planned requests for the primary batch;
             a successful partial collection can be used as historical replay.
+        progress: Emit per-shard audit progress while loading raw features.
 
     Returns:
         Audited examples and combined capture preflight with shard provenance.
@@ -122,6 +124,12 @@ def load_collection_examples(
         seen_ids.update(actual_ids)
         parts.append(data)
         preflights.append(meta)
+        if progress:
+            print(
+                f"[进度] 原始特征审计 {len(parts)}/{len(completed)}批："
+                f"{len(seen_ids)}条请求，当前批{len(data['remaining'])}个状态",
+                flush=True,
+            )
     labels = [label for part in parts for label in part["labels"]]
     natural = sum(label["natural_finish"] for label in labels)
     if (

@@ -170,7 +170,7 @@ class Qwen3PlatformTests(unittest.TestCase):
             with patch.dict(sys.modules, transformers=transformers):
                 prepare_inputs(root, root / "inputs", self.profile)
             prompts = read(root / "inputs/smoke_prompts.json")
-            for tp, limit in ((1, 16384), (2, 32768)):
+            for tp, limit in ((1, 8192), (2, 16384)):
                 row = prompts[f"boundary_tp{tp}"]
                 self.assertEqual(len(row["token_ids"]) + 32, limit)
                 self.assertEqual(row["only_tp"], tp)

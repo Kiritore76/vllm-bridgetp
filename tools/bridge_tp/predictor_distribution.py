@@ -48,6 +48,12 @@ def nonuniform16k91_upper_edges() -> np.ndarray:
     )
 
 
+def nonuniform8k62_upper_edges() -> np.ndarray:
+    """Keep short bins, then widen the sparse 4K-8K tail; no overflow head."""
+    short = nonuniform84_upper_edges()
+    return np.concatenate((short[short <= 4096], np.array([5120, 6144, 8192])))
+
+
 def aggregate_probabilities(
     probabilities: np.ndarray,
     source_edges: np.ndarray,

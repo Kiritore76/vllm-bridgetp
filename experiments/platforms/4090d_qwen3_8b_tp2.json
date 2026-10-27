@@ -31,12 +31,12 @@
   "dtype": "bfloat16",
   "model_native_context_tokens": 32768,
   "service_max_model_len": {
-    "tp1": 16384,
-    "tp2": 32768
+    "tp1": 8192,
+    "tp2": 16384
   },
-  "migration_common_max_model_len": 16384,
+  "migration_common_max_model_len": 8192,
   "capture_max_model_len": 16384,
-  "predictor_supported_domain_target": "natural EOS output <=16384 tokens; finite conditional predictor; coverage requires validation",
+  "predictor_supported_domain_target": "natural EOS output <=8192 tokens; finite conditional predictor; 4K-8K tail requires evaluation",
   "gpu_memory_utilization": 0.88,
   "thinking_mode": "disabled",
   "sampling": {
@@ -48,13 +48,13 @@
     "feature_layer": "decoder:31",
     "network_depth": 4,
     "hidden_width": 256,
-    "bucket_profile": "nonuniform16k91",
-    "categories": 91,
-    "bucket_edges_path": "experiments/platforms/qwen3_nonuniform16k91.json",
+    "bucket_profile": "nonuniform8k62",
+    "categories": 62,
+    "bucket_edges_path": "experiments/platforms/qwen3_nonuniform8k62.json",
     "checkpoint": null,
-    "status": "REQUIRES_NEW_MODEL_CAPTURE_AND_TRAINING",
+    "status": "FORMAL_CAPTURE_AUDITED_REQUIRES_TRAINING",
     "overflow_category": false,
-    "maximum_remaining_tokens": 16384
+    "maximum_remaining_tokens": 8192
   },
   "measured_profiles": {
     "tp1_kv_blocks": null,

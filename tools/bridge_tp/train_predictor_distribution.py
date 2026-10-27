@@ -21,6 +21,7 @@ from predictor_distribution import (
     default_upper_edges,
     distribution_nll,
     km_conditional_survival,
+    nonuniform8k62_upper_edges,
     nonuniform16k91_upper_edges,
     nonuniform24k100_upper_edges,
     nonuniform84_upper_edges,
@@ -137,6 +138,7 @@ def fit_distribution(
             "risk76",
             "nonuniform24k100",
             "nonuniform16k91",
+            "nonuniform8k62",
         )
         or not 0 <= head_warmup_epochs < epochs
         or not math.isfinite(head_learning_rate)
@@ -144,7 +146,10 @@ def fit_distribution(
         or network_depth not in (2, 4)
     ):
         raise ValueError("dropout must be in [0, 1); weight decay must be nonnegative")
-    overflow_category = bucket_profile != "nonuniform16k91"
+    finite_maximum = {"nonuniform16k91": 16384, "nonuniform8k62": 8192}.get(
+        bucket_profile
+    )
+    overflow_category = finite_maximum is None
     support_selection = None
     if not overflow_category:
         if warmstart_checkpoint is not None or reference_checkpoint is not None:
@@ -153,7 +158,7 @@ def fit_distribution(
             raise ValueError(
                 "finite-support filtering requires unweighted raw examples"
             )
-        data, support_selection = finite_support_examples(data)
+        data, support_selection = finite_support_examples(data, finite_maximum)
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     device = torch.device(device_name)
@@ -248,6 +253,8 @@ def fit_distribution(
         if bucket_profile == "nonuniform24k100"
         else nonuniform16k91_upper_edges()
         if bucket_profile == "nonuniform16k91"
+        else nonuniform8k62_upper_edges()
+        if bucket_profile == "nonuniform8k62"
         else default_upper_edges(preflight["max_tokens"], bin_step)
     )
     categories = len(edges) + int(overflow_category)
@@ -403,8 +410,7 @@ def fit_distribution(
                         if bucket_profile in ("nonuniform84", "risk76") or not parent
                         else "parent head",
                         "tail_initialization": "not used for new classifier"
-                        if bucket_profile
-                        in ("nonuniform84", "risk76", "nonuniform24k100")
+                        if not parent or bucket_profile == "nonuniform84"
                         else "equal split preserving parent calibrated sums",
                     },
                     "format_version": 2,
@@ -734,6 +740,23 @@ def fit_distribution(
         "open_tail_lower_inclusive": int(edges[-1]) + 1 if overflow_category else None,
         "support_scope": checkpoint["support_scope"],
         "support_selection": support_selection,
+        "bucket_support": {
+            name: {
+                "state_counts": np.bincount(
+                    targets[mask], minlength=categories
+                ).tolist(),
+                "independent_request_counts": [
+                    len(set(data["requests"][mask & (targets == category)]))
+                    for category in range(categories)
+                ],
+            }
+            for name, mask in {
+                "train": exact_train,
+                "selection_validation": selection,
+                "calibration_validation": calibration,
+                "test": test,
+            }.items()
+        },
         "censored_training_requests": sum(
             not x["natural_finish"] for x in train_labels
         ),
@@ -846,6 +869,7 @@ def main() -> None:
             "risk76",
             "nonuniform24k100",
             "nonuniform16k91",
+            "nonuniform8k62",
         ),
         default="parent",
     )
@@ -886,7 +910,10 @@ def main() -> None:
         )
     if args.tail_edges and not args.warmstart_checkpoint:
         parser.error("tail edges require warmstart checkpoint")
-    if args.bucket_profile == "nonuniform16k91" and args.warmstart_checkpoint:
+    if (
+        args.bucket_profile in ("nonuniform16k91", "nonuniform8k62")
+        and args.warmstart_checkpoint
+    ):
         parser.error("finite-support classifiers must train from scratch")
     if args.bucket_profile == "nonuniform84" and (
         not args.warmstart_checkpoint or args.tail_edges or args.head_warmup_epochs < 1
@@ -908,11 +935,13 @@ def main() -> None:
     if args.collection_batch:
         from predictor_collection_training import load_collection_examples
 
+        emit("开始读取并审计已采集的原始特征，不加载基础语言模型")
         data, preflight = load_collection_examples(
             args.collection_batch,
             expected_revision=args.expected_capture_revision,
             expected_recipe_sha256=args.expected_input_sha256,
             expected_feature_layer=args.expected_feature_layer,
+            progress=True,
         )
     else:
         preflight = json.loads(
@@ -999,8 +1028,9 @@ def main() -> None:
         split: len(set(data["requests"][(data["splits"] == split) & ~data["censored"]]))
         for split in ("train", "validation", "test")
     }
-    if args.bucket_profile == "nonuniform16k91":
-        finite, _ = finite_support_examples(data)
+    if args.bucket_profile in ("nonuniform16k91", "nonuniform8k62"):
+        maximum = 8192 if args.bucket_profile == "nonuniform8k62" else 16384
+        finite, _ = finite_support_examples(data, maximum)
         counts = {
             split: len(set(finite["requests"][finite["splits"] == split]))
             for split in ("train", "validation", "test")
