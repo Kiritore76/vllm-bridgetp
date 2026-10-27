@@ -29,9 +29,9 @@
     "feature_layer": "decoder:31",
     "network_depth": 4,
     "hidden_width": 256,
-    "bucket_profile": "nonuniform24k114",
-    "categories": 114,
-    "bucket_edges_path": "experiments/platforms/qwen3_nonuniform24k114.json",
+    "bucket_profile": "nonuniform24k100",
+    "categories": 100,
+    "bucket_edges_path": "experiments/platforms/qwen3_nonuniform24k100.json",
     "checkpoint": null,
     "status": "REQUIRES_NEW_MODEL_CAPTURE_AND_TRAINING"
   },

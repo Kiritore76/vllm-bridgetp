@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT / "tools/bridge_tp"))
 
 from predictor_distribution import (  # noqa: E402
     category_targets,
-    nonuniform24k114_upper_edges,
+    nonuniform24k100_upper_edges,
     probability_gt_bounds,
     risk76_upper_edges,
 )
@@ -63,26 +63,26 @@ class Nonuniform24KTests(unittest.TestCase):
         )
         return data, meta
 
-    def test_short_precision_16k_frontier_and_24k_open_tail(self):
-        edges = nonuniform24k114_upper_edges()
-        self.assertEqual(len(edges) + 1, 114)
+    def test_monotone_widths_and_24k_open_tail(self):
+        edges = nonuniform24k100_upper_edges()
+        self.assertEqual(len(edges) + 1, 100)
         frozen = json.loads(
-            (ROOT / "experiments/platforms/qwen3_nonuniform24k114.json").read_text()
+            (ROOT / "experiments/platforms/qwen3_nonuniform24k100.json").read_text()
         )
         self.assertEqual(edges.tolist(), frozen["finite_upper_edges"])
         self.assertTrue(np.all(np.diff(edges) > 0))
+        self.assertTrue(np.all(np.diff(np.diff(edges)) >= 0))
         np.testing.assert_array_equal(edges[:75], risk76_upper_edges())
         for lower, upper, width in (
-            (8192, 12288, 512),
-            (12288, 18432, 256),
-            (18432, 24576, 1024),
+            (8192, 16384, 512),
+            (16384, 24576, 1024),
         ):
             segment = edges[(edges >= lower) & (edges <= upper)]
             np.testing.assert_array_equal(
                 np.diff(segment), np.full(len(segment) - 1, width)
             )
         self.assertEqual(
-            category_targets(np.array([24576, 24577]), edges).tolist(), [112, 113]
+            category_targets(np.array([24576, 24577]), edges).tolist(), [98, 99]
         )
         for value in [0, 8, 32, 512, 2048, 4096, 8192, 12288, 16384, 18432, 24576]:
             self.assertEqual(
@@ -90,8 +90,8 @@ class Nonuniform24KTests(unittest.TestCase):
             )
 
     def test_probability_bounds_do_not_invent_within_bucket_precision(self):
-        edges = nonuniform24k114_upper_edges()
-        p = np.zeros((1, 114))
+        edges = nonuniform24k100_upper_edges()
+        p = np.zeros((1, 100))
         p[0, np.searchsorted(edges, 16384)] = 1
         low, high = probability_gt_bounds(p, edges, 16300)
         self.assertEqual((low.item(), high.item()), (0, 1))
@@ -114,12 +114,12 @@ class Nonuniform24KTests(unittest.TestCase):
                 Path(temporary),
                 revision="test",
                 device_name="cpu",
-                bucket_profile="nonuniform24k114",
+                bucket_profile="nonuniform24k100",
                 warmstart_checkpoint=Path(temporary) / "old.pt",
                 warmstart_sha256="not-used",
             )
 
-    def test_scratch_114_output_checkpoint_loads_in_real_runtime(self):
+    def test_scratch_100_output_checkpoint_loads_in_real_runtime(self):
         from tests.bridge_tp.test_distribution_predictor_runtime import runtime
 
         data, meta = self.fixture()
@@ -134,17 +134,17 @@ class Nonuniform24KTests(unittest.TestCase):
                 epochs=2,
                 hidden_width=4,
                 network_depth=4,
-                bucket_profile="nonuniform24k114",
+                bucket_profile="nonuniform24k100",
             )
             path = out / "predictor_distribution.pt"
             saved = torch.load(path, weights_only=True)
-            self.assertEqual(len(saved["category_upper_edges"]) + 1, 114)
+            self.assertEqual(len(saved["category_upper_edges"]) + 1, 100)
             self.assertEqual(saved["category_upper_edges"][-1].item(), 24576)
             self.assertEqual(
                 saved["warmstart_provenance"]["initialization"], "from scratch"
             )
             self.assertEqual(
-                saved["warmstart_provenance"]["bucket_profile"], "nonuniform24k114"
+                saved["warmstart_provenance"]["bucket_profile"], "nonuniform24k100"
             )
             self.assertAlmostEqual(saved["position_log_scale"], float(np.log1p(24064)))
             self.assertEqual(report["open_tail_lower_inclusive"], 24577)
@@ -158,7 +158,7 @@ class Nonuniform24KTests(unittest.TestCase):
                 torch.tensor(data["hidden"]), torch.zeros(10)
             ).numpy()
             with np.load(out / "distribution_predictions.npz") as predictions:
-                self.assertEqual(actual.shape, (10, 114))
+                self.assertEqual(actual.shape, (10, 100))
                 np.testing.assert_allclose(
                     actual, predictions["probabilities"], atol=1e-6
                 )

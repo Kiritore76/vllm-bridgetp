@@ -52,9 +52,9 @@ First validate model initialization and feature capture with the short
 `recipe48 --probe-only --max-model-len 24576` probe; this checks the 24K engine
 configuration, not actual 24K-length generation. Then collect diverse tasks.
 
-Scratch training supports `--bucket-profile nonuniform24k114`: 113 finite
-inclusive bounds through 24576 plus one open tail, with 256-token widths
-from 12288 to 18432 around the TP1 frontier. This is a proposed geometry,
+Scratch training supports `--bucket-profile nonuniform24k100`: 99 finite
+inclusive bounds through 24576 plus one open tail, with progressively wider bins:
+512 tokens from 8192 to 16384 and 1024 tokens from 16384 to 24576. This is a proposed geometry,
 not evidence that the model has observed sufficient natural long outputs.
 All inherited features, normalization, calibration and head weights must be
 regenerated for Qwen3. Existing valid 16K Qwen3 captures retain value within
