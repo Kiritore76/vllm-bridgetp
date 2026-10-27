@@ -201,6 +201,7 @@ def main() -> None:
     parser.add_argument("--interval", type=int, default=20)
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--max-model-len", type=int, default=4096)
+    parser.add_argument("--max-num-batched-tokens", type=int)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--limit", type=int)
@@ -217,6 +218,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.interval <= 0 or args.max_tokens <= 0 or args.max_model_len <= 0:
         parser.error("interval, max-tokens, and max-model-len must be positive")
+    if args.max_num_batched_tokens is not None and args.max_num_batched_tokens <= 0:
+        parser.error("max-num-batched-tokens must be positive")
     if not 0 < args.gpu_memory_utilization < 1:
         parser.error("gpu-memory-utilization must be between 0 and 1")
     if args.out_dir.exists() and any(args.out_dir.iterdir()):
@@ -288,6 +291,7 @@ def main() -> None:
         "interval": args.interval,
         "max_tokens": args.max_tokens,
         "max_model_len": args.max_model_len,
+        "max_num_batched_tokens": args.max_num_batched_tokens,
         "temperature": args.temperature,
         "feature_layer": args.feature_layer,
         "feature_semantics": feature_semantics(args.feature_layer),
@@ -319,6 +323,14 @@ def main() -> None:
         gpu_memory_utilization=args.gpu_memory_utilization,
         enable_prefix_caching=False,
         max_num_seqs=1,
+        **(
+            {
+                "max_num_batched_tokens": args.max_num_batched_tokens,
+                "enable_chunked_prefill": True,
+            }
+            if args.max_num_batched_tokens is not None
+            else {}
+        ),
     )
     tokenizer = llm.get_tokenizer()
     emit(f"模型就绪，准备采集{len(requests)}条请求")

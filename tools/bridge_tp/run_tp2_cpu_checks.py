@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT))
 
 TESTS = [
     "4090d_qwen3",
+    "qwen3_recipe_pilot",
     "predictor_capture",
     "predictor_layer_probe",
     "predictor_formal_corpus",
