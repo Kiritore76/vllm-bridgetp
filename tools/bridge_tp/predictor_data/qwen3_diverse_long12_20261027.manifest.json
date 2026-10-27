@@ -1,0 +1,28 @@
+{
+  "rows": 12,
+  "independent_source_families": 12,
+  "input_sha256": "b19d2ad2684017ee6bc1e41b7fb1a3d2477fa806a2f0f5b221684f1f69d0d7c4",
+  "groups": {
+    "coding_long": 6,
+    "technical_tutorial": 2,
+    "system_design": 2,
+    "document_analysis": 2
+  },
+  "languages": {
+    "zh": 6,
+    "en": 6
+  },
+  "sources": {
+    "project_authored": "coding projects, tutorials, design and document analysis"
+  },
+  "licenses": {
+    "project_authored": "Apache-2.0"
+  },
+  "formal_training_eligible": false,
+  "formal_holdout_eligible": false,
+  "GPU_capture_started": false,
+  "reference_answers_in_prompts": false,
+  "old_features_or_labels_used": false,
+  "needs_qwen3_tokenizer_budgeting": true,
+  "excludes_frozen_recipe48_families": true
+}

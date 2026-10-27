@@ -27,6 +27,9 @@ from tools.bridge_tp.result_archive import pack  # noqa: E402
 
 DATA = ROOT / "tools/bridge_tp/predictor_data/qwen3_recipe_pilot48_20261027.jsonl"
 MANIFEST = DATA.with_suffix(".manifest.json")
+DIVERSE_DATA = (
+    ROOT / "tools/bridge_tp/predictor_data/qwen3_diverse_long12_20261027.jsonl"
+)
 
 
 def write(path, value):
@@ -66,6 +69,38 @@ def balanced_batches(rows):
     if any(pools.values()):
         raise ValueError("unassigned candidates")
     return batches
+
+
+def load_batch(profile, batch_index):
+    """Keep historical inputs frozen while adding a separately identified pilot."""
+    if profile not in ("recipe48", "diverse12"):
+        raise ValueError("unknown candidate profile")
+    source = DATA if profile == "recipe48" else DIVERSE_DATA
+    manifest_path = source.with_suffix(".manifest.json")
+    if sha(source) != read(manifest_path)["input_sha256"]:
+        raise ValueError("candidate SHA differs")
+    with source.open(encoding="utf-8") as stream:
+        rows = [json.loads(line) for line in stream if line.strip()]
+    if profile == "recipe48":
+        if batch_index not in range(4):
+            raise ValueError("recipe48 batch index outside 0..3")
+        batch = balanced_batches(rows)[batch_index]
+    else:
+        if batch_index != 0:
+            raise ValueError("diverse12 has one batch; batch-index must be 0")
+        if (
+            len(rows) != 12
+            or len({r["id"] for r in rows}) != 12
+            or len({r["source_tree_id"] for r in rows}) != 12
+            or any(r["split"] != "pilot" for r in rows)
+        ):
+            raise ValueError("diverse12 requires 12 unique pilot families")
+        if Counter(r["candidate_group"] for r in rows) != dict(
+            coding_long=6, technical_tutorial=2, system_design=2, document_analysis=2
+        ) or Counter(r["lang"] for r in rows) != {"en": 6, "zh": 6}:
+            raise ValueError("diverse12 task/language quotas differ")
+        batch = rows
+    return batch, source, manifest_path
 
 
 def render_budget(rows, tokenizer, max_model_len=16384):
@@ -173,11 +208,16 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--batch-index", type=int, choices=range(4), default=0)
     parser.add_argument(
+        "--profile", choices=("recipe48", "diverse12"), default="recipe48"
+    )
+    parser.add_argument(
         "--probe-only",
         action="store_true",
         help="capture two short probes before repeating the 12 requests",
     )
     args = parser.parse_args(argv)
+    if args.probe_only and args.profile != "recipe48":
+        parser.error("probe-only belongs to the historical recipe48 profile")
     args.output = args.output.resolve()
     archive_path = Path(str(args.output) + ".tar.gz")
     if (
@@ -222,12 +262,9 @@ def main(argv=None):
             args.installation_record / "model_identity.json",
             args.output / "model_identity.json",
         )
-        manifest = read(MANIFEST)
-        if sha(DATA) != manifest["input_sha256"]:
-            raise ValueError("candidate SHA differs")
-        with DATA.open(encoding="utf-8") as stream:
-            candidates = [json.loads(line) for line in stream if line.strip()]
-        batch = balanced_batches(candidates)[args.batch_index]
+        batch, candidate_path, candidate_manifest = load_batch(
+            args.profile, args.batch_index
+        )
         if args.probe_only:
             batch = [
                 next(r for r in batch if r["candidate_group"] == "controlled"),
@@ -250,12 +287,13 @@ def main(argv=None):
             "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows),
             encoding="utf-8",
         )
-        shutil.copyfile(MANIFEST, args.output / "candidate_sources.json")
+        shutil.copyfile(candidate_manifest, args.output / "candidate_sources.json")
         write(
             args.output / "preflight.json",
             dict(
                 revision=revision,
                 batch_index=args.batch_index,
+                candidate_profile=args.profile,
                 requests=len(rows),
                 probe_only=args.probe_only,
                 model_runner="V1",
@@ -265,7 +303,7 @@ def main(argv=None):
                 max_model_len=16384,
                 max_tokens=cap,
                 prompt_tokens=[r["planned_prompt_tokens"] for r in rows],
-                candidate_sha256=sha(DATA),
+                candidate_sha256=sha(candidate_path),
                 input_sha256=sha(input_path),
                 installation_record=str(args.installation_record),
                 formal_training=False,

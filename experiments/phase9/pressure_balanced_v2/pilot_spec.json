@@ -305,12 +305,14 @@
     "tools/bridge_tp/prepare_4090d_qwen3.py": "a7a3b8aa520cc4b53eb15afa789deecbbd91a18368f363e7a0f1dce55717ead5",
     "tools/bridge_tp/run_4090d_qwen3_smoke.py": "cc9b24f4e498c7b5f744683ba5c8effc0ea1d7a9c84e070055d41243637df9b7",
     "tests/bridge_tp/test_4090d_qwen3.py": "e9b0cf6fdba3da01acd0ec19f9bd18be03c4493829a4e82a4a5d89c91ac11638",
-    "tools/bridge_tp/predictor_data/README.md": "ec2d847b9ff6c6b372328d5f74ee0a705fbb8de9c937c9d39b4883977eaba56c",
-    "tools/bridge_tp/run_qwen3_recipe_pilot.py": "549c0eba54868e2f117f6786e1d1bbf730037a370d3f4faef61ffe05be9e1c35",
-    "tests/bridge_tp/test_qwen3_recipe_pilot.py": "314240085e3095181bc55a8e73f1b2ad3a15e6e8e9391f82605a135ca8c7451d",
+    "tools/bridge_tp/predictor_data/README.md": "28b815c3ed7d362916a71f491fae6bc3a7bbf11b6f44b97de39f5dbce3d7d283",
+    "tools/bridge_tp/run_qwen3_recipe_pilot.py": "e7dce2d3fa4c6cdcb33c316c9a16ef455be1b803f23a1827c5e1792dce0cdba7",
+    "tests/bridge_tp/test_qwen3_recipe_pilot.py": "6414f0123b5d5422d4586357a4be6de157a9e1874c1181c6a09826bc6b8e1764",
     "tools/bridge_tp/predictor_data/qwen3_recipe_pilot48_20261027.jsonl": "19016b758454ce4ea44dc78bc6bdd8fac5cd1ba22d79a0717fe09d3da7939d20",
     "tools/bridge_tp/predictor_data/qwen3_recipe_pilot48_20261027.manifest.json": "37598819745b6e03ca4b91d9285e268a0e2ecf2c3413eefd0918aedb51679923",
-    "tests/bridge_tp/test_predictor_capture.py": "b841741e55f0177ea25f32ab52de40c405c2afb593e304e47181159163173ca9"
+    "tests/bridge_tp/test_predictor_capture.py": "b841741e55f0177ea25f32ab52de40c405c2afb593e304e47181159163173ca9",
+    "tools/bridge_tp/predictor_data/qwen3_diverse_long12_20261027.jsonl": "b19d2ad2684017ee6bc1e41b7fb1a3d2477fa806a2f0f5b221684f1f69d0d7c4",
+    "tools/bridge_tp/predictor_data/qwen3_diverse_long12_20261027.manifest.json": "7d2961b161d10b896aef4c86b55fde180f683a6fa0b721a209ce3d46fa8d00df"
   },
   "server_settings": {
     "dtype": "bfloat16",

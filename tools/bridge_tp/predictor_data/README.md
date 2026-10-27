@@ -27,6 +27,22 @@ and requires each completed request's prefill/decode samples immediately.
 Use `--probe-only` first to run two selected requests capped at 128 output
 tokens, and require both prefill and decode evidence before repeating a full batch.
 
+## Additional coding and diverse long-task pilot
+
+`qwen3_diverse_long12_20261027.jsonl` is a separate project-authored pilot:
+6 complete coding projects, 2 technical tutorials, 2 system-design/incident
+analyses and 2 document-analysis tasks. English/Chinese are 6/6. Tasks ask
+for substantive deliverables and tests rather than appending thousands of
+words to short emails or scheduling questions. The manifest freezes the
+input SHA and source-family IDs remain distinct from the original 48.
+
+Select it with `run_qwen3_recipe_pilot.py --profile diverse12 --batch-index 0`.
+The same Qwen3 tokenizer budgets, V1 runner, natural EOS and feature audits
+apply. All tasks are recipe-development pilots, and “long” is an intent,
+not an observed length. This 50% coding diagnostic allocation is not a
+claim about production traffic proportions. Generated source code is stored
+as response data and is not automatically executed.
+
 ## Historical Qwen2 smoke
 
 `oasst1_smoke16.jsonl` contains 16 public root user prompts from

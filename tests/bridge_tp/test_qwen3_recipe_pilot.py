@@ -10,6 +10,7 @@ from tools.bridge_tp.run_qwen3_recipe_pilot import (
     DATA,
     MANIFEST,
     balanced_batches,
+    load_batch,
     read,
     render_budget,
     sha,
@@ -53,6 +54,40 @@ class RecipePilotTests(unittest.TestCase):
                 ),
             )
             self.assertTrue(all(r["split"] == "pilot" for r in batch))
+
+    def test_diverse_tasks_are_separate_and_include_six_coding_projects(self):
+        batch, source, manifest = load_batch("diverse12", 0)
+        self.assertEqual(sha(source), read(manifest)["input_sha256"])
+        self.assertEqual(len(batch), 12)
+        self.assertEqual(Counter(r["lang"] for r in batch), {"en": 6, "zh": 6})
+        self.assertEqual(
+            Counter(r["candidate_group"] for r in batch),
+            dict(
+                coding_long=6,
+                technical_tutorial=2,
+                system_design=2,
+                document_analysis=2,
+            ),
+        )
+        self.assertFalse(
+            {r["source_tree_id"] for r in batch}
+            & {r["source_tree_id"] for r in self.rows}
+        )
+        self.assertTrue(all(r["split"] == "pilot" for r in batch))
+        rendered, cap = render_budget(batch, Tokenizer())
+        self.assertEqual(len(rendered), 12)
+        self.assertGreaterEqual(cap, 8192)
+        for index in range(4):
+            old, _, _ = load_batch("recipe48", index)
+            self.assertEqual(old, balanced_batches(self.rows)[index])
+
+    def test_profile_indices_cannot_relabel_or_repeat_the_new_batch(self):
+        for profile, index in (("diverse12", 1), ("recipe48", 4), ("unknown", 0)):
+            with (
+                self.subTest(profile=profile, index=index),
+                self.assertRaises(ValueError),
+            ):
+                load_batch(profile, index)
 
     def test_duplicate_family_or_nonpilot_rows_rejected(self):
         for key, value in (
