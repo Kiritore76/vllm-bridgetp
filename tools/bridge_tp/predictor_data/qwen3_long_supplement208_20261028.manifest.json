@@ -1,0 +1,42 @@
+{
+  "rows": 208,
+  "input_sha256": "1bb057055965d98938cae9403132b3bf24c65e14991a281aa8496ec74e011a2a",
+  "source_families": 144,
+  "groups": {
+    "technical_dossier": 64,
+    "public_long_technical_instruction": 64,
+    "long_coding_project": 64,
+    "technical_document_translation": 16
+  },
+  "splits": {
+    "train": 142,
+    "test": 26,
+    "validation": 40
+  },
+  "languages": {
+    "en": 120,
+    "zh": 88
+  },
+  "previous_task_families_excluded": 2060,
+  "source": {
+    "dataset": "zai-org/LongWriter-6k",
+    "revision": "0db15c0624f19d63e2efe1021595af933cc5b6cc",
+    "sha256": "baac20a6fe9fc9d8ad600c8f1e98214f4b9590d810c9c9c875237d57b8342f52",
+    "url": "https://huggingface.co/datasets/zai-org/LongWriter-6k",
+    "license": "Apache-2.0"
+  },
+  "label_rule": "actual Qwen3 natural EOS; requested band and reference length are not labels",
+  "split_rule": "freeze family split before generation; code/design siblings share a split",
+  "capture_max_model_len": 16384,
+  "capture_max_output_tokens": 10240,
+  "prompt_budget": 6144,
+  "status": "LOCAL_QWEN3_TOKENIZER_VERIFIED_SERVER_RECHECK_REQUIRED",
+  "verified_rendered_recipe_sha256": "237b92f3838a85ae4887a73f9323c0be64e1b0b32f6023031a792bb10abfaa7a",
+  "verified_max_prompt_tokens": 4237,
+  "planned_worker_rows": [
+    52,
+    52,
+    52,
+    52
+  ]
+}

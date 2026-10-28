@@ -78,6 +78,17 @@ repository. For the 160-request pilot, transfer the local generated file or
 prepare it from the pinned source on a machine with dataset access.
 # Active Qwen3 predictor profile (2026-10-28)
 
+Long supplement: `qwen3_long_supplement208_20261028.jsonl` freezes 208 candidates
+in 144 task families (142 train / 40 validation / 26 additional development-test
+requests). Project code/design siblings share a split; previous corpus/pilot
+families are excluded. Counts are candidates, not guaranteed long model outputs.
+It combines 128 project-authored controlled tasks with 64 original LongWriter-6K
+instructions and 16 explicitly new translation tasks on public reference
+excerpts. Public portions retain the LongWriter attribution, pinned revision and
+Apache-2.0 terms in the companion provenance manifest. References are not output
+labels. `run_qwen3_long_four_gpu.py` collects four independent TP1 shards with
+natural EOS and preserves all short, capped and out-of-domain outcomes.
+
 Train from the existing frozen capture with `--bucket-profile nonuniform8k62`
 and `--network-depth 4`: 62 finite classes, maximum remaining length 8192, no overflow.
 The 4K-8K tail has upper bounds 5120, 6144, 8192. TP1/TP2 service contexts are

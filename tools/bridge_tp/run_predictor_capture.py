@@ -243,6 +243,7 @@ def main() -> None:
     parser.add_argument("--expected-input-sha256", required=True)
     parser.add_argument("--expected-gpu-name", required=True)
     parser.add_argument("--expected-gpu-count", type=int, required=True)
+    parser.add_argument("--expected-visible-gpu-count", type=int)
     parser.add_argument("--interval", type=int, default=20)
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--max-model-len", type=int, default=4096)
@@ -334,6 +335,8 @@ def main() -> None:
         "model_path": str(Path(args.model).resolve()),
         "model_config_sha256": hashlib.sha256(model_config.read_bytes()).hexdigest(),
         "gpu_names": gpu_names,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "tensor_parallel_size": 1,
         "interval": args.interval,
         "max_tokens": args.max_tokens,
         "max_model_len": args.max_model_len,
@@ -359,7 +362,20 @@ def main() -> None:
     )
     print(json.dumps(preflight, ensure_ascii=False), flush=True)
 
+    import torch
+
     from vllm import LLM, SamplingParams
+
+    visible_count = torch.cuda.device_count()
+    if (
+        args.expected_visible_gpu_count is not None
+        and visible_count != args.expected_visible_gpu_count
+    ):
+        raise RuntimeError(f"CUDA-visible GPU count differs: {visible_count}")
+    preflight["cuda_visible_gpu_count"] = visible_count
+    (args.out_dir / "preflight.json").write_text(
+        json.dumps(preflight, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
 
     emit("正在加载模型和初始化采集引擎")
     llm = LLM(

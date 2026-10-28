@@ -21,6 +21,7 @@ TESTS = [
     "qwen3_recipe_pilot",
     "qwen3_formal16k",
     "qwen3_retraining",
+    "qwen3_four_gpu_capture",
     "predictor_training_mix",
     "predictor_capture",
     "predictor_layer_probe",
