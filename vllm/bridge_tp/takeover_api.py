@@ -451,6 +451,36 @@ async def finalize_performance_trace(raw_request: Request) -> dict[str, Any]:
         )
 
 
+@router.post("/bridge_tp/v1/diagnostic/retire_channel")
+async def retire_diagnostic_channel(raw_request: Request) -> dict[str, Any]:
+    """Experimental one-way channel retirement after native empty/source release."""
+    token = os.environ.get("BRIDGETP_CHANNEL_DIAGNOSTIC_TOKEN", "")
+    role = os.environ.get("BRIDGETP_CHANNEL_DIAGNOSTIC_ROLE", "")
+    root = os.environ.get("BRIDGETP_CHANNEL_DIAGNOSTIC_DIR", "")
+    if not token or role not in {"source", "target"} or not root:
+        raise HTTPException(status_code=404, detail="Channel diagnostic disabled")
+    body = await raw_request.json()
+    provided = body.get("token") if isinstance(body, dict) else None
+    if not isinstance(provided, str) or not hmac.compare_digest(provided, token):
+        raise HTTPException(status_code=403, detail="Diagnostic token differs")
+    from vllm.bridge_tp.channel_diagnostics import validate_arm
+
+    async with _takeover_lock:
+        try:
+            validate_arm(Path(root), role, os.getpid())
+        except (OSError, ValueError, KeyError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        results = await raw_request.app.state.engine_client.collective_rpc(
+            "bridge_tp_retire_diagnostic_channel", timeout=60.0
+        )
+    expected = 1 if role == "source" else session_target_tp(Path(root))
+    if len(results) != expected or any(
+        r.get("status") != "RETIRED" or not r.get("identity_unchanged") for r in results
+    ):
+        raise HTTPException(status_code=500, detail="Retirement rank proof incomplete")
+    return dict(status="RETIRED", role=role, ranks=results)
+
+
 def attach_router(app: FastAPI, *, diagnostics_only: bool = False) -> None:
     if diagnostics_only:
         diagnostics = APIRouter()

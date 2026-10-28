@@ -10,6 +10,7 @@ import argparse
 import contextlib
 import json
 import math
+import secrets
 import subprocess
 import sys
 import threading
@@ -64,7 +65,14 @@ def main(argv=None):
     parser.add_argument("--natural-probe", action="store_true")
     parser.add_argument("--target-background", type=int, choices=(0, 2, 4), default=0)
     parser.add_argument("--diagnostic-probe", action="store_true")
+    parser.add_argument("--channel-ablation", action="store_true")
     args = parser.parse_args(argv)
+    if args.channel_ablation and (
+        not args.diagnostic_probe or args.target_background != 4
+    ):
+        raise ValueError(
+            "channel ablation requires diagnostic mode with four backgrounds"
+        )
     if not math.isfinite(args.timeout_s) or args.timeout_s <= 0:
         raise ValueError("finite positive timeout required")
     if (
@@ -150,6 +158,14 @@ def main(argv=None):
             )
 
             configure_predictor(plan, args.predictor_checkpoint, args.model_path)
+    if args.channel_ablation:
+        for role in ("source", "target"):
+            plan[role + "_env"].update(
+                BRIDGETP_CHANNEL_DIAGNOSTIC_TOKEN=secrets.token_hex(32),
+                BRIDGETP_CHANNEL_DIAGNOSTIC_ROLE=role,
+                BRIDGETP_CHANNEL_DIAGNOSTIC_DIR=str(plan["run_dir"]),
+                BRIDGETP_TAKEOVER_ENABLED="1",
+            )
     common.write_json(
         args.out_root / "effective_plan.json",
         {
@@ -457,6 +473,10 @@ def main(argv=None):
                 "after",
             )
             wait_empty(directory)
+        if args.channel_ablation:
+            from tools.bridge_tp.qwen3_channel_ablation import run_ablation
+
+            run_ablation(args, plan, processes, inputs, pool, io, common, config)
         seams = [
             b["unix_s"] - a["unix_s"]
             for a, b in zip(emissions, emissions[1:])

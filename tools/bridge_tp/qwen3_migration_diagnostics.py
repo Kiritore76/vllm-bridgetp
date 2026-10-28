@@ -100,7 +100,7 @@ def performance_report(directory, result):
             name=path.name,
             **stream_quality([json.loads(x) for x in path.read_text().splitlines()]),
         )
-        for path in sorted(controller.glob("background-diagnostic-*.tokens.jsonl"))
+        for path in sorted(controller.rglob("background-diagnostic-*.tokens.jsonl"))
     ]
     return dict(
         handoff_s=handoff,

@@ -1184,6 +1184,12 @@ class Worker(WorkerBase):
             raise RuntimeError("performance trace disabled")
         return trace.close()
 
+    def bridge_tp_retire_diagnostic_channel(self):
+        """Retire only an opted-in, idle BridgeTP migration channel."""
+        from vllm.bridge_tp.channel_diagnostics import worker_retire
+
+        return worker_retire(self)
+
     def shutdown(self) -> None:
         gc.unfreeze()
 

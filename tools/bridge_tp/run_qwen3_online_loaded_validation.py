@@ -33,7 +33,13 @@ class PerformanceFailure(RuntimeError):
     """Mechanism completed, but the required output SLO did not pass."""
 
 
-def stages(diagnostic=False):
+def stages(diagnostic=False, channel_ablation=False):
+    if channel_ablation:
+        return [
+            dict(
+                name="channel-ablation-loaded4", background=4, history=2048, probe=False
+            )
+        ]
     return [
         dict(
             name="diagnostic-loaded2" if diagnostic else "live-natural-and-loaded2",
@@ -73,12 +79,23 @@ def child_arguments(args, stage):
         "1200",
     ]
     if getattr(args, "diagnostic_probe", False):
-        return argv + ["--diagnostic-probe"]
+        return (
+            argv
+            + ["--diagnostic-probe"]
+            + (
+                ["--channel-ablation"]
+                if getattr(args, "channel_ablation", False)
+                else []
+            )
+        )
     return argv + ["--natural-probe"] if stage["probe"] else argv
 
 
 def execute(args, ledger):
-    for stage in stages(getattr(args, "diagnostic_probe", False)):
+    for stage in stages(
+        getattr(args, "diagnostic_probe", False),
+        getattr(args, "channel_ablation", False),
+    ):
         if not gpu_idle():
             raise RuntimeError("GPUs busy; do not stop unrelated processes")
         row = dict(name=stage["name"], status="STARTED")
@@ -113,6 +130,23 @@ def execute(args, ledger):
                     raise ValueError("live predictor receipt missing")
             if not gpu_idle():
                 raise RuntimeError("GPU cleanup incomplete")
+            if getattr(args, "channel_ablation", False):
+                proof = read(
+                    directory / "mechanism/controller/channel_ablation_receipt.json"
+                )
+                if proof.get("status") != "COMPLETED" or not proof.get(
+                    "retired_kept_model_process"
+                ):
+                    raise ValueError("three-state ablation proof missing")
+                for role in ("source", "target"):
+                    retired = read(
+                        directory
+                        / f"mechanism/controller/{role}_channel_retirement.json"
+                    )
+                    if retired.get("status") != "RETIRED" or not all(
+                        r.get("identity_unchanged") for r in retired["ranks"]
+                    ):
+                        raise ValueError("channel retirement rank proof missing")
             if getattr(args, "diagnostic_probe", False):
                 from tools.bridge_tp.monitor_pressure_host import validate_journal
 
@@ -155,19 +189,28 @@ def main(argv=None):
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--diagnostic-probe", action="store_true")
     parser.add_argument("--prior-online", type=Path)
+    parser.add_argument("--channel-ablation", action="store_true")
+    parser.add_argument("--prior-ready", type=Path)
     args = parser.parse_args(argv)
     if args.diagnostic_probe and args.prior_online is None:
         parser.error("diagnostics require the previous online validation directory")
-    prior_count = 22 if args.diagnostic_probe else 20
+    if args.channel_ablation and (
+        not args.diagnostic_probe or args.prior_ready is None
+    ):
+        parser.error(
+            "channel ablation requires diagnostics and the previous ready probe"
+        )
+    prior_count = 24 if args.channel_ablation else (22 if args.diagnostic_probe else 20)
+    new_limit = 1 if args.channel_ablation else 2
     if args.validate_only:
         print(
             json.dumps(
                 dict(
                     status="STATIC_PLAN_ONLY",
-                    stages=stages(args.diagnostic_probe),
+                    stages=stages(args.diagnostic_probe, args.channel_ablation),
                     prior_profile_attempts=prior_count,
-                    additional_limit=2,
-                    total_limit=prior_count + 2,
+                    additional_limit=new_limit,
+                    total_limit=prior_count + new_limit,
                     checkpoint_sha256=CHECKPOINT_SHA,
                     automatic_policy=False,
                 ),
@@ -182,6 +225,15 @@ def main(argv=None):
     args.output.mkdir(parents=True, exist_ok=False)
     ledger, result, code = [], dict(status="TECHNICAL_FAILURE"), 1
     try:
+        if args.channel_ablation:
+            ready = read(args.prior_ready / "result.json")
+            if (
+                ready.get("total_profile_attempts") != 24
+                or len(ready.get("stages", [])) != 2
+            ):
+                raise ValueError("requires the audited ready/slowdown probe")
+            for previous in stages(True):
+                verify_migration(args.prior_ready / previous["name"])
         if args.diagnostic_probe:
             online = read(args.prior_online / "result.json")
             if (
@@ -221,10 +273,11 @@ def main(argv=None):
                 versions=versions,
                 checkpoint_sha256=CHECKPOINT_SHA,
                 prior_profile_attempts=prior_count,
-                maximum_new_attempts=2,
-                total_limit=prior_count + 2,
+                maximum_new_attempts=new_limit,
+                total_limit=prior_count + new_limit,
                 predictor_training=False,
                 diagnostic_probe=args.diagnostic_probe,
+                channel_ablation=args.channel_ablation,
                 automatic_pressure_policy=False,
             ),
         )
