@@ -242,6 +242,30 @@ class ServiceCalibrationTests(unittest.TestCase):
                 9,
             )
 
+            pilot_pre = runner.read(output / "preflight.json")
+            pilot_pre["revision"] = "f90c48b721dc3ab37ecb7db6b09b62ecf088f95b"
+            (output / "preflight.json").write_text(json.dumps(pilot_pre))
+            remaining = [
+                "--model",
+                str(Path(tmp) / "model"),
+                "--output",
+                str(Path(tmp) / "remaining"),
+                "--expected-revision",
+                "frozen",
+                "--phase",
+                "remaining",
+                "--prior-service-attempts",
+                "3",
+                "--pilot-batch",
+                str(output),
+                "--no-archive",
+            ]
+            before_count = measured.call_count
+            self.assertEqual(runner.main(remaining), 0)
+            self.assertEqual(measured.call_count - before_count, 7)
+            attempt_rows = runner.read(Path(tmp) / "remaining/attempt_ledger.json")
+            self.assertEqual(sum("nd8-long" in r["scene"] for r in attempt_rows), 1)
+
     def test_real_api_registration_serves_diagnostics_without_enabling_takeover(self):
         class Router:
             def __init__(self):

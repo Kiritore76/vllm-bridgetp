@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 BUNDLE = Path("experiments/phase9/pressure_balanced_v2")
 
 
-def cloud_identity(model_path, checkpoint_path):
+def cloud_identity(model_path, checkpoint_path=None):
     """Capture installed versions and vetted predictor metadata before serving."""
     import importlib.metadata
 
@@ -29,23 +29,27 @@ def cloud_identity(model_path, checkpoint_path):
         model_files[name] = (
             hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
         )
-    weights = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    fields = (
-        "format_version",
-        "model_type",
-        "feature_layer",
-        "hidden_width",
-        "hidden_widths",
-        "input_width",
-        "network_depth",
-        "temperature",
-        "position_log_scale",
-        "overflow_category",
-        "model_config_sha256",
-    )
-    predictor = {key: weights.get(key) for key in fields}
-    predictor["category_upper_edges"] = weights["category_upper_edges"].tolist()
-    predictor["sha256"] = hashlib.sha256(Path(checkpoint_path).read_bytes()).hexdigest()
+    predictor = None
+    if checkpoint_path is not None:
+        weights = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        fields = (
+            "format_version",
+            "model_type",
+            "feature_layer",
+            "hidden_width",
+            "hidden_widths",
+            "input_width",
+            "network_depth",
+            "temperature",
+            "position_log_scale",
+            "overflow_category",
+            "model_config_sha256",
+        )
+        predictor = {key: weights.get(key) for key in fields}
+        predictor["category_upper_edges"] = weights["category_upper_edges"].tolist()
+        predictor["sha256"] = hashlib.sha256(
+            Path(checkpoint_path).read_bytes()
+        ).hexdigest()
     try:
         vllm_version = importlib.metadata.version("vllm")
     except importlib.metadata.PackageNotFoundError:

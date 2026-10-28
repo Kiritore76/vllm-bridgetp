@@ -174,8 +174,12 @@ def main(argv=None):
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--expected-revision", required=True)
-    parser.add_argument("--phase", choices=("pilot", "full"), default="pilot")
+    parser.add_argument(
+        "--phase", choices=("pilot", "full", "remaining"), default="pilot"
+    )
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--pilot-batch", type=Path)
+    parser.add_argument("--no-archive", action="store_true")
     parser.add_argument("--prior-service-attempts", type=int, default=0)
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
@@ -325,7 +329,25 @@ def main(argv=None):
             target_tp_size=2,
         )
         spec = dict(service_only=True, startup_timeout_s=900, run_timeout_s=1200)
-        selected = matrix()[:1] if args.phase == "pilot" else matrix()
+        if args.phase == "remaining":
+            if args.prior_service_attempts != 3 or args.pilot_batch is None:
+                raise ValueError(
+                    "remaining phase requires audited pilot and three prior attempts"
+                )
+            pilot_pre = read(args.pilot_batch / "preflight.json")
+            if (
+                pilot_pre["revision"] != "f90c48b721dc3ab37ecb7db6b09b62ecf088f95b"
+                or pilot_pre["input_sha256"] != digest
+                or pilot_pre["versions"] != json.loads(json.dumps(versions))
+                or read(args.pilot_batch / "result.json")["status"] != "COMPLETED"
+                or read(args.pilot_batch / "hardware.json")["gpus"] != hardware["gpus"]
+            ):
+                raise ValueError("prior pilot identity differs")
+            for repetition in (1, 2):
+                accepted_scene(args.pilot_batch / f"qwen3-nd2-r{repetition}")
+            selected = matrix()[1:]
+        else:
+            selected = matrix()[:1] if args.phase == "pilot" else matrix()
         common.write_json(
             args.output / "selection.json",
             dict(
@@ -344,6 +366,12 @@ def main(argv=None):
         for repetition in (1, 2):
             order = selected if repetition == 1 else list(reversed(selected))
             for scene in order:
+                if (
+                    args.phase == "remaining"
+                    and repetition == 2
+                    and scene["name"] == "qwen3-nd8-long"
+                ):
+                    continue  # One diagnostic, not a repeated working-point reference.
                 directory = args.output / f"{scene['name']}-r{repetition}"
                 if not directory.resolve().is_relative_to(args.output):
                     raise ValueError("scene directory escapes the batch")
@@ -421,12 +449,13 @@ def main(argv=None):
             json.dumps(result, indent=2) + "\n",
             encoding="utf-8",
         )
-        receipt = pack(args.output, archive)
-        Path(str(archive) + ".sha256").write_text(
-            receipt["sha256"] + "  " + archive.name + "\n"
-        )
-        print(json.dumps(receipt), flush=True)
-        print(f"[结果] {result['status']}；完整证据包：{archive}", flush=True)
+        if not args.no_archive:
+            receipt = pack(args.output, archive)
+            Path(str(archive) + ".sha256").write_text(
+                receipt["sha256"] + "  " + archive.name + "\n"
+            )
+            print(json.dumps(receipt), flush=True)
+            print(f"[结果] {result['status']}；完整证据包：{archive}", flush=True)
     return code
 
 

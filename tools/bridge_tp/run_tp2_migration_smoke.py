@@ -46,6 +46,10 @@ def main(argv=None):
     parser.add_argument("--history-tokens", type=int, choices=(128, 2048), default=128)
     parser.add_argument("--timeout-s", type=float, default=900)
     parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument("--platform", choices=("a100", "qwen3"), default="a100")
+    parser.add_argument("--inputs", type=Path)
+    parser.add_argument("--expected-revision")
+    parser.add_argument("--no-archive", action="store_true")
     args = parser.parse_args(argv)
     if not math.isfinite(args.timeout_s) or args.timeout_s <= 0:
         raise ValueError("finite positive timeout required")
@@ -70,23 +74,41 @@ def main(argv=None):
     names = subprocess.check_output(
         ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], text=True
     ).splitlines()
-    if len(names) != 4 or any(n.strip() != "NVIDIA A100-PCIE-40GB" for n in names):
+    if args.platform == "a100" and (
+        len(names) != 4 or any(n.strip() != "NVIDIA A100-PCIE-40GB" for n in names)
+    ):
         raise RuntimeError("four A100 PCIe 40GB required")
     if subprocess.check_output(
         ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"], text=True
     ).strip():
         raise RuntimeError("GPUs busy; no unrelated processes are stopped")
-    spec = prepare(args.model_path)
-    if pilot.sha(args.model_path / "config.json") != spec["model_config_sha256"]:
-        raise ValueError("frozen model config differs")
-    if pilot.sha(spec["checkpoint"]) != spec["checkpoint_sha256"]:
-        raise ValueError("frozen predictor differs")
+    inputs = None
+    if args.platform == "qwen3":
+        from tools.bridge_tp.prepare_4090d_qwen3 import PROFILE, read, runtime_inventory
+        from tools.bridge_tp.qwen3_calibration_contract import (
+            migration_spec,
+            require_revision,
+            verified_inputs,
+        )
+
+        require_revision(args.expected_revision)
+        runtime_inventory(read(PROFILE))
+        inputs = verified_inputs(args.model_path, args.inputs)
+        spec = migration_spec(args.model_path)
+    else:
+        spec = prepare(args.model_path)
+        if pilot.sha(args.model_path / "config.json") != spec["model_config_sha256"]:
+            raise ValueError("frozen model config differs")
+        if pilot.sha(spec["checkpoint"]) != spec["checkpoint_sha256"]:
+            raise ValueError("frozen predictor differs")
     common, settings = pilot.arguments(spec)
     args.out_root.mkdir(parents=True, exist_ok=False)
     freeze(args.out_root / "source_identity")
     common.write_json(
         args.out_root / "runtime_identity.json",
-        cloud_identity(args.model_path, spec["checkpoint"]),
+        cloud_identity(
+            args.model_path, spec["checkpoint"] if args.platform == "a100" else None
+        ),
     )
     plan = pilot.build_scene(
         spec,
@@ -94,6 +116,30 @@ def main(argv=None):
         args.out_root,
         common,
         settings,
+    )
+    if args.platform == "qwen3":
+        from tools.bridge_tp.qwen3_calibration_contract import adjust_migration_plan
+
+        adjust_migration_plan(plan)
+    common.write_json(
+        args.out_root / "effective_plan.json",
+        {
+            "platform": args.platform,
+            "source_argv": plan["source_argv"],
+            "target_argv": plan["target_argv"],
+            "source_environment": {
+                k: v
+                for k, v in plan["source_env"].items()
+                if k.startswith(("BRIDGETP_", "CUDA_", "VLLM_", "OMP_"))
+                and not k.endswith("TOKEN")
+            },
+            "target_environment": {
+                k: v
+                for k, v in plan["target_env"].items()
+                if k.startswith(("BRIDGETP_", "CUDA_", "VLLM_", "OMP_"))
+                and not k.endswith("TOKEN")
+            },
+        },
     )
     directory = plan["run_dir"]
     directory.mkdir(parents=True)
@@ -105,6 +151,7 @@ def main(argv=None):
     pool = ThreadPoolExecutor(max_workers=4)
     driver = None
     emissions = []
+    first_idle_observed = None
     try:
         for role in ("target", "source"):
             process = common.start_process(
@@ -117,9 +164,10 @@ def main(argv=None):
             common.wait_healthy(
                 plan["config"][role + "_url"], process, spec["startup_timeout_s"]
             )
-        inputs = pilot.read(
-            ROOT / "experiments/phase9/pressure_balanced_v2/calibration.json"
-        )
+        if inputs is None:
+            inputs = pilot.read(
+                ROOT / "experiments/phase9/pressure_balanced_v2/calibration.json"
+            )
         for role in ("source", "target"):
             io.post_streaming_completion(
                 plan["config"][role + "_url"],
@@ -138,10 +186,20 @@ def main(argv=None):
             )
         )
         native = wait_empty(directory)
-        request = payload(
-            pilot.read(
-                ROOT / "experiments/phase9/pressure_balanced_v2/calibration.json"
+        common.write_json(args.out_root / "native_initial_receipt.json", native)
+        config.tp1_total_kv_blocks = native[0]["total_blocks"]
+        config.tp4_total_kv_blocks = native[1]["total_blocks"]
+        common.write_json(
+            args.out_root / "effective_controller_config.json",
+            dict(
+                mechanism_config=vars(config),
+                pressure_policy_executed=False,
+                predictor_loaded=args.platform == "a100",
+                native_capacity_replaced=True,
             ),
+        )
+        request = payload(
+            inputs,
             2048,
             6144,
             f"bridgetp-phase9-{directory.name}",
@@ -213,6 +271,12 @@ def main(argv=None):
                     )
                 if (
                     driver.settled
+                    and first_idle_observed is None
+                    and channel_idle(directory, "mechanism", driver.record.request_id)
+                ):
+                    first_idle_observed = time.time()
+                if (
+                    driver.settled
                     and driver.target_future is not None
                     and driver.target_future.done()
                     and future.done()
@@ -230,6 +294,15 @@ def main(argv=None):
             raise RuntimeError("matching source/target IDLE evidence missing")
         wait_empty(directory, after_generations=[r["generation"] for r in native])
         full_speed = pilot.verify_full_speed(directory)
+        seams = [
+            b["unix_s"] - a["unix_s"]
+            for a, b in zip(emissions, emissions[1:])
+            if a["origin"] == "source" and b["origin"] == "target"
+        ]
+        if len(seams) != 1:
+            raise RuntimeError("exactly one source-to-target client seam required")
+        if first_idle_observed is None:
+            first_idle_observed = time.time()
         result = dict(
             status="COMPLETED",
             mechanism_only=True,
@@ -240,6 +313,16 @@ def main(argv=None):
             full_speed=full_speed,
             source_release_confirmed=True,
             output_tokens=len(emissions),
+            visible_handoff_gap_s=seams[0],
+            start_to_source_release_and_idle_observed_s=first_idle_observed
+            - driver.record.t_decision,
+            idle_observation_note=(
+                "first polling observation after confirmed source release; "
+                "not target output completion"
+            ),
+            history_trigger_tokens=args.history_tokens,
+            observed_generated_at_start=driver.record.trigger_output_tokens - 1,
+            source_release_to_channel_idle_checked=True,
             start_to_release_s=(
                 mechanism.load_json(directory / "source_kv_release_receipt.json")[
                     "released_unix_ns"
@@ -268,10 +351,11 @@ def main(argv=None):
             result["status"], code = "TECHNICAL_FAILURE", 1
         result.update(runner_code=code, all_owned_groups_ended=ended)
         common.write_json(args.out_root / "result.json", result)
-        import tarfile
+        if not args.no_archive:
+            import tarfile
 
-        with tarfile.open(str(args.out_root) + ".tar.gz", "w:gz") as archive:
-            archive.add(args.out_root, arcname=args.out_root.name)
+            with tarfile.open(str(args.out_root) + ".tar.gz", "w:gz") as archive:
+                archive.add(args.out_root, arcname=args.out_root.name)
     return code
 
 

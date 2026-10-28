@@ -17,6 +17,17 @@ GPU2为源，GPU0/1为目标，GPU3空闲。高并发场同时覆盖TP2 8K以上
 不建立KV传输通道。125块仅为实验形状余量，线上guard与释放前瞻仍为null。
 本轮服务结果不能替代实际迁移成本、bundle重建或正式布局净收益证据。
 
+2026-10-28 合批入口：`tools/bridge_tp/run_qwen3_parameter_batch.py --model
+<Qwen3-dir> --pilot-batch <audited-pilot> --output <new-dir>
+--expected-revision <HEAD>`。复用f90c48b72版成功pilot，只新增7次服务采集、
+4条空载DRAIN边和最多2次显式TP1→TP2迁移；大历史依赖小历史成功。
+原12个profile预算含旧失败1次和pilot成功2次，4条空载边另属功能验收。
+完成或失败均统一打包，单独保存阶段台账；GPU未清理则停止所有后续动作。
+`--resume`只核验并跳过已完成步骤、继续从未开始的步骤，不自动重试失败或
+不确定的物理动作。所有子入口固定Qwen3/V1/eager/TP1 8K/TP2 16K，
+无需训练或加载预测器；不会把旧A100参数部署成新测量。合并参数报告保持
+`deployment_ready=false`，空载READY与单次迁移观测不作为通用时长边界。
+
 - `tools/bridge_tp/run_tp2_cpu_checks.py --output <new-dir>`：真实 CPU 模块
   回归，绕过 CUDA 包启动；不代表 GPU 验收。
 - `tools/bridge_tp/run_tp2_calibration.py --model-path <model> --out-root <new-dir>`：

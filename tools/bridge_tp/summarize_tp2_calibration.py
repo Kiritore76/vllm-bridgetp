@@ -55,6 +55,44 @@ def window_score(streams, left, right):
     return dict(raw_s=raw / (right - left), good_s=good / (right - left))
 
 
+def workload_from_cells(cells, service):
+    supported = [c for c in cells if c["health_status"] == "REFERENCE"]
+    workload = {}
+    missing = []
+    for role in ("source", "target"):
+        capacities = []
+        for cb in sorted({c["context_bin"] for c in supported if c["pool"] == role}):
+            points = [
+                c for c in supported if c["pool"] == role and c["context_bin"] == cb
+            ]
+            peak = max(c["window_goodoutput"]["median"] for c in points)
+            capacities.append(
+                [
+                    cb,
+                    min(
+                        c["nd"]
+                        for c in points
+                        if c["window_goodoutput"]["median"] >= 0.9 * peak
+                    ),
+                ]
+            )
+        prefill = [
+            c["engine_ms"]["p95"] / 1000 / c["prefill_tokens_range"]["min"]
+            for c in service
+            if c["pool"] == role
+            and c["runs"] >= 2
+            and c["samples"] >= 5
+            and c["prefill_tokens_range"]["min"] >= 256
+        ]
+        workload[role] = dict(
+            capacities=capacities or None,
+            prefill_s_per_token=max(prefill) if prefill else None,
+        )
+        if not capacities or not prefill:
+            missing.append(role + " workload/prefill support")
+    return workload, missing
+
+
 def summarize(root):
     selection = read(root / "selection.json")
     if selection["target_tp"] != 2:
@@ -198,40 +236,7 @@ def summarize(root):
                 windows=rows,
             )
         )
-    supported = [c for c in cells if c["health_status"] == "REFERENCE"]
-    workload = {}
-    missing = []
-    for role in ("source", "target"):
-        capacities = []
-        for cb in sorted({c["context_bin"] for c in supported if c["pool"] == role}):
-            points = [
-                c for c in supported if c["pool"] == role and c["context_bin"] == cb
-            ]
-            peak = max(c["window_goodoutput"]["median"] for c in points)
-            capacities.append(
-                [
-                    cb,
-                    min(
-                        c["nd"]
-                        for c in points
-                        if c["window_goodoutput"]["median"] >= 0.9 * peak
-                    ),
-                ]
-            )
-        prefill = [
-            c["engine_ms"]["p95"] / 1000 / c["prefill_tokens_range"]["min"]
-            for c in service
-            if c["pool"] == role
-            and c["runs"] >= 2
-            and c["samples"] >= 5
-            and c["prefill_tokens_range"]["min"] >= 256
-        ]
-        workload[role] = dict(
-            capacities=capacities or None,
-            prefill_s_per_token=max(prefill) if prefill else None,
-        )
-        if not capacities or not prefill:
-            missing.append(role + " workload/prefill support")
+    workload, missing = workload_from_cells(cells, service)
     return dict(
         schema="TP2_DEVELOPMENT_PROFILE_V1",
         target_tp=2,

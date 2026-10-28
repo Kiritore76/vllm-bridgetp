@@ -76,7 +76,9 @@ class NativeDrainBackend:
                 bundle,
                 f"http://127.0.0.1:{port}",
                 str(self.args.model_path),
-                8192,
+                16384
+                if getattr(self.args, "platform", "a100") == "qwen3" and tp == 2
+                else 8192,
             )
             self.registry.register(row)
             path = self.args.out_root / name
@@ -88,15 +90,27 @@ class NativeDrainBackend:
                 BRIDGETP_PRESSURE_POOL="tp1" if tp == 1 else "tp4",
                 BRIDGETP_PRESSURE_INVENTORY_PATH=str(path / "inventory.jsonl"),
             )
+            if getattr(self.args, "platform", "a100") == "qwen3":
+                from tools.bridge_tp.qwen3_calibration_contract import (
+                    engine_environment,
+                )
+
+                engine_environment(env)
             settings = SimpleNamespace(
                 python_bin=Path(sys.executable),
                 model_path=self.args.model_path,
                 dtype="bfloat16",
                 max_model_len=8192,
-                tp4_max_model_len=8192,
+                tp4_max_model_len=16384
+                if getattr(self.args, "platform", "a100") == "qwen3"
+                else 8192,
                 gpu_memory_utilization=0.88,
             )
             argv = self.common.server_command(settings, tp, port)
+            if getattr(self.args, "platform", "a100") == "qwen3":
+                from tools.bridge_tp.qwen3_calibration_contract import engine_arguments
+
+                argv.extend(engine_arguments())
             self.common.write_json(path / "argv.json", argv)
             self.event("LOAD_START", instance=name, bundle=bundle, tp=tp, gpus=gpus)
             process = self.common.start_process(name, argv, env, path / "server.log")
@@ -394,6 +408,10 @@ def main(argv=None):
     parser.add_argument("--plan-timeout-s", type=float, default=900)
     parser.add_argument("--base-port", type=int, default=8500)
     parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument("--platform", choices=("a100", "qwen3"), default="a100")
+    parser.add_argument("--inputs", type=Path)
+    parser.add_argument("--expected-revision")
+    parser.add_argument("--no-archive", action="store_true")
     parser.add_argument(
         "--empty",
         action="store_true",
@@ -446,13 +464,33 @@ def main(argv=None):
     names = subprocess.check_output(
         ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], text=True
     ).splitlines()
-    if len(names) != 4 or any(n.strip() != "NVIDIA A100-PCIE-40GB" for n in names):
+    if args.platform == "a100" and (
+        len(names) != 4 or any(n.strip() != "NVIDIA A100-PCIE-40GB" for n in names)
+    ):
         raise RuntimeError("requires four A100 PCIe 40GB")
     if subprocess.check_output(
         ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"], text=True
     ).strip():
         raise RuntimeError("GPUs busy; nothing stopped")
-    spec = prepare(args.model_path)
+    if args.platform == "qwen3":
+        from tools.bridge_tp.prepare_4090d_qwen3 import PROFILE, read, runtime_inventory
+        from tools.bridge_tp.qwen3_calibration_contract import (
+            migration_spec,
+            require_revision,
+            verified_inputs,
+        )
+
+        require_revision(args.expected_revision)
+        runtime_inventory(read(PROFILE))
+        inputs = verified_inputs(args.model_path, args.inputs)
+        spec = migration_spec(args.model_path)
+    else:
+        spec = prepare(args.model_path)
+        inputs = json.loads(
+            (
+                ROOT / "experiments/phase9/pressure_balanced_v2/calibration.json"
+            ).read_text()
+        )
     import hashlib
 
     if (
@@ -461,16 +499,15 @@ def main(argv=None):
     ):
         raise ValueError("frozen model identity differs")
     args.out_root.mkdir(parents=True, exist_ok=False)
-    inputs = json.loads(
-        (ROOT / "experiments/phase9/pressure_balanced_v2/calibration.json").read_text()
-    )
     registry = pool.Registry()
     from tools.bridge_tp.freeze_pressure_baseline import cloud_identity, freeze
 
     freeze(args.out_root / "source_identity")
     common.write_json(
         args.out_root / "runtime_identity.json",
-        cloud_identity(args.model_path, spec["checkpoint"]),
+        cloud_identity(
+            args.model_path, spec["checkpoint"] if args.platform == "a100" else None
+        ),
     )
     (args.out_root / "gpu_topology.txt").write_bytes(
         subprocess.check_output(["nvidia-smi", "topo", "-m"])
@@ -578,10 +615,11 @@ def main(argv=None):
             migration_validated=False,
         )
         common.write_json(args.out_root / "result.json", result)
-        import tarfile
+        if not args.no_archive:
+            import tarfile
 
-        with tarfile.open(str(args.out_root) + ".tar.gz", "w:gz") as archive:
-            archive.add(args.out_root, arcname=args.out_root.name)
+            with tarfile.open(str(args.out_root) + ".tar.gz", "w:gz") as archive:
+                archive.add(args.out_root, arcname=args.out_root.name)
     return code
 
 
