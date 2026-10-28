@@ -11,13 +11,83 @@ from unittest.mock import Mock, PropertyMock, patch
 from tools.bridge_tp import launch_pressure_balanced_pilot as launcher
 from tools.bridge_tp import run_qwen3_parameter_batch as batch
 from tools.bridge_tp import run_tp2_calibration as old
+from tools.bridge_tp import run_tp2_migration_smoke as migration
 from tools.bridge_tp import run_tp_bundle_drain as drain
 from tools.bridge_tp.freeze_pressure_baseline import cloud_identity
+from tools.bridge_tp.pressure_cpu import load
 from tools.bridge_tp.qwen3_calibration_contract import adjust_migration_plan
 from tools.bridge_tp.summarize_tp2_calibration import workload_from_cells
 
 
 class BatchTests(unittest.TestCase):
+    def test_migration_freezes_qwen3_request_and_builds_shadow_target(self):
+        inputs = {
+            "requests": {
+                "2048": dict(
+                    model="bridgetp-model",
+                    prompt=[1] * 2048,
+                    temperature=0.0,
+                    top_p=1.0,
+                    stream=True,
+                )
+            }
+        }
+        original = json.dumps(inputs, sort_keys=True)
+        source = migration.migration_request(inputs, 6144, "source")
+        contract = load("sampling_contract")
+        self.assertEqual(contract.strict_greedy_sampling_errors(source), [])
+        self.assertEqual(json.dumps(inputs, sort_keys=True), original)
+        self.assertEqual(source["max_tokens"], 6144)
+        self.assertTrue(source["ignore_eos"])
+        target, cutover = load("online_io").build_gpu_resident_shadow_target_request(
+            source,
+            dict(
+                all_known_token_ids=[1] * 2179,
+                num_prompt_tokens=2048,
+                migration_id="mechanism",
+            ),
+            "controller",
+            662,
+        )
+        self.assertEqual(contract.strict_greedy_sampling_errors(target), [])
+        self.assertEqual(cutover, 662)
+        self.assertEqual(len(target["prompt"]), 2048 + 662)
+        self.assertEqual(target["max_tokens"], 6144 - 662)
+
+    def test_migration_does_not_override_conflicting_sampling(self):
+        for field, value in (("repetition_penalty", 1.1), ("temperature", 0.6)):
+            with self.subTest(field=field):
+                inputs = {
+                    "requests": {
+                        "2048": dict(
+                            model="bridgetp-model",
+                            prompt=[1] * 2048,
+                            temperature=0.0,
+                            top_p=1.0,
+                        )
+                    }
+                }
+                inputs["requests"]["2048"][field] = value
+                with self.assertRaisesRegex(ValueError, field):
+                    migration.migration_request(inputs, 6144, "source")
+
+    def test_migration_warmup_uses_same_contract(self):
+        inputs = {
+            "requests": {
+                "2048": dict(
+                    model="bridgetp-model",
+                    prompt=[1] * 2048,
+                    temperature=0.0,
+                    top_p=1.0,
+                )
+            }
+        }
+        request = migration.migration_request(inputs, 16, "warm-target")
+        self.assertEqual(
+            load("sampling_contract").strict_greedy_sampling_errors(request), []
+        )
+        self.assertEqual(request["max_tokens"], 16)
+
     def test_transport_plan_keeps_full_speed_without_predictor(self):
         with tempfile.TemporaryDirectory() as tmp:
             model = Path(tmp) / "model"

@@ -292,7 +292,7 @@
     "tools/bridge_tp/freeze_pressure_baseline.py": "c53b3a70502f65c76ce3fcaf97fbd439508651472a2b1065eeea69d0e8322194",
     "tools/bridge_tp/run_tp2_calibration.py": "d35f9077cfb7a9abaae9e39d6a0aec0bf5142efcaa86cea87ef8a5ae03114244",
     "tools/bridge_tp/run_tp2_cpu_checks.py": "49d38c232fc53fe679defb2e08918d0cdb1d6c616343699a86ca10b41548fef4",
-    "tools/bridge_tp/run_tp2_migration_smoke.py": "d10d031e0710970b10ed65ae8b8e6d8db3309898b2fc121dfbe8d3e8da40534a",
+    "tools/bridge_tp/run_tp2_migration_smoke.py": "0f3f43cb1c2df9787ae5aa81eb5d2325c772fb6fa5dfb95e30cd32b207d6c9cc",
     "tools/bridge_tp/run_tp_bundle_drain.py": "d08cf3a42e8f2e6c4d6e68057ab560eeb0a09af55acc9546a721300cb1a93c7e",
     "tools/bridge_tp/summarize_tp2_calibration.py": "e8fbb63e2bee9bc6e6cbbd24bbda6cda98f4ad33b34debebfba0236a9a1964d3",
     "vllm/bridge_tp/controller/instance_pool.py": "38f6842c63e88566e2a6add7aac13841bdd16570056e8e07e47608ac9e4bd5b4",
@@ -335,7 +335,7 @@
     "vllm/entrypoints/openai/api_server.py": "0cbf2af64daa695e12d0ba3f76f7315a4d22f242baa17c9f71cea68bbc4b93fc",
     "tools/bridge_tp/run_qwen3_parameter_batch.py": "7c569e98bd239ec565d3b9f4f01e5c5784b7d71a212eddad84a1931d6fbf31f8",
     "tools/bridge_tp/qwen3_calibration_contract.py": "24545c1671a0b54b6526209fb26dfcfd89b72a196295e6b61131b78e7a0c3a28",
-    "tests/bridge_tp/test_qwen3_parameter_batch.py": "c70a93852c9d6ab8c796ea901b306ec7db07d2264f53d062751290dbf39aea72"
+    "tests/bridge_tp/test_qwen3_parameter_batch.py": "d9d7ef911ea5f60793320556c56dff7a185c44d1a08cf4480842336021f95c0f"
   },
   "server_settings": {
     "dtype": "bfloat16",

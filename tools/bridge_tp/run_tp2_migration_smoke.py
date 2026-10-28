@@ -39,6 +39,15 @@ class Audit:
             stream.flush()
 
 
+def migration_request(inputs, max_tokens, request_id):
+    """Freeze the source contract before serving or constructing its target."""
+    from tools.bridge_tp.run_pressure_calibration import payload
+
+    return load("sampling_contract").freeze_strict_greedy_sampling(
+        payload(inputs, 2048, max_tokens, request_id)
+    )
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", type=Path, required=True)
@@ -69,7 +78,7 @@ def main(argv=None):
         return 0
     from tools.bridge_tp import run_phase9_controller as mechanism
     from tools.bridge_tp.freeze_pressure_baseline import cloud_identity, freeze
-    from tools.bridge_tp.run_pressure_calibration import payload, wait_empty
+    from tools.bridge_tp.run_pressure_calibration import wait_empty
 
     names = subprocess.check_output(
         ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], text=True
@@ -143,6 +152,15 @@ def main(argv=None):
     )
     directory = plan["run_dir"]
     directory.mkdir(parents=True)
+    if inputs is None:
+        inputs = pilot.read(
+            ROOT / "experiments/phase9/pressure_balanced_v2/calibration.json"
+        )
+    request = migration_request(inputs, 6144, f"bridgetp-phase9-{directory.name}")
+    warm_requests = {
+        role: migration_request(inputs, 16, "warm-" + role)
+        for role in ("source", "target")
+    }
     config = SimpleNamespace(**plan["config"])
     io = load("online_io")
     mechanism.RuntimeControl(armed=False).write(directory)
@@ -164,14 +182,10 @@ def main(argv=None):
             common.wait_healthy(
                 plan["config"][role + "_url"], process, spec["startup_timeout_s"]
             )
-        if inputs is None:
-            inputs = pilot.read(
-                ROOT / "experiments/phase9/pressure_balanced_v2/calibration.json"
-            )
         for role in ("source", "target"):
             io.post_streaming_completion(
                 plan["config"][role + "_url"],
-                payload(inputs, 2048, 16, "warm-" + role),
+                warm_requests[role],
                 args.timeout_s,
                 lambda *values: None,
                 directory / (role + "_warm_failure.json"),
@@ -197,12 +211,6 @@ def main(argv=None):
                 predictor_loaded=args.platform == "a100",
                 native_capacity_replaced=True,
             ),
-        )
-        request = payload(
-            inputs,
-            2048,
-            6144,
-            f"bridgetp-phase9-{directory.name}",
         )
         recorder = io.ProxyRecorder(
             request["request_id"],
