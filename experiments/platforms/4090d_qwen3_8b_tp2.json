@@ -52,9 +52,11 @@
     "categories": 62,
     "bucket_edges_path": "experiments/platforms/qwen3_nonuniform8k62.json",
     "checkpoint": null,
-    "status": "FORMAL_CAPTURE_AUDITED_REQUIRES_TRAINING",
+    "status": "TRAINED_OFFLINE_AUDITED_NOT_ACTIVATED",
     "overflow_category": false,
-    "maximum_remaining_tokens": 8192
+    "maximum_remaining_tokens": 8192,
+    "candidate_checkpoint_sha256": "f51f6a8fd2e299f2ebffae71706f7c9dcd93154eeffa18cf008bf0ee710f738f",
+    "candidate_training_run": "qwen3_retrain8k62_merged2208_20261028_135855_692"
   },
   "measured_profiles": {
     "tp1_kv_blocks": null,

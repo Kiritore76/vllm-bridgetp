@@ -22,6 +22,7 @@ TESTS = [
     "qwen3_formal16k",
     "qwen3_retraining",
     "qwen3_four_gpu_capture",
+    "qwen3_service_calibration",
     "predictor_training_mix",
     "predictor_capture",
     "predictor_layer_probe",

@@ -26,7 +26,7 @@ from tools.bridge_tp.pressure_progress import save_progress  # noqa: E402
 io = load("online_io")
 
 
-def payload(config, prompt_tokens, max_tokens, request_id):
+def payload(config, prompt_tokens, max_tokens, request_id, *, context_limit=8192):
     """Reuse tracked token inputs, with explicit context and output bounds."""
     key = "2048" if prompt_tokens <= 2048 else "6144"
     result = copy.deepcopy(config["requests"][key])
@@ -34,13 +34,13 @@ def payload(config, prompt_tokens, max_tokens, request_id):
     if len(tokens) != prompt_tokens:
         # Controlled performance inputs, not natural-EOS prediction evaluation.
         tokens = tokens[: prompt_tokens - 32] + tokens[-32:]
-    if len(tokens) != prompt_tokens or prompt_tokens + max_tokens > 8192:
+    if len(tokens) != prompt_tokens or prompt_tokens + max_tokens > context_limit:
         raise ValueError("invalid prompt or output context boundary")
     result.update(
         prompt=tokens,
         max_tokens=max_tokens,
         ignore_eos=True,
-        seed=20261015,
+        seed=config.get("seed", 20261015),
         request_id=request_id,
         stream=True,
         return_token_ids=True,
@@ -175,7 +175,13 @@ class Workload:
         self.phase = "background"
 
     def submit(self, pool, prompt, output, label):
-        request = payload(self.config, prompt, output, label)
+        request = payload(
+            self.config,
+            prompt,
+            output,
+            label,
+            context_limit=self.config.get("context_limits", {}).get(pool, 8192),
+        )
         row = dict(
             id=label,
             pool=pool,
@@ -360,6 +366,39 @@ def observe(work, receipt):
             work.stop.wait(0.2)
 
 
+def service_only_plan(spec, scene, run_root, common, settings):
+    """Collect a new platform without loading an old predictor or KV connector."""
+    directory = run_root / scene["name"] / "controller"
+    plan = dict(run_dir=directory, config={})
+    for role, tp, devices, port in (
+        ("source", 1, settings.tp1_gpu, settings.tp1_port),
+        ("target", settings.target_tp_size, settings.tp4_gpus, settings.tp4_port),
+    ):
+        plan["config"][role + "_url"] = f"http://127.0.0.1:{port}"
+        env = {k: v for k, v in os.environ.items() if not k.startswith("BRIDGETP_")}
+        env.update(
+            CUDA_VISIBLE_DEVICES=devices,
+            CUDA_DEVICE_ORDER="PCI_BUS_ID",
+            OMP_NUM_THREADS="1",
+            VLLM_USE_V2_MODEL_RUNNER="0",
+            VLLM_DISABLE_COMPILE_CACHE="1",
+            PYTHONUNBUFFERED="1",
+            BRIDGETP_PRESSURE_POOL="tp1" if role == "source" else "tp4",
+            BRIDGETP_PRESSURE_INVENTORY_PATH=str(directory / f"{role}_inventory.jsonl"),
+        )
+        plan[role + "_env"] = env
+        plan[role + "_argv"] = common.server_command(settings, tp, port) + [
+            "--enforce-eager",
+            "--max-num-seqs",
+            "16",
+            "--max-num-batched-tokens",
+            "2048",
+            "--block-size",
+            "16",
+        ]
+    return plan
+
+
 def run_scene(
     spec, config, scene, repetition, root, common, settings, capture_observations=False
 ):
@@ -376,21 +415,27 @@ def run_scene(
         )
         pilot.announce(root.name, label, **details)
 
-    plan = pilot.build_scene(
-        spec,
-        {"name": root.name, "arrivals": spec["scenarios"][0]["arrivals"]},
-        root.parent,
-        common,
-        settings,
-    )
+    if spec.get("service_only"):
+        plan = service_only_plan(
+            spec, {"name": root.name}, root.parent, common, settings
+        )
+    else:
+        plan = pilot.build_scene(
+            spec,
+            {"name": root.name, "arrivals": spec["scenarios"][0]["arrivals"]},
+            root.parent,
+            common,
+            settings,
+        )
     run_dir = plan["run_dir"]
     run_dir.mkdir()
-    RuntimeControl(
-        armed=False,
-        migration_id=root.name,
-        source_request_id_prefix="calibration-unarmed-",
-    ).write(run_dir)
-    # No controller or stager is started. Source hooks remain unarmed throughout.
+    if not spec.get("service_only"):
+        RuntimeControl(
+            armed=False,
+            migration_id=root.name,
+            source_request_id_prefix="calibration-unarmed-",
+        ).write(run_dir)
+    # No controller or stager is started.
     urls = {pool: plan["config"][pool + "_url"] for pool in ("source", "target")}
     processes, work, observer = [], None, None
     host_monitor = None
@@ -463,12 +508,17 @@ def run_scene(
                 root / f"{pool}_warmup.json",
                 spec["run_timeout_s"],
             )
-            lifecycle_events.append(dict(
-                pool=pool, load_started_unix_s=load_started,
-                healthy_unix_s=healthy_at, warm_ready_unix_s=time.time(),
-            ))
+            lifecycle_events.append(
+                dict(
+                    pool=pool,
+                    load_started_unix_s=load_started,
+                    healthy_unix_s=healthy_at,
+                    warm_ready_unix_s=time.time(),
+                )
+            )
             common.write_json(root / "lifecycle_events.json", lifecycle_events)
         inventories = wait_empty(run_dir)
+        common.write_json(root / "native_initial_receipt.json", inventories)
         initial_generations = [r["generation"] for r in inventories]
         common.write_json(
             root / "capacity_check.json", capacity_check(scene, inventories)
@@ -526,8 +576,10 @@ def run_scene(
         window = pilot.read(root / "measurement_window.json")
         window["ended_unix_s"] = time.time()
         common.write_json(root / "measurement_window.json", window)
-        for pool, ranks in (("source", 1),
-                            ("target", getattr(settings, "target_tp_size", 4))):
+        for pool, ranks in (
+            ("source", 1),
+            ("target", getattr(settings, "target_tp_size", 4)),
+        ):
             stage("收尾性能轨迹", pool=pool)
             result = _post_json(
                 urls[pool],

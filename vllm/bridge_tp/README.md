@@ -6,6 +6,17 @@
 SHA 已单独冻结；TP2 不沿用 TP4 的目标服务/迁移成本 profile。旧五卡
 wrapper 仍检查原分支，不可直接用它启动四卡 TP2。
 
+2026-10-28：4090D/Qwen3-8B 分支为 `bridgetp/tp2-4090d-qwen3-8b`。
+`tools/bridge_tp/run_qwen3_tp2_calibration.py --model <Qwen3-dir>
+--output <new-dir> --expected-revision <HEAD>` 首先仅运行两场 Nd2 pilot；
+审查后以相同目录加 `--phase full --resume` 复用完整场次，最多10次服务
+尝试（失败也计数），另留2个迁移profile单元。该入口使用新tokenizer、
+V1/eager、TP1 8192/TP2 16384、显存比例0.88、block16、batch2048；
+GPU2为源，GPU0/1为目标，GPU3空闲。高并发场同时覆盖TP2 8K以上上下文，
+稀疏网格未测的Nd/上下文组合保持缺失。只采服务与原生库存，不加载旧预测器、
+不建立KV传输通道。125块仅为实验形状余量，线上guard与释放前瞻仍为null。
+本轮服务结果不能替代实际迁移成本、bundle重建或正式布局净收益证据。
+
 - `tools/bridge_tp/run_tp2_cpu_checks.py --output <new-dir>`：真实 CPU 模块
   回归，绕过 CUDA 包启动；不代表 GPU 验收。
 - `tools/bridge_tp/run_tp2_calibration.py --model-path <model> --out-root <new-dir>`：

@@ -66,6 +66,9 @@ def summarize(root):
     for scene in sorted(
         p for p in root.iterdir() if p.is_dir() and (p / "recipe.json").exists()
     ):
+        if not (scene / "request_results.json").is_file():
+            failures.append(dict(run=scene.name, reason="missing request results"))
+            continue
         results = read(scene / "request_results.json")
         if results["status"] != "COMPLETED":
             failures.append(dict(run=scene.name, result=results))
