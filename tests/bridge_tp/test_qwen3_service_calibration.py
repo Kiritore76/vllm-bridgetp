@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU checks for the new platform's measured service contract."""
 
+import ast
 import json
 import os
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -220,6 +222,120 @@ class ServiceCalibrationTests(unittest.TestCase):
             result = runner.read(output / "result.json")
             self.assertEqual(sum(r["reused"] for r in result["runs"]), 2)
             self.assertFalse(result["deployment_ready"])
+            # A prior failed run still consumes this platform's service budget.
+            limited = [
+                "--model",
+                str(Path(tmp) / "model"),
+                "--output",
+                str(Path(tmp) / "limited"),
+                "--expected-revision",
+                "frozen",
+                "--prior-service-attempts",
+                "9",
+            ]
+            self.assertEqual(runner.main(limited), 1)
+            self.assertEqual(measured.call_count, 11)
+            self.assertEqual(
+                runner.read(Path(tmp) / "limited/preflight.json")[
+                    "prior_service_attempts"
+                ],
+                9,
+            )
+
+    def test_real_api_registration_serves_diagnostics_without_enabling_takeover(self):
+        class Router:
+            def __init__(self):
+                self.paths = []
+
+            def add_api_route(self, path, endpoint, methods):
+                self.paths.append((path, methods))
+
+        source = ast.parse(
+            (runner.ROOT / "vllm/bridge_tp/takeover_api.py").read_text(encoding="utf8")
+        )
+        attach = next(
+            n
+            for n in source.body
+            if isinstance(n, ast.FunctionDef) and n.name == "attach_router"
+        )
+        control_router = object()
+        scope = dict(
+            FastAPI=object,
+            APIRouter=Router,
+            router=control_router,
+            finalize_performance_trace=lambda: None,
+        )
+        exec(
+            compile(
+                ast.Module(body=[attach], type_ignores=[]), "actual-router", "exec"
+            ),
+            scope,
+        )
+        module = types.ModuleType("vllm.bridge_tp.takeover_api")
+        module.attach_router = scope["attach_router"]
+        server = ast.parse(
+            (runner.ROOT / "vllm/entrypoints/openai/api_server.py").read_text(
+                encoding="utf8"
+            )
+        )
+        build = next(
+            n
+            for n in server.body
+            if isinstance(n, ast.FunctionDef) and n.name == "build_app"
+        )
+        body = [
+            n
+            for n in build.body
+            if (
+                isinstance(n, ast.Assign)
+                and any(
+                    isinstance(t, ast.Name)
+                    and t.id in ("takeover_enabled", "performance_trace_enabled")
+                    for t in n.targets
+                )
+            )
+            or (
+                isinstance(n, ast.If)
+                and ast.unparse(n.test)
+                == "takeover_enabled or performance_trace_enabled"
+            )
+        ]
+        self.assertEqual(len(body), 3)
+        for environment, expected in (
+            ({}, "none"),
+            ({"BRIDGETP_PERFORMANCE_TRACE_DIR": "trace"}, "none"),
+            (
+                {
+                    "BRIDGETP_PERFORMANCE_TRACE_DIR": "trace",
+                    "BRIDGETP_PERFORMANCE_FINALIZE_TOKEN": "secret",
+                },
+                "diagnostic",
+            ),
+            ({"BRIDGETP_TAKEOVER_ENABLED": "1"}, "control"),
+        ):
+            included = []
+            app = SimpleNamespace(include_router=included.append)
+            with (
+                patch.dict(os.environ, environment, clear=True),
+                patch.dict(sys.modules, {module.__name__: module}),
+            ):
+                exec(
+                    compile(
+                        ast.Module(body=body, type_ignores=[]),
+                        "actual-api-registration",
+                        "exec",
+                    ),
+                    dict(os=os, app=app),
+                )
+            if expected == "none":
+                self.assertEqual(included, [])
+            elif expected == "control":
+                self.assertIs(included[0], control_router)
+            else:
+                self.assertEqual(
+                    included[0].paths,
+                    [("/bridge_tp/v1/performance_trace/finalize", ["POST"])],
+                )
 
 
 if __name__ == "__main__":

@@ -176,8 +176,11 @@ def main(argv=None):
     parser.add_argument("--expected-revision", required=True)
     parser.add_argument("--phase", choices=("pilot", "full"), default="pilot")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--prior-service-attempts", type=int, default=0)
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
+    if not 0 <= args.prior_service_attempts <= 10:
+        raise ValueError("prior service attempts must be between zero and ten")
     if args.validate_only:
         print(
             json.dumps(
@@ -217,7 +220,11 @@ def main(argv=None):
         raise ValueError("results must be outside the source checkout")
     if args.resume:
         old = read(args.output / "preflight.json")
-        if old["revision"] != revision or old["model"] != str(args.model.resolve()):
+        if (
+            old["revision"] != revision
+            or old["model"] != str(args.model.resolve())
+            or old.get("prior_service_attempts", 0) != args.prior_service_attempts
+        ):
             raise ValueError("resume code/model identity differs")
     else:
         args.output.mkdir(parents=True, exist_ok=False)
@@ -301,6 +308,7 @@ def main(argv=None):
                 versions=versions,
                 capacity_guard_blocks=None,
                 experiment_shape_headroom_blocks=125,
+                prior_service_attempts=args.prior_service_attempts,
             ),
         )
         settings = SimpleNamespace(
@@ -356,7 +364,7 @@ def main(argv=None):
                             preserved / f"{directory.name}_{time.time_ns()}"
                         )
                 print(f"[进度] 开始 {directory.name}", flush=True)
-                if len(attempts) >= 10:
+                if len(attempts) + args.prior_service_attempts >= 10:
                     raise RuntimeError("ten service attempts spent, including failures")
                 attempts.append(dict(scene=directory.name, status="STARTED"))
                 common.write_json(ledger_path, attempts)

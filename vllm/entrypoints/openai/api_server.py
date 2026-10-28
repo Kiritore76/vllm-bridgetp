@@ -182,17 +182,22 @@ def build_app(
 
     register_vllm_serve_api_routers(app)
 
-    if os.getenv("BRIDGETP_TAKEOVER_ENABLED", "").strip().lower() in {
+    takeover_enabled = os.getenv("BRIDGETP_TAKEOVER_ENABLED", "").strip().lower() in {
         "1",
         "true",
         "yes",
         "on",
-    }:
+    }
+    performance_trace_enabled = bool(
+        os.getenv("BRIDGETP_PERFORMANCE_TRACE_DIR")
+        and os.getenv("BRIDGETP_PERFORMANCE_FINALIZE_TOKEN")
+    )
+    if takeover_enabled or performance_trace_enabled:
         from vllm.bridge_tp.takeover_api import (
             attach_router as attach_takeover_router,
         )
 
-        attach_takeover_router(app)
+        attach_takeover_router(app, diagnostics_only=not takeover_enabled)
 
     from vllm.entrypoints.openai.models.api_router import (
         attach_router as register_models_api_router,

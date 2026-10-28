@@ -104,13 +104,17 @@ def _validate_target_ready(
     sender_dir = (
         run_dir / "stage_delivery_receipts" if phase8 else run_dir / "sender_receipts"
     )
-    senders = [_load_json(sender_dir / f"tp_rank_{rank}.json") for rank in range(session_target_tp(run_dir))]
+    senders = [
+        _load_json(sender_dir / f"tp_rank_{rank}.json")
+        for rank in range(session_target_tp(run_dir))
+    ]
     receiver_root = run_dir / "receiver_receipts"
     target_dirs = sorted(path for path in receiver_root.iterdir() if path.is_dir())
     if len(target_dirs) != 1:
         raise ValueError("Phase 7 requires exactly one target request directory")
     receivers = [
-        _load_json(target_dirs[0] / f"tp_rank_{rank}.json") for rank in range(session_target_tp(run_dir))
+        _load_json(target_dirs[0] / f"tp_rank_{rank}.json")
+        for rank in range(session_target_tp(run_dir))
     ]
     target_request_ids = {str(receipt["target_request_id"]) for receipt in receivers}
     if len(target_request_ids) != 1:
@@ -447,5 +451,14 @@ async def finalize_performance_trace(raw_request: Request) -> dict[str, Any]:
         )
 
 
-def attach_router(app: FastAPI) -> None:
-    app.include_router(router)
+def attach_router(app: FastAPI, *, diagnostics_only: bool = False) -> None:
+    if diagnostics_only:
+        diagnostics = APIRouter()
+        diagnostics.add_api_route(
+            "/bridge_tp/v1/performance_trace/finalize",
+            finalize_performance_trace,
+            methods=["POST"],
+        )
+        app.include_router(diagnostics)
+    else:
+        app.include_router(router)
