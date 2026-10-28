@@ -335,7 +335,9 @@
     "vllm/entrypoints/openai/api_server.py": "0cbf2af64daa695e12d0ba3f76f7315a4d22f242baa17c9f71cea68bbc4b93fc",
     "tools/bridge_tp/run_qwen3_parameter_batch.py": "7c569e98bd239ec565d3b9f4f01e5c5784b7d71a212eddad84a1931d6fbf31f8",
     "tools/bridge_tp/qwen3_calibration_contract.py": "24545c1671a0b54b6526209fb26dfcfd89b72a196295e6b61131b78e7a0c3a28",
-    "tests/bridge_tp/test_qwen3_parameter_batch.py": "d9d7ef911ea5f60793320556c56dff7a185c44d1a08cf4480842336021f95c0f"
+    "tests/bridge_tp/test_qwen3_parameter_batch.py": "d9d7ef911ea5f60793320556c56dff7a185c44d1a08cf4480842336021f95c0f",
+    "tools/bridge_tp/run_qwen3_scheduler_supplement.py": "78044e014a097707b22032903f9a48f2e64bb0225c2c2682070beed31bbc44ac",
+    "tests/bridge_tp/test_qwen3_scheduler_supplement.py": "40fd9afa64c988a4a8e6a5fa09e9ac89a45ff02a4489aa1b9a8198acc6331dab"
   },
   "server_settings": {
     "dtype": "bfloat16",
