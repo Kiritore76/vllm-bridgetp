@@ -345,6 +345,12 @@ class PredictorLiveObserver(PredictorFeatureCapture):
                     "checkpoint_sha256": checkpoint_sha256,
                     "model_type": self.predictor.model_type,
                     "network_depth": self.predictor.network_depth,
+                    "overflow_category": getattr(
+                        self.predictor, "overflow_category", True
+                    ),
+                    "support_scope": getattr(
+                        self.predictor, "support_scope", "unbounded_with_open_tail"
+                    ),
                     "feature_journal_enabled": self._feature_journal is not None,
                     "capture_input_sha256": self.predictor.capture_input_sha256,
                     "model_config_sha256": digest,

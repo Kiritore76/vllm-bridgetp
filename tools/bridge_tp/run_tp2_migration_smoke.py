@@ -59,9 +59,16 @@ def main(argv=None):
     parser.add_argument("--inputs", type=Path)
     parser.add_argument("--expected-revision")
     parser.add_argument("--no-archive", action="store_true")
+    parser.add_argument("--predictor-checkpoint", type=Path)
+    parser.add_argument("--natural-probe", action="store_true")
+    parser.add_argument("--target-background", type=int, choices=(0, 2, 4), default=0)
     args = parser.parse_args(argv)
     if not math.isfinite(args.timeout_s) or args.timeout_s <= 0:
         raise ValueError("finite positive timeout required")
+    if (args.predictor_checkpoint or args.natural_probe or args.target_background) and (
+        args.platform != "qwen3" or not args.predictor_checkpoint
+    ):
+        raise ValueError("loaded/live validation requires Qwen3 and its checkpoint")
     if args.validate_only:
         print(
             json.dumps(
@@ -130,6 +137,14 @@ def main(argv=None):
         from tools.bridge_tp.qwen3_calibration_contract import adjust_migration_plan
 
         adjust_migration_plan(plan)
+        if args.predictor_checkpoint:
+            from tools.bridge_tp.qwen3_online_validation import (
+                background_completion,
+                configure_predictor,
+                latest_inventory,
+            )
+
+            configure_predictor(plan, args.predictor_checkpoint, args.model_path)
     common.write_json(
         args.out_root / "effective_plan.json",
         {
@@ -166,10 +181,13 @@ def main(argv=None):
     mechanism.RuntimeControl(armed=False).write(directory)
     audit = Audit(directory / "pressure_audit.jsonl")
     result, code, processes = {}, 0, []
-    pool = ThreadPoolExecutor(max_workers=4)
+    pool = ThreadPoolExecutor(max_workers=4 + args.target_background)
+    background_futures = []
     driver = None
     emissions = []
     first_idle_observed = None
+    last_telemetry = 0.0
+    telemetry = Audit(directory / "loaded_telemetry.jsonl")
     try:
         for role in ("target", "source"):
             process = common.start_process(
@@ -191,6 +209,10 @@ def main(argv=None):
                 directory / (role + "_warm_failure.json"),
                 retain_chunks=False,
             )
+        if args.natural_probe:
+            from tools.bridge_tp.qwen3_online_validation import natural_probe
+
+            natural_probe(config.source_url, directory, args.model_path, io)
         processes.append(
             common.start_process(
                 "stager",
@@ -208,10 +230,23 @@ def main(argv=None):
             dict(
                 mechanism_config=vars(config),
                 pressure_policy_executed=False,
-                predictor_loaded=args.platform == "a100",
+                predictor_loaded=args.platform == "a100"
+                or bool(args.predictor_checkpoint),
                 native_capacity_replaced=True,
             ),
         )
+        for index in range(args.target_background):
+            background_futures.append(
+                pool.submit(
+                    background_completion,
+                    io,
+                    config.target_url,
+                    migration_request(inputs, 6144, f"target-background-{index}"),
+                    args.timeout_s,
+                    directory,
+                    index,
+                )
+            )
         recorder = io.ProxyRecorder(
             request["request_id"],
             io.ProxyMode.HOLD_BACK,
@@ -244,6 +279,15 @@ def main(argv=None):
         while time.monotonic() < deadline:
             if any(p.process.poll() is not None for p in processes[:2]):
                 raise RuntimeError("serving engine exited")
+            if args.predictor_checkpoint and time.monotonic() - last_telemetry >= 0.2:
+                inventories = {
+                    role: latest_inventory(directory / f"{role}_inventory.jsonl")
+                    for role in ("source", "target")
+                }
+                telemetry.write(
+                    dict(kind="inventory_observation", inventories=inventories)
+                )
+                last_telemetry = time.monotonic()
             view = mechanism.read_source_progress(directory, request, time.time())
             if view is None:
                 if future.done():
@@ -256,6 +300,22 @@ def main(argv=None):
                     future.result()
                     raise RuntimeError("source ended before explicit trigger")
                 if view.output_tokens >= args.history_tokens:
+                    if args.target_background:
+                        target = latest_inventory(directory / "target_inventory.jsonl")
+                        if any(f.done() for f in background_futures):
+                            raise RuntimeError(
+                                "background ended before migration START"
+                            )
+                        if not target or target["running"] < args.target_background:
+                            time.sleep(0.05)
+                            continue
+                        if not 0 <= time.time() - target["sampled_at"] <= 2:
+                            raise RuntimeError(
+                                "loaded target inventory stale or future"
+                            )
+                        common.write_json(
+                            directory / "target_loaded_at_start.json", target
+                        )
                     # Target starts empty. The existing native placeholder
                     # allocator still decides whether the reserved prefix fits.
                     candidate = SimpleNamespace(
@@ -273,6 +333,33 @@ def main(argv=None):
                     driver.start(candidate, snapshot)
             else:
                 driver.tick(view, snapshot)
+                if (
+                    args.target_background
+                    and driver.settled
+                    and not (
+                        directory / "target_loaded_at_source_release.json"
+                    ).exists()
+                ):
+                    if any(f.done() for f in background_futures):
+                        raise RuntimeError("background did not overlap source release")
+                    target = latest_inventory(directory / "target_inventory.jsonl")
+                    if not target or not 0 <= time.time() - target["sampled_at"] <= 2:
+                        raise RuntimeError(
+                            "source-release target inventory unavailable"
+                        )
+                    if (
+                        sum(
+                            r["request_id"].startswith("cmpl-target-background-")
+                            for r in target["requests"]
+                        )
+                        < args.target_background
+                    ):
+                        raise RuntimeError(
+                            "background missing from native release inventory"
+                        )
+                    common.write_json(
+                        directory / "target_loaded_at_source_release.json", target
+                    )
                 if driver.cancel_future is not None or driver.cleanup_requires_shutdown:
                     raise RuntimeError(
                         "migration did not finish; inspect cleanup evidence"
@@ -300,6 +387,14 @@ def main(argv=None):
             raise RuntimeError("unified response indices are not contiguous")
         if not channel_idle(directory, "mechanism", driver.record.request_id):
             raise RuntimeError("matching source/target IDLE evidence missing")
+        for index, background in enumerate(background_futures):
+            response = background.result(timeout=args.timeout_s)
+            if (
+                len(response["token_ids"]) != 6144
+                or response["finish_reason"] != "length"
+            ):
+                raise RuntimeError("background output incomplete")
+            common.write_json(directory / f"background-{index}-result.json", response)
         wait_empty(directory, after_generations=[r["generation"] for r in native])
         full_speed = pilot.verify_full_speed(directory)
         seams = [
@@ -316,6 +411,8 @@ def main(argv=None):
             mechanism_only=True,
             natural_policy_trigger=False,
             target_tp=2,
+            target_background_requests=args.target_background,
+            predictor_loaded=bool(args.predictor_checkpoint) or args.platform == "a100",
             source_finish=source["finish_reason"],
             target_finish=target["finish_reason"],
             full_speed=full_speed,
@@ -340,6 +437,8 @@ def main(argv=None):
             ),
         )
         common.write_json(directory / "unified_tokens.json", emissions)
+    except KeyboardInterrupt:
+        code, result = 130, dict(status="INTERRUPTED", natural_policy_trigger=False)
     except Exception as error:
         code, result = (
             1,

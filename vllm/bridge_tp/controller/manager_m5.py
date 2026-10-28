@@ -11,14 +11,18 @@ from pathlib import Path
 
 
 def probability_gt_bounds(
-    probabilities: tuple[float, ...], edges: tuple[int, ...], horizon: int
+    probabilities: tuple[float, ...],
+    edges: tuple[int, ...],
+    horizon: int,
+    *,
+    overflow_category: bool = True,
 ) -> tuple[float, float]:
     """Bounds for P(remaining > horizon), including the unresolved bin."""
     if horizon < 0:
         return 1.0, 1.0
     index = bisect.bisect_left(edges, horizon)
     if index == len(edges):
-        return 0.0, probabilities[-1]
+        return 0.0, probabilities[-1] if overflow_category else 0.0
     lower = sum(probabilities[index + 1 :])
     upper = lower if horizon == edges[index] else sum(probabilities[index:])
     return lower, upper
@@ -28,7 +32,11 @@ class PredictorEventReader:
     """Incrementally read one source TP1 event file; never influence actuation."""
 
     def __init__(
-        self, path: Path, checkpoint_sha256: str, *, max_age_s: float = 30.0,
+        self,
+        path: Path,
+        checkpoint_sha256: str,
+        *,
+        max_age_s: float = 30.0,
         max_output_lag_tokens: int = 40,
     ) -> None:
         if len(checkpoint_sha256) != 64 or max_age_s <= 0 or max_output_lag_tokens < 0:
@@ -76,6 +84,11 @@ class PredictorEventReader:
             or edges[0] != 0
             or any(not isinstance(v, int) or isinstance(v, bool) for v in edges)
             or any(a >= b for a, b in zip(edges, edges[1:]))
+            or type(row.get("overflow_category", True)) is not bool
+            or (
+                row.get("overflow_category") is False
+                and row.get("support_scope") != "natural_eos_within_finite_support"
+            )
         ):
             raise ValueError("M5 predictor event header differs from frozen contract")
         self._header = row
@@ -85,8 +98,14 @@ class PredictorEventReader:
             raise ValueError("M5 predictor event checkpoint differs")
         request_id = row.get("request_id")
         position = row.get("generated_tokens")
-        if not isinstance(request_id, str) or not request_id or (
-            not isinstance(position, int) or isinstance(position, bool) or position < 0
+        if (
+            not isinstance(request_id, str)
+            or not request_id
+            or (
+                not isinstance(position, int)
+                or isinstance(position, bool)
+                or position < 0
+            )
         ):
             raise ValueError("invalid M5 predictor request identity or position")
         if position <= self._last_position.get(request_id, -1):
@@ -102,10 +121,14 @@ class PredictorEventReader:
         assert self._header is not None
         if (
             not isinstance(values, list)
-            or len(values) != len(self._header["category_upper_edges"]) + 1
+            or len(values)
+            != len(self._header["category_upper_edges"])
+            + int(self._header.get("overflow_category", True))
             or any(
-                not isinstance(v, (int, float)) or isinstance(v, bool)
-                or not math.isfinite(v) or v < 0
+                not isinstance(v, (int, float))
+                or isinstance(v, bool)
+                or not math.isfinite(v)
+                or v < 0
                 for v in values
             )
             or abs(sum(values) - 1.0) > 1e-4
@@ -116,9 +139,15 @@ class PredictorEventReader:
         self._unavailable.pop(request_id, None)
 
     def advisory(
-        self, request_id: str, output_tokens: int, headroom_tokens: int,
-        short_window_tokens: int = 64, *, now_ns: int | None = None,
-        max_output_tokens: int | None = None, ignore_eos: bool = False,
+        self,
+        request_id: str,
+        output_tokens: int,
+        headroom_tokens: int,
+        short_window_tokens: int = 64,
+        *,
+        now_ns: int | None = None,
+        max_output_tokens: int | None = None,
+        ignore_eos: bool = False,
     ) -> dict:
         """Report raw model risk and bounds under the actual output stop rule."""
         self.poll()
@@ -126,7 +155,8 @@ class PredictorEventReader:
             raise ValueError("M5 output cap cannot be negative")
         remaining_cap = (
             max(0, max_output_tokens - output_tokens)
-            if max_output_tokens is not None else None
+            if max_output_tokens is not None
+            else None
         )
         result: dict = {
             "kind": "manager_m5_predictor_shadow",
@@ -145,48 +175,69 @@ class PredictorEventReader:
         row = self._latest.get(request_id)
         if row is None:
             return {
-                **result, "status": "UNAVAILABLE",
+                **result,
+                "status": "UNAVAILABLE",
                 "reason": self._unavailable.get(request_id, "no prediction yet"),
             }
         position = row["generated_tokens"]
-        result.update({
-            "probabilities": row["probabilities"],
-            "feature_id": row.get("feature_id"),
-            "category_upper_edges": self._header["category_upper_edges"],
-            "captured_unix_ns": row["captured_unix_ns"],
-            "published_unix_ns": row.get("published_unix_ns"),
-        })
+        result.update(
+            {
+                "probabilities": row["probabilities"],
+                "feature_id": row.get("feature_id"),
+                "category_upper_edges": self._header["category_upper_edges"],
+                "overflow_category": self._header.get("overflow_category", True),
+                "support_scope": self._header.get(
+                    "support_scope", "unbounded_with_open_tail"
+                ),
+                "captured_unix_ns": row["captured_unix_ns"],
+                "published_unix_ns": row.get("published_unix_ns"),
+            }
+        )
         age_s = ((now_ns or time.time_ns()) - row["captured_unix_ns"]) / 1e9
         if (
             position > output_tokens
             or output_tokens - position > self.max_output_lag_tokens
-            or age_s < -1 or age_s > self.max_age_s
+            or age_s < -1
+            or age_s > self.max_age_s
         ):
             return {
-                **result, "status": "STALE", "prediction_output_tokens": position,
+                **result,
+                "status": "STALE",
+                "prediction_output_tokens": position,
                 "age_s": age_s,
             }
         probabilities = tuple(float(v) for v in row["probabilities"])
         edges = tuple(self._header["category_upper_edges"])
-        result.update({
-            "probabilities": probabilities,
-            "category_upper_edges": edges,
-            "prediction_output_tokens": position,
-            "captured_unix_ns": row["captured_unix_ns"],
-            "prediction_lag_tokens": output_tokens - position,
-            "feature_layer": self._header["feature_layer"],
-            "interval": self._header["interval"],
-            "position_alignment": "condition R>=lag; subtract lag; cap runtime",
-        })
+        result.update(
+            {
+                "probabilities": probabilities,
+                "category_upper_edges": edges,
+                "prediction_output_tokens": position,
+                "captured_unix_ns": row["captured_unix_ns"],
+                "prediction_lag_tokens": output_tokens - position,
+                "feature_layer": self._header["feature_layer"],
+                "interval": self._header["interval"],
+                "position_alignment": "condition R>=lag; subtract lag; cap runtime",
+            }
+        )
         headroom_bounds = probability_gt_bounds(
-            probabilities, edges, headroom_tokens
+            probabilities,
+            edges,
+            headroom_tokens,
+            overflow_category=self._header.get("overflow_category", True),
         )
         short_bounds = probability_gt_bounds(
-            probabilities, edges, short_window_tokens
+            probabilities,
+            edges,
+            short_window_tokens,
+            overflow_category=self._header.get("overflow_category", True),
         )
         long_window_tokens = 512
         long_bounds = probability_gt_bounds(
-            probabilities, edges, long_window_tokens
+            probabilities,
+            edges,
+            long_window_tokens,
+            overflow_category=self._header.get("overflow_category", True),
         )
 
         def cap_aware(bounds: tuple[float, float], horizon: int) -> tuple[float, float]:
@@ -218,8 +269,10 @@ class PredictorEventReader:
                         sure_b += mass
             lower_denom = sure_a + possible_b
             upper_denom = possible_a + sure_b
-            return (sure_a / lower_denom if lower_denom else 0.0,
-                    possible_a / upper_denom if upper_denom else 0.0)
+            return (
+                sure_a / lower_denom if lower_denom else 0.0,
+                possible_a / upper_denom if upper_denom else 0.0,
+            )
 
         return {
             **result,

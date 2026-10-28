@@ -148,7 +148,7 @@ def summarize(root):
                     math.ceil(prefill / 256),
                 )
                 groups[key].append(dict(row, run=scene.name))
-            if "-nd" not in scene.name:
+            if "-nd" not in scene.name and not scene.name.startswith("nd"):
                 continue
             for index in range(int((ended - origin) // 10)):
                 left, right = origin + 10 * index, origin + 10 * (index + 1)

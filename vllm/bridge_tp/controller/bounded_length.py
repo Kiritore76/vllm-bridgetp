@@ -90,6 +90,7 @@ def bounded_length(
     predicted_at: int,
     max_output_tokens: int,
     ignore_eos: bool = False,
+    overflow_category: bool = True,
 ) -> BoundedLength:
     """Condition on R>=lag, shift, and clip to min(8192, stop)-generated.
 
@@ -107,11 +108,14 @@ def bounded_length(
     ):
         raise ValueError("invalid alignment or bucket edges")
     if (
-        len(probabilities) != len(edges) + 1
+        type(overflow_category) is not bool
+        or len(probabilities) != len(edges) + int(overflow_category)
         or any(not math.isfinite(p) or p < 0 for p in probabilities)
         or abs(sum(probabilities) - 1) > 1e-4
     ):
         raise ValueError("invalid PMF")
+    # Keep the frozen total-output stop contract for both predictor geometries.
+    # TP2's larger context limit is not a larger output-generation contract.
     cap = max(0, min(8192, max_output_tokens) - generated)
     lag = generated - predicted_at
     pmf = [0.0] * (cap + 1)
@@ -156,4 +160,5 @@ def from_advisory(advisory: dict, max_output_tokens: int) -> BoundedLength:
         predicted_at=advisory["prediction_output_tokens"],
         max_output_tokens=max_output_tokens,
         ignore_eos=advisory.get("ignore_eos", False),
+        overflow_category=advisory.get("overflow_category", True),
     )
