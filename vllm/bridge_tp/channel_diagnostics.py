@@ -5,6 +5,8 @@ import contextlib
 import os
 import socket
 
+from vllm.bridge_tp.channel_runtime import receiver_snapshot
+
 
 def idle_lifecycle(channel):
     lifecycle = getattr(channel, "lifecycle", None)
@@ -52,8 +54,12 @@ def retire_receiver(connector):
     if any(t.is_alive() for t in connector._load_threads.values()):
         raise RuntimeError("target restore thread still active")
     receiver = connector._persistent_gpu_receiver
-    if receiver is None or not idle_lifecycle(receiver) or receiver.comm is None:
-        raise RuntimeError("target migration channel is not IDLE")
+    if receiver is None:
+        raise RuntimeError("target persistent receiver is absent")
+    if not idle_lifecycle(receiver):
+        raise RuntimeError("target migration lifecycle is not IDLE")
+    if receiver.comm is None:
+        raise RuntimeError("target migration communicator is absent")
     if connector._prebound_gpu_receiver not in (None, receiver):
         raise RuntimeError("unexpected independent prebound receiver")
     connector._prebind_receiver_stop.set()
@@ -96,7 +102,21 @@ def worker_retire(worker):
     else:
         from vllm.distributed.kv_transfer import get_kv_transfer_group
 
-        result = retire_receiver(get_kv_transfer_group())
+        connector = get_kv_transfer_group()
+        snapshot = receiver_snapshot(connector)
+        try:
+            result = retire_receiver(connector)
+        except RuntimeError as error:
+            # Expected guard refusals must not escape the worker RPC and
+            # terminate the model executor. Preserve the state for diagnosis.
+            return dict(
+                status="REJECTED",
+                error=str(error),
+                role=role,
+                pid=os.getpid(),
+                channel_runtime=snapshot,
+            )
+        result["channel_runtime_before"] = snapshot
     after = (
         id(worker.model_runner.model),
         id(get_tp_group()),

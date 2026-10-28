@@ -33,7 +33,11 @@ class PerformanceFailure(RuntimeError):
     """Mechanism completed, but the required output SLO did not pass."""
 
 
-def stages(diagnostic=False, channel_ablation=False):
+def stages(diagnostic=False, channel_ablation=False, runtime_fix=False):
+    if runtime_fix:
+        return [
+            dict(name="runtime-fix-loaded4", background=4, history=2048, probe=False)
+        ]
     if channel_ablation:
         return [
             dict(
@@ -95,6 +99,7 @@ def execute(args, ledger):
     for stage in stages(
         getattr(args, "diagnostic_probe", False),
         getattr(args, "channel_ablation", False),
+        getattr(args, "runtime_fix_probe", False),
     ):
         if not gpu_idle():
             raise RuntimeError("GPUs busy; do not stop unrelated processes")
@@ -157,6 +162,10 @@ def execute(args, ledger):
             from tools.bridge_tp.qwen3_migration_diagnostics import performance_report
 
             performance = performance_report(directory, result)
+            if getattr(args, "runtime_fix_probe", False):
+                write(
+                    directory / "runtime_fix_acceptance.json", runtime_proof(directory)
+                )
             row.update(
                 status="COMPLETED" if performance["passed"] else "PERFORMANCE_FAILURE",
                 measurement=result,
@@ -181,6 +190,30 @@ def execute(args, ledger):
             write(args.output / "attempt_ledger.json", ledger)
 
 
+def runtime_proof(directory):
+    controller = directory / "mechanism/controller"
+    ranks = []
+    for rank in range(2):
+        receipt = read(controller / f"persistent_payload_cleanup/tp_rank_{rank}.json")
+        state = receipt.get("channel_runtime", {})
+        polling = state.get("manifest_polling") or {}
+        if (
+            receipt.get("status") != "PERSISTENT_SESSION_PAYLOAD_RELEASED"
+            or receipt.get("tp_rank") != rank
+            or not state.get("same_receiver")
+            or state.get("lifecycle_state") != "IDLE"
+            or state.get("active_session")
+            or not state.get("communicator_present")
+            or state.get("live_load_threads") != 0
+            or not 1 <= polling.get("parses", 0) <= polling.get("polls", 0)
+        ):
+            raise ValueError(f"rank {rank} worker/channel cleanup proof invalid")
+        ranks.append(receipt)
+    return dict(
+        status="COMPLETED", ranks=ranks, channel_retired=False, target_restarted=False
+    )
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     for key in ("model", "checkpoint", "inputs", "prior-supplement", "output"):
@@ -191,6 +224,8 @@ def main(argv=None):
     parser.add_argument("--prior-online", type=Path)
     parser.add_argument("--channel-ablation", action="store_true")
     parser.add_argument("--prior-ready", type=Path)
+    parser.add_argument("--runtime-fix-probe", action="store_true")
+    parser.add_argument("--prior-ablation", type=Path)
     args = parser.parse_args(argv)
     if args.diagnostic_probe and args.prior_online is None:
         parser.error("diagnostics require the previous online validation directory")
@@ -200,14 +235,31 @@ def main(argv=None):
         parser.error(
             "channel ablation requires diagnostics and the previous ready probe"
         )
-    prior_count = 24 if args.channel_ablation else (22 if args.diagnostic_probe else 20)
-    new_limit = 1 if args.channel_ablation else 2
+    if args.runtime_fix_probe and (
+        not args.diagnostic_probe
+        or args.channel_ablation
+        or args.prior_ready is None
+        or args.prior_ablation is None
+    ):
+        parser.error(
+            "runtime fix requires diagnostics, ready/ablation evidence, no retirement"
+        )
+    prior_count = (
+        25
+        if args.runtime_fix_probe
+        else (24 if args.channel_ablation else (22 if args.diagnostic_probe else 20))
+    )
+    new_limit = 1 if args.channel_ablation or args.runtime_fix_probe else 2
     if args.validate_only:
         print(
             json.dumps(
                 dict(
                     status="STATIC_PLAN_ONLY",
-                    stages=stages(args.diagnostic_probe, args.channel_ablation),
+                    stages=stages(
+                        args.diagnostic_probe,
+                        args.channel_ablation,
+                        args.runtime_fix_probe,
+                    ),
                     prior_profile_attempts=prior_count,
                     additional_limit=new_limit,
                     total_limit=prior_count + new_limit,
@@ -225,7 +277,15 @@ def main(argv=None):
     args.output.mkdir(parents=True, exist_ok=False)
     ledger, result, code = [], dict(status="TECHNICAL_FAILURE"), 1
     try:
-        if args.channel_ablation:
+        if args.runtime_fix_probe:
+            previous = read(args.prior_ablation / "result.json")
+            if (
+                previous.get("total_profile_attempts") != 25
+                or previous.get("attempted_new") != 1
+                or previous.get("status") != "TECHNICAL_FAILURE"
+            ):
+                raise ValueError("requires the previous failed single ablation result")
+        if args.channel_ablation or args.runtime_fix_probe:
             ready = read(args.prior_ready / "result.json")
             if (
                 ready.get("total_profile_attempts") != 24
@@ -278,6 +338,7 @@ def main(argv=None):
                 predictor_training=False,
                 diagnostic_probe=args.diagnostic_probe,
                 channel_ablation=args.channel_ablation,
+                runtime_fix_probe=args.runtime_fix_probe,
                 automatic_pressure_policy=False,
             ),
         )

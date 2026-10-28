@@ -21,6 +21,11 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from vllm.bridge_tp.block_layout import snapshot_target_block_ids
+from vllm.bridge_tp.channel_runtime import (
+    ManifestPollCache,
+    publish_prebound_receiver,
+    receiver_snapshot,
+)
 from vllm.bridge_tp.delta_timing import delta_timing
 from vllm.bridge_tp.kv_restore import inject_rank_delta, inject_rank_shard
 from vllm.bridge_tp.online_remote_attention import (
@@ -198,14 +203,10 @@ def _write_gpu_direct_rank_diagnostic(
     }
     if device.type == "cuda":
         try:
-            value["cuda_memory_allocated_bytes"] = torch.cuda.memory_allocated(
+            value["cuda_memory_allocated_bytes"] = torch.cuda.memory_allocated(device)
+            value["cuda_memory_reserved_bytes"] = torch.cuda.memory_reserved(device)
+            value["cuda_max_memory_allocated_bytes"] = torch.cuda.max_memory_allocated(
                 device
-            )
-            value["cuda_memory_reserved_bytes"] = torch.cuda.memory_reserved(
-                device
-            )
-            value["cuda_max_memory_allocated_bytes"] = (
-                torch.cuda.max_memory_allocated(device)
             )
         except BaseException as memory_error:
             value["cuda_memory_error"] = (
@@ -302,10 +303,14 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         configured_phase = self._kv_transfer_config.get_from_extra_config(
             "bridgetp_stream_expected_phase", None
         )
-        self.expected_phase = str(configured_phase) if configured_phase else (
-            "BridgeTP D3 Phase 7"
-            if self.takeover_control_path is not None
-            else "BridgeTP D3 Phase 6"
+        self.expected_phase = (
+            str(configured_phase)
+            if configured_phase
+            else (
+                "BridgeTP D3 Phase 7"
+                if self.takeover_control_path is not None
+                else "BridgeTP D3 Phase 6"
+            )
         )
         parallel = vllm_config.parallel_config
         if parallel.tensor_parallel_size not in (2, 4):
@@ -489,6 +494,8 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         # after both the receiver and the buffered history handle are
         # published, so a waiter can safely reuse them.
         self._prebind_receiver_ready = threading.Event()
+        self._prebind_manifest_cache = ManifestPollCache()
+        self._finished_worker_requests: set[str] = set()
         # Use one restore stream for all sequential sessions.  Recreating it
         # per session strands the readback temporaries in separate CUDA
         # allocator stream caches and looks like a TP4 KV leak in nvidia-smi.
@@ -992,8 +999,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     "target-ready barrier before ownership commit"
                     if phase7
                     else (
-                        "live stream restore and exact readback; "
-                        "no ownership takeover"
+                        "live stream restore and exact readback; no ownership takeover"
                     )
                 ),
                 "status": "TARGET_READY" if phase7 else "READY",
@@ -1253,8 +1259,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                         defer_communicator_destroy=True,
                     )
                     receiver.listener.settimeout(None)
-                    with self._prebound_gpu_receiver_lock:
-                        self._prebound_gpu_receiver = receiver
+                    publish_prebound_receiver(self, receiver)
                     receiver._open(migration_id="", rank=tp_rank)
                     if receiver.channel_generation != self.channel_generation:
                         raise RuntimeError(
@@ -1287,6 +1292,9 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     with self._prebound_gpu_receiver_lock:
                         if self._prebound_gpu_receiver is receiver:
                             self._prebound_gpu_receiver = None
+                    with self._persistent_gpu_receiver_lock:
+                        if self._persistent_gpu_receiver is receiver:
+                            self._persistent_gpu_receiver = None
                     if receiver is not None:
                         receiver.close()
                     self._prebind_receiver_ready.set()
@@ -1297,7 +1305,9 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     if not self.manifest_path.is_file():
                         time.sleep(0.005)
                         continue
-                    manifest = _load_json(self.manifest_path)
+                    manifest = self._prebind_manifest_cache.load(
+                        self.manifest_path, _load_json
+                    )
                     if manifest.get("history_transport") != "NCCL_P2P_GPU_DIRECT":
                         self._prebind_receiver_ready.set()
                         return
@@ -1339,11 +1349,18 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     # to bind the port a second time.
                     with self._prebound_gpu_receiver_lock:
                         if self._prebound_gpu_receiver is None:
+                            # This branch already owns the prebound lock.
+                            with self._persistent_gpu_receiver_lock:
+                                if self.persistent_channel:
+                                    if self._persistent_gpu_receiver not in (
+                                        None,
+                                        receiver,
+                                    ):
+                                        raise RuntimeError(
+                                            "independent persistent receiver exists"
+                                        )
+                                    self._persistent_gpu_receiver = receiver
                             self._prebound_gpu_receiver = receiver
-                            if self.persistent_channel:
-                                with self._persistent_gpu_receiver_lock:
-                                    if self._persistent_gpu_receiver is None:
-                                        self._persistent_gpu_receiver = receiver
                         else:
                             if receiver is not self._prebound_gpu_receiver:
                                 receiver.close()
@@ -1572,8 +1589,8 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             manifest = self._load_manifest()
             tp_rank = get_tp_group().rank_in_group
             deadline = time.monotonic() + self.socket_timeout_s
-            queue_dir = self.manifest_path.parent / "live_gpu_queue" / (
-                f"tp_rank_{tp_rank}"
+            queue_dir = (
+                self.manifest_path.parent / "live_gpu_queue" / (f"tp_rank_{tp_rank}")
             )
             digest = hashlib.sha256()
             aggregate_bytes = 0
@@ -1599,9 +1616,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             started = time.perf_counter()
             initial_end = int(manifest["num_computed_tokens"])
             initial_blocks = math.ceil(initial_end / int(manifest["block_size"]))
-            gpu_direct = (
-                manifest.get("history_transport") == "NCCL_P2P_GPU_DIRECT"
-            )
+            gpu_direct = manifest.get("history_transport") == "NCCL_P2P_GPU_DIRECT"
             gpu_direct_delta = (
                 manifest.get("delta_transport")
                 == "NCCL_P2P_GPU_DIRECT_PERSISTENT"
@@ -1764,6 +1779,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
 
                     layer_trace_hook = None
                     if _gpu_direct_layer_diagnostics_enabled(receiver):
+
                         def layer_trace_hook(operation: str, layer_name: str) -> None:
                             _write_gpu_direct_rank_diagnostic(
                                 self.manifest_path,
@@ -1850,9 +1866,11 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             buffered_completed_unix_s = previous_initial_receipt.get(
                 "buffered_completed_unix_s"
             )
-            if buffered_completed_unix_s is None and previous_initial_receipt.get(
-                "status"
-            ) == "INITIAL_HISTORY_GPU_BUFFERED":
+            if (
+                buffered_completed_unix_s is None
+                and previous_initial_receipt.get("status")
+                == "INITIAL_HISTORY_GPU_BUFFERED"
+            ):
                 buffered_completed_unix_s = previous_initial_receipt.get(
                     "completed_unix_s"
                 )
@@ -1913,7 +1931,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     / "initial_stage_receipts"
                     / f"tp_rank_{tp_rank}.json",
                 )
-            rolling = (self.manifest_path.parent / 'rolling_reservation.json').is_file()
+            rolling = (self.manifest_path.parent / "rolling_reservation.json").is_file()
             while current < request.num_computed_tokens or rolling:
                 direct_delta = None
                 if gpu_direct_delta:
@@ -2075,10 +2093,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                         request_id=request_id,
                         migration_id=request.migration_id,
                         tp_rank=tp_rank,
-                        phase=(
-                            "DELTA_APPLIED_"
-                            f"{start:012d}_{end:012d}"
-                        ),
+                        phase=(f"DELTA_APPLIED_{start:012d}_{end:012d}"),
                         device=device,
                         receiver=receiver,
                         delta_start_token=start,
@@ -2419,16 +2434,37 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:
-        del finished_req_ids
         if self._load_errors:
             request_id, error = next(iter(self._load_errors.items()))
             raise RuntimeError(
                 f"GPU-resident Shadow load failed for {request_id}: {error}"
             ) from error
         ready = self._completed_recvs - self._reported_recvs
+        self._reported_recvs.update(ready)
+        # request_finished() is a scheduler hook. GPU receiver resources and
+        # copy events live in worker processes, whose completion hook is here.
+        self._finished_worker_requests.update(
+            finished_req_ids & self._load_threads.keys()
+        )
+        for request_id in tuple(self._finished_worker_requests):
+            thread = self._load_threads.get(request_id)
+            if thread is not None and thread.is_alive():
+                continue
+            self._release_persistent_payload_buffer(request_id)
+            self._load_threads.pop(request_id, None)
+            with self._gpu_kv_lock:
+                self._copy_done_events.pop(request_id, None)
+                self._model_wait_streams = {
+                    row for row in self._model_wait_streams if row[0] != request_id
+                }
+                self._model_wait_pending_requests.discard(request_id)
+            with self._gpu_restore_quiescence_lock:
+                self._gpu_restore_quiescence.pop(request_id, None)
+            self._completed_recvs.discard(request_id)
+            self._reported_recvs.discard(request_id)
+            self._finished_worker_requests.discard(request_id)
         if not ready:
             return None, None
-        self._reported_recvs.update(ready)
         return None, set(ready)
 
     def request_finished(
@@ -2443,9 +2479,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             path = self.takeover_control_path.resolve()
             if path.is_file():
                 state = _load_json(path)
-                expected = (
-                    f"cmpl-bridgetp-phase9-target-{path.parent.name}-0-"
-                )
+                expected = f"cmpl-bridgetp-phase9-target-{path.parent.name}-0-"
                 if (
                     state.get("state") == "CANCELLED"
                     and request_id.startswith(expected)
@@ -2486,15 +2520,13 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 continue
             cutover_path = self.manifest_path.parent / "cutover_manifest.json"
             if not cutover_path.is_file():
-                cleanup_path = (
-                    self.manifest_path.parent / "target_cleanup_receipt.json"
-                )
+                cleanup_path = self.manifest_path.parent / "target_cleanup_receipt.json"
                 if cleanup_path.is_file():
                     continue
                 raise FileNotFoundError("Shadow receive finished without cutover")
             cutover = _load_json(cutover_path)
             token_ids = list(cutover["all_known_token_ids"])
-            reservation_path = self.manifest_path.parent / 'rolling_reservation.json'
+            reservation_path = self.manifest_path.parent / "rolling_reservation.json"
             if reservation_path.is_file():
                 from vllm.bridge_tp.rolling_cutover import (
                     MECHANISM,
@@ -2502,30 +2534,35 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 )
 
                 reservation = _load_json(reservation_path)
-                if (reservation.get('mechanism') != MECHANISM
-                        or reservation.get('migration_id') != cutover['migration_id']
-                        or reservation['num_prompt_tokens']
-                        + reservation['reservation_output_tokens']
-                        != request.num_tokens):
-                    raise ValueError('rolling target reservation identity differs')
+                if (
+                    reservation.get("mechanism") != MECHANISM
+                    or reservation.get("migration_id") != cutover["migration_id"]
+                    or reservation["num_prompt_tokens"]
+                    + reservation["reservation_output_tokens"]
+                    != request.num_tokens
+                ):
+                    raise ValueError("rolling target reservation identity differs")
                 finalize_reserved_request(
-                    request, cutover, reserved_known_tokens=request.num_tokens,
-                    total_output_budget=reservation['total_output_budget'],
+                    request,
+                    cutover,
+                    reserved_known_tokens=request.num_tokens,
+                    total_output_budget=reservation["total_output_budget"],
                 )
                 _atomic_json_dump(
                     {
-                        'format_version': 1, 'mechanism': MECHANISM,
-                        'migration_id': cutover['migration_id'],
-                        'target_request_id': request_id,
-                        'cutover_output_tokens': cutover['cutover_num_output_tokens'],
-                        'reserved_known_tokens': reservation['num_prompt_tokens']
-                        + reservation['reservation_output_tokens'],
-                        'num_tokens': request.num_tokens,
-                        'num_computed_tokens': request.num_computed_tokens,
-                        'max_tokens': request.max_tokens,
-                        'completed_unix_s': time.time(),
+                        "format_version": 1,
+                        "mechanism": MECHANISM,
+                        "migration_id": cutover["migration_id"],
+                        "target_request_id": request_id,
+                        "cutover_output_tokens": cutover["cutover_num_output_tokens"],
+                        "reserved_known_tokens": reservation["num_prompt_tokens"]
+                        + reservation["reservation_output_tokens"],
+                        "num_tokens": request.num_tokens,
+                        "num_computed_tokens": request.num_computed_tokens,
+                        "max_tokens": request.max_tokens,
+                        "completed_unix_s": time.time(),
                     },
-                    self.manifest_path.parent / 'rolling_target_finalized.json',
+                    self.manifest_path.parent / "rolling_target_finalized.json",
                 )
             elif len(token_ids) != request.num_tokens:
                 raise ValueError("Final Shadow token count differs from reservation")
@@ -2596,9 +2633,9 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
 
     def _release_persistent_payload_buffer(self, request_id: str) -> None:
         """Release request-scoped packed KV storage after request completion."""
-        if not (
-            self.persistent_channel and self.release_persistent_payload_buffer
-        ):
+        if not (self.persistent_channel and self.release_persistent_payload_buffer):
+            return
+        if request_id != self._claimed_target_request_id:
             return
         with self._persistent_gpu_receiver_lock:
             receiver = self._persistent_gpu_receiver
@@ -2627,6 +2664,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 # cache.  This field makes that distinction explicit.
                 "cuda_memory_reserved_before_bytes": reserved_before,
                 "cuda_memory_reserved_after_bytes": reserved_after,
+                "channel_runtime": receiver_snapshot(self),
                 "completed_unix_s": time.time(),
             },
             self.manifest_path.parent

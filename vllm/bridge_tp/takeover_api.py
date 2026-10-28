@@ -474,6 +474,8 @@ async def retire_diagnostic_channel(raw_request: Request) -> dict[str, Any]:
             "bridge_tp_retire_diagnostic_channel", timeout=60.0
         )
     expected = 1 if role == "source" else session_target_tp(Path(root))
+    if any(r.get("status") == "REJECTED" for r in results):
+        raise HTTPException(status_code=409, detail=dict(role=role, ranks=results))
     if len(results) != expected or any(
         r.get("status") != "RETIRED" or not r.get("identity_unchanged") for r in results
     ):
