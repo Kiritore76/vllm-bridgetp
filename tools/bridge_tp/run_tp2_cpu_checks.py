@@ -20,6 +20,8 @@ TESTS = [
     "4090d_qwen3",
     "qwen3_recipe_pilot",
     "qwen3_formal16k",
+    "qwen3_retraining",
+    "predictor_training_mix",
     "predictor_capture",
     "predictor_layer_probe",
     "predictor_formal_corpus",

@@ -8,12 +8,12 @@ from predictor_distribution import category_targets, request_weights
 
 def mixed_training_weights(
     data: dict,
-    legacy_ids: set[str],
+    legacy_ids: set[str] | None,
     *,
     legacy_mass: float = 0.25,
     prefill_mass: float = 0.0,
 ) -> tuple[np.ndarray, dict]:
-    """Balance legacy/new requests with configurable mass; stages get 30/40/30.
+    """Balance source cohorts and stages; None selects one request-equal cohort.
 
     Each request has equal mass within its source cohort. Exact requests use
     actual generation progress: early <25%, middle 25-75%, late >=75%.
@@ -38,10 +38,15 @@ def mixed_training_weights(
         raise ValueError("prefill weighting requires one phase per sample")
     if prefill_mass:
         phases = np.asarray(phases)
-    cohorts = {
-        "legacy5000": train & np.isin(ids, sorted(legacy_ids)),
-        "new300_and_first60": train & ~np.isin(ids, sorted(legacy_ids)),
-    }
+    cohorts = (
+        {"all_requests": train}
+        if legacy_ids is None
+        else {
+            "legacy5000": train & np.isin(ids, sorted(legacy_ids)),
+            "new300_and_first60": train & ~np.isin(ids, sorted(legacy_ids)),
+        }
+    )
+    cohort_masses = (1.0,) if legacy_ids is None else (legacy_mass, 1 - legacy_mass)
     total = data["generated"] + data["remaining"]
     fraction = np.divide(
         data["generated"], total, out=np.zeros(len(total)), where=total > 0
@@ -52,7 +57,7 @@ def mixed_training_weights(
     for index in np.flatnonzero(train):
         by_id.setdefault(str(ids[index]), []).append(index)
     report = {}
-    for (name, mask), mass in zip(cohorts.items(), (legacy_mass, 1 - legacy_mass)):
+    for (name, mask), mass in zip(cohorts.items(), cohort_masses):
         members = sorted(set(ids[mask]))
         if not members:
             raise ValueError(f"empty training cohort: {name}")

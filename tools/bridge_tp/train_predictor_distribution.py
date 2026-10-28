@@ -20,6 +20,7 @@ from predictor_distribution import (
     category_targets,
     default_upper_edges,
     distribution_nll,
+    finite_bucket_midpoint_mean,
     km_conditional_survival,
     nonuniform8k62_upper_edges,
     nonuniform16k91_upper_edges,
@@ -121,6 +122,7 @@ def fit_distribution(
     balanced_validation_ids: dict[str, set[str]] | None = None,
     reference_checkpoint: Path | None = None,
     reference_sha256: str | None = None,
+    request_weighting: str = "uniform",
 ) -> dict:
     """Fit on train, select on one validation half, calibrate on the other."""
     import torch
@@ -144,6 +146,7 @@ def fit_distribution(
         or not math.isfinite(head_learning_rate)
         or head_learning_rate <= 0
         or network_depth not in (2, 4)
+        or request_weighting not in ("uniform", "prefill20_stage304030")
     ):
         raise ValueError("dropout must be in [0, 1); weight decay must be nonnegative")
     finite_maximum = {"nonuniform16k91": 16384, "nonuniform8k62": 8192}.get(
@@ -159,6 +162,14 @@ def fit_distribution(
                 "finite-support filtering requires unweighted raw examples"
             )
         data, support_selection = finite_support_examples(data, finite_maximum)
+    if request_weighting == "prefill20_stage304030":
+        if training_weights is not None or weighting_provenance is not None:
+            raise ValueError("stage profile cannot replace explicit training weights")
+        from predictor_training_mix import mixed_training_weights
+
+        training_weights, weighting_provenance = mixed_training_weights(
+            data, None, prefill_mass=0.2
+        )
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     device = torch.device(device_name)
@@ -433,6 +444,13 @@ def fit_distribution(
                     "position_log_scale": position_scale,
                     "category_upper_edges": torch.from_numpy(edges),
                     "overflow_category": overflow_category,
+                    "training_weighting": weighting_provenance
+                    or {"rule": "request equal"},
+                    "point_estimator": (
+                        "probability_weighted_integer_bucket_midpoint_mean"
+                        if not overflow_category
+                        else "requires_explicit_tail_contract"
+                    ),
                     "support_scope": "unbounded_with_open_tail"
                     if overflow_category
                     else "natural_eos_within_finite_support",
@@ -477,6 +495,11 @@ def fit_distribution(
     all_logits = logits_for(np.ones(len(features), dtype=bool))
     calibrated_p = softmax(all_logits, temperature)
     raw_p = softmax(all_logits)
+    mean_points = (
+        finite_bucket_midpoint_mean(calibrated_p, edges)
+        if not overflow_category
+        else None
+    )
     horizons = [
         int(h)
         for h in (
@@ -529,6 +552,21 @@ def fit_distribution(
             }
         return result
 
+    def point_report(mask):
+        if mean_points is None:
+            return None
+        error = mean_points[mask] - data["remaining"][mask]
+        weights = request_weights(data["requests"][mask])
+        absolute = np.abs(error)
+        return {
+            "mae": float(weights @ absolute),
+            "rmse": float(np.sqrt(weights @ (error**2))),
+            "bias": float(weights @ error),
+            "within_128": float(weights @ (absolute <= 128)),
+            "within_256": float(weights @ (absolute <= 256)),
+            "within_512": float(weights @ (absolute <= 512)),
+        }
+
     results = {}
     groups = {
         "train_exact": exact_train,
@@ -565,6 +603,7 @@ def fit_distribution(
                 data["requests"][mask],
             ),
             "risk_by_horizon_tokens": risk_report(mask),
+            "bucket_mean_point_metrics": point_report(mask),
         }
         if validation_cohorts and name in (
             "selection_validation",
@@ -731,6 +770,7 @@ def fit_distribution(
             "weight_decay": weight_decay,
             "parameter_count": sum(p.numel() for p in model.parameters()),
             "bucket_profile": bucket_profile,
+            "request_weighting": request_weighting,
             "head_warmup_epochs": head_warmup_epochs,
             "head_learning_rate": head_learning_rate,
         },
@@ -739,6 +779,7 @@ def fit_distribution(
         "overflow_category": overflow_category,
         "open_tail_lower_inclusive": int(edges[-1]) + 1 if overflow_category else None,
         "support_scope": checkpoint["support_scope"],
+        "point_estimator": checkpoint["point_estimator"],
         "support_selection": support_selection,
         "bucket_support": {
             name: {
@@ -815,6 +856,10 @@ def fit_distribution(
         splits=data["splits"],
         phases=data["phases"],
         languages=data["languages"],
+        bucket_mean_remaining_tokens=mean_points
+        if mean_points is not None
+        else np.array([]),
+        training_loss_weights=weight,
     )
     print(
         json.dumps(
@@ -877,6 +922,11 @@ def main() -> None:
     parser.add_argument("--head-learning-rate", type=float, default=0.0003)
 
     parser.add_argument("--expected-feature-layer", default="final")
+    parser.add_argument(
+        "--request-weighting",
+        choices=("uniform", "prefill20_stage304030"),
+        default="uniform",
+    )
     args = parser.parse_args()
     if (
         min(
@@ -1084,6 +1134,7 @@ def main() -> None:
         bucket_profile=args.bucket_profile,
         head_warmup_epochs=args.head_warmup_epochs,
         head_learning_rate=args.head_learning_rate,
+        request_weighting=args.request_weighting,
     )
 
 

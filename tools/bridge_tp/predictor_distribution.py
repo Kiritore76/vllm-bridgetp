@@ -54,6 +54,23 @@ def nonuniform8k62_upper_edges() -> np.ndarray:
     return np.concatenate((short[short <= 4096], np.array([5120, 6144, 8192])))
 
 
+def finite_bucket_midpoint_mean(probabilities: np.ndarray, edges: np.ndarray):
+    """Decode a finite head with the historical probability-weighted midpoint."""
+    validate_edges(edges)
+    p = np.asarray(probabilities, dtype=np.float64)
+    if (
+        p.shape[-1] != len(edges)
+        or not np.isfinite(p).all()
+        or (p < 0).any()
+        or not np.allclose(p.sum(axis=-1), 1, atol=1e-5)
+    ):
+        raise ValueError(
+            "finite mean requires normalized finite category probabilities"
+        )
+    midpoints = (np.r_[0, edges[:-1] + 1] + edges) / 2
+    return p @ midpoints
+
+
 def aggregate_probabilities(
     probabilities: np.ndarray,
     source_edges: np.ndarray,
