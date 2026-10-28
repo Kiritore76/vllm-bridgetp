@@ -634,6 +634,13 @@ def parse_args(argv=None) -> argparse.Namespace:
 def main(argv=None) -> None:
     args = parse_args(argv)
     args.run_dir.mkdir(parents=True, exist_ok=True)
+    from vllm.bridge_tp.experiment_timeline import emit_event
+
+    _atomic_json_dump(
+        dict(status="STAGER_PROCESS_READY", pid=os.getpid(), unix_s=time.time()),
+        args.run_dir / "stager_process_ready.json",
+    )
+    emit_event(args.run_dir, "cpu_stager", "STAGER_PROCESS_READY")
     deadline = time.monotonic() + args.timeout_s
     cleanup_path = args.run_dir / "cleanup_request.json"
     manifest_path = args.run_dir / "session_manifest.json"
@@ -675,15 +682,15 @@ def main(argv=None) -> None:
     # the source publishes the irreversible cutover boundary.  This also lets
     # a pre-cutover cleanup finish immediately without waiting for socket
     # timeouts from history publishers that correctly never started.
-    if manifest.get("shadow_strategy", "S_NEW_OLD") == "S_NEW":
-        if not _wait_for_path(cutover_path, cleanup_path, deadline):
-            delta_receivers.close()
-            request = _load_json(cleanup_path)
-            delta_count = sum(len(value) for value in delta_receivers.by_rank)
-            for value in delta_receivers.by_rank:
-                value.clear()
-            _cleanup(args.run_dir, str(request.get("reason")), 0, delta_count)
-            return
+    if (manifest.get("shadow_strategy", "S_NEW_OLD") == "S_NEW"
+            and not _wait_for_path(cutover_path, cleanup_path, deadline)):
+        delta_receivers.close()
+        request = _load_json(cleanup_path)
+        delta_count = sum(len(value) for value in delta_receivers.by_rank)
+        for value in delta_receivers.by_rank:
+            value.clear()
+        _cleanup(args.run_dir, str(request.get("reason")), 0, delta_count)
+        return
 
     if gpu_direct_history:
         # TP4 workers receive historical tensors directly from TP1.  The CPU
@@ -724,6 +731,7 @@ def main(argv=None) -> None:
         _cleanup(args.run_dir, str(request.get("reason")), target_tp, delta_count)
         return
     cutover = _load_json(cutover_path)
+    emit_event(args.run_dir, "cpu_stager", "STAGER_CUTOVER_OBSERVED")
     delta_receivers.close()
 
     if args.gpu_resident_shadow:
@@ -780,6 +788,7 @@ def main(argv=None) -> None:
             "ranks": ranks,
         }
         _atomic_json_dump(staging_manifest, args.run_dir / "staging_manifest.json")
+        emit_event(args.run_dir, "cpu_stager", "STAGER_MANIFEST_PUBLISHED")
         for rank, record in enumerate(ranks):
             watermark_path = (
                 args.run_dir / "gpu_watermarks" / f"tp_rank_{rank}.json"

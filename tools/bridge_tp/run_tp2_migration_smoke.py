@@ -7,6 +7,7 @@ It is not evidence of a natural pressure trigger or migration benefit.
 """
 
 import argparse
+import contextlib
 import json
 import math
 import subprocess
@@ -62,12 +63,16 @@ def main(argv=None):
     parser.add_argument("--predictor-checkpoint", type=Path)
     parser.add_argument("--natural-probe", action="store_true")
     parser.add_argument("--target-background", type=int, choices=(0, 2, 4), default=0)
+    parser.add_argument("--diagnostic-probe", action="store_true")
     args = parser.parse_args(argv)
     if not math.isfinite(args.timeout_s) or args.timeout_s <= 0:
         raise ValueError("finite positive timeout required")
-    if (args.predictor_checkpoint or args.natural_probe or args.target_background) and (
-        args.platform != "qwen3" or not args.predictor_checkpoint
-    ):
+    if (
+        args.predictor_checkpoint
+        or args.natural_probe
+        or args.target_background
+        or args.diagnostic_probe
+    ) and (args.platform != "qwen3" or not args.predictor_checkpoint):
         raise ValueError("loaded/live validation requires Qwen3 and its checkpoint")
     if args.validate_only:
         print(
@@ -188,6 +193,7 @@ def main(argv=None):
     first_idle_observed = None
     last_telemetry = 0.0
     telemetry = Audit(directory / "loaded_telemetry.jsonl")
+    monitor = None
     try:
         for role in ("target", "source"):
             process = common.start_process(
@@ -199,6 +205,30 @@ def main(argv=None):
             processes.append(process)
             common.wait_healthy(
                 plan["config"][role + "_url"], process, spec["startup_timeout_s"]
+            )
+        if args.diagnostic_probe:
+            registry = args.out_root / "diagnostic_processes.json"
+            common.write_json(
+                registry, [dict(pid=p.process.pid, name=p.name) for p in processes]
+            )
+            monitor = common.start_process(
+                "diagnostic monitor",
+                [
+                    sys.executable,
+                    "-B",
+                    str(ROOT / "tools/bridge_tp/monitor_pressure_host.py"),
+                    "--output",
+                    str(args.out_root / "host_monitor.jsonl"),
+                    "--stop-file",
+                    str(args.out_root / "monitor.stop"),
+                    "--process-file",
+                    str(registry),
+                    "--gpu-processes",
+                    "--gpu-interval-s",
+                    "2",
+                ],
+                plan["source_env"],
+                args.out_root / "monitor.log",
             )
         for role in ("source", "target"):
             io.post_streaming_completion(
@@ -221,6 +251,25 @@ def main(argv=None):
                 args.out_root / "stager.log",
             )
         )
+        if args.platform == "qwen3":
+            from tools.bridge_tp.qwen3_migration_diagnostics import wait_stager_ready
+
+            wait_stager_ready(directory, processes[-1])
+        if args.diagnostic_probe:
+            from tools.bridge_tp.qwen3_migration_diagnostics import control_batch
+
+            common.write_json(
+                registry, [dict(pid=p.process.pid, name=p.name) for p in processes]
+            )
+            control_batch(
+                io,
+                config.target_url,
+                inputs,
+                directory,
+                pool,
+                args.target_background + 1,
+                "before",
+            )
         native = wait_empty(directory)
         common.write_json(args.out_root / "native_initial_receipt.json", native)
         config.tp1_total_kv_blocks = native[0]["total_blocks"]
@@ -397,6 +446,17 @@ def main(argv=None):
             common.write_json(directory / f"background-{index}-result.json", response)
         wait_empty(directory, after_generations=[r["generation"] for r in native])
         full_speed = pilot.verify_full_speed(directory)
+        if args.diagnostic_probe:
+            control_batch(
+                io,
+                config.target_url,
+                inputs,
+                directory,
+                pool,
+                args.target_background + 1,
+                "after",
+            )
+            wait_empty(directory)
         seams = [
             b["unix_s"] - a["unix_s"]
             for a, b in zip(emissions, emissions[1:])
@@ -452,8 +512,16 @@ def main(argv=None):
         if driver:
             driver.adapter.close()
         common.stop_processes(processes)
+        if monitor is not None:
+            (args.out_root / "monitor.stop").touch()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                monitor.process.wait(timeout=10)
+            common.stop_processes([monitor])
         pool.shutdown(wait=True, cancel_futures=False)
-        ended = not any(common.process_group_alive(p) for p in processes)
+        ended = not any(
+            common.process_group_alive(p)
+            for p in processes + ([monitor] if monitor else [])
+        )
         if not ended:
             result["status"], code = "TECHNICAL_FAILURE", 1
         result.update(runner_code=code, all_owned_groups_ended=ended)

@@ -147,12 +147,8 @@ def _gpu_direct_layer_diagnostics_enabled(receiver: Any | None) -> bool:
     """Enable per-layer markers only for a selected persistent session range."""
     if not _gpu_direct_diagnostics_enabled():
         return False
-    if os.environ.get("BRIDGETP_GPU_DIRECT_LAYER_DIAGNOSTICS", "").strip().lower() not in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
+    flag = os.environ.get("BRIDGETP_GPU_DIRECT_LAYER_DIAGNOSTICS", "").strip().lower()
+    if flag not in {"1", "true", "yes", "on"}:
         return False
     try:
         minimum_session = int(
@@ -746,7 +742,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             "Target block allocation differs from live snapshot",
         )
         self._claimed_target_request_id = request.request_id
-        setattr(request, "_bridgetp_target_block_ids", block_ids)
+        request._bridgetp_target_block_ids = block_ids
         self._pending_requests[request.request_id] = request
         self._active_requests[request.request_id] = request
 
@@ -1562,6 +1558,8 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         return destination
 
     def _live_gpu_load(self, request: BridgeTPStreamRequest) -> None:
+        from vllm.bridge_tp.experiment_timeline import emit_event
+
         request_id = request.target_request_id
         session_request_id = _persistent_session_request_id(request)
         diagnostic_phase = "ENTER"
@@ -1636,7 +1634,10 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     # terminated without publishing a listener, create the
                     # normal live receiver as a fallback.
                     prebind_thread = self._prebind_receiver_thread
-                    if prebind_thread is not None and not self._prebind_receiver_ready.is_set():
+                    if (
+                        prebind_thread is not None
+                        and not self._prebind_receiver_ready.is_set()
+                    ):
                         self._prebind_receiver_ready.wait(
                             timeout=self.socket_timeout_s
                         )
@@ -2097,6 +2098,14 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 if terminal is not None:
                     raise RuntimeError("GPU-direct delta stream has trailing data")
             cutover_path = self.manifest_path.parent / "cutover_manifest.json"
+            emit_event(
+                self.manifest_path.parent,
+                "target_connector",
+                "TARGET_DELTA_STREAM_ENDED",
+                request_id=request_id,
+                migration_id=request.migration_id,
+                tp_rank=tp_rank,
+            )
             self._wait_for_file(cutover_path, deadline)
             cutover = _load_json(cutover_path)
             if int(cutover["num_computed_tokens"]) != current:
@@ -2130,7 +2139,23 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             )
             if gpu_direct:
                 staging_path = self.manifest_path.parent / "staging_manifest.json"
+                emit_event(
+                    self.manifest_path.parent,
+                    "target_connector",
+                    "TARGET_STAGING_WAIT_BEGIN",
+                    request_id=request_id,
+                    migration_id=request.migration_id,
+                    tp_rank=tp_rank,
+                )
                 self._wait_for_file(staging_path, deadline)
+                emit_event(
+                    self.manifest_path.parent,
+                    "target_connector",
+                    "TARGET_STAGING_WAIT_END",
+                    request_id=request_id,
+                    migration_id=request.migration_id,
+                    tp_rank=tp_rank,
+                )
                 staging = _load_json(staging_path)
                 terminal_record = staging["ranks"][tp_rank]
                 aggregate_bytes = int(terminal_record["payload_bytes"])

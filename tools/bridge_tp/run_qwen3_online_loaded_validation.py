@@ -29,10 +29,24 @@ from tools.bridge_tp.run_qwen3_scheduler_supplement import (  # noqa: E402
 from tools.bridge_tp.run_tp2_migration_smoke import main as migration_main  # noqa: E402
 
 
-def stages():
+class PerformanceFailure(RuntimeError):
+    """Mechanism completed, but the required output SLO did not pass."""
+
+
+def stages(diagnostic=False):
     return [
-        dict(name="live-natural-and-loaded2", background=2, history=128, probe=True),
-        dict(name="loaded4-history2048", background=4, history=2048, probe=False),
+        dict(
+            name="diagnostic-loaded2" if diagnostic else "live-natural-and-loaded2",
+            background=2,
+            history=128,
+            probe=not diagnostic,
+        ),
+        dict(
+            name="diagnostic-loaded4" if diagnostic else "loaded4-history2048",
+            background=4,
+            history=2048,
+            probe=False,
+        ),
     ]
 
 
@@ -58,11 +72,13 @@ def child_arguments(args, stage):
         "--timeout-s",
         "1200",
     ]
+    if getattr(args, "diagnostic_probe", False):
+        return argv + ["--diagnostic-probe"]
     return argv + ["--natural-probe"] if stage["probe"] else argv
 
 
 def execute(args, ledger):
-    for stage in stages():
+    for stage in stages(getattr(args, "diagnostic_probe", False)):
         if not gpu_idle():
             raise RuntimeError("GPUs busy; do not stop unrelated processes")
         row = dict(name=stage["name"], status="STARTED")
@@ -89,7 +105,7 @@ def execute(args, ledger):
                 or result.get("target_background_requests") != stage["background"]
             ):
                 raise ValueError("predictor/background identity differs")
-            if stage["probe"]:
+            if stage["probe"] and not getattr(args, "diagnostic_probe", False):
                 probe = read(
                     directory / "mechanism/controller/online_predictor_receipt.json"
                 )
@@ -97,10 +113,34 @@ def execute(args, ledger):
                     raise ValueError("live predictor receipt missing")
             if not gpu_idle():
                 raise RuntimeError("GPU cleanup incomplete")
-            row.update(status="COMPLETED", measurement=result)
-        except BaseException:
+            if getattr(args, "diagnostic_probe", False):
+                from tools.bridge_tp.monitor_pressure_host import validate_journal
+
+                write(
+                    directory / "monitor_acceptance.json",
+                    validate_journal(directory / "host_monitor.jsonl"),
+                )
+            from tools.bridge_tp.qwen3_migration_diagnostics import performance_report
+
+            performance = performance_report(directory, result)
+            row.update(
+                status="COMPLETED" if performance["passed"] else "PERFORMANCE_FAILURE",
+                measurement=result,
+                performance=performance,
+            )
+            if not performance["passed"] and not getattr(
+                args, "diagnostic_probe", False
+            ):
+                raise PerformanceFailure("handoff or output stream SLO failed")
+        except BaseException as error:
             row["status"] = (
-                "INTERRUPTED" if sys.exc_info()[0] is KeyboardInterrupt else "FAILED"
+                "INTERRUPTED"
+                if isinstance(error, KeyboardInterrupt)
+                else (
+                    "PERFORMANCE_FAILURE"
+                    if isinstance(error, PerformanceFailure)
+                    else "FAILED"
+                )
             )
             raise
         finally:
@@ -113,16 +153,21 @@ def main(argv=None):
         parser.add_argument("--" + key, type=Path, required=True)
     parser.add_argument("--expected-revision", required=True)
     parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument("--diagnostic-probe", action="store_true")
+    parser.add_argument("--prior-online", type=Path)
     args = parser.parse_args(argv)
+    if args.diagnostic_probe and args.prior_online is None:
+        parser.error("diagnostics require the previous online validation directory")
+    prior_count = 22 if args.diagnostic_probe else 20
     if args.validate_only:
         print(
             json.dumps(
                 dict(
                     status="STATIC_PLAN_ONLY",
-                    stages=stages(),
-                    prior_profile_attempts=20,
+                    stages=stages(args.diagnostic_probe),
+                    prior_profile_attempts=prior_count,
                     additional_limit=2,
-                    total_limit=22,
+                    total_limit=prior_count + 2,
                     checkpoint_sha256=CHECKPOINT_SHA,
                     automatic_policy=False,
                 ),
@@ -137,6 +182,15 @@ def main(argv=None):
     args.output.mkdir(parents=True, exist_ok=False)
     ledger, result, code = [], dict(status="TECHNICAL_FAILURE"), 1
     try:
+        if args.diagnostic_probe:
+            online = read(args.prior_online / "result.json")
+            if (
+                online.get("total_profile_attempts") != 22
+                or len(online.get("stages", [])) != 2
+            ):
+                raise ValueError("requires the audited two-stage online result")
+            for previous in stages():
+                verify_migration(args.prior_online / previous["name"])
         prior = read(args.prior_supplement / "result.json")
         prior_identity = read(args.prior_supplement / "identity.json")
         if (
@@ -166,17 +220,25 @@ def main(argv=None):
                 gpu=gpu,
                 versions=versions,
                 checkpoint_sha256=CHECKPOINT_SHA,
-                prior_profile_attempts=20,
+                prior_profile_attempts=prior_count,
                 maximum_new_attempts=2,
-                total_limit=22,
+                total_limit=prior_count + 2,
                 predictor_training=False,
+                diagnostic_probe=args.diagnostic_probe,
                 automatic_pressure_policy=False,
             ),
         )
         execute(args, ledger)
-        result, code = dict(status="COMPLETED"), 0
+        performance_failed = any(r["status"] == "PERFORMANCE_FAILURE" for r in ledger)
+        result, code = (
+            (dict(status="PERFORMANCE_FAILURE"), 2)
+            if performance_failed
+            else (dict(status="COMPLETED"), 0)
+        )
     except KeyboardInterrupt:
         result, code = dict(status="INTERRUPTED"), 130
+    except PerformanceFailure as error:
+        result, code = dict(status="PERFORMANCE_FAILURE", error=str(error)), 2
     except Exception as error:
         result["error"] = repr(error)
         print(f"[错误] {error!r}", flush=True)
@@ -184,9 +246,9 @@ def main(argv=None):
         result.update(
             runner_code=code,
             stages=ledger,
-            prior_profile_attempts=20,
+            prior_profile_attempts=prior_count,
             attempted_new=len(ledger),
-            total_profile_attempts=20 + len(ledger),
+            total_profile_attempts=prior_count + len(ledger),
             deployment_ready=False,
             general_guard_blocks=None,
         )

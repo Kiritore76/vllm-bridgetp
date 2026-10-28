@@ -61,7 +61,7 @@ def capture(proc_root, cgroup_root, filesystem):
     )
 
 
-def gpu_sample():
+def gpu_sample(include_processes=False):
     started = time.monotonic()
     try:
         result = subprocess.run(
@@ -75,11 +75,41 @@ def gpu_sample():
             timeout=3,
             check=True,
         )
-        return dict(
+        sample = dict(
             rows=list(csv.reader(result.stdout.splitlines())),
             error=None,
             duration_s=time.monotonic() - started,
         )
+        if include_processes:
+            processes = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-compute-apps=pid,gpu_uuid,process_name,used_gpu_memory",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            sample["compute_processes"] = list(
+                csv.reader(processes.stdout.splitlines())
+            )
+            sample["process_query_error"] = (
+                processes.stderr if processes.returncode else None
+            )
+            clocks = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,clocks.sm,clocks.mem,pstate,power.limit",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            sample["clocks_and_limits"] = list(csv.reader(clocks.stdout.splitlines()))
+            sample["clock_query_error"] = clocks.stderr if clocks.returncode else None
+        return sample
     except (OSError, subprocess.SubprocessError) as error:
         return dict(rows=None, error=repr(error), duration_s=time.monotonic() - started)
 
@@ -155,6 +185,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--stop-file", type=Path, required=True)
     parser.add_argument("--process-file", type=Path)
+    parser.add_argument("--gpu-processes", action="store_true")
+    parser.add_argument("--gpu-interval-s", type=int, choices=(2, 10), default=10)
     args = parser.parse_args()
     if os.name != "posix":
         raise RuntimeError("Linux monitor required")
@@ -182,7 +214,7 @@ def main():
                 schema="PRESSURE_HOST_MONITOR_V1",
                 kind="monitor_header",
                 host_interval_s=2,
-                gpu_interval_s=10,
+                gpu_interval_s=args.gpu_interval_s,
                 pid=os.getpid(),
             )
         )
@@ -199,8 +231,8 @@ def main():
                     sample_gap_s=stamp - last if last is not None else 0,
                 )
                 last = stamp
-                if stamp - last_gpu >= 10:
-                    row["gpu"] = gpu_sample()
+                if stamp - last_gpu >= args.gpu_interval_s:
+                    row["gpu"] = gpu_sample(args.gpu_processes)
                     last_gpu = stamp
                 write(row)
                 samples += 1
