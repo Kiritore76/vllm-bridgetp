@@ -60,7 +60,7 @@
     "tools/bridge_tp/inspect_stream_run.py": "14c293fde1c4c59f96e3efccf53f1c7135f143ddb3f6f8f501abc13daa32a369",
     "tools/bridge_tp/inspect_takeover_run.py": "2dd402d3af6c0e97369188be223efeb2cb771a42635b7314caf9fde978eac3dc",
     "tools/bridge_tp/isolated_collector.py": "8f889d05b722b62f060f55726f461b3b388f3c743eff36511210b257ddf42e8b",
-    "tools/bridge_tp/launch_pressure_balanced_pilot.py": "a7efd096742bee668af20d69f88858d5de4e6bb223bc4623f43b27d52b2c885b",
+    "tools/bridge_tp/launch_pressure_balanced_pilot.py": "43cc2fe4126915ad733203d0598c382540b2ac3825671fd22937436e117a8318",
     "tools/bridge_tp/measure_agreement.py": "f4c11d8ebdb440054abf466d9fbaa397b51e8a03752f2dd046f7452f98647096",
     "tools/bridge_tp/output_quality.py": "e15ad4eb3dcb41917b402efd65ab1a7eee2e5d85f4d03cb57570ed60db4c7ec5",
     "tools/bridge_tp/phase8_stager.py": "5048849ff8c36d6635a1574202fe7d3125c59c5869a99534ecde2b0ff9fb8372",
@@ -269,8 +269,8 @@
     "vllm/bridge_tp/controller/pressure_io.py": "3ec692213318f43d842a7925af0bf34fc1300c5448febaba2dd07b4bcd1a65d9",
     "experiments/phase9/pressure_balanced_v2/HEALTH_SUSTAINED.md": "42afaa2569c11e2e16752c7dba1fae95ead2fe0cb0b9a2888d734fa7a6482f64",
     "experiments/phase9/pressure_balanced_v2/health_sustained.json": "a684253451ceb1d33331afd852beeea4dbc9f725c4fa70d53cc19b28bac1eb5f",
-    "tools/bridge_tp/pressure_sessions.py": "c8794b3a8a992bd0257d0885f22cb4fc4abf60f0b42a24e4b9c0849589413ae3",
-    "tests/bridge_tp/test_pressure_sessions.py": "01c9c3875318a43d6050b2c2ece3ec37639a3222653053089ff0eea3ff763135",
+    "tools/bridge_tp/pressure_sessions.py": "68efce3171bb1814d5fd902316d89cd05d3d3aa261083d5f803c7de4fe88d203",
+    "tests/bridge_tp/test_pressure_sessions.py": "a70d7f53a86ed1de1d5e95abfcacac48c03d4e65722c81babc4334caae52c86d",
     "experiments/phase9/pressure_balanced_v2/EVALUATION_STANDARD_CN.md": "fedf01ecfabb244f2c198cf0c4763a63741061c2323ee3888f2c0c837ee3cad8",
     "experiments/phase9/pressure_balanced_v2/PARAMETER_STATUS_CN.md": "8283c9dd80b5545295dfa91a2cd7660a91c18a761f470d34e9ade0dd5328f0ce",
     "vllm/bridge_tp/controller/pressure_cancel.py": "4e49b50be7d8ff57feec753fc8942cd158ebdb1d2b7f4b713ddcbd5b5abc5e19",
@@ -358,8 +358,9 @@
     "experiments/platforms/qwen3_pressure_observation/scope.json": "7cf1845a67e01054df5011088174b4c30e4ba0b36f3c01d08d151e7e3c24dca8",
     "experiments/platforms/qwen3_pressure_observation/service_evidence.json": "513028147a78f7342556584396ff6e2ec574c8c9caf906e86efabfcfc0a4cdba",
     "tools/bridge_tp/qwen3_stay_migrate.py": "a18219546bc8492c89943905b600ced54f99f06e49eb13712932871e7232fee1",
-    "tools/bridge_tp/run_qwen3_stay_migrate.py": "bc21cbef641c13c5cfb2a1ed1639ceb3121271005a9a97676345765ff5765f58",
-    "tests/bridge_tp/test_qwen3_stay_migrate.py": "725ef0959b991c7c1001fb2d3277c009289b19be758e3b4ea0a9fff1f8a5026f"
+    "tools/bridge_tp/run_qwen3_stay_migrate.py": "93d08b4a530ca2f8a41dd201f9810621f07f1bfc24421f9933f7546f5c69d1dd",
+    "tests/bridge_tp/test_qwen3_stay_migrate.py": "725ef0959b991c7c1001fb2d3277c009289b19be758e3b4ea0a9fff1f8a5026f",
+    "tests/bridge_tp/test_pressure_launcher.py": "44f50ec2554a5d3196a92411ee807336392063e70c81d86e3991d86dd4541b32"
   },
   "server_settings": {
     "dtype": "bfloat16",

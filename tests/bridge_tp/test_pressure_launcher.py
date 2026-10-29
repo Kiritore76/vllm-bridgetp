@@ -16,6 +16,23 @@ from tools.bridge_tp import launch_pressure_balanced_pilot as launch
 ROOT = Path(__file__).resolve().parents[2]
 
 
+class TimingFailureTests(unittest.TestCase):
+    def test_missing_timing_preserves_startup_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "not_created.jsonl"
+            self.assertEqual(
+                launch.timing_receipt(missing, True)["status"],
+                "UNAVAILABLE_AFTER_SCENE_FAILURE",
+            )
+
+    def test_missing_timing_is_still_an_error_after_success(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            self.assertRaises(FileNotFoundError),
+        ):
+            launch.timing_receipt(Path(tmp) / "not_created.jsonl", False)
+
+
 def functions(path, names, context):
     tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
     selected = [

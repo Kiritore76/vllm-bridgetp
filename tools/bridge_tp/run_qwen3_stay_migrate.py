@@ -4,6 +4,7 @@
 import argparse
 import json
 import sys
+import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -325,6 +326,9 @@ def main(argv=None):
         result, code = dict(status="INTERRUPTED"), 130
     except Exception as error:
         result["error"] = repr(error)
+        (args.output / "failure_traceback.txt").write_text(
+            traceback.format_exc(), encoding="utf-8"
+        )
         print(f"[错误] {error!r}", flush=True)
     finally:
         if ledger and ledger[-1]["status"] == "STARTED":

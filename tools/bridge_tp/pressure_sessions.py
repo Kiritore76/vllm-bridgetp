@@ -9,7 +9,10 @@ import sys
 import time
 from pathlib import Path
 
-from tools.bridge_tp.pressure_cpu import load
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from tools.bridge_tp.pressure_cpu import load  # noqa: E402
 
 
 def publish_active(root, directory):
@@ -194,5 +197,4 @@ def follow_stager(argv, run=None):
 
 
 if __name__ == "__main__":
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     follow_stager(sys.argv[1:])

@@ -4,6 +4,8 @@
 import ast
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from concurrent.futures import Future
@@ -32,6 +34,25 @@ def actual_function(path, name, context):
 
 
 class RepeatedSessions(unittest.TestCase):
+    def test_direct_script_bootstrap_without_pythonpath_or_repo_cwd(self):
+        path = ROOT / "tools/bridge_tp/pressure_sessions.py"
+        code = (
+            "import ast; from pathlib import Path; "
+            f"p=Path({str(path)!r}); "
+            "t=ast.parse(p.read_text(encoding='utf-8')); "
+            "assert isinstance(t.body[-1],ast.If); "
+            "exec(compile(ast.Module(body=t.body[:-1],type_ignores=[]),str(p),'exec'),"
+            "{'__name__':'__main__','__file__':str(p)})"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run(
+                [sys.executable, "-I", "-B", "-c", code],
+                cwd=tmp,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[2])
         self.root = Path(self.temp.name)

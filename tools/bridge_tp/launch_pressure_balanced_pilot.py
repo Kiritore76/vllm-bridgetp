@@ -19,6 +19,7 @@ import secrets
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -454,6 +455,17 @@ def scene_result(run_dir, name):
     )
 
 
+def timing_receipt(path, scene_failed):
+    from tools.bridge_tp.pressure_cpu import load
+
+    if scene_failed and not path.exists():
+        return dict(
+            status="UNAVAILABLE_AFTER_SCENE_FAILURE",
+            reason="controller timing journal was not created",
+        )
+    return load("pause_diagnostics").verify(path)
+
+
 def run_scene(
     spec,
     scene,
@@ -534,16 +546,20 @@ def run_scene(
                 root / "host_monitor.log",
             )
             processes.append(monitor)
-        announce(scene["name"], "启动TP4服务，等待就绪")
+        target_label = f"TP{plan['config'].get('target_tp_size', 4)}"
+        announce(scene["name"], f"启动{target_label}服务，等待就绪")
         target = common.start_process(
-            "target TP4", plan["target_argv"], plan["target_env"], root / "target.log"
+            f"target {target_label}",
+            plan["target_argv"],
+            plan["target_env"],
+            root / "target.log",
         )
         processes.append(target)
         publish_processes()
         common.wait_healthy(
             plan["config"]["target_url"], target, spec["startup_timeout_s"]
         )
-        announce(scene["name"], "TP4就绪；启动TP1服务")
+        announce(scene["name"], f"{target_label}就绪；启动TP1服务")
         source = common.start_process(
             "source TP1", plan["source_argv"], plan["source_env"], root / "source.log"
         )
@@ -676,7 +692,13 @@ def run_scene(
             announce(scene["name"], "全速检查通过：历史pacing关闭，运行时限速为0")
         if before_shutdown is not None:
             before_shutdown(plan)
+    except BaseException:
+        (root / "scene_failure_traceback.txt").write_text(
+            traceback.format_exc(), encoding="utf-8"
+        )
+        raise
     finally:
+        scene_failed = sys.exc_info()[0] is not None
         if monitor:
             (root / "host_monitor.stop").touch()
             with contextlib.suppress(subprocess.TimeoutExpired):
@@ -713,7 +735,6 @@ def run_scene(
                 active.unlink()
         if monitor:
             from tools.bridge_tp.monitor_pressure_host import validate_journal
-            from tools.bridge_tp.pressure_cpu import load
 
             if monitor.process.returncode != 0:
                 raise RuntimeError("host monitor failed; preserve evidence")
@@ -721,11 +742,10 @@ def run_scene(
                 root / "host_monitor_receipt.json",
                 validate_journal(root / "host_monitor.jsonl"),
             )
+            timing_path = plan["run_dir"] / "pressure_timing.jsonl"
             common.write_json(
                 root / "pressure_timing_receipt.json",
-                load("pause_diagnostics").verify(
-                    plan["run_dir"] / "pressure_timing.jsonl"
-                ),
+                timing_receipt(timing_path, scene_failed),
             )
     return scene_result(plan["run_dir"], scene["name"])
 
