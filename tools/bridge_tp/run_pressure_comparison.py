@@ -257,7 +257,11 @@ def build_plans(spec, config, inputs, root, common, settings):
         arms = ["stay", "migrate"] if recipe["repetition"] == 1 else ["migrate", "stay"]
         if config.get("pool_comparison"):
             base = config["arms"]
-            offset = (recipe["repetition"] - 1) % len(base)
+            offset = recipe.get(
+                "arm_order_offset", (recipe["repetition"] - 1) % len(base)
+            )
+            if type(offset) is not int or not 0 <= offset < len(base):
+                raise ValueError("invalid comparison arm order offset")
             arms = base[offset:] + base[:offset]
         path = root / (recipe["name"] + "_arrivals.json")
         common.write_json(path, arrivals(inputs, recipe))

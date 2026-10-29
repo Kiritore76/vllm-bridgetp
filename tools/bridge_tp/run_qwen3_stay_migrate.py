@@ -14,6 +14,7 @@ from tools.bridge_tp import launch_pressure_balanced_pilot as pilot  # noqa: E40
 from tools.bridge_tp import qwen3_four_mode as four  # noqa: E402
 from tools.bridge_tp import qwen3_kv_guard_trial as guard_trial  # noqa: E402
 from tools.bridge_tp import qwen3_migration_matrix as matrix  # noqa: E402
+from tools.bridge_tp import qwen3_pressure_four_mode as pressure_four  # noqa: E402
 from tools.bridge_tp import qwen3_pressure_observation as observation  # noqa: E402
 from tools.bridge_tp import qwen3_resident_pressure as resident  # noqa: E402
 from tools.bridge_tp import qwen3_stay_migrate as matched  # noqa: E402
@@ -175,6 +176,7 @@ def main(argv=None):
     parser.add_argument("--migration-matrix", action="store_true")
     parser.add_argument("--kv-guard-trial", action="store_true")
     parser.add_argument("--resident-pressure", action="store_true")
+    parser.add_argument("--pressure-four-mode", action="store_true")
     parser.add_argument("--prior-comparison", type=Path)
     parser.add_argument("--complete-four-mode", type=Path)
     parser.add_argument("--validate-only", action="store_true")
@@ -182,7 +184,31 @@ def main(argv=None):
     matrix_mode = args.migration_matrix or args.kv_guard_trial or args.resident_pressure
     inherited, evaluations, missing = [], [], None
     previous_attempts = 49 if args.four_mode else 31
-    if args.resident_pressure:
+    if args.pressure_four_mode:
+        if (
+            args.four_mode
+            or matrix_mode
+            or args.complete_four_mode
+            or args.repetitions != 1
+            or args.prior_comparison is None
+        ):
+            parser.error(
+                "pressure four-mode requires one repetition and prior resident trial"
+            )
+        prior = read(args.prior_comparison / "result.json")
+        if (
+            prior.get("experiment_mode") != "resident-pressure"
+            or prior.get("status")
+            not in {"COMPLETED_RESIDENT_PRESSURE_TRIAL", "COMPLETED_WITH_COVERAGE_GAPS"}
+            or len(prior.get("runs", [])) != 8
+            or any(r["status"] != "COMPLETED" for r in prior["runs"])
+        ):
+            raise ValueError("requires all eight completed resident comparison runs")
+        args.four_mode = True
+        previous_attempts = prior["total_profile_attempts"]
+        cfg = pressure_four.config(read(args.inputs))
+        values = cfg["recipes"]
+    elif args.resident_pressure:
         if (
             args.migration_matrix
             or args.kv_guard_trial
@@ -322,7 +348,7 @@ def main(argv=None):
         hardware, versions = runtime_inventory(read(PROFILE)), runtime_versions()
         prior_identity = (
             args.prior_comparison
-            if matrix_mode
+            if matrix_mode or args.pressure_four_mode
             else args.complete_four_mode or args.prior_observation
         )
         old = read(prior_identity / "identity.json")
@@ -449,6 +475,8 @@ def main(argv=None):
                     ),
                     audit,
                 )
+                if args.pressure_four_mode:
+                    score = pressure_four.decorate(score, recipe)
                 write(plan["run_dir"].parent / "sustained_goodoutput.json", score)
                 evaluations.append(
                     dict(arm=arm, score=score, scenario=recipe["scenario"])
@@ -477,7 +505,9 @@ def main(argv=None):
                 else:
                     write(
                         args.output / "four_mode_summary.json",
-                        four.aggregate(evaluations),
+                        pressure_four.aggregate(evaluations)
+                        if args.pressure_four_mode
+                        else four.aggregate(evaluations),
                     )
                     write(
                         args.output / "four_mode_comparison.json",
@@ -534,7 +564,9 @@ def main(argv=None):
             result, code = (
                 (
                     dict(
-                        status="COMPLETED_FOUR_MODE_SUPPLEMENT"
+                        status="COMPLETED_PRESSURE_FOUR_MODE_TRIAL"
+                        if args.pressure_four_mode
+                        else "COMPLETED_FOUR_MODE_SUPPLEMENT"
                         if args.complete_four_mode
                         else "COMPLETED_FOUR_MODE_EXPERIMENT"
                     ),
@@ -582,7 +614,9 @@ def main(argv=None):
             total_profile_attempts=previous_attempts + len(ledger),
             inherited_runs=inherited,
             maximum_live_runs=run_count,
-            experiment_mode="resident-pressure"
+            experiment_mode="pressure-four-mode"
+            if args.pressure_four_mode
+            else "resident-pressure"
             if args.resident_pressure
             else "kv-guard-trial"
             if args.kv_guard_trial
