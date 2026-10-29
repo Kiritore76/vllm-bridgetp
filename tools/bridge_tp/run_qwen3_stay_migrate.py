@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT))
 
 from tools.bridge_tp import launch_pressure_balanced_pilot as pilot  # noqa: E402
 from tools.bridge_tp import qwen3_four_mode as four  # noqa: E402
+from tools.bridge_tp import qwen3_migration_matrix as matrix  # noqa: E402
 from tools.bridge_tp import qwen3_pressure_observation as observation  # noqa: E402
 from tools.bridge_tp import qwen3_stay_migrate as matched  # noqa: E402
 from tools.bridge_tp import run_pressure_comparison as comparison  # noqa: E402
@@ -169,13 +170,31 @@ def main(argv=None):
     parser.add_argument("--expected-revision", required=True)
     parser.add_argument("--repetitions", type=int, choices=(1, 2, 3), default=2)
     parser.add_argument("--four-mode", action="store_true")
+    parser.add_argument("--migration-matrix", action="store_true")
     parser.add_argument("--prior-comparison", type=Path)
     parser.add_argument("--complete-four-mode", type=Path)
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
     inherited, evaluations, missing = [], [], None
     previous_attempts = 49 if args.four_mode else 31
-    if args.complete_four_mode:
+    if args.migration_matrix:
+        if (
+            args.four_mode
+            or args.complete_four_mode
+            or args.repetitions != 3
+            or args.prior_comparison is None
+        ):
+            parser.error("matrix requires three repetitions and prior comparison only")
+        prior = read(args.prior_comparison / "result.json")
+        if prior["status"] not in {
+            "COMPLETED_FOUR_MODE_SUPPLEMENT",
+            "COMPLETED_FOUR_MODE_EXPERIMENT",
+        }:
+            raise ValueError("matrix requires completed four-mode evidence")
+        previous_attempts = prior["total_profile_attempts"]
+        cfg = matrix.config(read(args.inputs))
+        values = cfg["recipes"]
+    elif args.complete_four_mode:
         if not args.four_mode or args.repetitions != 3:
             parser.error("completion requires four-mode and three repetitions")
         cfg, inherited, evaluations, missing, previous_attempts = four.supplement(
@@ -217,15 +236,17 @@ def main(argv=None):
                     routing_weights=cfg["routing_weights"],
                     migration_execution=True,
                     maximum_migrations_per_run=0,
-                    routing_policy="original four allocation strategies"
+                    routing_policy="fixed initial pools; unchanged migration policy"
+                    if args.migration_matrix
+                    else "original four allocation strategies"
                     if args.four_mode
                     else "same original pressure policy in both arms",
                     recipes=[
                         {k: v for k, v in r.items() if k != "jobs"} for r in values
                     ],
                     output_contract=(
-                        "four-mode uses fixed outputs only"
-                        if args.four_mode
+                        "fixed-output system comparison"
+                        if args.four_mode or args.migration_matrix
                         else "identical fixed budgets in primary pairs; "
                         "additional natural-EOS pair reported separately"
                     ),
@@ -242,7 +263,11 @@ def main(argv=None):
     result, code, ledger, pairs = dict(status="TECHNICAL_FAILURE"), 1, [], []
     try:
         hardware, versions = runtime_inventory(read(PROFILE)), runtime_versions()
-        prior_identity = args.complete_four_mode or args.prior_observation
+        prior_identity = (
+            args.prior_comparison
+            if args.migration_matrix
+            else args.complete_four_mode or args.prior_observation
+        )
         old = read(prior_identity / "identity.json")
         write(
             args.output / "identity.json",
@@ -266,7 +291,7 @@ def main(argv=None):
             policy_config=str(observation.ASSETS / "policy.json"),
             service_evidence=str(observation.ASSETS / "service_evidence.json"),
             health_reference=str(observation.ASSETS / "health_reference.json"),
-            run_timeout_s=900 if args.four_mode else 600,
+            run_timeout_s=900 if args.four_mode or args.migration_matrix else 600,
             startup_timeout_s=900,
             no_progress_s=90,
             require_stager_process_ready=True,
@@ -348,9 +373,10 @@ def main(argv=None):
                 dict(summary=summary, requests=requests),
             )
             row.update(status="COMPLETED", summary=summary, closed_loop=proof)
-            if args.four_mode:
+            if args.four_mode or args.migration_matrix:
+                raw = read(plan["run_dir"] / "pressure_request_results.json")
                 score = four.full_score(
-                    read(plan["run_dir"] / "pressure_request_results.json"),
+                    raw,
                     cfg,
                     next(
                         r["unix_s"]
@@ -360,14 +386,39 @@ def main(argv=None):
                     audit,
                 )
                 write(plan["run_dir"].parent / "sustained_goodoutput.json", score)
-                evaluations.append(dict(arm=arm, score=score))
-                write(
-                    args.output / "four_mode_summary.json", four.aggregate(evaluations)
+                evaluations.append(
+                    dict(arm=arm, score=score, scenario=recipe["scenario"])
                 )
-                write(
-                    args.output / "four_mode_comparison.json",
-                    four.comparisons(inherited + ledger),
-                )
+                if args.migration_matrix:
+                    evaluations[-1]["roles"] = {
+                        j["id"]: j["comparison_role"] for j in recipe["jobs"]
+                    }
+                    row["mechanism"] = matrix.assess(recipe, arm, raw, audit, score)
+                    matching_count = row["mechanism"]["matching_committed_released"]
+                    print(
+                        f"[场景验收] {scene['name']} "
+                        f"匹配路径提交并释放={matching_count} "
+                        f"机制覆盖={row['mechanism']['mechanism_coverage_pass']}；"
+                        "性能得分及未触发结果均保留",
+                        flush=True,
+                    )
+                    write(
+                        plan["run_dir"].parent / "migration_matrix_acceptance.json",
+                        row["mechanism"],
+                    )
+                    write(
+                        args.output / "migration_matrix_summary.json",
+                        matrix.aggregate(evaluations),
+                    )
+                else:
+                    write(
+                        args.output / "four_mode_summary.json",
+                        four.aggregate(evaluations),
+                    )
+                    write(
+                        args.output / "four_mode_comparison.json",
+                        four.comparisons(inherited + ledger),
+                    )
             write(args.output / "attempt_ledger.json", ledger)
             arms = {
                 r["arm"]: r
@@ -428,6 +479,17 @@ def main(argv=None):
                 if valid
                 else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
             )
+        if args.migration_matrix:
+            coverage = (
+                len(pairs) == 9
+                and valid
+                and all(r["mechanism"]["mechanism_coverage_pass"] for r in ledger)
+            )
+            result, code = (
+                (dict(status="COMPLETED_MIGRATION_MATRIX"), 0)
+                if coverage
+                else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
+            )
     except KeyboardInterrupt:
         result, code = dict(status="INTERRUPTED"), 130
     except Exception as error:
@@ -447,7 +509,11 @@ def main(argv=None):
             total_profile_attempts=previous_attempts + len(ledger),
             inherited_runs=inherited,
             maximum_live_runs=run_count,
-            experiment_mode="four-mode" if args.four_mode else "stay-migrate",
+            experiment_mode="migration-matrix"
+            if args.migration_matrix
+            else "four-mode"
+            if args.four_mode
+            else "stay-migrate",
             actual_migration_observed=any(
                 r.get("summary", {}).get("committed_requests", 0) for r in ledger
             ),
