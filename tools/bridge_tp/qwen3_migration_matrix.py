@@ -183,12 +183,18 @@ def assess(recipe, arm, raw, audit, score):
                 active_target_background=active,
             )
         )
+        if "matching_job_ids" in recipe:
+            rows[-1]["job_id"] = committed[0]["job_id"] if committed else None
     matching = [
         r
         for r in rows
         if r["path"] == recipe["expected_path"]
         and r["committed"]
         and r["source_released"]
+        and (
+            "matching_job_ids" not in recipe
+            or r.get("job_id") in recipe["matching_job_ids"]
+        )
         and (not recipe["require_target_background"] or r["active_target_background"])
     ]
     handoffs = [

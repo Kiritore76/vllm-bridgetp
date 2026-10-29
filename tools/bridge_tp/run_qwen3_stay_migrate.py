@@ -15,6 +15,7 @@ from tools.bridge_tp import qwen3_four_mode as four  # noqa: E402
 from tools.bridge_tp import qwen3_kv_guard_trial as guard_trial  # noqa: E402
 from tools.bridge_tp import qwen3_migration_matrix as matrix  # noqa: E402
 from tools.bridge_tp import qwen3_pressure_observation as observation  # noqa: E402
+from tools.bridge_tp import qwen3_resident_pressure as resident  # noqa: E402
 from tools.bridge_tp import qwen3_stay_migrate as matched  # noqa: E402
 from tools.bridge_tp import run_pressure_comparison as comparison  # noqa: E402
 from tools.bridge_tp.prepare_4090d_qwen3 import (  # noqa: E402
@@ -173,14 +174,39 @@ def main(argv=None):
     parser.add_argument("--four-mode", action="store_true")
     parser.add_argument("--migration-matrix", action="store_true")
     parser.add_argument("--kv-guard-trial", action="store_true")
+    parser.add_argument("--resident-pressure", action="store_true")
     parser.add_argument("--prior-comparison", type=Path)
     parser.add_argument("--complete-four-mode", type=Path)
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
-    matrix_mode = args.migration_matrix or args.kv_guard_trial
+    matrix_mode = args.migration_matrix or args.kv_guard_trial or args.resident_pressure
     inherited, evaluations, missing = [], [], None
     previous_attempts = 49 if args.four_mode else 31
-    if args.kv_guard_trial:
+    if args.resident_pressure:
+        if (
+            args.migration_matrix
+            or args.kv_guard_trial
+            or args.four_mode
+            or args.complete_four_mode
+            or args.repetitions != 1
+            or args.prior_comparison is None
+        ):
+            parser.error(
+                "resident pressure requires one repetition and prior guard trial"
+            )
+        prior = read(args.prior_comparison / "result.json")
+        if (
+            prior.get("experiment_mode") != "kv-guard-trial"
+            or prior.get("status")
+            not in {"COMPLETED_KV_GUARD_TRIAL", "COMPLETED_WITH_COVERAGE_GAPS"}
+            or len(prior.get("runs", [])) != 6
+            or any(r["status"] != "COMPLETED" for r in prior["runs"])
+        ):
+            raise ValueError("requires all six completed guard screening runs")
+        previous_attempts = prior["total_profile_attempts"]
+        cfg = resident.config(read(args.inputs))
+        values = cfg["recipes"]
+    elif args.kv_guard_trial:
         if (
             args.migration_matrix
             or args.four_mode
@@ -261,7 +287,10 @@ def main(argv=None):
                     routing_weights=cfg["routing_weights"],
                     migration_execution=True,
                     maximum_migrations_per_run=0,
-                    routing_policy="fixed pools for growth/burst; original router "
+                    routing_policy="six initial TP1 residents; later stress arrivals "
+                    "use original pressure router; per-recipe guard125/384"
+                    if args.resident_pressure
+                    else "fixed pools for growth/burst; original router "
                     "for stress arrivals in routed pair; experimental guard384"
                     if args.kv_guard_trial
                     else "fixed initial pools; unchanged migration policy"
@@ -338,7 +367,10 @@ def main(argv=None):
                 "configuration and hooks; allocation differs by declared arm"
             ),
             guard_status=(
-                "guard384 offline-selected GPU screening candidate; "
+                "same-batch guard125/384 screening; per-recipe policy; "
+                "neither is a calibrated guarantee"
+                if args.resident_pressure
+                else "guard384 offline-selected GPU screening candidate; "
                 "NOT a calibrated guarantee"
                 if args.kv_guard_trial
                 else "original nominal guard retained for development trial; "
@@ -520,7 +552,9 @@ def main(argv=None):
             result, code = (
                 (
                     dict(
-                        status="COMPLETED_KV_GUARD_TRIAL"
+                        status="COMPLETED_RESIDENT_PRESSURE_TRIAL"
+                        if args.resident_pressure
+                        else "COMPLETED_KV_GUARD_TRIAL"
                         if args.kv_guard_trial
                         else "COMPLETED_MIGRATION_MATRIX"
                     ),
@@ -548,7 +582,9 @@ def main(argv=None):
             total_profile_attempts=previous_attempts + len(ledger),
             inherited_runs=inherited,
             maximum_live_runs=run_count,
-            experiment_mode="kv-guard-trial"
+            experiment_mode="resident-pressure"
+            if args.resident_pressure
+            else "kv-guard-trial"
             if args.kv_guard_trial
             else "migration-matrix"
             if args.migration_matrix

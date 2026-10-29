@@ -261,11 +261,25 @@ def build_plans(spec, config, inputs, root, common, settings):
             arms = base[offset:] + base[:offset]
         path = root / (recipe["name"] + "_arrivals.json")
         common.write_json(path, arrivals(inputs, recipe))
+        recipe_spec = local_spec
+        if "policy_overrides" in recipe:
+            overrides = recipe["policy_overrides"]
+            if (
+                config.get("schema") != "QWEN3_RESIDENT_PRESSURE_GUARD_COMPARISON_V1"
+                or set(overrides) != {"capacity_guard_blocks"}
+                or overrides["capacity_guard_blocks"] not in (125, 384)
+            ):
+                raise ValueError("unsupported per-recipe pressure policy override")
+            recipe_spec = copy.deepcopy(local_spec)
+            recipe_policy = policy | overrides
+            recipe_path = root / (recipe["name"] + "_policy.json")
+            common.write_json(recipe_path, recipe_policy)
+            recipe_spec["policy_config"] = str(recipe_path)
         for arm in arms:
             if arm not in config["arms"]:
                 continue
             scene = dict(name=recipe["name"] + "-" + arm, arrivals=str(path))
-            plan = pilot.build_scene(local_spec, scene, root, common, settings)
+            plan = pilot.build_scene(recipe_spec, scene, root, common, settings)
             if arm != "migrate":
                 plan["controller_argv"].append("--no-migration")
             elif config.get("test_only_cancel_smoke"):
