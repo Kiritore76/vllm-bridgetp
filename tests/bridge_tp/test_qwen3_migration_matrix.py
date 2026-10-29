@@ -171,6 +171,10 @@ class MigrationMatrixTests(unittest.TestCase):
         self.assertTrue(
             matrix.assess(recipe, "stay", raw, [], score)["mechanism_coverage_pass"]
         )
+        recipe["minimum_matching_migrations"] = 0
+        self.assertTrue(
+            matrix.assess(recipe, "migrate", raw, [], score)["mechanism_coverage_pass"]
+        )
 
     def test_aggregate_target_metrics_pool_requests_not_p95s(self):
         from tools.bridge_tp import qwen3_four_mode as full
@@ -206,3 +210,5 @@ class MigrationMatrixTests(unittest.TestCase):
         self.assertAlmostEqual(
             result["role_metrics"]["target-background"]["soft_goodoutput"], 4 / 600
         )
+        e["scenario"] = "routed_burst"
+        self.assertIn("routed_burst", matrix.aggregate([e]))

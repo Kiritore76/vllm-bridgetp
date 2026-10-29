@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT))
 
 from tools.bridge_tp import launch_pressure_balanced_pilot as pilot  # noqa: E402
 from tools.bridge_tp import qwen3_four_mode as four  # noqa: E402
+from tools.bridge_tp import qwen3_kv_guard_trial as guard_trial  # noqa: E402
 from tools.bridge_tp import qwen3_migration_matrix as matrix  # noqa: E402
 from tools.bridge_tp import qwen3_pressure_observation as observation  # noqa: E402
 from tools.bridge_tp import qwen3_stay_migrate as matched  # noqa: E402
@@ -171,13 +172,36 @@ def main(argv=None):
     parser.add_argument("--repetitions", type=int, choices=(1, 2, 3), default=2)
     parser.add_argument("--four-mode", action="store_true")
     parser.add_argument("--migration-matrix", action="store_true")
+    parser.add_argument("--kv-guard-trial", action="store_true")
     parser.add_argument("--prior-comparison", type=Path)
     parser.add_argument("--complete-four-mode", type=Path)
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
+    matrix_mode = args.migration_matrix or args.kv_guard_trial
     inherited, evaluations, missing = [], [], None
     previous_attempts = 49 if args.four_mode else 31
-    if args.migration_matrix:
+    if args.kv_guard_trial:
+        if (
+            args.migration_matrix
+            or args.four_mode
+            or args.complete_four_mode
+            or args.repetitions != 1
+            or args.prior_comparison is None
+        ):
+            parser.error("guard trial requires one repetition and prior matrix only")
+        prior = read(args.prior_comparison / "result.json")
+        if (
+            prior.get("experiment_mode") != "migration-matrix"
+            or prior.get("status")
+            not in {"COMPLETED_MIGRATION_MATRIX", "COMPLETED_WITH_COVERAGE_GAPS"}
+            or len(prior.get("runs", [])) != 18
+            or any(r["status"] != "COMPLETED" for r in prior["runs"])
+        ):
+            raise ValueError("guard trial requires all eighteen completed matrix runs")
+        previous_attempts = prior["total_profile_attempts"]
+        cfg = guard_trial.config(read(args.inputs))
+        values = cfg["recipes"]
+    elif args.migration_matrix:
         if (
             args.four_mode
             or args.complete_four_mode
@@ -233,10 +257,14 @@ def main(argv=None):
                     inherited_runs=len(inherited),
                     missing_cells=sorted(missing) if missing is not None else None,
                     arms=cfg["arms"],
+                    policy_overrides=cfg["policy_overrides"],
                     routing_weights=cfg["routing_weights"],
                     migration_execution=True,
                     maximum_migrations_per_run=0,
-                    routing_policy="fixed initial pools; unchanged migration policy"
+                    routing_policy="fixed pools for growth/burst; original router "
+                    "for stress arrivals in routed pair; experimental guard384"
+                    if args.kv_guard_trial
+                    else "fixed initial pools; unchanged migration policy"
                     if args.migration_matrix
                     else "original four allocation strategies"
                     if args.four_mode
@@ -246,7 +274,7 @@ def main(argv=None):
                     ],
                     output_contract=(
                         "fixed-output system comparison"
-                        if args.four_mode or args.migration_matrix
+                        if args.four_mode or matrix_mode
                         else "identical fixed budgets in primary pairs; "
                         "additional natural-EOS pair reported separately"
                     ),
@@ -265,7 +293,7 @@ def main(argv=None):
         hardware, versions = runtime_inventory(read(PROFILE)), runtime_versions()
         prior_identity = (
             args.prior_comparison
-            if args.migration_matrix
+            if matrix_mode
             else args.complete_four_mode or args.prior_observation
         )
         old = read(prior_identity / "identity.json")
@@ -291,7 +319,7 @@ def main(argv=None):
             policy_config=str(observation.ASSETS / "policy.json"),
             service_evidence=str(observation.ASSETS / "service_evidence.json"),
             health_reference=str(observation.ASSETS / "health_reference.json"),
-            run_timeout_s=900 if args.four_mode or args.migration_matrix else 600,
+            run_timeout_s=900 if args.four_mode or matrix_mode else 600,
             startup_timeout_s=900,
             no_progress_s=90,
             require_stager_process_ready=True,
@@ -310,9 +338,13 @@ def main(argv=None):
                 "configuration and hooks; allocation differs by declared arm"
             ),
             guard_status=(
-                "original nominal guard retained for development trial; "
+                "guard384 offline-selected GPU screening candidate; "
+                "NOT a calibrated guarantee"
+                if args.kv_guard_trial
+                else "original nominal guard retained for development trial; "
                 "NOT a calibrated guarantee"
             ),
+            policy_overrides=cfg["policy_overrides"],
         )
         write(args.output / "scope.json", scope)
         write(args.output / "comparison_recipe.json", cfg)
@@ -373,7 +405,7 @@ def main(argv=None):
                 dict(summary=summary, requests=requests),
             )
             row.update(status="COMPLETED", summary=summary, closed_loop=proof)
-            if args.four_mode or args.migration_matrix:
+            if args.four_mode or matrix_mode:
                 raw = read(plan["run_dir"] / "pressure_request_results.json")
                 score = four.full_score(
                     raw,
@@ -389,7 +421,7 @@ def main(argv=None):
                 evaluations.append(
                     dict(arm=arm, score=score, scenario=recipe["scenario"])
                 )
-                if args.migration_matrix:
+                if matrix_mode:
                     evaluations[-1]["roles"] = {
                         j["id"]: j["comparison_role"] for j in recipe["jobs"]
                     }
@@ -479,14 +511,21 @@ def main(argv=None):
                 if valid
                 else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
             )
-        if args.migration_matrix:
+        if matrix_mode:
             coverage = (
-                len(pairs) == 9
+                len(pairs) == len(values)
                 and valid
                 and all(r["mechanism"]["mechanism_coverage_pass"] for r in ledger)
             )
             result, code = (
-                (dict(status="COMPLETED_MIGRATION_MATRIX"), 0)
+                (
+                    dict(
+                        status="COMPLETED_KV_GUARD_TRIAL"
+                        if args.kv_guard_trial
+                        else "COMPLETED_MIGRATION_MATRIX"
+                    ),
+                    0,
+                )
                 if coverage
                 else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
             )
@@ -509,7 +548,9 @@ def main(argv=None):
             total_profile_attempts=previous_attempts + len(ledger),
             inherited_runs=inherited,
             maximum_live_runs=run_count,
-            experiment_mode="migration-matrix"
+            experiment_mode="kv-guard-trial"
+            if args.kv_guard_trial
+            else "migration-matrix"
             if args.migration_matrix
             else "four-mode"
             if args.four_mode

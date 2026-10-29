@@ -206,14 +206,17 @@ def assess(recipe, arm, raw, audit, score):
         handoff_slo_pass=all(v is not None and v <= 1.0 for v in handoffs)
         if handoffs
         else None,
-        note="service case counts only service moves; target-impact case "
-        "requires visible background generation at START",
+        note=recipe.get(
+            "coverage_note",
+            "service case counts only service moves; target-impact case "
+            "requires visible background generation at START",
+        ),
     )
 
 
 def aggregate(evaluations):
     output = {}
-    for scenario in SCENARIOS:
+    for scenario in dict.fromkeys(e["scenario"] for e in evaluations):
         selected = [e for e in evaluations if e["scenario"] == scenario]
         arms = full.aggregate(selected)
         for arm, summary in arms.items():

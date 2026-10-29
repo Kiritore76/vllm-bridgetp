@@ -358,7 +358,7 @@
     "experiments/platforms/qwen3_pressure_observation/scope.json": "7cf1845a67e01054df5011088174b4c30e4ba0b36f3c01d08d151e7e3c24dca8",
     "experiments/platforms/qwen3_pressure_observation/service_evidence.json": "513028147a78f7342556584396ff6e2ec574c8c9caf906e86efabfcfc0a4cdba",
     "tools/bridge_tp/qwen3_stay_migrate.py": "a18219546bc8492c89943905b600ced54f99f06e49eb13712932871e7232fee1",
-    "tools/bridge_tp/run_qwen3_stay_migrate.py": "6d6e73094754a211f2348a7fd12825546196a9c4e909a3c0ee2077e036e03a9c",
+    "tools/bridge_tp/run_qwen3_stay_migrate.py": "3f538672c9ddc01e7d0639e8f9fb0851c4d3297f1850274b5ce9e4c658323473",
     "tests/bridge_tp/test_qwen3_stay_migrate.py": "725ef0959b991c7c1001fb2d3277c009289b19be758e3b4ea0a9fff1f8a5026f",
     "tests/bridge_tp/test_pressure_launcher.py": "44f50ec2554a5d3196a92411ee807336392063e70c81d86e3991d86dd4541b32",
     "tools/bridge_tp/qwen3_four_mode.py": "21de51e7a2ac0e0b6b4616b0c66e956e73496171874cb22f6e81841bf4553267",
@@ -366,8 +366,10 @@
     "experiments/platforms/qwen3_pressure_observation/inputs.json": "53e4f904db5c9f94f672fa1b6bf3a008d4b2b02c98df5f06a59649529f671aec",
     "experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt": "f51f6a8fd2e299f2ebffae71706f7c9dcd93154eeffa18cf008bf0ee710f738f",
     "experiments/platforms/qwen3_pressure_observation/artifacts/provenance.json": "b0e490253c90719f9e74f53ed3d91c2a9bd638b1770194d0b953dbed28f7ab5e",
-    "tools/bridge_tp/qwen3_migration_matrix.py": "e9548e7d6166bdeb706d1f605ca2b5927cf0f71f734429f242600ed0689ac1b0",
-    "tests/bridge_tp/test_qwen3_migration_matrix.py": "b6645016155ec34e4e33a8723f1813a80e141e68de07ccd369a23b105dff7817"
+    "tools/bridge_tp/qwen3_migration_matrix.py": "ec0b1901a04614bf62e5be6536b5cac9c5eb33a013de3b52049deea38356a9e6",
+    "tests/bridge_tp/test_qwen3_migration_matrix.py": "9cf15a7ee073dd01c9b3014de09cee3ba6857a8b61b480bf486b8421c54b9895",
+    "tools/bridge_tp/qwen3_kv_guard_trial.py": "4a068f56e6d024cdfb30ff4e9fa848d91c09423d6715564d97307ea9f3157366",
+    "tests/bridge_tp/test_qwen3_kv_guard_trial.py": "b42a4134a4a074f5fa85dffe016332a8842299a61feb9b803f766587a25cab39"
   },
   "server_settings": {
     "dtype": "bfloat16",
