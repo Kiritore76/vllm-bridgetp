@@ -28,6 +28,7 @@ from tools.bridge_tp.qwen3_calibration_contract import (  # noqa: E402
     verified_inputs,
 )
 from tools.bridge_tp.qwen3_online_validation import (  # noqa: E402
+    CHECKPOINT_PATH,
     CHECKPOINT_SHA,
     configure_predictor,
 )
@@ -158,17 +159,34 @@ def closed_loop_proof(plan, arm):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    for key in ("model", "checkpoint", "inputs", "prior-observation", "output"):
+    for key in ("model", "output"):
         parser.add_argument("--" + key, type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT_PATH)
+    parser.add_argument(
+        "--inputs", type=Path, default=observation.ASSETS / "inputs.json"
+    )
+    parser.add_argument("--prior-observation", type=Path)
     parser.add_argument("--expected-revision", required=True)
     parser.add_argument("--repetitions", type=int, choices=(1, 2, 3), default=2)
     parser.add_argument("--four-mode", action="store_true")
     parser.add_argument("--prior-comparison", type=Path)
+    parser.add_argument("--complete-four-mode", type=Path)
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
-    if args.four_mode:
+    inherited, evaluations, missing = [], [], None
+    previous_attempts = 49 if args.four_mode else 31
+    if args.complete_four_mode:
+        if not args.four_mode or args.repetitions != 3:
+            parser.error("completion requires four-mode and three repetitions")
+        cfg, inherited, evaluations, missing, previous_attempts = four.supplement(
+            args.complete_four_mode.resolve()
+        )
+        values = cfg["recipes"]
+    elif args.four_mode:
         if args.repetitions != 3 or args.prior_comparison is None:
             parser.error("four-mode requires three repetitions and prior comparison")
+        if args.prior_observation is None:
+            parser.error("four-mode requires prior observation")
         cfg = four.config(
             args.prior_observation,
             read(args.inputs),
@@ -182,15 +200,19 @@ def main(argv=None):
             raise ValueError("requires the completed eighteen-run comparison")
         values = cfg["recipes"]
     else:
+        if args.prior_observation is None:
+            parser.error("paired mode requires prior observation")
         values = matched.recipes(args.prior_observation, args.repetitions)
         cfg = matched.config(values)
-    run_count = len(values) * len(cfg["arms"])
+    run_count = len(missing) if missing is not None else len(values) * len(cfg["arms"])
     if args.validate_only:
         print(
             json.dumps(
                 dict(
                     status="CPU_MATCHED_PLAN_ONLY",
                     runs=run_count,
+                    inherited_runs=len(inherited),
+                    missing_cells=sorted(missing) if missing is not None else None,
                     arms=cfg["arms"],
                     routing_weights=cfg["routing_weights"],
                     migration_execution=True,
@@ -218,10 +240,10 @@ def main(argv=None):
         raise ValueError("results must be outside checkout")
     args.output.mkdir(parents=True, exist_ok=False)
     result, code, ledger, pairs = dict(status="TECHNICAL_FAILURE"), 1, [], []
-    evaluations = []
     try:
         hardware, versions = runtime_inventory(read(PROFILE)), runtime_versions()
-        old = read(args.prior_observation / "identity.json")
+        prior_identity = args.complete_four_mode or args.prior_observation
+        old = read(prior_identity / "identity.json")
         write(
             args.output / "identity.json",
             dict(
@@ -269,7 +291,22 @@ def main(argv=None):
         )
         write(args.output / "scope.json", scope)
         write(args.output / "comparison_recipe.json", cfg)
+        if args.complete_four_mode:
+            write(
+                args.output / "completion_provenance.json",
+                dict(
+                    original_batch=str(args.complete_four_mode.resolve()),
+                    original_revision=old["revision"],
+                    current_revision=args.expected_revision,
+                    inherited_runs=inherited,
+                    new_cells=sorted(missing),
+                    note="new archive holds supplement only; retain original archive; "
+                    "third repetition combines runs from different times",
+                ),
+            )
         plans = comparison.build_plans(spec, cfg, inputs, args.output, common, settings)
+        if missing is not None:
+            plans = [p for p in plans if p[2]["name"] in missing]
         for _, arm, _, plan in plans:
             adapt_plan(plan, arm, args.checkpoint, args.model)
         serving_preflight(plans)
@@ -328,7 +365,8 @@ def main(argv=None):
                     args.output / "four_mode_summary.json", four.aggregate(evaluations)
                 )
                 write(
-                    args.output / "four_mode_comparison.json", four.comparisons(ledger)
+                    args.output / "four_mode_comparison.json",
+                    four.comparisons(inherited + ledger),
                 )
             write(args.output / "attempt_ledger.json", ledger)
             arms = {
@@ -369,7 +407,7 @@ def main(argv=None):
             else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
         )
         if args.four_mode:
-            paired = four.comparisons(ledger)
+            paired = four.comparisons(inherited + ledger)
             pairs = paired
             write(args.output / "four_mode_comparison.json", paired)
             valid = len(paired) == 3 and all(
@@ -379,7 +417,14 @@ def main(argv=None):
                 for p in paired
             )
             result, code = (
-                (dict(status="COMPLETED_FOUR_MODE_EXPERIMENT"), 0)
+                (
+                    dict(
+                        status="COMPLETED_FOUR_MODE_SUPPLEMENT"
+                        if args.complete_four_mode
+                        else "COMPLETED_FOUR_MODE_EXPERIMENT"
+                    ),
+                    0,
+                )
                 if valid
                 else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
             )
@@ -398,8 +443,9 @@ def main(argv=None):
             runner_code=code,
             runs=ledger,
             pairs=pairs,
-            previous_profile_attempts=49 if args.four_mode else 31,
-            total_profile_attempts=(49 if args.four_mode else 31) + len(ledger),
+            previous_profile_attempts=previous_attempts,
+            total_profile_attempts=previous_attempts + len(ledger),
+            inherited_runs=inherited,
             maximum_live_runs=run_count,
             experiment_mode="four-mode" if args.four_mode else "stay-migrate",
             actual_migration_observed=any(

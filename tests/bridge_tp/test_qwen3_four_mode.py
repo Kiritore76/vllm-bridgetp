@@ -2,6 +2,8 @@
 """Frozen measured weights, four actual strategies and full-window accounting."""
 
 import copy
+import hashlib
+import json
 import tempfile
 import unittest
 from collections import Counter
@@ -33,6 +35,106 @@ def config():
 
 
 class FourModeTests(unittest.TestCase):
+    def prior(self, root):
+        cfg = config()
+
+        def write(path, value):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(value), encoding="utf-8")
+
+        write(root / "comparison_recipe.json", cfg)
+        write(root / "comparison_policy.json", obs.read(obs.ASSETS / "policy.json"))
+        write(
+            root / "identity.json",
+            dict(checkpoint_sha256=runner.CHECKPOINT_SHA, revision="original"),
+        )
+        runs = []
+        for rec in cfg["recipes"]:
+            write(root / (rec["name"] + "_arrivals.json"), rec["jobs"])
+            for arm in four.ARMS:
+                if rec["repetition"] == 3 and arm in ("weighted", "least"):
+                    continue
+                name = rec["name"] + "-" + arm
+                runs.append(
+                    dict(
+                        name=name,
+                        arm=arm,
+                        pair=rec["name"],
+                        status="COMPLETED",
+                        summary=dict(window_soft_goodoutput_s=1.0),
+                    )
+                )
+                write(
+                    root / name / "owned_shutdown_receipt.json",
+                    dict(all_owned_groups_ended=True),
+                )
+                write(
+                    root / name / "sustained_goodoutput.json",
+                    dict(goodoutput_tokens_s=1.0),
+                )
+        failed = "four-mixed-r3-weighted"
+        runs.append(dict(name=failed, status="FAILED"))
+        write(
+            root / failed / "owned_shutdown_receipt.json",
+            dict(all_owned_groups_ended=True),
+        )
+        write(
+            root / "result.json",
+            dict(status="TECHNICAL_FAILURE", total_profile_attempts=60, runs=runs),
+        )
+        return cfg
+
+    def test_tracked_assets_match_original_checkpoint_and_input_identity(self):
+        from tools.bridge_tp.qwen3_calibration_contract import INPUT_SHA
+
+        self.assertEqual(
+            hashlib.sha256(runner.CHECKPOINT_PATH.read_bytes()).hexdigest(),
+            runner.CHECKPOINT_SHA,
+        )
+        self.assertEqual(
+            hashlib.sha256((obs.ASSETS / "inputs.json").read_bytes()).hexdigest(),
+            INPUT_SHA,
+        )
+
+    def test_supplement_selects_two_missing_cells_and_keeps_original_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.prior(root)
+            before = (root / "result.json").read_bytes()
+            cfg, inherited, scores, missing, attempts = four.supplement(root)
+            self.assertEqual(len(inherited), 10)
+            self.assertEqual(len(scores), 10)
+            self.assertEqual(missing, {"four-mixed-r3-weighted", "four-mixed-r3-least"})
+            self.assertEqual(attempts, 60)
+            self.assertEqual((root / "result.json").read_bytes(), before)
+
+    def test_supplement_rejects_modified_workload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self.prior(root)
+            cfg["recipes"][0]["jobs"][0]["request"]["max_tokens"] += 1
+            (root / "comparison_recipe.json").write_text(json.dumps(cfg))
+            with self.assertRaises(ValueError):
+                four.supplement(root)
+
+    def test_supplement_rejects_unconfirmed_old_process_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.prior(root)
+            (root / "four-mixed-r3-weighted/owned_shutdown_receipt.json").write_text(
+                json.dumps(dict(all_owned_groups_ended=False))
+            )
+            with self.assertRaises(ValueError):
+                four.supplement(root)
+
+    def test_supplement_rejects_changed_policy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.prior(root)
+            (root / "comparison_policy.json").write_text("{}")
+            with self.assertRaises(ValueError):
+                four.supplement(root)
+
     def test_measured_weights_use_common_repeated_peaks(self):
         weights, cells = four.measured_weights(
             obs.read(obs.ASSETS / "health_reference.json")

@@ -9,6 +9,11 @@ from tools.bridge_tp.prepare_4090d_qwen3 import sha
 from tools.bridge_tp.pressure_cpu import load
 
 CHECKPOINT_SHA = "f51f6a8fd2e299f2ebffae71706f7c9dcd93154eeffa18cf008bf0ee710f738f"
+CHECKPOINT_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "experiments/platforms/qwen3_pressure_observation/artifacts"
+    / "predictor_distribution.pt"
+)
 
 
 def background_completion(io, url, payload, timeout, directory, index):

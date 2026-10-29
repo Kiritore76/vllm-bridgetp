@@ -1,0 +1,13 @@
+{
+  "model": "Qwen3-8B",
+  "predictor": "four-layer finite62 distribution; probability-weighted integer-bin mean",
+  "checkpoint": "predictor_distribution.pt",
+  "checkpoint_sha256": "f51f6a8fd2e299f2ebffae71706f7c9dcd93154eeffa18cf008bf0ee710f738f",
+  "checkpoint_bytes": 5351873,
+  "source_archive": "qwen3_retrain8k62_merged2208_20261028_135855_692.tar.gz",
+  "source_member": "training/predictor_distribution.pt",
+  "restoration": "byte-identical existing weight; no retraining or parameter change",
+  "service_inputs": "../inputs.json",
+  "service_inputs_sha256": "53e4f904db5c9f94f672fa1b6bf3a008d4b2b02c98df5f06a59649529f671aec",
+  "service_inputs_bytes": 113076
+}

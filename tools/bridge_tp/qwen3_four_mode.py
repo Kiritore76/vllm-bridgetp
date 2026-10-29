@@ -4,12 +4,80 @@
 import copy
 import random
 import statistics
+from pathlib import Path
 
 from tools.bridge_tp import pressure_sustained as sustained
+from tools.bridge_tp import qwen3_pressure_observation as observation
 from tools.bridge_tp import qwen3_stay_migrate as matched
 from tools.bridge_tp.run_pressure_comparison import percentile
 
 ARMS = ["weighted", "least", "stay", "migrate"]
+
+
+def supplement(prior):
+    """Read the immutable partial batch; only missing cells may run again."""
+    prior = Path(prior)
+    old = observation.read(prior / "result.json")
+    cfg = observation.read(prior / "comparison_recipe.json")
+    identity = observation.read(prior / "identity.json")
+    from tools.bridge_tp.qwen3_online_validation import CHECKPOINT_SHA
+
+    if (
+        old.get("status") != "TECHNICAL_FAILURE"
+        or cfg.get("schema") != "QWEN3_FOUR_MODE_FIXED_V1"
+        or cfg.get("arms") != ARMS
+        or len(cfg.get("recipes", [])) != 3
+        or identity.get("checkpoint_sha256") != CHECKPOINT_SHA
+        or observation.read(prior / "comparison_policy.json")
+        != observation.read(observation.ASSETS / "policy.json")
+    ):
+        raise ValueError("supplement requires matching frozen four-mode contract")
+    if (
+        cfg["routing_weights"]
+        != measured_weights(
+            observation.read(observation.ASSETS / "health_reference.json")
+        )[0]
+    ):
+        raise ValueError("supplement weights changed")
+    expected = set()
+    for recipe in cfg["recipes"]:
+        jobs = recipe["jobs"]
+        if (
+            len(jobs) != 75
+            or matched.digest(jobs) != recipe["input_sha256"]
+            or observation.read(prior / (recipe["name"] + "_arrivals.json")) != jobs
+        ):
+            raise ValueError("supplement workload identity changed")
+        expected.update(recipe["name"] + "-" + a for a in ARMS)
+    inherited, evaluations = [], []
+    for run in old["runs"]:
+        if not observation.read(prior / run["name"] / "owned_shutdown_receipt.json")[
+            "all_owned_groups_ended"
+        ]:
+            raise ValueError("prior owned process cleanup was not proven")
+        if run["status"] != "COMPLETED":
+            continue
+        if run["name"] not in expected:
+            raise ValueError("unknown inherited cell")
+        row = copy.deepcopy(run)
+        row["provenance"] = dict(
+            batch=str(prior), revision=identity["revision"], reused=True
+        )
+        inherited.append(row)
+        score = observation.read(prior / run["name"] / "sustained_goodoutput.json")
+        if (
+            abs(
+                score["goodoutput_tokens_s"]
+                - row["summary"]["window_soft_goodoutput_s"]
+            )
+            > 1e-8
+        ):
+            raise ValueError("inherited score differs from completed ledger")
+        evaluations.append(dict(arm=run["arm"], score=score))
+    done = {r["name"] for r in inherited}
+    if len(done) != len(inherited) or not done < expected:
+        raise ValueError("invalid or already complete supplement")
+    return cfg, inherited, evaluations, expected - done, old["total_profile_attempts"]
 
 
 def measured_weights(reference):
