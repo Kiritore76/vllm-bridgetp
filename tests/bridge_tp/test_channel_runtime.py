@@ -47,6 +47,36 @@ def methods(*names):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_gpu_identity_allows_replacement_cards_and_changed_indices(self):
+        from tools.bridge_tp import run_qwen3_online_loaded_validation as runner
+
+        old = [
+            dict(
+                name="4090D",
+                memory_mib=24564,
+                driver="595.71.05",
+                uuid="old",
+                index="0",
+            )
+        ]
+        new = [dict(old[0], uuid="new", index="3")]
+        self.assertEqual(runner.gpu_configuration(old), runner.gpu_configuration(new))
+
+    def test_gpu_identity_still_detects_capability_driver_and_count_changes(self):
+        from tools.bridge_tp import run_qwen3_online_loaded_validation as runner
+
+        old = [dict(name="4090D", memory_mib=24564, driver="595.71.05")]
+        for changed in [
+            [],
+            old * 2,
+            [dict(old[0], name="A100")],
+            [dict(old[0], memory_mib=48000)],
+            [dict(old[0], driver="other")],
+        ]:
+            self.assertNotEqual(
+                runner.gpu_configuration(old), runner.gpu_configuration(changed)
+            )
+
     def test_post_cleanup_receipts_reject_leaks_busy_streams_and_missing_rank(self):
         from tools.bridge_tp import run_qwen3_online_loaded_validation as runner
 

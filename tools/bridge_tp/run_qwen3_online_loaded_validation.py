@@ -33,6 +33,11 @@ class PerformanceFailure(RuntimeError):
     """Mechanism completed, but the required output SLO did not pass."""
 
 
+def gpu_configuration(rows):
+    """Compare device capabilities, allowing replacement cards and reindexing."""
+    return sorted((r["name"], r["memory_mib"], r["driver"]) for r in rows)
+
+
 def stages(diagnostic=False, channel_ablation=False, runtime_fix=False):
     if runtime_fix:
         return [
@@ -372,9 +377,24 @@ def main(argv=None):
             raise ValueError("requires the audited completed parameter supplement")
         gpu = runtime_inventory(read(PROFILE))
         versions = runtime_versions()
+        comparison = dict(
+            uuid_and_index_identity_required=False,
+            gpu_configuration_matches=(
+                gpu_configuration(gpu["gpus"])
+                == gpu_configuration(prior_identity["gpu"]["gpus"])
+            ),
+            runtime_matches=(
+                json.loads(json.dumps(versions)) == prior_identity["versions"]
+            ),
+            previous_gpu=prior_identity["gpu"],
+            current_gpu=gpu,
+            previous_versions=prior_identity["versions"],
+            current_versions=versions,
+        )
+        write(args.output / "runtime_identity_comparison.json", comparison)
         if (
-            gpu["gpus"] != prior_identity["gpu"]["gpus"]
-            or json.loads(json.dumps(versions)) != prior_identity["versions"]
+            not comparison["gpu_configuration_matches"]
+            or not comparison["runtime_matches"]
         ):
             raise ValueError("GPU/driver/runtime identity differs")
         verified_inputs(args.model, args.inputs)

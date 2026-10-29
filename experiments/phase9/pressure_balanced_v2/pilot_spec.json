@@ -339,7 +339,7 @@
     "tools/bridge_tp/run_qwen3_scheduler_supplement.py": "78044e014a097707b22032903f9a48f2e64bb0225c2c2682070beed31bbc44ac",
     "tests/bridge_tp/test_qwen3_scheduler_supplement.py": "40fd9afa64c988a4a8e6a5fa09e9ac89a45ff02a4489aa1b9a8198acc6331dab",
     "tools/bridge_tp/qwen3_online_validation.py": "ce864fa51ce8f9a4a364d962f5acd73aee394d03373aad78be79f70d26470173",
-    "tools/bridge_tp/run_qwen3_online_loaded_validation.py": "ba10d950bb4fd5ececd1ee0f7056b6531bebca9292e7af846fb71c22d545c10d",
+    "tools/bridge_tp/run_qwen3_online_loaded_validation.py": "070369a80eff0be742be7eccb1aa49509c61cb96e11b111a25a2c81b6ff70c1e",
     "tests/bridge_tp/test_qwen3_online_contract.py": "a284700b66cc01b8d4024d96539f5204d712076c8526abbd9f6e26e8463992e1",
     "tools/bridge_tp/qwen3_migration_diagnostics.py": "f6608ca05a3f905147e30dc0b5fe8cc8dcf7b605d1b7ad6da9f8f4ced668659d",
     "tests/bridge_tp/test_qwen3_migration_diagnostics.py": "cfed6e02f79c59e48146176dc4a8e751f2e4d5584deb10f6708153c8c1e1fa3d",
@@ -349,7 +349,7 @@
     "vllm/bridge_tp/channel_diagnostics.py": "abb013298c86d52cdff658d9afc76c2af76d38b184a848a910185ca29b9ba97e",
     "vllm/bridge_tp/controller/native_journal.py": "90d2e87c2f5641580e33b95fec547191c3837a5f03e9f3b1104ffffd4034fe59",
     "vllm/bridge_tp/channel_runtime.py": "e0b3afec9b621f6a4df0fe204d28b5ba8b0d08b3fb6a5cf1e51c9e5fb4157934",
-    "tests/bridge_tp/test_channel_runtime.py": "cc147b17546a9def962ce6fc7799d54c5556e483cb4164e1a2b4db71bd5ee15e"
+    "tests/bridge_tp/test_channel_runtime.py": "b2c4364471680e71d243830db84e17cb560979f8a8f3a40a9df751f4cae045bb"
   },
   "server_settings": {
     "dtype": "bfloat16",
