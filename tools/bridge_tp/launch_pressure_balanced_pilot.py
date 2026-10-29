@@ -142,8 +142,11 @@ def arguments(spec):
     if target_tp not in (2, 4):
         raise ValueError("target TP must be 2 or 4")
     devices = args.tp4_gpus.split(",")
-    if (len(devices) != target_tp or len(set(devices)) != target_tp
-            or args.tp1_gpu in devices):
+    if (
+        len(devices) != target_tp
+        or len(set(devices)) != target_tp
+        or args.tp1_gpu in devices
+    ):
         raise ValueError("source/target GPUs must be disjoint and match TP")
     if (
         args.dtype != "bfloat16"
@@ -567,6 +570,10 @@ def run_scene(
         )
         processes.append(stager)
         publish_processes()
+        if spec.get("require_stager_process_ready"):
+            from tools.bridge_tp.qwen3_migration_diagnostics import wait_stager_ready
+
+            wait_stager_ready(mechanism_dir, stager)
         checked = controller.parse_args(
             plan["controller_argv"][2:] + ["--validate-only"]
         )

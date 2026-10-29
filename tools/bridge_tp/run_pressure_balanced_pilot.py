@@ -70,6 +70,7 @@ def parse_args(argv=None):
     parser.add_argument("--no-progress-s", type=float, default=60)
     parser.add_argument("--no-migration", action="store_true")
     parser.add_argument("--platform", choices=["a100", "qwen3"], default="a100")
+    parser.add_argument("--qwen3-execute-migrations", action="store_true")
     parser.add_argument(
         "--routing-strategy",
         default="pressure",
@@ -99,8 +100,12 @@ def parse_args(argv=None):
         from tools.bridge_tp.qwen3_online_validation import CHECKPOINT_SHA
 
         expected = CHECKPOINT_SHA
-        if not args.no_migration:
-            parser.error("Qwen3 policy integration currently permits observation only")
+        if not args.no_migration and not args.qwen3_execute_migrations:
+            parser.error("Qwen3 migration execution must be explicitly enabled")
+    if args.qwen3_execute_migrations and (
+        args.platform != "qwen3" or args.no_migration
+    ):
+        parser.error("Qwen3 execution flag requires the Qwen3 migrate arm")
     if args.predictor_sha256 != expected:
         parser.error("frozen platform checkpoint identity required")
     return args
@@ -233,7 +238,7 @@ def preflight(args):
         gpu_validated=False,
         platform=getattr(args, "platform", "a100"),
         calibration_scope=(
-            "Qwen3 read-only migration advice; original nominal KV "
+            "Qwen3 development experiment; original nominal KV "
             "guard is unvalidated; release maximum is empirical only"
         )
         if getattr(args, "platform", "a100") == "qwen3"
@@ -438,7 +443,9 @@ def _run(args, prepared):
         )
     )
     predictor = load("manager_m5").PredictorEventReader(
-        args.predictor_events, args.predictor_sha256
+        args.predictor_events,
+        args.predictor_sha256,
+        align_history=getattr(args, "platform", "a100") == "qwen3",
     )
     dispatched, previous = {}, {}
     growth_readers = {pool: health.NativeDecodeGrowth() for pool in ("tp1", "tp4")}

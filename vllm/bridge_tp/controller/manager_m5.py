@@ -7,6 +7,7 @@ import bisect
 import json
 import math
 import time
+from collections import deque
 from pathlib import Path
 
 
@@ -38,13 +39,23 @@ class PredictorEventReader:
         *,
         max_age_s: float = 30.0,
         max_output_lag_tokens: int = 40,
+        align_history: bool = False,
+        history_size: int = 4,
     ) -> None:
-        if len(checkpoint_sha256) != 64 or max_age_s <= 0 or max_output_lag_tokens < 0:
+        if (
+            len(checkpoint_sha256) != 64
+            or max_age_s <= 0
+            or max_output_lag_tokens < 0
+            or type(history_size) is not int
+            or history_size < 1
+        ):
             raise ValueError("invalid M5 reader configuration")
         self.path = Path(path)
         self.checkpoint_sha256 = checkpoint_sha256
         self.max_age_s = max_age_s
         self.max_output_lag_tokens = max_output_lag_tokens
+        self.align_history, self.history_size = align_history, history_size
+        self._history: dict[str, deque] = {}
         self._offset = 0
         self._header: dict | None = None
         self._latest: dict[str, dict] = {}
@@ -113,6 +124,7 @@ class PredictorEventReader:
         self._last_position[request_id] = position
         if row.get("kind") == "predictor_unavailable":
             self._latest.pop(request_id, None)
+            self._history.pop(request_id, None)
             self._unavailable[request_id] = str(row.get("reason", "unknown"))
             return
         if row.get("kind") != "predictor_prediction":
@@ -136,6 +148,10 @@ class PredictorEventReader:
         ):
             raise ValueError("invalid M5 predictor probability event")
         self._latest[request_id] = row
+        if self.align_history:
+            self._history.setdefault(
+                request_id, deque(maxlen=self.history_size)
+            ).append(row)
         self._unavailable.pop(request_id, None)
 
     def advisory(
@@ -179,6 +195,29 @@ class PredictorEventReader:
                 "status": "UNAVAILABLE",
                 "reason": self._unavailable.get(request_id, "no prediction yet"),
             }
+        if self.align_history:
+            decision_ns = now_ns if now_ns is not None else time.time_ns()
+            eligible = [
+                v
+                for v in self._history.get(request_id, ())
+                if v["generated_tokens"] <= output_tokens
+                and v["captured_unix_ns"] <= decision_ns
+                and type(v.get("published_unix_ns")) is int
+                and v["captured_unix_ns"] <= v["published_unix_ns"] <= decision_ns
+            ]
+            if not eligible:
+                return {
+                    **result,
+                    "status": "NO_CAUSAL_HISTORY",
+                    "reason": (
+                        "no retained event matches inventory position and decision time"
+                    ),
+                }
+            row = eligible[-1]
+            result["history_alignment"] = (
+                "latest causal event at/before inventory position"
+            )
+            result["retained_events"] = len(self._history[request_id])
         position = row["generated_tokens"]
         result.update(
             {

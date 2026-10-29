@@ -247,7 +247,7 @@ def build_plans(spec, config, inputs, root, common, settings):
     local_spec["policy_config"] = str(policy_path)
     local_spec["maximum_migrations"] = config["maximum_migrations"]
     if policy.get("health_service"):
-        local_spec["health_reference"] = str(
+        local_spec["health_reference"] = spec.get("health_reference") or str(
             Path(spec.get("service_evidence", spec["policy_config"])).parent
             / "health_reference_v2.json"
         )
@@ -301,7 +301,10 @@ def finalize(plan, common):
     common.write_json(
         root / "native_empty_receipt.json", calibration.wait_empty(run_dir)
     )
-    for pool, ranks in (("source", 1), ("target", 4)):
+    for pool, ranks in (
+        ("source", 1),
+        ("target", plan["config"].get("target_tp_size", 4)),
+    ):
         pilot.announce(root.name, "收尾性能轨迹", pool=pool)
         result = _post_json(
             plan["config"][pool + "_url"],
