@@ -319,6 +319,30 @@ class PreflightTests(unittest.TestCase):
             self.assertEqual(prepared[-1]["jobs"], 1)
             self.assertEqual(len(prepared[-1]["input_sha256"]), 4)
             self.assertFalse((root / "run").exists())
+            # Exercise the actual controller preflight, not only the outer plan.
+            assets = Path("experiments/platforms/qwen3_pressure_observation")
+            trial_policy = json.loads((assets / "policy.json").read_text())
+            trial_policy["capacity_guard_blocks"] = 384
+            (root / "policy.json").write_text(json.dumps(trial_policy))
+            control["target_tp_size"] = 2
+            (root / "controller.json").write_text(json.dumps(control))
+            from tools.bridge_tp.qwen3_online_validation import CHECKPOINT_SHA
+
+            argv[argv.index("--predictor-sha256") + 1] = CHECKPOINT_SHA
+            argv[argv.index("--service-evidence") + 1] = str(
+                assets / "service_evidence.json"
+            )
+            argv += [
+                "--platform",
+                "qwen3",
+                "--qwen3-execute-migrations",
+                "--health-reference",
+                str(assets / "health_reference.json"),
+            ]
+            prepared = pilot.preflight(pilot.parse_args(argv))
+            self.assertEqual(prepared[-1]["capacity_guard_blocks"], 384)
+            self.assertEqual(prepared[-1]["capacity_guard_tokens"], 6144)
+            self.assertFalse((root / "run").exists())
 
 
 if __name__ == "__main__":

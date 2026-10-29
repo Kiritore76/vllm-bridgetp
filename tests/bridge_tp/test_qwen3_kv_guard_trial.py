@@ -2,6 +2,7 @@
 """Guard screening must preserve workload parity, default policy and routing."""
 
 import unittest
+from types import SimpleNamespace
 
 from tools.bridge_tp import qwen3_kv_guard_trial as trial
 from tools.bridge_tp import qwen3_migration_matrix as matrix
@@ -63,3 +64,37 @@ class GuardTrialTests(unittest.TestCase):
                 )
                 total += request["max_tokens"]
         self.assertEqual(total * 2, 493184)
+
+    def test_controller_preflight_guard_scope_and_physical_geometry(self):
+        from tools.bridge_tp import run_pressure_balanced_pilot as pilot
+
+        cfg = SimpleNamespace(capacity_guard_blocks=384, health_service=True)
+        controller = SimpleNamespace(
+            target_tp_size=2,
+            block_size=16,
+            tp1_total_kv_blocks=2326,
+            tp4_total_kv_blocks=11713,
+            policy=SimpleNamespace(kv_bytes_per_token=147456),
+        )
+        pilot.validate_guard_geometry(cfg, controller, "qwen3")
+        for platform in ("a100", "unknown"):
+            with self.assertRaises(ValueError):
+                pilot.validate_guard_geometry(cfg, controller, platform)
+        controller.target_tp_size = 4
+        with self.assertRaises(ValueError):
+            pilot.validate_guard_geometry(cfg, controller, "qwen3")
+        controller.target_tp_size = 2
+        cfg.capacity_guard_blocks = 512
+        with self.assertRaises(ValueError):
+            pilot.validate_guard_geometry(cfg, controller, "qwen3")
+        cfg.capacity_guard_blocks = 384
+        controller.tp1_total_kv_blocks = 384
+        with self.assertRaises(ValueError):
+            pilot.validate_guard_geometry(cfg, controller, "qwen3")
+        controller.tp1_total_kv_blocks = 2326
+        controller.block_size = 32
+        with self.assertRaises(ValueError):
+            pilot.validate_guard_geometry(cfg, controller, "qwen3")
+        controller.block_size = 16
+        cfg.capacity_guard_blocks = 125
+        pilot.validate_guard_geometry(cfg, controller, "a100")

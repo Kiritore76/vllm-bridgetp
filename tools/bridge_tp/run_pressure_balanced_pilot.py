@@ -111,6 +111,23 @@ def parse_args(argv=None):
     return args
 
 
+def validate_guard_geometry(cfg, controller, platform):
+    """Retain the A100 contract; allow only the scoped TP2 guard384 trial."""
+    allowed = (
+        {125, 384}
+        if platform == "qwen3" and controller.target_tp_size == 2 and cfg.health_service
+        else {125}
+    )
+    if (
+        controller.block_size != 16
+        or cfg.capacity_guard_blocks not in allowed
+        or controller.tp1_total_kv_blocks <= cfg.capacity_guard_blocks
+        or controller.tp4_total_kv_blocks <= cfg.capacity_guard_blocks
+        or controller.policy.kv_bytes_per_token <= 0
+    ):
+        raise ValueError("pilot geometry/scoped KV guard contract differs")
+
+
 def preflight(args):
     if any(not math.isfinite(w) or w <= 0 for w in args.routing_weights):
         raise ValueError("routing weights must be positive and finite")
@@ -154,14 +171,7 @@ def preflight(args):
         ready_notification_mode=raw.get("ready_notification_mode", "FILE_POLL"),
         ready_notification_port=raw.get("ready_notification_port", 0),
     )
-    if (
-        controller.block_size != 16
-        or cfg.capacity_guard_blocks * 16 != 2000
-        or controller.tp1_total_kv_blocks <= 0
-        or controller.tp4_total_kv_blocks <= 0
-        or controller.policy.kv_bytes_per_token <= 0
-    ):
-        raise ValueError("pilot geometry/2000-token guard contract differs")
+    validate_guard_geometry(cfg, controller, getattr(args, "platform", "a100"))
     if controller.transfer_mode not in {"FULL_SPEED", "ADAPTIVE"}:
         raise ValueError("unknown pressure transfer_mode")
     if controller.transfer_mode == "ADAPTIVE":
@@ -237,6 +247,8 @@ def preflight(args):
         ),
         gpu_validated=False,
         platform=getattr(args, "platform", "a100"),
+        capacity_guard_blocks=cfg.capacity_guard_blocks,
+        capacity_guard_tokens=cfg.capacity_guard_blocks * controller.block_size,
         calibration_scope=(
             "Qwen3 development experiment; original nominal KV "
             "guard is unvalidated; release maximum is empirical only"
@@ -783,7 +795,8 @@ def _run(args, prepared):
                 candidates,
                 predictor,
                 now,
-                pools[0].free_blocks * pools[0].block_size - 2000,
+                (pools[0].free_blocks - cfg.capacity_guard_blocks)
+                * pools[0].block_size,
                 eos,
             )
             growth = pools[0].growth_blocks_s
@@ -808,7 +821,8 @@ def _run(args, prepared):
                 source_sampled_unix_s=pools[0].sampled_at,
                 target_sampled_unix_s=pools[1].sampled_at,
                 source_free_kv_tokens=pools[0].free_blocks * pools[0].block_size,
-                source_guard_free_kv_tokens=2000,
+                source_guard_free_kv_tokens=cfg.capacity_guard_blocks
+                * pools[0].block_size,
                 source_pool_growth_tokens_s=pools[0].growth_blocks_s
                 * pools[0].block_size
                 if pools[0].growth_blocks_s is not None
