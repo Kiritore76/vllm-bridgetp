@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from tools.bridge_tp import launch_pressure_balanced_pilot as pilot  # noqa: E402
+from tools.bridge_tp import qwen3_four_mode as four  # noqa: E402
 from tools.bridge_tp import qwen3_pressure_observation as observation  # noqa: E402
 from tools.bridge_tp import qwen3_stay_migrate as matched  # noqa: E402
 from tools.bridge_tp import run_pressure_comparison as comparison  # noqa: E402
@@ -45,9 +46,9 @@ def adapt_plan(plan, arm, checkpoint, model):
         if "--no-migration" in plan["controller_argv"]:
             raise ValueError("MIGRATE arm must execute actions")
         plan["controller_argv"].append("--qwen3-execute-migrations")
-    elif arm == "stay":
+    elif arm in {"stay", "weighted", "least"}:
         if "--no-migration" not in plan["controller_argv"]:
-            raise ValueError("STAY arm must disable migration")
+            raise ValueError("baseline arms must disable migration")
     else:
         raise ValueError("unknown comparison arm")
 
@@ -103,8 +104,8 @@ def closed_loop_proof(plan, arm):
         for r in audit
         if r.get("kind") == "pressure_decision" and r.get("execution") == "RESERVED"
     ]
-    if arm == "stay" and (starts or reserved):
-        raise ValueError("STAY arm executed or reserved a migration")
+    if arm != "migrate" and (starts or reserved):
+        raise ValueError("baseline arm executed or reserved a migration")
     sessions = []
     for session in final["sessions"]:
         if not session["started"]:
@@ -160,25 +161,50 @@ def main(argv=None):
     for key in ("model", "checkpoint", "inputs", "prior-observation", "output"):
         parser.add_argument("--" + key, type=Path, required=True)
     parser.add_argument("--expected-revision", required=True)
-    parser.add_argument("--repetitions", type=int, choices=(1, 2), default=2)
+    parser.add_argument("--repetitions", type=int, choices=(1, 2, 3), default=2)
+    parser.add_argument("--four-mode", action="store_true")
+    parser.add_argument("--prior-comparison", type=Path)
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
-    values = matched.recipes(args.prior_observation, args.repetitions)
-    cfg = matched.config(values)
+    if args.four_mode:
+        if args.repetitions != 3 or args.prior_comparison is None:
+            parser.error("four-mode requires three repetitions and prior comparison")
+        cfg = four.config(
+            args.prior_observation,
+            read(args.inputs),
+            read(observation.ASSETS / "health_reference.json"),
+        )
+        previous = read(args.prior_comparison / "result.json")
+        if (
+            previous.get("status") != "COMPLETED_PAIRED_EXPERIMENT"
+            or previous.get("total_profile_attempts") != 49
+        ):
+            raise ValueError("requires the completed eighteen-run comparison")
+        values = cfg["recipes"]
+    else:
+        values = matched.recipes(args.prior_observation, args.repetitions)
+        cfg = matched.config(values)
+    run_count = len(values) * len(cfg["arms"])
     if args.validate_only:
         print(
             json.dumps(
                 dict(
                     status="CPU_MATCHED_PLAN_ONLY",
-                    runs=len(values) * 2,
+                    runs=run_count,
+                    arms=cfg["arms"],
+                    routing_weights=cfg["routing_weights"],
                     migration_execution=True,
                     maximum_migrations_per_run=0,
-                    routing_policy="same original pressure policy in both arms",
+                    routing_policy="original four allocation strategies"
+                    if args.four_mode
+                    else "same original pressure policy in both arms",
                     recipes=[
                         {k: v for k, v in r.items() if k != "jobs"} for r in values
                     ],
                     output_contract=(
-                        "primary pairs have identical fixed output budgets; "
+                        "four-mode uses fixed outputs only"
+                        if args.four_mode
+                        else "identical fixed budgets in primary pairs; "
                         "additional natural-EOS pair reported separately"
                     ),
                 ),
@@ -192,6 +218,7 @@ def main(argv=None):
         raise ValueError("results must be outside checkout")
     args.output.mkdir(parents=True, exist_ok=False)
     result, code, ledger, pairs = dict(status="TECHNICAL_FAILURE"), 1, [], []
+    evaluations = []
     try:
         hardware, versions = runtime_inventory(read(PROFILE)), runtime_versions()
         old = read(args.prior_observation / "identity.json")
@@ -217,7 +244,7 @@ def main(argv=None):
             policy_config=str(observation.ASSETS / "policy.json"),
             service_evidence=str(observation.ASSETS / "service_evidence.json"),
             health_reference=str(observation.ASSETS / "health_reference.json"),
-            run_timeout_s=600,
+            run_timeout_s=900 if args.four_mode else 600,
             startup_timeout_s=900,
             no_progress_s=90,
             require_stager_process_ready=True,
@@ -227,13 +254,13 @@ def main(argv=None):
         scope.update(
             migration_execution_enabled=True,
             experiment_only=True,
-            arms=["stay", "migrate"],
+            arms=cfg["arms"],
             repetitions=args.repetitions,
-            maximum_live_runs=len(values) * 2,
+            maximum_live_runs=run_count,
             maximum_migrations_per_run=0,
             fairness=(
-                "same routing policy, prompts, fixed output budgets, "
-                "arrivals, seeds and hooks"
+                "same prompts, fixed output budgets, arrivals, seeds, service "
+                "configuration and hooks; allocation differs by declared arm"
             ),
             guard_status=(
                 "original nominal guard retained for development trial; "
@@ -275,7 +302,7 @@ def main(argv=None):
             ]:
                 raise RuntimeError("owned process cleanup failed")
             proof = closed_loop_proof(plan, arm)
-            summary, requests, _ = matched.metrics(
+            summary, requests, audit = matched.metrics(
                 plan["run_dir"], recipe["jobs"], natural_eos=not recipe["fixed_output"]
             )
             write(plan["run_dir"].parent / "closed_loop_acceptance.json", proof)
@@ -284,6 +311,25 @@ def main(argv=None):
                 dict(summary=summary, requests=requests),
             )
             row.update(status="COMPLETED", summary=summary, closed_loop=proof)
+            if args.four_mode:
+                score = four.full_score(
+                    read(plan["run_dir"] / "pressure_request_results.json"),
+                    cfg,
+                    next(
+                        r["unix_s"]
+                        for r in audit
+                        if r["kind"] == "pressure_clock_origin"
+                    ),
+                    audit,
+                )
+                write(plan["run_dir"].parent / "sustained_goodoutput.json", score)
+                evaluations.append(dict(arm=arm, score=score))
+                write(
+                    args.output / "four_mode_summary.json", four.aggregate(evaluations)
+                )
+                write(
+                    args.output / "four_mode_comparison.json", four.comparisons(ledger)
+                )
             write(args.output / "attempt_ledger.json", ledger)
             arms = {
                 r["arm"]: r
@@ -322,6 +368,21 @@ def main(argv=None):
             if valid and observed
             else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
         )
+        if args.four_mode:
+            paired = four.comparisons(ledger)
+            pairs = paired
+            write(args.output / "four_mode_comparison.json", paired)
+            valid = len(paired) == 3 and all(
+                p["arrivals_valid"]
+                and p["matched_output_work"]
+                and p["all_load_covered"]
+                for p in paired
+            )
+            result, code = (
+                (dict(status="COMPLETED_FOUR_MODE_EXPERIMENT"), 0)
+                if valid
+                else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
+            )
     except KeyboardInterrupt:
         result, code = dict(status="INTERRUPTED"), 130
     except Exception as error:
@@ -337,9 +398,13 @@ def main(argv=None):
             runner_code=code,
             runs=ledger,
             pairs=pairs,
-            previous_profile_attempts=31,
-            total_profile_attempts=31 + len(ledger),
-            maximum_live_runs=len(values) * 2,
+            previous_profile_attempts=49 if args.four_mode else 31,
+            total_profile_attempts=(49 if args.four_mode else 31) + len(ledger),
+            maximum_live_runs=run_count,
+            experiment_mode="four-mode" if args.four_mode else "stay-migrate",
+            actual_migration_observed=any(
+                r.get("summary", {}).get("committed_requests", 0) for r in ledger
+            ),
             maximum_migrations_per_run=0,
             migration_execution=True,
             deployment_ready=False,
