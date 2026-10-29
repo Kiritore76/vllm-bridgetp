@@ -1,0 +1,308 @@
+{
+  "schema": "PRESSURE_HEALTH_REFERENCE_V2",
+  "metric": "CAUSAL_10S_ITL100MS_SLOW1PCT_MAXGAP1S_V1",
+  "target_tp_size": 2,
+  "cells": [
+    {
+      "context_bin": 1,
+      "health_reason": "repeated empirical working point",
+      "health_status": "REFERENCE",
+      "nd": 1,
+      "pool": "source",
+      "runs": 2,
+      "window_goodoutput": {
+        "max": 51.7,
+        "median": 51.7,
+        "min": 51.7,
+        "p95": 51.7
+      }
+    },
+    {
+      "context_bin": 2,
+      "health_reason": "repeated empirical working point",
+      "health_status": "REFERENCE",
+      "nd": 1,
+      "pool": "source",
+      "runs": 2,
+      "window_goodoutput": {
+        "max": 50.75,
+        "median": 50.675,
+        "min": 50.599999999999994,
+        "p95": 50.75
+      }
+    },
+    {
+      "context_bin": 3,
+      "health_reason": "repeated empirical working point",
+      "health_status": "REFERENCE",
+      "nd": 1,
+      "pool": "source",
+      "runs": 2,
+      "window_goodoutput": {
+        "max": 49.2,
+        "median": 48.975,
+        "min": 48.75,
+        "p95": 49.2
+      }
+    },
+    {
+      "context_bin": 1,
+      "health_reason": "repeated empirical working point",
+      "health_status": "REFERENCE",
+      "nd": 2,
+      "pool": "target",
+      "runs": 2,
+      "window_goodoutput": {
+        "max": 120.1,
+        "median": 118.9,
+        "min": 117.7,
+        "p95": 120.1
+      }
+    },
+    {
+      "context_bin": 2,
+      "health_reason": "repeated empirical working point",
+      "health_status": "REFERENCE",
+      "nd": 2,
+      "pool": "target",
+      "runs": 2,
+      "window_goodoutput": {
+        "max": 123.2,
+        "median": 122.9,
+        "min": 122.6,
+        "p95": 123.2
+      }
+    },
+    {
+      "context_bin": 3,
+      "health_reason": "repeated empirical working point",
+      "health_status": "REFERENCE",
+      "nd": 2,
+      "pool": "target",
+      "runs": 2,
+      "window_goodoutput": {
+        "max": 117.0,
+        "median": 114.1,
+        "min": 111.2,
+        "p95": 117.0
+      }
+    },
+    {
+      "context_bin": 1,
+      "health_reason": "repeated empirical working point",
+      "health_status": "REFERENCE",
+      "nd": 2,
+      "pool": "source",
+      "runs": 2,
+      "window_goodoutput": {
+        "max": 96.6,
+        "median": 96.35,
+        "min": 96.1,
+        "p95": 96.6
+      }
+    },
+    {
+      "context_bin": 2,
+      "health_reason": "repeated empirical working point",
+      "health_status": "REFERENCE",
+      "nd": 2,
+      "pool": "source",
+      "runs": 2,
+      "window_goodoutput": {
+        "max": 93.6,
+        "median": 93.5,
+        "min": 93.4,
+        "p95": 93.6
+      }
+    },
+    {
+      "context_bin": 3,
+      "health_reason": "repeated empirical working point",
+      "health_status": "REFERENCE",
+      "nd": 2,
+      "pool": "source",
+      "runs": 2,
+      "window_goodoutput": {
+        "max": 90.4,
+        "median": 90.4,
+        "min": 90.4,
+        "p95": 90.4
+      }
+    },
+    {
+      "context_bin": 1,
+      "health_reason": "repeated empirical working point",
+      "health_status": "REFERENCE",
+      "nd": 4,
+      "pool": "target",
+      "runs": 2,
+      "window_goodoutput": {
+        "max": 246.0,
+        "median": 237.2,
+        "min": 228.39999999999998,
+        "p95": 246.0
+      }
+    },
+    {
+      "context_bin": 2,
+      "health_reason": "repeated empirical working point",
+      "health_status": "REFERENCE",
+      "nd": 4,
+      "pool": "target",
+      "runs": 2,
+      "window_goodoutput": {
+        "max": 246.8,
+        "median": 242.0,
+        "min": 237.2,
+        "p95": 246.8
+      }
+    },
+    {
+      "context_bin": 3,
+      "health_reason": "repeated empirical working point",
+      "health_status": "REFERENCE",
+      "nd": 4,
+      "pool": "target",
+      "runs": 2,
+      "window_goodoutput": {
+        "max": 249.25,
+        "median": 248.425,
+        "min": 247.6,
+        "p95": 249.25
+      }
+    },
+    {
+      "pool": "source",
+      "nd": 4,
+      "context_bin": 1,
+      "runs": 4,
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point",
+      "window_goodoutput": {
+        "min": 180.4,
+        "median": 182.4,
+        "p95": 182.4,
+        "max": 182.4
+      }
+    },
+    {
+      "pool": "source",
+      "nd": 4,
+      "context_bin": 2,
+      "runs": 4,
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point",
+      "window_goodoutput": {
+        "min": 168.8,
+        "median": 171.2,
+        "p95": 172.6,
+        "max": 172.6
+      }
+    },
+    {
+      "pool": "source",
+      "nd": 4,
+      "context_bin": 3,
+      "runs": 4,
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point",
+      "window_goodoutput": {
+        "min": 160.2,
+        "median": 161.0,
+        "p95": 161.8,
+        "max": 161.8
+      }
+    },
+    {
+      "pool": "target",
+      "nd": 8,
+      "context_bin": 1,
+      "runs": 2,
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point",
+      "window_goodoutput": {
+        "min": 400.8,
+        "median": 416.4,
+        "p95": 432.0,
+        "max": 432.0
+      }
+    },
+    {
+      "pool": "target",
+      "nd": 8,
+      "context_bin": 2,
+      "runs": 2,
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point",
+      "window_goodoutput": {
+        "min": 430.0,
+        "median": 440.2,
+        "p95": 450.4,
+        "max": 450.4
+      }
+    },
+    {
+      "pool": "target",
+      "nd": 8,
+      "context_bin": 3,
+      "runs": 2,
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point",
+      "window_goodoutput": {
+        "min": 397.25,
+        "median": 403.825,
+        "p95": 410.4,
+        "max": 410.4
+      }
+    },
+    {
+      "pool": "target",
+      "nd": 16,
+      "context_bin": 1,
+      "runs": 2,
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point",
+      "window_goodoutput": {
+        "min": 752.0,
+        "median": 777.6,
+        "p95": 803.2,
+        "max": 803.2
+      }
+    },
+    {
+      "pool": "target",
+      "nd": 16,
+      "context_bin": 2,
+      "runs": 2,
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point",
+      "window_goodoutput": {
+        "min": 696.8,
+        "median": 703.675,
+        "p95": 710.55,
+        "max": 710.55
+      }
+    },
+    {
+      "pool": "target",
+      "nd": 16,
+      "context_bin": 3,
+      "runs": 2,
+      "health_status": "REFERENCE",
+      "health_reason": "repeated empirical working point",
+      "window_goodoutput": {
+        "min": 625.25,
+        "median": 630.625,
+        "p95": 636.0,
+        "max": 636.0
+      }
+    }
+  ],
+  "provenance": {
+    "multi\\control\\QWEN3_SCHEDULER_SUPPLEMENT_ANALYSIS_20261028.json": "ffa2ad8e521aeeff2140621f1bd33bfe0f5349d8f689f0c0afa846468ad65674",
+    "multi\\results\\unpacked_qwen3_tp2_service_20261028_151240_21544\\qwen3_tp2_service_20261028_151240_21544\\service_profile.json": "fb75767373e9577ad06285be6734104851856542b8ebf4ed6c76258f32fe47f4",
+    "multi\\results\\unpacked_qwen3_parameter_batch_20261028_161242_17847\\qwen3_parameter_batch_20261028_161242_17847\\service\\service_profile.json": "a9aa56edd315863ae1aa3a70ee93d2d69f72749d0a55d30b0c1b641917d2ae21",
+    "multi\\results\\unpacked_qwen3_scheduler_supplement_20261028_185441_12295\\qwen3_scheduler_supplement_20261028_185441_12295\\service_profile.json": "091d9c2f03fda754ae87d327995327237ed2ca516493c16308a41bbdc8bf1fdb"
+  },
+  "deployment_ready": false
+}

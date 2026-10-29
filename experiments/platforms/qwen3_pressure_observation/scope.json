@@ -1,0 +1,19 @@
+{
+  "migration_execution_enabled": false,
+  "target_tp_size": 2,
+  "predictor_sha256": "f51f6a8fd2e299f2ebffae71706f7c9dcd93154eeffa18cf008bf0ee710f738f",
+  "source_context_limit": 8192,
+  "target_context_limit": 16384,
+  "general_guard_blocks": null,
+  "general_release_bound_s": null,
+  "nominal_original_guard_blocks": 125,
+  "guard_status": "original nominal 2000-token margin retained for ADVICE ONLY; NOT TP2 calibrated",
+  "release_status": "observed maximum only; not a general bound",
+  "algorithm": "unchanged PressureCoordinator/PressurePolicy/admit/with_predictions",
+  "provenance": {
+    "multi\\control\\QWEN3_SCHEDULER_SUPPLEMENT_ANALYSIS_20261028.json": "ffa2ad8e521aeeff2140621f1bd33bfe0f5349d8f689f0c0afa846468ad65674",
+    "multi\\results\\unpacked_qwen3_tp2_service_20261028_151240_21544\\qwen3_tp2_service_20261028_151240_21544\\service_profile.json": "fb75767373e9577ad06285be6734104851856542b8ebf4ed6c76258f32fe47f4",
+    "multi\\results\\unpacked_qwen3_parameter_batch_20261028_161242_17847\\qwen3_parameter_batch_20261028_161242_17847\\service\\service_profile.json": "a9aa56edd315863ae1aa3a70ee93d2d69f72749d0a55d30b0c1b641917d2ae21",
+    "multi\\results\\unpacked_qwen3_scheduler_supplement_20261028_185441_12295\\qwen3_scheduler_supplement_20261028_185441_12295\\service_profile.json": "091d9c2f03fda754ae87d327995327237ed2ca516493c16308a41bbdc8bf1fdb"
+  }
+}

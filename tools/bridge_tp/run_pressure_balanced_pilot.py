@@ -69,6 +69,7 @@ def parse_args(argv=None):
     parser.add_argument("--tick-s", type=float, default=0.2)
     parser.add_argument("--no-progress-s", type=float, default=60)
     parser.add_argument("--no-migration", action="store_true")
+    parser.add_argument("--platform", choices=["a100", "qwen3"], default="a100")
     parser.add_argument(
         "--routing-strategy",
         default="pressure",
@@ -93,11 +94,15 @@ def parse_args(argv=None):
         for v in (args.tick_s, args.max_seconds, args.no_progress_s)
     ):
         parser.error("positive tick and runtime required")
-    if (
-        args.predictor_sha256
-        != "dbe02d968e19c32d69deaa9a37748e9ca68f506807b220c114d22a4e2845c8a7"
-    ):
-        parser.error("frozen four-layer76 checkpoint identity required")
+    expected = "dbe02d968e19c32d69deaa9a37748e9ca68f506807b220c114d22a4e2845c8a7"
+    if args.platform == "qwen3":
+        from tools.bridge_tp.qwen3_online_validation import CHECKPOINT_SHA
+
+        expected = CHECKPOINT_SHA
+        if not args.no_migration:
+            parser.error("Qwen3 policy integration currently permits observation only")
+    if args.predictor_sha256 != expected:
+        parser.error("frozen platform checkpoint identity required")
     return args
 
 
@@ -163,8 +168,10 @@ def preflight(args):
     evidence = read(args.service_evidence)
     if controller.target_tp_size == 2 and (
         evidence.get("target_tp_size") != 2
-        or (args.health_reference
-            and read(args.health_reference).get("target_tp_size") != 2)
+        or (
+            args.health_reference
+            and read(args.health_reference).get("target_tp_size") != 2
+        )
     ):
         raise ValueError("TP2 requires explicitly identified TP2 service profiles")
     lookup = s.LocalServiceLookup(evidence)
@@ -224,6 +231,13 @@ def preflight(args):
             "observed engine-span local proxy; causal ITL delta unmeasured"
         ),
         gpu_validated=False,
+        platform=getattr(args, "platform", "a100"),
+        calibration_scope=(
+            "Qwen3 read-only migration advice; original nominal KV "
+            "guard is unvalidated; release maximum is empirical only"
+        )
+        if getattr(args, "platform", "a100") == "qwen3"
+        else "original A100 contract",
     )
     return cfg, controller, lookup, jobs, receipt
 

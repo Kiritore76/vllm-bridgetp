@@ -1,0 +1,3259 @@
+{
+  "schema": "PRESSURE_EVIDENCE_V1",
+  "target_tp_size": 2,
+  "service_lookup": [
+    {
+      "context_sum_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "decode_requests": 0,
+      "engine_ms": {
+        "max": 217.82163996249437,
+        "median": 217.21665374934673,
+        "min": 216.6116675361991,
+        "p95": 217.82163996249437
+      },
+      "mean_context_bin_1024": 0,
+      "phase": "prefill_ge1536",
+      "pool": "source",
+      "prefill_bin_256": 8,
+      "prefill_tokens_range": {
+        "max": 2048,
+        "median": 2048.0,
+        "min": 2048,
+        "p95": 2048
+      },
+      "runs": 2,
+      "samples": 2
+    },
+    {
+      "context_sum_range": {
+        "max": 3068,
+        "median": 2560.0,
+        "min": 2052,
+        "p95": 3020
+      },
+      "decode_requests": 1,
+      "engine_ms": {
+        "max": 19.71403881907463,
+        "median": 19.045775290578604,
+        "min": 18.878016620874405,
+        "p95": 19.600383937358856
+      },
+      "mean_context_bin_1024": 2,
+      "phase": "decode",
+      "pool": "source",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 2,
+      "samples": 256
+    },
+    {
+      "context_sum_range": {
+        "max": 4092,
+        "median": 3584.0,
+        "min": 3076,
+        "p95": 4044
+      },
+      "decode_requests": 1,
+      "engine_ms": {
+        "max": 20.291362889111042,
+        "median": 19.195323809981346,
+        "min": 18.973534926772118,
+        "p95": 19.85766366124153
+      },
+      "mean_context_bin_1024": 3,
+      "phase": "decode",
+      "pool": "source",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 2,
+      "samples": 256
+    },
+    {
+      "context_sum_range": {
+        "max": 5116,
+        "median": 4608.0,
+        "min": 4100,
+        "p95": 5068
+      },
+      "decode_requests": 1,
+      "engine_ms": {
+        "max": 20.482839085161686,
+        "median": 19.38361395150423,
+        "min": 19.22116708010435,
+        "p95": 20.15662007033825
+      },
+      "mean_context_bin_1024": 4,
+      "phase": "decode",
+      "pool": "source",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 2,
+      "samples": 256
+    },
+    {
+      "context_sum_range": {
+        "max": 6140,
+        "median": 5632.0,
+        "min": 5124,
+        "p95": 6092
+      },
+      "decode_requests": 1,
+      "engine_ms": {
+        "max": 27.015218511223793,
+        "median": 19.5104768499732,
+        "min": 19.302058964967728,
+        "p95": 20.351825281977654
+      },
+      "mean_context_bin_1024": 5,
+      "phase": "decode",
+      "pool": "source",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 2,
+      "samples": 256
+    },
+    {
+      "context_sum_range": {
+        "max": 7164,
+        "median": 6656.0,
+        "min": 6148,
+        "p95": 7116
+      },
+      "decode_requests": 1,
+      "engine_ms": {
+        "max": 22.654850967228413,
+        "median": 19.90267913788557,
+        "min": 19.48613580316305,
+        "p95": 20.986040122807026
+      },
+      "mean_context_bin_1024": 6,
+      "phase": "decode",
+      "pool": "source",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 2,
+      "samples": 256
+    },
+    {
+      "context_sum_range": {
+        "max": 8188,
+        "median": 7680.0,
+        "min": 7172,
+        "p95": 8140
+      },
+      "decode_requests": 1,
+      "engine_ms": {
+        "max": 31.387219205498695,
+        "median": 20.238082390278578,
+        "min": 19.731703214347363,
+        "p95": 21.77060768008232
+      },
+      "mean_context_bin_1024": 7,
+      "phase": "decode",
+      "pool": "source",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 2,
+      "samples": 256
+    },
+    {
+      "context_sum_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "decode_requests": 0,
+      "engine_ms": {
+        "max": 289.9143472313881,
+        "median": 289.4172351807356,
+        "min": 288.9201231300831,
+        "p95": 289.9143472313881
+      },
+      "mean_context_bin_1024": 0,
+      "phase": "prefill_ge1536",
+      "pool": "target",
+      "prefill_bin_256": 8,
+      "prefill_tokens_range": {
+        "max": 2048,
+        "median": 2048.0,
+        "min": 2048,
+        "p95": 2048
+      },
+      "runs": 2,
+      "samples": 2
+    },
+    {
+      "context_sum_range": {
+        "max": 2049,
+        "median": 2049.0,
+        "min": 2049,
+        "p95": 2049
+      },
+      "decode_requests": 1,
+      "engine_ms": {
+        "max": 28.563518077135086,
+        "median": 28.182137291878462,
+        "min": 27.800756506621838,
+        "p95": 28.563518077135086
+      },
+      "mean_context_bin_1024": 2,
+      "phase": "prefill_lt256",
+      "pool": "target",
+      "prefill_bin_256": 1,
+      "prefill_tokens_range": {
+        "max": 1,
+        "median": 1.0,
+        "min": 1,
+        "p95": 1
+      },
+      "runs": 2,
+      "samples": 2
+    },
+    {
+      "context_sum_range": {
+        "max": 2048,
+        "median": 2048.0,
+        "min": 2048,
+        "p95": 2048
+      },
+      "decode_requests": 1,
+      "engine_ms": {
+        "max": 275.76925698667765,
+        "median": 275.4687056876719,
+        "min": 275.16815438866615,
+        "p95": 275.76925698667765
+      },
+      "mean_context_bin_1024": 2,
+      "phase": "prefill_ge1536",
+      "pool": "target",
+      "prefill_bin_256": 8,
+      "prefill_tokens_range": {
+        "max": 2047,
+        "median": 2047.0,
+        "min": 2047,
+        "p95": 2047
+      },
+      "runs": 2,
+      "samples": 2
+    },
+    {
+      "context_sum_range": {
+        "max": 6134,
+        "median": 5118.0,
+        "min": 4102,
+        "p95": 6038
+      },
+      "decode_requests": 2,
+      "engine_ms": {
+        "max": 28.149803169071674,
+        "median": 16.158590093255043,
+        "min": 14.638594351708889,
+        "p95": 22.921787574887276
+      },
+      "mean_context_bin_1024": 2,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 2,
+      "samples": 256
+    },
+    {
+      "context_sum_range": {
+        "max": 8182,
+        "median": 7166.0,
+        "min": 6150,
+        "p95": 8086
+      },
+      "decode_requests": 2,
+      "engine_ms": {
+        "max": 23.284489288926125,
+        "median": 16.038077883422375,
+        "min": 14.88449890166521,
+        "p95": 19.30602826178074
+      },
+      "mean_context_bin_1024": 3,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 2,
+      "samples": 256
+    },
+    {
+      "context_sum_range": {
+        "max": 10230,
+        "median": 9214.0,
+        "min": 8198,
+        "p95": 10134
+      },
+      "decode_requests": 2,
+      "engine_ms": {
+        "max": 23.684692569077015,
+        "median": 15.939169097691774,
+        "min": 14.520902186632156,
+        "p95": 17.665782012045383
+      },
+      "mean_context_bin_1024": 4,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 2,
+      "samples": 256
+    },
+    {
+      "context_sum_range": {
+        "max": 12278,
+        "median": 11262.0,
+        "min": 10246,
+        "p95": 12182
+      },
+      "decode_requests": 2,
+      "engine_ms": {
+        "max": 24.93018377572298,
+        "median": 15.902618411928415,
+        "min": 14.569646678864956,
+        "p95": 17.061466351151466
+      },
+      "mean_context_bin_1024": 5,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 2,
+      "samples": 256
+    },
+    {
+      "context_sum_range": {
+        "max": 14326,
+        "median": 13310.0,
+        "min": 12294,
+        "p95": 14230
+      },
+      "decode_requests": 2,
+      "engine_ms": {
+        "max": 25.208666920661926,
+        "median": 16.522931400686502,
+        "min": 15.28746448457241,
+        "p95": 22.48907182365656
+      },
+      "mean_context_bin_1024": 6,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 2,
+      "samples": 256
+    },
+    {
+      "context_sum_range": {
+        "max": 16374,
+        "median": 15358.0,
+        "min": 14342,
+        "p95": 16278
+      },
+      "decode_requests": 2,
+      "engine_ms": {
+        "max": 35.352449864149094,
+        "median": 16.714550089091063,
+        "min": 14.869015663862228,
+        "p95": 22.565179504454136
+      },
+      "mean_context_bin_1024": 7,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 2,
+      "samples": 256
+    },
+    {
+      "context_sum_range": {
+        "max": 0,
+        "median": 0,
+        "min": 0,
+        "p95": 0
+      },
+      "decode_requests": 0,
+      "engine_ms": {
+        "max": 258.4059201180935,
+        "median": 217.86981355398893,
+        "min": 216.6862916201353,
+        "p95": 258.4059201180935
+      },
+      "mean_context_bin_1024": 0,
+      "phase": "prefill_ge1536",
+      "pool": "source",
+      "prefill_bin_256": 8,
+      "prefill_tokens_range": {
+        "max": 2048,
+        "median": 2048,
+        "min": 2048,
+        "p95": 2048
+      },
+      "runs": 7,
+      "samples": 9
+    },
+    {
+      "context_sum_range": {
+        "max": 3065,
+        "median": 2600.0,
+        "min": 2048,
+        "p95": 3024
+      },
+      "decode_requests": 1,
+      "engine_ms": {
+        "max": 27.674272656440735,
+        "median": 19.099663477391005,
+        "min": 18.73651333153248,
+        "p95": 19.807874225080013
+      },
+      "mean_context_bin_1024": 2,
+      "phase": "decode",
+      "pool": "source",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 4,
+      "samples": 470
+    },
+    {
+      "context_sum_range": {
+        "max": 2489,
+        "median": 2292.0,
+        "min": 2049,
+        "p95": 2484
+      },
+      "decode_requests": 1,
+      "engine_ms": {
+        "max": 28.221583925187588,
+        "median": 25.36248229444027,
+        "min": 23.71663600206375,
+        "p95": 28.03004253655672
+      },
+      "mean_context_bin_1024": 2,
+      "phase": "prefill_lt256",
+      "pool": "source",
+      "prefill_bin_256": 1,
+      "prefill_tokens_range": {
+        "max": 2,
+        "median": 2.0,
+        "min": 1,
+        "p95": 2
+      },
+      "runs": 4,
+      "samples": 12
+    },
+    {
+      "context_sum_range": {
+        "max": 2463,
+        "median": 2321.0,
+        "min": 2177,
+        "p95": 2463
+      },
+      "decode_requests": 1,
+      "engine_ms": {
+        "max": 66.88238773494959,
+        "median": 65.0887624360621,
+        "min": 64.1903979703784,
+        "p95": 66.88238773494959
+      },
+      "mean_context_bin_1024": 2,
+      "phase": "prefill_256_767",
+      "pool": "source",
+      "prefill_bin_256": 2,
+      "prefill_tokens_range": {
+        "max": 512,
+        "median": 512.0,
+        "min": 512,
+        "p95": 512
+      },
+      "runs": 2,
+      "samples": 10
+    },
+    {
+      "context_sum_range": {
+        "max": 2488,
+        "median": 2328.5,
+        "min": 2048,
+        "p95": 2487
+      },
+      "decode_requests": 1,
+      "engine_ms": {
+        "max": 240.32737407833338,
+        "median": 219.90245021879673,
+        "min": 216.4826411753893,
+        "p95": 239.84258249402046
+      },
+      "mean_context_bin_1024": 2,
+      "phase": "prefill_ge1536",
+      "pool": "source",
+      "prefill_bin_256": 8,
+      "prefill_tokens_range": {
+        "max": 2047,
+        "median": 2047.0,
+        "min": 2047,
+        "p95": 2047
+      },
+      "runs": 4,
+      "samples": 22
+    },
+    {
+      "context_sum_range": {
+        "max": 4089,
+        "median": 3580.5,
+        "min": 3072,
+        "p95": 4040
+      },
+      "decode_requests": 1,
+      "engine_ms": {
+        "max": 29.721480794250965,
+        "median": 19.300241954624653,
+        "min": 18.964682705700397,
+        "p95": 20.083333365619183
+      },
+      "mean_context_bin_1024": 3,
+      "phase": "decode",
+      "pool": "source",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 4,
+      "samples": 512
+    },
+    {
+      "context_sum_range": {
+        "max": 5113,
+        "median": 4604.5,
+        "min": 4096,
+        "p95": 5064
+      },
+      "decode_requests": 1,
+      "engine_ms": {
+        "max": 26.336918585002422,
+        "median": 19.42489482462406,
+        "min": 19.146778620779514,
+        "p95": 20.31344547867775
+      },
+      "mean_context_bin_1024": 4,
+      "phase": "decode",
+      "pool": "source",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 4,
+      "samples": 512
+    },
+    {
+      "context_sum_range": {
+        "max": 6137,
+        "median": 5628.5,
+        "min": 5120,
+        "p95": 6088
+      },
+      "decode_requests": 1,
+      "engine_ms": {
+        "max": 29.10609170794487,
+        "median": 19.489506259560585,
+        "min": 19.210005179047585,
+        "p95": 20.373797044157982
+      },
+      "mean_context_bin_1024": 5,
+      "phase": "decode",
+      "pool": "source",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 4,
+      "samples": 512
+    },
+    {
+      "context_sum_range": {
+        "max": 7166,
+        "median": 7166,
+        "min": 7166,
+        "p95": 7166
+      },
+      "decode_requests": 1,
+      "engine_ms": {
+        "max": 19.96839325875044,
+        "median": 19.96839325875044,
+        "min": 19.96839325875044,
+        "p95": 19.96839325875044
+      },
+      "mean_context_bin_1024": 6,
+      "phase": "decode",
+      "pool": "source",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 1,
+      "samples": 1
+    },
+    {
+      "context_sum_range": {
+        "max": 6147,
+        "median": 6145.5,
+        "min": 6144,
+        "p95": 6147
+      },
+      "decode_requests": 1,
+      "engine_ms": {
+        "max": 265.63997752964497,
+        "median": 238.3410008624196,
+        "min": 227.07232646644115,
+        "p95": 265.63997752964497
+      },
+      "mean_context_bin_1024": 6,
+      "phase": "prefill_ge1536",
+      "pool": "source",
+      "prefill_bin_256": 8,
+      "prefill_tokens_range": {
+        "max": 2047,
+        "median": 2047.0,
+        "min": 2047,
+        "p95": 2047
+      },
+      "runs": 1,
+      "samples": 4
+    },
+    {
+      "context_sum_range": {
+        "max": 2997,
+        "median": 2848.0,
+        "min": 2703,
+        "p95": 2994
+      },
+      "decode_requests": 2,
+      "engine_ms": {
+        "max": 22.398781962692738,
+        "median": 20.31883131712675,
+        "min": 19.733098335564137,
+        "p95": 20.98899334669113
+      },
+      "mean_context_bin_1024": 1,
+      "phase": "decode",
+      "pool": "source",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 2,
+      "samples": 18
+    },
+    {
+      "context_sum_range": {
+        "max": 6134,
+        "median": 5118.0,
+        "min": 4102,
+        "p95": 6038
+      },
+      "decode_requests": 2,
+      "engine_ms": {
+        "max": 30.92171810567379,
+        "median": 20.244718994945288,
+        "min": 20.01890540122986,
+        "p95": 21.077830344438553
+      },
+      "mean_context_bin_1024": 2,
+      "phase": "decode",
+      "pool": "source",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 2,
+      "samples": 256
+    },
+    {
+      "context_sum_range": {
+        "max": 8182,
+        "median": 7094.0,
+        "min": 6150,
+        "p95": 8070
+      },
+      "decode_requests": 2,
+      "engine_ms": {
+        "max": 22.287397645413876,
+        "median": 20.58112993836403,
+        "min": 20.23274078965187,
+        "p95": 20.795865915715694
+      },
+      "mean_context_bin_1024": 3,
+      "phase": "decode",
+      "pool": "source",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 4,
+      "samples": 274
+    },
+    {
+      "context_sum_range": {
+        "max": 10230,
+        "median": 9214.0,
+        "min": 8198,
+        "p95": 10134
+      },
+      "decode_requests": 2,
+      "engine_ms": {
+        "max": 25.12289583683014,
+        "median": 20.865127444267273,
+        "min": 20.573743619024754,
+        "p95": 21.182850003242493
+      },
+      "mean_context_bin_1024": 4,
+      "phase": "decode",
+      "pool": "source",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 2,
+      "samples": 256
+    },
+    {
+      "context_sum_range": {
+        "max": 12278,
+        "median": 11262.0,
+        "min": 10246,
+        "p95": 12182
+      },
+      "decode_requests": 2,
+      "engine_ms": {
+        "max": 22.90400117635727,
+        "median": 21.236689295619726,
+        "min": 20.831027999520302,
+        "p95": 22.439713589847088
+      },
+      "mean_context_bin_1024": 5,
+      "phase": "decode",
+      "pool": "source",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 2,
+      "samples": 256
+    },
+    {
+      "context_sum_range": {
+        "max": 14326,
+        "median": 13310.0,
+        "min": 12294,
+        "p95": 14230
+      },
+      "decode_requests": 2,
+      "engine_ms": {
+        "max": 23.794060572981834,
+        "median": 21.507139783352613,
+        "min": 21.225485019385815,
+        "p95": 22.18597661703825
+      },
+      "mean_context_bin_1024": 6,
+      "phase": "decode",
+      "pool": "source",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 2,
+      "samples": 256
+    },
+    {
+      "context_sum_range": {
+        "max": 12296,
+        "median": 12294,
+        "min": 12292,
+        "p95": 12296
+      },
+      "decode_requests": 2,
+      "engine_ms": {
+        "max": 268.8410673290491,
+        "median": 246.60039972513914,
+        "min": 233.11457689851522,
+        "p95": 268.8410673290491
+      },
+      "mean_context_bin_1024": 6,
+      "phase": "prefill_ge1536",
+      "pool": "source",
+      "prefill_bin_256": 8,
+      "prefill_tokens_range": {
+        "max": 2046,
+        "median": 2046,
+        "min": 2046,
+        "p95": 2046
+      },
+      "runs": 1,
+      "samples": 3
+    },
+    {
+      "context_sum_range": {
+        "max": 16374,
+        "median": 15358.0,
+        "min": 14342,
+        "p95": 16278
+      },
+      "decode_requests": 2,
+      "engine_ms": {
+        "max": 24.784943088889122,
+        "median": 21.855744067579508,
+        "min": 21.59946598112583,
+        "p95": 23.799492046236992
+      },
+      "mean_context_bin_1024": 7,
+      "phase": "decode",
+      "pool": "source",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 2,
+      "samples": 256
+    },
+    {
+      "context_sum_range": {
+        "max": 21483,
+        "median": 21483,
+        "min": 21483,
+        "p95": 21483
+      },
+      "decode_requests": 3,
+      "engine_ms": {
+        "max": 23.089084774255753,
+        "median": 23.089084774255753,
+        "min": 23.089084774255753,
+        "p95": 23.089084774255753
+      },
+      "mean_context_bin_1024": 6,
+      "phase": "decode",
+      "pool": "source",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 1,
+      "samples": 1
+    },
+    {
+      "context_sum_range": {
+        "max": 18448,
+        "median": 18448,
+        "min": 18448,
+        "p95": 18448
+      },
+      "decode_requests": 3,
+      "engine_ms": {
+        "max": 53.626093082129955,
+        "median": 53.626093082129955,
+        "min": 53.626093082129955,
+        "p95": 53.626093082129955
+      },
+      "mean_context_bin_1024": 6,
+      "phase": "prefill_lt256",
+      "pool": "source",
+      "prefill_bin_256": 1,
+      "prefill_tokens_range": {
+        "max": 16,
+        "median": 16,
+        "min": 16,
+        "p95": 16
+      },
+      "runs": 1,
+      "samples": 1
+    },
+    {
+      "context_sum_range": {
+        "max": 18445,
+        "median": 18443.5,
+        "min": 18442,
+        "p95": 18445
+      },
+      "decode_requests": 3,
+      "engine_ms": {
+        "max": 267.73655228316784,
+        "median": 257.930101826787,
+        "min": 248.12365137040615,
+        "p95": 267.73655228316784
+      },
+      "mean_context_bin_1024": 6,
+      "phase": "prefill_ge1536",
+      "pool": "source",
+      "prefill_bin_256": 8,
+      "prefill_tokens_range": {
+        "max": 2045,
+        "median": 2045.0,
+        "min": 2045,
+        "p95": 2045
+      },
+      "runs": 1,
+      "samples": 2
+    },
+    {
+      "context_sum_range": {
+        "max": 28619,
+        "median": 26619.0,
+        "min": 24619,
+        "p95": 28427
+      },
+      "decode_requests": 4,
+      "engine_ms": {
+        "max": 33.94262492656708,
+        "median": 23.776693735271692,
+        "min": 23.427057079970837,
+        "p95": 26.96631196886301
+      },
+      "mean_context_bin_1024": 6,
+      "phase": "decode",
+      "pool": "source",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 1,
+      "samples": 126
+    },
+    {
+      "context_sum_range": {
+        "max": 0,
+        "median": 0,
+        "min": 0,
+        "p95": 0
+      },
+      "decode_requests": 0,
+      "engine_ms": {
+        "max": 299.22121949493885,
+        "median": 289.00548815727234,
+        "min": 283.9006371796131,
+        "p95": 299.22121949493885
+      },
+      "mean_context_bin_1024": 0,
+      "phase": "prefill_ge1536",
+      "pool": "target",
+      "prefill_bin_256": 8,
+      "prefill_tokens_range": {
+        "max": 2048,
+        "median": 2048,
+        "min": 2048,
+        "p95": 2048
+      },
+      "runs": 7,
+      "samples": 9
+    },
+    {
+      "context_sum_range": {
+        "max": 2049,
+        "median": 2049.0,
+        "min": 2049,
+        "p95": 2049
+      },
+      "decode_requests": 1,
+      "engine_ms": {
+        "max": 37.48789522796869,
+        "median": 28.705321718007326,
+        "min": 27.32882648706436,
+        "p95": 37.48789522796869
+      },
+      "mean_context_bin_1024": 2,
+      "phase": "prefill_lt256",
+      "pool": "target",
+      "prefill_bin_256": 1,
+      "prefill_tokens_range": {
+        "max": 1,
+        "median": 1.0,
+        "min": 1,
+        "p95": 1
+      },
+      "runs": 4,
+      "samples": 4
+    },
+    {
+      "context_sum_range": {
+        "max": 2049,
+        "median": 2048.0,
+        "min": 2048,
+        "p95": 2049
+      },
+      "decode_requests": 1,
+      "engine_ms": {
+        "max": 276.89154352992773,
+        "median": 274.002019315958,
+        "min": 273.50835781544447,
+        "p95": 276.89154352992773
+      },
+      "mean_context_bin_1024": 2,
+      "phase": "prefill_ge1536",
+      "pool": "target",
+      "prefill_bin_256": 8,
+      "prefill_tokens_range": {
+        "max": 2047,
+        "median": 2047.0,
+        "min": 2047,
+        "p95": 2047
+      },
+      "runs": 6,
+      "samples": 8
+    },
+    {
+      "context_sum_range": {
+        "max": 6147,
+        "median": 6145.5,
+        "min": 6144,
+        "p95": 6147
+      },
+      "decode_requests": 1,
+      "engine_ms": {
+        "max": 296.4033139869571,
+        "median": 287.4625832773745,
+        "min": 278.6331530660391,
+        "p95": 296.4033139869571
+      },
+      "mean_context_bin_1024": 6,
+      "phase": "prefill_ge1536",
+      "pool": "target",
+      "prefill_bin_256": 8,
+      "prefill_tokens_range": {
+        "max": 2047,
+        "median": 2047.0,
+        "min": 2047,
+        "p95": 2047
+      },
+      "runs": 1,
+      "samples": 4
+    },
+    {
+      "context_sum_range": {
+        "max": 8190,
+        "median": 8190.0,
+        "min": 8190,
+        "p95": 8190
+      },
+      "decode_requests": 1,
+      "engine_ms": {
+        "max": 22.84861169755459,
+        "median": 18.81797518581152,
+        "min": 14.787338674068451,
+        "p95": 22.84861169755459
+      },
+      "mean_context_bin_1024": 7,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 2,
+      "samples": 2
+    },
+    {
+      "context_sum_range": {
+        "max": 6142,
+        "median": 5214,
+        "min": 4110,
+        "p95": 6048
+      },
+      "decode_requests": 2,
+      "engine_ms": {
+        "max": 31.635724008083344,
+        "median": 16.406536102294922,
+        "min": 14.09637276083231,
+        "p95": 22.62460347265005
+      },
+      "mean_context_bin_1024": 2,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 4,
+      "samples": 465
+    },
+    {
+      "context_sum_range": {
+        "max": 5034,
+        "median": 4674.0,
+        "min": 4332,
+        "p95": 5034
+      },
+      "decode_requests": 2,
+      "engine_ms": {
+        "max": 23.027178831398487,
+        "median": 18.576436676084995,
+        "min": 17.67432875931263,
+        "p95": 23.027178831398487
+      },
+      "mean_context_bin_1024": 2,
+      "phase": "prefill_lt256",
+      "pool": "target",
+      "prefill_bin_256": 1,
+      "prefill_tokens_range": {
+        "max": 4,
+        "median": 4.0,
+        "min": 4,
+        "p95": 4
+      },
+      "runs": 2,
+      "samples": 10
+    },
+    {
+      "context_sum_range": {
+        "max": 4946,
+        "median": 4608.0,
+        "min": 4278,
+        "p95": 4946
+      },
+      "decode_requests": 2,
+      "engine_ms": {
+        "max": 79.52598761767149,
+        "median": 78.13786016777158,
+        "min": 77.91144400835037,
+        "p95": 79.52598761767149
+      },
+      "mean_context_bin_1024": 2,
+      "phase": "prefill_256_767",
+      "pool": "target",
+      "prefill_bin_256": 2,
+      "prefill_tokens_range": {
+        "max": 512,
+        "median": 512.0,
+        "min": 512,
+        "p95": 512
+      },
+      "runs": 2,
+      "samples": 10
+    },
+    {
+      "context_sum_range": {
+        "max": 5032,
+        "median": 4653.0,
+        "min": 4098,
+        "p95": 5030
+      },
+      "decode_requests": 2,
+      "engine_ms": {
+        "max": 284.9819269031286,
+        "median": 274.6830810792744,
+        "min": 272.7315854281187,
+        "p95": 284.7911464050412
+      },
+      "mean_context_bin_1024": 2,
+      "phase": "prefill_ge1536",
+      "pool": "target",
+      "prefill_bin_256": 8,
+      "prefill_tokens_range": {
+        "max": 2046,
+        "median": 2046.0,
+        "min": 2046,
+        "p95": 2046
+      },
+      "runs": 4,
+      "samples": 22
+    },
+    {
+      "context_sum_range": {
+        "max": 8190,
+        "median": 7167.0,
+        "min": 6144,
+        "p95": 8080
+      },
+      "decode_requests": 2,
+      "engine_ms": {
+        "max": 23.75814411789179,
+        "median": 16.15412626415491,
+        "min": 14.54915665090084,
+        "p95": 22.127836011350155
+      },
+      "mean_context_bin_1024": 3,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 4,
+      "samples": 512
+    },
+    {
+      "context_sum_range": {
+        "max": 10238,
+        "median": 9215.0,
+        "min": 8192,
+        "p95": 10128
+      },
+      "decode_requests": 2,
+      "engine_ms": {
+        "max": 27.02610194683075,
+        "median": 16.09460124745965,
+        "min": 14.613605104386806,
+        "p95": 18.36810912936926
+      },
+      "mean_context_bin_1024": 4,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 4,
+      "samples": 512
+    },
+    {
+      "context_sum_range": {
+        "max": 12286,
+        "median": 11263.0,
+        "min": 10240,
+        "p95": 12176
+      },
+      "decode_requests": 2,
+      "engine_ms": {
+        "max": 33.03393255919218,
+        "median": 16.267321538180113,
+        "min": 14.738762751221657,
+        "p95": 21.5934868901968
+      },
+      "mean_context_bin_1024": 5,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 4,
+      "samples": 512
+    },
+    {
+      "context_sum_range": {
+        "max": 14334,
+        "median": 13311.0,
+        "min": 12288,
+        "p95": 14224
+      },
+      "decode_requests": 2,
+      "engine_ms": {
+        "max": 36.14018205553293,
+        "median": 16.199703328311443,
+        "min": 14.468979090452194,
+        "p95": 22.64809049665928
+      },
+      "mean_context_bin_1024": 6,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 4,
+      "samples": 512
+    },
+    {
+      "context_sum_range": {
+        "max": 12296,
+        "median": 12294,
+        "min": 12292,
+        "p95": 12296
+      },
+      "decode_requests": 2,
+      "engine_ms": {
+        "max": 296.08035553246737,
+        "median": 286.87903843820095,
+        "min": 280.08288610726595,
+        "p95": 296.08035553246737
+      },
+      "mean_context_bin_1024": 6,
+      "phase": "prefill_ge1536",
+      "pool": "target",
+      "prefill_bin_256": 8,
+      "prefill_tokens_range": {
+        "max": 2046,
+        "median": 2046,
+        "min": 2046,
+        "p95": 2046
+      },
+      "runs": 1,
+      "samples": 3
+    },
+    {
+      "context_sum_range": {
+        "max": 16368,
+        "median": 15358.0,
+        "min": 14336,
+        "p95": 16272
+      },
+      "decode_requests": 2,
+      "engine_ms": {
+        "max": 24.946942925453186,
+        "median": 15.831358265131712,
+        "min": 14.700574800372124,
+        "p95": 17.415241338312626
+      },
+      "mean_context_bin_1024": 7,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 4,
+      "samples": 510
+    },
+    {
+      "context_sum_range": {
+        "max": 28663,
+        "median": 28663,
+        "min": 28663,
+        "p95": 28663
+      },
+      "decode_requests": 2,
+      "engine_ms": {
+        "max": 21.88112586736679,
+        "median": 21.88112586736679,
+        "min": 21.88112586736679,
+        "p95": 21.88112586736679
+      },
+      "mean_context_bin_1024": 13,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 1,
+      "samples": 1
+    },
+    {
+      "context_sum_range": {
+        "max": 5502,
+        "median": 5140,
+        "min": 4803,
+        "p95": 5478
+      },
+      "decode_requests": 3,
+      "engine_ms": {
+        "max": 27.402865700423717,
+        "median": 16.48852787911892,
+        "min": 15.650399029254913,
+        "p95": 24.037182331085205
+      },
+      "mean_context_bin_1024": 1,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 2,
+      "samples": 19
+    },
+    {
+      "context_sum_range": {
+        "max": 9159,
+        "median": 8814.0,
+        "min": 8430,
+        "p95": 9135
+      },
+      "decode_requests": 3,
+      "engine_ms": {
+        "max": 21.824387833476067,
+        "median": 16.98164828121662,
+        "min": 15.657629817724228,
+        "p95": 21.822500973939896
+      },
+      "mean_context_bin_1024": 2,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 2,
+      "samples": 18
+    },
+    {
+      "context_sum_range": {
+        "max": 6148,
+        "median": 6148.0,
+        "min": 6148,
+        "p95": 6148
+      },
+      "decode_requests": 3,
+      "engine_ms": {
+        "max": 26.488407514989376,
+        "median": 25.65296459943056,
+        "min": 24.817521683871746,
+        "p95": 26.488407514989376
+      },
+      "mean_context_bin_1024": 2,
+      "phase": "prefill_lt256",
+      "pool": "target",
+      "prefill_bin_256": 1,
+      "prefill_tokens_range": {
+        "max": 4,
+        "median": 4.0,
+        "min": 4,
+        "p95": 4
+      },
+      "runs": 2,
+      "samples": 2
+    },
+    {
+      "context_sum_range": {
+        "max": 18448,
+        "median": 18445,
+        "min": 18442,
+        "p95": 18448
+      },
+      "decode_requests": 3,
+      "engine_ms": {
+        "max": 297.1569364890456,
+        "median": 287.54371870309114,
+        "min": 281.20435774326324,
+        "p95": 297.1569364890456
+      },
+      "mean_context_bin_1024": 6,
+      "phase": "prefill_ge1536",
+      "pool": "target",
+      "prefill_bin_256": 8,
+      "prefill_tokens_range": {
+        "max": 2045,
+        "median": 2045,
+        "min": 2045,
+        "p95": 2045
+      },
+      "runs": 1,
+      "samples": 3
+    },
+    {
+      "context_sum_range": {
+        "max": 12263,
+        "median": 10231.0,
+        "min": 8199,
+        "p95": 12071
+      },
+      "decode_requests": 4,
+      "engine_ms": {
+        "max": 25.459361262619495,
+        "median": 15.994621440768242,
+        "min": 14.95298370718956,
+        "p95": 23.0247862637043
+      },
+      "mean_context_bin_1024": 2,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 2,
+      "samples": 256
+    },
+    {
+      "context_sum_range": {
+        "max": 16359,
+        "median": 14327.0,
+        "min": 12295,
+        "p95": 16167
+      },
+      "decode_requests": 4,
+      "engine_ms": {
+        "max": 24.608575738966465,
+        "median": 15.753502026200294,
+        "min": 14.952022582292557,
+        "p95": 20.666352473199368
+      },
+      "mean_context_bin_1024": 3,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 2,
+      "samples": 256
+    },
+    {
+      "context_sum_range": {
+        "max": 20455,
+        "median": 18423.0,
+        "min": 16391,
+        "p95": 20263
+      },
+      "decode_requests": 4,
+      "engine_ms": {
+        "max": 40.82824755460024,
+        "median": 15.84550179541111,
+        "min": 14.76545911282301,
+        "p95": 22.407078184187412
+      },
+      "mean_context_bin_1024": 4,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 2,
+      "samples": 256
+    },
+    {
+      "context_sum_range": {
+        "max": 24551,
+        "median": 22519.0,
+        "min": 20487,
+        "p95": 24359
+      },
+      "decode_requests": 4,
+      "engine_ms": {
+        "max": 25.817394256591797,
+        "median": 15.989915933459997,
+        "min": 14.892159961163998,
+        "p95": 22.241792641580105
+      },
+      "mean_context_bin_1024": 5,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 2,
+      "samples": 256
+    },
+    {
+      "context_sum_range": {
+        "max": 28647,
+        "median": 26615.0,
+        "min": 24583,
+        "p95": 28455
+      },
+      "decode_requests": 4,
+      "engine_ms": {
+        "max": 22.636817768216133,
+        "median": 15.770175494253635,
+        "min": 14.973006211221218,
+        "p95": 16.48095715790987
+      },
+      "mean_context_bin_1024": 6,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 2,
+      "samples": 256
+    },
+    {
+      "context_sum_range": {
+        "max": 24603,
+        "median": 24599,
+        "min": 24595,
+        "p95": 24603
+      },
+      "decode_requests": 4,
+      "engine_ms": {
+        "max": 299.81280863285065,
+        "median": 297.1919300034642,
+        "min": 292.62131452560425,
+        "p95": 299.81280863285065
+      },
+      "mean_context_bin_1024": 6,
+      "phase": "prefill_ge1536",
+      "pool": "target",
+      "prefill_bin_256": 8,
+      "prefill_tokens_range": {
+        "max": 2044,
+        "median": 2044,
+        "min": 2044,
+        "p95": 2044
+      },
+      "runs": 1,
+      "samples": 3
+    },
+    {
+      "context_sum_range": {
+        "max": 32743,
+        "median": 30711.0,
+        "min": 28679,
+        "p95": 32551
+      },
+      "decode_requests": 4,
+      "engine_ms": {
+        "max": 22.8266641497612,
+        "median": 15.744685661047697,
+        "min": 15.127444639801979,
+        "p95": 16.38869009912014
+      },
+      "mean_context_bin_1024": 7,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 2,
+      "samples": 256
+    },
+    {
+      "context_sum_range": {
+        "max": 30761,
+        "median": 30756,
+        "min": 30751,
+        "p95": 30761
+      },
+      "decode_requests": 5,
+      "engine_ms": {
+        "max": 306.6310165449977,
+        "median": 290.70980101823807,
+        "min": 283.8248172774911,
+        "p95": 306.6310165449977
+      },
+      "mean_context_bin_1024": 6,
+      "phase": "prefill_ge1536",
+      "pool": "target",
+      "prefill_bin_256": 8,
+      "prefill_tokens_range": {
+        "max": 2043,
+        "median": 2043,
+        "min": 2043,
+        "p95": 2043
+      },
+      "runs": 1,
+      "samples": 3
+    },
+    {
+      "context_sum_range": {
+        "max": 71640,
+        "median": 71640,
+        "min": 71640,
+        "p95": 71640
+      },
+      "decode_requests": 5,
+      "engine_ms": {
+        "max": 29.31421995162964,
+        "median": 29.31421995162964,
+        "min": 29.31421995162964,
+        "p95": 29.31421995162964
+      },
+      "mean_context_bin_1024": 13,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 1,
+      "samples": 1
+    },
+    {
+      "context_sum_range": {
+        "max": 36922,
+        "median": 36916,
+        "min": 36910,
+        "p95": 36922
+      },
+      "decode_requests": 6,
+      "engine_ms": {
+        "max": 301.18213035166264,
+        "median": 291.0999720916152,
+        "min": 283.18634536117315,
+        "p95": 301.18213035166264
+      },
+      "mean_context_bin_1024": 6,
+      "phase": "prefill_ge1536",
+      "pool": "target",
+      "prefill_bin_256": 8,
+      "prefill_tokens_range": {
+        "max": 2042,
+        "median": 2042,
+        "min": 2042,
+        "p95": 2042
+      },
+      "runs": 1,
+      "samples": 3
+    },
+    {
+      "context_sum_range": {
+        "max": 43086,
+        "median": 43086,
+        "min": 43086,
+        "p95": 43086
+      },
+      "decode_requests": 7,
+      "engine_ms": {
+        "max": 39.91835657507181,
+        "median": 39.91835657507181,
+        "min": 39.91835657507181,
+        "p95": 39.91835657507181
+      },
+      "mean_context_bin_1024": 6,
+      "phase": "prefill_lt256",
+      "pool": "target",
+      "prefill_bin_256": 1,
+      "prefill_tokens_range": {
+        "max": 78,
+        "median": 78,
+        "min": 78,
+        "p95": 78
+      },
+      "runs": 1,
+      "samples": 1
+    },
+    {
+      "context_sum_range": {
+        "max": 43079,
+        "median": 43075.5,
+        "min": 43072,
+        "p95": 43079
+      },
+      "decode_requests": 7,
+      "engine_ms": {
+        "max": 302.14583314955235,
+        "median": 296.9897883012891,
+        "min": 291.8337434530258,
+        "p95": 302.14583314955235
+      },
+      "mean_context_bin_1024": 6,
+      "phase": "prefill_ge1536",
+      "pool": "target",
+      "prefill_bin_256": 8,
+      "prefill_tokens_range": {
+        "max": 2041,
+        "median": 2041.0,
+        "min": 2041,
+        "p95": 2041
+      },
+      "runs": 1,
+      "samples": 2
+    },
+    {
+      "context_sum_range": {
+        "max": 100261,
+        "median": 100261,
+        "min": 100261,
+        "p95": 100261
+      },
+      "decode_requests": 7,
+      "engine_ms": {
+        "max": 30.474988743662834,
+        "median": 30.474988743662834,
+        "min": 30.474988743662834,
+        "p95": 30.474988743662834
+      },
+      "mean_context_bin_1024": 13,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 1,
+      "samples": 1
+    },
+    {
+      "context_sum_range": {
+        "max": 57317,
+        "median": 53285,
+        "min": 49253,
+        "p95": 56933
+      },
+      "decode_requests": 8,
+      "engine_ms": {
+        "max": 23.526040837168694,
+        "median": 17.884070985019207,
+        "min": 17.468906939029694,
+        "p95": 22.59781491011381
+      },
+      "mean_context_bin_1024": 6,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 1,
+      "samples": 127
+    },
+    {
+      "context_sum_range": {
+        "max": 65509,
+        "median": 61445.0,
+        "min": 57381,
+        "p95": 65125
+      },
+      "decode_requests": 8,
+      "engine_ms": {
+        "max": 27.468361891806126,
+        "median": 18.52489449083805,
+        "min": 17.944837920367718,
+        "p95": 23.176091723144054
+      },
+      "mean_context_bin_1024": 7,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 1,
+      "samples": 128
+    },
+    {
+      "context_sum_range": {
+        "max": 73701,
+        "median": 69637.0,
+        "min": 65573,
+        "p95": 73317
+      },
+      "decode_requests": 8,
+      "engine_ms": {
+        "max": 24.817136116325855,
+        "median": 18.921272363513708,
+        "min": 18.459849059581757,
+        "p95": 19.298627972602844
+      },
+      "mean_context_bin_1024": 8,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 1,
+      "samples": 128
+    },
+    {
+      "context_sum_range": {
+        "max": 81893,
+        "median": 77829.0,
+        "min": 73765,
+        "p95": 81509
+      },
+      "decode_requests": 8,
+      "engine_ms": {
+        "max": 40.1440653949976,
+        "median": 21.64361346513033,
+        "min": 19.226196222007275,
+        "p95": 27.845692820847034
+      },
+      "mean_context_bin_1024": 9,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 1,
+      "samples": 128
+    },
+    {
+      "context_sum_range": {
+        "max": 90085,
+        "median": 86021.0,
+        "min": 81957,
+        "p95": 89701
+      },
+      "decode_requests": 8,
+      "engine_ms": {
+        "max": 27.85373292863369,
+        "median": 20.103197544813156,
+        "min": 19.75912507623434,
+        "p95": 23.67464918643236
+      },
+      "mean_context_bin_1024": 10,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 1,
+      "samples": 128
+    },
+    {
+      "context_sum_range": {
+        "max": 98277,
+        "median": 94213.0,
+        "min": 90149,
+        "p95": 97893
+      },
+      "decode_requests": 8,
+      "engine_ms": {
+        "max": 28.90396397560835,
+        "median": 20.970240235328674,
+        "min": 20.379367284476757,
+        "p95": 25.750741362571716
+      },
+      "mean_context_bin_1024": 11,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 1,
+      "samples": 128
+    },
+    {
+      "context_sum_range": {
+        "max": 106469,
+        "median": 102405.0,
+        "min": 98341,
+        "p95": 106085
+      },
+      "decode_requests": 8,
+      "engine_ms": {
+        "max": 33.76204799860716,
+        "median": 21.626740228384733,
+        "min": 21.120724268257618,
+        "p95": 26.236679404973984
+      },
+      "mean_context_bin_1024": 12,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 1,
+      "samples": 128
+    },
+    {
+      "context_sum_range": {
+        "max": 114533,
+        "median": 110533.0,
+        "min": 106533,
+        "p95": 114149
+      },
+      "decode_requests": 8,
+      "engine_ms": {
+        "max": 30.11250589042902,
+        "median": 22.16763375326991,
+        "min": 21.740769036114216,
+        "p95": 23.8020746037364
+      },
+      "mean_context_bin_1024": 13,
+      "phase": "decode",
+      "pool": "target",
+      "prefill_bin_256": 0,
+      "prefill_tokens_range": {
+        "max": 0,
+        "median": 0.0,
+        "min": 0,
+        "p95": 0
+      },
+      "runs": 1,
+      "samples": 126
+    },
+    {
+      "pool": "source",
+      "decode_requests": 0,
+      "mean_context_bin_1024": 0,
+      "prefill_bin_256": 8,
+      "phase": "prefill_ge1536",
+      "samples": 4,
+      "runs": 4,
+      "context_sum_range": {
+        "min": 0,
+        "median": 0.0,
+        "p95": 0,
+        "max": 0
+      },
+      "prefill_tokens_range": {
+        "min": 2048,
+        "median": 2048.0,
+        "p95": 2048,
+        "max": 2048
+      },
+      "engine_ms": {
+        "min": 216.6198454797268,
+        "median": 217.87813305854797,
+        "p95": 219.8975458741188,
+        "max": 219.8975458741188
+      }
+    },
+    {
+      "pool": "source",
+      "decode_requests": 1,
+      "mean_context_bin_1024": 2,
+      "prefill_bin_256": 8,
+      "phase": "prefill_ge1536",
+      "samples": 8,
+      "runs": 4,
+      "context_sum_range": {
+        "min": 2048,
+        "median": 2048.5,
+        "p95": 2049,
+        "max": 2049
+      },
+      "prefill_tokens_range": {
+        "min": 2047,
+        "median": 2047.0,
+        "p95": 2047,
+        "max": 2047
+      },
+      "engine_ms": {
+        "min": 219.05783284455538,
+        "median": 220.22555815055966,
+        "p95": 220.61993647366762,
+        "max": 220.61993647366762
+      }
+    },
+    {
+      "pool": "source",
+      "decode_requests": 2,
+      "mean_context_bin_1024": 2,
+      "prefill_bin_256": 8,
+      "phase": "prefill_ge1536",
+      "samples": 4,
+      "runs": 4,
+      "context_sum_range": {
+        "min": 4098,
+        "median": 4098.0,
+        "p95": 4098,
+        "max": 4098
+      },
+      "prefill_tokens_range": {
+        "min": 2046,
+        "median": 2046.0,
+        "p95": 2046,
+        "max": 2046
+      },
+      "engine_ms": {
+        "min": 220.80594766885042,
+        "median": 221.96771297603846,
+        "p95": 223.52686244994402,
+        "max": 223.52686244994402
+      }
+    },
+    {
+      "pool": "source",
+      "decode_requests": 3,
+      "mean_context_bin_1024": 2,
+      "prefill_bin_256": 1,
+      "phase": "prefill_lt256",
+      "samples": 4,
+      "runs": 4,
+      "context_sum_range": {
+        "min": 6148,
+        "median": 6148.0,
+        "p95": 6148,
+        "max": 6148
+      },
+      "prefill_tokens_range": {
+        "min": 4,
+        "median": 4.0,
+        "p95": 4,
+        "max": 4
+      },
+      "engine_ms": {
+        "min": 27.482761070132256,
+        "median": 27.795351576060057,
+        "p95": 29.832251369953156,
+        "max": 29.832251369953156
+      }
+    },
+    {
+      "pool": "source",
+      "decode_requests": 4,
+      "mean_context_bin_1024": 2,
+      "prefill_bin_256": 0,
+      "phase": "decode",
+      "samples": 512,
+      "runs": 4,
+      "context_sum_range": {
+        "min": 8199,
+        "median": 10231.0,
+        "p95": 12071,
+        "max": 12263
+      },
+      "prefill_tokens_range": {
+        "min": 0,
+        "median": 0.0,
+        "p95": 0,
+        "max": 0
+      },
+      "engine_ms": {
+        "min": 20.49867808818817,
+        "median": 21.2609083391726,
+        "p95": 22.754674777388573,
+        "max": 27.130961418151855
+      }
+    },
+    {
+      "pool": "source",
+      "decode_requests": 4,
+      "mean_context_bin_1024": 3,
+      "prefill_bin_256": 0,
+      "phase": "decode",
+      "samples": 512,
+      "runs": 4,
+      "context_sum_range": {
+        "min": 12295,
+        "median": 14327.0,
+        "p95": 16167,
+        "max": 16359
+      },
+      "prefill_tokens_range": {
+        "min": 0,
+        "median": 0.0,
+        "p95": 0,
+        "max": 0
+      },
+      "engine_ms": {
+        "min": 21.231969818472862,
+        "median": 21.85119967907667,
+        "p95": 23.647277615964413,
+        "max": 28.704671189188957
+      }
+    },
+    {
+      "pool": "source",
+      "decode_requests": 4,
+      "mean_context_bin_1024": 4,
+      "prefill_bin_256": 0,
+      "phase": "decode",
+      "samples": 512,
+      "runs": 4,
+      "context_sum_range": {
+        "min": 16391,
+        "median": 18423.0,
+        "p95": 20263,
+        "max": 20455
+      },
+      "prefill_tokens_range": {
+        "min": 0,
+        "median": 0.0,
+        "p95": 0,
+        "max": 0
+      },
+      "engine_ms": {
+        "min": 21.932550705969334,
+        "median": 22.515992168337107,
+        "p95": 24.857408367097378,
+        "max": 29.41904589533806
+      }
+    },
+    {
+      "pool": "source",
+      "decode_requests": 4,
+      "mean_context_bin_1024": 5,
+      "prefill_bin_256": 0,
+      "phase": "decode",
+      "samples": 512,
+      "runs": 4,
+      "context_sum_range": {
+        "min": 20487,
+        "median": 22519.0,
+        "p95": 24359,
+        "max": 24551
+      },
+      "prefill_tokens_range": {
+        "min": 0,
+        "median": 0.0,
+        "p95": 0,
+        "max": 0
+      },
+      "engine_ms": {
+        "min": 22.534496150910854,
+        "median": 23.070191498845816,
+        "p95": 25.80809034407139,
+        "max": 27.875743806362152
+      }
+    },
+    {
+      "pool": "source",
+      "decode_requests": 4,
+      "mean_context_bin_1024": 6,
+      "prefill_bin_256": 0,
+      "phase": "decode",
+      "samples": 512,
+      "runs": 4,
+      "context_sum_range": {
+        "min": 24583,
+        "median": 26615.0,
+        "p95": 28455,
+        "max": 28647
+      },
+      "prefill_tokens_range": {
+        "min": 0,
+        "median": 0.0,
+        "p95": 0,
+        "max": 0
+      },
+      "engine_ms": {
+        "min": 23.177783004939556,
+        "median": 23.751843720674515,
+        "p95": 26.762562803924084,
+        "max": 36.453187465667725
+      }
+    },
+    {
+      "pool": "source",
+      "decode_requests": 4,
+      "mean_context_bin_1024": 7,
+      "prefill_bin_256": 0,
+      "phase": "decode",
+      "samples": 512,
+      "runs": 4,
+      "context_sum_range": {
+        "min": 28679,
+        "median": 30711.0,
+        "p95": 32551,
+        "max": 32743
+      },
+      "prefill_tokens_range": {
+        "min": 0,
+        "median": 0.0,
+        "p95": 0,
+        "max": 0
+      },
+      "engine_ms": {
+        "min": 23.85159209370613,
+        "median": 24.37945269048214,
+        "p95": 26.92531980574131,
+        "max": 30.649647116661072
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 0,
+      "mean_context_bin_1024": 0,
+      "prefill_bin_256": 8,
+      "phase": "prefill_ge1536",
+      "samples": 4,
+      "runs": 4,
+      "context_sum_range": {
+        "min": 0,
+        "median": 0.0,
+        "p95": 0,
+        "max": 0
+      },
+      "prefill_tokens_range": {
+        "min": 2048,
+        "median": 2048.0,
+        "p95": 2048,
+        "max": 2048
+      },
+      "engine_ms": {
+        "min": 286.8694728240371,
+        "median": 290.27757700532675,
+        "p95": 290.9974614158273,
+        "max": 290.9974614158273
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 1,
+      "mean_context_bin_1024": 2,
+      "prefill_bin_256": 8,
+      "phase": "prefill_ge1536",
+      "samples": 8,
+      "runs": 4,
+      "context_sum_range": {
+        "min": 2048,
+        "median": 2048.5,
+        "p95": 2049,
+        "max": 2049
+      },
+      "prefill_tokens_range": {
+        "min": 2047,
+        "median": 2047.0,
+        "p95": 2047,
+        "max": 2047
+      },
+      "engine_ms": {
+        "min": 273.19668140262365,
+        "median": 274.09188309684396,
+        "p95": 275.196461006999,
+        "max": 275.196461006999
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 2,
+      "mean_context_bin_1024": 2,
+      "prefill_bin_256": 8,
+      "phase": "prefill_ge1536",
+      "samples": 4,
+      "runs": 4,
+      "context_sum_range": {
+        "min": 4098,
+        "median": 4098.0,
+        "p95": 4098,
+        "max": 4098
+      },
+      "prefill_tokens_range": {
+        "min": 2046,
+        "median": 2046.0,
+        "p95": 2046,
+        "max": 2046
+      },
+      "engine_ms": {
+        "min": 273.4564393758774,
+        "median": 274.2851488292217,
+        "p95": 275.0251805409789,
+        "max": 275.0251805409789
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 3,
+      "mean_context_bin_1024": 2,
+      "prefill_bin_256": 8,
+      "phase": "prefill_ge1536",
+      "samples": 4,
+      "runs": 4,
+      "context_sum_range": {
+        "min": 6148,
+        "median": 6148.0,
+        "p95": 6148,
+        "max": 6148
+      },
+      "prefill_tokens_range": {
+        "min": 2045,
+        "median": 2045.0,
+        "p95": 2045,
+        "max": 2045
+      },
+      "engine_ms": {
+        "min": 273.87330774217844,
+        "median": 274.48719879612327,
+        "p95": 277.33409218490124,
+        "max": 277.33409218490124
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 3,
+      "mean_context_bin_1024": 7,
+      "prefill_bin_256": 0,
+      "phase": "decode",
+      "samples": 4,
+      "runs": 4,
+      "context_sum_range": {
+        "min": 24567,
+        "median": 24567.0,
+        "p95": 24567,
+        "max": 24567
+      },
+      "prefill_tokens_range": {
+        "min": 0,
+        "median": 0.0,
+        "p95": 0,
+        "max": 0
+      },
+      "engine_ms": {
+        "min": 16.773494891822338,
+        "median": 17.05716783180833,
+        "p95": 17.435395158827305,
+        "max": 17.435395158827305
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 4,
+      "mean_context_bin_1024": 2,
+      "prefill_bin_256": 8,
+      "phase": "prefill_ge1536",
+      "samples": 4,
+      "runs": 4,
+      "context_sum_range": {
+        "min": 8199,
+        "median": 8199.0,
+        "p95": 8199,
+        "max": 8199
+      },
+      "prefill_tokens_range": {
+        "min": 2044,
+        "median": 2044.0,
+        "p95": 2044,
+        "max": 2044
+      },
+      "engine_ms": {
+        "min": 274.60039127618074,
+        "median": 274.93189834058285,
+        "p95": 276.0464893653989,
+        "max": 276.0464893653989
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 5,
+      "mean_context_bin_1024": 2,
+      "prefill_bin_256": 8,
+      "phase": "prefill_ge1536",
+      "samples": 4,
+      "runs": 4,
+      "context_sum_range": {
+        "min": 10251,
+        "median": 10251.0,
+        "p95": 10251,
+        "max": 10251
+      },
+      "prefill_tokens_range": {
+        "min": 2043,
+        "median": 2043.0,
+        "p95": 2043,
+        "max": 2043
+      },
+      "engine_ms": {
+        "min": 275.05757845938206,
+        "median": 275.6065153516829,
+        "p95": 275.85653215646744,
+        "max": 275.85653215646744
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 6,
+      "mean_context_bin_1024": 2,
+      "prefill_bin_256": 8,
+      "phase": "prefill_ge1536",
+      "samples": 4,
+      "runs": 4,
+      "context_sum_range": {
+        "min": 12304,
+        "median": 12304.0,
+        "p95": 12304,
+        "max": 12304
+      },
+      "prefill_tokens_range": {
+        "min": 2042,
+        "median": 2042.0,
+        "p95": 2042,
+        "max": 2042
+      },
+      "engine_ms": {
+        "min": 275.36085806787014,
+        "median": 276.09251718968153,
+        "p95": 277.147414162755,
+        "max": 277.147414162755
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 7,
+      "mean_context_bin_1024": 2,
+      "prefill_bin_256": 1,
+      "phase": "prefill_lt256",
+      "samples": 2,
+      "runs": 2,
+      "context_sum_range": {
+        "min": 14358,
+        "median": 14358.0,
+        "p95": 14358,
+        "max": 14358
+      },
+      "prefill_tokens_range": {
+        "min": 22,
+        "median": 22.0,
+        "p95": 22,
+        "max": 22
+      },
+      "engine_ms": {
+        "min": 38.7386828660965,
+        "median": 39.35476532205939,
+        "p95": 39.97084777802229,
+        "max": 39.97084777802229
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 7,
+      "mean_context_bin_1024": 2,
+      "prefill_bin_256": 8,
+      "phase": "prefill_ge1536",
+      "samples": 2,
+      "runs": 2,
+      "context_sum_range": {
+        "min": 14358,
+        "median": 14358.0,
+        "p95": 14358,
+        "max": 14358
+      },
+      "prefill_tokens_range": {
+        "min": 2041,
+        "median": 2041.0,
+        "p95": 2041,
+        "max": 2041
+      },
+      "engine_ms": {
+        "min": 276.32579021155834,
+        "median": 276.51940099895,
+        "p95": 276.71301178634167,
+        "max": 276.71301178634167
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 8,
+      "mean_context_bin_1024": 2,
+      "prefill_bin_256": 0,
+      "phase": "decode",
+      "samples": 256,
+      "runs": 2,
+      "context_sum_range": {
+        "min": 16445,
+        "median": 20509.0,
+        "p95": 24189,
+        "max": 24573
+      },
+      "prefill_tokens_range": {
+        "min": 0,
+        "median": 0.0,
+        "p95": 0,
+        "max": 0
+      },
+      "engine_ms": {
+        "min": 15.332818031311035,
+        "median": 17.155721317976713,
+        "p95": 23.217881098389626,
+        "max": 25.671835988759995
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 8,
+      "mean_context_bin_1024": 2,
+      "prefill_bin_256": 8,
+      "phase": "prefill_ge1536",
+      "samples": 2,
+      "runs": 2,
+      "context_sum_range": {
+        "min": 16413,
+        "median": 16413.0,
+        "p95": 16413,
+        "max": 16413
+      },
+      "prefill_tokens_range": {
+        "min": 2040,
+        "median": 2040.0,
+        "p95": 2040,
+        "max": 2040
+      },
+      "engine_ms": {
+        "min": 276.860517449677,
+        "median": 277.05889102071524,
+        "p95": 277.2572645917535,
+        "max": 277.2572645917535
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 8,
+      "mean_context_bin_1024": 3,
+      "prefill_bin_256": 0,
+      "phase": "decode",
+      "samples": 256,
+      "runs": 2,
+      "context_sum_range": {
+        "min": 24637,
+        "median": 28701.0,
+        "p95": 32381,
+        "max": 32765
+      },
+      "prefill_tokens_range": {
+        "min": 0,
+        "median": 0.0,
+        "p95": 0,
+        "max": 0
+      },
+      "engine_ms": {
+        "min": 15.780122950673103,
+        "median": 16.642518807202578,
+        "p95": 22.992477752268314,
+        "max": 26.22285671532154
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 8,
+      "mean_context_bin_1024": 4,
+      "prefill_bin_256": 0,
+      "phase": "decode",
+      "samples": 256,
+      "runs": 2,
+      "context_sum_range": {
+        "min": 32829,
+        "median": 36893.0,
+        "p95": 40573,
+        "max": 40957
+      },
+      "prefill_tokens_range": {
+        "min": 0,
+        "median": 0.0,
+        "p95": 0,
+        "max": 0
+      },
+      "engine_ms": {
+        "min": 16.06958359479904,
+        "median": 17.082914244383574,
+        "p95": 23.335681296885014,
+        "max": 26.268397457897663
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 8,
+      "mean_context_bin_1024": 5,
+      "prefill_bin_256": 0,
+      "phase": "decode",
+      "samples": 256,
+      "runs": 2,
+      "context_sum_range": {
+        "min": 41021,
+        "median": 45085.0,
+        "p95": 48765,
+        "max": 49149
+      },
+      "prefill_tokens_range": {
+        "min": 0,
+        "median": 0.0,
+        "p95": 0,
+        "max": 0
+      },
+      "engine_ms": {
+        "min": 16.473318450152874,
+        "median": 17.104445956647396,
+        "p95": 22.911127656698227,
+        "max": 27.21215970814228
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 8,
+      "mean_context_bin_1024": 6,
+      "prefill_bin_256": 0,
+      "phase": "decode",
+      "samples": 256,
+      "runs": 2,
+      "context_sum_range": {
+        "min": 49213,
+        "median": 53277.0,
+        "p95": 56957,
+        "max": 57341
+      },
+      "prefill_tokens_range": {
+        "min": 0,
+        "median": 0.0,
+        "p95": 0,
+        "max": 0
+      },
+      "engine_ms": {
+        "min": 17.093395814299583,
+        "median": 17.899101600050926,
+        "p95": 22.99793530255556,
+        "max": 28.7787402048707
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 8,
+      "mean_context_bin_1024": 7,
+      "prefill_bin_256": 0,
+      "phase": "decode",
+      "samples": 254,
+      "runs": 2,
+      "context_sum_range": {
+        "min": 57405,
+        "median": 61437.0,
+        "p95": 65085,
+        "max": 65469
+      },
+      "prefill_tokens_range": {
+        "min": 0,
+        "median": 0.0,
+        "p95": 0,
+        "max": 0
+      },
+      "engine_ms": {
+        "min": 17.739311791956425,
+        "median": 18.279362469911575,
+        "p95": 22.31922559440136,
+        "max": 26.169266551733017
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 9,
+      "mean_context_bin_1024": 2,
+      "prefill_bin_256": 8,
+      "phase": "prefill_ge1536",
+      "samples": 2,
+      "runs": 2,
+      "context_sum_range": {
+        "min": 18469,
+        "median": 18469.0,
+        "p95": 18469,
+        "max": 18469
+      },
+      "prefill_tokens_range": {
+        "min": 2039,
+        "median": 2039.0,
+        "p95": 2039,
+        "max": 2039
+      },
+      "engine_ms": {
+        "min": 277.3350654169917,
+        "median": 277.3858467116952,
+        "p95": 277.4366280063987,
+        "max": 277.4366280063987
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 10,
+      "mean_context_bin_1024": 2,
+      "prefill_bin_256": 8,
+      "phase": "prefill_ge1536",
+      "samples": 2,
+      "runs": 2,
+      "context_sum_range": {
+        "min": 20526,
+        "median": 20526.0,
+        "p95": 20526,
+        "max": 20526
+      },
+      "prefill_tokens_range": {
+        "min": 2038,
+        "median": 2038.0,
+        "p95": 2038,
+        "max": 2038
+      },
+      "engine_ms": {
+        "min": 278.10719795525074,
+        "median": 278.2291006296873,
+        "p95": 278.3510033041239,
+        "max": 278.3510033041239
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 11,
+      "mean_context_bin_1024": 2,
+      "prefill_bin_256": 8,
+      "phase": "prefill_ge1536",
+      "samples": 2,
+      "runs": 2,
+      "context_sum_range": {
+        "min": 22584,
+        "median": 22584.0,
+        "p95": 22584,
+        "max": 22584
+      },
+      "prefill_tokens_range": {
+        "min": 2037,
+        "median": 2037.0,
+        "p95": 2037,
+        "max": 2037
+      },
+      "engine_ms": {
+        "min": 277.79283467680216,
+        "median": 278.07387663051486,
+        "p95": 278.35491858422756,
+        "max": 278.35491858422756
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 11,
+      "mean_context_bin_1024": 7,
+      "prefill_bin_256": 0,
+      "phase": "decode",
+      "samples": 2,
+      "runs": 2,
+      "context_sum_range": {
+        "min": 90035,
+        "median": 90035.0,
+        "p95": 90035,
+        "max": 90035
+      },
+      "prefill_tokens_range": {
+        "min": 0,
+        "median": 0.0,
+        "p95": 0,
+        "max": 0
+      },
+      "engine_ms": {
+        "min": 21.503975614905357,
+        "median": 21.51373913511634,
+        "p95": 21.52350265532732,
+        "max": 21.52350265532732
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 12,
+      "mean_context_bin_1024": 2,
+      "prefill_bin_256": 8,
+      "phase": "prefill_ge1536",
+      "samples": 2,
+      "runs": 2,
+      "context_sum_range": {
+        "min": 24643,
+        "median": 24643.0,
+        "p95": 24643,
+        "max": 24643
+      },
+      "prefill_tokens_range": {
+        "min": 2036,
+        "median": 2036.0,
+        "p95": 2036,
+        "max": 2036
+      },
+      "engine_ms": {
+        "min": 278.6040408536792,
+        "median": 278.73194543644786,
+        "p95": 278.85985001921654,
+        "max": 278.85985001921654
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 13,
+      "mean_context_bin_1024": 2,
+      "prefill_bin_256": 8,
+      "phase": "prefill_ge1536",
+      "samples": 2,
+      "runs": 2,
+      "context_sum_range": {
+        "min": 26703,
+        "median": 26703.0,
+        "p95": 26703,
+        "max": 26703
+      },
+      "prefill_tokens_range": {
+        "min": 2035,
+        "median": 2035.0,
+        "p95": 2035,
+        "max": 2035
+      },
+      "engine_ms": {
+        "min": 278.9456909522414,
+        "median": 279.096111189574,
+        "p95": 279.2465314269066,
+        "max": 279.2465314269066
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 14,
+      "mean_context_bin_1024": 2,
+      "prefill_bin_256": 8,
+      "phase": "prefill_ge1536",
+      "samples": 2,
+      "runs": 2,
+      "context_sum_range": {
+        "min": 28764,
+        "median": 28764.0,
+        "p95": 28764,
+        "max": 28764
+      },
+      "prefill_tokens_range": {
+        "min": 2034,
+        "median": 2034.0,
+        "p95": 2034,
+        "max": 2034
+      },
+      "engine_ms": {
+        "min": 279.32248171418905,
+        "median": 279.6641509048641,
+        "p95": 280.0058200955391,
+        "max": 280.0058200955391
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 15,
+      "mean_context_bin_1024": 2,
+      "prefill_bin_256": 1,
+      "phase": "prefill_lt256",
+      "samples": 2,
+      "runs": 2,
+      "context_sum_range": {
+        "min": 30826,
+        "median": 30826.0,
+        "p95": 30826,
+        "max": 30826
+      },
+      "prefill_tokens_range": {
+        "min": 106,
+        "median": 106.0,
+        "p95": 106,
+        "max": 106
+      },
+      "engine_ms": {
+        "min": 36.14863008260727,
+        "median": 36.84636205434799,
+        "p95": 37.544094026088715,
+        "max": 37.544094026088715
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 16,
+      "mean_context_bin_1024": 2,
+      "prefill_bin_256": 0,
+      "phase": "decode",
+      "samples": 254,
+      "runs": 2,
+      "context_sum_range": {
+        "min": 32953,
+        "median": 41017.0,
+        "p95": 48313,
+        "max": 49081
+      },
+      "prefill_tokens_range": {
+        "min": 0,
+        "median": 0.0,
+        "p95": 0,
+        "max": 0
+      },
+      "engine_ms": {
+        "min": 17.682895064353943,
+        "median": 18.696474377065897,
+        "p95": 23.22397753596306,
+        "max": 26.18763316422701
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 16,
+      "mean_context_bin_1024": 3,
+      "prefill_bin_256": 0,
+      "phase": "decode",
+      "samples": 256,
+      "runs": 2,
+      "context_sum_range": {
+        "min": 49209,
+        "median": 57337.0,
+        "p95": 64697,
+        "max": 65465
+      },
+      "prefill_tokens_range": {
+        "min": 0,
+        "median": 0.0,
+        "p95": 0,
+        "max": 0
+      },
+      "engine_ms": {
+        "min": 18.9182972535491,
+        "median": 20.014018286019564,
+        "p95": 24.0027392283082,
+        "max": 28.683913871645927
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 16,
+      "mean_context_bin_1024": 4,
+      "prefill_bin_256": 0,
+      "phase": "decode",
+      "samples": 256,
+      "runs": 2,
+      "context_sum_range": {
+        "min": 65593,
+        "median": 73721.0,
+        "p95": 81081,
+        "max": 81849
+      },
+      "prefill_tokens_range": {
+        "min": 0,
+        "median": 0.0,
+        "p95": 0,
+        "max": 0
+      },
+      "engine_ms": {
+        "min": 20.333795808255672,
+        "median": 21.272148471325636,
+        "p95": 23.029168136417866,
+        "max": 33.68160221725702
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 16,
+      "mean_context_bin_1024": 5,
+      "prefill_bin_256": 0,
+      "phase": "decode",
+      "samples": 256,
+      "runs": 2,
+      "context_sum_range": {
+        "min": 81977,
+        "median": 90105.0,
+        "p95": 97465,
+        "max": 98233
+      },
+      "prefill_tokens_range": {
+        "min": 0,
+        "median": 0.0,
+        "p95": 0,
+        "max": 0
+      },
+      "engine_ms": {
+        "min": 21.50097396224737,
+        "median": 22.55255449563265,
+        "p95": 23.918542079627514,
+        "max": 34.65914912521839
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 16,
+      "mean_context_bin_1024": 6,
+      "prefill_bin_256": 0,
+      "phase": "decode",
+      "samples": 256,
+      "runs": 2,
+      "context_sum_range": {
+        "min": 98361,
+        "median": 106489.0,
+        "p95": 113849,
+        "max": 114617
+      },
+      "prefill_tokens_range": {
+        "min": 0,
+        "median": 0.0,
+        "p95": 0,
+        "max": 0
+      },
+      "engine_ms": {
+        "min": 22.86509796977043,
+        "median": 23.674669209867716,
+        "p95": 24.686715565621853,
+        "max": 43.23703609406948
+      }
+    },
+    {
+      "pool": "target",
+      "decode_requests": 16,
+      "mean_context_bin_1024": 7,
+      "prefill_bin_256": 0,
+      "phase": "decode",
+      "samples": 254,
+      "runs": 2,
+      "context_sum_range": {
+        "min": 114745,
+        "median": 122809.0,
+        "p95": 130105,
+        "max": 130873
+      },
+      "prefill_tokens_range": {
+        "min": 0,
+        "median": 0.0,
+        "p95": 0,
+        "max": 0
+      },
+      "engine_ms": {
+        "min": 24.108577519655228,
+        "median": 25.039998814463615,
+        "p95": 25.768878869712353,
+        "max": 35.34479346126318
+      }
+    }
+  ],
+  "source_release_summary": {
+    "start_to_release_s": {
+      "max": 8.007738590240479
+    }
+  },
+  "provenance": {
+    "multi\\control\\QWEN3_SCHEDULER_SUPPLEMENT_ANALYSIS_20261028.json": "ffa2ad8e521aeeff2140621f1bd33bfe0f5349d8f689f0c0afa846468ad65674",
+    "multi\\results\\unpacked_qwen3_tp2_service_20261028_151240_21544\\qwen3_tp2_service_20261028_151240_21544\\service_profile.json": "fb75767373e9577ad06285be6734104851856542b8ebf4ed6c76258f32fe47f4",
+    "multi\\results\\unpacked_qwen3_parameter_batch_20261028_161242_17847\\qwen3_parameter_batch_20261028_161242_17847\\service\\service_profile.json": "a9aa56edd315863ae1aa3a70ee93d2d69f72749d0a55d30b0c1b641917d2ae21",
+    "multi\\results\\unpacked_qwen3_scheduler_supplement_20261028_185441_12295\\qwen3_scheduler_supplement_20261028_185441_12295\\service_profile.json": "091d9c2f03fda754ae87d327995327237ed2ca516493c16308a41bbdc8bf1fdb"
+  },
+  "general_release_bound_s": null,
+  "deployment_ready": false
+}
