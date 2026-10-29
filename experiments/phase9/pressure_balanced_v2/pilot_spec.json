@@ -182,7 +182,7 @@
     "vllm/bridge_tp/rolling_cutover.py": "5def4ab368759b33791633794e15d86845b1848c95e22f6d488515367669c016",
     "vllm/bridge_tp/runtime_control.py": "d9f396b855f17ac33a676e59aca014e3a2609b96660d0e46f2513b29115e88f7",
     "vllm/bridge_tp/shadow_transfer_protocol.py": "fdd6f3d6839fa35c01cd165ad0251ccb0f4112a89cc2e94c8846b7e435fadeac",
-    "vllm/bridge_tp/streaming_connector.py": "1ee286ef77bbc71fb5ea8e6e32e8574ae99e0a50714a3600906510192deed7a7",
+    "vllm/bridge_tp/streaming_connector.py": "a4a2453cf5cd79ecf1f1bb3257909114daca92925960702b5f6c6be696722b30",
     "vllm/bridge_tp/stream_protocol.py": "8f2f15bbc005b778c2b68b7fd1c0a3c3583fda66feca70f8ec27346619381271",
     "vllm/bridge_tp/takeover_api.py": "77ded955c3dd53ceb551b187f67a5cd5b4f2f12f55f5ba35953a694c08ce9cf2",
     "vllm/bridge_tp/__init__.py": "3ffd9c3646257f2f954d336022cb2ee840a35e156a7b725a7ab9b0e6ce651f56",
@@ -339,7 +339,7 @@
     "tools/bridge_tp/run_qwen3_scheduler_supplement.py": "78044e014a097707b22032903f9a48f2e64bb0225c2c2682070beed31bbc44ac",
     "tests/bridge_tp/test_qwen3_scheduler_supplement.py": "40fd9afa64c988a4a8e6a5fa09e9ac89a45ff02a4489aa1b9a8198acc6331dab",
     "tools/bridge_tp/qwen3_online_validation.py": "ce864fa51ce8f9a4a364d962f5acd73aee394d03373aad78be79f70d26470173",
-    "tools/bridge_tp/run_qwen3_online_loaded_validation.py": "82eb56b179f320cc1fed39c14cdffa7121e54e3a7d2f3272870a82eb885bf402",
+    "tools/bridge_tp/run_qwen3_online_loaded_validation.py": "ba10d950bb4fd5ececd1ee0f7056b6531bebca9292e7af846fb71c22d545c10d",
     "tests/bridge_tp/test_qwen3_online_contract.py": "a284700b66cc01b8d4024d96539f5204d712076c8526abbd9f6e26e8463992e1",
     "tools/bridge_tp/qwen3_migration_diagnostics.py": "f6608ca05a3f905147e30dc0b5fe8cc8dcf7b605d1b7ad6da9f8f4ced668659d",
     "tests/bridge_tp/test_qwen3_migration_diagnostics.py": "cfed6e02f79c59e48146176dc4a8e751f2e4d5584deb10f6708153c8c1e1fa3d",
@@ -348,8 +348,8 @@
     "tools/bridge_tp/qwen3_channel_ablation.py": "f4df71fa7fd7109da3dddd2563006195d1161829c49ad5c9e765f0795b72198c",
     "vllm/bridge_tp/channel_diagnostics.py": "abb013298c86d52cdff658d9afc76c2af76d38b184a848a910185ca29b9ba97e",
     "vllm/bridge_tp/controller/native_journal.py": "90d2e87c2f5641580e33b95fec547191c3837a5f03e9f3b1104ffffd4034fe59",
-    "vllm/bridge_tp/channel_runtime.py": "f0bf5170230428b95625b8e3edbf85ce9fbcb2b8736f255c69fac5d6c4bdd5e0",
-    "tests/bridge_tp/test_channel_runtime.py": "10df0d6c2ddceb3fa8827eb9ccbd2bf783b32229746c508c5e34e26865c3b1c4"
+    "vllm/bridge_tp/channel_runtime.py": "e0b3afec9b621f6a4df0fe204d28b5ba8b0d08b3fb6a5cf1e51c9e5fb4157934",
+    "tests/bridge_tp/test_channel_runtime.py": "cc147b17546a9def962ce6fc7799d54c5556e483cb4164e1a2b4db71bd5ee15e"
   },
   "server_settings": {
     "dtype": "bfloat16",

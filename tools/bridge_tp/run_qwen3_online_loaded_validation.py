@@ -163,9 +163,10 @@ def execute(args, ledger):
 
             performance = performance_report(directory, result)
             if getattr(args, "runtime_fix_probe", False):
-                write(
-                    directory / "runtime_fix_acceptance.json", runtime_proof(directory)
-                )
+                proof = runtime_proof(directory)
+                if getattr(args, "prior_runtime", None) is not None:
+                    proof["post_cleanup"] = verify_worker_cleanup(directory, proof)
+                write(directory / "runtime_fix_acceptance.json", proof)
             row.update(
                 status="COMPLETED" if performance["passed"] else "PERFORMANCE_FAILURE",
                 measurement=result,
@@ -214,6 +215,48 @@ def runtime_proof(directory):
     )
 
 
+def verify_worker_cleanup(directory, proof):
+    controller = directory / "mechanism/controller"
+    request_ids = {r["target_request_id"] for r in proof["ranks"]}
+    if len(request_ids) != 1:
+        raise ValueError("worker cleanup request identity differs across ranks")
+    accepted = []
+    for path in sorted(
+        (controller / "worker_cleanup_receipts").glob("*/tp_rank_*.json")
+    ):
+        row = read(path)
+        if row.get("target_request_id") not in request_ids:
+            continue
+        state = row.get("worker_state", {})
+        counts = state.get("counts", {})
+        expected = {
+            "load_threads",
+            "copy_done_events",
+            "model_wait_streams",
+            "model_wait_pending_requests",
+            "gpu_restore_quiescence",
+            "completed_recvs",
+            "reported_recvs",
+            "finished_worker_requests",
+        }
+        if (
+            row.get("status") != "WORKER_REQUEST_STATE_CLEANED"
+            or set(counts) != expected
+            or any(counts.values())
+            or state.get("receiver_payload_present") is not False
+            or state.get("receiver_payload_capacity_elements") != 0
+            or set(state.get("stream_ready", {})) != {"migration_receive", "restore"}
+            or any(
+                v is not True and v is not None for v in state["stream_ready"].values()
+            )
+        ):
+            raise ValueError("post-cleanup worker state is not empty/idle")
+        accepted.append(row)
+    if len(accepted) != 2 or {r.get("tp_rank") for r in accepted} != {0, 1}:
+        raise ValueError("post-cleanup evidence requires both target ranks")
+    return accepted
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     for key in ("model", "checkpoint", "inputs", "prior-supplement", "output"):
@@ -226,6 +269,7 @@ def main(argv=None):
     parser.add_argument("--prior-ready", type=Path)
     parser.add_argument("--runtime-fix-probe", action="store_true")
     parser.add_argument("--prior-ablation", type=Path)
+    parser.add_argument("--prior-runtime", type=Path)
     args = parser.parse_args(argv)
     if args.diagnostic_probe and args.prior_online is None:
         parser.error("diagnostics require the previous online validation directory")
@@ -244,11 +288,15 @@ def main(argv=None):
         parser.error(
             "runtime fix requires diagnostics, ready/ablation evidence, no retirement"
         )
+    if args.prior_runtime is not None and not args.runtime_fix_probe:
+        parser.error("previous runtime evidence requires runtime fix probe")
     prior_count = (
         25
         if args.runtime_fix_probe
         else (24 if args.channel_ablation else (22 if args.diagnostic_probe else 20))
     )
+    if args.prior_runtime is not None:
+        prior_count = 26
     new_limit = 1 if args.channel_ablation or args.runtime_fix_probe else 2
     if args.validate_only:
         print(
@@ -278,6 +326,16 @@ def main(argv=None):
     ledger, result, code = [], dict(status="TECHNICAL_FAILURE"), 1
     try:
         if args.runtime_fix_probe:
+            if args.prior_runtime is not None:
+                previous = read(args.prior_runtime / "result.json")
+                if (
+                    previous.get("total_profile_attempts") != 26
+                    or previous.get("status") != "COMPLETED"
+                    or previous.get("runner_code") != 0
+                    or len(previous.get("stages", [])) != 1
+                ):
+                    raise ValueError("requires the completed first runtime validation")
+                verify_migration(args.prior_runtime / "runtime-fix-loaded4")
             previous = read(args.prior_ablation / "result.json")
             if (
                 previous.get("total_profile_attempts") != 25

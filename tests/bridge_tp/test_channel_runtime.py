@@ -18,6 +18,7 @@ from vllm.bridge_tp.channel_runtime import (
     ManifestPollCache,
     publish_prebound_receiver,
     receiver_snapshot,
+    worker_state_snapshot,
 )
 
 
@@ -46,6 +47,135 @@ def methods(*names):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_post_cleanup_receipts_reject_leaks_busy_streams_and_missing_rank(self):
+        from tools.bridge_tp import run_qwen3_online_loaded_validation as runner
+
+        counts = {
+            name: 0
+            for name in (
+                "load_threads",
+                "copy_done_events",
+                "model_wait_streams",
+                "model_wait_pending_requests",
+                "gpu_restore_quiescence",
+                "completed_recvs",
+                "reported_recvs",
+                "finished_worker_requests",
+            )
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            c = d / "mechanism/controller/worker_cleanup_receipts/r"
+            c.mkdir(parents=True)
+            for rank in range(2):
+                row = dict(
+                    status="WORKER_REQUEST_STATE_CLEANED",
+                    target_request_id="r",
+                    tp_rank=rank,
+                    worker_state=dict(
+                        counts=dict(counts),
+                        receiver_payload_present=False,
+                        receiver_payload_capacity_elements=0,
+                        stream_ready=dict(migration_receive=True, restore=True),
+                    ),
+                )
+                (c / f"tp_rank_{rank}.json").write_text(json.dumps(row))
+            proof = dict(
+                ranks=[dict(target_request_id="r"), dict(target_request_id="r")]
+            )
+            self.assertEqual(len(runner.verify_worker_cleanup(d, proof)), 2)
+            row["worker_state"]["counts"]["copy_done_events"] = 1
+            (c / "tp_rank_1.json").write_text(json.dumps(row))
+            with self.assertRaises(ValueError):
+                runner.verify_worker_cleanup(d, proof)
+            row["worker_state"]["counts"]["copy_done_events"] = 0
+            row["worker_state"]["stream_ready"]["restore"] = False
+            (c / "tp_rank_1.json").write_text(json.dumps(row))
+            with self.assertRaises(ValueError):
+                runner.verify_worker_cleanup(d, proof)
+
+    def test_actual_worker_cleanup_receipt_records_post_cleanup_state(self):
+        c = NS(
+            _persistent_gpu_receiver=None,
+            _load_threads={},
+            manifest_path=Path("session/manifest.json"),
+        )
+        ns = methods("_write_worker_cleanup_receipt")
+        ns.update(
+            receiver_snapshot=receiver_snapshot,
+            worker_state_snapshot=worker_state_snapshot,
+            _safe_name=lambda r: r,
+        )
+        ns["_write_worker_cleanup_receipt"](c, "r")
+        receipt = ns["_atomic_json_dump"].call_args.args[0]
+        self.assertEqual(receipt["status"], "WORKER_REQUEST_STATE_CLEANED")
+        self.assertFalse(any(receipt["worker_state"]["counts"].values()))
+
+    def test_idle_cancel_check_without_history_does_no_file_io(self):
+        for history in [None, ("other-session", object())]:
+            c = NS(
+                _prebound_gpu_history_lock=threading.Lock(),
+                _prebound_gpu_history=history,
+            )
+            # No manifest_path: touching the filesystem would fail this test.
+            call = methods("_cleanup_cancelled_prebound_history")[
+                "_cleanup_cancelled_prebound_history"
+            ]
+            self.assertFalse(
+                call(c, migration_id="m", source_request_id="r", tp_rank=0)
+            )
+
+    def test_admitted_or_committed_history_is_not_drained(self):
+        for state, admitted in [("COMMITTED", False), ("CANCELLED", True)]:
+            with tempfile.TemporaryDirectory() as tmp:
+                d = Path(tmp)
+                (d / "takeover_state.json").write_text(json.dumps(dict(state=state)))
+                (d / "runtime_control.json").write_text(
+                    json.dumps(dict(target_request_admitted=admitted))
+                )
+                history = ("m", object())
+                c = NS(
+                    _prebound_gpu_history_lock=threading.Lock(),
+                    _prebound_gpu_history=history,
+                    manifest_path=d / "manifest.json",
+                )
+                ns = methods("_cleanup_cancelled_prebound_history")
+                ns["_load_json"] = lambda p: json.loads(p.read_text())
+                self.assertFalse(
+                    ns["_cleanup_cancelled_prebound_history"](
+                        c, migration_id="m", source_request_id="r", tp_rank=0
+                    )
+                )
+                self.assertIs(c._prebound_gpu_history, history)
+
+    def test_unadmitted_cancel_still_drains_and_records_idle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "takeover_state.json").write_text('{"state":"CANCELLED"}')
+            (d / "runtime_control.json").write_text('{"target_request_admitted":false}')
+            receiver = NS(
+                receive_delta=Mock(return_value=None),
+                last_session_payload_released_bytes=123,
+            )
+            c = NS(
+                _prebound_gpu_history_lock=threading.Lock(),
+                _prebound_gpu_history=("m", object()),
+                manifest_path=d / "manifest.json",
+                _prebound_gpu_receiver_lock=threading.Lock(),
+                _prebound_gpu_receiver=receiver,
+                _record_persistent_receiver_idle=Mock(),
+            )
+            ns = methods("_cleanup_cancelled_prebound_history")
+            ns["_load_json"] = lambda p: json.loads(p.read_text())
+            self.assertTrue(
+                ns["_cleanup_cancelled_prebound_history"](
+                    c, migration_id="m", source_request_id="r", tp_rank=0
+                )
+            )
+            self.assertIsNone(c._prebound_gpu_history)
+            receiver.receive_delta.assert_called_once_with(migration_id="m", rank=0)
+            c._record_persistent_receiver_idle.assert_called_once()
+
     def test_runtime_probe_is_one_stage_without_retirement(self):
         from tools.bridge_tp import run_qwen3_online_loaded_validation as runner
 
@@ -190,6 +320,7 @@ class RuntimeTests(unittest.TestCase):
             _reported_recvs=set(),
             _finished_worker_requests=set(),
             _release_persistent_payload_buffer=Mock(),
+            _write_worker_cleanup_receipt=Mock(),
             _gpu_kv_lock=threading.Lock(),
             _gpu_restore_quiescence_lock=threading.Lock(),
             _copy_done_events={"migrated": 1, "other": 2},
@@ -207,6 +338,23 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(c._gpu_restore_quiescence, {"other": 2})
         self.assertFalse(c._load_threads)
         self.assertFalse(c._finished_worker_requests)
+        c._write_worker_cleanup_receipt.assert_called_once_with("migrated")
+
+    def test_worker_state_observes_streams_without_synchronizing(self):
+        stream = Mock()
+        stream.query.return_value = True
+        receiver = NS(stream=stream, _packed_buffer=None, buffer_capacity_elements=0)
+        c = NS(
+            _persistent_gpu_receiver=receiver,
+            _persistent_restore_stream=stream,
+            _copy_done_events={"leftover": object()},
+            _finished_worker_requests=set(),
+        )
+        snapshot = worker_state_snapshot(c)
+        self.assertEqual(snapshot["counts"]["copy_done_events"], 1)
+        self.assertTrue(snapshot["stream_ready"]["restore"])
+        self.assertFalse(snapshot["receiver_payload_present"])
+        stream.synchronize.assert_not_called()
 
     def test_old_completion_cannot_release_new_session_payload(self):
         c = NS(

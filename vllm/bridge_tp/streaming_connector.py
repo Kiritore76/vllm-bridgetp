@@ -25,6 +25,7 @@ from vllm.bridge_tp.channel_runtime import (
     ManifestPollCache,
     publish_prebound_receiver,
     receiver_snapshot,
+    worker_state_snapshot,
 )
 from vllm.bridge_tp.delta_timing import delta_timing
 from vllm.bridge_tp.kv_restore import inject_rank_delta, inject_rank_shard
@@ -1173,6 +1174,13 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         tp_rank: int,
     ) -> bool:
         """Drain an unadmitted cancelled session and release its GPU buffer."""
+        # After admission the history handle is consumed. The idle prebind
+        # loop must not reopen cancellation/control files every 5 ms forever.
+        # Recheck under the same lock below before taking ownership to drain.
+        with self._prebound_gpu_history_lock:
+            prebound = self._prebound_gpu_history
+            if prebound is None or prebound[0] != migration_id:
+                return False
         run_dir = self.manifest_path.parent.resolve()
         state_path = run_dir / "takeover_state.json"
         control_path = run_dir / "runtime_control.json"
@@ -2463,9 +2471,24 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             self._completed_recvs.discard(request_id)
             self._reported_recvs.discard(request_id)
             self._finished_worker_requests.discard(request_id)
+            self._write_worker_cleanup_receipt(request_id)
         if not ready:
             return None, None
         return None, set(ready)
+
+    def _write_worker_cleanup_receipt(self, request_id: str) -> None:
+        _atomic_json_dump(
+            dict(
+                status="WORKER_REQUEST_STATE_CLEANED",
+                target_request_id=request_id,
+                tp_rank=get_tp_group().rank_in_group,
+                channel_runtime=receiver_snapshot(self),
+                worker_state=worker_state_snapshot(self),
+                completed_unix_s=time.time(),
+            ),
+            self.manifest_path.parent / "worker_cleanup_receipts"
+            / _safe_name(request_id) / f"tp_rank_{get_tp_group().rank_in_group}.json",
+        )
 
     def request_finished(
         self,

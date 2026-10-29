@@ -83,3 +83,38 @@ def receiver_snapshot(connector):
         live_load_threads=sum(t.is_alive() for t in connector._load_threads.values()),
         manifest_polling=cache.snapshot() if cache is not None else None,
     )
+
+
+def worker_state_snapshot(connector):
+    """Observe retained worker state and stream readiness without waiting on CUDA."""
+    names = (
+        "_load_threads",
+        "_copy_done_events",
+        "_model_wait_streams",
+        "_model_wait_pending_requests",
+        "_gpu_restore_quiescence",
+        "_completed_recvs",
+        "_reported_recvs",
+        "_finished_worker_requests",
+    )
+    receiver = connector._persistent_gpu_receiver
+    streams = dict(
+        migration_receive=getattr(receiver, "stream", None),
+        restore=getattr(connector, "_persistent_restore_stream", None),
+    )
+    ready = {}
+    for name, stream in streams.items():
+        try:
+            ready[name] = None if stream is None else bool(stream.query())
+        except RuntimeError as error:
+            ready[name] = dict(error=str(error))
+    return dict(
+        counts={
+            name.removeprefix("_"): len(getattr(connector, name, ())) for name in names
+        },
+        receiver_payload_present=getattr(receiver, "_packed_buffer", None) is not None,
+        receiver_payload_capacity_elements=getattr(
+            receiver, "buffer_capacity_elements", 0
+        ),
+        stream_ready=ready,
+    )
