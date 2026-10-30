@@ -249,6 +249,7 @@ def preflight(args):
         platform=getattr(args, "platform", "a100"),
         capacity_guard_blocks=cfg.capacity_guard_blocks,
         capacity_guard_tokens=cfg.capacity_guard_blocks * controller.block_size,
+        kv_emergency_priority=cfg.kv_emergency_priority,
         calibration_scope=(
             "Qwen3 development experiment; original nominal KV "
             "guard is unvalidated; release maximum is empirical only"

@@ -43,6 +43,9 @@ class PressureConfig:
     # Opt-in KV-release pilot only; existing modes retain zero lookahead.
     capacity_lookahead_s: float = 0.0
     capacity_only: bool = False
+    # Opt-in urgent-KV policy: target service/remaining-work are preferences,
+    # not vetoes. Physical release/deadline and ownership checks remain.
+    kv_emergency_priority: bool = False
     health_service: bool = False
     # Route from passive health/KV evidence, without fixed prompt cutoffs.
     pressure_routing: bool = False
@@ -75,6 +78,7 @@ class PressureConfig:
             and self.prefill_waiting_budget > 0
             and self.capacity_guard_blocks > 0
             and type(self.capacity_only) is bool
+            and type(self.kv_emergency_priority) is bool
             and type(self.health_service) is bool
             and type(self.pressure_routing) is bool
             and (not self.pressure_routing or self.health_service)
@@ -105,9 +109,11 @@ class PressureConfig:
 
     @property
     def sha256(self) -> str:
-        return hashlib.sha256(
-            json.dumps(asdict(self), sort_keys=True).encode()
-        ).hexdigest()
+        values = asdict(self)
+        # Preserve frozen historical policy identities when the fix is disabled.
+        if not self.kv_emergency_priority:
+            values.pop("kv_emergency_priority")
+        return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -781,12 +787,14 @@ class PressurePolicy:
             if now - self._last_start < cfg.cooldown_s:
                 return decision("migration cooldown")
         # Capacity bypasses persistence/cooldown, never physical feasibility.
+        kv_priority = emergency and cfg.kv_emergency_priority
         if t.capacity is None or "pool timestamp" in t.missing:
             return decision("target physical capacity evidence absent")
         pending_blocks, pending_decode, _ = self.ledger.pending(target.pool_id)
         feasible, rows = [], []
         for c in candidates:
             reasons = []
+            soft_warnings = []
             if now < self._retry_after.get(c.request_id, -math.inf):
                 reasons.append("cancelled request cooling down")
             if not c.action_available:
@@ -902,9 +910,13 @@ class PressurePolicy:
             if emergency and not valid_prediction and cap <= cfg.survival_horizon:
                 # A missing predictor is not evidence that a short stop budget
                 # can survive transport. Keep emergency fallback explicit.
-                reasons.append("stop budget cannot cover migration horizon")
+                (soft_warnings if kv_priority else reasons).append(
+                    "stop budget cannot cover migration horizon"
+                )
             if summary and summary["p_gt_bounds"][0] < cfg.min_survival_lower:
-                reasons.append("insufficient sustained work probability")
+                (soft_warnings if kv_priority else reasons).append(
+                    "insufficient sustained work probability"
+                )
             costs = (c.source_decode_relief, c.target_decode_cost)
             valid_costs = all(
                 v is not None and math.isfinite(v) and v >= 0 for v in costs
@@ -937,6 +949,23 @@ class PressurePolicy:
                     > cfg.spare_ratio
                 ):
                     reasons.append("post-move overload/reverse imbalance")
+            elif kv_priority:
+                # The ledger must still be able to track a finite target cost.
+                if (
+                    c.target_decode_cost is None
+                    or not math.isfinite(c.target_decode_cost)
+                    or c.target_decode_cost < 0
+                ):
+                    reasons.append("target commitment cost unknown/invalid")
+                if (
+                    t.prefill is None
+                    or t.decode is None
+                    or not valid_costs
+                    or t.decode + pending_decode + c.target_decode_cost
+                    > cfg.enter_ratio
+                    or t.prefill > cfg.enter_ratio
+                ):
+                    soft_warnings.append("emergency target service budget unavailable")
             elif (
                 t.prefill is None
                 or t.decode is None
@@ -955,6 +984,9 @@ class PressurePolicy:
                     "prediction_fallback": bool(not valid_prediction and emergency),
                 }
             )
+            if kv_priority:
+                rows[-1]["kv_priority_override"] = True
+                rows[-1]["soft_warnings"] = soft_warnings
             if not reasons:
                 feasible.append((c, summary))
         if not feasible:
@@ -964,7 +996,17 @@ class PressurePolicy:
             # Known adequate survival takes precedence over the explicit
             # emergency-only missing-prediction fallback. All candidates have
             # already passed candidate-specific release size/deadline checks.
-            tier = [c for c, _ in predicted] if predicted else [c for c, _ in feasible]
+            if kv_priority:
+                durable = [
+                    c
+                    for c, summary in predicted
+                    if summary["p_gt_bounds"][0] >= cfg.min_survival_lower
+                ]
+                tier = durable or [c for c, _ in feasible]
+            else:
+                tier = (
+                    [c for c, _ in predicted] if predicted else [c for c, _ in feasible]
+                )
 
             def rank(c):
                 return (
@@ -974,7 +1016,11 @@ class PressurePolicy:
                     c.request_id,
                 )
 
-            policy = "KV: survival evidence, release time, bytes, release, id"
+            policy = (
+                "KV priority: durable preference, release time, bytes, release, id"
+                if kv_priority
+                else "KV: survival evidence, release time, bytes, release, id"
+            )
         else:
             # Service relief should persist. Predictions within the configured
             # resolution form one tier; KV size is not the service tie-breaker.

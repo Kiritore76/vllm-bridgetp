@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT))
 from tools.bridge_tp import launch_pressure_balanced_pilot as pilot  # noqa: E402
 from tools.bridge_tp import qwen3_four_mode as four  # noqa: E402
 from tools.bridge_tp import qwen3_kv_guard_trial as guard_trial  # noqa: E402
+from tools.bridge_tp import qwen3_kv_priority_verify as priority  # noqa: E402
 from tools.bridge_tp import qwen3_migration_matrix as matrix  # noqa: E402
 from tools.bridge_tp import qwen3_pressure_four_mode as pressure_four  # noqa: E402
 from tools.bridge_tp import qwen3_pressure_observation as observation  # noqa: E402
@@ -177,14 +178,47 @@ def main(argv=None):
     parser.add_argument("--kv-guard-trial", action="store_true")
     parser.add_argument("--resident-pressure", action="store_true")
     parser.add_argument("--pressure-four-mode", action="store_true")
+    parser.add_argument("--kv-priority-verify", action="store_true")
     parser.add_argument("--prior-comparison", type=Path)
     parser.add_argument("--complete-four-mode", type=Path)
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
     matrix_mode = args.migration_matrix or args.kv_guard_trial or args.resident_pressure
     inherited, evaluations, missing = [], [], None
+    baseline_reference = None
     previous_attempts = 49 if args.four_mode else 31
-    if args.pressure_four_mode:
+    if args.kv_priority_verify:
+        if (
+            args.four_mode
+            or args.pressure_four_mode
+            or matrix_mode
+            or args.complete_four_mode
+            or args.repetitions != 1
+            or args.prior_comparison is None
+        ):
+            parser.error(
+                "KV priority verification requires one repetition "
+                "and prior pressure trial"
+            )
+        prior = read(args.prior_comparison / "result.json")
+        if (
+            prior.get("experiment_mode") != "pressure-four-mode"
+            or len(prior.get("runs", [])) != 12
+            or any(r["status"] != "COMPLETED" for r in prior["runs"])
+            or prior.get("status")
+            not in {
+                "COMPLETED_PRESSURE_FOUR_MODE_TRIAL",
+                "COMPLETED_WITH_COVERAGE_GAPS",
+            }
+        ):
+            raise ValueError("requires the completed twelve-run pressure trial")
+        args.four_mode = True
+        previous_attempts = prior["total_profile_attempts"]
+        cfg, baseline_reference = priority.config(
+            read(args.inputs), args.prior_comparison
+        )
+        values = cfg["recipes"]
+    elif args.pressure_four_mode:
         if (
             args.four_mode
             or matrix_mode
@@ -313,7 +347,9 @@ def main(argv=None):
                     routing_weights=cfg["routing_weights"],
                     migration_execution=True,
                     maximum_migrations_per_run=0,
-                    routing_policy="six initial TP1 residents; later stress arrivals "
+                    routing_policy="single pressure MIGRATE; urgent KV soft-gate fix"
+                    if args.kv_priority_verify
+                    else "six initial TP1 residents; later stress arrivals "
                     "use original pressure router; per-recipe guard125/384"
                     if args.resident_pressure
                     else "fixed pools for growth/burst; original router "
@@ -348,7 +384,7 @@ def main(argv=None):
         hardware, versions = runtime_inventory(read(PROFILE)), runtime_versions()
         prior_identity = (
             args.prior_comparison
-            if matrix_mode or args.pressure_four_mode
+            if matrix_mode or args.pressure_four_mode or args.kv_priority_verify
             else args.complete_four_mode or args.prior_observation
         )
         old = read(prior_identity / "identity.json")
@@ -406,6 +442,8 @@ def main(argv=None):
         )
         write(args.output / "scope.json", scope)
         write(args.output / "comparison_recipe.json", cfg)
+        if baseline_reference is not None:
+            write(args.output / "baseline_reference.json", baseline_reference)
         if args.complete_four_mode:
             write(
                 args.output / "completion_provenance.json",
@@ -475,8 +513,13 @@ def main(argv=None):
                     ),
                     audit,
                 )
-                if args.pressure_four_mode:
+                if args.pressure_four_mode or args.kv_priority_verify:
                     score = pressure_four.decorate(score, recipe)
+                if args.kv_priority_verify:
+                    row["kv_priority"] = priority.assess(raw, audit)
+                    write(
+                        args.output / "kv_priority_acceptance.json", row["kv_priority"]
+                    )
                 write(plan["run_dir"].parent / "sustained_goodoutput.json", score)
                 evaluations.append(
                     dict(arm=arm, score=score, scenario=recipe["scenario"])
@@ -506,7 +549,7 @@ def main(argv=None):
                     write(
                         args.output / "four_mode_summary.json",
                         pressure_four.aggregate(evaluations)
-                        if args.pressure_four_mode
+                        if args.pressure_four_mode or args.kv_priority_verify
                         else four.aggregate(evaluations),
                     )
                     write(
@@ -551,7 +594,7 @@ def main(argv=None):
             if valid and observed
             else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
         )
-        if args.four_mode:
+        if args.four_mode and not args.kv_priority_verify:
             paired = four.comparisons(inherited + ledger)
             pairs = paired
             write(args.output / "four_mode_comparison.json", paired)
@@ -595,6 +638,17 @@ def main(argv=None):
                 if coverage
                 else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
             )
+        if args.kv_priority_verify:
+            accepted = (
+                len(ledger) == 1
+                and ledger[0]["summary"]["fixed_arrivals_valid"]
+                and ledger[0]["kv_priority"]["verification_pass"]
+            )
+            result, code = (
+                (dict(status="COMPLETED_KV_PRIORITY_VERIFY"), 0)
+                if accepted
+                else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
+            )
     except KeyboardInterrupt:
         result, code = dict(status="INTERRUPTED"), 130
     except Exception as error:
@@ -614,7 +668,9 @@ def main(argv=None):
             total_profile_attempts=previous_attempts + len(ledger),
             inherited_runs=inherited,
             maximum_live_runs=run_count,
-            experiment_mode="pressure-four-mode"
+            experiment_mode="kv-priority-verify"
+            if args.kv_priority_verify
+            else "pressure-four-mode"
             if args.pressure_four_mode
             else "resident-pressure"
             if args.resident_pressure

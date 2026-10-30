@@ -1,0 +1,91 @@
+# SPDX-License-Identifier: Apache-2.0
+"""One real MIGRATE rerun of the worst prefill workload; no forced route/START."""
+
+from tools.bridge_tp import qwen3_pressure_four_mode as pressure
+from tools.bridge_tp import qwen3_stay_migrate as matched
+
+
+def config(inputs, prior):
+    cfg = pressure.config(inputs)
+    recipe = next(r for r in cfg["recipes"] if r["scenario"] == "prefill_competition")
+    previous = pressure.full.observation.read(prior / "result.json")
+    old = next(
+        r
+        for r in previous["runs"]
+        if r["name"] == "pressure-four-prefill_competition-r1-migrate"
+    )
+    if old["status"] != "COMPLETED" or old["summary"]["migration_starts"] != 0:
+        raise ValueError("requires the completed zero-migration prefill baseline")
+    if matched.digest(recipe["jobs"]) != old["input_sha256"]:
+        raise ValueError("prefill baseline workload differs")
+    recipe["name"] = "kv-priority-prefill-r1"
+    recipe["arm_order_offset"] = 0
+    cfg.update(
+        schema="QWEN3_KV_PRIORITY_VERIFY_V1",
+        arms=["migrate"],
+        recipes=[recipe],
+        policy_overrides=dict(capacity_guard_blocks=125, kv_emergency_priority=True),
+        note="one prefill MIGRATE; same old workload; no forced migration; "
+        "physical release/deadline gates unchanged",
+    )
+    baseline = dict(
+        prior=str(prior),
+        name=old["name"],
+        input_sha256=old["input_sha256"],
+        summary=old["summary"],
+        comparison_scope="historical same workload; no contemporaneous STAY",
+    )
+    return cfg, baseline
+
+
+def assess(raw, audit):
+    moves = []
+    for start in (r for r in audit if r["kind"] == "pressure_actual_start"):
+        decision = next(
+            r
+            for r in reversed(audit)
+            if r["kind"] == "pressure_decision"
+            and r.get("execution") == "RESERVED"
+            and r["unix_s"] <= start["unix_s"]
+            and r["decision"]["request_id"] == start["request_id"]
+        )
+        selected = next(c for c in decision["decision"]["candidates"] if c["selected"])
+        if not decision["decision"]["capacity_path"] or not selected.get(
+            "kv_priority_override"
+        ):
+            raise ValueError("verification START did not use urgent KV policy")
+        response = next(
+            r["response"] for r in raw if r["server_id"] == start["request_id"]
+        )
+        released = any(
+            r["kind"] == "pressure_source_release_confirmed"
+            and r["migration_id"] == start["migration_id"]
+            for r in audit
+        )
+        moves.append(
+            dict(
+                migration_id=start["migration_id"],
+                soft_warnings=selected["soft_warnings"],
+                committed=response["committed"],
+                source_released=released,
+                handoff_s=response.get("handoff_stall_s"),
+            )
+        )
+    committed = [m for m in moves if m["committed"] and m["source_released"]]
+    mechanism = bool(committed) and any(
+        "emergency target service budget unavailable" in m["soft_warnings"]
+        for m in committed
+    )
+    handoff = (
+        all(m["handoff_s"] is not None and m["handoff_s"] <= 1 for m in committed)
+        if committed
+        else None
+    )
+    return dict(
+        migrations=moves,
+        mechanism_pass=mechanism,
+        handoff_slo_pass=handoff,
+        verification_pass=mechanism and handoff is True,
+        note="single fix/mechanism verification; "
+        "does not mean all output SLOs or performance passed",
+    )
