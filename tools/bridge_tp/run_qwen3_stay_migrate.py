@@ -179,11 +179,14 @@ def main(argv=None):
     parser.add_argument("--resident-pressure", action="store_true")
     parser.add_argument("--pressure-four-mode", action="store_true")
     parser.add_argument("--kv-priority-verify", action="store_true")
+    parser.add_argument("--kv-routing-verify", action="store_true")
     parser.add_argument("--current-machine", action="store_true")
     parser.add_argument("--prior-comparison", type=Path)
     parser.add_argument("--complete-four-mode", type=Path)
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
+    if args.kv_routing_verify and not args.kv_priority_verify:
+        parser.error("kv-routing-verify requires kv-priority-verify")
     if args.current_machine and (not args.kv_priority_verify or args.prior_comparison):
         parser.error(
             "current-machine is standalone KV verification without a prior directory"
@@ -224,7 +227,8 @@ def main(argv=None):
         args.four_mode = True
         previous_attempts = 0 if prior is None else prior["total_profile_attempts"]
         cfg, baseline_reference = priority.config(
-            read(args.inputs), args.prior_comparison
+            read(args.inputs), args.prior_comparison,
+            kv_routing=args.kv_routing_verify,
         )
         values = cfg["recipes"]
     elif args.pressure_four_mode:
@@ -359,7 +363,10 @@ def main(argv=None):
                     routing_weights=cfg["routing_weights"],
                     migration_execution=True,
                     maximum_migrations_per_run=0,
-                    routing_policy="single pressure MIGRATE; urgent KV soft-gate fix"
+                    routing_policy="KV-first ingress during warning/recovery; "
+                    "original service routing otherwise"
+                    if args.kv_routing_verify
+                    else "single pressure MIGRATE; urgent KV soft-gate fix"
                     if args.kv_priority_verify
                     else "six initial TP1 residents; later stress arrivals "
                     "use original pressure router; per-recipe guard125/384"
@@ -533,6 +540,10 @@ def main(argv=None):
                     score = pressure_four.decorate(score, recipe)
                 if args.kv_priority_verify:
                     row["kv_priority"] = priority.assess(raw, audit)
+                    if args.kv_routing_verify:
+                        row["kv_routing"] = priority.assess_routing(audit)
+                        write(args.output / "kv_routing_acceptance.json",
+                              row["kv_routing"])
                     write(
                         args.output / "kv_priority_acceptance.json", row["kv_priority"]
                     )
@@ -665,6 +676,21 @@ def main(argv=None):
                 if accepted
                 else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
             )
+            if args.kv_routing_verify:
+                moves = ledger[0]["kv_priority"]["migrations"] if ledger else []
+                accepted = (
+                    len(ledger)==1
+                    and ledger[0]["summary"]["fixed_arrivals_valid"]
+                    and ledger[0]["kv_routing"]["verification_pass"]
+                    and (not moves or (
+                        ledger[0]["kv_priority"]["handoff_slo_pass"] is True
+                        and ledger[0]["kv_priority"]["joint_scoring_pass"]
+                    ))
+                )
+                result, code = (
+                    (dict(status="COMPLETED_KV_ROUTING_VERIFY"), 0) if accepted
+                    else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
+                )
     except KeyboardInterrupt:
         result, code = dict(status="INTERRUPTED"), 130
     except Exception as error:
@@ -684,7 +710,9 @@ def main(argv=None):
             total_profile_attempts=previous_attempts + len(ledger),
             inherited_runs=inherited,
             maximum_live_runs=run_count,
-            experiment_mode="kv-priority-verify"
+            experiment_mode="kv-routing-verify"
+            if args.kv_routing_verify
+            else "kv-priority-verify"
             if args.kv_priority_verify
             else "pressure-four-mode"
             if args.pressure_four_mode

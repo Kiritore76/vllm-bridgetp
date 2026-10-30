@@ -190,6 +190,7 @@ class KVPriorityTests(unittest.TestCase):
         self.assertEqual(selections[0].reason, selections[1].reason)
         old_values = dataclasses.asdict(config())
         old_values.pop("kv_emergency_priority")
+        old_values.pop("kv_routing_priority")
         expected = hashlib.sha256(
             json.dumps(old_values, sort_keys=True).encode()
         ).hexdigest()

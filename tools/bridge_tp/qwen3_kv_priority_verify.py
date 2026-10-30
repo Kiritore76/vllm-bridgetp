@@ -17,7 +17,7 @@ def enable_urgent_target(plan):
     argv[position] = json.dumps(kv)
 
 
-def config(inputs, prior=None):
+def config(inputs, prior=None, *, kv_routing=False):
     cfg = pressure.config(inputs)
     recipe = next(r for r in cfg["recipes"] if r["scenario"] == "prefill_competition")
     baseline = dict(
@@ -59,6 +59,9 @@ def config(inputs, prior=None):
         note="one prefill MIGRATE; frozen workload; no forced migration; "
         "physical release/deadline gates unchanged",
     )
+    if kv_routing:
+        cfg["policy_overrides"]["kv_routing_priority"] = True
+        cfg["note"] += "; KV-first ingress only during KV warning/recovery"
     return cfg, baseline
 
 
@@ -130,4 +133,25 @@ def assess(raw, audit):
         verification_pass=mechanism and handoff is True and joint_scoring,
         note="single fix/mechanism verification; "
         "does not mean all output SLOs or performance passed",
+    )
+
+
+def assess_routing(audit):
+    arrivals = [r["admission"] for r in audit if r["kind"] == "pressure_admission"]
+    checked = [a for a in arrivals if a.get("routing_kv") is not None]
+    changed = [a for a in checked if a["routing_kv"]["changed_route"]]
+    normal = [a for a in checked if a["routing_kv"]["mode"] == "SERVICE_PRESSURE"]
+    valid = all(
+        a["routing_kv"]["redirect"]
+        and a["pool_id"] == "tp4"
+        and a["routing_kv"]["target"]["pressure"]
+        < a["routing_kv"]["source"]["pressure"]
+        for a in changed
+    ) and all(a["pool_id"] == a["routing_kv"]["previous_pool_id"] for a in normal)
+    return dict(
+        checked_arrivals=len(checked), changed_routes=len(changed),
+        normal_service_routes=len(normal), invariants_pass=valid,
+        verification_pass=bool(changed) and valid and len(checked)==len(arrivals),
+        note="routing fix coverage only; zero migrations is allowed; "
+        "no output-quality or comparative performance acceptance",
     )

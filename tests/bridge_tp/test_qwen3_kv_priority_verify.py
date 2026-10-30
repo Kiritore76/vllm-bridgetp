@@ -47,6 +47,55 @@ def evidence():
 
 
 class KVPriorityVerifyTests(unittest.TestCase):
+    def test_actual_cli_builds_single_routing_trial_without_gpu(self):
+        from tools.bridge_tp import run_qwen3_stay_migrate as runner
+        inputs = dict(requests={str(n):dict(prompt=list(range(n)))
+                                for n in (2048,6144)})
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/'inputs.json'
+            path.write_text(json.dumps(inputs))
+            output=io.StringIO()
+            with contextlib.redirect_stdout(output), patch.object(
+                runner,'serving_preflight') as serving:
+                code=runner.main([
+                    '--model','unused','--output',str(Path(temp)/'out'),
+                    '--inputs',str(path),'--expected-revision','CPU_PLAN',
+                    '--repetitions','1','--kv-priority-verify','--kv-routing-verify',
+                    '--current-machine','--validate-only'])
+            self.assertEqual(code,0)
+            serving.assert_not_called()
+            record=json.loads(output.getvalue())
+            self.assertEqual(record['runs'],1)
+            self.assertTrue(record['policy_overrides']['kv_routing_priority'])
+            self.assertEqual(record['arms'],['migrate'])
+
+    def test_routing_plan_only_enables_new_flag_when_explicitly_selected(self):
+        inputs = dict(requests={str(n):dict(prompt=list(range(n)))
+                                for n in (2048,6144)})
+        old,_ = verify.config(inputs)
+        new,_ = verify.config(inputs,kv_routing=True)
+        self.assertEqual(old['recipes'],new['recipes'])
+        self.assertNotIn('kv_routing_priority',old['policy_overrides'])
+        self.assertTrue(new['policy_overrides']['kv_routing_priority'])
+
+    def test_routing_acceptance_requires_actual_kv_change_and_preserves_normal(self):
+        urgent=dict(pool_id='tp4',routing_kv=dict(
+            mode='KV_URGENT',changed_route=True,redirect=True,
+            source=dict(pressure=1.9),target=dict(pressure=1.01),
+            previous_pool_id='tp1'))
+        normal=dict(pool_id='tp1',routing_kv=dict(
+            mode='SERVICE_PRESSURE',changed_route=False,redirect=False,
+            source=dict(pressure=.4),target=dict(pressure=.2),
+            previous_pool_id='tp1'))
+        audit=[dict(kind='pressure_admission',admission=a)for a in (urgent,normal)]
+        self.assertTrue(verify.assess_routing(audit)['verification_pass'])
+        normal['pool_id']='tp4'
+        self.assertFalse(verify.assess_routing(audit)['verification_pass'])
+        normal['pool_id']='tp1'
+        urgent['routing_kv']['target']['pressure']=2.0
+        self.assertFalse(verify.assess_routing(audit)['verification_pass'])
+        self.assertFalse(verify.assess_routing(audit[1:])['verification_pass'])
+
     def test_urgent_target_opt_in_preserves_source_and_running_cap(self):
         plan = dict(source_argv=["untouched"], target_argv=[
             "serve", "--max-num-seqs", "16", "--kv-transfer-config",

@@ -60,6 +60,7 @@ class PressureCoordinator:
             if self.routing_strategy == "pressure":
                 self.policy.relief.acknowledge(now)
             relief = self.policy.relief.snapshot()
+            kv_before = self.policy.kv_route.snapshot()
             result = admit(
                 *args,
                 cfg=self.policy.cfg,
@@ -67,14 +68,20 @@ class PressureCoordinator:
                 routing_strategy=self.routing_strategy,
                 routing_weights=self.routing_weights,
                 routing_relief=relief,
+                kv_routing_state=kv_before,
                 **kwargs,
             )
+            if result.routing_kv is not None:
+                self.policy.kv_route.observe(
+                    result.routing_kv["source"], self.policy.cfg, now
+                )
             if self.policy.cfg.routing_relief:
                 self.policy.relief.admitted(
                     result.pool_id,
                     args[1] if len(args) > 1 else kwargs["prompt_tokens"],
                     now,
-                    result.routing_reason.startswith("router relief epoch"),
+                    result.routing_reason.startswith("router relief epoch")
+                    or bool(result.routing_kv and result.routing_kv["redirect"]),
                 )
                 if result.pool_id == pools[0].pool_id:
                     self.policy._since = None
@@ -99,6 +106,9 @@ class PressureCoordinator:
                 "reservation_before": before,
                 "reservation_after": self.ledger.snapshot(),
             }
+            if self.policy.cfg.kv_routing_priority:
+                record["kv_routing_state"] = kv_before
+                record["kv_routing_state_after"] = self.policy.kv_route.snapshot()
         self.audit(record)
         return result
 

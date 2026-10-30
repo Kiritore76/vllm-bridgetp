@@ -13,6 +13,7 @@ import json
 import math
 from dataclasses import asdict, dataclass, fields, replace
 
+from . import pressure_kv_routing as kv_routing
 from . import pressure_workload as workload
 from .bounded_length import BoundedLength
 from .pressure_relief import RoutingRelief
@@ -43,9 +44,9 @@ class PressureConfig:
     # Opt-in KV-release pilot only; existing modes retain zero lookahead.
     capacity_lookahead_s: float = 0.0
     capacity_only: bool = False
-    # Opt-in urgent-KV policy: target service/remaining-work are preferences,
-    # not vetoes. Physical release/deadline and ownership checks remain.
+    # Urgent KV relaxes target service vetoes; survival/physical gates remain.
     kv_emergency_priority: bool = False
+    kv_routing_priority: bool = False
     health_service: bool = False
     # Route from passive health/KV evidence, without fixed prompt cutoffs.
     pressure_routing: bool = False
@@ -79,6 +80,10 @@ class PressureConfig:
             and self.capacity_guard_blocks > 0
             and type(self.capacity_only) is bool
             and type(self.kv_emergency_priority) is bool
+            and type(self.kv_routing_priority) is bool
+            and (not self.kv_routing_priority or (
+                self.workload_pressure and self.capacity_lookahead_s > 0
+            ))
             and type(self.health_service) is bool
             and type(self.pressure_routing) is bool
             and (not self.pressure_routing or self.health_service)
@@ -113,6 +118,8 @@ class PressureConfig:
         # Preserve frozen historical policy identities when the fix is disabled.
         if not self.kv_emergency_priority:
             values.pop("kv_emergency_priority")
+        if not self.kv_routing_priority:
+            values.pop("kv_routing_priority")
         return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
@@ -606,8 +613,13 @@ class PressurePolicy:
         self._retry_after: dict[str, float] = {}
         self._service_confirmation = None
         self.relief = RoutingRelief()
+        self.kv_route = kv_routing.KVRouteProtection()
 
     def observe_relief(self, now, source):
+        if self.cfg.kv_routing_priority:
+            self.kv_route.observe(
+                kv_routing.risk(source, self.ledger, self.cfg, now), self.cfg, now
+            )
         if not self.cfg.routing_relief:
             return
         source = self.ledger.routing_reading(source)
@@ -1116,6 +1128,7 @@ class Admission:
     reservation_basis: str = "none"
     routing_capacity: dict | None = None
     routing_pressure: dict | None = None
+    routing_kv: dict | None = None
 
 
 def prompt_fit(pool, prompt_tokens, ledger, cfg, now):
@@ -1178,6 +1191,7 @@ def admit(
     routing_strategy: str = "pressure",
     routing_weights: tuple[float, float] = (1.0, 1.0),
     routing_relief: dict | None = None,
+    kv_routing_state: dict | None = None,
 ) -> Admission:
     """Choose an instance; leave queueing and KV allocation to vLLM.
 
@@ -1343,6 +1357,20 @@ def admit(
         preferred = pools[1]
         eligible.sort(key=lambda pool: pool.pool_id != preferred.pool_id)
         routing_reason = "router relief epoch; TP4 projected budget and prompt fit"
+    routing_kv = None
+    if (cfg.kv_routing_priority and routing_strategy == "pressure"
+            and allowed_pool_id is None and all(pool in eligible for pool in pools)):
+        routing_kv = kv_routing.preference(
+            pools, ledger, cfg, now, prompt_tokens, capacity, kv_routing_state
+        )
+        routing_kv["previous_pool_id"] = eligible[0].pool_id
+        if routing_kv["redirect"]:
+            preferred = pools[1]
+            eligible.sort(key=lambda pool: pool.pool_id != preferred.pool_id)
+            routing_reason = "KV protection: " + routing_kv["reason"]
+        routing_kv["changed_route"] = (
+            routing_kv["previous_pool_id"] != eligible[0].pool_id
+        )
     pool = eligible[0]
     if allowed_pool_id is not None:
         routing_reason = "fixed pilot route"
@@ -1357,4 +1385,5 @@ def admit(
         routing_reason,
         routing_capacity=capacity,
         routing_pressure=projected,
+        routing_kv=routing_kv,
     )
