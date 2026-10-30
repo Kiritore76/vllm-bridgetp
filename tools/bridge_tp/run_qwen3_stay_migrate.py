@@ -28,6 +28,7 @@ from tools.bridge_tp.prepare_4090d_qwen3 import (  # noqa: E402
 )
 from tools.bridge_tp.qwen3_calibration_contract import (  # noqa: E402
     adjust_migration_plan,
+    expanded_context_spec,
     migration_spec,
     require_revision,
     runtime_versions,
@@ -64,6 +65,12 @@ def prepare_native(plan, common):
     from tools.bridge_tp.run_pressure_calibration import wait_empty
 
     rows = wait_empty(plan["run_dir"])
+    if "expected_context_limits" in plan:
+        for row, limit in zip(rows, plan["expected_context_limits"]):
+            if row["context_limit"] != limit or (
+                row["free_blocks"] * row["block_size"] < limit + 125 * row["block_size"]
+            ):
+                raise ValueError("expanded context or native KV headroom differs")
     plan["config"].update(
         tp1_total_kv_blocks=rows[0]["total_blocks"],
         tp4_total_kv_blocks=rows[1]["total_blocks"],
@@ -181,6 +188,7 @@ def main(argv=None):
     parser.add_argument("--pressure-four-mode", action="store_true")
     parser.add_argument("--updated-pressure-four-mode", action="store_true")
     parser.add_argument("--routine-four-mode", action="store_true")
+    parser.add_argument("--expanded-context", action="store_true")
     parser.add_argument("--kv-priority-verify", action="store_true")
     parser.add_argument("--kv-routing-verify", action="store_true")
     parser.add_argument("--current-machine", action="store_true")
@@ -192,6 +200,10 @@ def main(argv=None):
         if args.updated_pressure_four_mode:
             parser.error("routine and updated pressure trials are separate modes")
         args.updated_pressure_four_mode = True
+    if args.expanded_context and not (
+        args.updated_pressure_four_mode and args.current_machine
+    ):
+        parser.error("expanded-context requires a current-machine four-mode trial")
     if args.kv_routing_verify and not args.kv_priority_verify:
         parser.error("kv-routing-verify requires kv-priority-verify")
     if args.current_machine and (
@@ -381,6 +393,10 @@ def main(argv=None):
             parser.error("paired mode requires prior observation")
         values = matched.recipes(args.prior_observation, args.repetitions)
         cfg = matched.config(values)
+    if args.expanded_context:
+        cfg["service_context_limits"] = dict(tp1=32768, tp2=32768)
+        cfg["context_profile"] = "QWEN3_NATIVE_32K_BOTH_V1"
+        cfg["note"] += "; native context limits raised; boundary GPU validation pending"
     run_count = len(missing) if missing is not None else len(values) * len(cfg["arms"])
     if args.validate_only:
         print(
@@ -391,6 +407,9 @@ def main(argv=None):
                     inherited_runs=len(inherited),
                     missing_cells=sorted(missing) if missing is not None else None,
                     arms=cfg["arms"],
+                    service_context_limits=cfg.get(
+                        "service_context_limits", dict(tp1=8192, tp2=16384)
+                    ),
                     environment_mode="CURRENT_MACHINE_NO_PRIOR_COMPARISON"
                     if args.current_machine
                     else "PRIOR_ENVIRONMENT_COMPARISON",
@@ -459,6 +478,8 @@ def main(argv=None):
             raise ValueError("GPU capability/driver/runtime differ; UUID not compared")
         inputs = verified_inputs(args.model, args.inputs)
         spec = migration_spec(args.model)
+        if args.expanded_context:
+            expanded_context_spec(spec, read(args.model / "config.json"))
         spec.update(
             checkpoint=str(args.checkpoint),
             checkpoint_sha256=CHECKPOINT_SHA,
@@ -495,6 +516,9 @@ def main(argv=None):
                 "NOT a calibrated guarantee"
             ),
             policy_overrides=cfg["policy_overrides"],
+            service_context_limits=cfg.get(
+                "service_context_limits", dict(tp1=8192, tp2=16384)
+            ),
         )
         write(args.output / "scope.json", scope)
         write(args.output / "comparison_recipe.json", cfg)
@@ -518,6 +542,8 @@ def main(argv=None):
             plans = [p for p in plans if p[2]["name"] in missing]
         for _, arm, _, plan in plans:
             adapt_plan(plan, arm, args.checkpoint, args.model)
+            if args.expanded_context:
+                plan["expected_context_limits"] = (32768, 32768)
             if args.kv_priority_verify or args.updated_pressure_four_mode:
                 priority.enable_urgent_target(plan)
         serving_preflight(plans)

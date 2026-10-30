@@ -62,6 +62,18 @@ def engine_arguments():
     ]
 
 
+def expanded_context_spec(spec, model_config):
+    """Opt in to native 32K limits in both pools; preserve frozen profiles."""
+    validate_config(model_config, read(PROFILE))
+    if (
+        model_config.get("max_position_embeddings", 0) < 32768
+        or spec["server_settings"].get("target_tp_size") != 2
+    ):
+        raise ValueError("expanded context requires native Qwen3 TP1/TP2")
+    spec["context_profile"] = "QWEN3_NATIVE_32K_BOTH_V1"
+    spec["server_settings"].update(max_model_len=32768, tp4_max_model_len=32768)
+
+
 def migration_spec(model):
     """Reuse transport configuration, never its old model/predictor evidence."""
     from tools.bridge_tp.run_tp2_calibration import prepare

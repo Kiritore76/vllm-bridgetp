@@ -149,10 +149,15 @@ def arguments(spec):
         or args.tp1_gpu in devices
     ):
         raise ValueError("source/target GPUs must be disjoint and match TP")
+    context_profile = spec.get("context_profile")
+    limits = (8192, 16384)
+    if context_profile is not None:
+        if context_profile != "QWEN3_NATIVE_32K_BOTH_V1" or target_tp != 2:
+            raise ValueError("unknown or incompatible context profile")
+        limits = (32768, 32768)
     if (
         args.dtype != "bfloat16"
-        or args.max_model_len != 8192
-        or args.tp4_max_model_len != 16384
+        or (args.max_model_len, args.tp4_max_model_len) != limits
         or (target_tp == 4 and args.tp1_gpu != "0")
         or (target_tp == 4 and args.tp4_gpus != "1,2,3,4")
         or not args.persistent_channel

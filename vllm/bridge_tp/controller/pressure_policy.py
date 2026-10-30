@@ -1216,11 +1216,15 @@ def admit(
     source = ledger.routing_reading(pools[0])
     target = ledger.routing_reading(pools[1])
     source_pressure = classify(source, cfg, now)
-    prefer_target = prompt_tokens >= cfg.very_long_prompt_tokens or (
-        prompt_tokens >= cfg.prompt_boundary
-        and source_pressure.zone in {"CRITICAL", "OVERLOAD"}
+    # Current workload routing computes the real post-arrival costs below.
+    # Fixed prompt-length preferences belong only to legacy routing modes.
+    prefer_target = not cfg.workload_pressure and (
+        prompt_tokens >= cfg.very_long_prompt_tokens or (
+            prompt_tokens >= cfg.prompt_boundary
+            and source_pressure.zone in {"CRITICAL", "OVERLOAD"}
+        )
     )
-    if cfg.health_service:
+    if cfg.health_service and not cfg.workload_pressure:
         source_needs_relief = (
             source_pressure.capacity is not None and source_pressure.capacity >= 1
         ) or (
