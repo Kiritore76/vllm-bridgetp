@@ -757,6 +757,8 @@ class _GpuDirectHistoryPublisher:
                 ],
                 keep_open=self.config.gpu_direct_delta,
                 history_pacing=self.config.gpu_direct_history_pacing,
+                source_pack_budget_bytes=int(os.environ.get(
+                    "BRIDGETP_HISTORY_PACK_BUDGET_BYTES", "0")),
                 history_rate_provider=(
                     lambda: get_bridge_tp_stream_config().aggregate_rate_gib_s
                 ),
@@ -1000,6 +1002,49 @@ def _publish_request(
     block_axis = _get_block_axis(attn_groups, cache_dtype, block_size)
     layer_names = _ordered_layer_names(kv_cache_config)
     raw_source_bytes = _estimate_dump_bytes(kv_caches, block_axis, len(block_ids))
+    pack_budget = int(os.environ.get("BRIDGETP_HISTORY_PACK_BUDGET_BYTES", "0"))
+    if config.gpu_direct_history and pack_budget:
+        from vllm.bridge_tp.bounded_history import packing_plan
+
+        memory_plan = packing_plan(
+            kv_caches,
+            block_ids,
+            block_axis,
+            config.head_axis,
+            config.target_tp_size,
+            pack_budget,
+        )
+        reserve = int(
+            os.environ.get(
+                "BRIDGETP_HISTORY_FORWARD_RESERVE_BYTES", str(512 * 1024 * 1024)
+            )
+        )
+        if reserve < 0:
+            raise ValueError("history forward reserve cannot be negative")
+        free, total = torch.cuda.mem_get_info(kv_caches[0].device)
+        allowed = free >= memory_plan.source_peak_bound_bytes + reserve
+        config.run_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_json_dump(
+            dict(
+                status="READY_FOR_BOUNDED_HISTORY"
+                if allowed
+                else "DEFERRED_GPU_MEMORY",
+                migration_id=config.migration_id,
+                source_request_id=request_id,
+                cuda_free_bytes=free,
+                cuda_total_bytes=total,
+                source_pack_budget_bytes=pack_budget,
+                source_pack_peak_bound_bytes=memory_plan.source_peak_bound_bytes,
+                forward_reserve_bytes=reserve,
+                raw_history_bytes=raw_source_bytes,
+                updated_unix_s=time.time(),
+            ),
+            config.run_dir / "source_history_memory_receipt.json",
+        )
+        if not allowed:
+            # No publisher or wire session has been started. Leave inference
+            # running; retry only at the next normal iteration boundary.
+            return
     snapshot_started = time.perf_counter()
     session_token = secrets.token_hex(32)
     config.run_dir.mkdir(parents=True, exist_ok=True)

@@ -128,3 +128,58 @@ def prepare_native(plan, common, inputs):
             note="boundary capacity, not concurrency or quality",
         ),
     )
+
+
+def assess_memory(plan, summary):
+    """Require actual bounded transfers, commit/free and <=1s handoff samples."""
+    import json
+
+    rows = []
+    for folder in sorted((plan["run_dir"] / "sessions").glob("migration-*")):
+        state_path = folder / "takeover_state.json"
+        if not state_path.exists():
+            continue
+
+        def read(p):
+            return json.loads(p.read_text()) if p.exists() else {}
+
+        state = read(state_path)
+        sender = read(folder / "gpu_direct_sender.json")
+        memory = read(folder / "source_history_memory_receipt.json")
+        ranks = sender.get("ranks", [])
+        valid = (
+            state["state"] == "COMMITTED"
+            and len(ranks) == 2
+            and memory.get("status") == "READY_FOR_BOUNDED_HISTORY"
+            and memory["cuda_free_bytes"]
+            >= memory["source_pack_peak_bound_bytes"] + memory["forward_reserve_bytes"]
+            and all(
+                r.get("source_bounded_history")
+                and r.get("source_history_payload_released")
+                and type(r.get("source_pack_chunk_buffer_bytes")) is int
+                and r["source_pack_chunk_buffer_bytes"] > 0
+                and r["source_pack_chunk_buffer_bytes"] <= 16 * 1024 * 1024
+                for r in ranks
+            )
+        )
+        rows.append(
+            dict(
+                migration_id=state["migration_id"],
+                pass_memory=valid,
+                raw_history_bytes=memory.get("raw_history_bytes"),
+                source_peak_bound_bytes=memory.get("source_pack_peak_bound_bytes"),
+            )
+        )
+    accepted = (
+        bool(rows)
+        and all(r["pass_memory"] for r in rows)
+        and len(rows) == summary["committed_requests"] == summary["source_releases"]
+        and summary["maximum_handoff_s"] <= 1
+        and summary["fixed_arrivals_valid"]
+        and summary["load_coverage_pass"]
+    )
+    return {
+        "pass": accepted,
+        "sessions": rows,
+        "note": "memory mechanism verification; not comparative performance proof",
+    }

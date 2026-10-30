@@ -190,6 +190,7 @@ def main(argv=None):
     parser.add_argument("--updated-pressure-four-mode", action="store_true")
     parser.add_argument("--routine-four-mode", action="store_true")
     parser.add_argument("--long-burst-pair", action="store_true")
+    parser.add_argument("--long-burst-memory-verify", action="store_true")
     parser.add_argument("--expanded-context", action="store_true")
     parser.add_argument("--kv-priority-verify", action="store_true")
     parser.add_argument("--kv-routing-verify", action="store_true")
@@ -198,6 +199,8 @@ def main(argv=None):
     parser.add_argument("--complete-four-mode", type=Path)
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
+    if args.long_burst_memory_verify:
+        args.long_burst_pair = True
     if args.long_burst_pair:
         if args.routine_four_mode or args.updated_pressure_four_mode:
             parser.error("long-burst-pair is a separate STAY/MIGRATE experiment")
@@ -249,6 +252,13 @@ def main(argv=None):
             if args.routine_four_mode
             else pressure_four.updated_config(read(args.inputs))
         )
+        if args.long_burst_memory_verify:
+            cfg["recipes"] = [
+                r for r in cfg["recipes"] if r["scenario"] == "deep_long_burst"
+            ]
+            cfg["arms"] = ["migrate"]
+            cfg["recipes"][0]["arm_order_offset"] = 0
+            cfg["note"] += "; one failed-workload memory verification, not a new pair"
         values = cfg["recipes"]
     elif args.kv_priority_verify:
         if (
@@ -553,6 +563,10 @@ def main(argv=None):
             adapt_plan(plan, arm, args.checkpoint, args.model)
             if args.expanded_context:
                 plan["expected_context_limits"] = (32768, 32768)
+                plan["source_env"].update(
+                    BRIDGETP_HISTORY_PACK_BUDGET_BYTES=str(16 * 1024 * 1024),
+                    BRIDGETP_HISTORY_FORWARD_RESERVE_BYTES=str(512 * 1024 * 1024),
+                )
             if args.kv_priority_verify or args.updated_pressure_four_mode:
                 priority.enable_urgent_target(plan)
         serving_preflight(plans)
@@ -598,6 +612,12 @@ def main(argv=None):
                 dict(summary=summary, requests=requests),
             )
             row.update(status="COMPLETED", summary=summary, closed_loop=proof)
+            if args.long_burst_memory_verify:
+                row["history_memory"] = long_burst.assess_memory(plan, summary)
+                write(
+                    args.output / "history_memory_acceptance.json",
+                    row["history_memory"],
+                )
             if args.four_mode or matrix_mode:
                 raw = read(plan["run_dir"] / "pressure_request_results.json")
                 score = four.full_score(
@@ -729,6 +749,13 @@ def main(argv=None):
                 if valid
                 else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
             )
+            if args.long_burst_memory_verify:
+                accepted = len(ledger) == 1 and ledger[0]["history_memory"]["pass"]
+                result, code = (
+                    (dict(status="COMPLETED_HISTORY_MEMORY_VERIFY"), 0)
+                    if accepted
+                    else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
+                )
         if args.four_mode and not args.kv_priority_verify and not args.long_burst_pair:
             paired = four.comparisons(inherited + ledger)
             pairs = paired
@@ -826,7 +853,9 @@ def main(argv=None):
             total_profile_attempts=previous_attempts + len(ledger),
             inherited_runs=inherited,
             maximum_live_runs=run_count,
-            experiment_mode="long-burst-pair"
+            experiment_mode="long-burst-memory-verify"
+            if args.long_burst_memory_verify
+            else "long-burst-pair"
             if args.long_burst_pair
             else "routine-four-mode"
             if args.routine_four_mode

@@ -14,8 +14,9 @@ import math
 import socket
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 import torch
 
@@ -966,6 +967,7 @@ class GpuDirectHistorySender:
         target_addresses: list[str],
         keep_open: bool = False,
         history_pacing: bool = False,
+        source_pack_budget_bytes: int = 0,
         history_rate_provider: Callable[[], float] | None = None,
     ) -> list[dict[str, Any]]:
         if len(kv_caches) != len(layer_names):
@@ -975,15 +977,16 @@ class GpuDirectHistorySender:
         if persistent_channel and not request_id:
             raise ValueError("persistent GPU-direct history requires request_id")
         if persistent_channel and history_end_token is None:
-            raise ValueError(
-                "persistent GPU-direct history requires history_end_token"
-            )
+            raise ValueError("persistent GPU-direct history requires history_end_token")
         if persistent_channel and not keep_open:
             raise ValueError("persistent GPU-direct history must keep channel open")
         if history_pacing and (not persistent_channel or history_rate_provider is None):
             raise ValueError(
                 "paced GPU-direct history needs a persistent channel and rate"
             )
+
+        if source_pack_budget_bytes and not persistent_channel:
+            raise ValueError("bounded history requires persistent chunk protocol")
 
         channel_setup_started = time.perf_counter()
         topology_key = "|".join(target_addresses)
@@ -1034,8 +1037,7 @@ class GpuDirectHistorySender:
                             f"GPU-direct rank {rank} did not become ready"
                         )
                     if persistent_channel and (
-                        int(ready.get("channel_generation", -1))
-                        != channel_generation
+                        int(ready.get("channel_generation", -1)) != channel_generation
                         or int(ready.get("target_tp_rank", -1)) != rank
                     ):
                         raise ProtocolViolation(
@@ -1054,9 +1056,7 @@ class GpuDirectHistorySender:
                     )
                     self.lifecycle.mark_open()
 
-            channel_setup_ms = (
-                time.perf_counter() - channel_setup_started
-            ) * 1000
+            channel_setup_ms = (time.perf_counter() - channel_setup_started) * 1000
             session_handshake_started = time.perf_counter()
             if persistent_channel:
                 assert request_id is not None
@@ -1092,9 +1092,7 @@ class GpuDirectHistorySender:
                 time.perf_counter() - session_handshake_started
             ) * 1000
             started = time.perf_counter()
-            block_index = torch.tensor(
-                block_ids, dtype=torch.long, device=self.device
-            )
+            block_index = torch.tensor(block_ids, dtype=torch.long, device=self.device)
             dtype = kv_caches[0].dtype
             if any(cache.dtype != dtype for cache in kv_caches):
                 raise ValueError("GPU-direct packed history requires one dtype")
@@ -1105,6 +1103,44 @@ class GpuDirectHistorySender:
                 // target_tp_size
                 for cache in kv_caches
             )
+            bounded_plan = None
+            packer = None
+            pack_buffers = []
+            packing_chunks = 0
+            source_memory = {}
+            if source_pack_budget_bytes:
+                from vllm.bridge_tp.bounded_history import HistoryPacker, packing_plan
+
+                bounded_plan = packing_plan(
+                    kv_caches,
+                    block_ids,
+                    block_axis,
+                    head_axis,
+                    target_tp_size,
+                    source_pack_budget_bytes,
+                )
+                if kv_caches[0].device != self.device:
+                    raise ValueError("bounded history source device differs")
+                source_memory["before_allocated"] = torch.cuda.memory_allocated(
+                    self.device
+                )
+                source_memory["observed_peak_allocated"] = source_memory[
+                    "before_allocated"
+                ]
+                source_memory["observed_peak_reserved"] = torch.cuda.memory_reserved(
+                    self.device
+                )
+
+            def observe_source_memory():
+                source_memory["observed_peak_allocated"] = max(
+                    source_memory["observed_peak_allocated"],
+                    torch.cuda.memory_allocated(self.device),
+                )
+                source_memory["observed_peak_reserved"] = max(
+                    source_memory["observed_peak_reserved"],
+                    torch.cuda.memory_reserved(self.device),
+                )
+
             with torch.cuda.device(self.device):
                 producer_stream = self.producer_stream
                 if producer_stream is None:
@@ -1115,69 +1151,93 @@ class GpuDirectHistorySender:
                         torch.cuda.Stream(device=self.device)
                         for _ in range(target_tp_size)
                     ]
-                reusable_buffers = (
-                    persistent_channel
-                    and len(self._packed_buffers) == target_tp_size
-                    and self.buffer_capacity_elements >= rank_elements
-                    and all(value.dtype == dtype for value in self._packed_buffers)
-                )
-                if reusable_buffers:
-                    packed_by_rank = [
-                        value.narrow(0, 0, rank_elements)
-                        for value in self._packed_buffers
-                    ]
-                else:
-                    capacity = max(rank_elements, self.buffer_capacity_elements)
-                    self._packed_buffers = [
-                        torch.empty(capacity, dtype=dtype, device=self.device)
+                if bounded_plan is not None:
+                    pack_buffers = [
+                        torch.empty(
+                            bounded_plan.chunk_elements, dtype=dtype, device=self.device
+                        )
                         for _ in range(target_tp_size)
                     ]
-                    self.buffer_capacity_elements = capacity
-                    packed_by_rank = [
-                        value.narrow(0, 0, rank_elements)
-                        for value in self._packed_buffers
-                    ]
                     self.buffer_high_water_bytes = max(
-                        self.buffer_high_water_bytes,
-                        capacity
-                        * kv_caches[0].element_size()
-                        * target_tp_size,
+                        self.buffer_high_water_bytes, bounded_plan.chunk_buffer_bytes
                     )
-            self.streams = send_streams
-            offsets = [0] * target_tp_size
-            with torch.cuda.stream(producer_stream):
-                for cache in kv_caches:
-                    if _cuda_device(cache.device) != self.device:
-                        raise ValueError("all source KV caches must share one GPU")
-                    selected = cache.index_select(block_axis, block_index)
-                    if int(selected.shape[head_axis]) % target_tp_size:
-                        raise ValueError(
-                            "source KV heads are not divisible by target TP"
+                    packed_by_rank = []
+                else:
+                    reusable_buffers = (
+                        persistent_channel
+                        and len(self._packed_buffers) == target_tp_size
+                        and self.buffer_capacity_elements >= rank_elements
+                        and all(value.dtype == dtype for value in self._packed_buffers)
+                    )
+                    if reusable_buffers:
+                        packed_by_rank = [
+                            value.narrow(0, 0, rank_elements)
+                            for value in self._packed_buffers
+                        ]
+                    else:
+                        capacity = max(rank_elements, self.buffer_capacity_elements)
+                        self._packed_buffers = [
+                            torch.empty(capacity, dtype=dtype, device=self.device)
+                            for _ in range(target_tp_size)
+                        ]
+                        self.buffer_capacity_elements = capacity
+                        packed_by_rank = [
+                            value.narrow(0, 0, rank_elements)
+                            for value in self._packed_buffers
+                        ]
+                        self.buffer_high_water_bytes = max(
+                            self.buffer_high_water_bytes,
+                            capacity * kv_caches[0].element_size() * target_tp_size,
                         )
-                    for rank, shard in enumerate(
-                        selected.chunk(target_tp_size, dim=head_axis)
-                    ):
-                        flat = shard.contiguous().view(-1)
-                        packed_by_rank[rank].narrow(
-                            0, offsets[rank], flat.numel()
-                        ).copy_(flat)
-                        offsets[rank] += flat.numel()
-            producer_stream.synchronize()
-            pack_ms = (time.perf_counter() - started) * 1000
-            if offsets != [rank_elements] * target_tp_size:
-                raise RuntimeError("GPU-direct packed history size differs")
-            chunk_elements = (
-                min(
+            self.streams = send_streams
+            if bounded_plan is not None:
+                with torch.cuda.stream(producer_stream):
+                    packer = HistoryPacker(
+                        kv_caches,
+                        block_ids,
+                        block_axis,
+                        head_axis,
+                        target_tp_size,
+                        memory_observer=observe_source_memory,
+                    )
+                producer_stream.synchronize()
+                pack_ms = (time.perf_counter() - started) * 1000
+            else:
+                offsets = [0] * target_tp_size
+                with torch.cuda.stream(producer_stream):
+                    for cache in kv_caches:
+                        if _cuda_device(cache.device) != self.device:
+                            raise ValueError("all source KV caches must share one GPU")
+                        selected = cache.index_select(block_axis, block_index)
+                        if int(selected.shape[head_axis]) % target_tp_size:
+                            raise ValueError(
+                                "source KV heads are not divisible by target TP"
+                            )
+                        for rank, shard in enumerate(
+                            selected.chunk(target_tp_size, dim=head_axis)
+                        ):
+                            flat = shard.contiguous().view(-1)
+                            packed_by_rank[rank].narrow(
+                                0, offsets[rank], flat.numel()
+                            ).copy_(flat)
+                            offsets[rank] += flat.numel()
+                producer_stream.synchronize()
+                pack_ms = (time.perf_counter() - started) * 1000
+                if offsets != [rank_elements] * target_tp_size:
+                    raise RuntimeError("GPU-direct packed history size differs")
+            if bounded_plan is not None:
+                chunk_elements = bounded_plan.chunk_elements
+            elif history_pacing:
+                chunk_elements = min(
                     rank_elements,
                     max(
                         1,
                         _HISTORY_PACING_CHUNK_BYTES
-                        // (target_tp_size * packed_by_rank[0].element_size()),
+                        // (target_tp_size * kv_caches[0].element_size()),
                     ),
                 )
-                if history_pacing
-                else None
-            )
+            else:
+                chunk_elements = None
             receiver_ready_started = time.perf_counter()
             history_envelopes: dict[int, SessionEnvelope] = {}
             if persistent_channel:
@@ -1215,9 +1275,7 @@ class GpuDirectHistorySender:
                         expected_status="READY_TO_RECV",
                         expected=history_envelopes[rank],
                     )
-            receiver_ready_ms = (
-                time.perf_counter() - receiver_ready_started
-            ) * 1000
+            receiver_ready_ms = (time.perf_counter() - receiver_ready_started) * 1000
             nccl_send_started = time.perf_counter()
             pacing_chunks: list[dict[str, Any]] = []
             if chunk_elements is None:
@@ -1227,11 +1285,21 @@ class GpuDirectHistorySender:
                 nccl_send_ms = 0.0
                 for offset in range(0, rank_elements, chunk_elements):
                     length = min(chunk_elements, rank_elements - offset)
-                    chunk_bytes = (
-                        length * packed_by_rank[0].element_size() * target_tp_size
+                    chunk_bytes = length * kv_caches[0].element_size() * target_tp_size
+                    if bounded_plan is not None:
+                        pack_started = time.perf_counter()
+                        with torch.cuda.stream(producer_stream):
+                            packer.fill(pack_buffers, length)
+                        producer_stream.synchronize()
+                        pack_ms += (time.perf_counter() - pack_started) * 1000
+                        packed_by_rank = [
+                            value.narrow(0, 0, length) for value in pack_buffers
+                        ]
+                        packing_chunks += 1
+                    rate_gib_s = (
+                        float(history_rate_provider()) if history_pacing else 0.0
                     )
-                    rate_gib_s = float(history_rate_provider())
-                    if rate_gib_s <= 0:
+                    if history_pacing and rate_gib_s <= 0:
                         raise ValueError(
                             "GPU-direct history pacing rate must be positive"
                         )
@@ -1239,39 +1307,48 @@ class GpuDirectHistorySender:
                     _send_group(
                         nccl,
                         comms,
-                        [value.narrow(0, offset, length) for value in packed_by_rank],
+                        packed_by_rank
+                        if bounded_plan is not None
+                        else [
+                            value.narrow(0, offset, length) for value in packed_by_rank
+                        ],
                         send_streams,
                     )
                     send_ms = (time.perf_counter() - chunk_started) * 1000
                     nccl_send_ms += send_ms
                     sleep_s = 0.0
-                    if offset + length < rank_elements:
+                    if history_pacing and offset + length < rank_elements:
                         sleep_s = max(
-                            0.0, chunk_bytes / (rate_gib_s * 1024**3)
-                            - send_ms / 1000,
+                            0.0,
+                            chunk_bytes / (rate_gib_s * 1024**3) - send_ms / 1000,
                         )
                         if sleep_s:
                             sleep_started = time.perf_counter()
                             time.sleep(sleep_s)
                             sleep_s = time.perf_counter() - sleep_started
-                    pacing_chunks.append(
-                        {
-                            "aggregate_bytes": chunk_bytes,
-                            "requested_rate_gib_s": rate_gib_s,
-                            "send_ms": send_ms,
-                            "sleep_ms": sleep_s * 1000,
-                        }
-                    )
-            history_pacing_span_ms = (
-                time.perf_counter() - nccl_send_started
-            ) * 1000
+                    if history_pacing:
+                        pacing_chunks.append(
+                            {
+                                "aggregate_bytes": chunk_bytes,
+                                "requested_rate_gib_s": rate_gib_s,
+                                "send_ms": send_ms,
+                                "sleep_ms": sleep_s * 1000,
+                            }
+                        )
+            if bounded_plan is not None:
+                packer.close()
+                packer = None
+                pack_buffers = []
+                packed_by_rank = []
+                source_memory["after_history_allocated"] = torch.cuda.memory_allocated(
+                    self.device
+                )
+            history_pacing_span_ms = (time.perf_counter() - nccl_send_started) * 1000
             completion_ack_started = time.perf_counter()
             for rank, connection in enumerate(connections):
                 received = recv_json(connection)
                 if received.get("status") != "RECEIVED":
-                    raise RuntimeError(
-                        f"GPU-direct rank {rank} missed packed history"
-                    )
+                    raise RuntimeError(f"GPU-direct rank {rank} missed packed history")
                 if persistent_channel:
                     _validate_ack(
                         received,
@@ -1292,31 +1369,37 @@ class GpuDirectHistorySender:
                     assert self.lifecycle.active_session is not None
                     self.lifecycle.active_session.acknowledge(
                         rank=rank,
-                        sequence_number=(
-                            history_envelopes[rank].sequence_number
-                        ),
+                        sequence_number=(history_envelopes[rank].sequence_number),
                     )
-            completion_ack_ms = (
-                time.perf_counter() - completion_ack_started
-            ) * 1000
+            completion_ack_ms = (time.perf_counter() - completion_ack_started) * 1000
             elapsed_ms = (time.perf_counter() - started) * 1000
             bytes_by_rank = [
-                value.numel() * value.element_size()
-                for value in packed_by_rank
-            ]
+                rank_elements * kv_caches[0].element_size()
+            ] * target_tp_size
             result = [
                 {
                     "target_tp_rank": rank,
                     "raw_tensor_bytes": count,
                     "transfer_ms": elapsed_ms,
                     "channel_reused": reuse_channel,
-                    "preconnect_completed_unix_s": (
-                        self.preconnect_completed_unix_s
-                    ),
+                    "preconnect_completed_unix_s": (self.preconnect_completed_unix_s),
                     "warmup_completed_unix_s": self.warmup_completed_unix_s,
                     "channel_setup_ms": channel_setup_ms,
                     "session_handshake_ms": session_handshake_ms,
                     "pack_ms": pack_ms,
+                    "source_bounded_history": bounded_plan is not None,
+                    "source_pack_budget_bytes": source_pack_budget_bytes,
+                    "source_pack_chunk_buffer_bytes": bounded_plan.chunk_buffer_bytes
+                    if bounded_plan
+                    else None,
+                    "source_pack_peak_bound_bytes": bounded_plan.source_peak_bound_bytes
+                    if bounded_plan
+                    else None,
+                    "source_history_packing_chunks": packing_chunks,
+                    "source_history_payload_released": bounded_plan is not None,
+                    "source_cuda_memory_samples": source_memory
+                    if bounded_plan
+                    else None,
                     "receiver_ready_ms": receiver_ready_ms,
                     "nccl_send_ms": nccl_send_ms,
                     "history_pacing_enabled": history_pacing,
@@ -1329,9 +1412,9 @@ class GpuDirectHistorySender:
                     ),
                     "history_pacing_span_ms": history_pacing_span_ms,
                     "history_pacing_observed_gib_s": (
-                        sum(bytes_by_rank) / 1024**3
-                        / (history_pacing_span_ms / 1000)
-                        if history_pacing_span_ms > 0 else None
+                        sum(bytes_by_rank) / 1024**3 / (history_pacing_span_ms / 1000)
+                        if history_pacing_span_ms > 0
+                        else None
                     ),
                     "history_pacing_chunks": pacing_chunks,
                     "completion_ack_ms": completion_ack_ms,
@@ -1349,9 +1432,7 @@ class GpuDirectHistorySender:
                         else None
                     ),
                     "buffer_high_water_bytes": (
-                        self.buffer_high_water_bytes
-                        if persistent_channel
-                        else None
+                        self.buffer_high_water_bytes if persistent_channel else None
                     ),
                     "observed_gib_s": (
                         count / 1024**3 / (elapsed_ms / 1000)

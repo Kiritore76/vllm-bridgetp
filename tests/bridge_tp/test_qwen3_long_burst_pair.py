@@ -5,6 +5,7 @@ import contextlib
 import copy
 import io
 import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -16,6 +17,84 @@ from tools.bridge_tp import run_qwen3_stay_migrate as runner
 
 
 class LongBurstPairTests(unittest.TestCase):
+    def test_memory_assessment_rejects_zero_moves_bad_rank_or_long_handoff(self):
+        with tempfile.TemporaryDirectory() as temp:
+            plan = dict(run_dir=Path(temp))
+            summary = dict(
+                committed_requests=0,
+                source_releases=0,
+                maximum_handoff_s=0,
+                fixed_arrivals_valid=True,
+                load_coverage_pass=True,
+            )
+            self.assertFalse(burst.assess_memory(plan, summary)["pass"])
+            folder = Path(temp) / "sessions/migration-0001"
+            folder.mkdir(parents=True)
+            state = dict(state="COMMITTED", migration_id="m")
+            rank = dict(
+                source_bounded_history=True,
+                source_history_payload_released=True,
+                source_pack_chunk_buffer_bytes=128,
+            )
+            memory = dict(
+                status="READY_FOR_BOUNDED_HISTORY",
+                cuda_free_bytes=1000,
+                source_pack_peak_bound_bytes=100,
+                forward_reserve_bytes=200,
+                raw_history_bytes=2000,
+            )
+
+            def write(name, value):
+                (folder / name).write_text(json.dumps(value))
+
+            write("takeover_state.json", state)
+            write("gpu_direct_sender.json", dict(ranks=[rank, rank]))
+            write("source_history_memory_receipt.json", memory)
+            summary.update(
+                committed_requests=1, source_releases=1, maximum_handoff_s=0.5
+            )
+            self.assertTrue(burst.assess_memory(plan, summary)["pass"])
+            summary["maximum_handoff_s"] = 1.1
+            self.assertFalse(burst.assess_memory(plan, summary)["pass"])
+            summary["maximum_handoff_s"] = 0.5
+            write(
+                "gpu_direct_sender.json",
+                dict(ranks=[rank, rank | dict(source_bounded_history=False)]),
+            )
+            self.assertFalse(burst.assess_memory(plan, summary)["pass"])
+            write("takeover_state.json", dict(state="CANCELLED", migration_id="m"))
+            (folder / "gpu_direct_sender.json").unlink()
+            self.assertFalse(burst.assess_memory(plan, summary)["pass"])
+
+    def test_memory_cli_selects_only_failed_deep_migrate_without_forced_routes(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = runner.main(
+                [
+                    "--long-burst-memory-verify",
+                    "--current-machine",
+                    "--repetitions",
+                    "1",
+                    "--model",
+                    "unused",
+                    "--output",
+                    "unused",
+                    "--expected-revision",
+                    "CPU",
+                    "--validate-only",
+                ]
+            )
+        row = json.loads(out.getvalue())
+        self.assertEqual(code, 0)
+        self.assertEqual(row["runs"], 1)
+        self.assertEqual(row["arms"], ["migrate"])
+        self.assertEqual(row["recipes"][0]["scenario"], "deep_long_burst")
+        self.assertEqual(row["service_context_limits"], dict(tp1=32768, tp2=32768))
+        cfg = burst.config(runner.read(runner.observation.ASSETS / "inputs.json"))
+        self.assertEqual(
+            row["recipes"][0]["input_sha256"], cfg["recipes"][1]["input_sha256"]
+        )
+
     def setUp(self):
         self.inputs = dict(
             requests={
