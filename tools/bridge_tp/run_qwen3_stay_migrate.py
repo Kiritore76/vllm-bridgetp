@@ -191,6 +191,7 @@ def main(argv=None):
     parser.add_argument("--routine-four-mode", action="store_true")
     parser.add_argument("--long-burst-pair", action="store_true")
     parser.add_argument("--long-burst-memory-verify", action="store_true")
+    parser.add_argument("--long-burst-deep-stay", action="store_true")
     parser.add_argument("--expanded-context", action="store_true")
     parser.add_argument("--kv-priority-verify", action="store_true")
     parser.add_argument("--kv-routing-verify", action="store_true")
@@ -199,7 +200,9 @@ def main(argv=None):
     parser.add_argument("--complete-four-mode", type=Path)
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
-    if args.long_burst_memory_verify:
+    if args.long_burst_memory_verify and args.long_burst_deep_stay:
+        parser.error("deep STAY supplement and memory verification are separate runs")
+    if args.long_burst_memory_verify or args.long_burst_deep_stay:
         args.long_burst_pair = True
     if args.long_burst_pair:
         if args.routine_four_mode or args.updated_pressure_four_mode:
@@ -252,13 +255,17 @@ def main(argv=None):
             if args.routine_four_mode
             else pressure_four.updated_config(read(args.inputs))
         )
-        if args.long_burst_memory_verify:
+        if args.long_burst_memory_verify or args.long_burst_deep_stay:
             cfg["recipes"] = [
                 r for r in cfg["recipes"] if r["scenario"] == "deep_long_burst"
             ]
-            cfg["arms"] = ["migrate"]
+            cfg["arms"] = ["stay" if args.long_burst_deep_stay else "migrate"]
             cfg["recipes"][0]["arm_order_offset"] = 0
-            cfg["note"] += "; one failed-workload memory verification, not a new pair"
+            cfg["note"] += (
+                "; deep STAY supplement; compare separately with completed MIGRATE"
+                if args.long_burst_deep_stay
+                else "; one failed-workload memory verification, not a new pair"
+            )
         values = cfg["recipes"]
     elif args.kv_priority_verify:
         if (
@@ -756,6 +763,15 @@ def main(argv=None):
                     if accepted
                     else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
                 )
+            if args.long_burst_deep_stay:
+                accepted = len(ledger) == 1 and long_burst.assess_stay(
+                    ledger[0]["summary"], values[0]
+                )
+                result, code = (
+                    (dict(status="COMPLETED_DEEP_LONG_BURST_STAY"), 0)
+                    if accepted
+                    else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
+                )
         if args.four_mode and not args.kv_priority_verify and not args.long_burst_pair:
             paired = four.comparisons(inherited + ledger)
             pairs = paired
@@ -853,7 +869,9 @@ def main(argv=None):
             total_profile_attempts=previous_attempts + len(ledger),
             inherited_runs=inherited,
             maximum_live_runs=run_count,
-            experiment_mode="long-burst-memory-verify"
+            experiment_mode="long-burst-deep-stay"
+            if args.long_burst_deep_stay
+            else "long-burst-memory-verify"
             if args.long_burst_memory_verify
             else "long-burst-pair"
             if args.long_burst_pair

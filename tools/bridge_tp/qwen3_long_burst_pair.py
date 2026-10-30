@@ -130,6 +130,19 @@ def prepare_native(plan, common, inputs):
     )
 
 
+def assess_stay(summary, recipe):
+    """Accept full fixed work with valid arrivals, coverage and no migration."""
+    return (
+        summary["requests"] == len(recipe["jobs"])
+        and summary["output_tokens"] == recipe["planned_output_tokens"]
+        and summary["fixed_arrivals_valid"]
+        and summary["load_coverage_pass"]
+        and summary["migration_starts"] == 0
+        and summary["committed_requests"] == 0
+        and summary["source_releases"] == 0
+    )
+
+
 def assess_memory(plan, summary):
     """Require actual bounded transfers, commit/free and <=1s handoff samples."""
     import json

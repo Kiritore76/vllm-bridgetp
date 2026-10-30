@@ -17,6 +17,56 @@ from tools.bridge_tp import run_qwen3_stay_migrate as runner
 
 
 class LongBurstPairTests(unittest.TestCase):
+    def test_deep_stay_cli_keeps_completed_migrate_workload_and_disables_moves(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = runner.main(
+                [
+                    "--long-burst-deep-stay",
+                    "--current-machine",
+                    "--repetitions",
+                    "1",
+                    "--model",
+                    "unused",
+                    "--output",
+                    "unused",
+                    "--expected-revision",
+                    "CPU",
+                    "--validate-only",
+                ]
+            )
+        row = json.loads(out.getvalue())
+        expected = burst.config(runner.read(runner.observation.ASSETS / "inputs.json"))
+        self.assertEqual(code, 0)
+        self.assertEqual(row["runs"], 1)
+        self.assertEqual(row["arms"], ["stay"])
+        self.assertEqual(row["service_context_limits"], dict(tp1=32768, tp2=32768))
+        self.assertEqual(
+            row["recipes"][0]["input_sha256"],
+            expected["recipes"][1]["input_sha256"],
+        )
+        recipe = expected["recipes"][1]
+        summary = dict(
+            requests=156,
+            output_tokens=68352,
+            fixed_arrivals_valid=True,
+            load_coverage_pass=True,
+            migration_starts=0,
+            committed_requests=0,
+            source_releases=0,
+        )
+        self.assertTrue(burst.assess_stay(summary, recipe))
+        for field, value in (
+            ("output_tokens", 68351),
+            ("requests", 155),
+            ("migration_starts", 1),
+            ("committed_requests", 1),
+            ("source_releases", 1),
+            ("fixed_arrivals_valid", False),
+            ("load_coverage_pass", False),
+        ):
+            self.assertFalse(burst.assess_stay(summary | {field: value}, recipe))
+
     def test_memory_assessment_rejects_zero_moves_bad_rank_or_long_handoff(self):
         with tempfile.TemporaryDirectory() as temp:
             plan = dict(run_dir=Path(temp))
