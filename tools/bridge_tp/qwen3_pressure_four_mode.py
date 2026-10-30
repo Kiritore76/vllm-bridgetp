@@ -122,6 +122,31 @@ def decorate(score, recipe):
     return score
 
 
+def updated_config(inputs):
+    """Repeat the two affected workloads with identical updated serving paths."""
+    cfg = config(inputs)
+    cfg["recipes"] = [r for r in cfg["recipes"] if r["scenario"] != "decode_growth"]
+    cfg.update(
+        schema="QWEN3_UPDATED_PRESSURE_FOUR_MODE_8_V1",
+        policy_overrides=dict(
+            capacity_guard_blocks=125,
+            kv_emergency_priority=True,
+            kv_routing_priority=True,
+        ),
+        urgent_target_admission=dict(
+            ordinary_admission_slots=15,
+            total_running_limit=16,
+            first_token_small_batch=True,
+            async_load_bypasses_running_cap=True,
+            handoff_pending_prefill_quantum=256,
+        ),
+        note="two frozen workloads, four strategies, current machine; "
+        "same serving configuration in every arm; STAY/MIGRATE differ only "
+        "in migration execution; retain zero migrations and negative outcomes",
+    )
+    return cfg
+
+
 def aggregate(evaluations):
     return {
         scenario: full.aggregate([e for e in evaluations if e["scenario"] == scenario])

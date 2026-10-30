@@ -178,6 +178,7 @@ def main(argv=None):
     parser.add_argument("--kv-guard-trial", action="store_true")
     parser.add_argument("--resident-pressure", action="store_true")
     parser.add_argument("--pressure-four-mode", action="store_true")
+    parser.add_argument("--updated-pressure-four-mode", action="store_true")
     parser.add_argument("--kv-priority-verify", action="store_true")
     parser.add_argument("--kv-routing-verify", action="store_true")
     parser.add_argument("--current-machine", action="store_true")
@@ -187,15 +188,38 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.kv_routing_verify and not args.kv_priority_verify:
         parser.error("kv-routing-verify requires kv-priority-verify")
-    if args.current_machine and (not args.kv_priority_verify or args.prior_comparison):
+    if args.current_machine and (
+        not (args.kv_priority_verify or args.updated_pressure_four_mode)
+        or args.prior_comparison
+    ):
         parser.error(
-            "current-machine is standalone KV verification without a prior directory"
+            "current-machine requires standalone KV or updated four-mode trial"
         )
     matrix_mode = args.migration_matrix or args.kv_guard_trial or args.resident_pressure
     inherited, evaluations, missing = [], [], None
     baseline_reference = None
     previous_attempts = 49 if args.four_mode else 31
-    if args.kv_priority_verify:
+    if args.updated_pressure_four_mode:
+        if (
+            args.four_mode
+            or args.pressure_four_mode
+            or matrix_mode
+            or args.complete_four_mode
+            or args.kv_priority_verify
+            or args.repetitions != 1
+            or not args.current_machine
+            or args.prior_comparison
+            or args.prior_observation
+        ):
+            parser.error(
+                "updated four-mode requires current-machine, one repetition, "
+                "and no other experiment mode or prior directory"
+            )
+        args.four_mode = args.pressure_four_mode = True
+        previous_attempts = 0
+        cfg = pressure_four.updated_config(read(args.inputs))
+        values = cfg["recipes"]
+    elif args.kv_priority_verify:
         if (
             args.four_mode
             or args.pressure_four_mode
@@ -227,7 +251,8 @@ def main(argv=None):
         args.four_mode = True
         previous_attempts = 0 if prior is None else prior["total_profile_attempts"]
         cfg, baseline_reference = priority.config(
-            read(args.inputs), args.prior_comparison,
+            read(args.inputs),
+            args.prior_comparison,
             kv_routing=args.kv_routing_verify,
         )
         values = cfg["recipes"]
@@ -365,7 +390,7 @@ def main(argv=None):
                     maximum_migrations_per_run=0,
                     routing_policy="KV-first ingress during warning/recovery; "
                     "original service routing otherwise"
-                    if args.kv_routing_verify
+                    if args.kv_routing_verify or args.updated_pressure_four_mode
                     else "single pressure MIGRATE; urgent KV soft-gate fix"
                     if args.kv_priority_verify
                     else "six initial TP1 residents; later stress arrivals "
@@ -483,7 +508,7 @@ def main(argv=None):
             plans = [p for p in plans if p[2]["name"] in missing]
         for _, arm, _, plan in plans:
             adapt_plan(plan, arm, args.checkpoint, args.model)
-            if args.kv_priority_verify:
+            if args.kv_priority_verify or args.updated_pressure_four_mode:
                 priority.enable_urgent_target(plan)
         serving_preflight(plans)
         for recipe, arm, scene, plan in plans:
@@ -538,12 +563,24 @@ def main(argv=None):
                 )
                 if args.pressure_four_mode or args.kv_priority_verify:
                     score = pressure_four.decorate(score, recipe)
+                if args.updated_pressure_four_mode and arm in {"stay", "migrate"}:
+                    row["kv_routing"] = priority.assess_routing(audit)
+                    write(
+                        plan["run_dir"].parent / "kv_routing_acceptance.json",
+                        row["kv_routing"],
+                    )
+                    if not row["kv_routing"]["invariants_pass"] or (
+                        row["kv_routing"]["checked_arrivals"] != len(raw)
+                    ):
+                        raise ValueError("updated pressure routing audit incomplete")
                 if args.kv_priority_verify:
                     row["kv_priority"] = priority.assess(raw, audit)
                     if args.kv_routing_verify:
                         row["kv_routing"] = priority.assess_routing(audit)
-                        write(args.output / "kv_routing_acceptance.json",
-                              row["kv_routing"])
+                        write(
+                            args.output / "kv_routing_acceptance.json",
+                            row["kv_routing"],
+                        )
                     write(
                         args.output / "kv_priority_acceptance.json", row["kv_priority"]
                     )
@@ -625,7 +662,7 @@ def main(argv=None):
             paired = four.comparisons(inherited + ledger)
             pairs = paired
             write(args.output / "four_mode_comparison.json", paired)
-            valid = len(paired) == 3 and all(
+            valid = len(paired) == len(values) and all(
                 p["arrivals_valid"]
                 and p["matched_output_work"]
                 and p["all_load_covered"]
@@ -634,7 +671,9 @@ def main(argv=None):
             result, code = (
                 (
                     dict(
-                        status="COMPLETED_PRESSURE_FOUR_MODE_TRIAL"
+                        status="COMPLETED_UPDATED_PRESSURE_FOUR_MODE_TRIAL"
+                        if args.updated_pressure_four_mode
+                        else "COMPLETED_PRESSURE_FOUR_MODE_TRIAL"
                         if args.pressure_four_mode
                         else "COMPLETED_FOUR_MODE_SUPPLEMENT"
                         if args.complete_four_mode
@@ -679,16 +718,20 @@ def main(argv=None):
             if args.kv_routing_verify:
                 moves = ledger[0]["kv_priority"]["migrations"] if ledger else []
                 accepted = (
-                    len(ledger)==1
+                    len(ledger) == 1
                     and ledger[0]["summary"]["fixed_arrivals_valid"]
                     and ledger[0]["kv_routing"]["verification_pass"]
-                    and (not moves or (
-                        ledger[0]["kv_priority"]["handoff_slo_pass"] is True
-                        and ledger[0]["kv_priority"]["joint_scoring_pass"]
-                    ))
+                    and (
+                        not moves
+                        or (
+                            ledger[0]["kv_priority"]["handoff_slo_pass"] is True
+                            and ledger[0]["kv_priority"]["joint_scoring_pass"]
+                        )
+                    )
                 )
                 result, code = (
-                    (dict(status="COMPLETED_KV_ROUTING_VERIFY"), 0) if accepted
+                    (dict(status="COMPLETED_KV_ROUTING_VERIFY"), 0)
+                    if accepted
                     else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
                 )
     except KeyboardInterrupt:
@@ -710,7 +753,9 @@ def main(argv=None):
             total_profile_attempts=previous_attempts + len(ledger),
             inherited_runs=inherited,
             maximum_live_runs=run_count,
-            experiment_mode="kv-routing-verify"
+            experiment_mode="updated-pressure-four-mode"
+            if args.updated_pressure_four_mode
+            else "kv-routing-verify"
             if args.kv_routing_verify
             else "kv-priority-verify"
             if args.kv_priority_verify
