@@ -137,7 +137,7 @@
     "tools/bridge_tp/run_predictor_regularization_a100.py": "efdf52117542a0438437782eb029ff7403d5aa57e30b5e2b784cd81baa1b0d93",
     "tools/bridge_tp/run_predictor_tail_pilot.py": "1f22c18994ed77e01f42636760794dd1fea58d6b4b9f1f4ee21c40dc2f5d517d",
     "tools/bridge_tp/run_predictor_targeted4_pilot.py": "1e975e6750d24298af771ab9f94e76ae64b4f95993fdd4bf5f157ecbb6408019",
-    "tools/bridge_tp/run_pressure_balanced_pilot.py": "6e819fa46de7108384c0551edc485ea3f442dec5311fc07c289bd454b25dffab",
+    "tools/bridge_tp/run_pressure_balanced_pilot.py": "2543ca97688af16c5d40d22460c27895b057282a86068d2968c8da0788090f22",
     "tools/bridge_tp/run_randomized_goodoutput_pilot_a100.py": "6595b0f923c3fd601d01cb60c49fc5ef58054ae4bb52cc070aa70bae8cc67994",
     "tools/bridge_tp/run_remote_attention_validation.py": "3bc15acc9e45323f5084c5f9aaabef37336852af1470541beed55c4c4a8e19a3",
     "tools/bridge_tp/run_shadow_rate_load_matrix.py": "ad901d156ea287d9167547018c72445bcc4ce4a6c1b8a7bd1e751554c2f876fe",
@@ -206,7 +206,7 @@
     "vllm/bridge_tp/controller/predictor.py": "f134fdf282bceee20a007768cabb3d5ee1ce9d68c4201027c5b2f5f64197f29f",
     "vllm/bridge_tp/controller/pressure_ingress.py": "c6a9b133ea64d8381aee0e214c3396a77e814c312db0b6f11b73d115c1393194",
     "vllm/bridge_tp/controller/pressure_observation.py": "38177edad08deee36ccb4bbd15e815fce4efaac678b926e52f234e225145a39f",
-    "vllm/bridge_tp/controller/pressure_policy.py": "d5a1994c04891c118fde91326204199a29fb7d3ce36946e2e31da37d66a21892",
+    "vllm/bridge_tp/controller/pressure_policy.py": "43c50f46a6025a3e4d988073e57979dbc22ce8c3919dfb30dc2317bcc18c742a",
     "vllm/bridge_tp/controller/pressure_runtime.py": "33016f294432bda550bee4c729e9454a820c3a11589552352b3982ae2c544913",
     "vllm/bridge_tp/controller/pressure_service.py": "e2d537e473026842ee1f8bf6d5b43e860d3f25dab44d66d7be61a4ff9508f143",
     "vllm/bridge_tp/controller/rate_controller.py": "01f9efbbc2065f8f3d1e0202fe2eae303d2d45c3f9cdcd185209d675055471f1",
@@ -375,9 +375,9 @@
     "tests/bridge_tp/test_qwen3_resident_pressure.py": "3d6e0cf16a6630685b686f3030ca899862229611d63406aa7004cf356997a7b2",
     "tools/bridge_tp/qwen3_pressure_four_mode.py": "d6aa1534d59f5ab73381e26f58b661529138a772755d11536d1e3723219d4762",
     "tests/bridge_tp/test_qwen3_pressure_four_mode.py": "b90955959543a7f33477d034ed31d24a822ebe3948ac888cd4667d04fd02daa2",
-    "tools/bridge_tp/qwen3_kv_priority_verify.py": "1d2e49dc9b1c129a60492542efcf33f1b0d386c4bbc391d503c4d8bf6f96a9a5",
-    "tests/bridge_tp/test_kv_emergency_priority.py": "3b13e84ef06107a9a2bb2d0e9356ff41642629add1f5d8ba909c8b4a22c1fc1c",
-    "tests/bridge_tp/test_qwen3_kv_priority_verify.py": "f1111817dff88a10e29856c6ec8aeedfb4355d102fb7a97260e2163990da9e82"
+    "tools/bridge_tp/qwen3_kv_priority_verify.py": "76c50ed9c947c5d6d0c3337698a11b4fb9a773db96206b2ce0ad33dc5f74f03c",
+    "tests/bridge_tp/test_kv_emergency_priority.py": "8263c8b5d3ef949ac9d5386fc79b1fc326085b0fd8009963393fac6c5d0754da",
+    "tests/bridge_tp/test_qwen3_kv_priority_verify.py": "6d0cee7744d294c68485c98bff052a13b11afcdd23f5209e9633c6cf9a1f2032"
   },
   "server_settings": {
     "dtype": "bfloat16",

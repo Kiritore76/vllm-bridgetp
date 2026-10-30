@@ -5,11 +5,17 @@ import dataclasses
 import hashlib
 import json
 import unittest
+from dataclasses import replace
 
-from tests.bridge_tp.test_pressure_policy import candidate, config, length, pool
+from tests.bridge_tp.test_pressure_policy import candidate as base_candidate
+from tests.bridge_tp.test_pressure_policy import config, length, pool
 from tools.bridge_tp.pressure_cpu import load
 
 p = load("pressure_policy")
+
+
+def candidate(*args, **kwargs):
+    return base_candidate(*args, **(dict(source_tokens_s=32) | kwargs))
 
 
 def decide(source=None, target=None, candidates=None, cfg=None, ledger=None):
@@ -19,7 +25,7 @@ def decide(source=None, target=None, candidates=None, cfg=None, ledger=None):
         10.0,
         source or pool(free_blocks=100),
         target or pool("tp4"),
-        candidates if candidates is not None else [candidate()],
+        candidates if candidates is not None else [candidate(source_tokens_s=32)],
     )
 
 
@@ -104,6 +110,63 @@ class KVPriorityTests(unittest.TestCase):
             pool("tp4"),
         )
         self.assertEqual(decide(ledger=ledger).reason, "migration channel occupied")
+
+    def test_joint_score_can_choose_neither_largest_kv_nor_longest_request(self):
+        # All survive the same horizon and satisfy physical relief. Products:
+        # 400*(600/32-1.3)=6980; 80*(4000/32-1.3)=9896;
+        # 200*(2000/32-1.3)=12240 block-seconds.
+        choices = [
+            candidate("largest", owned_blocks=400, releasable_blocks=400,
+                      remaining=length(600)),
+            candidate("longest", remaining=length(4000)),
+            candidate("balanced", owned_blocks=200, releasable_blocks=200,
+                      remaining=length(2000)),
+        ]
+        result = decide(candidates=choices)
+        self.assertEqual(result.request_id, "balanced")
+        self.assertAlmostEqual(result.candidates[2]["kv_joint_benefit"]
+                               ["relief_block_seconds"], 12240)
+        for choice in (choices, list(reversed(choices))):
+            self.assertEqual(decide(candidates=choice).request_id, "balanced")
+
+    def test_joint_score_counts_releasable_blocks_not_all_owned_blocks(self):
+        c = candidate(owned_blocks=1000, releasable_blocks=80)
+        result = decide(candidates=[c])
+        score = result.candidates[0]["kv_joint_benefit"]
+        self.assertEqual(score["releasable_blocks"], 80)
+        self.assertAlmostEqual(score["relief_block_seconds"],
+                               80 * (c.remaining.mean / 32 - 1.3))
+
+    def test_joint_score_penalizes_transfer_delay_and_uses_request_rate(self):
+        a = candidate("a", remaining=length(1000))
+        b = candidate("b", remaining=length(1000), estimated_release_s=10)
+        self.assertEqual(decide(candidates=[b, a]).request_id, "a")
+        b = replace(b, estimated_release_s=1.3, source_tokens_s=16)
+        self.assertEqual(decide(candidates=[a, b]).request_id, "b")
+        self.assertEqual(decide(candidates=[replace(a, source_tokens_s=1000)])
+                         .action, "STAY")
+
+    def test_missing_or_invalid_rate_never_uses_output_cap_as_score(self):
+        for rate in (None, 0, -1, float("inf"), float("nan")):
+            result = decide(candidates=[candidate(source_tokens_s=rate)])
+            self.assertEqual(result.action, "STAY")
+            self.assertIsNone(result.candidates[0]["kv_joint_benefit"])
+
+    def test_joint_score_preserves_existing_probability_weighted_mean(self):
+        # A two-point PMF with mean 1000, median 600 and cap 5980.
+        # The scorer uses the mean, not either of those other quantities.
+        template = length(1000)
+        pmf = [0.0] * (template.cap + 1)
+        pmf[600] = pmf[1400] = 0.5
+        remaining = replace(template, pmf=tuple(pmf), bins=(
+            (0.5, 600, 600, True), (0.5, 1400, 1400, True),
+        ))
+        result = decide(candidates=[candidate(remaining=remaining)])
+        score = result.candidates[0]["kv_joint_benefit"]
+        self.assertEqual(score["remaining_tokens_mean"], remaining.mean)
+        self.assertAlmostEqual(score["remaining_s"], remaining.mean / 32)
+        self.assertAlmostEqual(score["relief_block_seconds"],
+                               80 * (remaining.mean / 32 - 1.3))
 
     def test_ordinary_service_path_unchanged_and_legacy_hash_stable(self):
         source = pool(decode_ratio=1.5)

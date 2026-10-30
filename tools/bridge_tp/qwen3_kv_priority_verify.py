@@ -69,10 +69,26 @@ def assess(raw, audit):
             and r["migration_id"] == start["migration_id"]
             for r in audit
         )
+        benefit = selected.get("kv_joint_benefit")
+        eligible_scores = [
+            c.get("kv_joint_benefit", {}).get("relief_block_seconds")
+            for c in decision["decision"]["candidates"]
+            if c.get("selection_eligible") and c.get("kv_joint_benefit")
+        ]
+        joint_maximal = bool(
+            benefit
+            and benefit.get("method")
+            == "OBSERVED_KV_X_MEAN_EARLY_RELEASE_SECONDS_V1"
+            and eligible_scores
+            and benefit["relief_block_seconds"] > 0
+            and benefit["relief_block_seconds"] == max(eligible_scores)
+        )
         moves.append(
             dict(
                 migration_id=start["migration_id"],
                 soft_warnings=selected["soft_warnings"],
+                kv_joint_benefit=benefit,
+                joint_score_maximal=joint_maximal,
                 committed=response["committed"],
                 source_released=released,
                 handoff_s=response.get("handoff_stall_s"),
@@ -88,11 +104,13 @@ def assess(raw, audit):
         if committed
         else None
     )
+    joint_scoring = bool(moves) and all(m["joint_score_maximal"] for m in moves)
     return dict(
         migrations=moves,
+        joint_scoring_pass=joint_scoring,
         mechanism_pass=mechanism,
         handoff_slo_pass=handoff,
-        verification_pass=mechanism and handoff is True,
+        verification_pass=mechanism and handoff is True and joint_scoring,
         note="single fix/mechanism verification; "
         "does not mean all output SLOs or performance passed",
     )

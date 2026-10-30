@@ -767,6 +767,10 @@ def _run(args, prepared):
                         relief,
                         cost,
                         release_budget,
+                        source_tokens_s=(
+                            source_rates.get(stream.client_id)
+                            if stream is not None else None
+                        ),
                         finished=stream.future.done() if stream is not None else False,
                         action_available=stream is not None and session.ready_for_start,
                         inventory_reference=f"{args.source_inventory}:{inventories[0]['generation']}",

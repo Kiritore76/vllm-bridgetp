@@ -27,6 +27,11 @@ def evidence():
                 candidates=[
                     dict(
                         selected=True,
+                        selection_eligible=True,
+                        kv_joint_benefit=dict(
+                            method="OBSERVED_KV_X_MEAN_EARLY_RELEASE_SECONDS_V1",
+                            relief_block_seconds=200,
+                        ),
                         kv_priority_override=True,
                         soft_warnings=["emergency target service budget unavailable"],
                     )
@@ -42,6 +47,19 @@ def evidence():
 
 
 class KVPriorityVerifyTests(unittest.TestCase):
+    def test_acceptance_requires_actual_maximum_joint_score(self):
+        raw, audit = evidence()
+        candidates = audit[0]["decision"]["candidates"]
+        candidates.append(dict(
+            selected=False, selection_eligible=True,
+            kv_joint_benefit=dict(relief_block_seconds=300),
+        ))
+        result = verify.assess(raw, audit)
+        self.assertFalse(result["joint_scoring_pass"])
+        self.assertFalse(result["verification_pass"])
+        candidates[1]["selection_eligible"] = False
+        self.assertTrue(verify.assess(raw, audit)["verification_pass"])
+
     def test_current_machine_runtime_reaches_server_preflight_without_old_identity(
         self,
     ):

@@ -536,11 +536,49 @@ class Candidate:
     action_available: bool = True
     inventory_reference: str | None = None
     target_health_after_supported: bool = False
+    # Causal per-request client-visible rate in the current source window.
+    source_tokens_s: float | None = None
 
     def audit(self) -> dict:
         return {
             f.name: getattr(self, f.name) for f in fields(self) if f.name != "remaining"
         }
+
+
+def kv_joint_benefit(c: Candidate) -> dict | None:
+    """Estimate block-seconds freed before this request's natural completion.
+
+    Use the existing stop/survival-conditioned PMF mean, not the output cap.
+    Only observed uniquely releasable blocks count; no future KV is invented.
+    This point estimate does not replace survival or physical safety gates.
+    """
+    if (
+        c.remaining is None
+        or type(c.releasable_blocks) is not int
+        or c.releasable_blocks <= 0
+        or c.source_tokens_s is None
+        or not math.isfinite(c.source_tokens_s)
+        or c.source_tokens_s <= 0
+        or c.estimated_release_s is None
+        or not math.isfinite(c.estimated_release_s)
+        or c.estimated_release_s < 0
+    ):
+        return None
+    remaining_s = c.remaining.mean / c.source_tokens_s
+    early_release_s = max(0.0, remaining_s - c.estimated_release_s)
+    benefit = c.releasable_blocks * early_release_s
+    if not all(math.isfinite(v) for v in (remaining_s, early_release_s, benefit)):
+        return None
+    return dict(
+        method="OBSERVED_KV_X_MEAN_EARLY_RELEASE_SECONDS_V1",
+        releasable_blocks=c.releasable_blocks,
+        remaining_tokens_mean=c.remaining.mean,
+        source_tokens_s=c.source_tokens_s,
+        remaining_s=remaining_s,
+        estimated_release_s=c.estimated_release_s,
+        early_release_s=early_release_s,
+        relief_block_seconds=benefit,
+    )
 
 
 @dataclass(frozen=True)
@@ -792,6 +830,7 @@ class PressurePolicy:
             return decision("target physical capacity evidence absent")
         pending_blocks, pending_decode, _ = self.ledger.pending(target.pool_id)
         feasible, rows = [], []
+        joint_benefits = {}
         for c in candidates:
             reasons = []
             soft_warnings = []
@@ -970,6 +1009,15 @@ class PressurePolicy:
                 or t.prefill > cfg.enter_ratio
             ):
                 reasons.append("emergency target service budget unavailable")
+            if kv_priority:
+                joint_benefits[c.request_id] = (
+                    kv_joint_benefit(c) if valid_prediction else None
+                )
+                benefit = joint_benefits[c.request_id]
+                if benefit is None:
+                    reasons.append("joint KV benefit evidence unavailable/invalid")
+                elif benefit["relief_block_seconds"] <= 0:
+                    reasons.append("no predicted early KV release benefit")
             rows.append(
                 {
                     "request": c.audit(),
@@ -983,6 +1031,7 @@ class PressurePolicy:
             if kv_priority:
                 rows[-1]["kv_priority_override"] = True
                 rows[-1]["soft_warnings"] = soft_warnings
+                rows[-1]["kv_joint_benefit"] = joint_benefits[c.request_id]
             if not reasons:
                 feasible.append((c, summary))
         if not feasible:
@@ -997,15 +1046,21 @@ class PressurePolicy:
             )
 
             def rank(c):
-                return (
+                key = (
                     c.estimated_release_s,
                     c.transfer_bytes,
                     -c.releasable_blocks,
                     c.request_id,
                 )
+                if kv_priority:
+                    return (
+                        -joint_benefits[c.request_id]["relief_block_seconds"],
+                        *key,
+                    )
+                return key
 
             policy = (
-                "KV priority: survival required, release time, bytes, release, id"
+                "KV priority: joint block-seconds, release time, bytes, release, id"
                 if kv_priority
                 else "KV: survival evidence, release time, bytes, release, id"
             )
