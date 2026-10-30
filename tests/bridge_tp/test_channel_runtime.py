@@ -155,8 +155,8 @@ class RuntimeTests(unittest.TestCase):
                 call(c, migration_id="m", source_request_id="r", tp_rank=0)
             )
 
-    def test_admitted_or_committed_history_is_not_drained(self):
-        for state, admitted in [("COMMITTED", False), ("CANCELLED", True)]:
+    def test_committed_history_is_not_drained(self):
+        for state, admitted in [("COMMITTED", False), ("COMMITTED", True)]:
             with tempfile.TemporaryDirectory() as tmp:
                 d = Path(tmp)
                 (d / "takeover_state.json").write_text(json.dumps(dict(state=state)))
@@ -178,11 +178,11 @@ class RuntimeTests(unittest.TestCase):
                 )
                 self.assertIs(c._prebound_gpu_history, history)
 
-    def test_unadmitted_cancel_still_drains_and_records_idle(self):
+    def test_admitted_queued_cancel_drains_and_records_idle(self):
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
             (d / "takeover_state.json").write_text('{"state":"CANCELLED"}')
-            (d / "runtime_control.json").write_text('{"target_request_admitted":false}')
+            (d / "runtime_control.json").write_text('{"target_request_admitted":true}')
             receiver = NS(
                 receive_delta=Mock(return_value=None),
                 last_session_payload_released_bytes=123,
@@ -205,6 +205,38 @@ class RuntimeTests(unittest.TestCase):
             self.assertIsNone(c._prebound_gpu_history)
             receiver.receive_delta.assert_called_once_with(migration_id="m", rank=0)
             c._record_persistent_receiver_idle.assert_called_once()
+
+    def test_cancelled_loader_cannot_claim_history_or_race_drainer(self):
+        class Cancelled(Exception):
+            pass
+
+        for history in [("m", object()), None]:
+            c = NS(
+                _prebound_gpu_history_lock=threading.Lock(),
+                _prebound_gpu_history=history,
+                _raise_if_shadow_cancelled=Mock(side_effect=Cancelled),
+            )
+            take = methods("_take_prebound_gpu_history")[
+                "_take_prebound_gpu_history"
+            ]
+            with self.assertRaises(Cancelled):
+                take(c, "m")
+            self.assertIs(c._prebound_gpu_history, history)
+
+    def test_live_loader_claim_removes_prebind_cleanup_ownership(self):
+        payload = object()
+        c = NS(
+            _prebound_gpu_history_lock=threading.Lock(),
+            _prebound_gpu_history=("m", payload),
+            _raise_if_shadow_cancelled=Mock(),
+        )
+        ns = methods("_take_prebound_gpu_history",
+                     "_cleanup_cancelled_prebound_history")
+        self.assertIs(ns["_take_prebound_gpu_history"](c, "m"), payload)
+        self.assertIsNone(c._prebound_gpu_history)
+        self.assertFalse(ns["_cleanup_cancelled_prebound_history"](
+            c, migration_id="m", source_request_id="r", tp_rank=0
+        ))
 
     def test_runtime_probe_is_one_stage_without_retirement(self):
         from tools.bridge_tp import run_qwen3_online_loaded_validation as runner

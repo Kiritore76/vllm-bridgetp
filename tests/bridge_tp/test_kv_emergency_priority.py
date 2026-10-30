@@ -36,7 +36,7 @@ class KVPriorityTests(unittest.TestCase):
             "emergency target service budget unavailable", selected["soft_warnings"]
         )
 
-    def test_short_or_missing_prediction_not_a_kv_profit_veto(self):
+    def test_short_or_missing_prediction_still_rejected_for_urgent_kv(self):
         for c in (
             candidate(max_output_tokens=200, remaining=length(32, cap=200)),
             candidate(
@@ -45,8 +45,34 @@ class KVPriorityTests(unittest.TestCase):
         ):
             self.assertEqual(decide(candidates=[c], cfg=config()).action, "STAY")
             result = decide(candidates=[c])
-            self.assertEqual(result.action, "START_SHADOW")
-            self.assertTrue(result.candidates[0]["soft_warnings"])
+            self.assertEqual(result.action, "STAY")
+            self.assertTrue(result.candidates[0]["rejections"])
+
+    def test_large_kv_does_not_override_insufficient_remaining_work(self):
+        short = candidate(
+            "large-short", max_output_tokens=200,
+            remaining=length(32, cap=200), owned_blocks=500,
+            releasable_blocks=500, transfer_bytes=1,
+        )
+        durable = candidate("durable", transfer_bytes=2000)
+        result = decide(candidates=[short, durable])
+        self.assertEqual(result.request_id, "durable")
+        self.assertIn("insufficient sustained work probability",
+                      result.candidates[0]["rejections"])
+
+    def test_long_stop_cap_alone_does_not_prove_remaining_generation(self):
+        missing = candidate(remaining=None, prediction_status="MISSING")
+        self.assertEqual(decide(candidates=[missing]).action, "STAY")
+        short = candidate(remaining=length(200))
+        self.assertEqual(decide(candidates=[short]).action, "STAY")
+
+    def test_cost_adjusted_horizon_filters_work_that_would_end_in_flight(self):
+        c = candidate(remaining=length(400))
+        self.assertEqual(decide(candidates=[c]).action, "START_SHADOW")
+        result = decide(candidates=[c], cfg=config(
+            kv_emergency_priority=True, survival_horizon=480))
+        self.assertEqual(result.action, "STAY")
+        self.assertEqual(result.candidates[0]["remaining"]["mean"], 400)
 
     def test_durable_work_still_preferred_when_both_can_release(self):
         short = candidate(

@@ -1173,7 +1173,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         source_request_id: str,
         tp_rank: int,
     ) -> bool:
-        """Drain an unadmitted cancelled session and release its GPU buffer."""
+        """Drain cancelled history not yet claimed by the scheduled loader."""
         # After admission the history handle is consumed. The idle prebind
         # loop must not reopen cancellation/control files every 5 ms forever.
         # Recheck under the same lock below before taking ownership to drain.
@@ -1188,9 +1188,9 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             return False
         if _load_json(state_path).get("state") != "CANCELLED":
             return False
-        if _load_json(control_path).get("target_request_admitted"):
-            # The admitted target request owns the receiver and its cleanup.
-            return False
+        # HTTP admission does not mean the scheduled loader consumed history.
+        # A queued admitted request still leaves this receiver owned by prebind.
+        admitted = bool(_load_json(control_path).get("target_request_admitted"))
         with self._prebound_gpu_history_lock:
             prebound = self._prebound_gpu_history
             if prebound is None or prebound[0] != migration_id:
@@ -1227,6 +1227,8 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 "status": "CANCELLED_PREBOUND_HISTORY_RELEASED",
                 "migration_id": migration_id,
                 "target_tp_rank": tp_rank,
+                "target_request_admitted": admitted,
+                "receiver_owner": "PREBIND_HISTORY_NOT_CONSUMED",
                 "discarded_delta_batches": discarded_deltas,
                 "released_payload_bytes": (
                     receiver.last_session_payload_released_bytes
@@ -1237,6 +1239,18 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             run_dir / "gpu_cancel_cleanup_receipts" / f"tp_rank_{tp_rank}.json",
         )
         return True
+
+    def _take_prebound_gpu_history(self, migration_id: str):
+        """Claim history only while the session still permits live loading."""
+        with self._prebound_gpu_history_lock:
+            # Serialize with cancel's ownership claim. A cancelled queued loader
+            # must never reopen receive() or race the prebind delta drainer.
+            self._raise_if_shadow_cancelled()
+            prebound = self._prebound_gpu_history
+            if prebound is not None and prebound[0] == migration_id:
+                self._prebound_gpu_history = None
+                return prebound[1]
+        return None
 
     def _start_gpu_direct_receiver_prebind(self) -> None:
         """Bind the GPU-direct listener before dynamic cutover is known.
@@ -1699,11 +1713,13 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     device=device,
                     receiver=receiver,
                 )
-                with self._prebound_gpu_history_lock:
-                    prebound = self._prebound_gpu_history
-                    if prebound is not None and prebound[0] == request.migration_id:
-                        direct = prebound[1]
-                        self._prebound_gpu_history = None
+                try:
+                    direct = self._take_prebound_gpu_history(request.migration_id)
+                except _ShadowCancelled:
+                    # Prebind still owns (or is draining) this receiver. The
+                    # live-load exception handler must not receive from it too.
+                    receiver = None
+                    raise
                 if direct is None:
                     direct = receiver.receive(
                         migration_id=request.migration_id,

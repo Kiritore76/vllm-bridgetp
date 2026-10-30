@@ -899,7 +899,7 @@ class PressurePolicy:
             summary = (
                 remaining.summary(cfg.survival_horizon) if valid_prediction else None
             )
-            if not valid_prediction and not emergency:
+            if not valid_prediction and (not emergency or kv_priority):
                 reasons.append("prediction missing/stale/cap mismatch")
             if not emergency and (
                 c.estimated_release_s is None
@@ -910,13 +910,9 @@ class PressurePolicy:
             if emergency and not valid_prediction and cap <= cfg.survival_horizon:
                 # A missing predictor is not evidence that a short stop budget
                 # can survive transport. Keep emergency fallback explicit.
-                (soft_warnings if kv_priority else reasons).append(
-                    "stop budget cannot cover migration horizon"
-                )
+                reasons.append("stop budget cannot cover migration horizon")
             if summary and summary["p_gt_bounds"][0] < cfg.min_survival_lower:
-                (soft_warnings if kv_priority else reasons).append(
-                    "insufficient sustained work probability"
-                )
+                reasons.append("insufficient sustained work probability")
             costs = (c.source_decode_relief, c.target_decode_cost)
             valid_costs = all(
                 v is not None and math.isfinite(v) and v >= 0 for v in costs
@@ -993,20 +989,12 @@ class PressurePolicy:
             return decision("no feasible candidate", rows=rows)
         predicted = [(c, summary) for c, summary in feasible if summary]
         if emergency:
-            # Known adequate survival takes precedence over the explicit
-            # emergency-only missing-prediction fallback. All candidates have
-            # already passed candidate-specific release size/deadline checks.
-            if kv_priority:
-                durable = [
-                    c
-                    for c, summary in predicted
-                    if summary["p_gt_bounds"][0] >= cfg.min_survival_lower
-                ]
-                tier = durable or [c for c, _ in feasible]
-            else:
-                tier = (
-                    [c for c, _ in predicted] if predicted else [c for c, _ in feasible]
-                )
+            # Urgent KV requires valid adequate survival. Legacy emergency
+            # mode retains its explicit missing-prediction fallback. Candidates
+            # also passed candidate-specific release size/deadline checks.
+            tier = (
+                [c for c, _ in predicted] if predicted else [c for c, _ in feasible]
+            )
 
             def rank(c):
                 return (
@@ -1017,7 +1005,7 @@ class PressurePolicy:
                 )
 
             policy = (
-                "KV priority: durable preference, release time, bytes, release, id"
+                "KV priority: survival required, release time, bytes, release, id"
                 if kv_priority
                 else "KV: survival evidence, release time, bytes, release, id"
             )

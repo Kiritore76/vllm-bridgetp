@@ -305,7 +305,20 @@ class _Phase8SourceState:
                 if state.get("state") == "COMMITTED":
                     return
             time.sleep(0.05)
+        def progress(stage: str, error: str | None = None) -> None:
+            _atomic_json_dump(
+                {
+                    "migration_id": self.config.migration_id,
+                    "component": "source_delta_mirror",
+                    "stage": stage,
+                    "error": error,
+                    "updated_unix_s": time.time(),
+                },
+                self.config.run_dir / "source_cleanup_progress.json",
+            )
+
         try:
+            progress("STOP_NEW_DELTAS")
             # Prevent later decode iterations from enqueueing deltas after the
             # worker queues have been drained.  This matters when Phase 9
             # abandons only the migration and deliberately leaves TP1 serving
@@ -315,13 +328,17 @@ class _Phase8SourceState:
                 finalizing = self.finalizing
             # Finalizer owns its queued work until its finally block runs.
             if finalizing:
+                progress("WAIT_FINALIZER")
                 deadline = time.monotonic() + self.config.socket_timeout_s
                 while self.finalizing:
                     if time.monotonic() >= deadline:
                         raise TimeoutError("cancel waits for source finalizer")
                     time.sleep(0.005)
+            progress("DRAIN_QUEUED_DELTAS")
             self.wait_for_acks()
+            progress("SEND_END_SESSION")
             self.stop_workers()
+            progress("WAIT_END_SESSION_IDLE")
             self.wait_for_acks()  # Includes END_SESSION and four IDLE ACKs.
             request = json.loads(cleanup_path.read_text(encoding="utf-8"))
             reason = request.get("reason", "source ended before cutover")
@@ -350,7 +367,9 @@ class _Phase8SourceState:
                 },
                 self.config.run_dir / "source_cleanup_receipt.json",
             )
-        except Exception:
+            progress("CLEANED")
+        except Exception as error:
+            progress("FAILED", repr(error))
             logger.exception("BridgeTP Phase 8 source cleanup failed")
 
 
