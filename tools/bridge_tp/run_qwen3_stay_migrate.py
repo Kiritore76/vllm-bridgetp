@@ -18,6 +18,7 @@ from tools.bridge_tp import qwen3_migration_matrix as matrix  # noqa: E402
 from tools.bridge_tp import qwen3_pressure_four_mode as pressure_four  # noqa: E402
 from tools.bridge_tp import qwen3_pressure_observation as observation  # noqa: E402
 from tools.bridge_tp import qwen3_resident_pressure as resident  # noqa: E402
+from tools.bridge_tp import qwen3_routine_four_mode as routine  # noqa: E402
 from tools.bridge_tp import qwen3_stay_migrate as matched  # noqa: E402
 from tools.bridge_tp import run_pressure_comparison as comparison  # noqa: E402
 from tools.bridge_tp.prepare_4090d_qwen3 import (  # noqa: E402
@@ -179,6 +180,7 @@ def main(argv=None):
     parser.add_argument("--resident-pressure", action="store_true")
     parser.add_argument("--pressure-four-mode", action="store_true")
     parser.add_argument("--updated-pressure-four-mode", action="store_true")
+    parser.add_argument("--routine-four-mode", action="store_true")
     parser.add_argument("--kv-priority-verify", action="store_true")
     parser.add_argument("--kv-routing-verify", action="store_true")
     parser.add_argument("--current-machine", action="store_true")
@@ -186,6 +188,10 @@ def main(argv=None):
     parser.add_argument("--complete-four-mode", type=Path)
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
+    if args.routine_four_mode:
+        if args.updated_pressure_four_mode:
+            parser.error("routine and updated pressure trials are separate modes")
+        args.updated_pressure_four_mode = True
     if args.kv_routing_verify and not args.kv_priority_verify:
         parser.error("kv-routing-verify requires kv-priority-verify")
     if args.current_machine and (
@@ -217,7 +223,11 @@ def main(argv=None):
             )
         args.four_mode = args.pressure_four_mode = True
         previous_attempts = 0
-        cfg = pressure_four.updated_config(read(args.inputs))
+        cfg = (
+            routine.config(read(args.inputs))
+            if args.routine_four_mode
+            else pressure_four.updated_config(read(args.inputs))
+        )
         values = cfg["recipes"]
     elif args.kv_priority_verify:
         if (
@@ -671,7 +681,9 @@ def main(argv=None):
             result, code = (
                 (
                     dict(
-                        status="COMPLETED_UPDATED_PRESSURE_FOUR_MODE_TRIAL"
+                        status="COMPLETED_ROUTINE_FOUR_MODE_TRIAL"
+                        if args.routine_four_mode
+                        else "COMPLETED_UPDATED_PRESSURE_FOUR_MODE_TRIAL"
                         if args.updated_pressure_four_mode
                         else "COMPLETED_PRESSURE_FOUR_MODE_TRIAL"
                         if args.pressure_four_mode
@@ -753,7 +765,9 @@ def main(argv=None):
             total_profile_attempts=previous_attempts + len(ledger),
             inherited_runs=inherited,
             maximum_live_runs=run_count,
-            experiment_mode="updated-pressure-four-mode"
+            experiment_mode="routine-four-mode"
+            if args.routine_four_mode
+            else "updated-pressure-four-mode"
             if args.updated_pressure_four_mode
             else "kv-routing-verify"
             if args.kv_routing_verify

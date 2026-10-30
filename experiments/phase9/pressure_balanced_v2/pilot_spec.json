@@ -358,7 +358,7 @@
     "experiments/platforms/qwen3_pressure_observation/scope.json": "7cf1845a67e01054df5011088174b4c30e4ba0b36f3c01d08d151e7e3c24dca8",
     "experiments/platforms/qwen3_pressure_observation/service_evidence.json": "513028147a78f7342556584396ff6e2ec574c8c9caf906e86efabfcfc0a4cdba",
     "tools/bridge_tp/qwen3_stay_migrate.py": "a18219546bc8492c89943905b600ced54f99f06e49eb13712932871e7232fee1",
-    "tools/bridge_tp/run_qwen3_stay_migrate.py": "ffffbef0aa5b74f942665dfbdb68b6ef9c3194479709e9768d0db5f6baad8cd7",
+    "tools/bridge_tp/run_qwen3_stay_migrate.py": "8f15b970f3ceaf6bf50ce877fc58ddbd451ebcd03b71250b5e102a37acd587ca",
     "tests/bridge_tp/test_qwen3_stay_migrate.py": "725ef0959b991c7c1001fb2d3277c009289b19be758e3b4ea0a9fff1f8a5026f",
     "tests/bridge_tp/test_pressure_launcher.py": "44f50ec2554a5d3196a92411ee807336392063e70c81d86e3991d86dd4541b32",
     "tools/bridge_tp/qwen3_four_mode.py": "21de51e7a2ac0e0b6b4616b0c66e956e73496171874cb22f6e81841bf4553267",
@@ -383,7 +383,9 @@
     "tests/bridge_tp/test_async_shadow_admission.py": "c125a5c5a7dcc7ec6bfc723df339c5da7fa2cf2a8be2fdffa637ae00befeb224",
     "tests/bridge_tp/test_result_archive.py": "5a6a270ec3121b8fafba6473159c052cc665ac7a67c2b5c53d1b1b022e543cb1",
     "vllm/bridge_tp/controller/pressure_kv_routing.py": "0ebff6efc035216e34f5308df2e1ce9274d66df6fd956e3cac6e30f16cc42631",
-    "tests/bridge_tp/test_pressure_kv_routing.py": "58cc01e5648ac77353fdbf9194e562ac209846d66d370edf74ec9e2286d10178"
+    "tests/bridge_tp/test_pressure_kv_routing.py": "58cc01e5648ac77353fdbf9194e562ac209846d66d370edf74ec9e2286d10178",
+    "tools/bridge_tp/qwen3_routine_four_mode.py": "9e713d4cb609ab05637cdbdfcad64b6a222a316ce38ef8c0793b73a2723aceb4",
+    "tests/bridge_tp/test_qwen3_routine_four_mode.py": "c711247f021e4c890e4f94d772890a759999a0dd5649882a19b7b22abb395efe"
   },
   "server_settings": {
     "dtype": "bfloat16",
