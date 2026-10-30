@@ -14,6 +14,7 @@ from tools.bridge_tp import launch_pressure_balanced_pilot as pilot  # noqa: E40
 from tools.bridge_tp import qwen3_four_mode as four  # noqa: E402
 from tools.bridge_tp import qwen3_kv_guard_trial as guard_trial  # noqa: E402
 from tools.bridge_tp import qwen3_kv_priority_verify as priority  # noqa: E402
+from tools.bridge_tp import qwen3_long_burst_pair as long_burst  # noqa: E402
 from tools.bridge_tp import qwen3_migration_matrix as matrix  # noqa: E402
 from tools.bridge_tp import qwen3_pressure_four_mode as pressure_four  # noqa: E402
 from tools.bridge_tp import qwen3_pressure_observation as observation  # noqa: E402
@@ -188,6 +189,7 @@ def main(argv=None):
     parser.add_argument("--pressure-four-mode", action="store_true")
     parser.add_argument("--updated-pressure-four-mode", action="store_true")
     parser.add_argument("--routine-four-mode", action="store_true")
+    parser.add_argument("--long-burst-pair", action="store_true")
     parser.add_argument("--expanded-context", action="store_true")
     parser.add_argument("--kv-priority-verify", action="store_true")
     parser.add_argument("--kv-routing-verify", action="store_true")
@@ -196,6 +198,11 @@ def main(argv=None):
     parser.add_argument("--complete-four-mode", type=Path)
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
+    if args.long_burst_pair:
+        if args.routine_four_mode or args.updated_pressure_four_mode:
+            parser.error("long-burst-pair is a separate STAY/MIGRATE experiment")
+        args.updated_pressure_four_mode = True
+        args.expanded_context = True
     if args.routine_four_mode:
         if args.updated_pressure_four_mode:
             parser.error("routine and updated pressure trials are separate modes")
@@ -236,7 +243,9 @@ def main(argv=None):
         args.four_mode = args.pressure_four_mode = True
         previous_attempts = 0
         cfg = (
-            routine.config(read(args.inputs))
+            long_burst.config(read(args.inputs))
+            if args.long_burst_pair
+            else routine.config(read(args.inputs))
             if args.routine_four_mode
             else pressure_four.updated_config(read(args.inputs))
         )
@@ -567,7 +576,11 @@ def main(argv=None):
                 plan,
                 common,
                 settings,
-                before_workload=lambda current: prepare_native(current, common),
+                before_workload=lambda current: (
+                    long_burst.prepare_native(current, common, inputs)
+                    if args.long_burst_pair
+                    else prepare_native(current, common)
+                ),
                 before_shutdown=lambda current: comparison.finalize(current, common),
                 diagnose_pauses=True,
             )
@@ -647,15 +660,21 @@ def main(argv=None):
                     )
                 else:
                     write(
-                        args.output / "four_mode_summary.json",
+                        args.output
+                        / (
+                            "stay_migrate_summary.json"
+                            if args.long_burst_pair
+                            else "four_mode_summary.json"
+                        ),
                         pressure_four.aggregate(evaluations)
                         if args.pressure_four_mode or args.kv_priority_verify
                         else four.aggregate(evaluations),
                     )
-                    write(
-                        args.output / "four_mode_comparison.json",
-                        four.comparisons(inherited + ledger),
-                    )
+                    if not args.long_burst_pair:
+                        write(
+                            args.output / "four_mode_comparison.json",
+                            four.comparisons(inherited + ledger),
+                        )
             write(args.output / "attempt_ledger.json", ledger)
             arms = {
                 r["arm"]: r
@@ -694,7 +713,23 @@ def main(argv=None):
             if valid and observed
             else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
         )
-        if args.four_mode and not args.kv_priority_verify:
+        if args.long_burst_pair:
+            valid = (
+                len(pairs) == len(values)
+                and len(ledger) == run_count
+                and all(
+                    p["comparison"]["matched_output_work"]
+                    and p["comparison"]["arrivals_valid"]
+                    and p["comparison"]["load_coverage_pass"]
+                    for p in pairs
+                )
+            )
+            result, code = (
+                (dict(status="COMPLETED_LONG_BURST_PAIRED_TRIAL"), 0)
+                if valid
+                else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
+            )
+        if args.four_mode and not args.kv_priority_verify and not args.long_burst_pair:
             paired = four.comparisons(inherited + ledger)
             pairs = paired
             write(args.output / "four_mode_comparison.json", paired)
@@ -791,7 +826,9 @@ def main(argv=None):
             total_profile_attempts=previous_attempts + len(ledger),
             inherited_runs=inherited,
             maximum_live_runs=run_count,
-            experiment_mode="routine-four-mode"
+            experiment_mode="long-burst-pair"
+            if args.long_burst_pair
+            else "routine-four-mode"
             if args.routine_four_mode
             else "updated-pressure-four-mode"
             if args.updated_pressure_four_mode
