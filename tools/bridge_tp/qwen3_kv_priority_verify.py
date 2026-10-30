@@ -1,8 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """One real MIGRATE rerun of the worst prefill workload; no forced route/START."""
 
+import json
+
 from tools.bridge_tp import qwen3_pressure_four_mode as pressure
 from tools.bridge_tp import qwen3_stay_migrate as matched
+
+
+def enable_urgent_target(plan):
+    argv = plan["target_argv"]
+    position = argv.index("--kv-transfer-config") + 1
+    kv = json.loads(argv[position])
+    kv.setdefault("kv_connector_extra_config", {})[
+        "bridgetp_urgent_shadow_admission"
+    ] = True
+    argv[position] = json.dumps(kv)
 
 
 def config(inputs, prior=None):
@@ -39,6 +51,11 @@ def config(inputs, prior=None):
         arms=["migrate"],
         recipes=[recipe],
         policy_overrides=dict(capacity_guard_blocks=125, kv_emergency_priority=True),
+        urgent_target_admission=dict(
+            ordinary_admission_slots=15, total_running_limit=16,
+            first_token_small_batch=True, async_load_bypasses_running_cap=True,
+            handoff_pending_prefill_quantum=256,
+        ),
         note="one prefill MIGRATE; frozen workload; no forced migration; "
         "physical release/deadline gates unchanged",
     )

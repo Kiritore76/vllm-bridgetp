@@ -29,8 +29,11 @@ def exclusion_reason(relative, root):
     return None
 
 
-def pack(root, output):
+def pack(root, output, *, compact=False):
     """Keep raw features, responses, journals, receipts, configs and failure logs."""
+    if compact:
+        from tools.bridge_tp.compact_archive import pack_compact
+        return pack_compact(root, output)
     root, output = Path(root).resolve(), Path(output).resolve()
     if not root.is_dir() or output.is_relative_to(root):
         raise ValueError("archive needs a directory and an output outside its tree")

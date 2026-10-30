@@ -378,6 +378,24 @@ class Scheduler(SchedulerInterface):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
+        from vllm.bridge_tp.urgent_admission import ordinary_limit, urgent_waiter
+
+        urgent = urgent_waiter(
+            self.connector, self.waiting, self.skipped_waiting,
+            self.finished_recving_kv_req_ids,
+        )
+        if getattr(self.connector, "urgent_handoff_pending", False):
+            # Do not allow a newly queued 2048-token prefill to occupy the GPU
+            # across commit. This temporary quantum ends after first output.
+            token_budget = min(token_budget, 256)
+        urgent_token_reserve = 0
+        if (urgent is not None and urgent[2] == "RESUME"
+                and len(self.running) < self.max_num_running_reqs):
+            # Avoid putting the first continuation token behind a large prefill
+            # forward. Ordinary decode can still run in this one recovery pass.
+            token_budget = min(token_budget, self.max_num_running_reqs)
+            urgent_token_reserve = 1
+            token_budget -= urgent_token_reserve
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
@@ -591,22 +609,36 @@ class Scheduler(SchedulerInterface):
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
             budget_deferred_waiting = []
+            token_budget += urgent_token_reserve
+            urgent_queue = create_request_queue(self.policy)
+            if urgent is not None:
+                urgent[0].remove_request(urgent[1])
+                urgent_queue.prepend_request(urgent[1])
             budget_free_async = (
                 getattr(self.connector, "budget_free_async_load_admission", False)
                 is True
             )
 
-            while (self.waiting or self.skipped_waiting) and (
+            while (self.waiting or self.skipped_waiting or urgent_queue) and (
                 token_budget > 0 or budget_free_async
             ):
-                if len(self.running) == self.max_num_running_reqs:
-                    break
-
-                request_queue = self._select_waiting_queue_for_scheduling()
+                request_queue = (
+                    urgent_queue or self._select_waiting_queue_for_scheduling()
+                )
                 assert request_queue is not None
-
                 request = request_queue.peek_request()
+                urgent_stage = urgent[2] if request_queue is urgent_queue else None
                 request_id = request.request_id
+                # Loading remote KV does not add to running/model sequences.
+                # Only the opt-in, identity-checked urgent loader may bypass
+                # the running cap. Its physical allocation still happens below.
+                if len(self.running) >= self.max_num_running_reqs:
+                    if urgent_stage != "LOAD":
+                        break
+                elif urgent_stage is None and len(self.running) >= ordinary_limit(
+                    self.connector, self.max_num_running_reqs
+                ):
+                    break
 
                 if token_budget == 0 and not (
                     self.connector.can_load_kv_without_token_budget(request)
@@ -713,6 +745,9 @@ class Scheduler(SchedulerInterface):
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
+                if (len(self.running) >= self.max_num_running_reqs
+                        and not load_kv_async):
+                    break  # A false async probe is never permission to exceed cap.
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
@@ -880,6 +915,8 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 self.running.append(request)
+                if urgent_stage == "RESUME":
+                    self.connector.record_urgent_resume(request, num_new_tokens)
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
@@ -918,6 +955,11 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.allocate(request, i)
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
+
+            if urgent_queue:
+                # Allocation/promotion failure retains the exact request and
+                # its KV ownership; never discard it or silently recompute.
+                urgent[0].prepend_request(urgent_queue.pop_request())
 
             for original_queue, deferred_request in reversed(budget_deferred_waiting):
                 original_queue.prepend_request(deferred_request)

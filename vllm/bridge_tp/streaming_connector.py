@@ -398,6 +398,12 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 "bridgetp_persistent_channel", False
             )
         )
+        self.urgent_shadow_admission = self.gpu_resident_shadow and bool(
+            self._kv_transfer_config.get_from_extra_config(
+                "bridgetp_urgent_shadow_admission", False
+            )
+        )
+        self._urgent_resume_requests: set[str] = set()
         self.release_persistent_payload_buffer = bool(
             self._kv_transfer_config.get_from_extra_config(
                 "bridgetp_release_persistent_payload_buffer", True
@@ -687,6 +693,34 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             return False
         return self._request_matches(request)
 
+    @property
+    def urgent_handoff_pending(self) -> bool:
+        return self.urgent_shadow_admission and any(
+            request.num_output_tokens == 0
+            for request in self._active_requests.values()
+        )
+
+    def urgent_shadow_stage(self, request: Request) -> str | None:
+        if not self.urgent_shadow_admission or not self.gpu_resident_shadow:
+            return None
+        if request.request_id in self._urgent_resume_requests:
+            return "RESUME" if request.num_output_tokens == 0 else None
+        if self.can_load_kv_without_token_budget(request):
+            return "LOAD"
+        return None
+
+    def record_urgent_resume(self, request: Request, tokens: int) -> None:
+        _atomic_json_dump(
+            {
+                "status": "URGENT_FIRST_TOKEN_SCHEDULED",
+                "target_request_id": request.request_id,
+                "scheduled_tokens": tokens,
+                "unix_s": time.time(),
+                "ordinary_slot_reservation": 1,
+            },
+            self.manifest_path.parent / "urgent_resume_receipt.json",
+        )
+
     def record_async_load_admission(
         self, request: Request, token_budget: int, reserved_blocks: int,
         num_external_tokens: int,
@@ -704,6 +738,9 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 "inflight_prefill_reserved_blocks": reserved_blocks,
                 "num_external_tokens": num_external_tokens,
                 "budget_free_admission": token_budget == 0,
+                "urgent_shadow_admission": getattr(
+                    self, "urgent_shadow_admission", False
+                ),
             },
             self.manifest_path.parent / "async_load_admission_receipt.json",
         )
@@ -2538,6 +2575,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         self._release_persistent_payload_buffer(request_id)
         self._pending_requests.pop(request_id, None)
         self._active_requests.pop(request_id, None)
+        getattr(self, "_urgent_resume_requests", set()).discard(request_id)
         self._load_threads.pop(request_id, None)
         self._load_errors.pop(request_id, None)
         with self._gpu_kv_lock:
@@ -2610,6 +2648,8 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             request.num_prompt_tokens = len(token_ids)
             request.block_hashes.clear()
             request.update_block_hashes()
+            if getattr(self, "urgent_shadow_admission", False):
+                self._urgent_resume_requests.add(request_id)
             if self.ready_sync_mode == _READY_SYNC_STREAM_EVENT:
                 self._model_wait_pending_requests.add(request_id)
 

@@ -476,6 +476,8 @@ def main(argv=None):
             plans = [p for p in plans if p[2]["name"] in missing]
         for _, arm, _, plan in plans:
             adapt_plan(plan, arm, args.checkpoint, args.model)
+            if args.kv_priority_verify:
+                priority.enable_urgent_target(plan)
         serving_preflight(plans)
         for recipe, arm, scene, plan in plans:
             if not gpu_idle():
@@ -705,7 +707,7 @@ def main(argv=None):
         )
         write(args.output / "result.json", result)
         archive = Path(str(args.output) + ".tar.gz")
-        receipt = pack(args.output, archive)
+        receipt = pack(args.output, archive, compact=True)
         Path(str(archive) + ".sha256").write_text(
             receipt["sha256"] + "  " + archive.name + "\n"
         )

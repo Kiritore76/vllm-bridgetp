@@ -47,6 +47,18 @@ def evidence():
 
 
 class KVPriorityVerifyTests(unittest.TestCase):
+    def test_urgent_target_opt_in_preserves_source_and_running_cap(self):
+        plan = dict(source_argv=["untouched"], target_argv=[
+            "serve", "--max-num-seqs", "16", "--kv-transfer-config",
+            json.dumps(dict(kv_connector="BridgeTPStreamingConnector")),
+        ])
+        verify.enable_urgent_target(plan)
+        self.assertEqual(plan["source_argv"], ["untouched"])
+        self.assertEqual(plan["target_argv"][2], "16")
+        kv = json.loads(plan["target_argv"][-1])
+        self.assertTrue(kv["kv_connector_extra_config"]
+                        ["bridgetp_urgent_shadow_admission"])
+
     def test_acceptance_requires_actual_maximum_joint_score(self):
         raw, audit = evidence()
         candidates = audit[0]["decision"]["candidates"]
