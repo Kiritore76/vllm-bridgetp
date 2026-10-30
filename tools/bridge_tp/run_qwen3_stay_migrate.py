@@ -179,10 +179,15 @@ def main(argv=None):
     parser.add_argument("--resident-pressure", action="store_true")
     parser.add_argument("--pressure-four-mode", action="store_true")
     parser.add_argument("--kv-priority-verify", action="store_true")
+    parser.add_argument("--current-machine", action="store_true")
     parser.add_argument("--prior-comparison", type=Path)
     parser.add_argument("--complete-four-mode", type=Path)
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
+    if args.current_machine and (not args.kv_priority_verify or args.prior_comparison):
+        parser.error(
+            "current-machine is standalone KV verification without a prior directory"
+        )
     matrix_mode = args.migration_matrix or args.kv_guard_trial or args.resident_pressure
     inherited, evaluations, missing = [], [], None
     baseline_reference = None
@@ -194,14 +199,18 @@ def main(argv=None):
             or matrix_mode
             or args.complete_four_mode
             or args.repetitions != 1
-            or args.prior_comparison is None
+            or (args.prior_comparison is None and not args.current_machine)
         ):
             parser.error(
                 "KV priority verification requires one repetition "
                 "and prior pressure trial"
             )
-        prior = read(args.prior_comparison / "result.json")
-        if (
+        prior = (
+            None
+            if args.current_machine
+            else read(args.prior_comparison / "result.json")
+        )
+        if prior is not None and (
             prior.get("experiment_mode") != "pressure-four-mode"
             or len(prior.get("runs", [])) != 12
             or any(r["status"] != "COMPLETED" for r in prior["runs"])
@@ -213,7 +222,7 @@ def main(argv=None):
         ):
             raise ValueError("requires the completed twelve-run pressure trial")
         args.four_mode = True
-        previous_attempts = prior["total_profile_attempts"]
+        previous_attempts = 0 if prior is None else prior["total_profile_attempts"]
         cfg, baseline_reference = priority.config(
             read(args.inputs), args.prior_comparison
         )
@@ -343,6 +352,9 @@ def main(argv=None):
                     inherited_runs=len(inherited),
                     missing_cells=sorted(missing) if missing is not None else None,
                     arms=cfg["arms"],
+                    environment_mode="CURRENT_MACHINE_NO_PRIOR_COMPARISON"
+                    if args.current_machine
+                    else "PRIOR_ENVIRONMENT_COMPARISON",
                     policy_overrides=cfg["policy_overrides"],
                     routing_weights=cfg["routing_weights"],
                     migration_execution=True,
@@ -387,7 +399,7 @@ def main(argv=None):
             if matrix_mode or args.pressure_four_mode or args.kv_priority_verify
             else args.complete_four_mode or args.prior_observation
         )
-        old = read(prior_identity / "identity.json")
+        old = None if args.current_machine else read(prior_identity / "identity.json")
         write(
             args.output / "identity.json",
             dict(
@@ -395,9 +407,10 @@ def main(argv=None):
                 gpu=hardware,
                 versions=versions,
                 checkpoint_sha256=CHECKPOINT_SHA,
+                prior_environment_comparison=not args.current_machine,
             ),
         )
-        if (
+        if old is not None and (
             gpu_configuration(hardware["gpus"]) != gpu_configuration(old["gpu"]["gpus"])
             or json.loads(json.dumps(versions)) != old["versions"]
         ):
@@ -419,6 +432,7 @@ def main(argv=None):
         scope = read(observation.ASSETS / "scope.json")
         scope.update(
             migration_execution_enabled=True,
+            current_machine_standalone=args.current_machine,
             experiment_only=True,
             arms=cfg["arms"],
             repetitions=args.repetitions,

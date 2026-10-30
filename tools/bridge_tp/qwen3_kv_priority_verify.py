@@ -5,19 +5,33 @@ from tools.bridge_tp import qwen3_pressure_four_mode as pressure
 from tools.bridge_tp import qwen3_stay_migrate as matched
 
 
-def config(inputs, prior):
+def config(inputs, prior=None):
     cfg = pressure.config(inputs)
     recipe = next(r for r in cfg["recipes"] if r["scenario"] == "prefill_competition")
-    previous = pressure.full.observation.read(prior / "result.json")
-    old = next(
-        r
-        for r in previous["runs"]
-        if r["name"] == "pressure-four-prefill_competition-r1-migrate"
+    baseline = dict(
+        prior=None,
+        input_sha256=matched.digest(recipe["jobs"]),
+        comparison_scope="current-machine standalone verification; "
+        "no historical environment or cross-machine performance comparison",
     )
-    if old["status"] != "COMPLETED" or old["summary"]["migration_starts"] != 0:
-        raise ValueError("requires the completed zero-migration prefill baseline")
-    if matched.digest(recipe["jobs"]) != old["input_sha256"]:
-        raise ValueError("prefill baseline workload differs")
+    if prior is not None:
+        previous = pressure.full.observation.read(prior / "result.json")
+        old = next(
+            r
+            for r in previous["runs"]
+            if r["name"] == "pressure-four-prefill_competition-r1-migrate"
+        )
+        if old["status"] != "COMPLETED" or old["summary"]["migration_starts"] != 0:
+            raise ValueError("requires the completed zero-migration prefill baseline")
+        if matched.digest(recipe["jobs"]) != old["input_sha256"]:
+            raise ValueError("prefill baseline workload differs")
+        baseline = dict(
+            prior=str(prior),
+            name=old["name"],
+            input_sha256=old["input_sha256"],
+            summary=old["summary"],
+            comparison_scope="historical same workload; no contemporaneous STAY",
+        )
     recipe["name"] = "kv-priority-prefill-r1"
     recipe["arm_order_offset"] = 0
     cfg.update(
@@ -25,15 +39,8 @@ def config(inputs, prior):
         arms=["migrate"],
         recipes=[recipe],
         policy_overrides=dict(capacity_guard_blocks=125, kv_emergency_priority=True),
-        note="one prefill MIGRATE; same old workload; no forced migration; "
+        note="one prefill MIGRATE; frozen workload; no forced migration; "
         "physical release/deadline gates unchanged",
-    )
-    baseline = dict(
-        prior=str(prior),
-        name=old["name"],
-        input_sha256=old["input_sha256"],
-        summary=old["summary"],
-        comparison_scope="historical same workload; no contemporaneous STAY",
     )
     return cfg, baseline
 

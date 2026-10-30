@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Single fixed-work rerun and explicit mechanism versus performance acceptance."""
 
+import contextlib
 import copy
+import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tools.bridge_tp import qwen3_kv_priority_verify as verify
 from tools.bridge_tp import qwen3_pressure_four_mode as pressure
@@ -39,6 +42,98 @@ def evidence():
 
 
 class KVPriorityVerifyTests(unittest.TestCase):
+    def test_current_machine_runtime_reaches_server_preflight_without_old_identity(
+        self,
+    ):
+        from tools.bridge_tp import run_qwen3_stay_migrate as runner
+
+        with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack:
+            output_dir = Path(tmp) / "new-machine-run"
+            for name, value in (
+                ("require_revision", None),
+                ("runtime_inventory", dict(gpus=[])),
+                ("runtime_versions", {}),
+                ("verified_inputs", {}),
+                ("migration_spec", {}),
+                ("pack", dict(sha256="CPU_ONLY")),
+            ):
+                stack.enter_context(patch.object(runner, name, return_value=value))
+            stack.enter_context(
+                patch.object(runner.pilot, "arguments", return_value=(None, None))
+            )
+            stack.enter_context(
+                patch.object(runner.comparison, "build_plans", return_value=[])
+            )
+            stop = stack.enter_context(
+                patch.object(
+                    runner,
+                    "serving_preflight",
+                    side_effect=RuntimeError("CPU_STOP_BEFORE_GPU"),
+                )
+            )
+            idle = stack.enter_context(patch.object(runner, "gpu_idle"))
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = runner.main(
+                    [
+                        "--kv-priority-verify",
+                        "--current-machine",
+                        "--repetitions",
+                        "1",
+                        "--model",
+                        "unused",
+                        "--output",
+                        str(output_dir),
+                        "--expected-revision",
+                        "CPU_RUNTIME",
+                    ]
+                )
+            self.assertEqual(code, 1)  # Deliberate stop before any GPU work.
+            stop.assert_called_once()
+            idle.assert_not_called()
+            identity = json.loads((output_dir / "identity.json").read_text())
+            self.assertFalse(identity["prior_environment_comparison"])
+            baseline = json.loads((output_dir / "baseline_reference.json").read_text())
+            self.assertIsNone(baseline["prior"])
+            self.assertIn(
+                "CPU_STOP_BEFORE_GPU",
+                (output_dir / "failure_traceback.txt").read_text(),
+            )
+
+    def test_current_machine_plan_never_requires_a_previous_directory(self):
+        inputs = dict(
+            requests={str(n): dict(prompt=list(range(n))) for n in (2048, 6144)}
+        )
+        cfg, baseline = verify.config(inputs)
+        self.assertEqual(len(cfg["recipes"][0]["jobs"]), 375)
+        self.assertIsNone(baseline["prior"])
+        self.assertNotIn("summary", baseline)
+        from tools.bridge_tp import run_qwen3_stay_migrate as runner
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = runner.main(
+                [
+                    "--kv-priority-verify",
+                    "--current-machine",
+                    "--repetitions",
+                    "1",
+                    "--model",
+                    "unused",
+                    "--output",
+                    "unused",
+                    "--expected-revision",
+                    "CPU_PLAN",
+                    "--validate-only",
+                ]
+            )
+        record = json.loads(output.getvalue())
+        self.assertEqual(code, 0)
+        self.assertEqual(record["runs"], 1)
+        self.assertEqual(
+            record["environment_mode"], "CURRENT_MACHINE_NO_PRIOR_COMPARISON"
+        )
+        self.assertTrue(record["policy_overrides"]["kv_emergency_priority"])
+
     def test_only_one_migrate_scene_same_prefill_jobs_and_budget(self):
         inputs = dict(
             requests={str(n): dict(prompt=list(range(n))) for n in (2048, 6144)}
