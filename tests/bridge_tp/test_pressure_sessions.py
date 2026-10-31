@@ -140,6 +140,68 @@ class RepeatedSessions(unittest.TestCase):
         self.sequence.close()
         self.assertTrue(all(s.adapter.close.called for s in self.sequence.sessions))
 
+    def channel_receipts(self, migration_id, request_id, sessions):
+        """Receipts of one source channel that has served ``sessions`` sessions."""
+        self.write(
+            "gpu_direct_sender.json",
+            dict(
+                communicator_lifecycle="PERSISTENT_CHANNEL_IDLE",
+                migration_id=migration_id,
+                source_request_id=request_id,
+                channel_create_count=1,
+                channel_destroy_count=0,
+                channel_session_count=sessions,
+            ),
+        )
+        for rank in range(4):
+            self.write(
+                f"persistent_channel_receipts/tp_rank_{rank}.json",
+                dict(
+                    status="PERSISTENT_CHANNEL_IDLE",
+                    migration_id=migration_id,
+                    session_request_id=request_id,
+                    tp_rank=rank,
+                    channel_create_count=1,
+                    channel_destroy_count=0,
+                    channel_session_count=sessions,
+                ),
+            )
+        self.write("rolling_target_finalized.json", dict(migration_id=migration_id))
+        self.write("pressure_stager_receipt.json", dict(returncode=0))
+
+    def settle_current(self, source, request_id):
+        session = self.sequence.sessions[-1]
+        session.source_instance = source
+        session.record = NS(request_id=request_id)
+        done = Future()
+        done.set_result({})
+        session.stream = NS(future=done)
+        session.target_future = Future()
+        session.settled = True
+        self.co.ledger.entries[session.migration_id] = self.entry
+
+    def test_sessions_alternating_between_two_source_channels_rotate(self):
+        """G2 (10-31): every TP1 source counts sessions on its own channel."""
+        policies = dict(tp1=NS(note_started=Mock()), extra=NS(note_started=Mock()))
+        self.co._policies = {"tp1": policies["tp1"], "A-g3-tp1": policies["extra"]}
+        self.sequence.sessions[0].source_instance = "tp1"
+        with patch("tools.bridge_tp.pressure_sessions.publish_active"):
+            self.assertTrue(self.sequence.rotate())
+            # Session 2 on the second source: its channel's first session.
+            self.settle_current("A-g3-tp1", "source-b")
+            self.channel_receipts("run-0002", "source-b", 1)
+            self.assertTrue(self.sequence.rotate())
+            # Session 3 back on the pair source: that channel's second session.
+            self.settle_current("tp1", "source-c")
+            self.channel_receipts("run-0003", "source-c", 3)
+            with self.assertRaises(ValueError):
+                self.sequence.rotate()
+            self.channel_receipts("run-0003", "source-c", 2)
+            self.assertTrue(self.sequence.rotate())
+        self.assertEqual(self.sequence.migration_id, "run-0004")
+        for policy in policies.values():
+            self.assertEqual(policy.note_started.call_count, 3)
+
     def test_missing_rank_or_native_confirmation_or_shutdown_blocks_reuse(self):
         self.entry.service_observed = False
         self.assertFalse(self.sequence.rotate())

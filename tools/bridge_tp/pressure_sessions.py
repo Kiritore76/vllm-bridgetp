@@ -72,6 +72,11 @@ class PressureSessions:
             )
         self.sessions.append(self.factory(**kwargs))
 
+    @staticmethod
+    def _source(session):
+        """Source instance of a session; the fixed pair's source when unbound."""
+        return getattr(session, "source_instance", None) or "tp1"
+
     @property
     def ready_for_start(self):
         return self.record is None
@@ -109,6 +114,12 @@ class PressureSessions:
         if not all(path.is_file() for path in paths):
             return False
         rows = [json.loads(path.read_text()) for path in paths]
+        # Each TP1 source has its own persistent channel (S1-d2): its receipts
+        # count that channel's sessions, not every session of the run.
+        source = self._source(self.sessions[-1])
+        channel_sessions = sum(
+            self._source(s) == source for s in self.sessions if s.record is not None
+        )
         sender, *rest = rows
         count = load("tp_geometry").session_target_tp(self.run_dir)
         targets, finalized, stager = rest[:count], rest[count], rest[count + 1]
@@ -119,7 +130,7 @@ class PressureSessions:
             or any(
                 row.get("channel_create_count") != 1
                 or row.get("channel_destroy_count") != 0
-                or row.get("channel_session_count") != len(self.sessions)
+                or row.get("channel_session_count") != channel_sessions
                 for row in [sender, *targets]
             )
             or any(
@@ -136,9 +147,14 @@ class PressureSessions:
         old_id = self.migration_id
         self.adapter.close()  # Release the UDP notification port before rebinding.
         self._new()
-        # A new service migration needs a fresh persistence period. KV warnings
-        # continue to bypass that period through PressurePolicy.decide().
-        self.coordinator.policy.note_started(time.time())
+        # A new service migration needs a fresh persistence period on every
+        # source. KV warnings continue to bypass it through decide().
+        now = time.time()
+        policies = getattr(self.coordinator, "_policies", None) or {}
+        for policy in {id(p): p for p in policies.values()}.values() or [
+            self.coordinator.policy
+        ]:
+            policy.note_started(now)
         self.audit.write(
             dict(
                 kind="pressure_channel_reused",

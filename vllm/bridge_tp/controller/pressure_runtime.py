@@ -111,6 +111,13 @@ class PressureCoordinator:
             self._bound_target(session_id, target_id)
             self.ledger.observe(session_id, **evidence)
 
+    def set_config(self, cfg: PressureConfig) -> None:
+        """Apply a configuration change (e.g. survival horizon) to every source."""
+        with self._lock:
+            self.policy.cfg = cfg
+            for policy in self._policies.values():
+                policy.cfg = cfg
+
     def policy_for(self, source_id: str) -> PressurePolicy:
         policy = self._policies.get(source_id)
         if policy is None:

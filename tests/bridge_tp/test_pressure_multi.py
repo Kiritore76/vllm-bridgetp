@@ -564,3 +564,14 @@ class PoolIdRuleTests(unittest.TestCase):
             self.assertTrue(pattern.fullmatch(good), good)
         for bad in ("tp2", "a-g1-tp1", "A-g-tp1", "A-g1-tp1;x", ""):
             self.assertFalse(pattern.fullmatch(bad), bad)
+
+
+class ConfigSyncTests(unittest.TestCase):
+    def test_set_config_reaches_every_source_policy(self):
+        co, _ = coordinator(config(sustain_s=0))
+        first, second = co.policy_for("tp1"), co.policy_for("A-g3-tp1")
+        updated = config(sustain_s=0, survival_horizon=777)
+        co.set_config(updated)
+        self.assertIs(first.cfg, updated)
+        self.assertIs(second.cfg, updated)
+        self.assertIs(co.policy_for("A-g5-tp1").cfg, updated)

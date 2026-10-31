@@ -802,7 +802,10 @@ def _run(args, prepared):
                 if 0 <= now - pool.sampled_at <= cfg.max_age_s:
                     ingress.reconcile(raw | {"sampled_at": pool.sampled_at}, now)
             now = time.time()
-            source_rates = service.snapshot("tp1", now)["request_rates"]
+            # Request rates of every migration source (client ids are unique).
+            source_rates = {}
+            for source_id, _, _ in migration_sources:
+                source_rates.update(service.snapshot(source_id, now)["request_rates"])
             if source_rates:
                 horizon = min(
                     8192,
@@ -810,7 +813,7 @@ def _run(args, prepared):
                     + math.ceil(lookup.release_budget * max(source_rates.values())),
                 )
                 if horizon != co.policy.cfg.survival_horizon:
-                    co.policy.cfg = replace(cfg, survival_horizon=horizon)
+                    co.set_config(replace(cfg, survival_horizon=horizon))
                     audit.write(
                         {
                             "kind": "pressure_cost_horizon",
