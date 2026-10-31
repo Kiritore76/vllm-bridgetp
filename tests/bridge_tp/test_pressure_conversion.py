@@ -346,6 +346,15 @@ class ConversionTests(unittest.TestCase):
             # No channel plan: retiring the target closes nothing on a target.
             retire = next(e for e in harness.events if e["kind"] == "CHANNEL_RETIRE")
             self.assertEqual(retire["closed"], [])
+            # Scene finalization drains and finalizes only the surviving side.
+            from tools.bridge_tp import launch_pressure_balanced_pilot as launch
+
+            self.assertEqual(
+                launch.live_pair(
+                    dict(run_dir=harness.root, instances=harness.manifest)
+                ),
+                ["source"],
+            )
 
     def test_merge_closes_retired_sources_channels_first(self):
         """L1A -> L2: bundle A TP1@2 + TP1@3 -> TP2(2,3); their channels close."""
@@ -412,6 +421,42 @@ class ConversionTests(unittest.TestCase):
             self.assertEqual(
                 json.loads((root / "conversion_result.json").read_text())["state"],
                 "NOT_TRIGGERED",
+            )
+
+    def test_runner_conversion_edges_build_on_the_l1a_layout(self):
+        import contextlib
+        import io
+
+        from tools.bridge_tp import run_qwen3_stay_migrate as runner
+
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            runner.main(
+                ["--long-burst-memory-verify", "--conversion", "L1A-L2"]
+                + ["--current-machine", "--model", "m", "--output", "o"]
+                + ["--expected-revision", "CPU", "--validate-only"]
+            )
+        registry, _ = instance_pool.fixed_pair_registry(
+            source_gpu="2",
+            target_gpus=["0", "1"],
+            source_url="s",
+            target_url="t",
+            identity="qwen",
+            source_context_limit=32768,
+            target_context_limit=32768,
+            extras=[
+                dict(bundle="A", tp=1, gpus=["3"], endpoint="e", context_limit=32768)
+            ],
+        )
+        from tools.bridge_tp import launch_pressure_balanced_pilot as launch
+
+        for edge, value in runner.CONVERSIONS.items():
+            request = dict(value, trigger_s=30, deadline_s=420, base_port=8400)
+            self.assertEqual(
+                launch.conversion_request(
+                    dict(layout=dict(name="L1A"), conversion=request), registry
+                ),
+                request,
+                edge,
             )
 
     def test_channel_retirement_waits_for_every_target_rank(self):

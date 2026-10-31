@@ -316,13 +316,19 @@ def finalize(plan, common):
     from tools.bridge_tp.verify_performance_trace import verify_pool
 
     root, run_dir = plan["run_dir"].parent, plan["run_dir"]
+    # A conversion may have retired a pair side mid-run (S3b-3); its engine
+    # is gone, so only the sides still serving are drained and finalized.
+    sides = pilot.live_pair(plan)
     common.write_json(
-        root / "native_empty_receipt.json", calibration.wait_empty(run_dir)
+        root / "native_empty_receipt.json",
+        calibration.wait_empty(run_dir, pools=sides),
     )
     for pool, ranks in (
         ("source", 1),
         ("target", plan["config"].get("target_tp_size", 4)),
     ):
+        if pool not in sides:
+            continue
         pilot.announce(root.name, "收尾性能轨迹", pool=pool)
         result = _post_json(
             plan["config"][pool + "_url"],

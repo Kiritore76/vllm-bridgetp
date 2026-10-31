@@ -449,6 +449,19 @@ def layout_extras(spec, args, target_tp, run_dir):
     ), extras
 
 
+def live_pair(plan):
+    """Pair sides still serving at the end: not absent, not retired mid-run."""
+    aliases = plan.get("instances", {}).get("legacy_pool_aliases", {})
+    status_path = plan["run_dir"] / "layout_status.json"
+    status = read(status_path)["instances"] if status_path.exists() else {}
+    return [
+        side
+        for side, pool in (("source", "tp1"), ("target", "tp4"))
+        if side not in absent_pair(plan)
+        and status.get(aliases.get(pool), {}).get("lifecycle") != "RETIRED"
+    ]
+
+
 def conversion_request(spec, registry):
     """Validated explicit conversion of one bundle (S3b-3), or None."""
     request = spec.get("conversion")

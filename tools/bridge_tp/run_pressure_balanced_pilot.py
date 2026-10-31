@@ -835,10 +835,19 @@ def _run(args, prepared):
                 state, ["QUIESCING", "RETIRED"]
             )
             # Its inventory is the only completion evidence for admissions
-            # still open there: stay QUIESCING until they settle.
-            if state == "RETIRED" and any(
-                r.pool_id == pool_id and r.state in {"ACTIVE", "COMMITTED"}
-                for r in tuple(co.ledger.entries.values())
+            # still open there, and the coordinator refuses to retire an
+            # instance an unsettled migration names (a QUIESCING source may
+            # still migrate out): stay QUIESCING until both settle.
+            if state == "RETIRED" and (
+                any(
+                    r.pool_id == pool_id and r.state in {"ACTIVE", "COMMITTED"}
+                    for r in tuple(co.ledger.entries.values())
+                )
+                or any(
+                    pool_id in (target, co._session_source.get(session))
+                    and co.ledger.entries[session].state == "ACTIVE"
+                    for session, (_, target) in tuple(co._sessions.items())
+                )
             ):
                 steps, state = ["QUIESCING"], "QUIESCING"
                 deferred.append(pool_id)

@@ -3,19 +3,22 @@
 # 运行：
 #   cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 #
-# 当前任务：S3a 四边带载DRAIN（生命周期测试夹具，不接fast控制器、不迁移）。
-# A={2,3}，B={0,1}；所有引擎32768/.88；边顺序 L0->L1A、L1A->L2、L2->L1A、L1A->L0。
-# 每条边：0s起每4s一条请求，持续120s（30条），prompt 2048、输出固定4096 token，
-# 请求轮流发到当时ACTIVE的实例；60s时触发转换：被转换bundle停止接新请求，
-# 等在途请求自然跑完后释放、重建、恢复路由。全程每秒采样一次GPU显存与利用率。
-# 每条边约5-7分钟，总计约25分钟。任一边技术失败即停，已完成部分照常打包。
+# 当前任务：S3b-3 带fast控制器的运行中转换（GPU功能验收，两条边各1场）。
+# 布局与G2相同：L1A，A={2,3}，B={0,1}；TP1@2（迁移源，通道1）、TP1@3（通道3）、
+# TP2@0,1；双32768/.88；深长突发配方MIGRATE臂（短请求每2s一条，90s起6条长请求）。
+# 控制器启动30s后显式触发DRAIN转换（长请求到来之前）：
+#   L1A-L2：A的两个TP1停止接入→排空→在目标TP2两个rank上关闭通道1、3→停引擎→
+#           起TP2@2,3→warmup→发布路由（之后迁移停用，两TP2只路由）。
+#   L1A-L0：B的TP2停止接入→排空→停引擎→起TP1@0、TP1@1→发布路由（之后迁移停用）。
+# 每场约8-10分钟，总计约20分钟。全程每秒采样一次GPU显存与利用率。
+# 一条边技术失败（退出码不是0或2）就停，已完成部分照常打包。
 
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
 py=$venv/bin/python
 model=/root/autodl-tmp/models/Qwen3-8B
 branch=bridgetp/tp2-4090d-qwen3-8b
-task=qwen3_loaded_drain
+task=qwen3_conversion_live
 
 cd "$repo" || exit 1
 source "$venv/bin/activate" || exit 1
@@ -39,6 +42,7 @@ echo "$head" > "$run/revision.txt"
 echo "代码：$head"
 echo "本批目录：$run"
 
+# 增量预编译：未改动的源码直接跳过。
 "$py" -m compileall -q -j 0 "$repo/vllm" "$repo/tools" >"$run/compileall.log" 2>&1
 
 # GPU显存/利用率，每秒一次（时间戳为nvidia-smi本地时间）。
@@ -51,30 +55,30 @@ export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 export VLLM_USE_V2_MODEL_RUNNER=0 OMP_NUM_THREADS=1
 
 status=0
-for edge in L0-L1A L1A-L2 L2-L1A L1A-L0; do
+for edge in L1A-L2 L1A-L0; do
     [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || {
         echo "上一场后GPU仍有计算进程，停止于 $edge 之前。"; status=1; break;
     }
-    echo "=== 开始带载转换：$edge（$(date +%T)）==="
+    echo "=== 开始运行中转换：$edge（$(date +%T)）==="
     date +%s.%N > "$run/$edge.started_unix_s"
-    "$py" -B tools/bridge_tp/run_tp_bundle_drain.py \
-        --edge "$edge" --platform qwen3 --expanded-context \
-        --bundle-gpus 2,3,0,1 \
-        --model-path "$model" \
+    "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
+        --long-burst-memory-verify --layout-l1a-channels --conversion "$edge" \
+        --current-machine --repetitions 1 \
+        --model "$model" \
+        --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
         --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json" \
-        --expected-revision "$head" \
-        --out-root "$run/loaded-$edge" \
-        --trigger-s 60 --arrival-duration-s 120 --arrival-interval-s 4 \
-        --output-tokens 4096 \
-        --plan-timeout-s 600 --request-timeout-s 900 \
-        --base-port 8700 --no-archive 2>&1 | tee "$run/$edge.console.log"
+        --output "$run/$edge" --expected-revision "$head" 2>&1 | tee "$run/$edge.console.log"
     status=${PIPESTATUS[0]}
     echo "$edge 退出码：$status" | tee -a "$run/exit_codes.txt"
-    [ "$status" = 0 ] || break
+    [ "$status" = 0 ] || [ "$status" = 2 ] || break
 done
 
 kill "$smi" 2>/dev/null
-tar -C "$(dirname "$run")" -czf "$run.tar.gz" "$(basename "$run")"
+# 每场的运行包已是compact包；外层只收它们和日志，不重复原始目录。
+tar -C "$(dirname "$run")" -czf "$run.tar.gz" \
+    --exclude="$(basename "$run")/L1A-L2" \
+    --exclude="$(basename "$run")/L1A-L0" \
+    "$(basename "$run")"
 sha256sum "$run.tar.gz" > "$run.tar.gz.sha256"
 echo '=== 退出码 ==='
 cat "$run/exit_codes.txt"

@@ -46,6 +46,15 @@ from tools.bridge_tp.run_qwen3_online_loaded_validation import (  # noqa: E402
 )
 from tools.bridge_tp.run_qwen3_parameter_batch import gpu_idle, write  # noqa: E402
 
+# S3b-3 GPU check: L1A on A={2,3}, B={0,1}. 30s after the controller starts
+# (before the deep burst), one bundle is drained, rebuilt and published.
+CONVERSIONS = {
+    # A: TP1@2 (pair source, channel 1) + TP1@3 (channel 3) -> TP2(2,3).
+    "L1A-L2": dict(bundle="A", target_mode="TP2"),
+    # B: TP2(0,1) (pair target) -> TP1@0 + TP1@1.
+    "L1A-L0": dict(bundle="B", target_mode="TP1"),
+}
+
 
 def adapt_plan(plan, arm, checkpoint, model):
     adjust_migration_plan(plan)
@@ -215,10 +224,17 @@ def main(argv=None):
         action="store_true",
         help="G2: L1A on A={2,3}, B={0,1}; TP1@2 and TP1@3 both migrate to TP2(0,1)",
     )
+    parser.add_argument(
+        "--conversion",
+        choices=sorted(CONVERSIONS),
+        help="S3b-3: explicit DRAIN conversion of one L1A bundle while serving",
+    )
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
     if args.layout_l1a_channels and not args.long_burst_memory_verify:
         parser.error("layout-l1a-channels runs with long-burst-memory-verify only")
+    if args.conversion and not args.layout_l1a_channels:
+        parser.error("conversion runs on the L1A channel layout only")
     if args.long_burst_memory_verify and args.long_burst_deep_stay:
         parser.error("deep STAY supplement and memory verification are separate runs")
     if args.long_burst_memory_verify or args.long_burst_deep_stay:
@@ -532,6 +548,13 @@ def main(argv=None):
                 base_port=8300,
                 migration_sources=True,
             )
+        if args.conversion:
+            spec["conversion"] = dict(
+                CONVERSIONS[args.conversion],
+                trigger_s=30,
+                deadline_s=420,
+                base_port=8400,
+            )
         spec.update(
             checkpoint=str(args.checkpoint),
             checkpoint_sha256=CHECKPOINT_SHA,
@@ -671,8 +694,11 @@ def main(argv=None):
                         plan["run_dir"].parent / "kv_routing_acceptance.json",
                         row["kv_routing"],
                     )
-                    if not row["kv_routing"]["invariants_pass"] or (
-                        row["kv_routing"]["checked_arrivals"] != len(raw)
+                    # Its invariants name the fixed pair; after a conversion
+                    # new instances take redirects too, so only record it.
+                    if not args.conversion and (
+                        not row["kv_routing"]["invariants_pass"]
+                        or row["kv_routing"]["checked_arrivals"] != len(raw)
                     ):
                         raise ValueError("updated pressure routing audit incomplete")
                 if args.kv_priority_verify:
@@ -789,6 +815,23 @@ def main(argv=None):
                     if accepted
                     else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
                 )
+            if args.conversion:
+                # The scene already failed unless the plan COMPLETED; the memory
+                # check needs every session COMMITTED, which retiring a source
+                # early does not provide, so it is kept as a record only.
+                conversion = read(
+                    plans[0][3]["run_dir"].parent / "conversion_result.json"
+                )
+                accepted = (
+                    len(ledger) == 1
+                    and ledger[0]["status"] == "COMPLETED"
+                    and conversion["state"] == "COMPLETED"
+                )
+                result, code = (
+                    (dict(status="COMPLETED_CONVERSION", edge=args.conversion), 0)
+                    if accepted
+                    else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
+                )
             if args.long_burst_deep_stay:
                 accepted = len(ledger) == 1 and long_burst.assess_stay(
                     ledger[0]["summary"], values[0]
@@ -895,7 +938,9 @@ def main(argv=None):
             total_profile_attempts=previous_attempts + len(ledger),
             inherited_runs=inherited,
             maximum_live_runs=run_count,
-            experiment_mode="long-burst-deep-stay"
+            experiment_mode="conversion-" + args.conversion
+            if args.conversion
+            else "long-burst-deep-stay"
             if args.long_burst_deep_stay
             else "long-burst-memory-verify"
             if args.long_burst_memory_verify
