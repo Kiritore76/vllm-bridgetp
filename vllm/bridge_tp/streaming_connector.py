@@ -1398,6 +1398,56 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             receiver.close()
             raise
 
+    def _retire_source_receiver(self, receiver, channel, tp_rank: int) -> None:
+        """Tear down a retired source's channel without blocking plan polling.
+
+        ``ncclCommAbort`` is the local teardown for a peer that is going away;
+        it runs on its own thread and its outcome is receipted separately.
+        """
+        path = (
+            self.manifest_path.parent
+            / "gpu_channel_plan_receipts"
+            / f"tp_rank_{tp_rank}-retired-{channel.generation}.json"
+        )
+        started = time.time()
+        logger.warning(
+            "BridgeTP retiring source channel %s generation %d",
+            channel.source,
+            channel.generation,
+        )
+
+        def teardown() -> None:
+            status, error = "ABORTED", None
+            try:
+                receiver.abort()
+            except BaseException as exc:  # receipted; nothing else uses it
+                status, error = "FAILED", repr(exc)
+                logger.exception("BridgeTP source channel teardown failed")
+            _atomic_json_dump(
+                dict(
+                    status=status,
+                    error=error,
+                    source_instance=channel.source,
+                    channel_generation=channel.generation,
+                    started_unix_s=started,
+                    completed_unix_s=time.time(),
+                ),
+                path,
+            )
+
+        _atomic_json_dump(
+            dict(
+                status="TEARDOWN_STARTED",
+                source_instance=channel.source,
+                channel_generation=channel.generation,
+                started_unix_s=started,
+            ),
+            path,
+        )
+        threading.Thread(
+            target=teardown, name=f"bridgetp-retire-{channel.generation}", daemon=True
+        ).start()
+
     def _reconcile_source_channels(self) -> None:
         """Apply the polled channel plan (TP conversion rebuild)."""
         if (
@@ -1457,6 +1507,9 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                             channel, tp_rank, device
                         ),
                         lambda receiver, channel: self._open_source_receiver(
+                            receiver, channel, tp_rank
+                        ),
+                        lambda receiver, channel: self._retire_source_receiver(
                             receiver, channel, tp_rank
                         ),
                     )

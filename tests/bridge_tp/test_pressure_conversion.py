@@ -170,6 +170,10 @@ class Harness:
                         )
                     )
                 )
+                # Background communicator teardown of each closed channel.
+                for generation in values["closing"]:
+                    name = f"tp_rank_{rank}-retired-{generation}.json"
+                    (directory / name).write_text(json.dumps(dict(status="ABORTED")))
 
     def publish(self, name, after=-float("inf")):
         while time.time() <= after:
@@ -394,6 +398,11 @@ class ConversionTests(unittest.TestCase):
             retire = next(e for e in harness.events if e["kind"] == "CHANNEL_RETIRE")
             self.assertEqual(retire["closed"], [1, 3])
             self.assertEqual(retire["ranks"], ["tp_rank_0.json", "tp_rank_1.json"])
+            self.assertTrue(retire["teardown_complete"])
+            self.assertEqual(
+                retire["teardown"],
+                {f"tp_rank_{r}/{g}": "ABORTED" for r in (0, 1) for g in (1, 3)},
+            )
 
     def test_scene_runner_binds_owned_engines_and_writes_result(self):
         from tools.bridge_tp import launch_pressure_balanced_pilot as launch
@@ -522,6 +531,40 @@ class ConversionTests(unittest.TestCase):
             )
             self.assertTrue(backend.precheck(plan))
 
+    def test_channel_close_that_never_arrives_fails_before_any_engine_stops(self):
+        """S3b-3 GPU run 2 (10-31) idled in FENCED until the workload ended."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            harness = Harness(root, "A", "TP2", channel_plan=True)
+            backend = harness.backend
+            harness.event = lambda kind, **values: None  # target never closes
+            backend.ops.event = harness.event
+            plan = dict(
+                plan_id="p",
+                refs=[
+                    dict(instance_id="A-g1-tp1", instance_generation=1),
+                    dict(instance_id="A-g3-tp1", instance_generation=3),
+                ],
+            )
+            (root / "layout_status.json").write_text(
+                json.dumps(
+                    dict(
+                        unix_s=time.time(),
+                        instances={
+                            name: dict(lifecycle="RETIRED")
+                            for name in ("A-g1-tp1", "A-g3-tp1")
+                        },
+                    )
+                )
+            )
+            now = [time.time()]
+            backend.clock = lambda: now[0]
+            self.assertFalse(backend.retire_channels(plan))
+            now[0] += 61
+            with self.assertRaises(RuntimeError):
+                backend.retire_channels(plan)
+            self.assertEqual(harness.stopped, set())
+
     def test_channel_retirement_waits_for_every_target_rank(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -563,6 +606,19 @@ class ConversionTests(unittest.TestCase):
             (receipts / "tp_rank_1.json").write_text(
                 json.dumps(dict(closed=[3], completed_unix_s=stamp + 1))
             )
+            # Closed everywhere; teardown receipts are awaited for up to 10s.
+            now = [time.time()]
+            backend.clock = lambda: now[0]
+            self.assertFalse(backend.retire_channels(plan))
+            for rank in (0, 1):
+                (receipts / f"tp_rank_{rank}-retired-1.json").write_text(
+                    json.dumps(dict(status="ABORTED"))
+                )
+            (receipts / "tp_rank_0-retired-3.json").write_text(
+                json.dumps(dict(status="TEARDOWN_STARTED"))
+            )
+            self.assertFalse(backend.retire_channels(plan))
+            now[0] += 11  # one teardown never returned: proceed and record it
             self.assertTrue(backend.retire_channels(plan))
 
 

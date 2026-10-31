@@ -190,6 +190,71 @@ class ConnectorWiringTests(unittest.TestCase):
         )
         return ns[name]
 
+    def test_retired_receiver_leaves_the_set_before_its_teardown(self):
+        """S3b-3 GPU (10-31): teardown runs through ``retire`` (background
+        in the connector), never as a blocking close inside reconcile."""
+        log, retired = [], []
+        channels = None
+
+        def retire(receiver, channel):
+            retired.append((channel.generation, set(channels.channels)))
+
+        channels = SourceChannelSet(
+            lambda c: Receiver(c, log), lambda r, c: r.open(), retire
+        )
+        channels.reconcile(parse_plan([A, A3], 2))
+        channels.channels[3][1].busy()
+        result = channels.reconcile(parse_plan([], 2))
+        self.assertEqual((result["closed"], result["deferred"]), ([1], [3]))
+        self.assertEqual(retired, [(1, {3})])  # already unselectable
+        self.assertNotIn(("close", "A-g1-tp1"), log)
+        channels.channels[3][1].idle()
+        channels.reconcile(parse_plan([], 2))
+        self.assertEqual([g for g, _ in retired], [1, 3])
+        self.assertEqual(channels.channels, {})
+
+    def test_connector_retires_a_source_channel_on_a_background_thread(self):
+        import json
+        import tempfile
+        import threading
+        import time
+        from pathlib import Path
+
+        retire = self.method("_retire_source_receiver")
+        retire.__globals__.update(
+            time=time,
+            logger=NS(warning=lambda *a: None, exception=lambda *a: None),
+            _atomic_json_dump=lambda value, path: (
+                path.parent.mkdir(parents=True, exist_ok=True),
+                path.write_text(json.dumps(value)),
+            ),
+        )
+        release = threading.Event()
+
+        class Blocking:
+            aborted = False
+
+            def abort(self):
+                release.wait(5)
+                self.aborted = True
+
+            def close(self):
+                raise AssertionError("synchronous destroy must not be used")
+
+        with tempfile.TemporaryDirectory() as folder:
+            connector = NS(manifest_path=Path(folder) / "s" / "manifest.json")
+            receiver = Blocking()
+            channel = parse_plan([A], 2)[0]
+            retire(connector, receiver, channel, 1)  # returns while abort blocks
+            path = Path(folder) / "s/gpu_channel_plan_receipts/tp_rank_1-retired-1.json"
+            self.assertEqual(json.loads(path.read_text())["status"], "TEARDOWN_STARTED")
+            release.set()
+            deadline = time.time() + 5
+            while json.loads(path.read_text())["status"] != "ABORTED":
+                self.assertLess(time.time(), deadline)
+                time.sleep(0.01)
+            self.assertTrue(receiver.aborted)
+
     def test_plan_file_is_read_as_a_list_and_receipted_on_first_load(self):
         """S3b-3 GPU (10-31): the target read the plan with the JSON-object
         loader, rejected it, and never closed a retired source's channel."""

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -45,18 +46,31 @@ def read_json(path):
         return None
 
 
-def channel_receipts(root):
-    """Every target-rank channel plan receipt below ``root`` (no symlinks)."""
+PLAN_RECEIPT = re.compile(r"tp_rank_\d+\.json")
+TEARDOWN_RECEIPT = re.compile(r"(tp_rank_\d+)-retired-(\d+)\.json")
+
+
+def channel_receipts(root, pattern=PLAN_RECEIPT):
+    """Target-rank channel plan receipts below ``root`` (no symlinks)."""
     rows = []
     for directory, _, names in os.walk(root):
         if Path(directory).name != "gpu_channel_plan_receipts":
             continue
         for name in sorted(names):
-            if name.startswith("tp_rank_") and name.endswith(".json"):
+            if pattern.fullmatch(name):
                 value = read_json(Path(directory) / name)
                 if value is not None:
                     rows.append((name, value))
     return rows
+
+
+def teardown_receipts(root):
+    """{(rank, generation): status} of retired channels' background teardown."""
+    return {
+        (match[1], int(match[2])): value.get("status")
+        for name, value in channel_receipts(root, TEARDOWN_RECEIPT)
+        for match in [TEARDOWN_RECEIPT.fullmatch(name)]
+    }
 
 
 class ControllerConversionBackend:
@@ -280,14 +294,38 @@ class ControllerConversionBackend:
         done = len(closing["closed"]) >= self.target_tp_ranks and all(
             set(closing["generations"]) <= seen for seen in closing["closed"].values()
         )
-        if done:
-            self.ops.event(
-                "CHANNEL_RETIRE",
-                plan_id=plan["plan_id"],
-                closed=closing["generations"],
-                ranks=sorted(closing["closed"]),
-            )
-        return done
+        if not done:
+            if self.clock() - closing["written_at"] > 60:
+                # Fail fast (before any engine stops) instead of idling in
+                # FENCED until the workload ends.
+                raise RuntimeError(
+                    "target ranks did not close retired channels within 60s: "
+                    + json.dumps({k: sorted(v) for k, v in closing["closed"].items()})
+                )
+            return False
+        # The channels are unselectable now; their communicators are torn
+        # down in the background. Wait briefly to record the outcome, then
+        # proceed either way: stopping the source ends the peer regardless.
+        closing.setdefault("closed_at", self.clock())
+        teardown = {
+            f"{rank}/{generation}": status
+            for (rank, generation), status in teardown_receipts(self.run_dir).items()
+            if generation in closing["generations"]
+        }
+        finished = sum(s in {"ABORTED", "FAILED"} for s in teardown.values())
+        expected = self.target_tp_ranks * len(closing["generations"])
+        if finished < expected and self.clock() - closing["closed_at"] < 10:
+            return False
+        self.ops.event(
+            "CHANNEL_RETIRE",
+            plan_id=plan["plan_id"],
+            closed=closing["generations"],
+            ranks=sorted(closing["closed"]),
+            teardown=teardown,
+            teardown_complete=finished == expected,
+            teardown_wait_s=self.clock() - closing["closed_at"],
+        )
+        return True
 
     def stop_owned_engines(self, plan):
         self.ops.stop([r.instance_id for r in self.refs(plan)])

@@ -79,14 +79,21 @@ class SourceChannelSet:
     listeners are bound before any handshake, and handshakes run in source-id
     order: a source connecting early is queued, never refused, and with
     sources also preconnecting targets in id order no wait cycle can form.
+
+    ``retire(receiver, channel)`` tears down a departed idle channel after it
+    has left the set (default: ``receiver.close()``). The connector passes a
+    background teardown: a synchronous communicator destroy with the source
+    still alive never returned and stalled plan polling (S3b-3 GPU, 10-31).
     """
 
     def __init__(
         self,
         bind: Callable[[SourceChannel], Any],
         open: Callable[[Any, SourceChannel], None],
+        retire: Callable[[Any, SourceChannel], None] | None = None,
     ) -> None:
         self._bind, self._open = bind, open
+        self._retire = retire or (lambda receiver, channel: receiver.close())
         self._lock = threading.RLock()
         self.channels: dict[int, tuple[SourceChannel, Any]] = {}
         self.active_generation: int | None = None
@@ -101,14 +108,15 @@ class SourceChannelSet:
                     raise ValueError("a generation cannot change source or port")
             closed, deferred = [], []
             for generation in sorted(set(self.channels) - set(wanted)):
-                _, receiver = self.channels[generation]
+                channel, receiver = self.channels[generation]
                 if not _idle(receiver):
                     deferred.append(generation)
                     continue
-                receiver.close()
+                # Unselectable first, then torn down.
                 del self.channels[generation]
                 if self.active_generation == generation:
                     self.active_generation = None
+                self._retire(receiver, channel)
                 closed.append(generation)
             self.deferred_close = set(deferred)
             new = sorted(

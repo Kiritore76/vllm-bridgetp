@@ -182,7 +182,7 @@
     "vllm/bridge_tp/rolling_cutover.py": "5def4ab368759b33791633794e15d86845b1848c95e22f6d488515367669c016",
     "vllm/bridge_tp/runtime_control.py": "07d675528907a98a0e50f1ac270a49c1721db3c0936eba8dcf230e0457cffd0a",
     "vllm/bridge_tp/shadow_transfer_protocol.py": "fdd6f3d6839fa35c01cd165ad0251ccb0f4112a89cc2e94c8846b7e435fadeac",
-    "vllm/bridge_tp/streaming_connector.py": "a335e13c78f3df55c26d7eb0fbe05e7a5012b87dc668599905735c72ccf7bf09",
+    "vllm/bridge_tp/streaming_connector.py": "293062351a41f2c85f08c2e5926cebfdf76d2d0b1cca474cd36844de6210eef0",
     "vllm/bridge_tp/stream_protocol.py": "8f2f15bbc005b778c2b68b7fd1c0a3c3583fda66feca70f8ec27346619381271",
     "vllm/bridge_tp/takeover_api.py": "77ded955c3dd53ceb551b187f67a5cd5b4f2f12f55f5ba35953a694c08ce9cf2",
     "vllm/bridge_tp/__init__.py": "3ffd9c3646257f2f954d336022cb2ee840a35e156a7b725a7ab9b0e6ce651f56",
@@ -395,10 +395,10 @@
     "tests/bridge_tp/test_pressure_multi.py": "5908a87b034fe7991bf92aeadd59b5b42511cb116de70568cc726a062ba9d54e",
     "vllm/bridge_tp/gpu_direct_targets.py": "e6ec01135656bfdf9c2f1fb8b646863557d850020061b9768dd146155ebdf683",
     "tests/bridge_tp/test_gpu_direct_targets.py": "fde9f51e4e718b0b68ffb8d98543a70f2b34dbf0ad85522893c561a75a20876e",
-    "vllm/bridge_tp/source_channels.py": "48032fa1da17c1bddd68730f2d61dc94926ca657cfd30f175fa03bbe5a327c7f",
-    "tests/bridge_tp/test_source_channels.py": "2957115e24843e659204f6b2f3138cc93152e8aaca93c43f62ba3b60ee6f32eb",
-    "tools/bridge_tp/pressure_conversion.py": "59293c5845640966aabb64fe074d5844ef9c3f2d339b79614083e5aa2d48c594",
-    "tests/bridge_tp/test_pressure_conversion.py": "9d38ffc6e2c48a5db6ee0abb261b028924976f13ebb4e36edcb4cb1a14ab67dc"
+    "vllm/bridge_tp/source_channels.py": "3e9512bdb6fbfd16d339a492b9ffe3c419956c3ce60db4cc689a7a3c8e531596",
+    "tests/bridge_tp/test_source_channels.py": "fcdfae60e54dfb1c8bebae4623aea7be48e5c453aaf927ad84eae5c3c0baef10",
+    "tools/bridge_tp/pressure_conversion.py": "82da9b30285a52fd8565d5be79bf03b9792af39378c49bface95b6156affdabf",
+    "tests/bridge_tp/test_pressure_conversion.py": "fac6df1fe1056e4a8763c851c1a82dea0c23e4658e52fc6fc62ffdad75ad2011"
   },
   "server_settings": {
     "dtype": "bfloat16",
