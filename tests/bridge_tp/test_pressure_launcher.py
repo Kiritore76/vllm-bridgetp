@@ -429,6 +429,70 @@ class LauncherTests(unittest.TestCase):
                 [r["instance_id"] for r in launch.controller.extra_instances(checked)],
                 ["A-g3-tp1"],
             )
+            # S1-d2c: the extra TP1 becomes a second migration source.
+            channel_spec = dict(
+                spec,
+                layout=dict(spec["layout"], migration_sources=True),
+            )
+            plan = launch.build_scene(
+                channel_spec,
+                dict(name="l1a-channels", arrivals="a"),
+                root,
+                common,
+                args,
+            )
+            plan["source_env"]["BRIDGETP_PERFORMANCE_TRACE_DIR"] = str(
+                root / "trace" / "source"
+            )
+            (extra,) = plan["extra_engines"]
+            self.assertEqual(
+                extra["migration_channel"], dict(base_port=30410, generation=3)
+            )
+            connector = json.loads(plan["target_argv"][-1])
+            self.assertEqual(
+                connector["kv_connector_extra_config"]["bridgetp_gpu_direct_sources"],
+                [
+                    dict(source="A-g1-tp1", base_port=30400, generation=1),
+                    dict(source="A-g3-tp1", base_port=30410, generation=3),
+                ],
+            )
+            argv, env = launch.extra_engine(plan, extra)
+            self.assertEqual(env["BRIDGETP_GPU_DIRECT_BASE_PORT"], "30410")
+            self.assertEqual(env["BRIDGETP_CHANNEL_GENERATION"], "3")
+            self.assertEqual(env["BRIDGETP_PRESSURE_POOL"], "A-g3-tp1")
+            self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "3")
+            self.assertEqual(env["BRIDGETP_STREAM_ENABLED"], "1")
+            self.assertTrue(
+                env["BRIDGETP_PREDICTOR_LIVE_EVENTS"].endswith(
+                    "predictor_events_A-g3-tp1.jsonl"
+                )
+            )
+            self.assertEqual(
+                env["BRIDGETP_PERFORMANCE_TRACE_DIR"], str(root / "trace" / "A-g3-tp1")
+            )
+            row = next(
+                r
+                for r in plan["instances"]["instances"]
+                if r["instance_id"] == "A-g3-tp1"
+            )
+            self.assertEqual(row["migration_channel"]["generation"], 3)
+            launch.write_instances(plan)
+            controller_args = launch.controller.parse_args(plan["controller_argv"][2:])
+            checked = launch.controller.instance_manifest(
+                controller_args, NS(target_tp_size=2)
+            )
+            self.assertEqual(
+                [r["instance_id"] for r in launch.controller.channel_sources(checked)],
+                ["A-g3-tp1"],
+            )
+            with self.assertRaises(ValueError):
+                launch.build_scene(
+                    channel_spec,
+                    dict(name="bad-generation", arrivals="a"),
+                    root,
+                    common,
+                    NS(**dict(vars(args), channel_generation=2)),
+                )
             for layout in (
                 dict(name="L2", bundle_gpus=["2", "3", "0", "1"], base_port=8300),
                 dict(name="L0", bundle_gpus=["2", "3", "0", "1"], base_port=8300),

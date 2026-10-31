@@ -600,6 +600,16 @@ class PressureCoordinator:
                 and actions is not None
                 and not session_active
                 and target_fresh
+                and chosen["best"]["decision"].request_id not in actions
+                and len(evaluations) > 1
+            ):
+                # Several sources: one without observed rates has no bindings.
+                record["execution_blocked"] = "chosen source has no action binding"
+            elif (
+                chosen is not None
+                and actions is not None
+                and not session_active
+                and target_fresh
             ):
                 s, t = chosen["source"], chosen["best"]["target"]
                 decision = chosen["best"]["decision"]

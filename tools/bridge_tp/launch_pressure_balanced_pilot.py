@@ -340,6 +340,21 @@ def build_scene(spec, scene, run_root, common, args):
             extra["inventory_path"] = row["inventory_path"] = str(
                 run_dir / f"inventory_{row['instance_id']}.jsonl"
             )
+            if "migration_channel" in extra:
+                # Channel generation = source instance generation: unique per
+                # run, and a rebuilt instance gets a new one.
+                extra["migration_channel"]["generation"] = row["instance_generation"]
+                row["migration_channel"] = dict(extra["migration_channel"])
+                extra["predictor_events"] = row["predictor_events"] = str(
+                    run_dir / f"predictor_events_{row['instance_id']}.jsonl"
+                )
+    sources = source_channel_list(args, aliases["tp1"], extras)
+    if len(sources) > 1:
+        connector = json.loads(target_argv[-1])
+        connector["kv_connector_extra_config"]["bridgetp_gpu_direct_sources"] = (
+            sources
+        )
+        target_argv[-1] = json.dumps(connector)
     return dict(
         run_dir=run_dir,
         instances=instances,
@@ -366,6 +381,9 @@ def layout_extras(spec, args, target_tp, run_dir):
     layout = spec.get("layout")
     if not layout:
         return ("A", "B"), []
+    channels = bool(layout.get("migration_sources"))
+    if channels and int(args.channel_generation) != 1:
+        raise ValueError("per-source channels need the pair source on generation 1")
     rows = load("instance_pool").layouts(target_tp, list(layout["bundle_gpus"]))[
         layout["name"]
     ]
@@ -377,7 +395,7 @@ def layout_extras(spec, args, target_tp, run_dir):
     ]
     if len(source) != 1 or len(target) != 1:
         raise ValueError("layout must contain the TP1 source and TP-k target pair")
-    extras = []
+    extras, sources = [], 0
     for index, row in enumerate(r for r in rows if r not in (source[0], target[0])):
         port = int(layout["base_port"]) + index
         extras.append(
@@ -392,7 +410,33 @@ def layout_extras(spec, args, target_tp, run_dir):
                 else args.tp4_max_model_len,
             )
         )
+        if channels and row["tp_degree"] == 1:
+            # Port blocks [base, base + tp] of 10 apart never overlap for TP<=4.
+            sources += 1
+            extras[-1]["migration_channel"] = dict(
+                base_port=int(args.gpu_direct_base_port) + 10 * sources
+            )
     return (source[0]["bundle_id"], target[0]["bundle_id"]), extras
+
+
+def source_channel_list(args, pair_source_id, extras):
+    """Target connector source list, sorted by source id (handshake order)."""
+    rows = [
+        dict(
+            source=pair_source_id,
+            base_port=int(args.gpu_direct_base_port),
+            generation=int(args.channel_generation),
+        )
+    ] + [
+        dict(
+            source=e["instance_id"],
+            base_port=e["migration_channel"]["base_port"],
+            generation=e["migration_channel"]["generation"],
+        )
+        for e in extras
+        if "migration_channel" in e
+    ]
+    return sorted(rows, key=lambda row: row["source"])
 
 
 def extra_engine(plan, extra):
@@ -407,11 +451,22 @@ def extra_engine(plan, extra):
         index = argv.index("--kv-transfer-config")
         del argv[index : index + 2]
     argv[argv.index("--port") + 1] = str(extra["port"])
-    env = {
-        k: v
-        for k, v in plan["target_env"].items()
-        if not k.startswith(("BRIDGETP_TAKEOVER", "BRIDGETP_STREAM_"))
-    }
+    channel = extra.get("migration_channel")
+    if channel:
+        # A second migration source: the pair source's publisher environment
+        # with its own channel, predictor journal, inventory and trace.
+        env = dict(plan["source_env"])
+        env.update(
+            BRIDGETP_GPU_DIRECT_BASE_PORT=str(channel["base_port"]),
+            BRIDGETP_CHANNEL_GENERATION=str(channel["generation"]),
+            BRIDGETP_PREDICTOR_LIVE_EVENTS=extra["predictor_events"],
+        )
+    else:
+        env = {
+            k: v
+            for k, v in plan["target_env"].items()
+            if not k.startswith(("BRIDGETP_TAKEOVER", "BRIDGETP_STREAM_"))
+        }
     env.update(
         CUDA_VISIBLE_DEVICES=",".join(extra["gpus"]),
         OMP_NUM_THREADS="1",

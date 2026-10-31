@@ -322,9 +322,16 @@ def instance_manifest(args, controller):
             )
             or not row.get("inventory_path")
             or endpoints.count(row["endpoint"]) != 1
+            or row.get("migration_channel")
+            and (row["tp_degree"] != 1 or not row.get("predictor_events"))
         ):
             raise ValueError("invalid routing-only instance " + row["instance_id"])
     return manifest
+
+
+def channel_sources(manifest):
+    """Routing-only TP1 rows that also own a migration channel (S1-d2c)."""
+    return [r for r in extra_instances(manifest) if r.get("migration_channel")]
 
 
 def extra_instances(manifest):
@@ -542,6 +549,19 @@ def _run(args, prepared):
         args.predictor_sha256,
         align_history=getattr(args, "platform", "a100") == "qwen3",
     )
+    # Migration sources: the pair source, then every TP1 with its own channel.
+    migration_sources = [("tp1", args.source_inventory, predictor)] + [
+        (
+            row["instance_id"],
+            Path(row["inventory_path"]),
+            load("manager_m5").PredictorEventReader(
+                Path(row["predictor_events"]),
+                args.predictor_sha256,
+                align_history=getattr(args, "platform", "a100") == "qwen3",
+            ),
+        )
+        for row in channel_sources(receipt.get("instance_manifest"))
+    ]
     dispatched, previous = {}, {}
     growth_readers = {pool: health.NativeDecodeGrowth() for pool in tp_of}
     started = time.monotonic()
@@ -803,146 +823,169 @@ def _run(args, prepared):
                     )
             dispatcher.publish(pools)
             dispatched = dispatcher.snapshot()
-            candidates, eos = [], {}
-            for row in inventories[0]["requests"]:
-                try:
-                    stream = ingress.for_server_id(row["request_id"])
-                except ValueError:
-                    stream = None
-                if workload_module is not None:
-                    relief, cost = (
-                        tuple(
-                            workload_module.slot_cost(
-                                workload_profiles[name],
-                                max(row["prompt_tokens"], row["computed_tokens"]),
-                            )[0]
-                            for name in ("tp1", "tp4")
-                        )
-                        if all(
-                            workload_module.valid(pool, co.policy.cfg, now)
-                            for pool in pools[:2]
-                        )
-                        else (None, None)
-                    )
-                else:
-                    relief, cost = (
-                        lookup.deltas(shapes[0], shapes[1], row["request_id"])
-                        if all(shapes[:2])
-                        else (None, None)
-                    )
-                release_budget = lookup.release_budget
-                candidates.append(
-                    p.Candidate(
-                        row["request_id"],
-                        co._owners.get(row["request_id"], "tp1"),
-                        inventories[0]["sampled_at"],
-                        readers[0].observed_at,
-                        row["generated"],
-                        row["prompt_tokens"],
-                        row["max_output_tokens"],
-                        row["releasable_blocks"],
-                        row["owned_blocks"],
-                        row["owned_blocks"]
-                        * controller.block_size
-                        * controller.policy.kv_bytes_per_token
-                        if row["owned_blocks"] is not None
-                        else None,
-                        None,
-                        "UNAVAILABLE",
-                        relief,
-                        cost,
-                        release_budget,
-                        source_tokens_s=(
-                            source_rates.get(stream.client_id)
-                            if stream is not None else None
-                        ),
-                        finished=stream.future.done() if stream is not None else False,
-                        action_available=stream is not None and session.ready_for_start,
-                        inventory_reference=f"{args.source_inventory}:{inventories[0]['generation']}",
-                        migrating=bool(
-                            session.record
-                            and session.record.request_id == row["request_id"]
-                        ),
-                        target_health_after_supported=(
-                            health_module.supported_after(
-                                health_tracker.reference,
-                                shapes[1]["decode_requests"] + 1,
-                                (
-                                    shapes[1]["decode_context_sum"]
-                                    + row["computed_tokens"]
-                                )
-                                / (shapes[1]["decode_requests"] + 1),
+            index_of = {pool.pool_id: n for n, pool in enumerate(pools)}
+            candidates_by_source, runtimes, rates_by_source = {}, {}, {}
+            for source_id, inventory_path, source_predictor in migration_sources:
+                n = index_of[source_id]
+                rates = service.snapshot(source_id, now)["request_rates"]
+                rates_by_source[source_id] = rates
+                candidates, eos = [], {}
+                for row in inventories[n]["requests"]:
+                    try:
+                        stream = ingress.for_server_id(row["request_id"])
+                    except ValueError:
+                        stream = None
+                    if workload_module is not None:
+                        relief, cost = (
+                            tuple(
+                                workload_module.slot_cost(
+                                    workload_profiles[name],
+                                    max(row["prompt_tokens"], row["computed_tokens"]),
+                                )[0]
+                                for name in ("tp1", "tp4")
                             )
-                            if health_tracker is not None and shapes[1]
-                            else False
-                        ),
+                            if all(
+                                workload_module.valid(pool, co.policy.cfg, now)
+                                for pool in (pools[n], pools[1])
+                            )
+                            else (None, None)
+                        )
+                    else:
+                        relief, cost = (
+                            lookup.deltas(shapes[n], shapes[1], row["request_id"])
+                            if shapes[n] and shapes[1]
+                            else (None, None)
+                        )
+                    release_budget = lookup.release_budget
+                    candidates.append(
+                        p.Candidate(
+                            row["request_id"],
+                            co._owners.get(row["request_id"], source_id),
+                            inventories[n]["sampled_at"],
+                            readers[n].observed_at,
+                            row["generated"],
+                            row["prompt_tokens"],
+                            row["max_output_tokens"],
+                            row["releasable_blocks"],
+                            row["owned_blocks"],
+                            row["owned_blocks"]
+                            * controller.block_size
+                            * controller.policy.kv_bytes_per_token
+                            if row["owned_blocks"] is not None
+                            else None,
+                            None,
+                            "UNAVAILABLE",
+                            relief,
+                            cost,
+                            release_budget,
+                            source_tokens_s=(
+                                rates.get(stream.client_id)
+                                if stream is not None else None
+                            ),
+                            finished=stream.future.done()
+                            if stream is not None
+                            else False,
+                            action_available=stream is not None
+                            and session.ready_for_start,
+                            inventory_reference=(
+                                f"{inventory_path}:{inventories[n]['generation']}"
+                            ),
+                            migrating=bool(
+                                session.record
+                                and session.record.request_id == row["request_id"]
+                            ),
+                            target_health_after_supported=(
+                                health_module.supported_after(
+                                    health_tracker.reference,
+                                    shapes[1]["decode_requests"] + 1,
+                                    (
+                                        shapes[1]["decode_context_sum"]
+                                        + row["computed_tokens"]
+                                    )
+                                    / (shapes[1]["decode_requests"] + 1),
+                                )
+                                if health_tracker is not None and shapes[1]
+                                else False
+                            ),
+                        )
                     )
+                    eos[row["request_id"]] = row["ignore_eos"]
+                candidates_by_source[source_id] = load("pause_diagnostics").call(
+                    "predictor.read",
+                    co.with_predictions,
+                    candidates,
+                    source_predictor,
+                    now,
+                    (pools[n].free_blocks - cfg.capacity_guard_blocks)
+                    * pools[n].block_size,
+                    eos,
                 )
-                eos[row["request_id"]] = row["ignore_eos"]
-            candidates = load("pause_diagnostics").call(
-                "predictor.read",
-                co.with_predictions,
-                candidates,
-                predictor,
-                now,
-                (pools[0].free_blocks - cfg.capacity_guard_blocks)
-                * pools[0].block_size,
-                eos,
-            )
-            growth = pools[0].growth_blocks_s
-            guard_time = (
-                max(0, pools[0].free_blocks - cfg.capacity_guard_blocks) / growth
-                if growth is not None and growth > 0
-                else None
-            )
-            pools[0] = replace(
-                pools[0],
-                guard_time_s=guard_time,
-                urgency=lookup.release_budget / guard_time
-                if guard_time is not None and guard_time > 0
-                else None,
-            )
-            runtime = load("manager_m0").RuntimeSnapshot(
-                unix_s=now,
-                migration_id=session.migration_id,
-                request_id=None,
-                state="LOCAL",
-                generated_tokens=None,
-                source_sampled_unix_s=pools[0].sampled_at,
-                target_sampled_unix_s=pools[1].sampled_at,
-                source_free_kv_tokens=pools[0].free_blocks * pools[0].block_size,
-                source_guard_free_kv_tokens=cfg.capacity_guard_blocks
-                * pools[0].block_size,
-                source_pool_growth_tokens_s=pools[0].growth_blocks_s
-                * pools[0].block_size
-                if pools[0].growth_blocks_s is not None
-                else None,
-                target_running=inventories[1]["running"],
-                target_waiting=co.ledger.routing_reading(pools[1]).waiting,
-                target_kv_usage_frac=1
-                - pools[1].free_blocks / inventories[1]["total_blocks"],
-            )
+                growth = pools[n].growth_blocks_s
+                guard_time = (
+                    max(0, pools[n].free_blocks - cfg.capacity_guard_blocks) / growth
+                    if growth is not None and growth > 0
+                    else None
+                )
+                pools[n] = replace(
+                    pools[n],
+                    guard_time_s=guard_time,
+                    urgency=lookup.release_budget / guard_time
+                    if guard_time is not None and guard_time > 0
+                    else None,
+                )
+                runtimes[source_id] = load("manager_m0").RuntimeSnapshot(
+                    unix_s=now,
+                    migration_id=session.migration_id,
+                    request_id=None,
+                    state="LOCAL",
+                    generated_tokens=None,
+                    source_sampled_unix_s=pools[n].sampled_at,
+                    target_sampled_unix_s=pools[1].sampled_at,
+                    source_free_kv_tokens=pools[n].free_blocks * pools[n].block_size,
+                    source_guard_free_kv_tokens=cfg.capacity_guard_blocks
+                    * pools[n].block_size,
+                    source_pool_growth_tokens_s=pools[n].growth_blocks_s
+                    * pools[n].block_size
+                    if pools[n].growth_blocks_s is not None
+                    else None,
+                    target_running=inventories[1]["running"],
+                    target_waiting=co.ledger.routing_reading(pools[1]).waiting,
+                    target_kv_usage_frac=1
+                    - pools[1].free_blocks / inventories[1]["total_blocks"],
+                )
+            candidates = [c for cs in candidates_by_source.values() for c in cs]
+            # A source without observed request rates may not start a migration;
+            # with one source this is the historical "no rates, advisory" rule.
             actions = (
                 None
-                if args.no_migration or not session.ready_for_start or not source_rates
+                if args.no_migration
+                or not session.ready_for_start
+                or not any(rates_by_source.values())
                 else {
                     c.request_id: r.BoundAction(
                         c.request_id,
                         session.migration_id,
-                        lambda c=c, runtime=runtime: session.start(c, runtime),
+                        lambda c=c, runtime=runtimes[source]: session.start(
+                            c, runtime
+                        ),
                     )
-                    for c in candidates
+                    for source, cs in candidates_by_source.items()
+                    if rates_by_source[source]
+                    for c in cs
                 }
             )
             load("pause_diagnostics").call(
                 "policy.tick",
                 co.tick_multi,
                 now,
-                {"tp1": pools[0], "tp4": pools[1]},
+                {"tp4": pools[1]}
+                | {source: pools[index_of[source]] for source in candidates_by_source},
                 tp_of,
-                {("tp1", "tp4"): candidates},
+                {(source, "tp4"): cs for source, cs in candidates_by_source.items()},
                 actions,
             )
+            session_source = co._session_source.get(session.migration_id, "tp1")
+            runtime = runtimes.get(session_source, runtimes["tp1"])
             if session.record is not None and not session.settled:
                 session.poll_cancel(inventories[1], now, cfg.max_age_s)
                 if args.test_only_cancel_first_shadow:
@@ -953,7 +996,7 @@ def _run(args, prepared):
                     inject_cancel_smoke(session, inventories[1], now, audit)
                 session.reconsider(
                     now,
-                    co.ledger.routing_reading(pools[0]),
+                    co.ledger.routing_reading(pools[index_of[session_source]]),
                     co.ledger.routing_reading(pools[1]),
                     next(
                         (

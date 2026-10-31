@@ -450,6 +450,13 @@ class DispatchTests(unittest.TestCase):
         def make_ingress(*args, **kwargs):
             return actual_ingress(*args, **kwargs, post=post)
 
+        actual_tick = r.PressureCoordinator.tick_multi
+        evaluated = []
+
+        def recording_tick(co, now, readings, tp_of, candidates, actions=None):
+            evaluated.append(sorted(source for source, _ in candidates))
+            return actual_tick(co, now, readings, tp_of, candidates, actions)
+
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             readers = {
@@ -476,6 +483,8 @@ class DispatchTests(unittest.TestCase):
                         instance_id="A-g3-tp1",
                         endpoint="extra",
                         inventory_path=str(root / "extra"),
+                        migration_channel=dict(base_port=30410, generation=3),
+                        predictor_events=str(root / "predictor-A-g3-tp1"),
                     ),
                 ],
             )
@@ -524,6 +533,7 @@ class DispatchTests(unittest.TestCase):
                 ),
                 patch.object(o, "scrape_inventory_metrics", return_value=None),
                 patch.object(i, "PressureIngress", side_effect=make_ingress),
+                patch.object(r.PressureCoordinator, "tick_multi", recording_tick),
             ):
                 pilot._run(
                     args,
@@ -541,6 +551,9 @@ class DispatchTests(unittest.TestCase):
             self.assertIn("A-g3-tp1", {row["initial_pool"] for row in result})
             self.assertIn("extra", calls)
             self.assertTrue((root / "inventory_A-g3-tp1_process_receipt.json").exists())
+            # S1-d2c: both channel-owning TP1 instances are migration sources.
+            self.assertTrue(evaluated)
+            self.assertTrue(all(row == ["A-g3-tp1", "tp1"] for row in evaluated))
             progress = json.loads((root / "pressure_progress.json").read_text())
             self.assertEqual(progress["stage"], "COMPLETED")
             bad = dict(manifest)
