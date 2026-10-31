@@ -198,6 +198,43 @@ class ConnectorWiringTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             activate(NS(_source_channels=None), 1)
 
+    def test_scheduler_role_accepts_planned_generations_without_receivers(self):
+        """G2 (10-31): the scheduler-role connector has no receivers."""
+        import json
+        import tempfile
+
+        from vllm.bridge_tp import source_channels
+
+        check = self.method("_check_source_generation")
+        check.__globals__.update(
+            parse_plan=source_channels.parse_plan,
+            _load_json=lambda p: json.loads(p.read_text(encoding="utf-8")),
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            plan_path = __import__("pathlib").Path(folder) / "plan.json"
+            plan_path.write_text(json.dumps([A, A3, row("A-g7-tp1", 30420, 7)]))
+            scheduler = NS(
+                _source_channels=None,
+                _source_plan=parse_plan([A, A3], 2),
+                _source_plan_path=plan_path,
+                _target_tp_size=2,
+            )
+            for generation in (1, 3, 7):
+                check(scheduler, generation)
+            with self.assertRaises(ValueError):
+                check(scheduler, 9)
+            self.assertIsNone(scheduler._source_channels)
+        log = []
+        channels = SourceChannelSet(lambda c: Receiver(c, log), lambda r, c: r.open())
+        channels.reconcile(parse_plan([A, A3], 2))
+        activated = []
+        worker = NS(
+            _source_channels=channels,
+            _activate_source_channel=activated.append,
+        )
+        check(worker, 3)
+        self.assertEqual(activated, [3])
+
     def test_connector_calls_the_channel_set(self):
         import ast
 
@@ -216,7 +253,7 @@ class ConnectorWiringTests(unittest.TestCase):
             }
 
         self.assertIn("parse_plan", called(methods["__init__"]))
-        self.assertIn("_activate_source_channel", called(methods["_load_manifest"]))
+        self.assertIn("_check_source_generation", called(methods["_load_manifest"]))
         prebind = called(methods["_start_gpu_direct_receiver_prebind"])
         for name in (
             "SourceChannelSet",

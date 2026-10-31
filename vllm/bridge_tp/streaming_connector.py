@@ -607,8 +607,8 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         if manifest_persistent and (
             self._source_plan is not None or self._source_plan_path is not None
         ):
-            self._activate_source_channel(int(manifest.get("channel_generation", -1)))
-        if manifest_persistent and (
+            self._check_source_generation(int(manifest.get("channel_generation", -1)))
+        elif manifest_persistent and (
             int(manifest.get("channel_generation", -1))
             != self.channel_generation
         ):
@@ -1313,6 +1313,28 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 self._prebound_gpu_history = None
                 return prebound[1]
         return None
+
+    def _check_source_generation(self, generation: int) -> None:
+        """Bind a session manifest to a planned source channel.
+
+        Only worker-role connectors open receivers. A worker switches its
+        receiver to the session's source; the scheduler-role connector (no
+        receivers, separate process) accepts any planned generation. G2
+        (10-31) failed when the scheduler side expected open receivers.
+        """
+        if self._source_channels is not None:
+            self._activate_source_channel(generation)
+            return
+        planned = {c.generation for c in self._source_plan or ()}
+        if self._source_plan_path is not None and self._source_plan_path.is_file():
+            planned |= {
+                c.generation
+                for c in parse_plan(
+                    _load_json(self._source_plan_path), self._target_tp_size
+                )
+            }
+        if generation not in planned:
+            raise ValueError("session channel generation is not a planned source")
 
     def _activate_source_channel(self, generation: int) -> None:
         """Point the single-receiver paths at this session's source channel."""

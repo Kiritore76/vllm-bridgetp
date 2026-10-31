@@ -182,7 +182,7 @@
     "vllm/bridge_tp/rolling_cutover.py": "5def4ab368759b33791633794e15d86845b1848c95e22f6d488515367669c016",
     "vllm/bridge_tp/runtime_control.py": "07d675528907a98a0e50f1ac270a49c1721db3c0936eba8dcf230e0457cffd0a",
     "vllm/bridge_tp/shadow_transfer_protocol.py": "fdd6f3d6839fa35c01cd165ad0251ccb0f4112a89cc2e94c8846b7e435fadeac",
-    "vllm/bridge_tp/streaming_connector.py": "682120d43c5c5bacb2a5a4d2254a8a6bce8307bcba28d68af1e3131625e0f1d0",
+    "vllm/bridge_tp/streaming_connector.py": "4e2b76d79f584b744bb839950d72a211205c87f03e16e29fda8b5ee817ae55a3",
     "vllm/bridge_tp/stream_protocol.py": "8f2f15bbc005b778c2b68b7fd1c0a3c3583fda66feca70f8ec27346619381271",
     "vllm/bridge_tp/takeover_api.py": "77ded955c3dd53ceb551b187f67a5cd5b4f2f12f55f5ba35953a694c08ce9cf2",
     "vllm/bridge_tp/__init__.py": "3ffd9c3646257f2f954d336022cb2ee840a35e156a7b725a7ab9b0e6ce651f56",
@@ -396,7 +396,7 @@
     "vllm/bridge_tp/gpu_direct_targets.py": "e6ec01135656bfdf9c2f1fb8b646863557d850020061b9768dd146155ebdf683",
     "tests/bridge_tp/test_gpu_direct_targets.py": "fde9f51e4e718b0b68ffb8d98543a70f2b34dbf0ad85522893c561a75a20876e",
     "vllm/bridge_tp/source_channels.py": "48032fa1da17c1bddd68730f2d61dc94926ca657cfd30f175fa03bbe5a327c7f",
-    "tests/bridge_tp/test_source_channels.py": "bf4a87b85f4c94003e48733a6cfe3cc679165e07611a09fc7f6e81076a432262"
+    "tests/bridge_tp/test_source_channels.py": "e12371a1b75bd4c1f5275d4c2bd7838017b0c64a82431094285eddc18dac0142"
   },
   "server_settings": {
     "dtype": "bfloat16",
