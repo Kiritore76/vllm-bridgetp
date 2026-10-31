@@ -136,8 +136,16 @@ class HealthTracker:
             raise ValueError("invalid repeated reference cells")
         self.reference, self.origin, self.tokens = reference, origin, tokens
         self.samples = {pool: collections.deque() for pool in ("tp1", "tp4")}
+        # Reference side per pool: TP1 instances use "source" cells, TP-k "target".
+        self.labels = {"tp1": "source", "tp4": "target"}
         self.cache_closed_windows = cache_closed_windows
         self.closed_cache = {}
+
+    def add_pool(self, pool, label):
+        if label not in {"source", "target"}:
+            raise ValueError("unknown reference side")
+        self.samples.setdefault(pool, collections.deque())
+        self.labels[pool] = label
 
     def observe(self, raw, now):
         pool = raw["pool_id"]
@@ -228,7 +236,7 @@ class HealthTracker:
         measured = self.tokens.score(pool, left, right)
         value = efficiency(
             self.reference,
-            "source" if pool == "tp1" else "target",
+            self.labels[pool],
             nd,
             statistics.median(
                 r[2][1] for r in valid if int(r[2][1] // 2048) == context_bin

@@ -5,6 +5,7 @@ import contextlib
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -13,6 +14,10 @@ from pathlib import Path
 
 from . import pause_diagnostics as timing
 from .pressure_observation import InventoryReader
+
+# Same rule as vllm/bridge_tp/pressure_inventory.py: fixed-pair name or
+# layout instance id <bundle>-g<gen>-tp<k>.
+POOL_ID = re.compile(r"tp1|tp4|[A-Z]-g[0-9]+-tp[0-9]+")
 
 MAX_MESSAGE_BYTES = 262144
 SCHEMA = "PRESSURE_INVENTORY_IPC_V1"
@@ -176,7 +181,7 @@ class ProcessInventory:
     """
 
     def __init__(self, path, pool_id, run_dir, *, command=None):
-        if pool_id not in {"tp1", "tp4"}:
+        if not POOL_ID.fullmatch(pool_id):
             raise ValueError("invalid inventory pool")
         self.path, self.pool_id, self.run_dir = Path(path), pool_id, Path(run_dir)
         self.stop = threading.Event()

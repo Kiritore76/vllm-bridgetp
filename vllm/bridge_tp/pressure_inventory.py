@@ -5,8 +5,13 @@ from __future__ import annotations
 
 import atexit
 import os
+import re
 import time
 from pathlib import Path
+
+# Historical fixed-pair pool names, or a layout instance id <bundle>-g<gen>-tp<k>.
+# Same rule as controller/pressure_inventory_process.py (no shared import there).
+POOL_ID = re.compile(r"tp1|tp4|[A-Z]-g[0-9]+-tp[0-9]+")
 
 
 def inventory_snapshot(scheduler, pool_id: str, now: float) -> dict:
@@ -86,7 +91,7 @@ class InventoryPublisher:
     def __init__(self, path: Path, pool_id: str, interval_s: float):
         from vllm.bridge_tp.async_journal import AsyncJournal
 
-        if pool_id not in {"tp1", "tp4"} or interval_s <= 0:
+        if not POOL_ID.fullmatch(pool_id) or interval_s <= 0:
             raise ValueError("invalid pressure inventory configuration")
         self.pool_id, self.interval_s = pool_id, interval_s
         self.journal = AsyncJournal(path, capacity=64, batch_size=4)

@@ -176,6 +176,13 @@ class NativeServiceWindow:
         self._lock = threading.RLock()
         self.health_observer = health_observer
 
+    def add_pool(self, pool_id):
+        """Track one more serving instance (layouts beyond the fixed pair)."""
+        with self._lock:
+            self._intervals.setdefault(pool_id, deque())
+            self._counts.setdefault(pool_id, [0, 0])
+            self._arrivals.setdefault(pool_id, -math.inf)
+
     def arrive(self, request_id, pool_id, now):
         with self._lock:
             if request_id in self._active or pool_id not in self._intervals:

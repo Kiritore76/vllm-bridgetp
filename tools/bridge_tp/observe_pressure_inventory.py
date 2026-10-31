@@ -13,9 +13,11 @@ from tools.bridge_tp.pressure_cpu import load  # noqa: E402
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inventory", type=Path, required=True)
-    parser.add_argument("--pool", choices=("tp1", "tp4"), required=True)
+    parser.add_argument("--pool", required=True)
     parser.add_argument("--timing", type=Path, required=True)
     args = parser.parse_args()
+    if not load("pressure_inventory_process").POOL_ID.fullmatch(args.pool):
+        parser.error("pool must be tp1, tp4 or a layout instance id")
     return load("pressure_inventory_process").worker(
         args.inventory, args.pool, args.timing
     )

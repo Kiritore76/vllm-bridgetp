@@ -289,7 +289,11 @@ def batch(inventory, now, cfg, reading):
 
 
 def instance_manifest(args, controller):
-    """Fixed-pair manifest; sessions and inventory are single-target until S1-d."""
+    """Fixed migration pair (tp1/tp4 aliases) plus optional routing-only instances.
+
+    Only the aliased pair has a migration channel and session; other instances
+    serve routed requests and never migrate (multi-source channels: S1-d2).
+    """
     if args.instances is None:
         return None
     manifest = read(args.instances)
@@ -298,17 +302,40 @@ def instance_manifest(args, controller):
     if (
         manifest.get("schema") != "BRIDGETP_INSTANCE_MANIFEST_V1"
         or set(aliases) != {"tp1", "tp4"}
-        or set(aliases.values()) != set(rows)
+        or not set(aliases.values()) <= set(rows)
         or rows[aliases["tp1"]]["tp_degree"] != 1
         or rows[aliases["tp4"]]["tp_degree"] != controller.target_tp_size
         or rows[aliases["tp1"]]["context_limit"] != args.source_context_limit
         or rows[aliases["tp4"]]["context_limit"] != args.target_context_limit
     ):
-        raise ValueError("controller runs one TP1 source and one TP-k target only")
+        raise ValueError("controller needs one TP1 source and one TP-k target pair")
+    endpoints = [row["endpoint"] for row in rows.values()]
+    for row in extra_instances(manifest):
+        if (
+            not load("pressure_inventory_process").POOL_ID.fullmatch(row["instance_id"])
+            or row["tp_degree"] not in {1, controller.target_tp_size}
+            or row["context_limit"]
+            != (
+                args.source_context_limit
+                if row["tp_degree"] == 1
+                else args.target_context_limit
+            )
+            or not row.get("inventory_path")
+            or endpoints.count(row["endpoint"]) != 1
+        ):
+            raise ValueError("invalid routing-only instance " + row["instance_id"])
     return manifest
 
 
-def unknown_routing_pools(args, block_size):
+def extra_instances(manifest):
+    """Routing-only instances: every manifest row outside the migration pair."""
+    if manifest is None:
+        return []
+    paired = set(manifest["legacy_pool_aliases"].values())
+    return [r for r in manifest["instances"] if r["instance_id"] not in paired]
+
+
+def unknown_routing_pools(args, block_size, extras=()):
     """Use configured context contracts while pressure telemetry is absent."""
     return tuple(
         p.PoolReading(
@@ -329,6 +356,7 @@ def unknown_routing_pools(args, block_size):
         for name, limit in (
             ("tp1", args.source_context_limit),
             ("tp4", args.target_context_limit),
+            *((row["instance_id"], row["context_limit"]) for row in extras),
         )
     )
 
@@ -456,6 +484,17 @@ def _run(args, prepared):
     # Fixed pair through the multi-instance entry points; identical behaviour
     # and records for one instance per TP class.
     tp_of = {"tp1": 1, "tp4": getattr(controller, "target_tp_size", 4)}
+    extras = extra_instances(receipt.get("instance_manifest"))
+    tp_of.update({row["instance_id"]: row["tp_degree"] for row in extras})
+    # Workload/health references exist per TP class, not per instance.
+    profile_key = {pool: ("tp1" if tp == 1 else "tp4") for pool, tp in tp_of.items()}
+    context_of = {
+        "tp1": args.source_context_limit,
+        "tp4": args.target_context_limit,
+        **{row["instance_id"]: row["context_limit"] for row in extras},
+    }
+    for row in extras:
+        service.add_pool(row["instance_id"])
     ingress = i.PressureIngress(
         co,
         service,
@@ -465,6 +504,7 @@ def _run(args, prepared):
         reconcile_log_interval_s=1.0 if cfg.health_service else 0,
         tp_of=tp_of,
     )
+    ingress.urls.update({row["instance_id"]: row["endpoint"] for row in extras})
     session = PressureSessions(
         persistent_cleanup=cfg.shadow_cancel,
         maximum_migrations=args.maximum_migrations,
@@ -486,6 +526,15 @@ def _run(args, prepared):
         for url, total in (
             (controller.source_url, controller.tp1_total_kv_blocks),
             (controller.target_url, controller.tp4_total_kv_blocks),
+            *(
+                (
+                    row["endpoint"],
+                    controller.tp1_total_kv_blocks
+                    if row["tp_degree"] == 1
+                    else controller.tp4_total_kv_blocks,
+                )
+                for row in extras
+            ),
         )
     )
     predictor = load("manager_m5").PredictorEventReader(
@@ -494,7 +543,7 @@ def _run(args, prepared):
         align_history=getattr(args, "platform", "a100") == "qwen3",
     )
     dispatched, previous = {}, {}
-    growth_readers = {pool: health.NativeDecodeGrowth() for pool in ("tp1", "tp4")}
+    growth_readers = {pool: health.NativeDecodeGrowth() for pool in tp_of}
     started = time.monotonic()
     origin_unix_s = time.time()
     health_tracker = (
@@ -507,6 +556,11 @@ def _run(args, prepared):
         if cfg.health_service
         else None
     )
+    if health_tracker is not None:
+        for row in extras:
+            health_tracker.add_pool(
+                row["instance_id"], "source" if row["tp_degree"] == 1 else "target"
+            )
     workload_module = load("pressure_workload") if cfg.workload_pressure else None
     workload_profiles = (
         workload_module.build_profiles(
@@ -543,6 +597,7 @@ def _run(args, prepared):
         for path, pool_id in (
             (args.source_inventory, "tp1"),
             (args.target_inventory, "tp4"),
+            *((Path(row["inventory_path"]), row["instance_id"]) for row in extras),
         ):
             background_inventory.append(
                 load("pressure_inventory_process").ProcessInventory(
@@ -570,7 +625,7 @@ def _run(args, prepared):
         dispatcher = load("pressure_dispatch").ScheduledDispatch(
             jobs,
             submit_arrival,
-            unknown_routing_pools(args, controller.block_size),
+            unknown_routing_pools(args, controller.block_size, extras),
             started,
             args.max_seconds,
         )
@@ -604,7 +659,9 @@ def _run(args, prepared):
                         "inventory evidence invalid: " + json.dumps(diagnostic)
                     )
             if any(v is None for v in inventories):
-                dispatcher.publish(unknown_routing_pools(args, controller.block_size))
+                dispatcher.publish(
+                    unknown_routing_pools(args, controller.block_size, extras)
+                )
                 save_progress(
                     progress_path,
                     stage="waiting_inventory",
@@ -640,12 +697,7 @@ def _run(args, prepared):
                     raise ValueError(
                         "live KV block geometry differs from pilot contract"
                     )
-                expected_context = (
-                    args.source_context_limit
-                    if raw["pool_id"] == "tp1"
-                    else args.target_context_limit
-                )
-                if raw["context_limit"] != expected_context:
+                if raw["context_limit"] != context_of[raw["pool_id"]]:
                     raise ValueError("live context limit differs from serving contract")
                 try:
                     if cfg.health_service:
@@ -713,7 +765,7 @@ def _run(args, prepared):
                     pool = replace(
                         pool,
                         workload=workload_module.observe(
-                            workload_profiles[raw["pool_id"]],
+                            workload_profiles[profile_key[raw["pool_id"]]],
                             raw | {"sampled_at": pool.sampled_at},
                             now,
                         ),
@@ -768,14 +820,14 @@ def _run(args, prepared):
                         )
                         if all(
                             workload_module.valid(pool, co.policy.cfg, now)
-                            for pool in pools
+                            for pool in pools[:2]
                         )
                         else (None, None)
                     )
                 else:
                     relief, cost = (
                         lookup.deltas(shapes[0], shapes[1], row["request_id"])
-                        if all(shapes)
+                        if all(shapes[:2])
                         else (None, None)
                     )
                 release_budget = lookup.release_budget

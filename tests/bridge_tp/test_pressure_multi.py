@@ -541,3 +541,26 @@ class InstanceLifecycleTests(unittest.TestCase):
         result, calls = self.started(co, readings, cands, "x", "s", now=14)
         self.assertIsNone(result)
         self.assertEqual(calls, [])
+
+
+class PoolIdRuleTests(unittest.TestCase):
+    def test_engine_and_controller_accept_the_same_pool_ids(self):
+        import re
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[2]
+        rule = re.compile(r'POOL_ID = re\.compile\((r".*?")\)')
+        texts = [
+            (root / name).read_text(encoding="utf-8")
+            for name in (
+                "vllm/bridge_tp/pressure_inventory.py",
+                "vllm/bridge_tp/controller/pressure_inventory_process.py",
+            )
+        ]
+        engine, controller = (rule.search(t).group(1) for t in texts)
+        self.assertEqual(engine, controller)
+        pattern = load("pressure_inventory_process").POOL_ID
+        for good in ("tp1", "tp4", "A-g3-tp1", "B-g12-tp2"):
+            self.assertTrue(pattern.fullmatch(good), good)
+        for bad in ("tp2", "a-g1-tp1", "A-g-tp1", "A-g1-tp1;x", ""):
+            self.assertFalse(pattern.fullmatch(bad), bad)
