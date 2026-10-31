@@ -50,7 +50,15 @@ class Reader:
 class Harness:
     """L1A on A={2,3}, B={0,1}: TP1@2 (pair source), TP1@3, TP2(0,1) target."""
 
-    def __init__(self, root, bundle, target_mode, channel_plan=False, slow=()):
+    def __init__(
+        self,
+        root,
+        bundle,
+        target_mode,
+        channel_plan=False,
+        slow=(),
+        acknowledge=True,
+    ):
         self.root, self.slow = root, set(slow)
         self.calls, self.events, self.stopped = [], [], set()
         self.lock = threading.Lock()
@@ -92,6 +100,22 @@ class Harness:
                     ]
                 )
             )
+            if acknowledge:
+                # Each target rank receipts its first accepted plan file load.
+                directory = root / "session-1" / "gpu_channel_plan_receipts"
+                directory.mkdir(parents=True)
+                for rank in (0, 1):
+                    (directory / f"tp_rank_{rank}.json").write_text(
+                        json.dumps(
+                            dict(
+                                opened=[],
+                                closed=[],
+                                deferred=[],
+                                planned=[1, 3],
+                                completed_unix_s=time.time() - 60,
+                            )
+                        )
+                    )
         ops = NS(
             stop=lambda ids: self.stopped.update(ids),
             alive=lambda instance_id: instance_id not in self.stopped,
@@ -458,6 +482,45 @@ class ConversionTests(unittest.TestCase):
                 request,
                 edge,
             )
+
+    def test_nothing_is_quiesced_until_every_target_rank_follows_the_plan(self):
+        """S3b-3 GPU (10-31): a target that rejected the plan file stalled the
+        conversion after both sources were already retired."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            harness = Harness(root, "A", "TP2", channel_plan=True, acknowledge=False)
+            plan = dict(
+                plan_id="p",
+                refs=[
+                    dict(instance_id="A-g1-tp1", instance_generation=1),
+                    dict(instance_id="A-g3-tp1", instance_generation=3),
+                ],
+            )
+            backend = harness.backend
+            self.assertFalse(backend.precheck(plan))
+            self.assertFalse(backend.precheck(plan))
+            reported = [
+                e
+                for e in harness.events
+                if e["kind"] == "CHANNEL_PLAN_NOT_ACKNOWLEDGED"
+            ]
+            self.assertEqual(len(reported), 1)
+            self.assertFalse((root / "layout_control.json").exists())
+            directory = root / "s" / "gpu_channel_plan_receipts"
+            directory.mkdir(parents=True)
+            receipt = dict(opened=[], closed=[], deferred=[], completed_unix_s=1)
+            (directory / "tp_rank_0.json").write_text(
+                json.dumps(dict(receipt, planned=[1, 3]))
+            )
+            # A receipt without the plan's generations does not count.
+            (directory / "tp_rank_1.json").write_text(
+                json.dumps(dict(receipt, planned=[1]))
+            )
+            self.assertFalse(backend.precheck(plan))
+            (directory / "tp_rank_1.json").write_text(
+                json.dumps(dict(receipt, planned=[1, 3]))
+            )
+            self.assertTrue(backend.precheck(plan))
 
     def test_channel_retirement_waits_for_every_target_rank(self):
         with tempfile.TemporaryDirectory() as directory:

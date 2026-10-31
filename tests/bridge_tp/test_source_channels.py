@@ -171,6 +171,76 @@ class ConnectorWiringTests(unittest.TestCase):
         )
         return ns[name]
 
+    def module_function(self, name):
+        """A module-level helper of the real connector file."""
+        import ast
+        import json
+
+        tree = ast.parse(self.PATH.read_text(encoding="utf-8"))
+        fn = next(
+            n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name
+        )
+        fn.returns = None
+        for arg in fn.args.args:
+            arg.annotation = None
+        ns = dict(json=json)
+        exec(
+            compile(ast.Module(body=[fn], type_ignores=[]), str(self.PATH), "exec"),
+            ns,
+        )
+        return ns[name]
+
+    def test_plan_file_is_read_as_a_list_and_receipted_on_first_load(self):
+        """S3b-3 GPU (10-31): the target read the plan with the JSON-object
+        loader, rejected it, and never closed a retired source's channel."""
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from vllm.bridge_tp import source_channels
+        from vllm.bridge_tp.channel_runtime import ManifestPollCache
+
+        reconcile = self.method("_reconcile_source_channels")
+        receipts = []
+        reconcile.__globals__.update(
+            parse_plan=source_channels.parse_plan,
+            _load_json_list=self.module_function("_load_json_list"),
+            _atomic_json_dump=lambda value, path: receipts.append((path.name, value)),
+            get_tp_group=lambda: NS(rank_in_group=1),
+            time=__import__("time"),
+        )
+        log = []
+        channels = SourceChannelSet(lambda c: Receiver(c, log), lambda r, c: r.open())
+        channels.reconcile(parse_plan([A, A3], 2))
+        with tempfile.TemporaryDirectory() as folder:
+            plan_path = Path(folder) / "plan.json"
+            plan_path.write_text(json.dumps([A, A3]))
+            connector = NS(
+                _source_channels=channels,
+                _source_plan_path=plan_path,
+                _channel_plan_cache=ManifestPollCache(),
+                _channel_plan_acknowledged=False,
+                _target_tp_size=2,
+                manifest_path=Path(folder) / "session" / "manifest.json",
+            )
+            reconcile(connector)
+            self.assertEqual(len(receipts), 1)
+            name, value = receipts[0]
+            self.assertEqual(name, "tp_rank_1.json")
+            self.assertEqual(value["planned"], [1, 3])
+            self.assertEqual(value["closed"], [])
+            reconcile(connector)
+            self.assertEqual(len(receipts), 1)  # unchanged plan: no new receipt
+            plan_path.write_text(json.dumps([A3]))
+            reconcile(connector)
+            self.assertEqual(receipts[-1][1]["closed"], [1])
+            self.assertEqual(receipts[-1][1]["planned"], [3])
+            self.assertEqual(set(channels.channels), {3})
+            plan_path.write_text(json.dumps(dict(sources=[A3])))
+            connector._channel_plan_cache = ManifestPollCache()
+            with self.assertRaises(TypeError):
+                reconcile(connector)
+
     def test_activate_points_every_single_receiver_path_at_the_source(self):
         import threading
 
@@ -208,7 +278,7 @@ class ConnectorWiringTests(unittest.TestCase):
         check = self.method("_check_source_generation")
         check.__globals__.update(
             parse_plan=source_channels.parse_plan,
-            _load_json=lambda p: json.loads(p.read_text(encoding="utf-8")),
+            _load_json_list=self.module_function("_load_json_list"),
         )
         with tempfile.TemporaryDirectory() as folder:
             plan_path = __import__("pathlib").Path(folder) / "plan.json"

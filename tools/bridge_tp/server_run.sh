@@ -4,6 +4,8 @@
 #   cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 #
 # 当前任务：S3b-3 带fast控制器的运行中转换（GPU功能验收，两条边各1场）。
+# 第2次：第1次（195116_9379）目标端把通道计划文件当JSON对象读取而拒绝，
+# 退役源的通道无法关闭，停在FENCED；已修复，并要求目标各rank先确认计划文件才触发。
 # 布局与G2相同：L1A，A={2,3}，B={0,1}；TP1@2（迁移源，通道1）、TP1@3（通道3）、
 # TP2@0,1；双32768/.88；深长突发配方MIGRATE臂（短请求每2s一条，90s起6条长请求）。
 # 控制器启动30s后显式触发DRAIN转换（长请求到来之前）：

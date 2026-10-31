@@ -91,6 +91,7 @@ class ControllerConversionBackend:
         self.started = {}
         self.warm = {}
         self.channel_closing = None
+        self.reported_unacknowledged = False
         self.lock = threading.Lock()
         # Engines are serving when the controller starts: the manifest's
         # PREPARING records become ACTIVE before the first plan.
@@ -133,9 +134,30 @@ class ControllerConversionBackend:
 
     # ------------------------------------------------------ executor steps
     def precheck(self, plan):
-        return all(
+        if not all(
             self.registry.get(ref).lifecycle == "ACTIVE" for ref in self.refs(plan)
-        )
+        ):
+            return False
+        if self.channel_plan is not None:
+            # Every target rank must follow the plan file before anything is
+            # quiesced; otherwise a retired source's channel could never close
+            # (S3b-3 GPU, 10-31: the connector had rejected the file).
+            planned = {r["generation"] for r in read_json(self.channel_plan) or []}
+            acknowledged = {
+                name
+                for name, receipt in channel_receipts(self.run_dir)
+                if "planned" in receipt and planned <= set(receipt["planned"])
+            }
+            if len(acknowledged) < self.target_tp_ranks:
+                if not self.reported_unacknowledged:
+                    self.reported_unacknowledged = True
+                    self.ops.event(
+                        "CHANNEL_PLAN_NOT_ACKNOWLEDGED",
+                        plan_id=plan["plan_id"],
+                        ranks=sorted(acknowledged),
+                    )
+                return False
+        return True
 
     def quiesce(self, plan):
         self.write_layout({r.instance_id: "QUIESCING" for r in self.refs(plan)})

@@ -260,6 +260,15 @@ def _load_json(path: Path) -> dict[str, Any]:
     return value
 
 
+def _load_json_list(path: Path) -> list[Any]:
+    """The per-source channel plan file is a JSON list of channel rows."""
+    with path.open(encoding="utf-8") as file:
+        value = json.load(file)
+    if not isinstance(value, list):
+        raise TypeError(f"Expected a JSON list: {path}")
+    return value
+
+
 class BridgeTPStreamingConnector(KVConnectorBase_V1):
     """Receive a live TP1 snapshot into scheduler-owned TP4 blocks."""
 
@@ -471,6 +480,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             raise ValueError("per-source channels need persistent preconnect")
         self._source_channels: SourceChannelSet | None = None
         self._channel_plan_cache = ManifestPollCache()
+        self._channel_plan_acknowledged = False
         if self.persistent_channel and self.post_takeover_communicator_destroy:
             raise ValueError(
                 "persistent channel cannot use post-takeover destruction"
@@ -1330,7 +1340,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             planned |= {
                 c.generation
                 for c in parse_plan(
-                    _load_json(self._source_plan_path), self._target_tp_size
+                    _load_json_list(self._source_plan_path), self._target_tp_size
                 )
             }
         if generation not in planned:
@@ -1396,17 +1406,28 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             or not self._source_plan_path.is_file()
         ):
             return
-        rows = self._channel_plan_cache.load(self._source_plan_path, _load_json)
-        result = self._source_channels.reconcile(
-            parse_plan(rows, self._target_tp_size)
-        )
-        if result["opened"] or result["closed"] or result["deferred"]:
+        rows = self._channel_plan_cache.load(self._source_plan_path, _load_json_list)
+        plan = parse_plan(rows, self._target_tp_size)
+        result = self._source_channels.reconcile(plan)
+        # The first accepted load is receipted too: a conversion only starts
+        # once every target rank follows the plan file (S3b-3 GPU, 10-31).
+        if (
+            result["opened"]
+            or result["closed"]
+            or result["deferred"]
+            or not self._channel_plan_acknowledged
+        ):
             _atomic_json_dump(
-                dict(result, completed_unix_s=time.time()),
+                dict(
+                    result,
+                    planned=sorted(c.generation for c in plan),
+                    completed_unix_s=time.time(),
+                ),
                 self.manifest_path.parent
                 / "gpu_channel_plan_receipts"
                 / f"tp_rank_{get_tp_group().rank_in_group}.json",
             )
+            self._channel_plan_acknowledged = True
 
     def _start_gpu_direct_receiver_prebind(self) -> None:
         """Bind the GPU-direct listener before dynamic cutover is known.
