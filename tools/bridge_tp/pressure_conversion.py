@@ -377,8 +377,9 @@ class ControllerConversionBackend:
         refs = [r.instance_id for r in self.refs(plan)]
         if any(instances[i]["sessions"] for i in refs) or instances[target]["sessions"]:
             return "a migration session is active", None
-        # S4: two received migrations cost ~1.3 GB on the 24 GB TP2 (about
-        # 1 GB left), so the total of assist starts per conversion is capped.
+        # S4: the first received migration grew the 24 GB TP2 by ~1.2 GB once
+        # (later ones did not), leaving ~1 GB; assists per conversion stay
+        # capped until runs with more migrations confirm the headroom.
         if len(self.assisted) >= self.safety["assist_max_starts"]:
             return "assist starts at cap for this conversion", None
         pressure = instances[target].get("pressure") or {}
