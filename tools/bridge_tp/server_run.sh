@@ -3,26 +3,21 @@
 # 运行：
 #   cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 #
-# 当前任务：S3b-3 带fast控制器的运行中转换（GPU功能验收，两条边各1场）。
-# 第3次：第1次（195116_9379）目标端拒读通道计划文件；第2次（200740_31723）
-# 计划文件已被接受，但关闭通道时没有回执（推测同步销毁通信器阻塞），停在FENCED。
-# 现在退役通道先移出可选集合，再在后台线程用ncclCommAbort拆除并单独写回执；
-# 60s内目标没关闭就直接失败（引擎都还没停）。
-# 布局与G2相同：L1A，A={2,3}，B={0,1}；TP1@2（迁移源，通道1）、TP1@3（通道3）、
-# TP2@0,1；双32768/.88；深长突发配方MIGRATE臂（短请求每2s一条，90s起6条长请求）。
-# 控制器启动30s后显式触发DRAIN转换（长请求到来之前）：
-#   L1A-L2：A的两个TP1停止接入→排空→在目标TP2两个rank上关闭通道1、3→停引擎→
-#           起TP2@2,3→warmup→发布路由（之后迁移停用，两TP2只路由）。
-#   L1A-L0：B的TP2停止接入→排空→停引擎→起TP1@0、TP1@1→发布路由（之后迁移停用）。
-# 每场约8-10分钟，总计约20分钟。全程每秒采样一次GPU显存与利用率。
-# 一条边技术失败（退出码不是0或2）就停，已完成部分照常打包。
+# 当前任务：S4 SHADOW规划器GPU检查（1场，约10-12分钟）。
+# 布局与负载同G2/S3b-3：L1A，A={2,3}，B={0,1}；TP1@2（迁移源，通道1）、TP1@3（通道3）、
+# TP2@0,1；双32768/.88；深长突发MIGRATE臂（短请求每2s一条，90-100s到达6条16384/8192长请求）。
+# 与S3b-3不同：控制器启动后110s才触发L1A-L2（A的两个TP1合并成TP2@2,3），此时A上
+# 正有长请求在跑。DRAIN等它们自然结束（fast策略原有的迁移照常可以把请求迁出到TP2），
+# 排空期间SHADOW规划器每秒给出“迁哪些能缩短排空”的建议，只记录不执行。
+# 控制器会一直服务到转换结束才退出（负载跑完也等）。
+# 全程每秒采样一次GPU显存与利用率。
 
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
 py=$venv/bin/python
 model=/root/autodl-tmp/models/Qwen3-8B
 branch=bridgetp/tp2-4090d-qwen3-8b
-task=qwen3_conversion_live
+task=qwen3_conversion_shadow
 
 cd "$repo" || exit 1
 source "$venv/bin/activate" || exit 1
@@ -58,34 +53,26 @@ trap 'kill "$smi" 2>/dev/null' EXIT
 export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 export VLLM_USE_V2_MODEL_RUNNER=0 OMP_NUM_THREADS=1
 
-status=0
-for edge in L1A-L2 L1A-L0; do
-    [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || {
-        echo "上一场后GPU仍有计算进程，停止于 $edge 之前。"; status=1; break;
-    }
-    echo "=== 开始运行中转换：$edge（$(date +%T)）==="
-    date +%s.%N > "$run/$edge.started_unix_s"
-    "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
-        --long-burst-memory-verify --layout-l1a-channels --conversion "$edge" \
-        --current-machine --repetitions 1 \
-        --model "$model" \
-        --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
-        --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json" \
-        --output "$run/$edge" --expected-revision "$head" 2>&1 | tee "$run/$edge.console.log"
-    status=${PIPESTATUS[0]}
-    echo "$edge 退出码：$status" | tee -a "$run/exit_codes.txt"
-    [ "$status" = 0 ] || [ "$status" = 2 ] || break
-done
+edge=L1A-L2
+echo "=== 开始：长请求在跑时触发 $edge（110s），SHADOW规划器（$(date +%T)）==="
+date +%s.%N > "$run/$edge.started_unix_s"
+"$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
+    --long-burst-memory-verify --layout-l1a-channels --conversion "$edge" \
+    --conversion-trigger-s 110 \
+    --current-machine --repetitions 1 \
+    --model "$model" \
+    --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
+    --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json" \
+    --output "$run/$edge" --expected-revision "$head" 2>&1 | tee "$run/$edge.console.log"
+status=${PIPESTATUS[0]}
+echo "$edge 退出码：$status" | tee "$run/exit_codes.txt"
 
 kill "$smi" 2>/dev/null
-# 每场的运行包已是compact包；外层只收它们和日志，不重复原始目录。
+# 运行包已是compact包；外层只收它和日志，不重复原始目录。
 tar -C "$(dirname "$run")" -czf "$run.tar.gz" \
-    --exclude="$(basename "$run")/L1A-L2" \
-    --exclude="$(basename "$run")/L1A-L0" \
+    --exclude="$(basename "$run")/$edge" \
     "$(basename "$run")"
 sha256sum "$run.tar.gz" > "$run.tar.gz.sha256"
-echo '=== 退出码 ==='
-cat "$run/exit_codes.txt"
 echo "最终退出码：$status"
 echo "请拿回：$run.tar.gz"
 echo "以及：$run.tar.gz.sha256"

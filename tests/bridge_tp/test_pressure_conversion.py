@@ -59,6 +59,7 @@ class Harness:
         channel_plan=False,
         slow=(),
         acknowledge=True,
+        trigger_s=0.3,
     ):
         self.root, self.slow = root, set(slow)
         self.calls, self.events, self.stopped = [], [], set()
@@ -149,7 +150,7 @@ class Harness:
             dict(
                 bundle=bundle,
                 target_mode=target_mode,
-                trigger_s=0.3,
+                trigger_s=trigger_s,
                 deadline_s=20,
                 base_port=8400,
             ),
@@ -199,7 +200,7 @@ class Harness:
             raise RuntimeError("request routed to a stopped engine")
         sink(0, 42, time.time())
         # In flight across the quiesce: the drain must wait for these.
-        time.sleep(0.8 if url in self.slow else 0.25)
+        time.sleep(1.5 if url in self.slow else 0.25)
         completed = time.time()
         with self.lock:
             self.publish(url, after=completed)
@@ -434,6 +435,28 @@ class ConversionTests(unittest.TestCase):
                 ),
                 ["source"],
             )
+
+    def test_controller_keeps_serving_until_a_late_conversion_ends(self):
+        """S4 GPU prep: the drain can outlast the workload; the controller
+        must stay up (routing, inventory) until the plan is terminal."""
+        with tempfile.TemporaryDirectory() as directory:
+            harness = Harness(Path(directory), "B", "TP1", trigger_s=2.0)
+            outcome = harness.run(jobs(8, 0.3))  # last arrival at 2.1s
+            self.assertEqual(outcome["state"], "COMPLETED", outcome)
+            root = harness.root
+            progress = json.loads((root / "pressure_progress.json").read_text())
+            self.assertEqual(progress["stage"], "COMPLETED")
+            audit = [
+                json.loads(line)
+                for line in (root / "pressure_audit.jsonl").read_text().splitlines()
+            ]
+            final = next(r for r in audit if r["kind"] == "pressure_final")
+            published = next(
+                e for e in harness.events if e["kind"] == "ROUTE_PUBLISHED"
+            )
+            self.assertGreater(final["unix_s"], published["unix_s"])
+            control = json.loads((root / "layout_control.json").read_text())
+            self.assertFalse(control["conversion_pending"])
 
     def test_merge_closes_retired_sources_channels_first(self):
         """L1A -> L2: bundle A TP1@2 + TP1@3 -> TP2(2,3); their channels close."""

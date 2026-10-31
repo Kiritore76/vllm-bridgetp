@@ -57,9 +57,22 @@ def assess(scene_dir, run_dir=None, events_path=None, metrics_path=None):
         for r in audit
         if r["kind"] == "pressure_layout_applied" and r["changes"]
     }
-    quiesce = applied.get(1)
+
+    def revision(state):
+        """First layout revision that moved instances to ``state``."""
+        return next(
+            (rev for rev, e in sorted(sent.items()) if state in e["changes"].values()),
+            None,
+        )
+
+    quiesce_revision, retire_revision = revision("QUIESCING"), revision("RETIRED")
+    quiesce = applied.get(quiesce_revision)
     published = at("ROUTE_PUBLISHED")
-    retired = list(sent[1]["changes"]) if 1 in sent else []
+    retired = (
+        [i for i, v in sent[quiesce_revision]["changes"].items() if v == "QUIESCING"]
+        if quiesce_revision is not None
+        else []
+    )
     new = kinds["ROUTE_PUBLISHED"][0]["instances"] if published else []
     pool_of = {
         r.get("legacy_pool") or r["instance_id"]: r["instance_id"]
@@ -78,7 +91,7 @@ def assess(scene_dir, run_dir=None, events_path=None, metrics_path=None):
     phases = dict(
         trigger_to_quiesce_applied=span(trigger, quiesce),
         drain=span(quiesce, at("FENCED")),
-        fenced_to_controller_retired=span(at("FENCED"), applied.get(2)),
+        fenced_to_controller_retired=span(at("FENCED"), applied.get(retire_revision)),
         channel_retire=span(at("CHANNEL_PLAN_WRITTEN"), at("CHANNEL_RETIRE")),
         stop_to_released=span(at("CHANNEL_RETIRE"), at("RESOURCES_RELEASED")),
         rebuild={i: span(load[i], verified.get(i)) for i in load},

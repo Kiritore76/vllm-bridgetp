@@ -229,12 +229,21 @@ def main(argv=None):
         choices=sorted(CONVERSIONS),
         help="S3b-3: explicit DRAIN conversion of one L1A bundle while serving",
     )
+    parser.add_argument(
+        "--conversion-trigger-s",
+        type=float,
+        default=30,
+        help="seconds after the controller starts; S4 GPU check: while the "
+        "90-100s long requests run on the converted bundle",
+    )
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
     if args.layout_l1a_channels and not args.long_burst_memory_verify:
         parser.error("layout-l1a-channels runs with long-burst-memory-verify only")
     if args.conversion and not args.layout_l1a_channels:
         parser.error("conversion runs on the L1A channel layout only")
+    if not 0 <= args.conversion_trigger_s < 300:
+        parser.error("conversion trigger must fall inside the 300s workload")
     if args.long_burst_memory_verify and args.long_burst_deep_stay:
         parser.error("deep STAY supplement and memory verification are separate runs")
     if args.long_burst_memory_verify or args.long_burst_deep_stay:
@@ -551,8 +560,9 @@ def main(argv=None):
         if args.conversion:
             spec["conversion"] = dict(
                 CONVERSIONS[args.conversion],
-                trigger_s=30,
-                deadline_s=420,
+                trigger_s=args.conversion_trigger_s,
+                # A drain behind 8192-token outputs can take minutes.
+                deadline_s=600,
                 base_port=8400,
             )
         spec.update(

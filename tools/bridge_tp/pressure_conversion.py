@@ -36,7 +36,14 @@ def atomic_json(path, value):
     path = Path(path)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
+    for attempt in range(50):
+        try:
+            os.replace(temporary, path)
+            return
+        except PermissionError:  # Windows: a reader holds the file right now
+            if attempt == 49:
+                raise
+            time.sleep(0.01)
 
 
 def read_json(path):
@@ -120,8 +127,12 @@ class ControllerConversionBackend:
     def refs(self, plan):
         return [pool.InstanceRef(**r) for r in plan["refs"]]
 
-    def write_layout(self, changes):
-        """Publish lifecycle changes; rows accumulate across revisions."""
+    def write_layout(self, changes, *, pending=True):
+        """Publish lifecycle changes; rows accumulate across revisions.
+
+        ``conversion_pending`` keeps the controller serving after its workload
+        is done, until the driver publishes the plan's terminal state.
+        """
         for instance_id, lifecycle in changes.items():
             row = self.rows[instance_id]
             self.layout[instance_id] = dict(
@@ -135,7 +146,11 @@ class ControllerConversionBackend:
         self.revision += 1
         atomic_json(
             self.run_dir / "layout_control.json",
-            dict(revision=self.revision, instances=list(self.layout.values())),
+            dict(
+                revision=self.revision,
+                instances=list(self.layout.values()),
+                conversion_pending=pending,
+            ),
         )
         self.ops.event("LAYOUT_CONTROL", revision=self.revision, changes=changes)
         return self.revision
@@ -527,6 +542,8 @@ class ConversionDriver:
 
     def start(self):
         self.origin = time.monotonic()
+        # The controller must not finish before this plan reaches its end.
+        self.backend.write_layout({})
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
@@ -561,6 +578,9 @@ class ConversionDriver:
         except Exception as error:
             self.error = repr(error)
             self.backend.ops.event("DRIVER_ERROR", error=self.error)
+        finally:
+            # Terminal, failed or stopped: release the controller.
+            self.backend.write_layout({}, pending=False)
 
     def stop(self, timeout_s=30):
         self.stop_event.set()

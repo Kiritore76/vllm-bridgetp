@@ -722,7 +722,11 @@ def _run(args, prepared):
                 owner.remove(sampler)
 
     layout_state = dict(
-        signature=None, revision=None, status_at=-math.inf, candidates={}
+        signature=None,
+        revision=None,
+        status_at=-math.inf,
+        candidates={},
+        pending=False,
     )
     instance_of = dict(manifest["legacy_pool_aliases"]) if manifest else {}
 
@@ -832,6 +836,7 @@ def _run(args, prepared):
         except json.JSONDecodeError:
             # A writer without atomic replace; retry on the next tick.
             return
+        layout_state["pending"] = bool(control.get("conversion_pending"))
         changes, deferred = [], []
         for row in control["instances"]:
             pool_id = alias_of.get(row["instance_id"], row["instance_id"])
@@ -1540,6 +1545,8 @@ def _run(args, prepared):
             if (
                 len(dispatched) == len(jobs)
                 and all(v.future.done() for v in dispatched.values())
+                # A live conversion keeps the controller serving until it ends.
+                and not layout_state["pending"]
                 and not any(
                     row.state in {"ACTIVE", "COMMITTED", "ACCOUNTED"}
                     and not (
