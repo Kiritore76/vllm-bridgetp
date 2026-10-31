@@ -27,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from tools.bridge_tp import run_pressure_balanced_pilot as controller  # noqa: E402
+from tools.bridge_tp.pressure_cpu import load  # noqa: E402
 from tools.bridge_tp.pressure_progress import save_progress  # noqa: E402
 
 
@@ -132,6 +133,10 @@ def verify_spec(spec):
         raise ValueError("first pilot requires exactly four function scenarios")
 
 
+def devices_of(args):
+    return args.tp4_gpus.split(",")
+
+
 def arguments(spec):
     # Existing transport helper is imported only in the actual server environment.
     from tools.bridge_tp import run_phase9_cap0_calibration as common
@@ -142,7 +147,7 @@ def arguments(spec):
     target_tp = getattr(args, "target_tp_size", 4)
     if target_tp not in (2, 4):
         raise ValueError("target TP must be 2 or 4")
-    devices = args.tp4_gpus.split(",")
+    devices = devices_of(args)
     if (
         len(devices) != target_tp
         or len(set(devices)) != target_tp
@@ -307,8 +312,22 @@ def build_scene(spec, scene, run_root, common, args):
         argv.extend(["--health-reference", spec["health_reference"]])
     if multiple:
         argv.extend(["--maximum-migrations", str(spec["maximum_migrations"])])
+    # Instance identities for the fixed pair; the controller still runs on the
+    # historical tp1/tp4 pool ids, recorded here as aliases.
+    instance_pool = load("instance_pool")
+    registry, aliases = instance_pool.fixed_pair_registry(
+        source_gpu=args.tp1_gpu,
+        target_gpus=devices_of(args),
+        source_url=config["source_url"],
+        target_url=config["target_url"],
+        identity=str(args.model_path),
+        source_context_limit=args.max_model_len,
+        target_context_limit=args.tp4_max_model_len,
+    )
     return dict(
         run_dir=run_dir,
+        instances=instance_pool.registry_manifest(registry, aliases),
+        instances_path=run_root / scene["name"] / "instances.json",
         config=config,
         config_path=config_path,
         source_env=source,
@@ -507,6 +526,8 @@ def run_scene(
 
         mechanism_dir = initialize(plan["run_dir"])
     common.write_json(plan["config_path"], plan["config"])
+    if "instances" in plan:
+        common.write_json(plan["instances_path"], plan["instances"])
     if plan["config"].get("transfer_mode") == "FULL_SPEED":
         announce(scene["name"], "迁移全速：历史pacing关闭，M2动态限速关闭")
     RuntimeControl(

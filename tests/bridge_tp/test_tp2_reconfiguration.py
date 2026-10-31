@@ -54,6 +54,88 @@ class GeometryTests(unittest.TestCase):
                 self.assertEqual(len(gpus), len(set(gpus)))
                 self.assertEqual(len(gpus), 2 * k)
 
+    def test_two_bundle_layouts_keep_historical_names_and_order(self):
+        layouts = pool.layouts(2, ["2", "3", "0", "1"])
+
+        def shape(label):
+            return [
+                (r["bundle_id"], r["tp_degree"], r["gpu_ids"]) for r in layouts[label]
+            ]
+
+        self.assertEqual(
+            shape("L0"),
+            [("A", 1, ["2"]), ("A", 1, ["3"]), ("B", 1, ["0"]), ("B", 1, ["1"])],
+        )
+        self.assertEqual(
+            shape("L1A"), [("A", 1, ["2"]), ("A", 1, ["3"]), ("B", 2, ["0", "1"])]
+        )
+        self.assertEqual(
+            shape("L1B"), [("A", 2, ["2", "3"]), ("B", 1, ["0"]), ("B", 1, ["1"])]
+        )
+        self.assertEqual(shape("L2"), [("A", 2, ["2", "3"]), ("B", 2, ["0", "1"])])
+
+    def test_any_bundle_count_enumerates_every_assignment(self):
+        layouts = pool.layouts(2, [str(i) for i in range(6)])
+        self.assertEqual(len(layouts), 8)
+        self.assertEqual(
+            set(layouts),
+            {"L0", "L1AB", "L1AC", "L1BC", "L2A", "L2B", "L2C", "L3"},
+        )
+        self.assertEqual(
+            [(r["bundle_id"], r["tp_degree"]) for r in layouts["L2B"]],
+            [("A", 2), ("B", 1), ("B", 1), ("C", 2)],
+        )
+        for rows in layouts.values():
+            gpus = [gpu for row in rows for gpu in row["gpu_ids"]]
+            self.assertEqual(sorted(gpus), [str(i) for i in range(6)])
+        self.assertEqual(set(pool.layouts(2, ["0", "1"])), {"L0", "L1"})
+        for bad in (["0", "1", "2"], ["0", "0", "1", "2"], []):
+            with self.assertRaises(ValueError):
+                pool.layouts(2, bad)
+
+    def test_fixed_pair_registry_aliases_historical_pools(self):
+        registry, aliases = pool.fixed_pair_registry(
+            source_gpu="2",
+            target_gpus=["0", "1"],
+            source_url="http://127.0.0.1:8001",
+            target_url="http://127.0.0.1:8200",
+            identity="model",
+            source_context_limit=32768,
+            target_context_limit=32768,
+        )
+        self.assertEqual(aliases, {"tp1": "A-g1-tp1", "tp4": "B-g2-tp2"})
+        manifest = pool.registry_manifest(registry, aliases)
+        self.assertEqual(manifest["registry_revision"], 2)
+        self.assertEqual(
+            [
+                (
+                    r["instance_id"],
+                    r["tp_degree"],
+                    r["physical_gpu_ids"],
+                    r["legacy_pool"],
+                )
+                for r in manifest["instances"]
+            ],
+            [("A-g1-tp1", 1, ["2"], "tp1"), ("B-g2-tp2", 2, ["0", "1"], "tp4")],
+        )
+        self.assertEqual(json.loads(json.dumps(manifest)), manifest)
+        self.assertEqual(pool.resolve_pool(manifest, "tp4"), "B-g2-tp2")
+        self.assertEqual(pool.resolve_pool(manifest, "A-g1-tp1"), "A-g1-tp1")
+        with self.assertRaises(KeyError):
+            pool.resolve_pool(manifest, "tp2")
+        with self.assertRaises(ValueError):
+            pool.registry_manifest(registry, {"tp1": "A-g1-tp1", "x": "A-g1-tp1"})
+        with self.assertRaises(ValueError):
+            pool.fixed_pair_registry(
+                source_gpu="0",
+                target_gpus=["0", "1"],
+                source_url="s",
+                target_url="t",
+                identity="model",
+                source_context_limit=1,
+                target_context_limit=1,
+            )
+
     def test_session_explicit_tp2_and_legacy_tp4(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(geometry.session_target_tp(tmp), 4)

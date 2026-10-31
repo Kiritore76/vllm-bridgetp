@@ -311,6 +311,8 @@ class RepeatedSessions(unittest.TestCase):
             target_connector=connector,
         )
         settings = NS(
+            model_path=Path("qwen"),
+            tp1_gpu="0",
             tp1_port=8000,
             tp4_port=8001,
             tp4_gpus="1,2,3,4",

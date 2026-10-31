@@ -4,6 +4,7 @@
 One coordinator owns this registry. No scheduler capacity is inferred from TP.
 """
 
+import itertools
 from dataclasses import dataclass, field
 from threading import RLock
 
@@ -230,25 +231,134 @@ class Registry:
             entry.state = "RELEASED"
 
 
+LEGACY_SOURCE_POOL = "tp1"
+LEGACY_TARGET_POOL = "tp4"  # historical name of the TP-k target pool, any k
+
+
+def fixed_pair_registry(
+    *,
+    source_gpu,
+    target_gpus,
+    source_url,
+    target_url,
+    identity,
+    source_context_limit,
+    target_context_limit,
+):
+    """Registry of the fixed TP1 source / TP-k target pilot.
+
+    The source is bundle A and the target bundle B, named like the bundle
+    runner (``<bundle>-g<generation>-tp<k>``). The controller still uses the
+    historical pool ids; they are returned as aliases of the instance ids.
+    """
+    registry = Registry()
+    target_tp = len(target_gpus)
+    rows = (
+        InstanceRecord(
+            InstanceRef("A-g1-tp1", 1),
+            1,
+            (str(source_gpu),),
+            "A",
+            source_url,
+            identity,
+            source_context_limit,
+        ),
+        InstanceRecord(
+            InstanceRef(f"B-g2-tp{target_tp}", 2),
+            target_tp,
+            tuple(str(gpu) for gpu in target_gpus),
+            "B",
+            target_url,
+            identity,
+            target_context_limit,
+        ),
+    )
+    for row in rows:
+        registry.register(row)
+    aliases = {
+        LEGACY_SOURCE_POOL: rows[0].ref.instance_id,
+        LEGACY_TARGET_POOL: rows[1].ref.instance_id,
+    }
+    return registry, aliases
+
+
+def registry_manifest(registry, aliases=None):
+    """JSON-ready instance list; ``legacy_pool`` names the old pool id, if any."""
+    aliases = dict(aliases or {})
+    by_instance = {value: key for key, value in aliases.items()}
+    if len(by_instance) != len(aliases) or not set(by_instance) <= set(
+        registry.instances
+    ):
+        raise ValueError("aliases must name distinct registered instances")
+    return dict(
+        schema="BRIDGETP_INSTANCE_MANIFEST_V1",
+        registry_revision=registry.registry_revision,
+        instances=[
+            dict(
+                instance_id=row.ref.instance_id,
+                instance_generation=row.ref.instance_generation,
+                tp_degree=row.tp_degree,
+                physical_gpu_ids=list(row.physical_gpu_ids),
+                bundle_id=row.bundle_id,
+                endpoint=row.endpoint,
+                context_limit=row.context_limit,
+                lifecycle=row.lifecycle,
+                legacy_pool=by_instance.get(row.ref.instance_id),
+            )
+            for _, row in sorted(registry.instances.items())
+        ],
+        legacy_pool_aliases=aliases,
+    )
+
+
+def resolve_pool(manifest, pool_id):
+    """Instance id for a historical pool id or an instance id."""
+    aliases = manifest["legacy_pool_aliases"]
+    if pool_id in aliases:
+        return aliases[pool_id]
+    if any(row["instance_id"] == pool_id for row in manifest["instances"]):
+        return pool_id
+    raise KeyError(f"unknown pool or instance: {pool_id}")
+
+
+def layout_label(merged, bundle_ids):
+    """``L<k>`` plus the bundles still at TP1 when the layout is mixed.
+
+    With two bundles this is the historical L0/L1A/L1B/L2 naming: L1A keeps
+    bundle A at TP1 and merges B.
+    """
+    count = sum(merged)
+    if count in (0, len(merged)):
+        return f"L{count}"
+    return f"L{count}" + "".join(b for b, m in zip(bundle_ids, merged) if not m)
+
+
 def layouts(target_tp, gpu_ids):
+    """Every TP1/TP-k assignment over consecutive ``target_tp``-GPU bundles.
+
+    Bundles are named A, B, C... in ``gpu_ids`` order; each one is either
+    ``target_tp`` TP1 instances or one TP-``target_tp`` instance.
+    """
     validate_target_tp(target_tp)
-    if len(gpu_ids) != target_tp * 2 or len(set(gpu_ids)) != len(gpu_ids):
-        raise ValueError("exactly two disjoint physical GPU bundles required")
-    groups = [tuple(gpu_ids[:target_tp]), tuple(gpu_ids[target_tp:])]
-    return {
-        label: [
+    count = len(gpu_ids) // target_tp
+    if (
+        count < 1
+        or count > 26
+        or len(gpu_ids) != count * target_tp
+        or len(set(gpu_ids)) != len(gpu_ids)
+    ):
+        raise ValueError("disjoint physical GPU bundles of target_tp GPUs required")
+    bundle_ids = [chr(ord("A") + i) for i in range(count)]
+    groups = [tuple(gpu_ids[i * target_tp : (i + 1) * target_tp]) for i in range(count)]
+    result = {}
+    for merged in itertools.product((False, True), repeat=count):
+        result[layout_label(merged, bundle_ids)] = [
             dict(
                 bundle_id=bundle,
-                tp_degree=target_tp if merged else 1,
-                gpu_ids=list(gpus) if merged else [gpu],
+                tp_degree=target_tp if flag else 1,
+                gpu_ids=list(gpus) if flag else [gpu],
             )
-            for bundle, gpus, merged in zip(("A", "B"), groups, flags)
-            for gpu in (gpus[:1] if merged else gpus)
+            for bundle, gpus, flag in zip(bundle_ids, groups, merged)
+            for gpu in (gpus[:1] if flag else gpus)
         ]
-        for label, flags in {
-            "L0": (False, False),
-            "L1A": (False, True),
-            "L1B": (True, False),
-            "L2": (True, True),
-        }.items()
-    }
+    return result

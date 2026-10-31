@@ -239,6 +239,23 @@ class LauncherTests(unittest.TestCase):
             self.assertTrue(connector["bridgetp_persistent_channel"])
             self.assertEqual(plan["source_env"]["BRIDGETP_PRESSURE_POOL"], "tp1")
             self.assertEqual(
+                plan["instances"]["legacy_pool_aliases"],
+                {"tp1": "A-g1-tp1", "tp4": "B-g2-tp4"},
+            )
+            self.assertEqual(
+                [
+                    (r["physical_gpu_ids"], r["endpoint"], r["context_limit"])
+                    for r in plan["instances"]["instances"]
+                ],
+                [
+                    (["0"], "http://127.0.0.1:8001", 8192),
+                    (["1", "2", "3", "4"], "http://127.0.0.1:8200", 16384),
+                ],
+            )
+            self.assertEqual(
+                plan["instances_path"], root / "both-light" / "instances.json"
+            )
+            self.assertEqual(
                 plan["source_env"]["BRIDGETP_GPU_DIRECT_HISTORY_PACING"], "0"
             )
             self.assertEqual(plan["source_env"]["BRIDGETP_STREAM_RATE_GIB_S"], "0")
