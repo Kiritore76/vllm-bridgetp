@@ -3,17 +3,17 @@
 # 运行：
 #   cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 #
-# 当前任务：G1 三卡兼容验收（多实例入口首次上GPU）。
-# 固定一对：GPU2=TP1源，GPU0/1=TP2目标，GPU3空闲；双32768/.88；与10-30深长突发同配方。
-#   1) 深长MIGRATE 1场（--long-burst-memory-verify）：须真实提交/源释放、双rank回执、handoff<=1s
-#   2) 深长STAY 1场（--long-burst-deep-stay）：完整完成且无迁移
-# 两场各约8-10分钟。任一场技术失败不影响另一场执行；最后统一打包。
+# 当前任务：G2 四卡L1A双源通道验收（S1-d2）。
+# 布局L1A，A={2,3}，B={0,1}：TP1@GPU2（迁移对源）、TP1@GPU3（第二个迁移源）、TP2@GPU0/1。
+# 两个TP1都在启动时预连到TP2（各自端口块与通道代际），全局同时只迁一组。
+# 负载：深长突发MIGRATE 1场（--long-burst-memory-verify），与10-30及G1同配方；双32768/.88。
+# 约10-12分钟。不训练、不重装；技术失败即停并打包。
 
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
 py=$venv/bin/python
 branch=bridgetp/tp2-4090d-qwen3-8b
-task=qwen3_g1_three_card
+task=qwen3_g2_l1a_channels
 
 cd "$repo" || exit 1
 source "$venv/bin/activate" || exit 1
@@ -27,44 +27,39 @@ head=$(git rev-parse HEAD)
 [ "$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)" = 4 ] || {
     echo '需要4张GPU，停止。'; exit 1;
 }
+[ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || {
+    echo 'GPU上有计算进程，未停止任何进程，请先确认。'; exit 1;
+}
 
 run=/root/autodl-tmp/bridgetp/results/${task}_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir -p "$run" || exit 1
 echo "$head" > "$run/revision.txt"
 echo "代码：$head"
 echo "本批目录：$run"
+nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv > "$run/gpu_memory_before.csv"
 
-# 增量预编译：只编译改动过的源码，未改的直接跳过（缩短引擎启动）。
+# 增量预编译：未改动的源码直接跳过。
 "$py" -m compileall -q -j 0 "$repo/vllm" "$repo/tools" >"$run/compileall.log" 2>&1
 
 export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 export VLLM_USE_V2_MODEL_RUNNER=0 OMP_NUM_THREADS=1
 
-status=0
-for mode in long-burst-memory-verify long-burst-deep-stay; do
-    [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || {
-        echo "GPU上有计算进程，未停止任何进程，跳过 $mode。"; status=1; continue;
-    }
-    echo "=== 开始：$mode ==="
-    "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
-        "--$mode" --current-machine --repetitions 1 \
-        --model /root/autodl-tmp/models/Qwen3-8B \
-        --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
-        --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json" \
-        --output "$run/$mode" --expected-revision "$head" 2>&1 | tee "$run/$mode.console.log"
-    code=${PIPESTATUS[0]}
-    echo "$mode 退出码：$code" | tee -a "$run/exit_codes.txt"
-    [ "$code" = 0 ] || status=1
-done
+mode=long-burst-memory-verify
+echo "=== 开始：G2（$mode + L1A双源通道）==="
+"$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
+    "--$mode" --layout-l1a-channels --current-machine --repetitions 1 \
+    --model /root/autodl-tmp/models/Qwen3-8B \
+    --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
+    --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json" \
+    --output "$run/g2" --expected-revision "$head" 2>&1 | tee "$run/g2.console.log"
+status=${PIPESTATUS[0]}
+echo "G2 退出码：$status" | tee "$run/exit_codes.txt"
 
-# 两场各自已打成 compact 包；外层只收这些包和日志，不重复原始目录。
+# 运行包已是 compact 包；外层只收它和日志，不重复原始目录。
 tar -C "$(dirname "$run")" -czf "$run.tar.gz" \
-    --exclude="$(basename "$run")/long-burst-memory-verify" \
-    --exclude="$(basename "$run")/long-burst-deep-stay" \
+    --exclude="$(basename "$run")/g2" \
     "$(basename "$run")"
 sha256sum "$run.tar.gz" > "$run.tar.gz.sha256"
-echo '=== 退出码 ==='
-cat "$run/exit_codes.txt"
 echo "最终退出码：$status"
 echo "请拿回：$run.tar.gz"
 echo "以及：$run.tar.gz.sha256"

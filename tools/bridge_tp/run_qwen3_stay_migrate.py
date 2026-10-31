@@ -201,8 +201,15 @@ def main(argv=None):
     parser.add_argument("--current-machine", action="store_true")
     parser.add_argument("--prior-comparison", type=Path)
     parser.add_argument("--complete-four-mode", type=Path)
+    parser.add_argument(
+        "--layout-l1a-channels",
+        action="store_true",
+        help="G2: L1A on A={2,3}, B={0,1}; TP1@2 and TP1@3 both migrate to TP2(0,1)",
+    )
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
+    if args.layout_l1a_channels and not args.long_burst_memory_verify:
+        parser.error("layout-l1a-channels runs with long-burst-memory-verify only")
     if args.long_burst_memory_verify and args.long_burst_deep_stay:
         parser.error("deep STAY supplement and memory verification are separate runs")
     if args.long_burst_memory_verify or args.long_burst_deep_stay:
@@ -509,6 +516,13 @@ def main(argv=None):
         spec = migration_spec(args.model)
         if args.expanded_context:
             expanded_context_spec(spec, read(args.model / "config.json"))
+        if args.layout_l1a_channels:
+            spec["layout"] = dict(
+                name="L1A",
+                bundle_gpus=["2", "3", "0", "1"],
+                base_port=8300,
+                migration_sources=True,
+            )
         spec.update(
             checkpoint=str(args.checkpoint),
             checkpoint_sha256=CHECKPOINT_SHA,

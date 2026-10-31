@@ -91,9 +91,15 @@ def apply_target(config, target: GpuDirectTarget):
 
 
 def select_target(config, target_instance: str | None, armed: bool):
-    """Overlay the session's target; an armed session must name one."""
+    """Overlay the session's target; an armed session must name one.
+
+    A source with exactly one listed target uses it when the session names
+    none (fixed-target sources need no per-session choice).
+    """
     if not config.gpu_direct_targets:
         return config
+    if target_instance is None and len(config.gpu_direct_targets) == 1:
+        return apply_target(config, config.gpu_direct_targets[0])
     if target_instance is None:
         if armed:
             raise ValueError("armed multi-target session names no target_instance")

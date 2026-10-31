@@ -344,6 +344,8 @@ def build_scene(spec, scene, run_root, common, args):
                 # Channel generation = source instance generation: unique per
                 # run, and a rebuilt instance gets a new one.
                 extra["migration_channel"]["generation"] = row["instance_generation"]
+                extra["migration_channel"]["target"] = aliases["tp4"]
+                extra["migration_channel"]["target_tp"] = target_tp
                 row["migration_channel"] = dict(extra["migration_channel"])
                 extra["predictor_events"] = row["predictor_events"] = str(
                     run_dir / f"predictor_events_{row['instance_id']}.jsonl"
@@ -460,6 +462,19 @@ def extra_engine(plan, extra):
             BRIDGETP_GPU_DIRECT_BASE_PORT=str(channel["base_port"]),
             BRIDGETP_CHANNEL_GENERATION=str(channel["generation"]),
             BRIDGETP_PREDICTOR_LIVE_EVENTS=extra["predictor_events"],
+            # One listed target: its own preconnect receipt name, implied per
+            # session (the pair source keeps the legacy source.json receipt).
+            BRIDGETP_GPU_DIRECT_TARGETS=json.dumps(
+                [
+                    dict(
+                        target=channel["target"],
+                        host=env.get("BRIDGETP_GPU_DIRECT_HOST", "127.0.0.1"),
+                        base_port=channel["base_port"],
+                        tp=channel["target_tp"],
+                        generation=channel["generation"],
+                    )
+                ]
+            ),
         )
     else:
         env = {

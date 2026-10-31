@@ -446,7 +446,8 @@ class LauncherTests(unittest.TestCase):
             )
             (extra,) = plan["extra_engines"]
             self.assertEqual(
-                extra["migration_channel"], dict(base_port=30410, generation=3)
+                extra["migration_channel"],
+                dict(base_port=30410, generation=3, target="B-g2-tp2", target_tp=2),
             )
             connector = json.loads(plan["target_argv"][-1])
             self.assertEqual(
@@ -458,6 +459,18 @@ class LauncherTests(unittest.TestCase):
             )
             argv, env = launch.extra_engine(plan, extra)
             self.assertEqual(env["BRIDGETP_GPU_DIRECT_BASE_PORT"], "30410")
+            self.assertEqual(
+                json.loads(env["BRIDGETP_GPU_DIRECT_TARGETS"]),
+                [
+                    dict(
+                        target="B-g2-tp2",
+                        host="127.0.0.1",
+                        base_port=30410,
+                        tp=2,
+                        generation=3,
+                    )
+                ],
+            )
             self.assertEqual(env["BRIDGETP_CHANNEL_GENERATION"], "3")
             self.assertEqual(env["BRIDGETP_PRESSURE_POOL"], "A-g3-tp1")
             self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "3")

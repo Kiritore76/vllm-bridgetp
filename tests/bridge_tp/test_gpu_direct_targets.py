@@ -102,6 +102,18 @@ class SelectTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             select_target(config, "B-g9-tp2", False)
 
+    def test_single_listed_target_is_implied(self):
+        config = Config(
+            gpu_direct_targets=parse_targets(json.dumps([entry("B-g2-tp2", 30410)]), 8)
+        )
+        chosen = select_target(config, None, True)
+        self.assertEqual(
+            (chosen.target_instance, chosen.gpu_direct_base_port), ("B-g2-tp2", 30410)
+        )
+        self.assertEqual(
+            [label for label, _ in preconnect_plan(config)], ["source-B-g2-tp2"]
+        )
+
     def test_preconnect_opens_every_target_with_its_own_receipt(self):
         plan = preconnect_plan(self.config())
         self.assertEqual(
