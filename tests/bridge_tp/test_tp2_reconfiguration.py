@@ -55,9 +55,7 @@ class GeometryTests(unittest.TestCase):
                 self.assertEqual(len(gpus), 2 * k)
 
     def test_session_explicit_tp2_and_legacy_tp4(self):
-        with tempfile.TemporaryDirectory(
-            dir=Path(__file__).resolve().parents[2]
-        ) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(geometry.session_target_tp(tmp), 4)
             path = Path(tmp) / "session_manifest.json"
             path.write_text(json.dumps(dict(target_tp_size=2)))
@@ -243,7 +241,7 @@ class PlannerTests(unittest.TestCase):
 class ExecutorTests(unittest.TestCase):
     def test_shadow_does_not_mutate_admission_or_engines(self):
         r, backend = active_registry(), Mock()
-        with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             ex = executor.ConversionExecutor(r, backend, Path(tmp) / "state.json")
             ex.plan_create(
                 "p", r.registry_revision, "A", "TP2", "DRAIN", "SHADOW", 100, "fixture"
@@ -290,9 +288,7 @@ class ExecutorTests(unittest.TestCase):
     def test_live_step_order_and_no_fake_rollback_after_stop(self):
         r = active_registry()
         backend = Mock()
-        with tempfile.TemporaryDirectory(
-            dir=Path(__file__).resolve().parents[2]
-        ) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             ex = executor.ConversionExecutor(r, backend, Path(tmp) / "state.json")
             ex.plan_create(
                 "p", r.registry_revision, "A", "TP2", "DRAIN", "ACTIVE", 100, "fixture"
@@ -339,7 +335,7 @@ class TargetRankReceiptTests(unittest.TestCase):
             compile(ast.Module(nodes, type_ignores=[]), str(source), "exec"),
             module.__dict__,
         )
-        with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
 
             def write(path, value):
@@ -393,7 +389,7 @@ class LiveDrainBackendTests(unittest.TestCase):
         from tools.bridge_tp import run_tp_bundle_drain as driver
 
         r = active_registry()
-        with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             args = types.SimpleNamespace(out_root=Path(tmp), base_port=8500)
             backend = driver.NativeDrainBackend(args, r, Mock(), {})
             ref = r.instances["s1"].ref
@@ -426,6 +422,222 @@ class LiveDrainBackendTests(unittest.TestCase):
                     self.assertFalse(backend.drain_evidence(plan)[0].drained(ref, 10))
             finally:
                 backend.executor.shutdown()
+
+
+class DrainClockTests(unittest.TestCase):
+    """Evidence scraped after the decision time must be judged when in hand."""
+
+    def run_drain(self, clock, sampled_at, now=100.0):
+        r = active_registry()
+        backend = Mock()
+        backend.precheck.return_value = True
+        backend.kv_emergency.return_value = False
+        backend.fence.return_value = True
+        with tempfile.TemporaryDirectory() as tmp:
+            ex = executor.ConversionExecutor(
+                r, backend, Path(tmp) / "state.json", clock=clock
+            )
+            ex.plan_create(
+                "p", r.registry_revision, "A", "TP2", "DRAIN", "ACTIVE", 1e9, "fixture"
+            )
+            ex.plan_execute(now)
+            backend.drain_evidence.return_value = [
+                ExecutorTests().evidence(ref, sampled_at=sampled_at)
+                for ref in ex.refs()
+            ]
+            return ex.plan_execute(now)
+
+    def test_sample_after_decision_passes_with_post_io_clock(self):
+        status = self.run_drain(lambda: 100.2, 100.1)
+        self.assertEqual(status["state"], "FENCED")
+        check = status["last_drain_check"]
+        self.assertEqual((check["decided_at"], check["evaluated_at"]), (100.0, 100.2))
+        self.assertTrue(check["complete"])
+
+    def test_pre_io_decision_time_reproduces_the_old_rejection(self):
+        status = self.run_drain(None, 100.1)
+        self.assertEqual(status["state"], "DRAINING")
+        self.assertFalse(status["last_drain_check"]["complete"])
+
+    def test_freshness_and_future_bounds_are_not_relaxed(self):
+        self.assertEqual(self.run_drain(lambda: 103.0, 100.1)["state"], "DRAINING")
+        self.assertEqual(self.run_drain(lambda: 100.2, 100.5)["state"], "DRAINING")
+        self.assertEqual(self.run_drain(lambda: 99.0, 98.9)["state"], "DRAINING")
+
+
+class DrainDriverTests(unittest.TestCase):
+    def backend(self, tmp, **extra):
+        from tools.bridge_tp import run_tp_bundle_drain as driver
+
+        args = types.SimpleNamespace(
+            out_root=Path(tmp),
+            base_port=8700,
+            model_path=Path(tmp) / "model",
+            platform="qwen3",
+            startup_timeout_s=1,
+            **extra,
+        )
+        common = Mock()
+        common.server_command.return_value = ["server"]
+        common.write_json.side_effect = lambda p, r: p.write_text(json.dumps(r))
+        inputs = {"requests": {"2048": {"prompt": [1] * 2048}}}
+        return (
+            driver,
+            driver.NativeDrainBackend(args, pool.Registry(), common, inputs),
+            common,
+        )
+
+    def test_expanded_context_sets_32k_for_every_engine(self):
+        from unittest.mock import PropertyMock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            driver, backend, common = self.backend(tmp, expanded_context=True)
+            try:
+                with patch.object(
+                    driver.NativeDrainBackend,
+                    "io",
+                    new_callable=PropertyMock,
+                    return_value=Mock(),
+                ):
+                    tp1 = backend.start("A", 1, ["2"])
+                    tp2 = backend.start("B", 2, ["0", "1"])
+                self.assertEqual((tp1.context_limit, tp2.context_limit), (32768, 32768))
+                settings = common.server_command.call_args.args[0]
+                self.assertEqual(
+                    (settings.max_model_len, settings.tp4_max_model_len),
+                    (32768, 32768),
+                )
+            finally:
+                backend.executor.shutdown()
+
+    def test_replacements_all_spawn_before_any_readiness_wait(self):
+        from unittest.mock import PropertyMock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            driver, backend, common = self.backend(tmp, expanded_context=True)
+            order = []
+            common.start_process.side_effect = lambda name, *a: (
+                order.append(("spawn", name)) or Mock()
+            )
+            common.wait_healthy.side_effect = lambda url, process, timeout: (
+                order.append(("wait", url))
+            )
+            try:
+                with patch.object(
+                    driver.NativeDrainBackend,
+                    "io",
+                    new_callable=PropertyMock,
+                    return_value=Mock(),
+                ):
+                    rows = backend.start_parallel(
+                        [
+                            dict(bundle_id="A", tp_degree=1, gpu_ids=[g])
+                            for g in ("2", "3")
+                        ],
+                        activate=False,
+                    )
+                kinds = [kind for kind, _ in order]
+                self.assertEqual(kinds[:2], ["spawn", "spawn"])
+                self.assertEqual(sorted(kinds[2:]), ["wait", "wait"])
+                self.assertTrue(all(r.lifecycle == "PREPARING" for r in rows))
+                events = [e["kind"] for e in backend.events]
+                self.assertEqual(events.count("HEALTHY"), 2)
+                self.assertEqual(events.count("READY"), 2)
+            finally:
+                backend.executor.shutdown()
+
+    def test_verification_is_a_fresh_request_per_replacement(self):
+        from unittest.mock import PropertyMock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            driver, backend, common = self.backend(tmp, expanded_context=True)
+            io = Mock()
+            io.post_streaming_completion.return_value = {"token_ids": [1] * 16}
+            try:
+                with patch.object(
+                    driver.NativeDrainBackend,
+                    "io",
+                    new_callable=PropertyMock,
+                    return_value=io,
+                ):
+                    backend.start_parallel(
+                        [dict(bundle_id="A", tp_degree=2, gpu_ids=["2", "3"])],
+                        activate=False,
+                    )
+                    calls = io.post_streaming_completion.call_count
+                    plan = dict(bundle_id="A")
+                    self.assertTrue(backend.warm_and_verify(plan))
+                    self.assertTrue(backend.warm_and_verify(plan))
+                    self.assertEqual(io.post_streaming_completion.call_count, calls + 1)
+                    io.post_streaming_completion.return_value = {"token_ids": [1]}
+                    backend.verified.clear()
+                    with self.assertRaises(RuntimeError):
+                        backend.warm_and_verify(plan)
+            finally:
+                backend.executor.shutdown()
+
+    def test_validate_only_reports_requested_bundle_mapping(self):
+        import contextlib
+        import io as stdio
+
+        from tools.bridge_tp import run_tp_bundle_drain as driver
+
+        stream = stdio.StringIO()
+        with contextlib.redirect_stdout(stream):
+            code = driver.main(
+                [
+                    "--edge",
+                    "L1A-L2",
+                    "--model-path",
+                    "unused",
+                    "--out-root",
+                    "unused",
+                    "--platform",
+                    "qwen3",
+                    "--expanded-context",
+                    "--bundle-gpus",
+                    "2,3,0,1",
+                    "--validate-only",
+                ]
+            )
+        report = json.loads(stream.getvalue())
+        self.assertEqual(code, 0)
+        self.assertEqual(report["bundle"], "A")
+        self.assertEqual(
+            [row["gpu_ids"] for row in report["initial"]], [["2"], ["3"], ["0", "1"]]
+        )
+        self.assertEqual(
+            [row["gpu_ids"] for row in report["final"]], [["2", "3"], ["0", "1"]]
+        )
+        with self.assertRaises(ValueError):
+            driver.main(
+                ["--edge", "L0-L1A", "--model-path", "m", "--out-root", "o"]
+                + ["--expanded-context", "--validate-only"]
+            )
+
+
+class LinkProbeTests(unittest.TestCase):
+    def test_transport_parsing_and_classification(self):
+        from tools.bridge_tp import probe_gpu_links as probe
+
+        log = "\n".join(
+            [
+                "host:1:2 [0] NCCL INFO Channel 00/0 : 0[0] -> 1[0] via P2P/CUMEM",
+                (
+                    "host:1:2 [0] NCCL INFO Channel 01/0 : 0[0] -> 1[0] "
+                    "via SHM/direct/direct"
+                ),
+                "host:1:2 [0] NCCL INFO Connected all rings",
+            ]
+        )
+        self.assertEqual(probe.transports(log), ["P2P/CUMEM", "SHM/direct/direct"])
+        self.assertEqual(probe.classify(["P2P/CUMEM"]), "P2P")
+        self.assertEqual(probe.classify(["SHM/direct/direct"]), "NON_P2P")
+        self.assertEqual(probe.classify(probe.transports(log)), "MIXED")
+        self.assertEqual(probe.classify([]), "UNKNOWN")
+        self.assertEqual(len(probe.pairs([0, 1, 2, 3])), 6)
+        with self.assertRaises(ValueError):
+            probe.pairs([0, 0])
 
 
 if __name__ == "__main__":

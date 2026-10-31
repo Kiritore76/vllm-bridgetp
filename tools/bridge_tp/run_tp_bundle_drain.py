@@ -25,6 +25,9 @@ from tools.bridge_tp.pressure_cpu import load  # noqa: E402
 
 pool = load("instance_pool")
 conversion = load("reconfiguration_executor")
+QWEN3_NATIVE_CONTEXT = 32768
+# Physical GPU order handed to layouts(): first pair is bundle A, second B.
+DEFAULT_BUNDLE_GPUS = "0,1,2,3"
 EDGES = {
     "L0-L1A": ("L0", "L1A", "B", "TP2"),
     "L1A-L0": ("L1A", "L0", "B", "TP1"),
@@ -63,7 +66,17 @@ class NativeDrainBackend:
             self.events.append(row)
         print(json.dumps(row), flush=True)
 
-    def start(self, bundle, tp, gpus, activate=True):
+    def context_limits(self):
+        """(TP1, TP2+) model length. Native 32K needs explicit opt-in."""
+        if getattr(self.args, "platform", "a100") != "qwen3":
+            return 8192, 8192
+        if getattr(self.args, "expanded_context", False):
+            return QWEN3_NATIVE_CONTEXT, QWEN3_NATIVE_CONTEXT
+        return 8192, 16384
+
+    def launch(self, bundle, tp, gpus):
+        """Register and spawn one owned engine; readiness is awaited separately."""
+        tp1_limit, merged_limit = self.context_limits()
         with self.lock:
             self.sequence += 1
             name = f"{bundle}-g{self.sequence}-tp{tp}"
@@ -76,9 +89,7 @@ class NativeDrainBackend:
                 bundle,
                 f"http://127.0.0.1:{port}",
                 str(self.args.model_path),
-                16384
-                if getattr(self.args, "platform", "a100") == "qwen3" and tp == 2
-                else 8192,
+                merged_limit if tp > 1 else tp1_limit,
             )
             self.registry.register(row)
             path = self.args.out_root / name
@@ -100,10 +111,8 @@ class NativeDrainBackend:
                 python_bin=Path(sys.executable),
                 model_path=self.args.model_path,
                 dtype="bfloat16",
-                max_model_len=8192,
-                tp4_max_model_len=16384
-                if getattr(self.args, "platform", "a100") == "qwen3"
-                else 8192,
+                max_model_len=tp1_limit,
+                tp4_max_model_len=merged_limit,
                 gpu_memory_utilization=0.88,
             )
             argv = self.common.server_command(settings, tp, port)
@@ -112,11 +121,25 @@ class NativeDrainBackend:
 
                 argv.extend(engine_arguments())
             self.common.write_json(path / "argv.json", argv)
-            self.event("LOAD_START", instance=name, bundle=bundle, tp=tp, gpus=gpus)
+            self.event(
+                "LOAD_START",
+                instance=name,
+                bundle=bundle,
+                tp=tp,
+                gpus=gpus,
+                max_model_len=row.context_limit,
+            )
             process = self.common.start_process(name, argv, env, path / "server.log")
             self.processes[name] = process
             self.inventories[name] = path / "inventory.jsonl"
-        self.common.wait_healthy(row.endpoint, process, self.args.startup_timeout_s)
+        return row
+
+    def await_ready(self, row, activate=True):
+        name, path = row.ref.instance_id, self.args.out_root / row.ref.instance_id
+        self.common.wait_healthy(
+            row.endpoint, self.processes[name], self.args.startup_timeout_s
+        )
+        self.event("HEALTHY", instance=name, bundle=row.bundle_id, tp=row.tp_degree)
         from tools.bridge_tp.run_pressure_calibration import payload
 
         request = payload(self.inputs, 2048, 16, "warm-" + name)
@@ -129,9 +152,34 @@ class NativeDrainBackend:
             retain_chunks=False,
         )
         if activate:
-            self.registry.transition(ref, "ACTIVE")
-        self.event("READY", instance=name, bundle=bundle, tp=tp)
+            self.registry.transition(row.ref, "ACTIVE")
+        self.event("READY", instance=name, bundle=row.bundle_id, tp=row.tp_degree)
         return row
+
+    def start(self, bundle, tp, gpus, activate=True):
+        return self.await_ready(self.launch(bundle, tp, gpus), activate)
+
+    def start_parallel(self, rows, activate):
+        """Spawn every engine first, then await them concurrently.
+
+        Serial start would count each extra engine's load time in rebuild cost.
+        """
+        launched = [
+            self.launch(r["bundle_id"], r["tp_degree"], r["gpu_ids"]) for r in rows
+        ]
+        with ThreadPoolExecutor(max_workers=max(1, len(launched))) as pool_:
+            futures = [
+                pool_.submit(self.await_ready, row, activate) for row in launched
+            ]
+            errors = []
+            for future in futures:
+                try:
+                    future.result()
+                except Exception as error:  # report after every wait has ended
+                    errors.append(error)
+        if errors:
+            raise errors[0]
+        return launched
 
     @property
     def io(self):
@@ -272,6 +320,19 @@ class NativeDrainBackend:
                     True,
                 )
             )
+        # Every observation is kept; plan.json only holds the latest check.
+        with (self.args.out_root / "drain_observations.jsonl").open(
+            "a", encoding="utf-8"
+        ) as stream:
+            stream.write(
+                json.dumps(
+                    dict(
+                        collected_unix_s=time.time(),
+                        rows=[vars(row) for row in evidence],
+                    )
+                )
+                + "\n"
+            )
         return evidence
 
     def fence(self, plan):
@@ -341,16 +402,43 @@ class NativeDrainBackend:
             for gpu in self.registry.get(pool.InstanceRef(**r)).physical_gpu_ids
         )
         tp = int(plan["target_bundle_mode"][2:])
-        for devices in [gpus] if tp > 1 else [[g] for g in gpus]:
-            self.start(plan["bundle_id"], tp, devices, activate=False)
+        self.start_parallel(
+            [
+                dict(bundle_id=plan["bundle_id"], tp_degree=tp, gpu_ids=devices)
+                for devices in ([gpus] if tp > 1 else [[g] for g in gpus])
+            ],
+            activate=False,
+        )
 
     def warm_and_verify(self, plan):
+        """One fresh, non-routed request per replacement before publication."""
+        from tools.bridge_tp.run_pressure_calibration import payload
+
         rows = [
             r
             for r in self.registry.instances.values()
             if r.bundle_id == plan["bundle_id"] and r.lifecycle != "RETIRED"
         ]
-        return bool(rows) and all(r.lifecycle == "PREPARING" for r in rows)
+        if not rows or any(r.lifecycle != "PREPARING" for r in rows):
+            return False
+        verified = self.__dict__.setdefault("verified", set())
+        for row in rows:
+            name = row.ref.instance_id
+            if name in verified:
+                continue
+            result = self.io.post_streaming_completion(
+                row.endpoint,
+                payload(self.inputs, 2048, 16, "verify-" + name),
+                120,
+                lambda *a: None,
+                self.args.out_root / name / "verify_failure.json",
+                retain_chunks=False,
+            )
+            if len(result["token_ids"]) != 16:
+                raise RuntimeError(f"replacement verification incomplete: {name}")
+            verified.add(name)
+            self.event("VERIFIED", instance=name, bundle=row.bundle_id)
+        return True
 
     def publish_ready(self, plan):
         with self.lock:
@@ -417,9 +505,24 @@ def main(argv=None):
         action="store_true",
         help="empty lifecycle cycle, no benchmark requests",
     )
+    parser.add_argument(
+        "--expanded-context",
+        action="store_true",
+        help="Qwen3 native 32768 limit for every TP1 and TP2 engine",
+    )
+    parser.add_argument(
+        "--bundle-gpus",
+        default=DEFAULT_BUNDLE_GPUS,
+        help="four physical GPU ids; first pair is bundle A, second bundle B",
+    )
     args = parser.parse_args(argv)
     initial, final, bundle, mode = EDGES[args.edge]
-    layouts = pool.layouts(2, ["0", "1", "2", "3"])
+    if args.expanded_context and args.platform != "qwen3":
+        raise ValueError("expanded context is defined only for Qwen3")
+    bundle_gpus = [g.strip() for g in args.bundle_gpus.split(",")]
+    if any(not g.isdigit() for g in bundle_gpus):
+        raise ValueError("bundle GPUs must be physical indices")
+    layouts = pool.layouts(2, bundle_gpus)
     if any(
         not math.isfinite(v)
         for v in (
@@ -452,6 +555,8 @@ def main(argv=None):
                     final=layouts[final],
                     bundle=bundle,
                     target_mode=mode,
+                    bundle_gpus=bundle_gpus,
+                    expanded_context=args.expanded_context,
                     purpose="fixed-route lifecycle fixture; no fast policy",
                 ),
                 indent=2,
@@ -484,6 +589,12 @@ def main(argv=None):
         runtime_inventory(read(PROFILE))
         inputs = verified_inputs(args.model_path, args.inputs)
         spec = migration_spec(args.model_path)
+        if args.expanded_context:
+            positions = json.loads((args.model_path / "config.json").read_text())[
+                "max_position_embeddings"
+            ]
+            if positions < QWEN3_NATIVE_CONTEXT:
+                raise ValueError("model does not natively support 32K context")
     else:
         spec = prepare(args.model_path)
         inputs = json.loads(
@@ -521,14 +632,14 @@ def main(argv=None):
     )
     backend = NativeDrainBackend(args, registry, common, inputs)
     executor = conversion.ConversionExecutor(
-        registry, backend, args.out_root / "plan.json"
+        registry, backend, args.out_root / "plan.json", clock=time.time
     )
-    result, code = {}, 0
+    # Only an observed COMPLETED plan may end with code 0.
+    result, code = dict(status="INCOMPLETE"), 1
     arrival_stop, arrival_errors = threading.Event(), []
     arrival_thread = None
     try:
-        for row in layouts[initial]:
-            backend.start(row["bundle_id"], row["tp_degree"], row["gpu_ids"])
+        backend.start_parallel(layouts[initial], activate=True)
         origin = time.monotonic()
         trigger = origin + args.trigger_s
 
@@ -589,7 +700,12 @@ def main(argv=None):
             ):
                 raise TimeoutError("finite lifecycle experiment deadline")
             time.sleep(0.1)
-        result = dict(status="COMPLETED", plan=executor.plan_status())
+        result, code = dict(status="COMPLETED", plan=executor.plan_status()), 0
+    except KeyboardInterrupt:
+        result, code = (
+            dict(status="INTERRUPTED", plan=executor.plan_status()),
+            130,
+        )
     except Exception as error:
         result, code = (
             dict(

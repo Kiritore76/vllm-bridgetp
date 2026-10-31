@@ -64,8 +64,14 @@ class ConversionExecutor:
     stay tracked and cannot be blindly replayed after a process restart.
     """
 
-    def __init__(self, registry, backend, journal_path):
+    def __init__(self, registry, backend, journal_path, clock=None):
+        """``clock`` (live runs) is read AFTER evidence I/O to judge freshness.
+
+        Without a clock the caller's ``now`` is used, which is only correct when
+        evidence cannot be sampled after it (deterministic CPU fixtures).
+        """
         self.registry, self.backend = registry, backend
+        self.clock = clock
         self.path = Path(journal_path)
         self.plan = None
         if self.path.exists():
@@ -203,9 +209,25 @@ class ConversionExecutor:
                 if self.plan["method"] != "DRAIN":
                     self.backend.assisted_step(self.plan, now)
                 evidence = self.backend.drain_evidence(self.plan)
-                if len(evidence) != len(self.refs()) or not all(
-                    row.drained(ref, now) for ref, row in zip(self.refs(), evidence)
-                ):
+                # Freshness is judged when the evidence is in hand. A decision
+                # time taken before the scrape would reject every new sample as
+                # "future" data and the drain could never complete.
+                evaluated_at = self.clock() if self.clock is not None else now
+                complete = (
+                    math.isfinite(evaluated_at)
+                    and evaluated_at >= now
+                    and len(evidence) == len(self.refs())
+                ) and all(
+                    row.drained(ref, evaluated_at)
+                    for ref, row in zip(self.refs(), evidence)
+                )
+                self.plan["last_drain_check"] = dict(
+                    decided_at=now,
+                    evaluated_at=evaluated_at,
+                    complete=complete,
+                    rows=[asdict(row) for row in evidence],
+                )
+                if not complete:
                     self.save("waiting for complete fresh drain evidence")
                     return self.plan_status()
                 if not self.backend.fence(self.plan):
