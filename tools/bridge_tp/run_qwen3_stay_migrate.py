@@ -667,6 +667,14 @@ def main(argv=None):
                 plan["run_dir"].parent / "comparison_metrics.json",
                 dict(summary=summary, requests=requests),
             )
+            if args.conversion:
+                from tools.bridge_tp.conversion_acceptance import assess
+
+                row["conversion"] = assess(plan["run_dir"].parent)
+                write(
+                    plan["run_dir"].parent / "conversion_acceptance.json",
+                    row["conversion"],
+                )
             row.update(status="COMPLETED", summary=summary, closed_loop=proof)
             if args.long_burst_memory_verify:
                 row["history_memory"] = long_burst.assess_memory(plan, summary)
@@ -826,6 +834,7 @@ def main(argv=None):
                     len(ledger) == 1
                     and ledger[0]["status"] == "COMPLETED"
                     and conversion["state"] == "COMPLETED"
+                    and ledger[0]["conversion"]["passed"]
                 )
                 result, code = (
                     (dict(status="COMPLETED_CONVERSION", edge=args.conversion), 0)

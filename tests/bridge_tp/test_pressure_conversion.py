@@ -363,6 +363,43 @@ class ConversionTests(unittest.TestCase):
             self.assertEqual(
                 harness.registry.instances[instance_id].lifecycle, "ACTIVE"
             )
+        # S3b-4: the reusable acceptance agrees with the checks above.
+        from tools.bridge_tp import conversion_acceptance as acceptance
+
+        events = root / "conversion_events.jsonl"
+        events.write_text("".join(json.dumps(e) + "\n" for e in harness.events))
+        (root / "conversion_result.json").write_text(json.dumps(outcome))
+        value = acceptance.assess(root, run_dir=root)
+        self.assertTrue(value["passed"], value["checks"])
+        self.assertEqual(value["retired"], retired)
+        self.assertEqual(value["new_instances"], added)
+        self.assertTrue(set(value["first_request_after_publish_s"]) <= set(added))
+        self.assertIsNone(value["service_by_arrival_phase"])  # no runner metrics
+        self.assertGreaterEqual(value["phases_s"]["drain"], 0.3)
+        self.assertGreater(sum(value["drain_inflight_peak"].values()), 0)
+        self.assertEqual(
+            sum(sum(c.values()) for c in value["routes_by_phase"].values()),
+            len(result),
+        )
+        # A single admission to a retired instance after quiesce fails it.
+        rows = (root / "pressure_audit.jsonl").read_text().splitlines()
+        forged = dict(
+            kind="pressure_dispatch",
+            job_id="forged",
+            pool=next(
+                r["legacy_pool"] or r["instance_id"]
+                for r in harness.manifest["instances"]
+                if r["instance_id"] in retired
+            ),
+            admission_finished_unix_s=quiesced + 0.5,
+        )
+        (root / "pressure_audit.jsonl").write_text(
+            "\n".join(rows + [json.dumps(forged)]) + "\n"
+        )
+        value = acceptance.assess(root, run_dir=root)
+        self.assertFalse(value["passed"])
+        self.assertFalse(value["checks"]["no_admission_to_retired_after_quiesce"])
+        self.assertEqual(value["admitted_to_retired_after_quiesce"], ["forged"])
         return audit
 
     def test_split_retires_pair_target_and_routes_to_new_tp1(self):
