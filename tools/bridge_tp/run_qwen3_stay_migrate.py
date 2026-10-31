@@ -93,10 +93,12 @@ def serving_preflight(plans):
         plan["config_path"].parent.mkdir(parents=True, exist_ok=True)
         write(plan["config_path"], plan["config"])
         pilot.write_instances(plan)
-        for role in ("source", "target"):
-            parsed = make_arg_parser(FlexibleArgumentParser()).parse_args(
-                plan[role + "_argv"][3:]
-            )
+        argvs = [plan["source_argv"], plan["target_argv"]] + [
+            pilot.extra_engine(plan, extra)[0]
+            for extra in plan.get("extra_engines", ())
+        ]
+        for argv in argvs:
+            parsed = make_arg_parser(FlexibleArgumentParser()).parse_args(argv[3:])
             validate_parsed_serve_args(parsed)
         phase8_stager.parse_args(plan["stager_argv"][2:])
         parsed = pilot.controller.parse_args(

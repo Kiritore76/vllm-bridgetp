@@ -559,10 +559,12 @@ def main():
         for _, _, _, plan in build_plans(
             spec, config, inputs, Path(temp), common, settings
         ):
-            for pool in ("source", "target"):
-                actual = make_arg_parser(FlexibleArgumentParser()).parse_args(
-                    plan[pool + "_argv"][3:]
-                )
+            argvs = [plan["source_argv"], plan["target_argv"]] + [
+                pilot.extra_engine(plan, extra)[0]
+                for extra in plan.get("extra_engines", ())
+            ]
+            for argv in argvs:
+                actual = make_arg_parser(FlexibleArgumentParser()).parse_args(argv[3:])
                 validate_parsed_serve_args(actual)
             phase8_stager.parse_args(plan["stager_argv"][2:])
             pilot.write_instances(plan)

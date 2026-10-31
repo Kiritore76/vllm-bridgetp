@@ -317,6 +317,7 @@ def build_scene(spec, scene, run_root, common, args):
     # Instance identities for the fixed pair; the controller still runs on the
     # historical tp1/tp4 pool ids, recorded here as aliases.
     instance_pool = load("instance_pool")
+    pair_bundles, extras = layout_extras(spec, args, target_tp, run_dir)
     registry, aliases = instance_pool.fixed_pair_registry(
         source_gpu=args.tp1_gpu,
         target_gpus=devices_of(args),
@@ -325,11 +326,25 @@ def build_scene(spec, scene, run_root, common, args):
         identity=str(args.model_path),
         source_context_limit=args.max_model_len,
         target_context_limit=args.tp4_max_model_len,
+        source_bundle=pair_bundles[0],
+        target_bundle=pair_bundles[1],
+        extras=extras,
     )
+    instances = instance_pool.registry_manifest(registry, aliases)
+    paired = set(aliases.values())
+    by_endpoint = {e["endpoint"]: e for e in extras}
+    for row in instances["instances"]:
+        if row["instance_id"] not in paired:
+            extra = by_endpoint[row["endpoint"]]
+            extra["instance_id"] = row["instance_id"]
+            extra["inventory_path"] = row["inventory_path"] = str(
+                run_dir / f"inventory_{row['instance_id']}.jsonl"
+            )
     return dict(
         run_dir=run_dir,
-        instances=instance_pool.registry_manifest(registry, aliases),
+        instances=instances,
         instances_path=instances_path,
+        extra_engines=extras,
         config=config,
         config_path=config_path,
         source_env=source,
@@ -339,6 +354,75 @@ def build_scene(spec, scene, run_root, common, args):
         stager_argv=stager_argv,
         controller_argv=argv,
     )
+
+
+def layout_extras(spec, args, target_tp, run_dir):
+    """Routing-only engines of ``spec["layout"]`` beside the migration pair.
+
+    The layout must contain the pair (TP1 on ``tp1_gpu``, TP-k on ``tp4_gpus``);
+    single-class layouts have no pair and belong to the conversion runner.
+    Returns the pair's bundle ids and one dict per extra engine.
+    """
+    layout = spec.get("layout")
+    if not layout:
+        return ("A", "B"), []
+    rows = load("instance_pool").layouts(target_tp, list(layout["bundle_gpus"]))[
+        layout["name"]
+    ]
+    source = [r for r in rows if r["tp_degree"] == 1 and r["gpu_ids"] == [args.tp1_gpu]]
+    target = [
+        r
+        for r in rows
+        if r["tp_degree"] == target_tp and r["gpu_ids"] == devices_of(args)
+    ]
+    if len(source) != 1 or len(target) != 1:
+        raise ValueError("layout must contain the TP1 source and TP-k target pair")
+    extras = []
+    for index, row in enumerate(r for r in rows if r not in (source[0], target[0])):
+        port = int(layout["base_port"]) + index
+        extras.append(
+            dict(
+                bundle=row["bundle_id"],
+                tp=row["tp_degree"],
+                gpus=row["gpu_ids"],
+                port=port,
+                endpoint=f"http://127.0.0.1:{port}",
+                context_limit=args.max_model_len
+                if row["tp_degree"] == 1
+                else args.tp4_max_model_len,
+            )
+        )
+    return (source[0]["bundle_id"], target[0]["bundle_id"]), extras
+
+
+def extra_engine(plan, extra):
+    """Serving argv/env of one routing-only engine, from the final pair plan.
+
+    Same serving flags as the pair engine of its TP class (whatever the runner
+    appended), without the migration connector or any source publisher.
+    """
+    template = plan["source_argv"] if extra["tp"] == 1 else plan["target_argv"]
+    argv = list(template)
+    if "--kv-transfer-config" in argv:
+        index = argv.index("--kv-transfer-config")
+        del argv[index : index + 2]
+    argv[argv.index("--port") + 1] = str(extra["port"])
+    env = {
+        k: v
+        for k, v in plan["target_env"].items()
+        if not k.startswith(("BRIDGETP_TAKEOVER", "BRIDGETP_STREAM_"))
+    }
+    env.update(
+        CUDA_VISIBLE_DEVICES=",".join(extra["gpus"]),
+        OMP_NUM_THREADS="1",
+        BRIDGETP_PRESSURE_INVENTORY_PATH=extra["inventory_path"],
+        BRIDGETP_PRESSURE_POOL=extra["instance_id"],
+    )
+    if "BRIDGETP_PERFORMANCE_TRACE_DIR" in env:
+        env["BRIDGETP_PERFORMANCE_TRACE_DIR"] = str(
+            Path(env["BRIDGETP_PERFORMANCE_TRACE_DIR"]).parent / extra["instance_id"]
+        )
+    return argv, env
 
 
 def write_instances(plan):
@@ -545,21 +629,32 @@ def run_scene(
         migration_id=scene["name"],
         source_request_id_prefix="pressure-unselected-" + secrets.token_hex(16),
     ).write(mechanism_dir)
+    engines = {
+        extra["instance_id"]: extra_engine(plan, extra)
+        for extra in plan.get("extra_engines", ())
+    }
     common.write_json(
         root / "effective_argv.json",
-        {k: v for k, v in plan.items() if k.endswith("_argv")},
+        {k: v for k, v in plan.items() if k.endswith("_argv")}
+        | ({"extra_argv": {k: v[0] for k, v in engines.items()}} if engines else {}),
     )
+
+    def recorded(env):
+        return {
+            key: value
+            for key, value in env.items()
+            if key.startswith(("BRIDGETP_", "CUDA_", "NCCL_", "VLLM_", "OMP_"))
+            and not key.endswith("_TOKEN")
+        }
+
     common.write_json(
         root / "effective_environment.json",
-        {
-            name: {
-                key: value
-                for key, value in plan[name + "_env"].items()
-                if key.startswith(("BRIDGETP_", "CUDA_", "NCCL_", "VLLM_", "OMP_"))
-                and not key.endswith("_TOKEN")
-            }
-            for name in ("source", "target")
-        },
+        {name: recorded(plan[name + "_env"]) for name in ("source", "target")}
+        | (
+            {"extra": {k: recorded(v[1]) for k, v in engines.items()}}
+            if engines
+            else {}
+        ),
     )
     try:
         if diagnose_pauses:
@@ -603,6 +698,25 @@ def run_scene(
         common.wait_healthy(
             plan["config"]["source_url"], source, spec["startup_timeout_s"]
         )
+        extras = []
+        for extra in plan.get("extra_engines", ()):
+            argv, env = engines[extra["instance_id"]]
+            announce(scene["name"], "启动只路由实例", instance=extra["instance_id"])
+            extras.append(
+                (
+                    extra,
+                    common.start_process(
+                        extra["instance_id"],
+                        argv,
+                        env,
+                        root / f"{extra['instance_id']}.log",
+                    ),
+                )
+            )
+            processes.append(extras[-1][1])
+        publish_processes()
+        for extra, process in extras:
+            common.wait_healthy(extra["endpoint"], process, spec["startup_timeout_s"])
         announce(scene["name"], "TP1就绪；开始warmup")
         requests = [job["request"] for job in read(scene["arrivals"])]
         for pool in ("source", "target"):
@@ -611,6 +725,14 @@ def run_scene(
                 plan["config"][pool + "_url"],
                 requests,
                 root / (pool + "_warmup.json"),
+                spec["run_timeout_s"],
+            )
+        for extra, _ in extras:
+            announce(scene["name"], "warmup", pool=extra["instance_id"])
+            warmup_prompt_shapes(
+                extra["endpoint"],
+                requests,
+                root / f"{extra['instance_id']}_warmup.json",
                 spec["run_timeout_s"],
             )
         if before_workload is not None:
@@ -808,8 +930,11 @@ def main():
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
     for plan in plans:
-        for key in ("source_argv", "target_argv"):
-            actual = make_arg_parser(FlexibleArgumentParser()).parse_args(plan[key][3:])
+        argvs = [plan["source_argv"], plan["target_argv"]] + [
+            extra_engine(plan, extra)[0] for extra in plan.get("extra_engines", ())
+        ]
+        for argv in argvs:
+            actual = make_arg_parser(FlexibleArgumentParser()).parse_args(argv[3:])
             validate_parsed_serve_args(actual)
         phase8_stager.parse_args(plan["stager_argv"][2:])
         write_instances(plan)

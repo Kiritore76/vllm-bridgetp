@@ -244,35 +244,53 @@ def fixed_pair_registry(
     identity,
     source_context_limit,
     target_context_limit,
+    source_bundle="A",
+    target_bundle="B",
+    extras=(),
 ):
     """Registry of the fixed TP1 source / TP-k target pilot.
 
-    The source is bundle A and the target bundle B, named like the bundle
-    runner (``<bundle>-g<generation>-tp<k>``). The controller still uses the
-    historical pool ids; they are returned as aliases of the instance ids.
+    Named like the bundle runner (``<bundle>-g<generation>-tp<k>``): the source
+    is generation 1, the target 2, routing-only ``extras`` (dicts with bundle,
+    tp, gpus, endpoint, context_limit) 3, 4, ... The controller still uses the
+    historical pool ids; they are returned as aliases of the pair's ids.
     """
     registry = Registry()
     target_tp = len(target_gpus)
-    rows = (
+    rows = [
         InstanceRecord(
-            InstanceRef("A-g1-tp1", 1),
+            InstanceRef(f"{source_bundle}-g1-tp1", 1),
             1,
             (str(source_gpu),),
-            "A",
+            source_bundle,
             source_url,
             identity,
             source_context_limit,
         ),
         InstanceRecord(
-            InstanceRef(f"B-g2-tp{target_tp}", 2),
+            InstanceRef(f"{target_bundle}-g2-tp{target_tp}", 2),
             target_tp,
             tuple(str(gpu) for gpu in target_gpus),
-            "B",
+            target_bundle,
             target_url,
             identity,
             target_context_limit,
         ),
-    )
+    ]
+    for generation, extra in enumerate(extras, start=3):
+        rows.append(
+            InstanceRecord(
+                InstanceRef(
+                    f"{extra['bundle']}-g{generation}-tp{extra['tp']}", generation
+                ),
+                extra["tp"],
+                tuple(str(gpu) for gpu in extra["gpus"]),
+                extra["bundle"],
+                extra["endpoint"],
+                identity,
+                extra["context_limit"],
+            )
+        )
     for row in rows:
         registry.register(row)
     aliases = {

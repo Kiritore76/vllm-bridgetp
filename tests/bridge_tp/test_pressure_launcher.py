@@ -320,6 +320,129 @@ class LauncherTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "outstanding reservation"):
                 launch.scene_result(run, "both-light")
 
+    def test_layout_adds_routing_only_engines_beside_the_pair(self):
+        """S1-d1b: L1A on A={2,3}, B={0,1} adds TP1@3 next to TP1@2 -> TP2(0,1)."""
+        context = dict(
+            argparse=argparse,
+            Path=Path,
+            os=os,
+            json=json,
+            model_kv_geometry=lambda *args: (8, 196608),
+        )
+        functions(
+            "tools/bridge_tp/run_phase9_cap0_calibration.py",
+            {"server_command", "source_environment", "target_connector"},
+            context,
+        )
+        common = NS(
+            **{
+                key: context[key]
+                for key in ("server_command", "source_environment", "target_connector")
+            },
+            STAGER=Path("phase8_stager.py"),
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            template = root / "template.json"
+            template.write_text("{}", encoding="utf-8")
+            args = NS(
+                python_bin=Path("python"),
+                model_path=Path("qwen"),
+                dtype="bfloat16",
+                max_model_len=32768,
+                tp4_max_model_len=32768,
+                gpu_memory_utilization=0.88,
+                tp1_gpu="2",
+                tp4_gpus="0,1",
+                target_tp_size=2,
+                snapshot_port=29800,
+                delta_port=29900,
+                delivery_port=30000,
+                tp1_port=8001,
+                tp4_port=8200,
+                gpu_direct_base_port=30400,
+                persistent_channel=True,
+                channel_generation=1,
+                preconnect_persistent_channel=True,
+                gpu_direct_history=True,
+                gpu_direct_delta=True,
+                gpu_direct_delta_batch_tokens=16,
+                gpu_direct_delta_flush_ms=25,
+                ready_notification_port=30300,
+            )
+            spec = dict(
+                controller_config_template=str(template),
+                checkpoint="checkpoint.pt",
+                checkpoint_sha256=(
+                    "dbe02d968e19c32d69deaa9a37748e9ca68f506807b220c114d22a4e2845c8a7"
+                ),
+                policy_config="policy.json",
+                service_evidence="evidence.json",
+                run_timeout_s=900,
+                layout=dict(
+                    name="L1A", bundle_gpus=["2", "3", "0", "1"], base_port=8300
+                ),
+            )
+            scene = dict(name="l1a", arrivals="arrivals.json")
+            plan = launch.build_scene(spec, scene, root, common, args)
+            plan["source_argv"] += ["--enforce-eager", "--max-num-seqs", "16"]
+            plan["target_env"]["BRIDGETP_PERFORMANCE_TRACE_DIR"] = str(
+                root / "trace" / "target"
+            )
+            (extra,) = plan["extra_engines"]
+            self.assertEqual(
+                (extra["instance_id"], extra["gpus"], extra["port"]),
+                ("A-g3-tp1", ["3"], 8300),
+            )
+            manifest = plan["instances"]
+            self.assertEqual(
+                manifest["legacy_pool_aliases"], {"tp1": "A-g1-tp1", "tp4": "B-g2-tp2"}
+            )
+            row = next(
+                r for r in manifest["instances"] if r["instance_id"] == "A-g3-tp1"
+            )
+            self.assertEqual(row["endpoint"], "http://127.0.0.1:8300")
+            self.assertEqual(row["inventory_path"], extra["inventory_path"])
+            argv, env = launch.extra_engine(plan, extra)
+            self.assertNotIn("--kv-transfer-config", argv)
+            self.assertEqual(argv[argv.index("--port") + 1], "8300")
+            self.assertEqual(argv[argv.index("--tensor-parallel-size") + 1], "1")
+            self.assertIn("--enforce-eager", argv)
+            self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "3")
+            self.assertEqual(env["BRIDGETP_PRESSURE_POOL"], "A-g3-tp1")
+            self.assertEqual(
+                env["BRIDGETP_PERFORMANCE_TRACE_DIR"], str(root / "trace" / "A-g3-tp1")
+            )
+            self.assertFalse(
+                [
+                    k
+                    for k in env
+                    if k.startswith(("BRIDGETP_TAKEOVER", "BRIDGETP_STREAM_"))
+                ]
+            )
+            controller_args = launch.controller.parse_args(plan["controller_argv"][2:])
+            launch.write_instances(plan)
+            checked = launch.controller.instance_manifest(
+                controller_args, NS(target_tp_size=2)
+            )
+            self.assertEqual(
+                [r["instance_id"] for r in launch.controller.extra_instances(checked)],
+                ["A-g3-tp1"],
+            )
+            for layout in (
+                dict(name="L2", bundle_gpus=["2", "3", "0", "1"], base_port=8300),
+                dict(name="L0", bundle_gpus=["2", "3", "0", "1"], base_port=8300),
+                dict(name="L1A", bundle_gpus=["0", "1", "2", "3"], base_port=8300),
+            ):
+                with self.assertRaises(ValueError):
+                    launch.build_scene(
+                        dict(spec, layout=layout),
+                        dict(name="bad", arrivals="arrivals.json"),
+                        root,
+                        common,
+                        args,
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()
