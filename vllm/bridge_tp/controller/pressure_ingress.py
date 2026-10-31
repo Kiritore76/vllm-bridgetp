@@ -76,9 +76,12 @@ class PressureIngress:
         post=None,
         clock=time.time,
         reconcile_log_interval_s=0,
+        tp_of=None,
     ):
         self.coordinator, self.service, self.executor = coordinator, service, executor
         self.urls = {"tp1": source_url, "tp4": target_url}
+        # With TP degrees per pool id, route through the multi-instance entry.
+        self.tp_of = tp_of
         self.timeout_s, self.clock = timeout_s, clock
         # Complete visible tokens already live in the recorder and journal.
         # Keeping nested SSE chunk dicts in every Future duplicates that data.
@@ -117,15 +120,27 @@ class PressureIngress:
         key = "admission-" + client_id
         with self._lock:
             now = self.clock()
-            admission = self.coordinator.admission(
-                client_id,
-                len(prompt),
-                int(payload["max_tokens"]),
-                pools,
-                now=now,
-                key=key,
-                allowed_pool_id=allowed_pool_id,
-            )
+            if self.tp_of is None:
+                admission = self.coordinator.admission(
+                    client_id,
+                    len(prompt),
+                    int(payload["max_tokens"]),
+                    pools,
+                    now=now,
+                    key=key,
+                    allowed_pool_id=allowed_pool_id,
+                )
+            else:
+                admission = self.coordinator.admission_multi(
+                    client_id,
+                    len(prompt),
+                    int(payload["max_tokens"]),
+                    list(pools),
+                    self.tp_of,
+                    now,
+                    key,
+                    allowed_pool_id=allowed_pool_id,
+                )
             payload["max_tokens"] = admission.max_output_tokens
             recorder = ObservedRecorder(
                 client_id, self.service, admission.pool_id, self.clock, emission_sink

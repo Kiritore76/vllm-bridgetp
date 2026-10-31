@@ -312,6 +312,8 @@ def build_scene(spec, scene, run_root, common, args):
         argv.extend(["--health-reference", spec["health_reference"]])
     if multiple:
         argv.extend(["--maximum-migrations", str(spec["maximum_migrations"])])
+    instances_path = run_root / scene["name"] / "instances.json"
+    argv.extend(["--instances", str(instances_path)])
     # Instance identities for the fixed pair; the controller still runs on the
     # historical tp1/tp4 pool ids, recorded here as aliases.
     instance_pool = load("instance_pool")
@@ -327,7 +329,7 @@ def build_scene(spec, scene, run_root, common, args):
     return dict(
         run_dir=run_dir,
         instances=instance_pool.registry_manifest(registry, aliases),
-        instances_path=run_root / scene["name"] / "instances.json",
+        instances_path=instances_path,
         config=config,
         config_path=config_path,
         source_env=source,

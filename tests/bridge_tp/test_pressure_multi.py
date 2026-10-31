@@ -148,9 +148,12 @@ class MultiTickTests(unittest.TestCase):
                 {("tp1", "tp4"): [candidate()]},
                 {"a": started_new.bind("a", "s")},
             )
-            actual = new_records[-2 if started_new.calls else -1]
-            pair = actual["evaluations"][0]["pairs"][0]["decision"]
-            self.assertEqual(pair, asdict(expected))
+            self.assertEqual(len(new_records), len(old_records))
+            for old_row, new_row in zip(old_records, new_records):
+                # The fixed pair writes the historical record plus multi fields.
+                self.assertEqual({k: new_row[k] for k in old_row}, old_row)
+            decision = new_records[0]["evaluations"][0]["pairs"][0]["decision"]
+            self.assertEqual(decision, asdict(expected))
             self.assertEqual(started_new.calls, started_old.calls)
             self.assertEqual(new.ledger.snapshot(), old.ledger.snapshot())
             self.assertEqual(
@@ -298,3 +301,45 @@ class MultiTickTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ControllerManifestTests(unittest.TestCase):
+    def test_controller_accepts_only_the_fixed_pair(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace as NS
+
+        from tools.bridge_tp import run_pressure_balanced_pilot as pilot
+
+        pool_module = load("instance_pool")
+        registry, aliases = pool_module.fixed_pair_registry(
+            source_gpu="2",
+            target_gpus=["0", "1"],
+            source_url="s",
+            target_url="t",
+            identity="model",
+            source_context_limit=32768,
+            target_context_limit=32768,
+        )
+        manifest = pool_module.registry_manifest(registry, aliases)
+        controller = NS(target_tp_size=2)
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "instances.json"
+            args = NS(
+                instances=path, source_context_limit=32768, target_context_limit=32768
+            )
+            path.write_text(json.dumps(manifest))
+            self.assertEqual(pilot.instance_manifest(args, controller), manifest)
+            self.assertIsNone(pilot.instance_manifest(NS(instances=None), controller))
+            extra = dict(
+                manifest,
+                instances=manifest["instances"]
+                + [dict(manifest["instances"][0], instance_id="A-g3-tp1")],
+            )
+            path.write_text(json.dumps(extra))
+            with self.assertRaises(ValueError):
+                pilot.instance_manifest(args, controller)
+            path.write_text(json.dumps(manifest))
+            with self.assertRaises(ValueError):
+                pilot.instance_manifest(args, NS(target_tp_size=4))

@@ -83,6 +83,11 @@ def parse_args(argv=None):
         default=1,
         help="0 permits repeated serialized migrations",
     )
+    parser.add_argument(
+        "--instances",
+        type=Path,
+        help="launcher instance manifest; recorded and checked against tp1/tp4",
+    )
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--test-only-cancel-first-shadow", action="store_true")
     args = parser.parse_args(argv)
@@ -256,7 +261,11 @@ def preflight(args):
         )
         if getattr(args, "platform", "a100") == "qwen3"
         else "original A100 contract",
+        routing_entry="multi-instance (class ranking, then two-pool admit/decide)",
     )
+    manifest = instance_manifest(args, controller)
+    if manifest is not None:
+        receipt["instance_manifest"] = manifest
     return cfg, controller, lookup, jobs, receipt
 
 
@@ -277,6 +286,26 @@ def batch(inventory, now, cfg, reading):
     ):
         return None
     return value
+
+
+def instance_manifest(args, controller):
+    """Fixed-pair manifest; sessions and inventory are single-target until S1-d."""
+    if args.instances is None:
+        return None
+    manifest = read(args.instances)
+    aliases = manifest.get("legacy_pool_aliases", {})
+    rows = {row["instance_id"]: row for row in manifest.get("instances", ())}
+    if (
+        manifest.get("schema") != "BRIDGETP_INSTANCE_MANIFEST_V1"
+        or set(aliases) != {"tp1", "tp4"}
+        or set(aliases.values()) != set(rows)
+        or rows[aliases["tp1"]]["tp_degree"] != 1
+        or rows[aliases["tp4"]]["tp_degree"] != controller.target_tp_size
+        or rows[aliases["tp1"]]["context_limit"] != args.source_context_limit
+        or rows[aliases["tp4"]]["context_limit"] != args.target_context_limit
+    ):
+        raise ValueError("controller runs one TP1 source and one TP-k target only")
+    return manifest
 
 
 def unknown_routing_pools(args, block_size):
@@ -424,6 +453,9 @@ def _run(args, prepared):
     health_tokens = health_module.TokenWindows() if cfg.health_service else None
     service = o.NativeServiceWindow(health_observer=health_tokens)
     executor = ThreadPoolExecutor(max_workers=max(4, len(jobs) + 1))
+    # Fixed pair through the multi-instance entry points; identical behaviour
+    # and records for one instance per TP class.
+    tp_of = {"tp1": 1, "tp4": getattr(controller, "target_tp_size", 4)}
     ingress = i.PressureIngress(
         co,
         service,
@@ -431,6 +463,7 @@ def _run(args, prepared):
         controller.source_url,
         controller.target_url,
         reconcile_log_interval_s=1.0 if cfg.health_service else 0,
+        tp_of=tp_of,
     )
     session = PressureSessions(
         persistent_cleanup=cfg.shadow_cancel,
@@ -850,7 +883,13 @@ def _run(args, prepared):
                 }
             )
             load("pause_diagnostics").call(
-                "policy.tick", co.tick, now, pools[0], pools[1], candidates, actions
+                "policy.tick",
+                co.tick_multi,
+                now,
+                {"tp1": pools[0], "tp4": pools[1]},
+                tp_of,
+                {("tp1", "tp4"): candidates},
+                actions,
             )
             if session.record is not None and not session.settled:
                 session.poll_cancel(inventories[1], now, cfg.max_age_s)

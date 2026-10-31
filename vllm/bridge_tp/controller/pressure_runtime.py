@@ -331,24 +331,7 @@ class PressureCoordinator:
                 "reservation_before": before,
                 "execution": "ADVISORY",
                 "routing_relief": self.policy.relief.snapshot(),
-                "prediction_inputs": [
-                    dict(
-                        request_id=c.request_id,
-                        status=c.prediction_status,
-                        generated=c.generated,
-                        max_output_tokens=c.max_output_tokens,
-                        remaining_mean=c.remaining.mean
-                        if c.remaining is not None
-                        else None,
-                        prediction_age_s=c.prediction_age_s,
-                        prediction_lag=c.prediction_lag,
-                        point_method=(
-                            "probability-weighted integer-bin means; "
-                            "survival/lag/stop aligned"
-                        ),
-                    )
-                    for c in candidates
-                ],
+                "prediction_inputs": prediction_inputs(candidates),
             }
             if decision.request_id is None or actions is None:
                 record["reservation_after"] = self.ledger.snapshot()
@@ -524,6 +507,17 @@ class PressureCoordinator:
                 "reservation_before": before,
                 "execution": "ADVISORY",
             }
+            if len(evaluations) == 1 and len(targets) == 1:
+                # Fixed pair: keep the historical record that analysis reads.
+                s, t = sources[0], targets[0]
+                record.update(
+                    kind="pressure_decision",
+                    decision=asdict(evaluations[0]["best"]["decision"]),
+                    source_reading=asdict(self.ledger.routing_reading(readings[s])),
+                    target_reading=asdict(self.ledger.routing_reading(readings[t])),
+                    routing_relief=self.policy_for(s).relief.snapshot(),
+                    prediction_inputs=prediction_inputs(candidates.get((s, t), [])),
+                )
             if chosen is not None and actions is not None and not session_active:
                 s, t = chosen["source"], chosen["best"]["target"]
                 decision = chosen["best"]["decision"]
@@ -626,6 +620,24 @@ class PressureCoordinator:
                 "reservation_after": self.ledger.snapshot(),
             }
         self.audit(record)
+
+
+def prediction_inputs(candidates: list[Candidate]) -> list[dict]:
+    return [
+        dict(
+            request_id=c.request_id,
+            status=c.prediction_status,
+            generated=c.generated,
+            max_output_tokens=c.max_output_tokens,
+            remaining_mean=c.remaining.mean if c.remaining is not None else None,
+            prediction_age_s=c.prediction_age_s,
+            prediction_lag=c.prediction_lag,
+            point_method=(
+                "probability-weighted integer-bin means; survival/lag/stop aligned"
+            ),
+        )
+        for c in candidates
+    ]
 
 
 def json_reference(row: dict) -> str:

@@ -305,7 +305,7 @@ class DispatchTests(unittest.TestCase):
                 publish(url, after=completed)
             return dict(request_started_unix_s=completed, completed_unix_s=completed)
 
-        actual_tick = r.PressureCoordinator.tick
+        actual_tick = r.PressureCoordinator.tick_multi
 
         def slow_tick(co, *args, **kwargs):
             control_paused.set()
@@ -367,7 +367,7 @@ class DispatchTests(unittest.TestCase):
                 ),
                 patch.object(o, "scrape_inventory_metrics", return_value=None),
                 patch.object(i, "PressureIngress", side_effect=make_ingress),
-                patch.object(r.PressureCoordinator, "tick", slow_tick),
+                patch.object(r.PressureCoordinator, "tick_multi", slow_tick),
             ):
                 pilot._run(
                     args, (config(), controller, NS(release_budget=17), jobs, {})
