@@ -133,7 +133,8 @@ def score(rows, config):
                 if row["response"]["committed"] and token["origin"] == "target"
                 else row["initial_pool"]
             )
-            pools[pool] += weight
+            # Layout instances beyond the fixed pair get their own entry.
+            pools[pool] = pools.get(pool, 0.0) + weight
         active.append((max(origin, start), min(origin + horizon, times[-1])))
         records.append(
             dict(
@@ -230,7 +231,8 @@ def score(rows, config):
 
 def queue_summary(audit, origin, horizon):
     result = {}
-    for pool in ("tp1", "tp4"):
+    sampled = {r["pool"] for r in audit if r.get("kind") == "pressure_metrics_sample"}
+    for pool in ["tp1", "tp4"] + sorted(sampled - {"tp1", "tp4"}):
         samples = [
             r
             for r in audit

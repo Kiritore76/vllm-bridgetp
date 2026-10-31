@@ -213,7 +213,8 @@ def full_score(rows, cfg, origin, audit):
     score["groups"] = dict(
         initial_pool={
             p: request_group([r for r in cohort if r["initial_pool"] == p])
-            for p in ("tp1", "tp4")
+            for p in ["tp1", "tp4"]
+            + sorted({r["initial_pool"] for r in cohort} - {"tp1", "tp4"})
         },
         prompt={
             name: request_group(
@@ -248,7 +249,7 @@ def full_score(rows, cfg, origin, audit):
                     if row["response"]["committed"] and token["origin"] == "target"
                     else row["initial_pool"]
                 )
-                raw_pools[pool] += 1
+                raw_pools[pool] = raw_pools.get(pool, 0) + 1
     score["actual_pool_window_tokens"] = raw_pools
     score["token_itl_s"] = distribution(gaps)
     score["tail_interval_counts"] = {

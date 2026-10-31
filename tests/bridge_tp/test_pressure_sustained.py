@@ -83,6 +83,22 @@ class ScoreTests(unittest.TestCase):
             score["goodoutput_tokens_s"],
         )
 
+    def test_layout_instances_get_their_own_pool_entries(self):
+        """G2 (10-31): a routing instance beyond tp1/tp4 is scored, not a KeyError."""
+        extra = self.row([110, 110.05, 110.1])
+        extra.update(job_id="b", initial_pool="A-g3-tp1")
+        migrated = self.row([110, 110.05, 110.1], True)
+        migrated.update(job_id="c", initial_pool="A-g3-tp1")
+        score = s.score([self.row([110, 110.05]), extra, migrated], self.config)
+        pools = score["actual_pool_G"]
+        self.assertEqual(list(pools)[:2], ["tp1", "tp4"])
+        self.assertGreater(pools["A-g3-tp1"], 0)
+        self.assertGreater(pools["tp4"], 0)
+        self.assertAlmostEqual(sum(pools.values()), score["goodoutput_tokens_s"])
+        self.assertEqual(
+            score["slo_attainment"]["by_initial_pool"]["A-g3-tp1"]["requests"], 2
+        )
+
     def test_drain_tokens_excluded_but_drain_gap_affects_window_weight(self):
         score = s.score([self.row([101, 101.01, 400, 401])], self.config)
         row = score["request_rows"][0]
