@@ -1,0 +1,29 @@
+{
+  "schema": "BRIDGETP_CONVERSION_PROFILE_V1",
+  "platform": "4090D_QWEN3_8B",
+  "bundle_gpus": 2,
+  "context_limits": {"tp1": 32768, "tp2": 32768},
+  "gpu_memory_utilization": 0.88,
+  "stage_upper_s": {
+    "rebuild": {"TP2": 39.7, "TP1": 30.8},
+    "stop_to_released": 1.4,
+    "channel_retire": 0.7,
+    "controller_apply": 0.25
+  },
+  "speed_margin": 0.8,
+  "evidence": {
+    "qwen3_loaded_drain_20261031_171448_29158": {
+      "revision": "c39fe7649",
+      "rebuild_s": {"L0-L1A TP2": 39.58, "L1A-L2 TP2": 39.7, "L2-L1A TP1": 29.8, "L1A-L0 TP1": 29.8},
+      "release_s": [1.1, 1.38]
+    },
+    "qwen3_conversion_live_20261031_202458_18532": {
+      "revision": "da157eb61",
+      "rebuild_s": {"L1A-L2 TP2": 37.111, "L1A-L0 TP1": [28.824, 30.79]},
+      "stop_to_released_s": [1.303, 1.331],
+      "channel_retire_s": 0.613,
+      "controller_apply_s": [0.041, 0.201]
+    }
+  },
+  "note": "Upper envelope of single-run observations (pyc cache warm), not a calibrated distribution. speed_margin scales each request's observed tokens/s into a conservative lower speed. Valid only for the platform, bundle size, context limits and memory fraction above; anything else makes the planner UNKNOWN."
+}

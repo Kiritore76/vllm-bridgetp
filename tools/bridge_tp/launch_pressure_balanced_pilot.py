@@ -728,6 +728,7 @@ def timing_receipt(path, scene_failed):
 def start_conversion(spec, scene, plan, common, processes, publish, requests):
     """Bind the conversion backend to this scene's owned engines and start it."""
     from tools.bridge_tp import pressure_conversion as pc
+    from tools.bridge_tp.conversion_planner import ShadowPlanner, load_profile
 
     root, run_dir = plan["run_dir"].parent, plan["run_dir"]
     aliases = plan["instances"]["legacy_pool_aliases"]
@@ -796,6 +797,7 @@ def start_conversion(spec, scene, plan, common, processes, publish, requests):
         context_limits=plan["context_limits"],
         channel_plan=plan.get("channel_plan"),
         target_tp_ranks=target_tp if "tp4" in aliases else 0,
+        shadow_planner=ShadowPlanner(load_profile(), manifest["instances"]),
     )
     driver = pc.ConversionDriver(
         backend, plan["conversion"], root / "conversion_plan.json"

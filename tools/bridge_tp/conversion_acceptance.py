@@ -167,6 +167,41 @@ def assess(scene_dir, run_dir=None, events_path=None, metrics_path=None):
                 failures=[r["job_id"] for r in rows if not r["slo_pass"]],
             )
 
+    # S4 SHADOW planner: what it would have done, and how its drain-only
+    # estimate compares with the drain that happened (reported, not judged).
+    shadow_path = run_dir / "conversion_planner_shadow.jsonl"
+    shadow = None
+    if shadow_path.exists():
+        records = _jsonl(shadow_path)
+        valid = [r for r in records if "error" not in r]
+        first = valid[0] if valid else None
+        fenced = at("FENCED")
+        estimate = first["drain_only"]["estimated_clear_s"] if first else None
+        actual = (
+            fenced - first["snapshot_unix_s"]
+            if first is not None and fenced is not None
+            else None
+        )
+        shadow = dict(
+            records=len(records),
+            errors=len(records) - len(valid),
+            mechanism_decisions=dict(
+                Counter(r["mechanism"]["decision"] for r in valid)
+            ),
+            net_utility_decisions=dict(
+                Counter(r["net_utility"]["decision"] for r in valid)
+            ),
+            first_drain_only_clear_s=_round(estimate),
+            first_actual_clear_s=_round(actual),
+            first_clear_error_s=_round(estimate - actual)
+            if estimate is not None and actual is not None
+            else None,
+            first_predicted_saving_s=_round(
+                first["mechanism"].get("predicted_clear_saving_s")
+            )
+            if first
+            else None,
+        )
     result = json.loads((scene_dir / "conversion_result.json").read_text("utf-8"))
     final = [r for r in audit if r["kind"] == "pressure_final"]
     checks = dict(
@@ -205,6 +240,7 @@ def assess(scene_dir, run_dir=None, events_path=None, metrics_path=None):
         first_request_after_publish_s=first_new,
         conversion_window=window,
         service_by_arrival_phase=service,
+        planner_shadow=shadow,
         scope="one conversion; mechanism checks decide pass; service is "
         "reported by phase, not judged",
     )

@@ -359,6 +359,32 @@ def pair_pools(manifest):
     return tuple(p for p in ("tp1", "tp4") if p in manifest["legacy_pool_aliases"])
 
 
+# Remaining-output quantiles published per request for the conversion planner.
+REMAINING_QUANTILES = (0.5, 0.75, 0.9, 0.95, 0.99, 1.0)
+
+
+def remaining_bins(row, candidate):
+    """Conservative remaining-token bins [(upper_tokens, mass), ...] of a request.
+
+    The hard bound (max output minus generated) always holds; a fresh
+    predictor distribution tightens it. Each quantile slice's mass is put at
+    its upper edge, so the bins never understate the remaining output.
+    """
+    cap = max(0, row["max_output_tokens"] - row["generated"])
+    remaining = getattr(candidate, "remaining", None)
+    if remaining is None or remaining.deterministic:
+        return [(cap, 1.0)], "HARD_CAP" if remaining is None else "DETERMINISTIC"
+    bins, previous = [], 0.0
+    for q in REMAINING_QUANTILES:
+        upper = min(cap, remaining.quantile(q))
+        if bins and bins[-1][0] == upper:
+            bins[-1] = (upper, q - previous + bins[-1][1])
+        else:
+            bins.append((upper, q - previous))
+        previous = q
+    return [(u, round(m, 6)) for u, m in bins], "PREDICTED"
+
+
 def channel_sources(manifest):
     """Routing-only TP1 rows that also own a migration channel (S1-d2c)."""
     return [r for r in extra_instances(manifest) if r.get("migration_channel")]
@@ -695,8 +721,33 @@ def _run(args, prepared):
                 sampler.close()
                 owner.remove(sampler)
 
-    layout_state = dict(signature=None, revision=None, status_at=-math.inf)
+    layout_state = dict(
+        signature=None, revision=None, status_at=-math.inf, candidates={}
+    )
     instance_of = dict(manifest["legacy_pool_aliases"]) if manifest else {}
+
+    def request_rows(raw):
+        rows = []
+        for row in raw["requests"]:
+            candidate = layout_state["candidates"].get(row["request_id"])
+            bins, basis = remaining_bins(row, candidate)
+            rows.append(
+                dict(
+                    request_id=row["request_id"],
+                    generated=row["generated"],
+                    max_output_tokens=row["max_output_tokens"],
+                    remaining_bins=bins,
+                    remaining_basis=basis,
+                    tokens_s=getattr(candidate, "source_tokens_s", None),
+                    transfer_bytes=getattr(candidate, "transfer_bytes", None),
+                    # Only a migration source's candidate can be started.
+                    action_available=candidate is not None
+                    and candidate.action_available
+                    and not candidate.migrating
+                    and not candidate.finished,
+                )
+            )
+        return rows
 
     def publish_layout_status(now, polled, dispatched):
         """Controller-side drain evidence per instance for the conversion executor.
@@ -734,6 +785,7 @@ def _run(args, prepared):
                 ),
                 streams_pending=streams.get(pool, 0),
                 sessions=sessions.get(pool, 0),
+                requests=[] if raw is None else request_rows(raw),
                 inventory=None
                 if raw is None
                 else dict(
@@ -753,6 +805,11 @@ def _run(args, prepared):
                     unix_s=time.time(),
                     layout_revision=layout_state["revision"],
                     instances=instances,
+                    # Measured START-to-source-release budget (S4 planner).
+                    release_budget_s=lookup.release_budget,
+                    migration_target=instance_of.get("tp4", "tp4")
+                    if "tp4" in polled and polled["tp4"] is not None
+                    else None,
                 )
             ),
             encoding="utf-8",
@@ -1100,6 +1157,8 @@ def _run(args, prepared):
             # not-yet-observed instances simply drop out (S3b-1).
             t = index_of.get("tp4")
             candidates_by_source, runtimes, rates_by_source = {}, {}, {}
+            # Published (next tick) with each request's planner row.
+            layout_state["candidates"] = {}
             for source_id, inventory_path, source_predictor in migration_sources:
                 if t is None or source_id not in index_of:
                     continue
@@ -1197,6 +1256,9 @@ def _run(args, prepared):
                     (pools[n].free_blocks - cfg.capacity_guard_blocks)
                     * pools[n].block_size,
                     eos,
+                )
+                layout_state["candidates"].update(
+                    (c.request_id, c) for c in candidates_by_source[source_id]
                 )
                 growth = pools[n].growth_blocks_s
                 guard_time = (

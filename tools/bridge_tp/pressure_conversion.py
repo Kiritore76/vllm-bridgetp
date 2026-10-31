@@ -94,6 +94,7 @@ class ControllerConversionBackend:
         channel_plan=None,
         target_tp_ranks=0,
         clock=time.time,
+        shadow_planner=None,
     ):
         self.registry, self.ops, self.clock = registry, ops, clock
         self.run_dir = Path(run_dir)
@@ -105,6 +106,8 @@ class ControllerConversionBackend:
         self.started = {}
         self.warm = {}
         self.channel_closing = None
+        # S4: read-only planner consulted while draining; never acts.
+        self.shadow_planner, self.shadow_at = shadow_planner, -float("inf")
         self.reported_unacknowledged = False
         self.lock = threading.Lock()
         # Engines are serving when the controller starts: the manifest's
@@ -180,10 +183,25 @@ class ControllerConversionBackend:
         # Migration assist (S5) is the response; DRAIN only waits.
         return False
 
+    def shadow(self, plan, status):
+        now = self.clock()
+        if self.shadow_planner is None or now - self.shadow_at < 1:
+            return
+        self.shadow_at = now
+        try:
+            record = self.shadow_planner(plan, status, now)
+        except Exception as error:  # a planner fault must never stop the drain
+            record = dict(evaluated_unix_s=now, error=repr(error))
+        with (self.run_dir / "conversion_planner_shadow.jsonl").open(
+            "a", encoding="utf-8"
+        ) as stream:
+            stream.write(json.dumps(record) + "\n")
+
     def drain_evidence(self, plan):
         value = self.status()
         if value is None:
             return []
+        self.shadow(plan, value)
         evidence = []
         for ref in self.refs(plan):
             state = value["instances"].get(ref.instance_id)

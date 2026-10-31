@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from tests.bridge_tp.test_performance_trace import journal
 from tests.bridge_tp.test_pressure_policy import config
+from tools.bridge_tp import conversion_planner
 from tools.bridge_tp import pressure_conversion as pc
 from tools.bridge_tp import run_pressure_balanced_pilot as pilot
 from tools.bridge_tp.pressure_cpu import load
@@ -139,6 +140,9 @@ class Harness:
             context_limits=(8192, 8192),
             channel_plan=self.channel_plan,
             target_tp_ranks=2,
+            shadow_planner=conversion_planner.ShadowPlanner(
+                conversion_planner.load_profile(), manifest["instances"]
+            ),
         )
         self.driver = pc.ConversionDriver(
             self.backend,
@@ -375,6 +379,16 @@ class ConversionTests(unittest.TestCase):
         self.assertEqual(value["new_instances"], added)
         self.assertTrue(set(value["first_request_after_publish_s"]) <= set(added))
         self.assertIsNone(value["service_by_arrival_phase"])  # no runner metrics
+        # S4: the SHADOW planner ran while draining and never failed. This
+        # harness serves 8192 context, outside the frozen profile: UNKNOWN.
+        shadow = value["planner_shadow"]
+        self.assertGreaterEqual(shadow["records"], 1)
+        self.assertEqual(shadow["errors"], 0)
+        first = json.loads(
+            (root / "conversion_planner_shadow.jsonl").read_text().splitlines()[0]
+        )
+        self.assertIn("context", first["profile_mismatch"])
+        self.assertEqual(first["drain_only"]["support_status"], "UNKNOWN")
         self.assertGreaterEqual(value["phases_s"]["drain"], 0.3)
         self.assertGreater(sum(value["drain_inflight_peak"].values()), 0)
         self.assertEqual(
