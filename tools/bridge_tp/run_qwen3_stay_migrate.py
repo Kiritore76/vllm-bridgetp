@@ -65,17 +65,22 @@ def adapt_plan(plan, arm, checkpoint, model):
 def prepare_native(plan, common):
     from tools.bridge_tp.run_pressure_calibration import wait_empty
 
-    rows = wait_empty(plan["run_dir"])
-    if "expected_context_limits" in plan:
-        for row, limit in zip(rows, plan["expected_context_limits"]):
-            if row["context_limit"] != limit or (
-                row["free_blocks"] * row["block_size"] < limit + 125 * row["block_size"]
-            ):
-                raise ValueError("expanded context or native KV headroom differs")
-    plan["config"].update(
-        tp1_total_kv_blocks=rows[0]["total_blocks"],
-        tp4_total_kv_blocks=rows[1]["total_blocks"],
-    )
+    # A single-class layout starts one side of the pair; the absent side keeps
+    # the template geometry (no inventory, never routed).
+    pools = [p for p in ("source", "target") if p not in pilot.absent_pair(plan)]
+    rows = wait_empty(plan["run_dir"], pools=pools)
+    by_pool = dict(zip(pools, rows))
+    limits = dict(zip(("source", "target"), plan.get("expected_context_limits", ())))
+    for pool, row in by_pool.items():
+        limit = limits.get(pool)
+        if limit is not None and (
+            row["context_limit"] != limit
+            or row["free_blocks"] * row["block_size"] < limit + 125 * row["block_size"]
+        ):
+            raise ValueError("expanded context or native KV headroom differs")
+    for pool, key in (("source", "tp1"), ("target", "tp4")):
+        if pool in by_pool:
+            plan["config"][key + "_total_kv_blocks"] = by_pool[pool]["total_blocks"]
     plan["config"]["policy"]["kv_bytes_per_token"] = 147456
     common.write_json(plan["config_path"], plan["config"])
     common.write_json(plan["run_dir"].parent / "native_initial_receipt.json", rows)
@@ -93,14 +98,18 @@ def serving_preflight(plans):
         plan["config_path"].parent.mkdir(parents=True, exist_ok=True)
         write(plan["config_path"], plan["config"])
         pilot.write_instances(plan)
-        argvs = [plan["source_argv"], plan["target_argv"]] + [
+        absent = pilot.absent_pair(plan)
+        argvs = [
+            plan[side + "_argv"] for side in ("source", "target") if side not in absent
+        ] + [
             pilot.extra_engine(plan, extra)[0]
             for extra in plan.get("extra_engines", ())
         ]
         for argv in argvs:
             parsed = make_arg_parser(FlexibleArgumentParser()).parse_args(argv[3:])
             validate_parsed_serve_args(parsed)
-        phase8_stager.parse_args(plan["stager_argv"][2:])
+        if not absent:
+            phase8_stager.parse_args(plan["stager_argv"][2:])
         parsed = pilot.controller.parse_args(
             plan["controller_argv"][2:] + ["--validate-only"]
         )

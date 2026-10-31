@@ -104,13 +104,12 @@ def latest_inventory(path):
     return None
 
 
-def wait_empty(run_dir, timeout_s=30, after_generations=None):
+def wait_empty(
+    run_dir, timeout_s=30, after_generations=None, pools=("source", "target")
+):
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        rows = [
-            latest_inventory(run_dir / f"{p}_inventory.jsonl")
-            for p in ("source", "target")
-        ]
+        rows = [latest_inventory(run_dir / f"{p}_inventory.jsonl") for p in pools]
         # Native inventory is event driven: a correctly idle pool may not append
         # another row. Require advancement after the measured work, not a fake
         # heartbeat on the previously accepted empty state.

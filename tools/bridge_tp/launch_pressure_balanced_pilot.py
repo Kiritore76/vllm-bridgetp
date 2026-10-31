@@ -350,12 +350,15 @@ def build_scene(spec, scene, run_root, common, args):
                 extra["predictor_events"] = row["predictor_events"] = str(
                     run_dir / f"predictor_events_{row['instance_id']}.jsonl"
                 )
-    sources = source_channel_list(args, aliases["tp1"], extras)
+    if set(aliases) != {"tp1", "tp4"}:
+        # Single-class layout: routing only, nothing to migrate between.
+        argv.append("--no-migration")
+    sources = (
+        source_channel_list(args, aliases["tp1"], extras) if "tp1" in aliases else []
+    )
     if len(sources) > 1:
         connector = json.loads(target_argv[-1])
-        connector["kv_connector_extra_config"]["bridgetp_gpu_direct_sources"] = (
-            sources
-        )
+        connector["kv_connector_extra_config"]["bridgetp_gpu_direct_sources"] = sources
         target_argv[-1] = json.dumps(connector)
     return dict(
         run_dir=run_dir,
@@ -376,9 +379,11 @@ def build_scene(spec, scene, run_root, common, args):
 def layout_extras(spec, args, target_tp, run_dir):
     """Routing-only engines of ``spec["layout"]`` beside the migration pair.
 
-    The layout must contain the pair (TP1 on ``tp1_gpu``, TP-k on ``tp4_gpus``);
-    single-class layouts have no pair and belong to the conversion runner.
-    Returns the pair's bundle ids and one dict per extra engine.
+    A mixed layout must contain the pair (TP1 on ``tp1_gpu``, TP-k on
+    ``tp4_gpus``). A single-class layout (L0: all TP1, L2: all TP-k) keeps only
+    the side of its class, on the same GPUs, and runs without migration.
+    Returns the pair's bundle ids (``None`` for an absent side) and one dict
+    per extra engine.
     """
     layout = spec.get("layout")
     if not layout:
@@ -395,10 +400,16 @@ def layout_extras(spec, args, target_tp, run_dir):
         for r in rows
         if r["tp_degree"] == target_tp and r["gpu_ids"] == devices_of(args)
     ]
-    if len(source) != 1 or len(target) != 1:
+    classes = {r["tp_degree"] for r in rows}
+    if len(classes) == 1 and channels:
+        raise ValueError("single-class layouts have no migration channels")
+    if len(source) + len(target) != (2 if len(classes) == 2 else 1) or (
+        classes == {1} and not source or classes == {target_tp} and not target
+    ):
         raise ValueError("layout must contain the TP1 source and TP-k target pair")
     extras, sources = [], 0
-    for index, row in enumerate(r for r in rows if r not in (source[0], target[0])):
+    pair = source + target
+    for index, row in enumerate(r for r in rows if r not in pair):
         port = int(layout["base_port"]) + index
         extras.append(
             dict(
@@ -418,7 +429,20 @@ def layout_extras(spec, args, target_tp, run_dir):
             extras[-1]["migration_channel"] = dict(
                 base_port=int(args.gpu_direct_base_port) + 10 * sources
             )
-    return (source[0]["bundle_id"], target[0]["bundle_id"]), extras
+    return (
+        source[0]["bundle_id"] if source else None,
+        target[0]["bundle_id"] if target else None,
+    ), extras
+
+
+def absent_pair(plan):
+    """Pair sides ("source"/"target") a single-class layout does not start."""
+    aliases = plan.get("instances", {}).get("legacy_pool_aliases", {"tp1": 0, "tp4": 0})
+    return [
+        side
+        for side, pool in (("source", "tp1"), ("target", "tp4"))
+        if pool not in aliases
+    ]
 
 
 def source_channel_list(args, pair_source_id, extras):
@@ -746,28 +770,34 @@ def run_scene(
                 root / "host_monitor.log",
             )
             processes.append(monitor)
+        absent = absent_pair(plan)
         target_label = f"TP{plan['config'].get('target_tp_size', 4)}"
-        announce(scene["name"], f"启动{target_label}服务，等待就绪")
-        target = common.start_process(
-            f"target {target_label}",
-            plan["target_argv"],
-            plan["target_env"],
-            root / "target.log",
-        )
-        processes.append(target)
-        publish_processes()
-        common.wait_healthy(
-            plan["config"]["target_url"], target, spec["startup_timeout_s"]
-        )
-        announce(scene["name"], f"{target_label}就绪；启动TP1服务")
-        source = common.start_process(
-            "source TP1", plan["source_argv"], plan["source_env"], root / "source.log"
-        )
-        processes.append(source)
-        publish_processes()
-        common.wait_healthy(
-            plan["config"]["source_url"], source, spec["startup_timeout_s"]
-        )
+        if "target" not in absent:
+            announce(scene["name"], f"启动{target_label}服务，等待就绪")
+            target = common.start_process(
+                f"target {target_label}",
+                plan["target_argv"],
+                plan["target_env"],
+                root / "target.log",
+            )
+            processes.append(target)
+            publish_processes()
+            common.wait_healthy(
+                plan["config"]["target_url"], target, spec["startup_timeout_s"]
+            )
+        if "source" not in absent:
+            announce(scene["name"], "启动TP1服务")
+            source = common.start_process(
+                "source TP1",
+                plan["source_argv"],
+                plan["source_env"],
+                root / "source.log",
+            )
+            processes.append(source)
+            publish_processes()
+            common.wait_healthy(
+                plan["config"]["source_url"], source, spec["startup_timeout_s"]
+            )
         extras = []
         for extra in plan.get("extra_engines", ()):
             argv, env = engines[extra["instance_id"]]
@@ -787,9 +817,11 @@ def run_scene(
         publish_processes()
         for extra, process in extras:
             common.wait_healthy(extra["endpoint"], process, spec["startup_timeout_s"])
-        announce(scene["name"], "TP1就绪；开始warmup")
+        announce(scene["name"], "实例就绪；开始warmup")
         requests = [job["request"] for job in read(scene["arrivals"])]
         for pool in ("source", "target"):
+            if pool in absent:
+                continue
             announce(scene["name"], "warmup", pool=pool)
             warmup_prompt_shapes(
                 plan["config"][pool + "_url"],
@@ -807,13 +839,17 @@ def run_scene(
             )
         if before_workload is not None:
             before_workload(plan)
-        announce(scene["name"], "warmup完成；启动stager和正式调度器")
-        stager = common.start_process(
-            "stager", plan["stager_argv"], os.environ.copy(), root / "stager.log"
-        )
-        processes.append(stager)
-        publish_processes()
-        if spec.get("require_stager_process_ready"):
+        if absent:
+            # Single-class layout: no pair to migrate between, so no stager.
+            announce(scene["name"], "warmup完成；单类布局不启动stager；启动正式调度器")
+        else:
+            announce(scene["name"], "warmup完成；启动stager和正式调度器")
+            stager = common.start_process(
+                "stager", plan["stager_argv"], os.environ.copy(), root / "stager.log"
+            )
+            processes.append(stager)
+            publish_processes()
+        if spec.get("require_stager_process_ready") and not absent:
             from tools.bridge_tp.qwen3_migration_diagnostics import wait_stager_ready
 
             wait_stager_ready(mechanism_dir, stager)

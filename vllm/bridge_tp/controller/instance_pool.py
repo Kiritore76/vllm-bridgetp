@@ -254,9 +254,15 @@ def fixed_pair_registry(
     is generation 1, the target 2, routing-only ``extras`` (dicts with bundle,
     tp, gpus, endpoint, context_limit) 3, 4, ... The controller still uses the
     historical pool ids; they are returned as aliases of the pair's ids.
+
+    A single-class layout (L0/L2) has only one side of the pair: pass
+    ``source_bundle=None`` or ``target_bundle=None``. The absent side keeps its
+    generation number unused and gets no alias.
     """
     registry = Registry()
     target_tp = len(target_gpus)
+    if source_bundle is None and target_bundle is None:
+        raise ValueError("a layout needs at least one side of the pair")
     rows = [
         InstanceRecord(
             InstanceRef(f"{source_bundle}-g1-tp1", 1),
@@ -277,6 +283,15 @@ def fixed_pair_registry(
             target_context_limit,
         ),
     ]
+    pair = [
+        (pool, row)
+        for pool, row, bundle in (
+            (LEGACY_SOURCE_POOL, rows[0], source_bundle),
+            (LEGACY_TARGET_POOL, rows[1], target_bundle),
+        )
+        if bundle is not None
+    ]
+    rows = [row for _, row in pair]
     for generation, extra in enumerate(extras, start=3):
         rows.append(
             InstanceRecord(
@@ -293,10 +308,7 @@ def fixed_pair_registry(
         )
     for row in rows:
         registry.register(row)
-    aliases = {
-        LEGACY_SOURCE_POOL: rows[0].ref.instance_id,
-        LEGACY_TARGET_POOL: rows[1].ref.instance_id,
-    }
+    aliases = {pool: row.ref.instance_id for pool, row in pair}
     return registry, aliases
 
 

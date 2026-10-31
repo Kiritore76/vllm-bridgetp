@@ -106,7 +106,11 @@ def prepare_native(plan, common, inputs):
     check_native(plan, common)
     records = []
     receipt = plan["run_dir"].parent / "context_boundary_receipt.json"
+    from tools.bridge_tp.launch_pressure_balanced_pilot import absent_pair
+
     for role in ("source", "target"):
+        if role in absent_pair(plan):
+            continue
         row = dict(role=role, status="STARTED", prompt_tokens=32767, max_tokens=1)
         records.append(row)
         common.write_json(receipt, dict(status="RUNNING", pools=records))

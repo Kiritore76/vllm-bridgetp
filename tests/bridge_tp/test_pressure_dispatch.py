@@ -565,6 +565,189 @@ class DispatchTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 pilot.instance_manifest(args, controller)
 
+    def test_single_class_layouts_route_without_the_absent_pair_side(self):
+        """S3b-2: L0 (TP1 only) and L2 (TP2 only) serve with migration off."""
+
+        class Reader:
+            def __init__(self, pool_id):
+                self.pool_id, self.generation = pool_id, 0
+
+            def poll(self, now):
+                self.generation += 1
+                return dict(
+                    schema="PRESSURE_INVENTORY_V1",
+                    dropped_before=0,
+                    writer_error=None,
+                    pool_id=self.pool_id,
+                    sampled_at=now,
+                    generation=self.generation,
+                    total_blocks=2001,
+                    usage_denominator_blocks=2000,
+                    free_blocks=2000,
+                    block_size=16,
+                    context_limit=8192,
+                    pending_prompt_tokens=0,
+                    waiting=0,
+                    running=0,
+                    requests=[],
+                )
+
+        session = NS(
+            sessions=[],
+            record=None,
+            stream=None,
+            target_future=None,
+            settled=True,
+            migration_id="test",
+            ready_for_start=True,
+            rotate=lambda: False,
+            cleanup_requires_shutdown=False,
+            cancel_future=None,
+            close=lambda: None,
+        )
+        actual_ingress = i.PressureIngress
+        actual_tick = r.PressureCoordinator.tick_multi
+        for pair_pool, pair_id, extra_id, tp, url in (
+            ("tp1", "A-g1-tp1", "A-g3-tp1", 1, "source"),
+            ("tp4", "B-g2-tp2", "A-g3-tp2", 2, "target"),
+        ):
+            with self.subTest(pair_pool), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                calls, evaluated = [], []
+                write_lock = threading.Lock()
+                readers = {url: Reader(pair_pool), "extra": Reader(extra_id)}
+
+                def publish(name, after=-float("inf"), root=root, readers=readers):
+                    while time.time() <= after:
+                        time.sleep(0.001)
+                    value = readers[name].poll(time.time())
+                    with (root / name).open("a", encoding="utf-8") as stream:
+                        stream.write(json.dumps(value) + "\n")
+
+                def post(
+                    name,
+                    payload,
+                    timeout,
+                    sink,
+                    calls=calls,
+                    publish=publish,
+                    lock=write_lock,
+                ):
+                    calls.append(name)
+                    sink(0, 42, time.time())
+                    completed = time.time()
+                    with lock:
+                        publish(name, after=completed)
+                    return dict(
+                        request_started_unix_s=completed, completed_unix_s=completed
+                    )
+
+                def make_ingress(*args, post=post, **kwargs):
+                    return actual_ingress(*args, **kwargs, post=post)
+
+                def recording_tick(
+                    co, now, readings, tp_of, candidates, actions=None, seen=evaluated
+                ):
+                    seen.append(sorted(source for source, _ in candidates))
+                    return actual_tick(co, now, readings, tp_of, candidates, actions)
+
+                for name in readers:
+                    publish(name)
+                row = dict(tp_degree=tp, context_limit=8192, physical_gpu_ids=["3"])
+                manifest = dict(
+                    schema="BRIDGETP_INSTANCE_MANIFEST_V1",
+                    legacy_pool_aliases={pair_pool: pair_id},
+                    instances=[
+                        dict(row, instance_id=pair_id, endpoint=url),
+                        dict(
+                            row,
+                            instance_id=extra_id,
+                            endpoint="extra",
+                            inventory_path=str(root / "extra"),
+                        ),
+                    ],
+                )
+                args = NS(
+                    run_dir=root,
+                    source_inventory=root / "source",
+                    target_inventory=root / "target",
+                    source_context_limit=8192,
+                    target_context_limit=8192,
+                    predictor_events=root / "predictor",
+                    predictor_sha256="0" * 64,
+                    migration_id="test",
+                    tick_s=0.005,
+                    max_seconds=3,
+                    no_progress_s=2,
+                    no_migration=True,
+                    maximum_migrations=1,
+                    routing_strategy="pressure",
+                    routing_weights=[1, 1],
+                    test_only_cancel_first_shadow=False,
+                    instances=root / "instances.json",
+                )
+                (root / "instances.json").write_text(json.dumps(manifest))
+                controller = NS(
+                    source_url="source",
+                    target_url="target",
+                    block_size=16,
+                    tp1_total_kv_blocks=2001,
+                    tp4_total_kv_blocks=2001,
+                    target_tp_size=2,
+                )
+                checked = pilot.instance_manifest(args, controller)
+                self.assertEqual(pilot.pair_pools(checked), (pair_pool,))
+                jobs = [
+                    dict(
+                        id=str(n),
+                        at_s=n * 0.03,
+                        request=dict(model="qwen", prompt=[1], max_tokens=8),
+                    )
+                    for n in range(4)
+                ]
+                with (
+                    patch.dict(sys.modules, {"vllm.bridge_tp.async_journal": journal}),
+                    patch(
+                        "tools.bridge_tp.pressure_sessions.PressureSessions",
+                        return_value=session,
+                    ),
+                    patch.object(o, "scrape_inventory_metrics", return_value=None),
+                    patch.object(i, "PressureIngress", side_effect=make_ingress),
+                    patch.object(r.PressureCoordinator, "tick_multi", recording_tick),
+                ):
+                    pilot._run(
+                        args,
+                        (
+                            config(),
+                            controller,
+                            NS(release_budget=17),
+                            jobs,
+                            {"instance_manifest": checked},
+                        ),
+                    )
+                result = json.loads(
+                    (root / "pressure_request_results.json").read_text()
+                )
+                self.assertEqual(len(result), 4)
+                self.assertTrue(all(row["source_done"] for row in result))
+                self.assertEqual(
+                    {row["initial_pool"] for row in result}, {pair_pool, extra_id}
+                )
+                self.assertEqual(set(calls), {url, "extra"})
+                absent = "tp4" if pair_pool == "tp1" else "tp1"
+                self.assertFalse(
+                    (root / f"inventory_{absent}_process_receipt.json").exists()
+                )
+                # No pair to migrate between: L0 never evaluates; L2 has a
+                # target but no migration source.
+                self.assertTrue(all(row == [] for row in evaluated))
+                self.assertEqual(bool(evaluated), pair_pool == "tp4")
+                progress = json.loads((root / "pressure_progress.json").read_text())
+                self.assertEqual(progress["stage"], "COMPLETED")
+                args.no_migration = False
+                with self.assertRaises(ValueError):
+                    pilot.instance_manifest(args, controller)
+
     def test_layout_control_adds_and_retires_instances_mid_run(self):
         """S3b-1: the conversion executor's layout file changes membership."""
         calls = []

@@ -207,6 +207,8 @@ def preflight(args):
     jobs = read(args.arrivals)
     if not isinstance(jobs, list) or not jobs:
         raise ValueError("arrivals must be a nonempty list")
+    manifest = instance_manifest(args, controller)
+    pair = pair_pools(manifest)
     ids = set()
     for job in jobs:
         req = job["request"]
@@ -218,11 +220,18 @@ def preflight(args):
             or not req["prompt"]
             or any(type(t) is not int or t < 0 for t in req["prompt"])
             or not 0 < req["max_tokens"] <= 8192
-            or job.get("route") not in {None, "tp1", "tp4"}
+            or job.get("route") not in {None, *pair}
         ):
             raise ValueError("invalid/duplicate arrival or stop contract")
         ids.add(job["id"])
-        limits = dict(tp1=args.source_context_limit, tp4=args.target_context_limit)
+        limits = {
+            name: limit
+            for name, limit in (
+                ("tp1", args.source_context_limit),
+                ("tp4", args.target_context_limit),
+            )
+            if name in pair
+        }
         routes = [job["route"]] if job.get("route") else limits
         if not any(
             len(req["prompt"]) + req["max_tokens"] <= limits[name] for name in routes
@@ -263,7 +272,6 @@ def preflight(args):
         else "original A100 contract",
         routing_entry="multi-instance (class ranking, then two-pool admit/decide)",
     )
-    manifest = instance_manifest(args, controller)
     if manifest is not None:
         receipt["instance_manifest"] = manifest
     return cfg, controller, lookup, jobs, receipt
@@ -299,16 +307,30 @@ def instance_manifest(args, controller):
     manifest = read(args.instances)
     aliases = manifest.get("legacy_pool_aliases", {})
     rows = {row["instance_id"]: row for row in manifest.get("instances", ())}
+    expected = dict(
+        tp1=(1, args.source_context_limit),
+        tp4=(controller.target_tp_size, args.target_context_limit),
+    )
     if (
         manifest.get("schema") != "BRIDGETP_INSTANCE_MANIFEST_V1"
-        or set(aliases) != {"tp1", "tp4"}
+        or not aliases
+        or not set(aliases) <= set(expected)
         or not set(aliases.values()) <= set(rows)
-        or rows[aliases["tp1"]]["tp_degree"] != 1
-        or rows[aliases["tp4"]]["tp_degree"] != controller.target_tp_size
-        or rows[aliases["tp1"]]["context_limit"] != args.source_context_limit
-        or rows[aliases["tp4"]]["context_limit"] != args.target_context_limit
+        or any(
+            (rows[aliases[pool]]["tp_degree"], rows[aliases[pool]]["context_limit"])
+            != expected[pool]
+            for pool in aliases
+        )
     ):
         raise ValueError("controller needs one TP1 source and one TP-k target pair")
+    if len(aliases) == 1 and (
+        not args.no_migration
+        or any(row.get("migration_channel") for row in rows.values())
+        or {row["tp_degree"] for row in rows.values()}
+        != {expected[next(iter(aliases))][0]}
+    ):
+        # Single-class layout (L0/L2): one side of the pair, routing only.
+        raise ValueError("single-class layout must be one class without migration")
     endpoints = [row["endpoint"] for row in rows.values()]
     for row in extra_instances(manifest):
         if (
@@ -329,6 +351,13 @@ def instance_manifest(args, controller):
     return manifest
 
 
+def pair_pools(manifest):
+    """Historical pool ids of the pair sides this run starts with."""
+    if manifest is None:
+        return ("tp1", "tp4")
+    return tuple(p for p in ("tp1", "tp4") if p in manifest["legacy_pool_aliases"])
+
+
 def channel_sources(manifest):
     """Routing-only TP1 rows that also own a migration channel (S1-d2c)."""
     return [r for r in extra_instances(manifest) if r.get("migration_channel")]
@@ -342,7 +371,7 @@ def extra_instances(manifest):
     return [r for r in manifest["instances"] if r["instance_id"] not in paired]
 
 
-def unknown_routing_pools(args, block_size, extras=()):
+def unknown_routing_pools(args, block_size, extras=(), pair=("tp1", "tp4")):
     """Use configured context contracts while pressure telemetry is absent."""
     return tuple(
         p.PoolReading(
@@ -361,8 +390,14 @@ def unknown_routing_pools(args, block_size, extras=()):
             growth_blocks_s=None,
         )
         for name, limit in (
-            ("tp1", args.source_context_limit),
-            ("tp4", args.target_context_limit),
+            *(
+                (name, limit)
+                for name, limit in (
+                    ("tp1", args.source_context_limit),
+                    ("tp4", args.target_context_limit),
+                )
+                if name in pair
+            ),
             *((row["instance_id"], row["context_limit"]) for row in extras),
         )
     )
@@ -491,13 +526,22 @@ def _run(args, prepared):
     # Fixed pair through the multi-instance entry points; identical behaviour
     # and records for one instance per TP class.
     tp_of = {"tp1": 1, "tp4": getattr(controller, "target_tp_size", 4)}
+    # A single-class layout starts with one side of the pair (S3b-2).
+    pair = pair_pools(receipt.get("instance_manifest"))
+    tp_of = {pool: tp for pool, tp in tp_of.items() if pool in pair}
     extras = extra_instances(receipt.get("instance_manifest"))
     tp_of.update({row["instance_id"]: row["tp_degree"] for row in extras})
     # Workload/health references exist per TP class, not per instance.
     profile_key = {pool: ("tp1" if tp == 1 else "tp4") for pool, tp in tp_of.items()}
     context_of = {
-        "tp1": args.source_context_limit,
-        "tp4": args.target_context_limit,
+        **{
+            pool: limit
+            for pool, limit in (
+                ("tp1", args.source_context_limit),
+                ("tp4", args.target_context_limit),
+            )
+            if pool in pair
+        },
         **{row["instance_id"]: row["context_limit"] for row in extras},
     }
     for row in extras:
@@ -512,6 +556,8 @@ def _run(args, prepared):
         tp_of=tp_of,
     )
     ingress.urls.update({row["instance_id"]: row["endpoint"] for row in extras})
+    for pool in {"tp1", "tp4"} - set(pair):
+        ingress.urls.pop(pool, None)
     session = PressureSessions(
         persistent_cleanup=cfg.shadow_cancel,
         maximum_migrations=args.maximum_migrations,
@@ -548,7 +594,9 @@ def _run(args, prepared):
         )
 
     # Migration sources: the pair source, then every TP1 with its own channel.
-    migration_sources = [("tp1", args.source_inventory, predictor)] + [
+    migration_sources = [("tp1", args.source_inventory, predictor)] * (
+        "tp1" in pair
+    ) + [
         (
             row["instance_id"],
             Path(row["inventory_path"]),
@@ -755,8 +803,14 @@ def _run(args, prepared):
 
     try:
         for path, pool_id, url, tp in (
-            (args.source_inventory, "tp1", controller.source_url, 1),
-            (args.target_inventory, "tp4", controller.target_url, 2),
+            *(
+                row
+                for row in (
+                    (args.source_inventory, "tp1", controller.source_url, 1),
+                    (args.target_inventory, "tp4", controller.target_url, 2),
+                )
+                if row[1] in pair
+            ),
             *(
                 (
                     Path(row["inventory_path"]),
@@ -786,7 +840,7 @@ def _run(args, prepared):
         dispatcher = load("pressure_dispatch").ScheduledDispatch(
             jobs,
             submit_arrival,
-            unknown_routing_pools(args, controller.block_size, extras),
+            unknown_routing_pools(args, controller.block_size, extras, pair),
             started,
             args.max_seconds,
         )
@@ -818,7 +872,7 @@ def _run(args, prepared):
                     )
             if any(polled[p] is None for p, s in slots.items() if s["initial"]):
                 dispatcher.publish(
-                    unknown_routing_pools(args, controller.block_size, extras)
+                    unknown_routing_pools(args, controller.block_size, extras, pair)
                 )
                 save_progress(
                     progress_path,

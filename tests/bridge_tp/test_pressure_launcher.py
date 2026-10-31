@@ -506,9 +506,56 @@ class LauncherTests(unittest.TestCase):
                     common,
                     NS(**dict(vars(args), channel_generation=2)),
                 )
+            # S3b-2: single-class layouts keep one side of the pair, no migration.
+            for name, aliases, absent, extra_ids in (
+                (
+                    "L0",
+                    {"tp1": "A-g1-tp1"},
+                    ["target"],
+                    ["A-g3-tp1", "B-g4-tp1", "B-g5-tp1"],
+                ),
+                ("L2", {"tp4": "B-g2-tp2"}, ["source"], ["A-g3-tp2"]),
+            ):
+                plan = launch.build_scene(
+                    dict(
+                        spec,
+                        layout=dict(
+                            name=name, bundle_gpus=["2", "3", "0", "1"], base_port=8300
+                        ),
+                    ),
+                    dict(name=name.lower(), arrivals="a"),
+                    root,
+                    common,
+                    args,
+                )
+                self.assertEqual(plan["instances"]["legacy_pool_aliases"], aliases)
+                self.assertEqual(launch.absent_pair(plan), absent)
+                self.assertEqual(
+                    [e["instance_id"] for e in plan["extra_engines"]], extra_ids
+                )
+                self.assertNotIn("bridgetp_gpu_direct_sources", plan["target_argv"][-1])
+                self.assertIn("--no-migration", plan["controller_argv"])
+                launch.write_instances(plan)
+                controller_args = launch.controller.parse_args(
+                    plan["controller_argv"][2:]
+                )
+                checked = launch.controller.instance_manifest(
+                    controller_args, NS(target_tp_size=2)
+                )
+                self.assertEqual(launch.controller.pair_pools(checked), tuple(aliases))
+                # The controller refuses to migrate in a single-class layout.
+                controller_args.no_migration = False
+                with self.assertRaises(ValueError):
+                    launch.controller.instance_manifest(
+                        controller_args, NS(target_tp_size=2)
+                    )
             for layout in (
-                dict(name="L2", bundle_gpus=["2", "3", "0", "1"], base_port=8300),
-                dict(name="L0", bundle_gpus=["2", "3", "0", "1"], base_port=8300),
+                dict(
+                    name="L0",
+                    bundle_gpus=["2", "3", "0", "1"],
+                    base_port=8300,
+                    migration_sources=True,
+                ),
                 dict(name="L1A", bundle_gpus=["0", "1", "2", "3"], base_port=8300),
             ):
                 with self.assertRaises(ValueError):
