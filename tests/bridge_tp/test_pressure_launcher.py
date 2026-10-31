@@ -549,6 +549,49 @@ class LauncherTests(unittest.TestCase):
                     launch.controller.instance_manifest(
                         controller_args, NS(target_tp_size=2)
                     )
+            # S3b-3: an explicit conversion puts the target on a channel plan
+            # file (same rows as the static list) so a retired source can close.
+            request = dict(
+                bundle="A",
+                target_mode="TP2",
+                trigger_s=60,
+                deadline_s=600,
+                base_port=8400,
+            )
+            plan = launch.build_scene(
+                dict(spec, conversion=request),
+                dict(name="convert", arrivals="a"),
+                root,
+                common,
+                args,
+            )
+            self.assertEqual(plan["conversion"], request)
+            self.assertEqual(plan["context_limits"], (32768, 32768))
+            extra_config = json.loads(plan["target_argv"][-1])[
+                "kv_connector_extra_config"
+            ]
+            self.assertEqual(
+                extra_config["bridgetp_gpu_direct_channel_plan"],
+                str(plan["channel_plan"]),
+            )
+            self.assertEqual(
+                extra_config["bridgetp_gpu_direct_sources"],
+                [dict(source="A-g1-tp1", base_port=30400, generation=1)],
+            )
+            for bad in (
+                dict(request, bundle="C"),
+                dict(request, target_mode="TP4"),
+                dict(request, trigger_s=700),
+                dict(request, extra=1),
+            ):
+                with self.assertRaises(ValueError):
+                    launch.build_scene(
+                        dict(spec, conversion=bad),
+                        dict(name="bad-conversion", arrivals="a"),
+                        root,
+                        common,
+                        args,
+                    )
             for layout in (
                 dict(
                     name="L0",

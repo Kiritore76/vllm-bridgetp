@@ -356,11 +356,25 @@ def build_scene(spec, scene, run_root, common, args):
     sources = (
         source_channel_list(args, aliases["tp1"], extras) if "tp1" in aliases else []
     )
-    if len(sources) > 1:
+    request = conversion_request(spec, registry)
+    channel_plan = None
+    if request is not None and sources:
+        # Conversion may retire a source: the target follows a channel plan
+        # file (same rows as the static list) so its channel can be closed.
+        channel_plan = run_root / scene["name"] / "gpu_channel_plan.json"
+    if len(sources) > 1 or channel_plan is not None:
         connector = json.loads(target_argv[-1])
-        connector["kv_connector_extra_config"]["bridgetp_gpu_direct_sources"] = sources
+        extra_config = connector["kv_connector_extra_config"]
+        extra_config["bridgetp_gpu_direct_sources"] = sources
+        if channel_plan is not None:
+            extra_config["bridgetp_gpu_direct_channel_plan"] = str(channel_plan)
         target_argv[-1] = json.dumps(connector)
     return dict(
+        registry=registry,
+        conversion=request,
+        context_limits=(args.max_model_len, args.tp4_max_model_len),
+        channel_plan=channel_plan,
+        channel_sources=sources,
         run_dir=run_dir,
         instances=instances,
         instances_path=instances_path,
@@ -433,6 +447,26 @@ def layout_extras(spec, args, target_tp, run_dir):
         source[0]["bundle_id"] if source else None,
         target[0]["bundle_id"] if target else None,
     ), extras
+
+
+def conversion_request(spec, registry):
+    """Validated explicit conversion of one bundle (S3b-3), or None."""
+    request = spec.get("conversion")
+    if request is None:
+        return None
+    if not spec.get("layout"):
+        raise ValueError("conversion needs an explicit layout")
+    bundles = {row.bundle_id for row in registry.instances.values()}
+    if (
+        set(request)
+        != {"bundle", "target_mode", "trigger_s", "deadline_s", "base_port"}
+        or request["bundle"] not in bundles
+        or request["target_mode"] not in {"TP1", "TP2"}
+        or not 0 <= request["trigger_s"] < request["deadline_s"]
+        or int(request["base_port"]) <= 0
+    ):
+        raise ValueError("invalid conversion request")
+    return dict(request)
 
 
 def absent_pair(plan):
@@ -678,6 +712,95 @@ def timing_receipt(path, scene_failed):
     return load("pause_diagnostics").verify(path)
 
 
+def start_conversion(spec, scene, plan, common, processes, publish, requests):
+    """Bind the conversion backend to this scene's owned engines and start it."""
+    from tools.bridge_tp import pressure_conversion as pc
+
+    root, run_dir = plan["run_dir"].parent, plan["run_dir"]
+    aliases = plan["instances"]["legacy_pool_aliases"]
+    by_name = {p.name: p for p in processes}
+    owned = {
+        **({aliases["tp1"]: by_name["source TP1"]} if "tp1" in aliases else {}),
+        **(
+            {aliases["tp4"]: next(p for p in processes if p.name.startswith("target"))}
+            if "tp4" in aliases
+            else {}
+        ),
+        **{e["instance_id"]: by_name[e["instance_id"]] for e in plan["extra_engines"]},
+    }
+    manifest = json.loads(json.dumps(plan["instances"]))
+    for row in manifest["instances"]:
+        pool_id = row.get("legacy_pool")
+        if pool_id is not None:
+            row["inventory_path"] = (
+                str(run_dir / ("source" if pool_id == "tp1" else "target"))
+                + "_inventory.jsonl"
+            )
+
+    def event(kind, **values):
+        row = dict(kind=kind, unix_s=time.time(), **values)
+        with (root / "conversion_events.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(row) + "\n")
+        announce(scene["name"], "转换", **{"event": kind, **values})
+
+    def start(extra):
+        argv, env = extra_engine(plan, extra)
+        process = common.start_process(
+            extra["instance_id"], argv, env, root / f"{extra['instance_id']}.log"
+        )
+        processes.append(process)
+        owned[extra["instance_id"]] = process
+        publish()
+
+    def warm(extra):
+        from tools.bridge_tp.run_phase9_cap0_noop import warmup_prompt_shapes
+
+        process = owned[extra["instance_id"]]
+        common.wait_healthy(extra["endpoint"], process, spec["startup_timeout_s"])
+        warmup_prompt_shapes(
+            extra["endpoint"],
+            requests,
+            root / f"{extra['instance_id']}_warmup.json",
+            spec["run_timeout_s"],
+        )
+
+    ops = SimpleNamespace(
+        stop=lambda ids: common.stop_processes([owned[i] for i in ids]),
+        alive=lambda i: common.process_group_alive(owned[i]),
+        gpus_released=pc.nvidia_gpus_released,
+        scrape=pc.scrape_metrics,
+        start=start,
+        warm=warm,
+        event=event,
+    )
+    target_tp = plan["config"].get("target_tp_size", 4)
+    backend = pc.ControllerConversionBackend(
+        plan["registry"],
+        manifest,
+        run_dir,
+        ops,
+        base_port=plan["conversion"]["base_port"],
+        context_limits=plan["context_limits"],
+        channel_plan=plan.get("channel_plan"),
+        target_tp_ranks=target_tp if "tp4" in aliases else 0,
+    )
+    driver = pc.ConversionDriver(
+        backend, plan["conversion"], root / "conversion_plan.json"
+    )
+    driver.start()
+    return driver
+
+
+def finish_conversion(driver, root):
+    outcome = driver.stop()
+    (root / "conversion_result.json").write_text(
+        json.dumps(outcome, indent=2) + "\n", encoding="utf-8"
+    )
+    driver.thread = None
+    driver.outcome = outcome
+    return outcome
+
+
 def run_scene(
     spec,
     scene,
@@ -693,7 +816,7 @@ def run_scene(
     from tools.bridge_tp.run_phase9_controller import RuntimeControl
 
     root, processes = plan["run_dir"].parent, []
-    monitor = None
+    monitor = driver = None
 
     def publish_processes():
         if diagnose_pauses:
@@ -771,6 +894,8 @@ def run_scene(
             )
             processes.append(monitor)
         absent = absent_pair(plan)
+        if plan.get("channel_plan") is not None:
+            common.write_json(plan["channel_plan"], plan["channel_sources"])
         target_label = f"TP{plan['config'].get('target_tp_size', 4)}"
         if "target" not in absent:
             announce(scene["name"], f"启动{target_label}服务，等待就绪")
@@ -871,6 +996,10 @@ def run_scene(
         )
         processes.append(worker)
         publish_processes()
+        if plan.get("conversion") is not None:
+            driver = start_conversion(
+                spec, scene, plan, common, processes, publish_processes, requests
+            )
         deadline = time.monotonic() + spec["run_timeout_s"] + 60
         last_progress_at = -float("inf")
         while worker.process.poll() is None:
@@ -947,6 +1076,10 @@ def run_scene(
             raise subprocess.CalledProcessError(
                 worker.process.returncode, plan["controller_argv"]
             )
+        if driver is not None:
+            outcome = finish_conversion(driver, root)
+            if outcome["state"] != "COMPLETED":
+                raise RuntimeError(f"conversion ended in {outcome['state']}")
         if plan["config"].get("transfer_mode") == "FULL_SPEED":
             common.write_json(
                 plan["run_dir"] / "full_speed_receipt.json",
@@ -962,6 +1095,8 @@ def run_scene(
         raise
     finally:
         scene_failed = sys.exc_info()[0] is not None
+        if driver is not None and driver.thread is not None:
+            finish_conversion(driver, root)
         if monitor:
             (root / "host_monitor.stop").touch()
             with contextlib.suppress(subprocess.TimeoutExpired):

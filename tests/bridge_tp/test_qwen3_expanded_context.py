@@ -123,3 +123,30 @@ class ExpandedContextTests(unittest.TestCase):
                 self.assertRaises(ValueError),
             ):
                 runner.prepare_native(plan, Mock())
+
+    def test_native_check_of_single_class_layout_reads_only_started_side(self):
+        """S3b-2: L2 has no TP1 source; its template geometry stays."""
+        from tools.bridge_tp import run_pressure_calibration as calibration
+
+        target = dict(
+            context_limit=32768, free_blocks=11711, block_size=16, total_blocks=11712
+        )
+        plan = dict(
+            run_dir=Path("unused"),
+            expected_context_limits=(32768, 32768),
+            config=dict(policy={}, tp1_total_kv_blocks=2325),
+            config_path="unused",
+            instances=dict(legacy_pool_aliases={"tp4": "B-g2-tp2"}),
+        )
+        with patch.object(calibration, "wait_empty", return_value=[target]) as wait:
+            runner.prepare_native(plan, Mock())
+        self.assertEqual(wait.call_args.kwargs["pools"], ["target"])
+        self.assertEqual(plan["config"]["tp1_total_kv_blocks"], 2325)
+        self.assertEqual(plan["config"]["tp4_total_kv_blocks"], 11712)
+        with (
+            patch.object(
+                calibration, "wait_empty", return_value=[target | dict(free_blocks=100)]
+            ),
+            self.assertRaises(ValueError),
+        ):
+            runner.prepare_native(plan, Mock())

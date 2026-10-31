@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import contextlib
 import hashlib
 import json
 import math
@@ -694,7 +695,71 @@ def _run(args, prepared):
                 sampler.close()
                 owner.remove(sampler)
 
-    layout_state = dict(signature=None, revision=None)
+    layout_state = dict(signature=None, revision=None, status_at=-math.inf)
+    instance_of = dict(manifest["legacy_pool_aliases"]) if manifest else {}
+
+    def publish_layout_status(now, polled, dispatched):
+        """Controller-side drain evidence per instance for the conversion executor.
+
+        Counts what only the controller knows (open admissions, streams it still
+        relays, migration sessions); the executor pairs it with fresh native
+        evidence before declaring an instance drained.
+        """
+        if now - layout_state["status_at"] < 0.5:
+            return
+        layout_state["status_at"] = now
+        entries = tuple(co.ledger.entries.values())
+        streams, sessions = {}, {}
+        for value in dispatched.values():
+            if not value.future.done():
+                # A committed migration moves ownership (keyed by server id).
+                owner = co._owners.get(
+                    getattr(value, "server_id", None),
+                    co._owners.get(value.client_id, value.pool_id),
+                )
+                streams[owner] = streams.get(owner, 0) + 1
+        for session, (_, target) in tuple(co._sessions.items()):
+            if co.ledger.entries[session].state == "ACTIVE":
+                for pool in {target, co._session_source.get(session)} - {None}:
+                    sessions[pool] = sessions.get(pool, 0) + 1
+        instances = {}
+        for pool in tp_of:
+            raw = polled.get(pool)
+            instances[instance_of.get(pool, pool)] = dict(
+                pool_id=pool,
+                lifecycle=co.lifecycle(pool),
+                open_admissions=sum(
+                    r.pool_id == pool and r.state in {"ACTIVE", "COMMITTED"}
+                    for r in entries
+                ),
+                streams_pending=streams.get(pool, 0),
+                sessions=sessions.get(pool, 0),
+                inventory=None
+                if raw is None
+                else dict(
+                    sampled_at=raw["sampled_at"],
+                    generation=raw["generation"],
+                    running=raw["running"],
+                    waiting=raw["waiting"],
+                    requests=len(raw["requests"]),
+                ),
+            )
+        path = args.run_dir / "layout_status.json"
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(
+                dict(
+                    schema="PRESSURE_LAYOUT_STATUS_V1",
+                    unix_s=time.time(),
+                    layout_revision=layout_state["revision"],
+                    instances=instances,
+                )
+            ),
+            encoding="utf-8",
+        )
+        # A Windows reader may hold it; the next tick retries.
+        with contextlib.suppress(PermissionError):
+            os.replace(temporary, path)
 
     def apply_layout_control():
         """Reconcile instances with the conversion executor's layout file."""
@@ -856,6 +921,7 @@ def _run(args, prepared):
             now, elapsed = time.time(), time.monotonic() - started
             readers = [slot["reader"] for slot in slots.values()]
             polled = {pool_id: s["reader"].poll(now) for pool_id, s in slots.items()}
+            publish_layout_status(now, polled, dispatched)
             for reader in readers:
                 diagnostic = reader.diagnostics()
                 status_key = (
