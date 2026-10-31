@@ -206,8 +206,8 @@
     "vllm/bridge_tp/controller/predictor.py": "f134fdf282bceee20a007768cabb3d5ee1ce9d68c4201027c5b2f5f64197f29f",
     "vllm/bridge_tp/controller/pressure_ingress.py": "c6a9b133ea64d8381aee0e214c3396a77e814c312db0b6f11b73d115c1393194",
     "vllm/bridge_tp/controller/pressure_observation.py": "38177edad08deee36ccb4bbd15e815fce4efaac678b926e52f234e225145a39f",
-    "vllm/bridge_tp/controller/pressure_policy.py": "34ff7285a80a722251102dc6a567328094433b72222f714099edcc1b968673fa",
-    "vllm/bridge_tp/controller/pressure_runtime.py": "0230314756c2043debc9467be393344d69f949e3748e532c948b9d8be62ccb40",
+    "vllm/bridge_tp/controller/pressure_policy.py": "c410d49192d898c1ce50bcdfd223815d3cce7e085387e3deef562eb807452188",
+    "vllm/bridge_tp/controller/pressure_runtime.py": "94483d9be18521af895516971b13cb7a410a1f05fd6ee9d602568cad5d18e29c",
     "vllm/bridge_tp/controller/pressure_service.py": "e2d537e473026842ee1f8bf6d5b43e860d3f25dab44d66d7be61a4ff9508f143",
     "vllm/bridge_tp/controller/rate_controller.py": "01f9efbbc2065f8f3d1e0202fe2eae303d2d45c3f9cdcd185209d675055471f1",
     "vllm/bridge_tp/controller/residency_policy.py": "afebde8915666ae1fba63d5a1b98fb5ac79d140f9a060a468a40b6b954780b37",
@@ -286,7 +286,7 @@
     "vllm/bridge_tp/controller/pressure_inventory_process.py": "a521a24f8e32568e5d17cf07f913bd7c3c584d1ede2181996009a43ef0f5a5ac",
     "tests/bridge_tp/test_pressure_inventory_process.py": "3e221b1b54e222ef4c59e9706c0a391ff416335b5d22bbeec6fb61dc4ea116fc",
     "tests/bridge_tp/test_pressure_compact_history.py": "dde224f14dcc4576e859da82fe29918bca6921a16172df13cdafa846a0a93de0",
-    "vllm/bridge_tp/controller/pressure_relief.py": "df43d5f2bdbb8d94f0428711021f08136142ef9230af6d87000217b04a2fb418",
+    "vllm/bridge_tp/controller/pressure_relief.py": "7b45301bf0d5e67a50e622331dc130702bcff1ae2a56961e4e479878de1a6ecf",
     "tests/bridge_tp/test_pressure_relief.py": "470728f6fbbb7b031faef0ef49821aa1f734950dc33d4d4a7a294b354da7e2ba",
     "tests/bridge_tp/test_tp2_reconfiguration.py": "9c992132e64a83ba5b949f10395d84519f040b1783eaf4e24dbee8357cb2bab1",
     "tools/bridge_tp/freeze_pressure_baseline.py": "c53b3a70502f65c76ce3fcaf97fbd439508651472a2b1065eeea69d0e8322194",
@@ -390,7 +390,9 @@
     "tools/bridge_tp/qwen3_long_burst_pair.py": "a7949b164bac586bbe0d23fcb3696ed0b1442bf898a90a2ecf54acf3d2147ca4",
     "tests/bridge_tp/test_qwen3_long_burst_pair.py": "9389e6185cb68d6a5b0e8825b24b7f937596798898e960a18bdc140b3dccf2d1",
     "vllm/bridge_tp/bounded_history.py": "d1ab2d049f4f5f27863e09c9b5f61f77986f5407ce50c82c51f48b821768b217",
-    "tests/bridge_tp/test_bounded_history.py": "1e1d324a68c9c35a0f31f17404a1142aafaedaffb32694f88b161c88074e5126"
+    "tests/bridge_tp/test_bounded_history.py": "1e1d324a68c9c35a0f31f17404a1142aafaedaffb32694f88b161c88074e5126",
+    "vllm/bridge_tp/controller/pressure_multi.py": "718728c7a560dc121b451a9d965488af8a866d7aefadfc3f90e4b0123ed5b49f",
+    "tests/bridge_tp/test_pressure_multi.py": "2b2c5aea64a09b430bf53d705a78fcdbad1b4a84fedc343b8f74439bf20106d8"
   },
   "server_settings": {
     "dtype": "bfloat16",

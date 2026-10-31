@@ -30,8 +30,8 @@ class RoutingRelief:
             self.acknowledged_at = now
             self.phase = "DRAIN_PREFILL"
 
-    def admitted(self, pool_id, prompt_tokens, now, redirected):
-        if pool_id == "tp1":
+    def admitted(self, pool_id, prompt_tokens, now, redirected, source_pool_id="tp1"):
+        if pool_id == source_pool_id:
             self.last_source_admission_at = now
             self.confirming = False
             self.recovery_since = None

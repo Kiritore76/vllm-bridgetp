@@ -8,6 +8,7 @@ records carry no KV or decode promise. Physical free blocks come from allocation
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -603,17 +604,57 @@ class PressureDecision:
     service_path: str = "legacy"
 
 
+class SharedPolicyState:
+    """Migration state shared by every source: one cooldown, one retry table."""
+
+    def __init__(self) -> None:
+        self.last_start = -math.inf
+        self.retry_after: dict[str, float] = {}
+
+
+# Per-source trigger state; everything else in a policy is shared or config.
+SOURCE_STATE = (
+    "_since",
+    "_last_tick",
+    "_latched",
+    "_service_confirmation",
+    "relief",
+    "kv_route",
+)
+
+
 class PressurePolicy:
-    def __init__(self, cfg: PressureConfig, ledger: ReservationLedger) -> None:
+    def __init__(
+        self,
+        cfg: PressureConfig,
+        ledger: ReservationLedger,
+        shared: SharedPolicyState | None = None,
+    ) -> None:
         self.cfg, self.ledger = cfg, ledger
+        self.shared = shared or SharedPolicyState()
         self._since: float | None = None
         self._last_tick: float | None = None
-        self._last_start = -math.inf
         self._latched = False
-        self._retry_after: dict[str, float] = {}
+        self._retry_after = self.shared.retry_after
         self._service_confirmation = None
         self.relief = RoutingRelief()
         self.kv_route = kv_routing.KVRouteProtection()
+
+    @property
+    def _last_start(self) -> float:
+        return self.shared.last_start
+
+    @_last_start.setter
+    def _last_start(self, value: float) -> None:
+        self.shared.last_start = value
+
+    def source_state(self) -> dict:
+        """Independent copy of the per-source trigger state."""
+        return copy.deepcopy({name: getattr(self, name) for name in SOURCE_STATE})
+
+    def restore_source_state(self, state: dict) -> None:
+        for name, value in copy.deepcopy(state).items():
+            setattr(self, name, value)
 
     def observe_relief(self, now, source):
         if self.cfg.kv_routing_priority:
@@ -1172,6 +1213,35 @@ def prompt_fit(pool, prompt_tokens, ledger, cfg, now):
     )
 
 
+def projected_pressure(reading, prompt_tokens, cfg, ledger, now):
+    """Post-arrival service and KV pressure of one routing-adjusted reading."""
+    pending_blocks, pending_decode, _ = ledger.pending(reading.pool_id)
+    service = workload.projected(reading, prompt_tokens, cfg, now, pending_decode)
+    capacity = classify(reading, cfg, now).capacity
+    if capacity is not None and reading.free_blocks is not None:
+        capacity += (
+            pending_blocks + math.ceil(prompt_tokens / reading.block_size)
+        ) / max(1, reading.free_blocks)
+    return dict(
+        service=service,
+        capacity=capacity,
+        score=max(service, capacity or 0) if service is not None else None,
+    )
+
+
+def admission_count(ledger, pool_id, routing_strategy="pressure"):
+    """In-flight admissions used by the normalized least-inflight fallback."""
+    return sum(
+        row.pool_id == pool_id
+        and row.kind == "admission"
+        and (
+            routing_strategy == "weighted-round-robin"
+            or row.state in {"ACTIVE", "COMMITTED", "ACCOUNTED"}
+        )
+        for row in ledger.entries.values()
+    )
+
+
 class RoutingError(ValueError):
     def __init__(self, diagnostics):
         self.diagnostics = diagnostics
@@ -1219,7 +1289,8 @@ def admit(
     # Current workload routing computes the real post-arrival costs below.
     # Fixed prompt-length preferences belong only to legacy routing modes.
     prefer_target = not cfg.workload_pressure and (
-        prompt_tokens >= cfg.very_long_prompt_tokens or (
+        prompt_tokens >= cfg.very_long_prompt_tokens
+        or (
             prompt_tokens >= cfg.prompt_boundary
             and source_pressure.zone in {"CRITICAL", "OVERLOAD"}
         )
@@ -1249,22 +1320,12 @@ def admit(
     if cfg.pressure_routing:
         routing_reason = "TP1 pressure and TP4 spare" if prefer_target else "prefer TP1"
     if cfg.workload_pressure and routing_strategy == "pressure":
-        projected = {}
-        for reading in (source, target):
-            pending_blocks, pending_decode, _ = ledger.pending(reading.pool_id)
-            service = workload.projected(
-                reading, prompt_tokens, cfg, now, pending_decode
+        projected = {
+            reading.pool_id: projected_pressure(
+                reading, prompt_tokens, cfg, ledger, now
             )
-            capacity = classify(reading, cfg, now).capacity
-            if capacity is not None and reading.free_blocks is not None:
-                capacity += (
-                    pending_blocks + math.ceil(prompt_tokens / reading.block_size)
-                ) / max(1, reading.free_blocks)
-            projected[reading.pool_id] = dict(
-                service=service,
-                capacity=capacity,
-                score=max(service, capacity or 0) if service is not None else None,
-            )
+            for reading in (source, target)
+        }
         a, b = (projected[pool.pool_id]["score"] for pool in pools)
         ac, bc = (projected[pool.pool_id]["capacity"] for pool in pools)
         if (
@@ -1362,8 +1423,12 @@ def admit(
         eligible.sort(key=lambda pool: pool.pool_id != preferred.pool_id)
         routing_reason = "router relief epoch; TP4 projected budget and prompt fit"
     routing_kv = None
-    if (cfg.kv_routing_priority and routing_strategy == "pressure"
-            and allowed_pool_id is None and all(pool in eligible for pool in pools)):
+    if (
+        cfg.kv_routing_priority
+        and routing_strategy == "pressure"
+        and allowed_pool_id is None
+        and all(pool in eligible for pool in pools)
+    ):
         routing_kv = kv_routing.preference(
             pools, ledger, cfg, now, prompt_tokens, capacity, kv_routing_state
         )

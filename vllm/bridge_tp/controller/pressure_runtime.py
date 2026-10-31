@@ -12,14 +12,17 @@ import threading
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 
+from . import pressure_multi as multi
 from .bounded_length import from_advisory
 from .pressure_policy import (
+    Admission,
     Candidate,
     PoolReading,
     PressureConfig,
     PressurePolicy,
     Reservation,
     ReservationLedger,
+    RoutingError,
     admit,
 )
 
@@ -49,68 +52,203 @@ class PressureCoordinator:
         self._sessions: dict[str, tuple[str, str]] = {}
         self._owners: dict[str, str] = {}
         self.routing_strategy, self.routing_weights = routing_strategy, routing_weights
+        # Per-source trigger state; the first source reuses self.policy so a
+        # single-source run is the historical coordinator.
+        self._policies: dict[str, PressurePolicy] = {}
+
+    def policy_for(self, source_id: str) -> PressurePolicy:
+        policy = self._policies.get(source_id)
+        if policy is None:
+            policy = (
+                self.policy
+                if not self._policies
+                else PressurePolicy(self.policy.cfg, self.ledger, self.policy.shared)
+            )
+            self._policies[source_id] = policy
+        return policy
+
+    def forget_source(self, source_id: str) -> None:
+        """Drop a retired source generation; a replacement starts fresh."""
+        with self._lock:
+            policy = self._policies.pop(source_id, None)
+            if policy is self.policy:
+                self.policy = PressurePolicy(policy.cfg, self.ledger, policy.shared)
 
     def admission(self, *args, **kwargs):
         """Route and track identity atomically, without reserving ingress KV."""
         with self._lock:
-            before = self.ledger.snapshot()
-            pools = args[3] if len(args) > 3 else kwargs["pools"]
-            now = kwargs.get("now", args[4] if len(args) > 4 else None)
-            self.policy.observe_relief(now, pools[0])
-            if self.routing_strategy == "pressure":
-                self.policy.relief.acknowledge(now)
-            relief = self.policy.relief.snapshot()
-            kv_before = self.policy.kv_route.snapshot()
-            result = admit(
-                *args,
-                cfg=self.policy.cfg,
-                ledger=self.ledger,
-                routing_strategy=self.routing_strategy,
-                routing_weights=self.routing_weights,
-                routing_relief=relief,
-                kv_routing_state=kv_before,
-                **kwargs,
-            )
-            if result.routing_kv is not None:
-                self.policy.kv_route.observe(
-                    result.routing_kv["source"], self.policy.cfg, now
-                )
-            if self.policy.cfg.routing_relief:
-                self.policy.relief.admitted(
-                    result.pool_id,
-                    args[1] if len(args) > 1 else kwargs["prompt_tokens"],
-                    now,
-                    result.routing_reason.startswith("router relief epoch")
-                    or bool(result.routing_kv and result.routing_kv["redirect"]),
-                )
-                if result.pool_id == pools[0].pool_id:
-                    self.policy._since = None
-                    self.policy._service_confirmation = None
-            self._owners[result.request_id] = result.pool_id
-            record = {
-                "kind": "pressure_admission",
-                "admission": asdict(result),
-                "pool_readings": [
-                    asdict(pool)
-                    for pool in (args[3] if len(args) > 3 else kwargs["pools"])
-                ],
-                "routing_config": asdict(self.policy.cfg),
-                "routing_strategy": self.routing_strategy,
-                "routing_weights": self.routing_weights,
-                "routing_relief": relief,
-                "routing_relief_after": self.policy.relief.snapshot(),
-                "decision_unix_s": kwargs.get(
-                    "now", args[4] if len(args) > 4 else None
-                ),
-                "config_sha256": self.policy.cfg.sha256,
-                "reservation_before": before,
-                "reservation_after": self.ledger.snapshot(),
-            }
-            if self.policy.cfg.kv_routing_priority:
-                record["kv_routing_state"] = kv_before
-                record["kv_routing_state_after"] = self.policy.kv_route.snapshot()
+            result, record = self._admit_pair(self.policy, args, kwargs)
         self.audit(record)
         return result
+
+    def _admit_pair(self, policy, args, kwargs):
+        before = self.ledger.snapshot()
+        pools = args[3] if len(args) > 3 else kwargs["pools"]
+        now = kwargs.get("now", args[4] if len(args) > 4 else None)
+        policy.observe_relief(now, pools[0])
+        if self.routing_strategy == "pressure":
+            policy.relief.acknowledge(now)
+        relief = policy.relief.snapshot()
+        kv_before = policy.kv_route.snapshot()
+        result = admit(
+            *args,
+            cfg=policy.cfg,
+            ledger=self.ledger,
+            routing_strategy=self.routing_strategy,
+            routing_weights=self.routing_weights,
+            routing_relief=relief,
+            kv_routing_state=kv_before,
+            **kwargs,
+        )
+        if result.routing_kv is not None:
+            policy.kv_route.observe(result.routing_kv["source"], policy.cfg, now)
+        if policy.cfg.routing_relief:
+            policy.relief.admitted(
+                result.pool_id,
+                args[1] if len(args) > 1 else kwargs["prompt_tokens"],
+                now,
+                result.routing_reason.startswith("router relief epoch")
+                or bool(result.routing_kv and result.routing_kv["redirect"]),
+                source_pool_id=pools[0].pool_id,
+            )
+            if result.pool_id == pools[0].pool_id:
+                policy._since = None
+                policy._service_confirmation = None
+        self._owners[result.request_id] = result.pool_id
+        record = {
+            "kind": "pressure_admission",
+            "admission": asdict(result),
+            "pool_readings": [asdict(pool) for pool in pools],
+            "routing_config": asdict(policy.cfg),
+            "routing_strategy": self.routing_strategy,
+            "routing_weights": self.routing_weights,
+            "routing_relief": relief,
+            "routing_relief_after": policy.relief.snapshot(),
+            "decision_unix_s": now,
+            "config_sha256": policy.cfg.sha256,
+            "reservation_before": before,
+            "reservation_after": self.ledger.snapshot(),
+        }
+        if policy.cfg.kv_routing_priority:
+            record["kv_routing_state"] = kv_before
+            record["kv_routing_state_after"] = policy.kv_route.snapshot()
+        return result, record
+
+    def admission_multi(
+        self,
+        request_id: str,
+        prompt_tokens: int,
+        requested_output: int,
+        readings: list[PoolReading],
+        tp_of: dict[str, int],
+        now: float,
+        key: str,
+        allowed_pool_id: str | None = None,
+    ):
+        """Rank inside each TP class, then the unchanged two-pool ``admit``."""
+        with self._lock:
+            classes = (
+                [r for r in readings if tp_of[r.pool_id] == 1],
+                [r for r in readings if tp_of[r.pool_id] > 1],
+            )
+            rankings = [
+                multi.class_ranking(
+                    rows,
+                    prompt_tokens,
+                    requested_output,
+                    self.ledger,
+                    self.policy.cfg,
+                    now,
+                    self.routing_strategy,
+                )
+                for rows in classes
+            ]
+            by_id = {r.pool_id: r for r in readings}
+            leaders = [
+                by_id[allowed_pool_id]
+                if allowed_pool_id in {row["pool_id"] for row in ranking}
+                else by_id[ranking[0]["pool_id"]]
+                for ranking in rankings
+                if ranking
+            ]
+            if len(leaders) == 2:
+                result, record = self._admit_pair(
+                    self.policy_for(leaders[0].pool_id),
+                    (request_id, prompt_tokens, requested_output, tuple(leaders)),
+                    dict(now=now, key=key, allowed_pool_id=allowed_pool_id),
+                )
+            else:
+                result, record = self._admit_class_only(
+                    request_id,
+                    prompt_tokens,
+                    requested_output,
+                    next(r for r in rankings if r),
+                    key,
+                    now,
+                    allowed_pool_id,
+                )
+            record.update(
+                class_ranking=rankings,
+                unified_choice=multi.unified_choice(rankings),
+                instance_readings=[asdict(r) for r in readings],
+            )
+        self.audit(record)
+        return result
+
+    def _admit_class_only(
+        self, request_id, prompt_tokens, requested_output, ranking, key, now, allowed
+    ):
+        """Single-class layout: the class leader, with admit's length contract."""
+        if (
+            type(prompt_tokens) is not int
+            or prompt_tokens < 0
+            or type(requested_output) is not int
+            or requested_output <= 0
+        ):
+            raise ValueError("invalid request lengths")
+        feasible = [
+            row
+            for row in ranking
+            if row["context_feasible"] and allowed in (None, row["pool_id"])
+        ]
+        if not feasible:
+            raise RoutingError(
+                {
+                    row["pool_id"]: dict(reasons=["context/stop budget exhausted"])
+                    for row in ranking
+                }
+            )
+        before = self.ledger.snapshot()
+        chosen = feasible[0]
+        self.ledger.track_ingress(key, request_id, chosen["pool_id"], prompt_tokens)
+        result = Admission(
+            request_id,
+            chosen["pool_id"],
+            min(8192, requested_output),
+            key,
+            "fixed pilot route" if allowed else "class-only: " + chosen["basis"],
+            routing_capacity={row["pool_id"]: row["fit"] for row in ranking},
+            routing_pressure={
+                row["pool_id"]: dict(
+                    service=row["service"],
+                    capacity=row["capacity"],
+                    score=row["score"],
+                )
+                for row in ranking
+            },
+        )
+        self._owners[request_id] = result.pool_id
+        record = {
+            "kind": "pressure_admission",
+            "admission": asdict(result),
+            "routing_config": asdict(self.policy.cfg),
+            "routing_strategy": self.routing_strategy,
+            "decision_unix_s": now,
+            "config_sha256": self.policy.cfg.sha256,
+            "reservation_before": before,
+            "reservation_after": self.ledger.snapshot(),
+        }
+        return result, record
 
     @staticmethod
     def with_predictions(
@@ -278,6 +416,171 @@ class PressureCoordinator:
             }
         )
         return decision
+
+    def tick_multi(
+        self,
+        now: float,
+        readings: dict[str, PoolReading],
+        tp_of: dict[str, int],
+        candidates: dict[tuple[str, str], list[Candidate]],
+        actions: dict[str, BoundAction] | None = None,
+    ):
+        """Evaluate every (TP1 source, TP-k target) pair; execute at most one.
+
+        ``candidates[(s, t)]`` are the requests owned by s, with target-side
+        costs for t. Each source's trigger state advances once per tick: pairs
+        are evaluated on copies and the chosen target's outcome is kept.
+        Returns the executed (source, target, decision) or None.
+        """
+        chosen = action = None
+        with self._lock:
+            for rows in candidates.values():
+                for c in rows:
+                    owner = self._owners.get(c.request_id)
+                    if owner is not None and owner != c.owner:
+                        raise ValueError("inventory contradicts confirmed ownership")
+            before = self.ledger.snapshot()
+            sources = sorted(i for i in readings if tp_of[i] == 1)
+            targets = sorted(i for i in readings if tp_of[i] > 1)
+            session_active = any(
+                r.kind == "migration" and r.state == "ACTIVE"
+                for r in self.ledger.entries.values()
+            )
+            evaluations = []
+            for s in sources if targets else ():
+                policy = self.policy_for(s)
+                policy.observe_relief(now, readings[s])
+                if self.routing_strategy == "pressure":
+                    policy.relief.acknowledge(now)
+                base = policy.source_state()
+                pairs = []
+                for t in targets:
+                    policy.restore_source_state(base)
+                    decision = policy.decide(
+                        now, readings[s], readings[t], candidates.get((s, t), [])
+                    )
+                    headroom = multi.target_headroom(readings[t], self.ledger)
+                    pairs.append(
+                        dict(
+                            target=t,
+                            decision=decision,
+                            headroom=headroom,
+                            state=policy.source_state(),
+                            key=multi.pair_key(decision, headroom, s, t)
+                            if decision.request_id is not None
+                            else None,
+                        )
+                    )
+                executable = [p for p in pairs if p["key"] is not None]
+                best = (
+                    min(executable, key=lambda p: p["key"])
+                    if executable
+                    else min(
+                        pairs,
+                        key=lambda p: (
+                            -p["headroom"] if p["headroom"] is not None else 0,
+                            p["target"],
+                        ),
+                    )
+                )
+                policy.restore_source_state(best["state"])
+                evaluations.append(dict(source=s, best=best, pairs=pairs))
+                if best["key"] is not None and (
+                    chosen is None or best["key"] < chosen["best"]["key"]
+                ):
+                    chosen = evaluations[-1]
+            record = {
+                "kind": "pressure_decision_multi",
+                "unix_s": now,
+                "readings": {
+                    i: asdict(self.ledger.routing_reading(r))
+                    for i, r in readings.items()
+                },
+                "evaluations": [
+                    dict(
+                        source=e["source"],
+                        best_target=e["best"]["target"],
+                        pairs=[
+                            dict(
+                                target=p["target"],
+                                headroom=p["headroom"],
+                                key=list(p["key"]) if p["key"] else None,
+                                decision=asdict(p["decision"]),
+                            )
+                            for p in e["pairs"]
+                        ],
+                    )
+                    for e in evaluations
+                ],
+                "chosen": [chosen["source"], chosen["best"]["target"]]
+                if chosen
+                else None,
+                "deferred": [
+                    [e["source"], e["best"]["target"]]
+                    for e in evaluations
+                    if e is not chosen and e["best"]["key"] is not None
+                ],
+                "global_session_active": session_active,
+                "reservation_before": before,
+                "execution": "ADVISORY",
+            }
+            if chosen is not None and actions is not None and not session_active:
+                s, t = chosen["source"], chosen["best"]["target"]
+                decision = chosen["best"]["decision"]
+                selected = next(
+                    c for c in candidates[(s, t)] if c.request_id == decision.request_id
+                )
+                action = actions.get(selected.request_id)
+                if action is None or action.request_id != selected.request_id:
+                    raise ValueError("selected request has no matching action binding")
+                if action.session_id in self._sessions:
+                    raise ValueError("session already used")
+                evidence = next(
+                    r
+                    for r in decision.candidates
+                    if r["request"]["request_id"] == selected.request_id
+                )
+                self.ledger.reserve(
+                    Reservation(
+                        action.session_id,
+                        selected.request_id,
+                        t,
+                        evidence["target_required_blocks"],
+                        selected.target_decode_cost,
+                        0,
+                        "migration",
+                    ),
+                    readings[t],
+                )
+                self._sessions[action.session_id] = (selected.request_id, t)
+                self._owners.setdefault(selected.request_id, s)
+                record.update(session_id=action.session_id, execution="RESERVED")
+            record["reservation_after"] = self.ledger.snapshot()
+        self.audit(record)
+        if action is None:
+            return None
+        try:
+            action.start()
+        except BaseException:
+            self.audit(
+                {
+                    "kind": "pressure_start_uncertain",
+                    "session_id": action.session_id,
+                    "request_id": action.request_id,
+                }
+            )
+            raise
+        with self._lock:
+            self.policy_for(s).note_started(now)
+        self.audit(
+            {
+                "kind": "pressure_start_published",
+                "unix_s": now,
+                "session_id": action.session_id,
+                "request_id": action.request_id,
+            }
+        )
+        return s, t, decision
 
     def finish(
         self,
