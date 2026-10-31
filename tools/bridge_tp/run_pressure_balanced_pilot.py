@@ -523,45 +523,44 @@ def _run(args, prepared):
         executor=executor,
         audit=audit,
     )
-    scrapers = tuple(
-        load("telemetry").MetricsScraper(
+
+    def scraper_for(url, tp):
+        return load("telemetry").MetricsScraper(
             url,
             controller.block_size,
-            total,
+            controller.tp1_total_kv_blocks
+            if tp == 1
+            else controller.tp4_total_kv_blocks,
             timeout_s=0.75 if cfg.health_service else 2.0,
         )
-        for url, total in (
-            (controller.source_url, controller.tp1_total_kv_blocks),
-            (controller.target_url, controller.tp4_total_kv_blocks),
-            *(
-                (
-                    row["endpoint"],
-                    controller.tp1_total_kv_blocks
-                    if row["tp_degree"] == 1
-                    else controller.tp4_total_kv_blocks,
-                )
-                for row in extras
-            ),
-        )
-    )
+
     predictor = load("manager_m5").PredictorEventReader(
         args.predictor_events,
         args.predictor_sha256,
         align_history=getattr(args, "platform", "a100") == "qwen3",
     )
+
+    def predictor_for(path):
+        return load("manager_m5").PredictorEventReader(
+            Path(path),
+            args.predictor_sha256,
+            align_history=getattr(args, "platform", "a100") == "qwen3",
+        )
+
     # Migration sources: the pair source, then every TP1 with its own channel.
     migration_sources = [("tp1", args.source_inventory, predictor)] + [
         (
             row["instance_id"],
             Path(row["inventory_path"]),
-            load("manager_m5").PredictorEventReader(
-                Path(row["predictor_events"]),
-                args.predictor_sha256,
-                align_history=getattr(args, "platform", "a100") == "qwen3",
-            ),
+            predictor_for(row["predictor_events"]),
         )
         for row in channel_sources(receipt.get("instance_manifest"))
     ]
+    manifest = receipt.get("instance_manifest")
+    # Layout instance id of the fixed pair -> historical pool id.
+    alias_of = (
+        {v: k for k, v in manifest["legacy_pool_aliases"].items()} if manifest else {}
+    )
     dispatched, previous = {}, {}
     growth_readers = {pool: health.NativeDecodeGrowth() for pool in tp_of}
     started = time.monotonic()
@@ -613,20 +612,162 @@ def _run(args, prepared):
     last_inventory_status = {}
     last_inventory_progress = ()
     failure = None
-    try:
-        for path, pool_id in (
-            (args.source_inventory, "tp1"),
-            (args.target_inventory, "tp4"),
-            *((Path(row["inventory_path"]), row["instance_id"]) for row in extras),
+    # Per-instance observation resources keyed by pool id (S3b-1). Initial
+    # instances gate start-up on inventory; layout-control additions join the
+    # readings once their first inventory arrives.
+    slots = {}
+
+    def metrics_for(scraper):
+        return load("pressure_io").BackgroundMetrics(
+            lambda raw, scraper=scraper: load("pause_diagnostics").call(
+                "metrics.scrape", o.scrape_inventory_metrics, scraper, raw
+            )
+        )
+
+    def add_slot(pool_id, path, url, tp, initial, metrics=False):
+        reader = load("pressure_inventory_process").ProcessInventory(
+            path, pool_id, args.run_dir
+        )
+        background_inventory.append(reader)
+        slot = dict(reader=reader, scraper=scraper_for(url, tp), initial=initial)
+        slot["metrics"] = metrics_for(slot["scraper"]) if metrics else None
+        if slot["metrics"] is not None:
+            background_metrics.append(slot["metrics"])
+        slots[pool_id] = slot
+
+    def remove_slot(pool_id):
+        slot = slots.pop(pool_id)
+        for sampler, owner in (
+            (slot["reader"], background_inventory),
+            (slot["metrics"], background_metrics),
         ):
-            background_inventory.append(
-                load("pressure_inventory_process").ProcessInventory(
-                    path,
+            if sampler is not None:
+                sampler.stop.set()
+                sampler.close()
+                owner.remove(sampler)
+
+    layout_state = dict(signature=None, revision=None)
+
+    def apply_layout_control():
+        """Reconcile instances with the conversion executor's layout file."""
+        path = args.run_dir / "layout_control.json"
+        if not path.is_file():
+            return
+        stat = path.stat()
+        signature = (stat.st_size, stat.st_mtime_ns)
+        if signature == layout_state["signature"]:
+            return
+        try:
+            control = read(path)
+        except json.JSONDecodeError:
+            # A writer without atomic replace; retry on the next tick.
+            return
+        changes, deferred = [], []
+        for row in control["instances"]:
+            pool_id = alias_of.get(row["instance_id"], row["instance_id"])
+            state = row["lifecycle"]
+            if state not in {"ACTIVE", "QUIESCING", "RETIRED"}:
+                raise ValueError("layout control lifecycle " + state)
+            if pool_id not in tp_of:
+                if state != "ACTIVE":
+                    raise ValueError("layout control adds instances as ACTIVE")
+                if (
+                    not load("pressure_inventory_process").POOL_ID.fullmatch(pool_id)
+                    or row["tp_degree"]
+                    not in {1, getattr(controller, "target_tp_size", 4)}
+                    or row["context_limit"]
+                    != (
+                        args.source_context_limit
+                        if row["tp_degree"] == 1
+                        else args.target_context_limit
+                    )
+                ):
+                    raise ValueError("invalid layout control instance " + pool_id)
+                tp = row["tp_degree"]
+                tp_of[pool_id] = tp
+                profile_key[pool_id] = "tp1" if tp == 1 else "tp4"
+                context_of[pool_id] = row["context_limit"]
+                service.add_pool(pool_id)
+                if health_tracker is not None:
+                    health_tracker.add_pool(pool_id, "source" if tp == 1 else "target")
+                growth_readers[pool_id] = health.NativeDecodeGrowth()
+                ingress.urls[pool_id] = row["endpoint"]
+                add_slot(
                     pool_id,
-                    args.run_dir,
+                    Path(row["inventory_path"]),
+                    row["endpoint"],
+                    tp,
+                    initial=False,
+                    metrics=cfg.health_service,
+                )
+                if row.get("migration_channel") and tp == 1:
+                    migration_sources.append(
+                        (
+                            pool_id,
+                            Path(row["inventory_path"]),
+                            predictor_for(row["predictor_events"]),
+                        )
+                    )
+                changes.append(dict(pool_id=pool_id, change="ADDED"))
+            # The file may skip a step between polls (ACTIVE straight to
+            # RETIRED); walk the coordinator's transitions in order.
+            # Re-reading a layout is idempotent; a retired id never comes back
+            # (a rebuilt engine gets a new generation in its id).
+            current = co.lifecycle(pool_id)
+            if current == "RETIRED":
+                if state != "RETIRED":
+                    raise ValueError("layout control revives retired " + pool_id)
+                continue
+            steps = {"ACTIVE": ["ACTIVE"], "QUIESCING": ["QUIESCING"]}.get(
+                state, ["QUIESCING", "RETIRED"]
+            )
+            # Its inventory is the only completion evidence for admissions
+            # still open there: stay QUIESCING until they settle.
+            if state == "RETIRED" and any(
+                r.pool_id == pool_id and r.state in {"ACTIVE", "COMMITTED"}
+                for r in tuple(co.ledger.entries.values())
+            ):
+                steps, state = ["QUIESCING"], "QUIESCING"
+                deferred.append(pool_id)
+            for step in steps:
+                if co.lifecycle(pool_id) != step:
+                    co.set_lifecycle(pool_id, step)
+                    changes.append(dict(pool_id=pool_id, change=step))
+            if state == "RETIRED" and pool_id in slots:
+                remove_slot(pool_id)
+                migration_sources[:] = [m for m in migration_sources if m[0] != pool_id]
+        # A deferred retirement re-reads the same file on the next tick.
+        layout_state.update(
+            signature=None if deferred else signature,
+            revision=control.get("revision"),
+        )
+        if changes or deferred != layout_state.get("deferred"):
+            audit.write(
+                dict(
+                    kind="pressure_layout_applied",
+                    unix_s=time.time(),
+                    revision=control.get("revision"),
+                    changes=changes,
+                    retire_deferred=deferred,
                 )
             )
-        readers = tuple(background_inventory)
+        layout_state["deferred"] = deferred
+
+    try:
+        for path, pool_id, url, tp in (
+            (args.source_inventory, "tp1", controller.source_url, 1),
+            (args.target_inventory, "tp4", controller.target_url, 2),
+            *(
+                (
+                    Path(row["inventory_path"]),
+                    row["instance_id"],
+                    row["endpoint"],
+                    row["tp_degree"],
+                )
+                for row in extras
+            ),
+        ):
+            add_slot(pool_id, path, url, tp, initial=True)
 
         def submit_arrival(job, pools):
             submitted = {}
@@ -651,19 +792,16 @@ def _run(args, prepared):
         )
         dispatcher.start()
         if cfg.health_service:
-            for scraper in scrapers:
-                background_metrics.append(
-                    load("pressure_io").BackgroundMetrics(
-                        lambda raw, scraper=scraper: load("pause_diagnostics").call(
-                            "metrics.scrape", o.scrape_inventory_metrics, scraper, raw
-                        )
-                    )
-                )
+            for slot in slots.values():
+                slot["metrics"] = metrics_for(slot["scraper"])
+                background_metrics.append(slot["metrics"])
         while time.monotonic() - started < args.max_seconds:
             load("pause_diagnostics").tick()
+            apply_layout_control()
             dispatched = dispatcher.snapshot()
             now, elapsed = time.time(), time.monotonic() - started
-            inventories = [reader.poll(now) for reader in readers]
+            readers = [slot["reader"] for slot in slots.values()]
+            polled = {pool_id: s["reader"].poll(now) for pool_id, s in slots.items()}
             for reader in readers:
                 diagnostic = reader.diagnostics()
                 status_key = (
@@ -678,7 +816,7 @@ def _run(args, prepared):
                     raise RuntimeError(
                         "inventory evidence invalid: " + json.dumps(diagnostic)
                     )
-            if any(v is None for v in inventories):
+            if any(polled[p] is None for p, s in slots.items() if s["initial"]):
                 dispatcher.publish(
                     unknown_routing_pools(args, controller.block_size, extras)
                 )
@@ -709,10 +847,13 @@ def _run(args, prepared):
                 )
                 time.sleep(args.tick_s)
                 continue
+            live = [p for p in slots if polled[p] is not None]
+            readers = [slots[p]["reader"] for p in live]
+            inventories = [polled[p] for p in live]
             pools, shapes = [], []
-            for pool_index, (reader, raw, scraper) in enumerate(
-                zip(readers, inventories, scrapers)
-            ):
+            for pool_id in live:
+                reader, raw = slots[pool_id]["reader"], polled[pool_id]
+                scraper, sampler = slots[pool_id]["scraper"], slots[pool_id]["metrics"]
                 if raw["block_size"] != controller.block_size:
                     raise ValueError(
                         "live KV block geometry differs from pilot contract"
@@ -721,7 +862,6 @@ def _run(args, prepared):
                     raise ValueError("live context limit differs from serving contract")
                 try:
                     if cfg.health_service:
-                        sampler = background_metrics[pool_index]
                         sampler.update_inventory(raw)
                         metrics = sampler.snapshot(time.time(), cfg.max_age_s)
                     else:
@@ -827,8 +967,13 @@ def _run(args, prepared):
             dispatcher.publish(pools)
             dispatched = dispatcher.snapshot()
             index_of = {pool.pool_id: n for n, pool in enumerate(pools)}
+            # Migration needs the pair target and a live source; retired or
+            # not-yet-observed instances simply drop out (S3b-1).
+            t = index_of.get("tp4")
             candidates_by_source, runtimes, rates_by_source = {}, {}, {}
             for source_id, inventory_path, source_predictor in migration_sources:
+                if t is None or source_id not in index_of:
+                    continue
                 n = index_of[source_id]
                 rates = service.snapshot(source_id, now)["request_rates"]
                 rates_by_source[source_id] = rates
@@ -849,14 +994,14 @@ def _run(args, prepared):
                             )
                             if all(
                                 workload_module.valid(pool, co.policy.cfg, now)
-                                for pool in (pools[n], pools[1])
+                                for pool in (pools[n], pools[t])
                             )
                             else (None, None)
                         )
                     else:
                         relief, cost = (
-                            lookup.deltas(shapes[n], shapes[1], row["request_id"])
-                            if shapes[n] and shapes[1]
+                            lookup.deltas(shapes[n], shapes[t], row["request_id"])
+                            if shapes[n] and shapes[t]
                             else (None, None)
                         )
                     release_budget = lookup.release_budget
@@ -883,7 +1028,8 @@ def _run(args, prepared):
                             release_budget,
                             source_tokens_s=(
                                 rates.get(stream.client_id)
-                                if stream is not None else None
+                                if stream is not None
+                                else None
                             ),
                             finished=stream.future.done()
                             if stream is not None
@@ -900,14 +1046,14 @@ def _run(args, prepared):
                             target_health_after_supported=(
                                 health_module.supported_after(
                                     health_tracker.reference,
-                                    shapes[1]["decode_requests"] + 1,
+                                    shapes[t]["decode_requests"] + 1,
                                     (
-                                        shapes[1]["decode_context_sum"]
+                                        shapes[t]["decode_context_sum"]
                                         + row["computed_tokens"]
                                     )
-                                    / (shapes[1]["decode_requests"] + 1),
+                                    / (shapes[t]["decode_requests"] + 1),
                                 )
-                                if health_tracker is not None and shapes[1]
+                                if health_tracker is not None and shapes[t]
                                 else False
                             ),
                         )
@@ -943,7 +1089,7 @@ def _run(args, prepared):
                     state="LOCAL",
                     generated_tokens=None,
                     source_sampled_unix_s=pools[n].sampled_at,
-                    target_sampled_unix_s=pools[1].sampled_at,
+                    target_sampled_unix_s=pools[t].sampled_at,
                     source_free_kv_tokens=pools[n].free_blocks * pools[n].block_size,
                     source_guard_free_kv_tokens=cfg.capacity_guard_blocks
                     * pools[n].block_size,
@@ -951,10 +1097,10 @@ def _run(args, prepared):
                     * pools[n].block_size
                     if pools[n].growth_blocks_s is not None
                     else None,
-                    target_running=inventories[1]["running"],
-                    target_waiting=co.ledger.routing_reading(pools[1]).waiting,
+                    target_running=inventories[t]["running"],
+                    target_waiting=co.ledger.routing_reading(pools[t]).waiting,
                     target_kv_usage_frac=1
-                    - pools[1].free_blocks / inventories[1]["total_blocks"],
+                    - pools[t].free_blocks / inventories[t]["total_blocks"],
                 )
             candidates = [c for cs in candidates_by_source.values() for c in cs]
             # A source without observed request rates may not start a migration;
@@ -968,39 +1114,44 @@ def _run(args, prepared):
                     c.request_id: r.BoundAction(
                         c.request_id,
                         session.migration_id,
-                        lambda c=c, runtime=runtimes[source]: session.start(
-                            c, runtime
-                        ),
+                        lambda c=c, runtime=runtimes[source]: session.start(c, runtime),
                     )
                     for source, cs in candidates_by_source.items()
                     if rates_by_source[source]
                     for c in cs
                 }
             )
-            load("pause_diagnostics").call(
-                "policy.tick",
-                co.tick_multi,
-                now,
-                {"tp4": pools[1]}
-                | {source: pools[index_of[source]] for source in candidates_by_source},
-                tp_of,
-                {(source, "tp4"): cs for source, cs in candidates_by_source.items()},
-                actions,
-            )
+            if t is not None:
+                load("pause_diagnostics").call(
+                    "policy.tick",
+                    co.tick_multi,
+                    now,
+                    {"tp4": pools[t]}
+                    | {
+                        source: pools[index_of[source]]
+                        for source in candidates_by_source
+                    },
+                    tp_of,
+                    {
+                        (source, "tp4"): cs
+                        for source, cs in candidates_by_source.items()
+                    },
+                    actions,
+                )
             session_source = co._session_source.get(session.migration_id, "tp1")
-            runtime = runtimes.get(session_source, runtimes["tp1"])
-            if session.record is not None and not session.settled:
-                session.poll_cancel(inventories[1], now, cfg.max_age_s)
+            runtime = runtimes.get(session_source)
+            if t is not None and session.record is not None and not session.settled:
+                session.poll_cancel(inventories[t], now, cfg.max_age_s)
                 if args.test_only_cancel_first_shadow:
                     from tools.bridge_tp.pressure_health_screen import (
                         inject_cancel_smoke,
                     )
 
-                    inject_cancel_smoke(session, inventories[1], now, audit)
+                    inject_cancel_smoke(session, inventories[t], now, audit)
                 session.reconsider(
                     now,
                     co.ledger.routing_reading(pools[index_of[session_source]]),
-                    co.ledger.routing_reading(pools[1]),
+                    co.ledger.routing_reading(pools[t]),
                     next(
                         (
                             c
@@ -1010,7 +1161,7 @@ def _run(args, prepared):
                         None,
                     ),
                     co.policy.cfg,
-                    target_inventory=inventories[1],
+                    target_inventory=inventories[t],
                 )
                 progress = session.old.read_source_progress(
                     session.run_dir, session.stream.payload, now
@@ -1028,7 +1179,7 @@ def _run(args, prepared):
                     session.cancel(
                         "source ended before selected progress was published"
                     )
-            for previous_session in session.sessions:
+            for previous_session in session.sessions if t is not None else ():
                 if previous_session.record is None:
                     continue
                 entry = co.ledger.entries[previous_session.migration_id]
@@ -1045,7 +1196,7 @@ def _run(args, prepared):
                 )
                 targets = [
                     row
-                    for row in inventories[1]["requests"]
+                    for row in inventories[t]["requests"]
                     if row["request_id"].startswith(prefix)
                 ]
                 if len(targets) > 1:
@@ -1053,12 +1204,12 @@ def _run(args, prepared):
                 if (
                     targets
                     and entry.state in {"ACTIVE", "COMMITTED"}
-                    and 0 <= now - pools[1].sampled_at <= cfg.max_age_s
+                    and 0 <= now - pools[t].sampled_at <= cfg.max_age_s
                     and targets[0]["owned_blocks"] is not None
                 ):
                     co.observe_migration(
                         entry.key,
-                        inventories[1]["pool_id"],
+                        inventories[t]["pool_id"],
                         allocated_blocks=min(targets[0]["owned_blocks"], entry.blocks),
                         service_observed=entry.service_observed
                         or targets[0]["generated"] >= 2,
@@ -1070,7 +1221,7 @@ def _run(args, prepared):
                     and previous_session.target_future is not None
                     and previous_session.target_future.done()
                     and not previous_session.target_future.exception()
-                    and pools[1].sampled_at
+                    and pools[t].sampled_at
                     > previous_session.target_future.result()["completed_unix_s"]
                     and entry.state in {"COMMITTED", "ACCOUNTED"}
                 ):
@@ -1098,6 +1249,8 @@ def _run(args, prepared):
                 p.classify(co.ledger.routing_reading(pool), co.policy.cfg, now)
                 for pool in pools
             ]
+            by_pool = dict(zip(index_of, pressures))
+            source_p, target_p = by_pool.get("tp1"), by_pool.get("tp4")
             if time.monotonic() - last_status_at >= 5:
                 last_status_at = time.monotonic()
                 status = dict(
@@ -1107,10 +1260,10 @@ def _run(args, prepared):
                     completed=completed,
                     total=len(jobs),
                     queued=due_queued,
-                    source_zone=pressures[0].zone,
-                    target_zone=pressures[1].zone,
-                    source_missing=pressures[0].missing,
-                    target_missing=pressures[1].missing,
+                    source_zone=source_p.zone if source_p else None,
+                    target_zone=target_p.zone if target_p else None,
+                    source_missing=source_p.missing if source_p else ["not serving"],
+                    target_missing=target_p.missing if target_p else ["not serving"],
                     active_generated=sum(row[2] for row in marker[2]),
                     migration=marker[3],
                     migrations_started=sum(
@@ -1188,8 +1341,8 @@ def _run(args, prepared):
                 reason=json.dumps(
                     dict(
                         queued=due_queued,
-                        source=pressures[0].zone,
-                        target=pressures[1].zone,
+                        source=source_p.zone if source_p else None,
+                        target=target_p.zone if target_p else None,
                     )
                 ),
             )

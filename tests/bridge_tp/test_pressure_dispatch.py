@@ -2,6 +2,7 @@
 """Exercise blocked control I/O while real ingress keeps sending CPU arrivals."""
 
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -563,6 +564,185 @@ class DispatchTests(unittest.TestCase):
             (root / "instances.json").write_text(json.dumps(bad))
             with self.assertRaises(ValueError):
                 pilot.instance_manifest(args, controller)
+
+    def test_layout_control_adds_and_retires_instances_mid_run(self):
+        """S3b-1: the conversion executor's layout file changes membership."""
+        calls = []
+
+        class Reader:
+            def __init__(self, pool_id):
+                self.pool_id, self.generation = pool_id, 0
+
+            def poll(self, now):
+                self.generation += 1
+                return dict(
+                    schema="PRESSURE_INVENTORY_V1",
+                    dropped_before=0,
+                    writer_error=None,
+                    pool_id=self.pool_id,
+                    sampled_at=now,
+                    generation=self.generation,
+                    total_blocks=2001,
+                    usage_denominator_blocks=2000,
+                    free_blocks=2000,
+                    block_size=16,
+                    context_limit=8192,
+                    pending_prompt_tokens=0,
+                    waiting=0,
+                    running=0,
+                    requests=[],
+                )
+
+        session = NS(
+            sessions=[],
+            record=None,
+            stream=None,
+            target_future=None,
+            settled=True,
+            migration_id="test",
+            ready_for_start=True,
+            rotate=lambda: False,
+            cleanup_requires_shutdown=False,
+            cancel_future=None,
+            close=lambda: None,
+        )
+        write_lock = threading.Lock()
+
+        def publish(url, after=-float("inf")):
+            while time.time() <= after:
+                time.sleep(0.001)
+            value = readers[url].poll(time.time())
+            with (root / url).open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(value) + "\n")
+
+        extra = dict(
+            instance_id="A-g3-tp1",
+            tp_degree=1,
+            context_limit=8192,
+            endpoint="extra",
+            inventory_path="",
+        )
+
+        def layout(revision, *rows):
+            path = root / "layout_control.json.tmp"
+            path.write_text(json.dumps(dict(revision=revision, instances=list(rows))))
+            os.replace(path, root / "layout_control.json")
+
+        def post(url, payload, timeout, sink):
+            with write_lock:
+                calls.append(url)
+                if len(calls) == 1:
+                    publish("extra")
+                    layout(1, dict(extra, lifecycle="ACTIVE"))
+                if len(calls) == 5:
+                    layout(
+                        2,
+                        dict(extra, lifecycle="RETIRED"),
+                        dict(
+                            instance_id="tp4",
+                            tp_degree=4,
+                            context_limit=8192,
+                            endpoint="target",
+                            inventory_path=str(root / "target"),
+                            lifecycle="RETIRED",
+                        ),
+                    )
+            sink(0, 42, time.time())
+            completed = time.time()
+            with write_lock:
+                publish(url, after=completed)
+            return dict(request_started_unix_s=completed, completed_unix_s=completed)
+
+        actual_ingress = i.PressureIngress
+
+        def make_ingress(*args, **kwargs):
+            return actual_ingress(*args, **kwargs, post=post)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            extra["inventory_path"] = str(root / "extra")
+            readers = {
+                "source": Reader("tp1"),
+                "target": Reader("tp4"),
+                "extra": Reader("A-g3-tp1"),
+            }
+            publish("source")
+            publish("target")
+            args = NS(
+                run_dir=root,
+                source_inventory=root / "source",
+                target_inventory=root / "target",
+                source_context_limit=8192,
+                target_context_limit=8192,
+                predictor_events=root / "predictor",
+                predictor_sha256="0" * 64,
+                migration_id="test",
+                tick_s=0.005,
+                max_seconds=8,
+                no_progress_s=4,
+                no_migration=True,
+                maximum_migrations=1,
+                routing_strategy="pressure",
+                routing_weights=[1, 1],
+                test_only_cancel_first_shadow=False,
+            )
+            controller = NS(
+                source_url="source",
+                target_url="target",
+                block_size=16,
+                tp1_total_kv_blocks=2001,
+                tp4_total_kv_blocks=2001,
+            )
+            jobs = [
+                dict(
+                    id=str(n),
+                    at_s=n * 0.3,
+                    request=dict(model="qwen", prompt=[1], max_tokens=8),
+                )
+                for n in range(8)
+            ]
+            with (
+                patch.dict(sys.modules, {"vllm.bridge_tp.async_journal": journal}),
+                patch(
+                    "tools.bridge_tp.pressure_sessions.PressureSessions",
+                    return_value=session,
+                ),
+                patch.object(o, "scrape_inventory_metrics", return_value=None),
+                patch.object(i, "PressureIngress", side_effect=make_ingress),
+            ):
+                pilot._run(
+                    args, (config(), controller, NS(release_budget=17), jobs, {})
+                )
+            result = json.loads((root / "pressure_request_results.json").read_text())
+            self.assertEqual(len(result), 8)
+            self.assertTrue(all(row["source_done"] for row in result))
+            pools = [row["initial_pool"] for row in result]
+            # Joined after its first inventory, served requests, then retired:
+            # nothing is routed to it (or to the retired target) afterwards.
+            self.assertIn("A-g3-tp1", pools)
+            self.assertEqual(pools[-1], "tp1")
+            self.assertTrue((root / "inventory_A-g3-tp1_process_receipt.json").exists())
+            audit = [
+                json.loads(line)
+                for line in (root / "pressure_audit.jsonl").read_text().splitlines()
+            ]
+            applied = [r for r in audit if r["kind"] == "pressure_layout_applied"]
+            changes = {}
+            for row in applied:
+                for c in row["changes"]:
+                    changes.setdefault(c["pool_id"], []).append(c["change"])
+            self.assertEqual(
+                changes,
+                {
+                    "A-g3-tp1": ["ADDED", "QUIESCING", "RETIRED"],
+                    "tp4": ["QUIESCING", "RETIRED"],
+                },
+            )
+            # Request 4 was still open on the extra instance when the layout
+            # said RETIRED: it stays QUIESCING until its inventory settles it.
+            self.assertIn(["A-g3-tp1"], [r["retire_deferred"] for r in applied])
+            progress = json.loads((root / "pressure_progress.json").read_text())
+            self.assertEqual(progress["stage"], "COMPLETED")
 
 
 if __name__ == "__main__":
