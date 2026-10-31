@@ -958,16 +958,14 @@ def _run(args, prepared):
                     and 0 <= now - pools[1].sampled_at <= cfg.max_age_s
                     and targets[0]["owned_blocks"] is not None
                 ):
-                    with co._lock:
-                        co.ledger.observe(
-                            entry.key,
-                            allocated_blocks=min(
-                                targets[0]["owned_blocks"], entry.blocks
-                            ),
-                            service_observed=entry.service_observed
-                            or targets[0]["generated"] >= 2,
-                            prefill_observed=True,
-                        )
+                    co.observe_migration(
+                        entry.key,
+                        inventories[1]["pool_id"],
+                        allocated_blocks=min(targets[0]["owned_blocks"], entry.blocks),
+                        service_observed=entry.service_observed
+                        or targets[0]["generated"] >= 2,
+                        prefill_observed=True,
+                    )
                 if (
                     not targets
                     and previous_session.settled

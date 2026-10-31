@@ -55,6 +55,61 @@ class PressureCoordinator:
         # Per-source trigger state; the first source reuses self.policy so a
         # single-source run is the historical coordinator.
         self._policies: dict[str, PressurePolicy] = {}
+        # Instance ids carry their generation (<bundle>-g<gen>-tp<k>); unknown
+        # ids are ACTIVE so the fixed pair needs no registration.
+        self._lifecycle: dict[str, str] = {}
+        self._session_source: dict[str, str] = {}
+
+    def lifecycle(self, instance_id: str) -> str:
+        return self._lifecycle.get(instance_id, "ACTIVE")
+
+    def set_lifecycle(self, instance_id: str, state: str) -> None:
+        """ACTIVE <-> QUIESCING -> RETIRED.
+
+        QUIESCING closes new admission and migration INTO the instance; it may
+        still migrate its own requests out. RETIRED needs every migration that
+        names it to be settled and drops its trigger state.
+        """
+        allowed = {
+            "ACTIVE": {"QUIESCING"},
+            "QUIESCING": {"ACTIVE", "RETIRED"},
+            "RETIRED": set(),
+        }
+        with self._lock:
+            current = self.lifecycle(instance_id)
+            if state == current:
+                return
+            if state not in allowed[current]:
+                raise ValueError("invalid instance lifecycle transition")
+            if state == "RETIRED" and any(
+                instance_id in (target, self._session_source.get(session))
+                and self.ledger.entries[session].state == "ACTIVE"
+                for session, (_, target) in self._sessions.items()
+            ):
+                raise ValueError("unsettled migration prevents retirement")
+            self._lifecycle[instance_id] = state
+            if state == "RETIRED":
+                self.forget_source(instance_id)
+        self.audit(
+            {
+                "kind": "pressure_instance_lifecycle",
+                "instance_id": instance_id,
+                "from": current,
+                "to": state,
+            }
+        )
+
+    def _bound_target(self, session_id: str, target_id: str | None) -> str:
+        actual = self._sessions[session_id][1]
+        if target_id is not None and target_id != actual:
+            raise ValueError("receipt names another target instance generation")
+        return actual
+
+    def observe_migration(self, session_id: str, target_id: str, **evidence) -> None:
+        """Target allocation evidence, accepted only from the bound instance."""
+        with self._lock:
+            self._bound_target(session_id, target_id)
+            self.ledger.observe(session_id, **evidence)
 
     def policy_for(self, source_id: str) -> PressurePolicy:
         policy = self._policies.get(source_id)
@@ -147,6 +202,12 @@ class PressureCoordinator:
     ):
         """Rank inside each TP class, then the unchanged two-pool ``admit``."""
         with self._lock:
+            readings = [r for r in readings if self.lifecycle(r.pool_id) == "ACTIVE"]
+            if not readings or (
+                allowed_pool_id is not None
+                and allowed_pool_id not in {r.pool_id for r in readings}
+            ):
+                raise RoutingError({"admission": dict(reasons=["no ACTIVE instance"])})
             classes = (
                 [r for r in readings if tp_of[r.pool_id] == 1],
                 [r for r in readings if tp_of[r.pool_id] > 1],
@@ -365,6 +426,7 @@ class PressureCoordinator:
                     selected.request_id,
                     target.pool_id,
                 )
+                self._session_source[action.session_id] = source.pool_id
                 self._owners.setdefault(selected.request_id, source.pool_id)
                 record.update(
                     {
@@ -423,8 +485,15 @@ class PressureCoordinator:
                     if owner is not None and owner != c.owner:
                         raise ValueError("inventory contradicts confirmed ownership")
             before = self.ledger.snapshot()
-            sources = sorted(i for i in readings if tp_of[i] == 1)
-            targets = sorted(i for i in readings if tp_of[i] > 1)
+            # A quiescing source may still migrate out; targets must be ACTIVE.
+            sources = sorted(
+                i
+                for i in readings
+                if tp_of[i] == 1 and self.lifecycle(i) in {"ACTIVE", "QUIESCING"}
+            )
+            targets = sorted(
+                i for i in readings if tp_of[i] > 1 and self.lifecycle(i) == "ACTIVE"
+            )
             session_active = any(
                 r.kind == "migration" and r.state == "ACTIVE"
                 for r in self.ledger.entries.values()
@@ -518,7 +587,20 @@ class PressureCoordinator:
                     routing_relief=self.policy_for(s).relief.snapshot(),
                     prediction_inputs=prediction_inputs(candidates.get((s, t), [])),
                 )
-            if chosen is not None and actions is not None and not session_active:
+            target_fresh = (
+                chosen is not None
+                and 0
+                <= now - readings[chosen["best"]["target"]].sampled_at
+                <= self.policy.cfg.max_age_s
+            )
+            if chosen is not None and not target_fresh:
+                record["execution_blocked"] = "target capacity evidence stale"
+            if (
+                chosen is not None
+                and actions is not None
+                and not session_active
+                and target_fresh
+            ):
                 s, t = chosen["source"], chosen["best"]["target"]
                 decision = chosen["best"]["decision"]
                 selected = next(
@@ -547,6 +629,7 @@ class PressureCoordinator:
                     readings[t],
                 )
                 self._sessions[action.session_id] = (selected.request_id, t)
+                self._session_source[action.session_id] = s
                 self._owners.setdefault(selected.request_id, s)
                 record.update(session_id=action.session_id, execution="RESERVED")
             record["reservation_after"] = self.ledger.snapshot()
@@ -585,9 +668,15 @@ class PressureCoordinator:
         ownership_confirmed: bool = False,
         source_release_confirmed: bool = False,
         cleanup_confirmed: bool = False,
+        target_id: str | None = None,
     ) -> None:
-        """Settle after existing lifecycle receipts; never infer safety from PMF."""
+        """Settle after existing lifecycle receipts; never infer safety from PMF.
+
+        ``target_id`` names the instance the receipt came from; a receipt from
+        another target generation is rejected.
+        """
         with self._lock:
+            self._bound_target(session_id, target_id)
             actual, target = self._sessions[session_id]
             if actual != request_id:
                 raise ValueError("completion request/session mismatch")

@@ -385,3 +385,159 @@ class PreflightOrderTests(unittest.TestCase):
                             f"{name}:{call.lineno}",
                         )
             self.assertTrue(checked, name)
+
+
+class InstanceLifecycleTests(unittest.TestCase):
+    """S1-c: lifecycle gates, generation-bound receipts, no oversubscription."""
+
+    def started(self, co, readings, cands, request, session, now=10):
+        calls = Started()
+        tp = {i: (1 if i.startswith("a") else 2) for i in readings}
+        result = co.tick_multi(
+            now, readings, tp, cands, {request: calls.bind(request, session)}
+        )
+        return result, calls.calls
+
+    def test_quiescing_instance_closes_admission_and_inbound_migration(self):
+        co, records = coordinator()
+        co.set_lifecycle("a2", "QUIESCING")
+        result = co.admission_multi(
+            "q",
+            2048,
+            1024,
+            [inst("a1", load=0.9), inst("a2", load=0.1), inst("b1", "tp4")],
+            TP,
+            10,
+            "k",
+        )
+        self.assertNotEqual(result.pool_id, "a2")
+        self.assertEqual(records[0]["kind"], "pressure_instance_lifecycle")
+        with self.assertRaises(p.RoutingError):
+            co.admission_multi(
+                "r", 128, 64, [inst("a2")], TP, 10, "k2", allowed_pool_id="a2"
+            )
+        co, _ = coordinator(config(sustain_s=0))
+        co.set_lifecycle("b1", "QUIESCING")
+        readings = {
+            "a1": pool("a1", decode_ratio=1.5),
+            "b1": pool("b1"),
+            "b2": pool("b2"),
+        }
+        cands = {
+            ("a1", "b1"): [candidate("x", owner="a1")],
+            ("a1", "b2"): [candidate("x", owner="a1")],
+        }
+        result, calls = self.started(co, readings, cands, "x", "s")
+        self.assertEqual(result[:2], ("a1", "b2"))
+        self.assertEqual(calls, ["x"])
+
+    def test_quiescing_source_still_migrates_out(self):
+        co, _ = coordinator(config(sustain_s=0))
+        co.set_lifecycle("a1", "QUIESCING")
+        readings = {"a1": pool("a1", decode_ratio=1.5), "b1": pool("b1")}
+        result, _ = self.started(
+            co, readings, {("a1", "b1"): [candidate("x", owner="a1")]}, "x", "s"
+        )
+        self.assertEqual(result[:2], ("a1", "b1"))
+
+    def test_retirement_waits_for_settlement_and_drops_state(self):
+        co, _ = coordinator(config(sustain_s=0))
+        readings = {"a1": pool("a1", decode_ratio=1.5), "b1": pool("b1")}
+        self.started(
+            co, readings, {("a1", "b1"): [candidate("x", owner="a1")]}, "x", "s"
+        )
+        co.set_lifecycle("a1", "QUIESCING")
+        with self.assertRaises(ValueError):
+            co.set_lifecycle("a1", "RETIRED")
+        co.finish("s", "x", "CANCELLED", cleanup_confirmed=True, target_id="b1")
+        co.set_lifecycle("a1", "RETIRED")
+        self.assertNotIn("a1", co._policies)
+        with self.assertRaises(ValueError):
+            co.set_lifecycle("a1", "ACTIVE")
+        with self.assertRaises(ValueError):
+            co.set_lifecycle("b1", "RETIRED")
+
+    def test_receipts_must_name_the_bound_target_generation(self):
+        co, _ = coordinator(config(sustain_s=0))
+        readings = {"a1": pool("a1", decode_ratio=1.5), "b1": pool("b1")}
+        self.started(
+            co, readings, {("a1", "b1"): [candidate("x", owner="a1")]}, "x", "s"
+        )
+        with self.assertRaises(ValueError):
+            co.observe_migration(
+                "s", "B-g9-tp2", allocated_blocks=1, service_observed=False
+            )
+        with self.assertRaises(ValueError):
+            co.finish("s", "x", "CANCELLED", cleanup_confirmed=True, target_id="b2")
+        co.observe_migration("s", "b1", allocated_blocks=1, service_observed=False)
+        self.assertEqual(co.ledger.entries["s"].allocated_blocks, 1)
+
+    def test_two_sources_cannot_oversubscribe_one_target(self):
+        co, co_records = coordinator(config(sustain_s=0, cooldown_s=0))
+        readings = {
+            "a1": pool("a1", decode_ratio=1.5),
+            "a2": pool("a2", decode_ratio=1.5),
+            "b1": pool("b1", free_blocks=600),
+        }
+        first, _ = self.started(
+            co,
+            readings,
+            {
+                ("a1", "b1"): [candidate("x", owner="a1")],
+                ("a2", "b1"): [candidate("y", owner="a2")],
+            },
+            "x",
+            "s1",
+        )
+        self.assertEqual(first[0], "a1")
+        promised = co.ledger.entries["s1"].blocks
+        co.finish(
+            "s1",
+            "x",
+            "COMMITTED",
+            ownership_confirmed=True,
+            source_release_confirmed=True,
+            target_id="b1",
+        )
+        self.assertEqual(co.ledger.pending("b1")[0], promised)
+        later = {
+            k: replace(v, sampled_at=11, published_at=11, decode_sampled_at=11)
+            for k, v in readings.items()
+        }
+        second, calls = self.started(
+            co,
+            later,
+            {
+                ("a2", "b1"): [
+                    candidate("y", owner="a2", sampled_at=11, published_at=11)
+                ]
+            },
+            "y",
+            "s2",
+            now=11,
+        )
+        self.assertIsNone(second)
+        self.assertEqual(calls, [])
+        (evaluation,) = [
+            e for e in co_records[-1]["evaluations"] if e["source"] == "a2"
+        ]
+        decision = evaluation["pairs"][0]["decision"]
+        rejected = decision["candidates"][0]["rejections"]
+        self.assertIn("target physical commitments exceed free blocks", rejected)
+        self.assertLessEqual(co.ledger.pending("b1")[0], 600)
+
+    def test_stale_target_evidence_blocks_execution(self):
+        co, records = coordinator(config(sustain_s=0))
+        readings = {"a1": pool("a1", decode_ratio=1.5), "b1": pool("b1")}
+        cands = {
+            ("a1", "b1"): [candidate("x", owner="a1", sampled_at=14, published_at=14)]
+        }
+        readings = {
+            "a1": replace(
+                readings["a1"], sampled_at=14, published_at=14, decode_sampled_at=14
+            ),
+            "b1": readings["b1"],
+        }
+        result, calls = self.started(co, readings, cands, "x", "s", now=14)
+        self.assertIsNone(result)
+        self.assertEqual(calls, [])
