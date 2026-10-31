@@ -343,7 +343,11 @@ class RepeatedSessions(unittest.TestCase):
         )
         plan["config_path"].parent.mkdir(parents=True)
         plan["config_path"].write_text(json.dumps(plan["config"]))
-        plan["instances_path"].write_text(json.dumps(plan["instances"]))
+        with self.assertRaises(FileNotFoundError):
+            launch.controller.preflight(
+                launch.controller.parse_args(plan["controller_argv"][2:])
+            )
+        launch.write_instances(plan)
         args = launch.controller.parse_args(plan["controller_argv"][2:])
         receipt = launch.controller.preflight(args)[-1]
         self.assertEqual(receipt["maximum_migrations"], 0)

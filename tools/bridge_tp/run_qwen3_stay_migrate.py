@@ -92,6 +92,7 @@ def serving_preflight(plans):
     for _, _, _, plan in plans:
         plan["config_path"].parent.mkdir(parents=True, exist_ok=True)
         write(plan["config_path"], plan["config"])
+        pilot.write_instances(plan)
         for role in ("source", "target"):
             parsed = make_arg_parser(FlexibleArgumentParser()).parse_args(
                 plan[role + "_argv"][3:]

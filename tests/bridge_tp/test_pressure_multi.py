@@ -343,3 +343,45 @@ class ControllerManifestTests(unittest.TestCase):
             path.write_text(json.dumps(manifest))
             with self.assertRaises(ValueError):
                 pilot.instance_manifest(args, NS(target_tp_size=4))
+
+
+class PreflightOrderTests(unittest.TestCase):
+    def test_every_controller_preflight_writes_instances_first(self):
+        # G1 (10-31) failed: up-front preflight ran before instances.json existed.
+        import ast
+        from pathlib import Path
+
+        def called(node):
+            func = node.func
+            return func.attr if isinstance(func, ast.Attribute) else func.id
+
+        root = Path(__file__).resolve().parents[2] / "tools/bridge_tp"
+        for name in (
+            "launch_pressure_balanced_pilot.py",
+            "run_pressure_comparison.py",
+            "run_qwen3_stay_migrate.py",
+        ):
+            tree = ast.parse((root / name).read_text(encoding="utf-8"))
+            checked = 0
+            for function in ast.walk(tree):
+                if not isinstance(function, ast.FunctionDef):
+                    continue
+                calls = [
+                    n
+                    for n in ast.walk(function)
+                    if isinstance(n, ast.Call)
+                    and isinstance(n.func, (ast.Attribute, ast.Name))
+                ]
+                writes = [n.lineno for n in calls if called(n) == "write_instances"]
+                for call in calls:
+                    if (
+                        called(call) == "preflight"
+                        and isinstance(call.func, ast.Attribute)
+                        and "controller" in ast.unparse(call.func.value)
+                    ):
+                        checked += 1
+                        self.assertTrue(
+                            any(line < call.lineno for line in writes),
+                            f"{name}:{call.lineno}",
+                        )
+            self.assertTrue(checked, name)

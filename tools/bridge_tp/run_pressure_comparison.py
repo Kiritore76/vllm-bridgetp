@@ -565,6 +565,7 @@ def main():
                 )
                 validate_parsed_serve_args(actual)
             phase8_stager.parse_args(plan["stager_argv"][2:])
+            pilot.write_instances(plan)
             actual = pilot.controller.parse_args(plan["controller_argv"][2:])
             actual.controller_config = Path(spec["controller_config_template"])
             pilot.controller.preflight(actual)

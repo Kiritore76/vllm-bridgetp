@@ -341,6 +341,14 @@ def build_scene(spec, scene, run_root, common, args):
     )
 
 
+def write_instances(plan):
+    """The controller checks --instances in every preflight, so write it first."""
+    path = plan.get("instances_path")
+    if path is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(plan["instances"], indent=2) + "\n", "utf-8")
+
+
 def verify_full_speed(run_dir):
     """Validate actual controls and history receipts, not only launch intent."""
     starts = 0
@@ -528,8 +536,7 @@ def run_scene(
 
         mechanism_dir = initialize(plan["run_dir"])
     common.write_json(plan["config_path"], plan["config"])
-    if "instances" in plan:
-        common.write_json(plan["instances_path"], plan["instances"])
+    write_instances(plan)
     if plan["config"].get("transfer_mode") == "FULL_SPEED":
         announce(scene["name"], "迁移全速：历史pacing关闭，M2动态限速关闭")
     RuntimeControl(
@@ -805,6 +812,7 @@ def main():
             actual = make_arg_parser(FlexibleArgumentParser()).parse_args(plan[key][3:])
             validate_parsed_serve_args(actual)
         phase8_stager.parse_args(plan["stager_argv"][2:])
+        write_instances(plan)
         actual = controller.parse_args(
             plan["controller_argv"][2:] + ["--validate-only"]
         )
