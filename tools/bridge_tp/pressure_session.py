@@ -174,6 +174,31 @@ class RollingPressureSession:
             )
             self.cancel(reason)
 
+    def _bind_source(self, candidate):
+        """Point commit/cleanup at the engine that owns the selected request.
+
+        Those endpoints abort the source request, so they must reach its own
+        engine. G2 (10-31) committed a second source's request on the pair
+        source, which aborted nothing; the real source kept recomputing it.
+        Without an owner or an endpoint map the configured source is kept.
+        """
+        owner = getattr(candidate, "owner", None)
+        urls = getattr(self.ingress, "urls", None)
+        if owner is None or urls is None:
+            return None
+        if owner not in urls:
+            raise ValueError(f"selected request owner {owner!r} has no endpoint")
+        self.adapter.source_url = urls[owner].rstrip("/")
+        self.audit.write(
+            {
+                "kind": "pressure_session_source",
+                "migration_id": self.migration_id,
+                "source_instance": owner,
+                "source_url": self.adapter.source_url,
+            }
+        )
+        return owner
+
     def start(self, candidate, snapshot):
         MigrationState, TriggerPath = self.old.MigrationState, self.old.TriggerPath
         RuntimeControl = self.old.RuntimeControl
@@ -188,6 +213,7 @@ class RollingPressureSession:
             raise ValueError("source ended or has no safe output budget")
         now = time.time()
         self.stream = stream
+        self.source_instance = self._bind_source(candidate)
         self.record = self.machine.create(
             self.migration_id, candidate.request_id,
             expected_ranks=getattr(self.config, "target_tp_size", 4),

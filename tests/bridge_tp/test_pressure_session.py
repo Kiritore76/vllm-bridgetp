@@ -187,6 +187,42 @@ class SessionTests(unittest.TestCase):
             self.driver._rate_decision(self.snapshot).profile, "FULL_SPEED"
         )
 
+    def test_commit_and_cleanup_target_the_selected_source_engine(self):
+        """G2 (10-31): a second source's request must commit on its own engine."""
+        old = self.driver
+        written = []
+        ingress = NS(
+            for_server_id=old.ingress.for_server_id,
+            urls={"tp1": "source", "A-g3-tp1": "http://127.0.0.1:8300/"},
+        )
+
+        def driver(name):
+            return RollingPressureSession(
+                run_dir=self.path / name,
+                migration_id=name,
+                config=old.config,
+                coordinator=old.coordinator,
+                ingress=ingress,
+                executor=old.executor,
+                audit=NS(write=written.append),
+                backend=old.old,
+            )
+
+        second = driver("second-source")
+        second.start(
+            NS(**(vars(self.candidate) | {"owner": "A-g3-tp1"})), self.snapshot
+        )
+        self.assertEqual(second.adapter.source_url, "http://127.0.0.1:8300")
+        self.assertEqual(second.source_instance, "A-g3-tp1")
+        self.assertIn("pressure_session_source", [row["kind"] for row in written])
+        pair = driver("pair-source")
+        pair.start(NS(**(vars(self.candidate) | {"owner": "tp1"})), self.snapshot)
+        self.assertEqual(pair.adapter.source_url, "source")
+        with self.assertRaises(ValueError):
+            driver("unknown").start(
+                NS(**(vars(self.candidate) | {"owner": "B-g9-tp1"})), self.snapshot
+            )
+
     def test_release_requires_matching_owner_and_request(self):
         self.driver.adapter.ranks = {0, 1, 2, 3}
         self.driver.tick(self.view, self.snapshot)
