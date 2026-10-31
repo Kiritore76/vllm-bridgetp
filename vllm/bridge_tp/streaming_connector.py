@@ -33,6 +33,7 @@ from vllm.bridge_tp.online_remote_attention import (
     RemoteAttentionConfig,
     RemoteAttentionRankServer,
 )
+from vllm.bridge_tp.source_channels import SourceChannelSet, parse_plan
 from vllm.bridge_tp.stream_protocol import (
     MIGRATION_PARAM,
     PROTOCOL_VERSION,
@@ -450,6 +451,26 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             )
         if self.channel_generation < 0:
             raise ValueError("bridgetp_channel_generation cannot be negative")
+        # S1-d2b: one preconnected receiver per TP1 source. The startup list and
+        # an optional plan file (polled; rebuilt on TP conversion) name each
+        # source's port block and channel generation; generations are unique
+        # per run, so a session manifest's generation selects its receiver.
+        sources = self._kv_transfer_config.get_from_extra_config(
+            "bridgetp_gpu_direct_sources", None
+        )
+        plan_path = self._kv_transfer_config.get_from_extra_config(
+            "bridgetp_gpu_direct_channel_plan", None
+        )
+        self._source_plan = (
+            parse_plan(sources, self._target_tp_size) if sources is not None else None
+        )
+        self._source_plan_path = Path(plan_path).absolute() if plan_path else None
+        if (self._source_plan is not None or self._source_plan_path) and not (
+            self.preconnect_gpu_direct and self.persistent_channel
+        ):
+            raise ValueError("per-source channels need persistent preconnect")
+        self._source_channels: SourceChannelSet | None = None
+        self._channel_plan_cache = ManifestPollCache()
         if self.persistent_channel and self.post_takeover_communicator_destroy:
             raise ValueError(
                 "persistent channel cannot use post-takeover destruction"
@@ -583,6 +604,10 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             raise ValueError(
                 "Persistent-channel connector and manifest settings differ"
             )
+        if manifest_persistent and (
+            self._source_plan is not None or self._source_plan_path is not None
+        ):
+            self._activate_source_channel(int(manifest.get("channel_generation", -1)))
         if manifest_persistent and (
             int(manifest.get("channel_generation", -1))
             != self.channel_generation
@@ -1289,6 +1314,78 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 return prebound[1]
         return None
 
+    def _activate_source_channel(self, generation: int) -> None:
+        """Point the single-receiver paths at this session's source channel."""
+        if self._source_channels is None:
+            raise RuntimeError("per-source GPU-direct channels are not open yet")
+        receiver = self._source_channels.select(generation)
+        with self._prebound_gpu_receiver_lock, self._persistent_gpu_receiver_lock:
+            self._prebound_gpu_receiver = receiver
+            self._persistent_gpu_receiver = receiver
+            self.channel_generation = generation
+
+    def _bind_source_receiver(self, channel, tp_rank: int, device):
+        """Bind one source's listener on this rank (no handshake yet)."""
+        from vllm.bridge_tp.gpu_direct_history import GpuDirectHistoryReceiver
+
+        receiver = GpuDirectHistoryReceiver(
+            device=device,
+            host=self.preconnect_gpu_direct_host,
+            port=channel.base_port + tp_rank,
+            defer_communicator_destroy=True,
+        )
+        receiver.listener.settimeout(None)
+        return receiver
+
+    def _open_source_receiver(self, receiver, channel, tp_rank: int) -> None:
+        """Handshake and warm one bound source channel on this rank."""
+        try:
+            receiver._open(migration_id="", rank=tp_rank)
+            if receiver.channel_generation != channel.generation:
+                raise RuntimeError("source channel generation differs")
+            assert receiver.connection is not None
+            receiver.allow_idle_wait = True
+            receiver.connection.settimeout(None)
+            started = time.perf_counter()
+            payload = receiver.warmup_preconnected_channel(rank=tp_rank)
+            _atomic_json_dump(
+                {
+                    "status": "WARMUP_COMPLETE",
+                    "target_tp_rank": tp_rank,
+                    "source_instance": channel.source,
+                    "channel_generation": channel.generation,
+                    "warmup_payload_bytes": payload,
+                    "warmup_ms": (time.perf_counter() - started) * 1000,
+                    "completed_unix_s": receiver.warmup_completed_unix_s,
+                },
+                self.manifest_path.parent
+                / "gpu_channel_preconnect_receipts"
+                / f"tp_rank_{tp_rank}-{channel.source}.json",
+            )
+        except BaseException:
+            receiver.close()
+            raise
+
+    def _reconcile_source_channels(self) -> None:
+        """Apply the polled channel plan (TP conversion rebuild)."""
+        if (
+            self._source_channels is None
+            or self._source_plan_path is None
+            or not self._source_plan_path.is_file()
+        ):
+            return
+        rows = self._channel_plan_cache.load(self._source_plan_path, _load_json)
+        result = self._source_channels.reconcile(
+            parse_plan(rows, self._target_tp_size)
+        )
+        if result["opened"] or result["closed"] or result["deferred"]:
+            _atomic_json_dump(
+                dict(result, completed_unix_s=time.time()),
+                self.manifest_path.parent
+                / "gpu_channel_plan_receipts"
+                / f"tp_rank_{get_tp_group().rank_in_group}.json",
+            )
+
     def _start_gpu_direct_receiver_prebind(self) -> None:
         """Bind the GPU-direct listener before dynamic cutover is known.
 
@@ -1306,7 +1403,28 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             )
 
             last_migration_id: str | None = None
-            if self.preconnect_gpu_direct:
+            if self.preconnect_gpu_direct and (
+                self._source_plan is not None or self._source_plan_path is not None
+            ):
+                try:
+                    tp_rank = get_tp_group().rank_in_group
+                    device = next(iter(self._registered_kv_caches.values())).device
+                    channels = SourceChannelSet(
+                        lambda channel: self._bind_source_receiver(
+                            channel, tp_rank, device
+                        ),
+                        lambda receiver, channel: self._open_source_receiver(
+                            receiver, channel, tp_rank
+                        ),
+                    )
+                    channels.reconcile(self._source_plan or ())
+                    self._source_channels = channels
+                    self._reconcile_source_channels()
+                except BaseException:
+                    logger.exception("GPU-direct per-source preconnect failed")
+                    self._prebind_receiver_ready.set()
+                    return
+            elif self.preconnect_gpu_direct:
                 receiver: Any | None = None
                 try:
                     tp_rank = get_tp_group().rank_in_group
@@ -1361,6 +1479,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             while not self._prebind_receiver_stop.is_set():
                 receiver: Any | None = None
                 try:
+                    self._reconcile_source_channels()
                     if not self.manifest_path.is_file():
                         time.sleep(0.005)
                         continue
@@ -1386,6 +1505,10 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     self._prebind_receiver_ready.clear()
                     tp_rank = get_tp_group().rank_in_group
                     record = ranks[tp_rank]
+                    if self._source_channels is not None:
+                        self._activate_source_channel(
+                            int(manifest.get("channel_generation", -1))
+                        )
                     with self._prebound_gpu_receiver_lock:
                         receiver = self._prebound_gpu_receiver
                     if receiver is None:
@@ -1486,6 +1609,8 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                         with self._persistent_gpu_receiver_lock:
                             if self._persistent_gpu_receiver is receiver:
                                 self._persistent_gpu_receiver = None
+                        if self._source_channels is not None:
+                            self._source_channels.discard(receiver)
                         try:
                             receiver.close()
                         except BaseException:

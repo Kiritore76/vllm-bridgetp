@@ -302,6 +302,11 @@ class RuntimeTests(unittest.TestCase):
             _prebind_receiver_ready=threading.Event(),
             _prebind_receiver_stop=threading.Event(),
             manifest_path=Path("unused/session.json"),
+            # Single-source connector: no per-source channel plan (S1-d2b).
+            _source_plan=None,
+            _source_plan_path=None,
+            _source_channels=None,
+            _reconcile_source_channels=lambda: None,
         )
         receiver = NS(
             listener=Mock(),

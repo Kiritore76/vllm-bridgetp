@@ -182,7 +182,7 @@
     "vllm/bridge_tp/rolling_cutover.py": "5def4ab368759b33791633794e15d86845b1848c95e22f6d488515367669c016",
     "vllm/bridge_tp/runtime_control.py": "07d675528907a98a0e50f1ac270a49c1721db3c0936eba8dcf230e0457cffd0a",
     "vllm/bridge_tp/shadow_transfer_protocol.py": "fdd6f3d6839fa35c01cd165ad0251ccb0f4112a89cc2e94c8846b7e435fadeac",
-    "vllm/bridge_tp/streaming_connector.py": "17424a5749ad0dc4c065bfd32aa16f01ba908ffe5ceec1598e1432c7d9d836fa",
+    "vllm/bridge_tp/streaming_connector.py": "682120d43c5c5bacb2a5a4d2254a8a6bce8307bcba28d68af1e3131625e0f1d0",
     "vllm/bridge_tp/stream_protocol.py": "8f2f15bbc005b778c2b68b7fd1c0a3c3583fda66feca70f8ec27346619381271",
     "vllm/bridge_tp/takeover_api.py": "77ded955c3dd53ceb551b187f67a5cd5b4f2f12f55f5ba35953a694c08ce9cf2",
     "vllm/bridge_tp/__init__.py": "3ffd9c3646257f2f954d336022cb2ee840a35e156a7b725a7ab9b0e6ce651f56",
@@ -349,7 +349,7 @@
     "vllm/bridge_tp/channel_diagnostics.py": "abb013298c86d52cdff658d9afc76c2af76d38b184a848a910185ca29b9ba97e",
     "vllm/bridge_tp/controller/native_journal.py": "90d2e87c2f5641580e33b95fec547191c3837a5f03e9f3b1104ffffd4034fe59",
     "vllm/bridge_tp/channel_runtime.py": "e0b3afec9b621f6a4df0fe204d28b5ba8b0d08b3fb6a5cf1e51c9e5fb4157934",
-    "tests/bridge_tp/test_channel_runtime.py": "17e9308b11e5a3e74d6e88abc3829855d630e1b56690c8d5f59035dfa8c0eac7",
+    "tests/bridge_tp/test_channel_runtime.py": "10399a1fe8284aee9414ba6b0c2661f93c6964267a989b74d9350db9746dde77",
     "tools/bridge_tp/qwen3_pressure_observation.py": "63b898e3142821bb23c6d8fac70cf66d4d2900beba011baa3be46116e64b8e9b",
     "tools/bridge_tp/run_qwen3_pressure_observation.py": "b4d1e63705a7c747e28303664f085955f6d61220e121cd0ea03ac79ef28a827a",
     "tests/bridge_tp/test_qwen3_pressure_observation.py": "93f1fb9d9d903b9501f560df4d39a3fc009183f0fed3946747a0dc29adf60604",
@@ -394,7 +394,9 @@
     "vllm/bridge_tp/controller/pressure_multi.py": "718728c7a560dc121b451a9d965488af8a866d7aefadfc3f90e4b0123ed5b49f",
     "tests/bridge_tp/test_pressure_multi.py": "bf6aa311f5d3f869522cf66fd7f44180a5d38d53aa0bf778f108208bcaacb3ea",
     "vllm/bridge_tp/gpu_direct_targets.py": "0ce34a69dd8be81cbf4b5dcff7d5748b39b8da58f7b07544eb24f8c1fb8e4e98",
-    "tests/bridge_tp/test_gpu_direct_targets.py": "dba87a7c218cd9c661efddc0710030545622f60702ca2f19f7e10d3cb233ef03"
+    "tests/bridge_tp/test_gpu_direct_targets.py": "dba87a7c218cd9c661efddc0710030545622f60702ca2f19f7e10d3cb233ef03",
+    "vllm/bridge_tp/source_channels.py": "48032fa1da17c1bddd68730f2d61dc94926ca657cfd30f175fa03bbe5a327c7f",
+    "tests/bridge_tp/test_source_channels.py": "bf4a87b85f4c94003e48733a6cfe3cc679165e07611a09fc7f6e81076a432262"
   },
   "server_settings": {
     "dtype": "bfloat16",

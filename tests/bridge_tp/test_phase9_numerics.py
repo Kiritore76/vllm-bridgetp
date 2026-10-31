@@ -44,6 +44,10 @@ def _streaming_connector_stub(connector_type):
     connector._model_wait_pending_requests = set()
     connector._gpu_restore_quiescence_lock = threading.Lock()
     connector._gpu_restore_quiescence = {}
+    # Single-source connector: no per-source channel plan (S1-d2b).
+    connector._source_plan = None
+    connector._source_plan_path = None
+    connector._source_channels = None
     return connector
 
 
