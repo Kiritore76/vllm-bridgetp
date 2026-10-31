@@ -60,6 +60,8 @@ class Harness:
         slow=(),
         acknowledge=True,
         trigger_s=0.3,
+        method="DRAIN",
+        safety=None,
     ):
         self.root, self.slow = root, set(slow)
         self.calls, self.events, self.stopped = [], [], set()
@@ -141,6 +143,7 @@ class Harness:
             context_limits=(8192, 8192),
             channel_plan=self.channel_plan,
             target_tp_ranks=2,
+            safety=safety,
             shadow_planner=conversion_planner.ShadowPlanner(
                 conversion_planner.load_profile(), manifest["instances"]
             ),
@@ -153,6 +156,7 @@ class Harness:
                 trigger_s=trigger_s,
                 deadline_s=20,
                 base_port=8400,
+                method=method,
             ),
             root / "conversion_plan.json",
             interval_s=0.02,
@@ -602,6 +606,21 @@ class ConversionTests(unittest.TestCase):
             self.assertFalse(backend.precheck(plan))
             (directory / "tp_rank_1.json").write_text(
                 json.dumps(dict(receipt, planned=[1, 3]))
+            )
+            # Plan acknowledged; the S5a start gate still needs fresh status.
+            self.assertFalse(backend.precheck(plan))
+            (root / "layout_status.json").write_text(
+                json.dumps(
+                    dict(
+                        unix_s=time.time(),
+                        instances={
+                            "B-g2-tp2": dict(
+                                lifecycle="ACTIVE",
+                                pressure=dict(zone="SPARE", capacity=0.1),
+                            )
+                        },
+                    )
+                )
             )
             self.assertTrue(backend.precheck(plan))
 

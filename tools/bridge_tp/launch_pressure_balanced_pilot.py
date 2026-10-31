@@ -463,16 +463,28 @@ def live_pair(plan):
 
 
 def conversion_request(spec, registry):
-    """Validated explicit conversion of one bundle (S3b-3), or None."""
+    """Validated explicit conversion of one bundle (S3b-3), or None.
+
+    Optional: ``method`` DRAIN (default) or SELECTIVE_ROLL (S5a drain assist,
+    merging a TP1 bundle only) and ``safety`` overrides of the S5a gate,
+    valve and assist thresholds.
+    """
+    from tools.bridge_tp.pressure_conversion import SAFETY
+
     request = spec.get("conversion")
     if request is None:
         return None
     if not spec.get("layout"):
         raise ValueError("conversion needs an explicit layout")
     bundles = {row.bundle_id for row in registry.instances.values()}
+    required = {"bundle", "target_mode", "trigger_s", "deadline_s", "base_port"}
+    method = request.get("method", "DRAIN")
     if (
-        set(request)
-        != {"bundle", "target_mode", "trigger_s", "deadline_s", "base_port"}
+        not required <= set(request) <= required | {"method", "safety"}
+        or method not in {"DRAIN", "SELECTIVE_ROLL"}
+        or method == "SELECTIVE_ROLL"
+        and request["target_mode"] != "TP2"
+        or not set(request.get("safety", {})) <= set(SAFETY)
         or request["bundle"] not in bundles
         or request["target_mode"] not in {"TP1", "TP2"}
         or not 0 <= request["trigger_s"] < request["deadline_s"]
@@ -798,6 +810,8 @@ def start_conversion(spec, scene, plan, common, processes, publish, requests):
         channel_plan=plan.get("channel_plan"),
         target_tp_ranks=target_tp if "tp4" in aliases else 0,
         shadow_planner=ShadowPlanner(load_profile(), manifest["instances"]),
+        safety=plan["conversion"].get("safety"),
+        speed_margin=load_profile()["speed_margin"],
     )
     driver = pc.ConversionDriver(
         backend, plan["conversion"], root / "conversion_plan.json"
@@ -1093,7 +1107,9 @@ def run_scene(
             )
         if driver is not None:
             outcome = finish_conversion(driver, root)
-            if outcome["state"] != "COMPLETED":
+            # ABORTED is the safe outcome of the S5a gate or valve: routing
+            # was restored before any engine stopped. Anything else failed.
+            if outcome["state"] not in {"COMPLETED", "ABORTED"}:
                 raise RuntimeError(f"conversion ended in {outcome['state']}")
         if plan["config"].get("transfer_mode") == "FULL_SPEED":
             common.write_json(

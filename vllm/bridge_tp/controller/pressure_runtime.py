@@ -676,6 +676,99 @@ class PressureCoordinator:
         )
         return s, t, decision
 
+    def assist_start(
+        self,
+        now: float,
+        source: str,
+        target: str,
+        candidate: Candidate,
+        action: BoundAction | None,
+        target_reading: PoolReading,
+        required_blocks: int,
+    ) -> str | None:
+        """S5a: start one conversion-assist migration chosen outside the policy.
+
+        The request is picked by the conversion's drain plan, not by pressure;
+        everything else is the policy path's: one global session, a fresh
+        target reading, an exact action binding and an atomic ledger
+        reservation (here sized for the request's final length). Returns None
+        once started, otherwise the refusal reason; nothing is retried here.
+        """
+        with self._lock:
+            if self.lifecycle(source) != "QUIESCING":
+                return "source is not quiescing"
+            if self.lifecycle(target) != "ACTIVE":
+                return "target is not active"
+            if any(
+                r.kind == "migration" and r.state == "ACTIVE"
+                for r in self.ledger.entries.values()
+            ):
+                return "a migration session is active"
+            if not 0 <= now - target_reading.sampled_at <= self.policy.cfg.max_age_s:
+                return "target capacity evidence stale"
+            if action is None or action.request_id != candidate.request_id:
+                return "no start binding for the request"
+            if action.session_id in self._sessions:
+                return "session already used"
+            owner = self._owners.get(candidate.request_id)
+            if owner is not None and owner != source:
+                return "request is not owned by the source"
+            try:
+                self.ledger.reserve(
+                    Reservation(
+                        action.session_id,
+                        candidate.request_id,
+                        target,
+                        required_blocks,
+                        candidate.target_decode_cost or 0.0,
+                        0,
+                        "migration",
+                    ),
+                    target_reading,
+                )
+            except ValueError as error:
+                return str(error)
+            self._sessions[action.session_id] = (candidate.request_id, target)
+            self._session_source[action.session_id] = source
+            self._owners.setdefault(candidate.request_id, source)
+            snapshot = self.ledger.snapshot()
+        self.audit(
+            {
+                "kind": "pressure_conversion_assist",
+                "unix_s": now,
+                "session_id": action.session_id,
+                "request_id": candidate.request_id,
+                "source": source,
+                "target": target,
+                "required_blocks": required_blocks,
+                "execution": "RESERVED",
+                "reservation_after": snapshot,
+            }
+        )
+        try:
+            action.start()
+        except BaseException:
+            self.audit(
+                {
+                    "kind": "pressure_start_uncertain",
+                    "session_id": action.session_id,
+                    "request_id": action.request_id,
+                }
+            )
+            raise
+        with self._lock:
+            self.policy_for(source).note_started(now)
+        self.audit(
+            {
+                "kind": "pressure_start_published",
+                "unix_s": now,
+                "session_id": action.session_id,
+                "request_id": action.request_id,
+                "reason": "conversion assist",
+            }
+        )
+        return None
+
     def finish(
         self,
         session_id: str,

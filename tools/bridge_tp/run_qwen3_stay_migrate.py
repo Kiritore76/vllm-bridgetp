@@ -230,6 +230,11 @@ def main(argv=None):
         help="S3b-3: explicit DRAIN conversion of one L1A bundle while serving",
     )
     parser.add_argument(
+        "--conversion-assist",
+        action="store_true",
+        help="S5a: SELECTIVE_ROLL drain assist (merging edge L1A-L2 only)",
+    )
+    parser.add_argument(
         "--conversion-trigger-s",
         type=float,
         default=30,
@@ -242,6 +247,8 @@ def main(argv=None):
         parser.error("layout-l1a-channels runs with long-burst-memory-verify only")
     if args.conversion and not args.layout_l1a_channels:
         parser.error("conversion runs on the L1A channel layout only")
+    if args.conversion_assist and args.conversion != "L1A-L2":
+        parser.error("drain assist merges TP1s into a TP2 (L1A-L2) only")
     if not 0 <= args.conversion_trigger_s < 300:
         parser.error("conversion trigger must fall inside the 300s workload")
     if args.long_burst_memory_verify and args.long_burst_deep_stay:
@@ -561,6 +568,7 @@ def main(argv=None):
             spec["conversion"] = dict(
                 CONVERSIONS[args.conversion],
                 trigger_s=args.conversion_trigger_s,
+                method="SELECTIVE_ROLL" if args.conversion_assist else "DRAIN",
                 # A drain behind 8192-token outputs can take minutes.
                 deadline_s=600,
                 base_port=8400,
@@ -849,6 +857,9 @@ def main(argv=None):
                 result, code = (
                     (dict(status="COMPLETED_CONVERSION", edge=args.conversion), 0)
                     if accepted
+                    # S5a gate/valve: routing restored, nothing stopped.
+                    else (dict(status="CONVERSION_ABORTED_SAFELY"), 2)
+                    if conversion["state"] == "ABORTED"
                     else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
                 )
             if args.long_burst_deep_stay:

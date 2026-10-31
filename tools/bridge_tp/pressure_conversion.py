@@ -80,6 +80,22 @@ def teardown_receipts(root):
     }
 
 
+# S5a safety, two tiers (first values; tuned from GPU runs, every decision is
+# logged). Hard safety is never relaxed: KV not driven into the guard (the
+# policy's capacity ratio, 1.0 = free down to guard + projected growth), no
+# request lost. Service quality (zone SPARE) gates the start comfortably, is
+# waived after ``relax_after_s``, and always gates assist migrations.
+SAFETY = dict(
+    relax_after_s=180.0,
+    gate_capacity_max=0.8,
+    valve_capacity=1.0,
+    valve_sustain_s=3.0,
+    assist_factor=3.0,
+    assist_max_starts=2,
+    decision_interval_s=1.0,
+)
+
+
 class ControllerConversionBackend:
     """Backend of one explicit conversion inside a pilot scene.
 
@@ -102,6 +118,8 @@ class ControllerConversionBackend:
         target_tp_ranks=0,
         clock=time.time,
         shadow_planner=None,
+        safety=None,
+        speed_margin=0.8,
     ):
         self.registry, self.ops, self.clock = registry, ops, clock
         self.run_dir = Path(run_dir)
@@ -113,6 +131,15 @@ class ControllerConversionBackend:
         self.started = {}
         self.warm = {}
         self.channel_closing = None
+        self.layout_assist = None
+        self.safety = dict(SAFETY, **(safety or {}))
+        self.speed_margin = speed_margin
+        self.gate_since = None
+        self.valve_since = None
+        self.assist_at = -float("inf")
+        self.assist_seq = 0
+        self.assisted = []  # request ids whose assist START was published
+        self.last_assist_reason = None
         # S4: read-only planner consulted while draining; never acts.
         self.shadow_planner, self.shadow_at = shadow_planner, -float("inf")
         self.reported_unacknowledged = False
@@ -127,7 +154,7 @@ class ControllerConversionBackend:
     def refs(self, plan):
         return [pool.InstanceRef(**r) for r in plan["refs"]]
 
-    def write_layout(self, changes, *, pending=True):
+    def write_layout(self, changes, *, pending=True, assist=None):
         """Publish lifecycle changes; rows accumulate across revisions.
 
         ``conversion_pending`` keeps the controller serving after its workload
@@ -144,12 +171,15 @@ class ControllerConversionBackend:
                 lifecycle=lifecycle,
             )
         self.revision += 1
+        if assist is not None:
+            self.layout_assist = assist
         atomic_json(
             self.run_dir / "layout_control.json",
             dict(
                 revision=self.revision,
                 instances=list(self.layout.values()),
                 conversion_pending=pending,
+                assist=assist or self.layout_assist,
             ),
         )
         self.ops.event("LAYOUT_CONTROL", revision=self.revision, changes=changes)
@@ -165,6 +195,76 @@ class ControllerConversionBackend:
         return {i: value["instances"].get(i) for i in ids}
 
     # ------------------------------------------------------ executor steps
+    def decision(self, kind, **values):
+        row = dict(kind=kind, unix_s=self.clock(), **values)
+        with (self.run_dir / "conversion_decisions.jsonl").open(
+            "a", encoding="utf-8"
+        ) as stream:
+            stream.write(json.dumps(row) + "\n")
+        return row
+
+    def retained(self, plan, status):
+        refs = {r.instance_id for r in self.refs(plan)}
+        return {
+            i: v
+            for i, v in status["instances"].items()
+            if i not in refs and v["lifecycle"] == "ACTIVE"
+        }
+
+    def fresh(self, status):
+        return status is not None and 0 <= self.clock() - status["unix_s"] <= 2
+
+    @staticmethod
+    def hard_ok(value, limit):
+        pressure = value.get("pressure") or {}
+        capacity = pressure.get("capacity")
+        return capacity is not None and capacity < limit
+
+    def gate(self, plan):
+        """Start gate: the retained instances must carry the load meanwhile."""
+        now = self.clock()
+        if self.gate_since is None:
+            self.gate_since = now
+        status = self.status()
+        waited = now - self.gate_since
+        if not self.fresh(status):
+            self.decision("GATE", open=False, waited_s=waited, reason="status stale")
+            return False
+        retained = self.retained(plan, status)
+        if not retained:
+            reason = "no retained instance"
+        elif not all(
+            self.hard_ok(v, self.safety["gate_capacity_max"]) for v in retained.values()
+        ):
+            reason = "retained KV headroom (hard)"
+        elif waited >= self.safety["relax_after_s"]:
+            reason = None
+        elif not all(
+            (v.get("pressure") or {}).get("zone") == "SPARE" for v in retained.values()
+        ):
+            reason = "retained not SPARE (waiting for a quieter time)"
+        else:
+            reason = None
+        opened = reason is None
+        self.decision(
+            "GATE",
+            open=opened,
+            waited_s=waited,
+            relaxed=opened and waited >= self.safety["relax_after_s"],
+            reason=reason,
+            retained={
+                i: (v.get("pressure") or {}).get("zone") for i, v in retained.items()
+            },
+        )
+        if opened:
+            self.ops.event(
+                "GATE_OPEN",
+                plan_id=plan["plan_id"],
+                waited_s=round(waited, 3),
+                relaxed=waited >= self.safety["relax_after_s"],
+            )
+        return opened
+
     def precheck(self, plan):
         if not all(
             self.registry.get(ref).lifecycle == "ACTIVE" for ref in self.refs(plan)
@@ -189,14 +289,124 @@ class ControllerConversionBackend:
                         ranks=sorted(acknowledged),
                     )
                 return False
-        return True
+        return self.gate(plan)
 
     def quiesce(self, plan):
         self.write_layout({r.instance_id: "QUIESCING" for r in self.refs(plan)})
 
     def kv_emergency(self, plan):
-        # Migration assist (S5) is the response; DRAIN only waits.
-        return False
+        """Safety valve: retained KV about to hit its guard, sustained.
+
+        Only hard safety aborts (before any engine stops): the plan is then
+        cancelled and routing restored. Service-quality drops do not abort,
+        or a conversion under load would cancel and retry forever.
+        """
+        status = self.status()
+        if not self.fresh(status):
+            return False
+        now = self.clock()
+        unsafe = {
+            i: (v.get("pressure") or {}).get("capacity")
+            for i, v in self.retained(plan, status).items()
+            if not self.hard_ok(v, self.safety["valve_capacity"])
+            and (v.get("pressure") or {}).get("capacity") is not None
+        }
+        if not unsafe:
+            self.valve_since = None
+            return False
+        if self.valve_since is None:
+            self.valve_since = now
+            self.decision("VALVE_WARNING", instances=unsafe)
+        if now - self.valve_since < self.safety["valve_sustain_s"]:
+            return False
+        self.decision("VALVE_ABORT", instances=unsafe)
+        self.ops.event("SAFETY_ABORT", plan_id=plan["plan_id"], instances=unsafe)
+        return True
+
+    def assisted_step(self, plan, now):
+        """S5a: migrate the next long request out, or leave the drain natural.
+
+        Rolling: at most one assist START at a time and a fresh decision after
+        each. Eligible: a startable request whose conservative remaining time
+        exceeds ``assist_factor`` x the measured START-to-release budget,
+        longest first. The target must be SPARE (service quality is never
+        traded for a faster drain here), at most ``assist_max_starts`` assists
+        start per conversion, and the controller re-checks KV for the final
+        length and health before starting.
+        """
+        if self.clock() - self.assist_at < self.safety["decision_interval_s"]:
+            return
+        self.assist_at = self.clock()
+        status = self.status()
+        reason, choice = self.assist_choice(plan, status)
+        if reason != self.last_assist_reason or choice is not None:
+            self.decision("ASSIST", choice=choice, reason=reason)
+            self.last_assist_reason = reason
+        if choice is None:
+            return
+        self.assist_seq += 1
+        self.write_layout(
+            {},
+            assist=dict(
+                seq=self.assist_seq,
+                request_id=choice["request_id"],
+                source=choice["instance"],
+            ),
+        )
+        self.ops.event("ASSIST_REQUESTED", seq=self.assist_seq, **choice)
+
+    def assist_choice(self, plan, status):
+        if not self.fresh(status):
+            return "status stale", None
+        result = status.get("assist_result")
+        if self.assist_seq and (result is None or result["seq"] != self.assist_seq):
+            return "previous assist not answered yet", None
+        if (
+            result is not None
+            and result["seq"] == self.assist_seq
+            and (
+                result["state"] == "STARTED"
+                and result["request_id"] not in self.assisted
+            )
+        ):
+            self.assisted.append(result["request_id"])
+        target = status.get("migration_target")
+        instances = status["instances"]
+        if target is None or instances.get(target, {}).get("lifecycle") != "ACTIVE":
+            return "no active migration target", None
+        refs = [r.instance_id for r in self.refs(plan)]
+        if any(instances[i]["sessions"] for i in refs) or instances[target]["sessions"]:
+            return "a migration session is active", None
+        # S4: two received migrations cost ~1.3 GB on the 24 GB TP2 (about
+        # 1 GB left), so the total of assist starts per conversion is capped.
+        if len(self.assisted) >= self.safety["assist_max_starts"]:
+            return "assist starts at cap for this conversion", None
+        pressure = instances[target].get("pressure") or {}
+        if pressure.get("zone") != "SPARE":
+            return f"target not SPARE ({pressure.get('zone')})", None
+        budget = status.get("release_budget_s")
+        if budget is None:
+            return "no measured transfer budget", None
+        best = None
+        for instance in refs:
+            for row in instances[instance]["requests"]:
+                speed = row.get("tokens_s")
+                if not row.get("action_available") or not speed:
+                    continue
+                remaining = max(u for u, _ in row["remaining_bins"])
+                natural = remaining / (speed * self.speed_margin)
+                if natural <= self.safety["assist_factor"] * budget:
+                    continue
+                if best is None or natural > best["natural_s"]:
+                    best = dict(
+                        request_id=row["request_id"],
+                        instance=instance,
+                        natural_s=round(natural, 3),
+                        transfer_s=budget,
+                    )
+        if best is None:
+            return "no request worth migrating (natural <= factor x transfer)", None
+        return None, best
 
     def shadow(self, plan, status):
         now = self.clock()
@@ -562,7 +772,7 @@ class ConversionDriver:
                             self.backend.registry.registry_revision,
                             self.request["bundle"],
                             self.request["target_mode"],
-                            "DRAIN",
+                            self.request.get("method", "DRAIN"),
                             "ACTIVE",
                             time.time() + self.request["deadline_s"],
                             "NO_PROFILE",

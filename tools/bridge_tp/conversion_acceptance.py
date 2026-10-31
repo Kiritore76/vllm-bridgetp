@@ -215,6 +215,37 @@ def assess(scene_dir, run_dir=None, events_path=None, metrics_path=None):
             if first
             else None,
         )
+    # S5a safety: start gate, drain assist and safety valve (reported).
+    decisions_path = run_dir / "conversion_decisions.jsonl"
+    safety = None
+    if decisions_path.exists():
+        rows = _jsonl(decisions_path)
+        gate = [r for r in rows if r["kind"] == "GATE"]
+        opened = next((r for r in gate if r["open"]), None)
+        assist_results = [r for r in audit if r["kind"] == "pressure_assist_result"]
+        safety = dict(
+            gate_checks=len(gate),
+            gate_opened=opened is not None,
+            gate_waited_s=_round(opened["waited_s"]) if opened else None,
+            gate_relaxed=bool(opened and opened.get("relaxed")),
+            gate_block_reasons=dict(
+                Counter(r["reason"] for r in gate if not r["open"])
+            ),
+            assist_reasons=dict(
+                Counter(
+                    r["reason"] or "requested" for r in rows if r["kind"] == "ASSIST"
+                )
+            ),
+            assist_requested=len(assist_results),
+            assist_started=[
+                r["request_id"] for r in assist_results if r["state"] == "STARTED"
+            ],
+            assist_refused=dict(
+                Counter(r["reason"] for r in assist_results if r["state"] != "STARTED")
+            ),
+            valve_warnings=sum(r["kind"] == "VALVE_WARNING" for r in rows),
+            valve_aborted=any(r["kind"] == "VALVE_ABORT" for r in rows),
+        )
     result = json.loads((scene_dir / "conversion_result.json").read_text("utf-8"))
     final = [r for r in audit if r["kind"] == "pressure_final"]
     checks = dict(
@@ -254,6 +285,7 @@ def assess(scene_dir, run_dir=None, events_path=None, metrics_path=None):
         conversion_window=window,
         service_by_arrival_phase=service,
         planner_shadow=shadow,
+        safety=safety,
         scope="one conversion; mechanism checks decide pass; service is "
         "reported by phase, not judged",
     )

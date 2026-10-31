@@ -727,6 +727,11 @@ def _run(args, prepared):
         status_at=-math.inf,
         candidates={},
         pending=False,
+        pressure={},
+        # S5a: the conversion's drain-assist request and its last outcome.
+        assist=None,
+        assist_seen=None,
+        assist_result=None,
     )
     instance_of = dict(manifest["legacy_pool_aliases"]) if manifest else {}
 
@@ -752,6 +757,50 @@ def _run(args, prepared):
                 )
             )
         return rows
+
+    def start_assist(assist, now, target_pool, candidates_by_source, actions):
+        """Final safety checks of one conversion-assist START (S5a).
+
+        Hard: the target keeps its KV guard after the request reaches its
+        final length (prompt + max output), on top of every pending promise.
+        Service: with the health service on, the target shape after one more
+        decode must be a measured supported one. Then the coordinator's
+        single-session reservation path starts it.
+        """
+        source = alias_of.get(assist["source"], assist["source"])
+        candidate = next(
+            (
+                c
+                for c in candidates_by_source.get(source, ())
+                if c.request_id == assist["request_id"]
+            ),
+            None,
+        )
+        if candidate is None:
+            return "request is not a current candidate of the source"
+        if candidate.migrating or candidate.finished:
+            return "request is migrating or finished"
+        if actions is None:
+            return "no start binding (session not ready or no observed rates)"
+        required = math.ceil(
+            (candidate.prompt_tokens + candidate.max_output_tokens)
+            / controller.block_size
+        )
+        pending, _, _ = co.ledger.pending("tp4")
+        free = target_pool.free_blocks
+        if free is None or free - pending - required < cfg.capacity_guard_blocks:
+            return "target KV cannot hold the final length plus guard"
+        if health_tracker is not None and not candidate.target_health_after_supported:
+            return "target health not supported after one more decode"
+        return co.assist_start(
+            now,
+            source,
+            "tp4",
+            candidate,
+            actions.get(candidate.request_id),
+            target_pool,
+            required,
+        )
 
     def publish_layout_status(now, polled, dispatched):
         """Controller-side drain evidence per instance for the conversion executor.
@@ -790,6 +839,7 @@ def _run(args, prepared):
                 streams_pending=streams.get(pool, 0),
                 sessions=sessions.get(pool, 0),
                 requests=[] if raw is None else request_rows(raw),
+                pressure=layout_state["pressure"].get(pool),
                 inventory=None
                 if raw is None
                 else dict(
@@ -814,6 +864,7 @@ def _run(args, prepared):
                     migration_target=instance_of.get("tp4", "tp4")
                     if "tp4" in polled and polled["tp4"] is not None
                     else None,
+                    assist_result=layout_state["assist_result"],
                 )
             ),
             encoding="utf-8",
@@ -837,6 +888,7 @@ def _run(args, prepared):
             # A writer without atomic replace; retry on the next tick.
             return
         layout_state["pending"] = bool(control.get("conversion_pending"))
+        layout_state["assist"] = control.get("assist")
         changes, deferred = [], []
         for row in control["instances"]:
             pool_id = alias_of.get(row["instance_id"], row["instance_id"])
@@ -1317,7 +1369,29 @@ def _run(args, prepared):
                     for c in cs
                 }
             )
-            if t is not None:
+            assist = layout_state["assist"]
+            assist_started = False
+            if (
+                t is not None
+                and assist is not None
+                and assist["seq"] != layout_state["assist_seen"]
+            ):
+                layout_state["assist_seen"] = assist["seq"]
+                reason = start_assist(
+                    assist, now, pools[t], candidates_by_source, actions
+                )
+                assist_started = reason is None
+                layout_state["assist_result"] = dict(
+                    seq=assist["seq"],
+                    request_id=assist["request_id"],
+                    state="STARTED" if assist_started else "REFUSED",
+                    reason=reason,
+                    unix_s=now,
+                )
+                audit.write(
+                    dict(kind="pressure_assist_result", **layout_state["assist_result"])
+                )
+            if t is not None and not assist_started:
                 load("pause_diagnostics").call(
                     "policy.tick",
                     co.tick_multi,
@@ -1446,6 +1520,10 @@ def _run(args, prepared):
                 for pool in pools
             ]
             by_pool = dict(zip(index_of, pressures))
+            # Per-instance pressure for the conversion's gate and safety valve.
+            layout_state["pressure"] = {
+                pool: asdict(value) for pool, value in by_pool.items()
+            }
             source_p, target_p = by_pool.get("tp1"), by_pool.get("tp4")
             if time.monotonic() - last_status_at >= 5:
                 last_status_at = time.monotonic()
