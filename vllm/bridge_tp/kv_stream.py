@@ -23,6 +23,14 @@ import torch
 
 from vllm.bridge_tp.controller.anchor_selector import select_source_request_id
 from vllm.bridge_tp.delta_batching import coalesce_delta
+from vllm.bridge_tp.gpu_direct_targets import (
+    ENV as GPU_DIRECT_TARGETS_ENV,
+)
+from vllm.bridge_tp.gpu_direct_targets import (
+    parse_targets,
+    preconnect_plan,
+    select_target,
+)
 from vllm.bridge_tp.kv_export import (
     _copy_request_blocks,
     _estimate_dump_bytes,
@@ -149,9 +157,15 @@ def preconnect_persistent_gpu_sender(device: torch.device) -> None:
     """Open the topology channel before an anchor request starts decoding."""
     if not _env_bool("BRIDGETP_GPU_DIRECT_PRECONNECT", False):
         return
-    config = BridgeTPStreamConfig.from_env()
-    if not (config.enabled and config.persistent_channel and config.gpu_direct_history):
+    base = BridgeTPStreamConfig.from_env()
+    if not (base.enabled and base.persistent_channel and base.gpu_direct_history):
         raise ValueError("GPU-direct preconnect requires persistent streaming")
+    for label, config in preconnect_plan(base):
+        _preconnect_one(config, device, label)
+
+
+def _preconnect_one(config: BridgeTPStreamConfig, device: torch.device, label: str):
+    """Open and warm one target's channel; receipt per target label."""
     key, sender = _acquire_persistent_gpu_sender(config, device)
     try:
         if sender.nccl is None:
@@ -168,6 +182,7 @@ def preconnect_persistent_gpu_sender(device: torch.device) -> None:
             _atomic_json_dump(
                 {
                     "status": "WARMUP_COMPLETE",
+                    "target_instance": config.target_instance,
                     "channel_generation": config.channel_generation,
                     "target_tp_size": config.target_tp_size,
                     "preconnect_completed_unix_s": sender.preconnect_completed_unix_s,
@@ -175,7 +190,7 @@ def preconnect_persistent_gpu_sender(device: torch.device) -> None:
                     "warmup_ms": (time.perf_counter() - warmup_started) * 1000,
                     "completed_unix_s": sender.warmup_completed_unix_s,
                 },
-                config.run_dir / "gpu_channel_preconnect_receipts" / "source.json",
+                config.run_dir / "gpu_channel_preconnect_receipts" / f"{label}.json",
             )
     except BaseException:
         _discard_persistent_gpu_sender(key, sender)
@@ -241,6 +256,11 @@ class BridgeTPStreamConfig:
     defer_communicator_destroy: bool = False
     persistent_channel: bool = False
     channel_generation: int = 0
+    # Every preconnected TP-k target of this source (BRIDGETP_GPU_DIRECT_TARGETS);
+    # empty keeps the single environment target. target_instance is the one the
+    # current session uses (from the runtime control block).
+    gpu_direct_targets: tuple = ()
+    target_instance: str | None = None
 
     @classmethod
     def from_env(cls) -> BridgeTPStreamConfig:
@@ -318,6 +338,16 @@ class BridgeTPStreamConfig:
                 os.getenv("BRIDGETP_CHANNEL_GENERATION", "0")
             ),
         )
+        config = replace(
+            config,
+            gpu_direct_targets=parse_targets(
+                os.getenv(GPU_DIRECT_TARGETS_ENV, ""), config.expected_kv_heads
+            ),
+        )
+        if config.gpu_direct_targets and not (
+            config.persistent_channel and config.gpu_direct_history
+        ):
+            raise ValueError("multiple GPU-direct targets need persistent channels")
         if config.target_tp_size not in (2, 4):
             raise ValueError("BridgeTP streaming requires target TP=2 or TP=4")
         if config.expected_kv_heads % config.target_tp_size:
@@ -443,6 +473,7 @@ def get_bridge_tp_stream_config() -> BridgeTPStreamConfig:
             else base.aggregate_rate_gib_s
         ),
     )
+    overlaid = select_target(overlaid, control.target_instance, overlaid.armed)
     overlaid.validate_boundaries()
     mark_control_honored(base.run_dir, control.generation)
     return overlaid

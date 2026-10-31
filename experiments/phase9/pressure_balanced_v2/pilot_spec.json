@@ -169,7 +169,7 @@
     "vllm/bridge_tp/kv_export.py": "dabc361580c57715a4429380f8fdecbe2cc5cbe8d2c03e1cc2febc9e33048537",
     "vllm/bridge_tp/kv_reshard.py": "051e14bd153074d7c090441a49d9921aeea902df98b33923cebd98b65e869b06",
     "vllm/bridge_tp/kv_restore.py": "86ea10e856715119c252a8c932b8996c33e40344494d5541ccc6b3bed319e635",
-    "vllm/bridge_tp/kv_stream.py": "1f0978e28a08e0759bbf0c5f89b232095708c5c639f4ff2b547a33e7bb1fc804",
+    "vllm/bridge_tp/kv_stream.py": "6bd2d5527b72d1f30d8cda696b3c70ab79181525007aa639036051469306cfe8",
     "vllm/bridge_tp/logit_capture.py": "a363b5162e81dc26605e6bbe4d7c8e1537b4f19cea15ebbb0ec0e261c103ebf6",
     "vllm/bridge_tp/online_remote_attention.py": "2275630f859e84a1fc7b668f83fc2e9a9b04ef3ac9e3f57746ca5f7757b38a7a",
     "vllm/bridge_tp/online_shadow_strategy_protocol.py": "8e6b3d55a82ba5416f3e2a417d5cfdce14394ea7af7b11fa62317efcfcb3965d",
@@ -180,7 +180,7 @@
     "vllm/bridge_tp/remote_attention_protocol.py": "312a3c1b0a534c1208c528cd53e5261c8d8cf40edaff64f3f9767ba2e856688f",
     "vllm/bridge_tp/request_freeze.py": "91827593aae41b8c2396a2805c99c824b909d1d493b3c100ed92f52074361627",
     "vllm/bridge_tp/rolling_cutover.py": "5def4ab368759b33791633794e15d86845b1848c95e22f6d488515367669c016",
-    "vllm/bridge_tp/runtime_control.py": "d9f396b855f17ac33a676e59aca014e3a2609b96660d0e46f2513b29115e88f7",
+    "vllm/bridge_tp/runtime_control.py": "07d675528907a98a0e50f1ac270a49c1721db3c0936eba8dcf230e0457cffd0a",
     "vllm/bridge_tp/shadow_transfer_protocol.py": "fdd6f3d6839fa35c01cd165ad0251ccb0f4112a89cc2e94c8846b7e435fadeac",
     "vllm/bridge_tp/streaming_connector.py": "17424a5749ad0dc4c065bfd32aa16f01ba908ffe5ceec1598e1432c7d9d836fa",
     "vllm/bridge_tp/stream_protocol.py": "8f2f15bbc005b778c2b68b7fd1c0a3c3583fda66feca70f8ec27346619381271",
@@ -392,7 +392,9 @@
     "vllm/bridge_tp/bounded_history.py": "d1ab2d049f4f5f27863e09c9b5f61f77986f5407ce50c82c51f48b821768b217",
     "tests/bridge_tp/test_bounded_history.py": "1e1d324a68c9c35a0f31f17404a1142aafaedaffb32694f88b161c88074e5126",
     "vllm/bridge_tp/controller/pressure_multi.py": "718728c7a560dc121b451a9d965488af8a866d7aefadfc3f90e4b0123ed5b49f",
-    "tests/bridge_tp/test_pressure_multi.py": "bf6aa311f5d3f869522cf66fd7f44180a5d38d53aa0bf778f108208bcaacb3ea"
+    "tests/bridge_tp/test_pressure_multi.py": "bf6aa311f5d3f869522cf66fd7f44180a5d38d53aa0bf778f108208bcaacb3ea",
+    "vllm/bridge_tp/gpu_direct_targets.py": "0ce34a69dd8be81cbf4b5dcff7d5748b39b8da58f7b07544eb24f8c1fb8e4e98",
+    "tests/bridge_tp/test_gpu_direct_targets.py": "dba87a7c218cd9c661efddc0710030545622f60702ca2f19f7e10d3cb233ef03"
   },
   "server_settings": {
     "dtype": "bfloat16",

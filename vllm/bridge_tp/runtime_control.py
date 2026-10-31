@@ -82,6 +82,9 @@ class RuntimeControl:
     # request-lifetime session without rebuilding the communicator.
     migration_id: str | None = None
     source_request_id_prefix: str | None = None
+    # Multi-target sources (BRIDGETP_GPU_DIRECT_TARGETS): the preconnected
+    # target instance this session migrates to. None for single-target runs.
+    target_instance: str | None = None
     note: str = ""
 
     # ---- read side (server process) -----------------------------------
