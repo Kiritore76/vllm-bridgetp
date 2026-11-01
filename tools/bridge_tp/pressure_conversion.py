@@ -91,7 +91,8 @@ SAFETY = dict(
     valve_capacity=1.0,
     valve_sustain_s=3.0,
     assist_factor=3.0,
-    assist_max_starts=2,
+    assist_max_committed=2,
+    assist_max_attempts=4,
     decision_interval_s=1.0,
 )
 
@@ -330,9 +331,10 @@ class ControllerConversionBackend:
         each. Eligible: a startable request whose conservative remaining time
         exceeds ``assist_factor`` x the measured START-to-release budget,
         longest first. The target must be SPARE (service quality is never
-        traded for a faster drain here), at most ``assist_max_starts`` assists
-        start per conversion, and the controller re-checks KV for the final
-        length and health before starting.
+        traded for a faster drain here), at most ``assist_max_committed``
+        assists commit and ``assist_max_attempts`` start per conversion, and
+        the controller re-checks KV for the final length and service before
+        starting.
         """
         if self.clock() - self.assist_at < self.safety["decision_interval_s"]:
             return
@@ -364,10 +366,8 @@ class ControllerConversionBackend:
         if (
             result is not None
             and result["seq"] == self.assist_seq
-            and (
-                result["state"] == "STARTED"
-                and result["request_id"] not in self.assisted
-            )
+            and result["state"] == "STARTED"
+            and len(self.assisted) < self.assist_seq
         ):
             self.assisted.append(result["request_id"])
         target = status.get("migration_target")
@@ -380,8 +380,12 @@ class ControllerConversionBackend:
         # S4: the first received migration grew the 24 GB TP2 by ~1.2 GB once
         # (later ones did not), leaving ~1 GB; assists per conversion stay
         # capped until runs with more migrations confirm the headroom.
-        if len(self.assisted) >= self.safety["assist_max_starts"]:
-            return "assist starts at cap for this conversion", None
+        states = list((status.get("assist_sessions") or {}).values())
+        committed = sum(s in {"COMMITTED", "ACCOUNTED", "COMPLETED"} for s in states)
+        if committed >= self.safety["assist_max_committed"]:
+            return "committed assists at cap for this conversion", None
+        if len(self.assisted) >= self.safety["assist_max_attempts"]:
+            return "assist attempts at cap for this conversion", None
         pressure = instances[target].get("pressure") or {}
         if pressure.get("zone") != "SPARE":
             return f"target not SPARE ({pressure.get('zone')})", None

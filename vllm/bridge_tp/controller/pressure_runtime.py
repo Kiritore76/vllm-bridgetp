@@ -59,6 +59,8 @@ class PressureCoordinator:
         # ids are ACTIVE so the fixed pair needs no registration.
         self._lifecycle: dict[str, str] = {}
         self._session_source: dict[str, str] = {}
+        # S5a: sessions started for a conversion's drain, not for relief.
+        self._assist_sessions: set[str] = set()
 
     def lifecycle(self, instance_id: str) -> str:
         return self._lifecycle.get(instance_id, "ACTIVE")
@@ -731,6 +733,7 @@ class PressureCoordinator:
             self._sessions[action.session_id] = (candidate.request_id, target)
             self._session_source[action.session_id] = source
             self._owners.setdefault(candidate.request_id, source)
+            self._assist_sessions.add(action.session_id)
             snapshot = self.ledger.snapshot()
         self.audit(
             {

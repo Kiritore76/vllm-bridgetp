@@ -911,6 +911,11 @@ def _run(args, prepared):
                     if "tp4" in polled and polled["tp4"] is not None
                     else None,
                     assist_result=layout_state["assist_result"],
+                    # Ledger state of every drain-assist session (S5a cap).
+                    assist_sessions={
+                        sid: co.ledger.entries[sid].state
+                        for sid in tuple(co._assist_sessions)
+                    },
                 )
             ),
             encoding="utf-8",
@@ -1461,21 +1466,25 @@ def _run(args, prepared):
                     )
 
                     inject_cancel_smoke(session, inventories[t], now, audit)
-                session.reconsider(
-                    now,
-                    co.ledger.routing_reading(pools[index_of[session_source]]),
-                    co.ledger.routing_reading(pools[t]),
-                    next(
-                        (
-                            c
-                            for c in candidates
-                            if c.request_id == session.record.request_id
+                # "Source recovered" ends a relief migration; a drain assist
+                # exists precisely because its quiescing source is idle
+                # (S5a GPU 11-01: it cancelled 2 of 3 assists).
+                if session.migration_id not in co._assist_sessions:
+                    session.reconsider(
+                        now,
+                        co.ledger.routing_reading(pools[index_of[session_source]]),
+                        co.ledger.routing_reading(pools[t]),
+                        next(
+                            (
+                                c
+                                for c in candidates
+                                if c.request_id == session.record.request_id
+                            ),
+                            None,
                         ),
-                        None,
-                    ),
-                    co.policy.cfg,
-                    target_inventory=inventories[t],
-                )
+                        co.policy.cfg,
+                        target_inventory=inventories[t],
+                    )
                 progress = session.old.read_source_progress(
                     session.run_dir, session.stream.payload, now
                 )

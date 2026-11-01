@@ -41,6 +41,7 @@ def status(
     target_sessions=0,
     requests=(),
     assist_result=None,
+    assist_sessions=None,
     target="B-g2-tp2",
     age=0.0,
 ):
@@ -50,6 +51,7 @@ def status(
         release_budget_s=8.0,
         migration_target=target,
         assist_result=assist_result,
+        assist_sessions=assist_sessions or {},
         instances={
             "A-g1-tp1": dict(
                 lifecycle="QUIESCING",
@@ -204,15 +206,37 @@ class AssistChoiceTests(Base):
             )
             self.backend.assisted_step(PLAN, self.now[0])
         self.assertEqual(self.backend.assisted, ["a", "b"])
-        self.now[0] += 1.1
+        # Two committed assists reach the cap; cancelled ones do not count.
+        for sessions, capped in (
+            (dict(s1="COMMITTED", s2="CANCELLED"), False),
+            (dict(s1="COMMITTED", s2="ACCOUNTED"), True),
+        ):
+            self.now[0] += 1.1
+            reason, choice = self.choice(
+                status(
+                    requests=[row("c", 4000)],
+                    assist_result=dict(seq=3, request_id="c", state="STARTED"),
+                    assist_sessions=sessions,
+                )
+            )
+            self.assertEqual(choice is None, capped, reason)
+            if capped:
+                self.assertIn("committed", reason)
+
+    def test_attempts_are_capped_even_when_assists_keep_failing(self):
+        """S5a GPU (11-01): the same request was started again after a
+        cancel; retries are bounded so they cannot churn the target."""
+        self.backend.assisted = ["a", "a", "b", "b"]
+        self.backend.assist_seq = 4
         reason, choice = self.choice(
             status(
                 requests=[row("c", 4000)],
-                assist_result=dict(seq=2, request_id="b", state="STARTED"),
+                assist_result=dict(seq=4, request_id="b", state="STARTED"),
+                assist_sessions=dict(s1="CANCELLED", s2="CANCELLED"),
             )
         )
         self.assertIsNone(choice)
-        self.assertIn("cap", reason)
+        self.assertIn("attempts", reason)
 
     def test_a_refused_assist_is_not_counted(self):
         self.backend.assist_seq = 1
@@ -255,6 +279,8 @@ class CoordinatorAssistTests(unittest.TestCase):
         self.assertEqual(self.started, ["s1"])
         self.assertEqual(self.co._sessions["s1"], ("r", "tp4"))
         self.assertEqual(self.co._session_source["s1"], "tp1")
+        # Marked as a drain assist: relief-cancel rules do not apply to it.
+        self.assertEqual(self.co._assist_sessions, {"s1"})
         entry = self.co.ledger.entries["s1"]
         self.assertEqual(
             (entry.blocks, entry.kind, entry.pool_id), (500, "migration", "tp4")
