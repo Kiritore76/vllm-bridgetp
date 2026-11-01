@@ -15,7 +15,11 @@ tuned later from real runs:
 A candidate must hold for ``hold_s`` (``urgent_hold_s`` when a TP1's KV is
 at its guard: liveness under pressure), and a capacity-motivated split must
 gain ``benefit_factor`` times the capacity a conversion removes. Hard safety
-stays with the conversion's start gate and valve. Inputs are the
+stays with the conversion's start gate and valve.
+
+Pre-tilt: while a candidate is satisfied (and ``tilt_release_s`` after),
+its bundle is reported in ``tilt``; the driver may then keep new long
+requests off it, so a later drain has little left to wait for. Inputs are the
 controller's ``layout_status.json`` and the registry's current layout.
 """
 
@@ -41,6 +45,7 @@ RULES = dict(
     benefit_factor=3.0,
     conversion_s=60.0,
     cooldown_s=600.0,
+    tilt_release_s=30.0,
 )
 
 
@@ -80,6 +85,7 @@ class ConversionDecider:
         self.since = {}
         self.proposed_at = {}
         self.converted_at = None
+        self.satisfied_at = {}  # bundle -> last time a candidate held
 
     def signals(self, status, bundles, members):
         r = self.rules
@@ -192,6 +198,7 @@ class ConversionDecider:
                 self.since.pop(key, None)
             else:
                 self.since.setdefault(key, now)
+                self.satisfied_at[edge[0]] = now
             held = now - self.since[key] if key in self.since else 0.0
             need = r["urgent_hold_s"] if urgent else r["hold_s"]
             repeated = (
@@ -206,6 +213,11 @@ class ConversionDecider:
                 proposal = dict(bundle=edge[0], target_mode=edge[1], held_s=held)
                 self.proposed_at[key] = now
                 self.since.pop(key, None)
+        tilt = sorted(
+            bundle
+            for bundle, at in self.satisfied_at.items()
+            if bundle in bundles and now - at <= r["tilt_release_s"]
+        )
         return dict(
             evaluated_unix_s=now,
             mode="EXECUTE" if self.execute else "RECORD_ONLY",
@@ -213,6 +225,7 @@ class ConversionDecider:
             candidates=candidates,
             cooling=cooling,
             proposal=proposal,
+            tilt=tilt,
         )
 
     def converted(self, now):

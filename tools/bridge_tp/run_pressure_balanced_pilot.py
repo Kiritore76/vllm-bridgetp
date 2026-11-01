@@ -826,6 +826,8 @@ def _run(args, prepared):
         assist_result=None,
         # (unix_s, source) of migration starts, for the conversion decider.
         migration_starts=[],
+        tilt=frozenset(),
+        tilted=0,
     )
 
     def note_migration_start(source, value):
@@ -999,6 +1001,8 @@ def _run(args, prepared):
             long_arrivals=len(long_requests),
             long_final_tokens=sum(long_requests),
             migration_starts=[[round(now - t, 3), source] for t, source in starts],
+            tilt=sorted(layout_state["tilt"]),
+            tilted_long_requests=layout_state["tilted"],
         )
         path = args.run_dir / "layout_status.json"
         temporary = path.with_suffix(".tmp")
@@ -1046,6 +1050,11 @@ def _run(args, prepared):
             return
         layout_state["pending"] = bool(control.get("conversion_pending"))
         layout_state["assist"] = control.get("assist")
+        # Decider pre-tilt: long requests avoid these pools (replaced whole,
+        # read by the arrival thread).
+        layout_state["tilt"] = frozenset(
+            alias_of.get(i, i) for i in control.get("tilt") or ()
+        )
         changes, deferred = [], []
         for row in control["instances"]:
             if row.get("legacy_pool") == "tp4" and row["instance_id"] not in alias_of:
@@ -1173,6 +1182,20 @@ def _run(args, prepared):
 
         def submit_arrival(job, pools):
             submitted = {}
+            request = job["request"]
+            tilt = layout_state["tilt"]
+            if (
+                tilt
+                and job.get("route") is None
+                and len(request["prompt"]) + int(request["max_tokens"])
+                >= decision.LONG_TOKENS
+            ):
+                # Keep new long requests off a bundle the decider expects to
+                # convert, while any other instance remains.
+                kept = [p for p in pools if p.pool_id not in tilt]
+                if any(co.lifecycle(p.pool_id) == "ACTIVE" for p in kept):
+                    pools = kept
+                    layout_state["tilted"] += 1
             dispatch_due(
                 [job],
                 submitted,

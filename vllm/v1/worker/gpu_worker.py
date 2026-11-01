@@ -248,6 +248,13 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Init device")
     def init_device(self):
+        # BridgeTP conversion pre-start: the old engine may still own this GPU;
+        # wait before any CUDA use until the conversion opens the gate.
+        from vllm.bridge_tp.start_gate import wait_for_start_gate
+
+        waited = wait_for_start_gate()
+        if waited is not None:
+            logger.info("BridgeTP start gate opened after %.2fs", waited)
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)

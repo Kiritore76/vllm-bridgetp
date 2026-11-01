@@ -62,6 +62,7 @@ class Harness:
         trigger_s=0.3,
         method="DRAIN",
         safety=None,
+        prestart=False,
     ):
         self.root, self.slow = root, set(slow)
         self.calls, self.events, self.stopped = [], [], set()
@@ -144,6 +145,7 @@ class Harness:
             channel_plan=self.channel_plan,
             target_tp_ranks=2,
             safety=safety,
+            prestart=prestart,
             shadow_planner=conversion_planner.ShadowPlanner(
                 conversion_planner.load_profile(), manifest["instances"]
             ),
@@ -192,6 +194,23 @@ class Harness:
             stream.write(json.dumps(value) + "\n")
 
     def start(self, extra):
+        self.starts = getattr(self, "starts", [])
+        self.starts.append(dict(extra, started_unix_s=time.time()))
+        if extra.get("start_gate"):
+            # A gated engine writes no inventory before its gate opens.
+            def opened():
+                gate = Path(extra["start_gate"])
+                while not gate.exists():
+                    if extra["instance_id"] in self.stopped or not self.root.exists():
+                        return
+                    time.sleep(0.02)
+                self.serve(extra)
+
+            threading.Thread(target=opened, daemon=True).start()
+            return
+        self.serve(extra)
+
+    def serve(self, extra):
         with self.lock:
             self.readers[extra["endpoint"]] = Reader(extra["instance_id"])
             self.path_of[extra["endpoint"]] = Path(extra["inventory_path"])
@@ -653,6 +672,120 @@ class ConversionTests(unittest.TestCase):
                 ["source"],
             )
 
+    def test_prestart_overlaps_the_drain_and_opens_the_gate_after_release(self):
+        """L1A -> L2 with pre-start: the TP2 starts at quiesce behind its gate."""
+        with tempfile.TemporaryDirectory() as directory:
+            harness = Harness(
+                Path(directory),
+                "A",
+                "TP2",
+                channel_plan=True,
+                slow={"source"},
+                prestart=True,
+            )
+            outcome = harness.run(jobs(16, 0.3, busy="tp1"))
+            self.check_common(harness, outcome, ["A-g1-tp1", "A-g3-tp1"], ["A-g4-tp2"])
+            at = {e["kind"]: e["unix_s"] for e in harness.events}
+            (start,) = harness.starts  # started once, never again
+            self.assertEqual(start["instance_id"], "A-g4-tp2")
+            gate = Path(start["start_gate"])
+            self.assertEqual(gate.name, "start_gate_A-g4-tp2")
+            # Started while draining, before the old engines stopped; the gate
+            # opened only after their GPUs were released.
+            self.assertLess(start["started_unix_s"], at["FENCED"])
+            self.assertLess(at["PRESTART"], at["STOP_RETURN"])
+            self.assertLessEqual(at["RESOURCES_RELEASED"], at["LOAD_START"])
+            self.assertTrue(gate.exists())
+            load = next(e for e in harness.events if e["kind"] == "LOAD_START")
+            self.assertTrue(load["prestarted"])
+            from tools.bridge_tp import conversion_acceptance as acceptance
+
+            value = acceptance.assess(harness.root, run_dir=harness.root)
+            self.assertGreater(value["phases_s"]["prestart_lead"], 0.3)
+
+    def test_a_prestarted_engine_that_died_is_started_afresh(self):
+        with tempfile.TemporaryDirectory() as directory:
+            harness = Harness(Path(directory), "B", "TP1", prestart=True)
+            original = harness.event
+
+            def event(kind, **values):
+                original(kind, **values)
+                if kind == "PRESTART":
+                    harness.stopped.update(values["instances"][:1])  # one died
+
+            harness.backend.ops.event = event
+            outcome = harness.run(jobs(16, 0.3, busy="tp4"))
+            self.assertEqual(outcome["state"], "COMPLETED", outcome)
+            kinds = [e["kind"] for e in harness.events]
+            self.assertIn("PRESTART_DROPPED", kinds)
+            gated = [s for s in harness.starts if s.get("start_gate")]
+            fresh = [s for s in harness.starts if not s.get("start_gate")]
+            self.assertEqual(len(gated), 2)
+            self.assertEqual(
+                sorted(s["instance_id"] for s in fresh), ["B-g4-tp1", "B-g5-tp1"]
+            )
+            loads = [e for e in harness.events if e["kind"] == "LOAD_START"]
+            self.assertFalse(any(e["prestarted"] for e in loads))
+
+    def test_an_aborted_conversion_stops_its_prestarted_engines(self):
+        with tempfile.TemporaryDirectory() as directory:
+            harness = Harness(Path(directory), "B", "TP1", prestart=True)
+            plan = dict(
+                plan_id="p",
+                bundle_id="B",
+                target_bundle_mode="TP1",
+                refs=[dict(instance_id="B-g2-tp2", instance_generation=2)],
+            )
+            harness.backend.quiesce(plan)
+            self.assertEqual(
+                sorted(harness.backend.prestarted), ["B-g4-tp1", "B-g5-tp1"]
+            )
+            harness.backend.restore_admission(plan)
+            self.assertIsNone(harness.backend.prestarted)
+            self.assertEqual(harness.stopped, {"B-g4-tp1", "B-g5-tp1"})
+            kinds = [e["kind"] for e in harness.events]
+            self.assertLess(
+                kinds.index("PRESTART_DROPPED"), kinds.index("ADMISSION_RESTORED")
+            )
+
+    def test_pre_tilt_keeps_long_requests_off_the_tilted_instances(self):
+        """Decider pre-tilt: long requests avoid the bundle to be converted."""
+        with tempfile.TemporaryDirectory() as directory:
+            harness = Harness(Path(directory), "A", "TP2")
+            harness.driver = pc.ConversionDriver(
+                harness.backend,
+                dict(
+                    decider="RECORD_ONLY",
+                    deadline_s=20,
+                    base_port=8400,
+                    edges={},
+                ),
+                harness.root / "conversion_plan.json",
+                interval_s=0.02,
+            )
+            harness.backend.layout_tilt = ["A-g1-tp1", "A-g3-tp1"]
+            values = jobs(12, 0.1)
+            for job in values:  # after the first tick applied the tilt
+                job["at_s"] += 1.0
+            for job in values[::2]:  # 1 + 8191 tokens: long
+                job["request"] = dict(job["request"], max_tokens=8191)
+            harness.run(values)
+            audit = [
+                json.loads(line)
+                for line in (harness.root / "pressure_audit.jsonl")
+                .read_text()
+                .splitlines()
+            ]
+            pools = {
+                r["job_id"]: r["pool"]
+                for r in audit
+                if r["kind"] == "pressure_dispatch"
+            }
+            self.assertEqual({pools[j["id"]] for j in values[::2]}, {"tp4"})
+            status = json.loads((harness.root / "layout_status.json").read_text())
+            self.assertEqual(status["workload"]["tilt"], ["A-g3-tp1", "tp1"])
+            self.assertEqual(status["workload"]["tilted_long_requests"], 6)
+
     def test_controller_keeps_serving_until_a_late_conversion_ends(self):
         """S4 GPU prep: the drain can outlast the workload; the controller
         must stay up (routing, inventory) until the plan is terminal."""
@@ -810,6 +943,8 @@ class ConversionTests(unittest.TestCase):
                 "long_arrivals",
                 "long_final_tokens",
                 "migration_starts",
+                "tilt",
+                "tilted_long_requests",
             },
         )
         self.assertEqual({v["tp_degree"] for v in status["instances"].values()}, {1, 2})

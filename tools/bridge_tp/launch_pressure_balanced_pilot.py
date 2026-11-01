@@ -506,8 +506,9 @@ def conversion_request(spec, registry):
     if (
         not required
         <= set(request)
-        <= required | {"method", "safety", "join_migration"}
+        <= required | {"method", "safety", "join_migration", "prestart"}
         or request.get("join_migration", False) not in (True, False)
+        or request.get("prestart", False) not in (True, False)
         or method not in {"DRAIN", "SELECTIVE_ROLL"}
         or method == "SELECTIVE_ROLL"
         and request["target_mode"] != "TP2"
@@ -537,7 +538,9 @@ def decider_request(request, registry):
 
     required = {"decider", "deadline_s", "base_port"}
     if (
-        not required <= set(request) <= required | {"rules"}
+        not required <= set(request) <= required | {"rules", "prestart", "pre_tilt"}
+        or request.get("prestart", False) not in (True, False)
+        or request.get("pre_tilt", False) not in (True, False)
         or request["decider"] not in {"RECORD_ONLY", "EXECUTE"}
         or not set(request.get("rules", {})) <= set(RULES)
         or request["deadline_s"] <= 0
@@ -948,9 +951,16 @@ def start_conversion(spec, scene, plan, common, processes, publish, requests):
     def start(extra):
         if extra.get("pair_slot") == "target":
             # S5b MERGE_TARGET: the planned (absent) pair target, unchanged.
-            argv, env = plan["target_argv"], plan["target_env"]
+            argv, env = plan["target_argv"], dict(plan["target_env"])
         else:
             argv, env = extra_engine(plan, extra)
+        if extra.get("start_gate"):
+            # Pre-started while the old engine drains: workers wait at the
+            # gate before CUDA; the API server must outwait the drain.
+            env.update(
+                BRIDGETP_START_GATE=extra["start_gate"],
+                VLLM_ENGINE_READY_TIMEOUT_S="1800",
+            )
         process = common.start_process(
             extra["instance_id"], argv, env, root / f"{extra['instance_id']}.log"
         )
@@ -1005,6 +1015,7 @@ def start_conversion(spec, scene, plan, common, processes, publish, requests):
         safety=plan["conversion"].get("safety"),
         speed_margin=load_profile()["speed_margin"],
         join=pc_join(plan),
+        prestart=bool(plan["conversion"].get("prestart")),
     )
     driver = pc.ConversionDriver(
         backend, plan["conversion"], root / "conversion_plan.json"

@@ -150,6 +150,7 @@ class ControllerConversionBackend:
         safety=None,
         speed_margin=0.8,
         join=None,
+        prestart=False,
     ):
         self.registry, self.ops, self.clock = registry, ops, clock
         self.run_dir = Path(run_dir)
@@ -162,6 +163,7 @@ class ControllerConversionBackend:
         self.warm = {}
         self.channel_closing = None
         self.layout_assist = None
+        self.layout_tilt = []
         self.safety = dict(SAFETY, **(safety or {}))
         self.speed_margin = speed_margin
         self.gate_since = None
@@ -182,6 +184,9 @@ class ControllerConversionBackend:
         self.join = join
         self.joining = None  # channels this conversion opens, once written
         self.stager_started = False
+        # Pre-start the replacements behind a start gate while draining.
+        self.prestart_enabled = prestart
+        self.prestarted = None
         self.lock = threading.Lock()
         # Engines are serving when the controller starts: the manifest's
         # PREPARING records become ACTIVE before the first plan.
@@ -193,7 +198,7 @@ class ControllerConversionBackend:
     def refs(self, plan):
         return [pool.InstanceRef(**r) for r in plan["refs"]]
 
-    def write_layout(self, changes, *, pending=True, assist=None):
+    def write_layout(self, changes, *, pending=True, assist=None, tilt=None):
         """Publish lifecycle changes; rows accumulate across revisions.
 
         ``conversion_pending`` keeps the controller serving after its workload
@@ -218,6 +223,8 @@ class ControllerConversionBackend:
         self.revision += 1
         if assist is not None:
             self.layout_assist = assist
+        if tilt is not None:
+            self.layout_tilt = sorted(tilt)
         atomic_json(
             self.run_dir / "layout_control.json",
             dict(
@@ -225,6 +232,8 @@ class ControllerConversionBackend:
                 instances=list(self.layout.values()),
                 conversion_pending=pending,
                 assist=assist or self.layout_assist,
+                # Decider pre-tilt: instances that get no new long request.
+                tilt=self.layout_tilt,
             ),
         )
         self.ops.event("LAYOUT_CONTROL", revision=self.revision, changes=changes)
@@ -338,6 +347,7 @@ class ControllerConversionBackend:
 
     def quiesce(self, plan):
         self.write_layout({r.instance_id: "QUIESCING" for r in self.refs(plan)})
+        self.prestart(plan)
 
     def remaining_s(self):
         """Conservative time left to READY from the latest planner snapshot.
@@ -710,7 +720,10 @@ class ControllerConversionBackend:
         self.ops.event("RESOURCES_RELEASED", plan_id=plan["plan_id"], gpus=gpus)
         return True
 
-    def start_replacements(self, plan):
+    def replacement_specs(self, plan):
+        """(instance id, generation, launch extra, joined row fields) per new
+        engine; deterministic until they are registered, so a pre-start at
+        quiesce and the start after release agree."""
         refs = self.refs(plan)
         gpus = sorted(g for r in refs for g in self.registry.get(r).physical_gpu_ids)
         tp = int(plan["target_bundle_mode"][2:])
@@ -718,9 +731,9 @@ class ControllerConversionBackend:
             r.ref.instance_generation for r in self.registry.instances.values()
         )
         port = self.base_port + len(self.started)
-        identity = self.registry.get(refs[0]).identity
         mode = self.join_mode(plan)
-        new = []
+        sources = len(self.joined_sources())
+        specs = []
         for devices in [gpus] if tp > 1 else [[g] for g in gpus]:
             generation += 1
             instance_id = f"{plan['bundle_id']}-g{generation}-tp{tp}"
@@ -748,13 +761,13 @@ class ControllerConversionBackend:
                 joined = dict(legacy_pool="tp4")
             elif mode == "SPLIT_SOURCES":
                 channel = dict(
-                    # 10 apart per channel source registered so far.
-                    base_port=self.join["channel_base_port"]
-                    + 10 * len(self.joined_sources()),
+                    # 10 apart per channel source, existing ones first.
+                    base_port=self.join["channel_base_port"] + 10 * sources,
                     generation=generation,
                     target=self.join["target_id"],
                     target_tp=self.join["target_tp"],
                 )
+                sources += 1
                 joined = dict(
                     migration_channel=channel,
                     predictor_events=str(
@@ -767,12 +780,61 @@ class ControllerConversionBackend:
                         Path(self.join["folder"]) / f"gpu_targets_{instance_id}.json"
                     ),
                 )
+            specs.append((instance_id, generation, extra, joined))
+        return specs
+
+    def prestart(self, plan):
+        """Start the replacements behind their start gate while draining.
+
+        Process start, imports and worker spawn (about two thirds of a
+        rebuild, S5b GPU 11-01) overlap the drain; each worker waits before
+        touching CUDA until ``start_replacements`` opens its gate.
+        """
+        if not self.prestart_enabled or self.prestarted is not None:
+            return
+        self.prestarted = {}
+        for instance_id, _, extra, _ in self.replacement_specs(plan):
+            gated = dict(
+                extra, start_gate=str(self.run_dir / f"start_gate_{instance_id}")
+            )
+            self.prestarted[instance_id] = gated
+            self.ops.start(gated)
+        self.ops.event(
+            "PRESTART", plan_id=plan["plan_id"], instances=sorted(self.prestarted)
+        )
+
+    def drop_prestarted(self, reason):
+        if self.prestarted:
+            self.ops.stop(sorted(self.prestarted))
+            self.ops.event(
+                "PRESTART_DROPPED", instances=sorted(self.prestarted), reason=reason
+            )
+        self.prestarted = None
+
+    def start_replacements(self, plan):
+        refs = self.refs(plan)
+        tp = int(plan["target_bundle_mode"][2:])
+        identity = self.registry.get(refs[0]).identity
+        mode = self.join_mode(plan)
+        specs = self.replacement_specs(plan)
+        prestarted = self.prestarted
+        if prestarted is not None and (
+            set(prestarted) != {i for i, _, _, _ in specs}
+            or not all(self.ops.alive(i) for i in prestarted)
+        ):
+            # A gated engine died (or the plan changed): start afresh.
+            self.drop_prestarted("not alive at release")
+            prestarted = None
+        new = []
+        for instance_id, generation, extra, joined in specs:
+            if prestarted is not None:
+                extra = prestarted[instance_id]
             new.append((instance_id, extra, joined))
             self.registry.register(
                 pool.InstanceRecord(
                     pool.InstanceRef(instance_id, generation),
                     tp,
-                    tuple(devices),
+                    tuple(extra["gpus"]),
                     plan["bundle_id"],
                     extra["endpoint"],
                     identity,
@@ -789,14 +851,22 @@ class ControllerConversionBackend:
             )
         if mode is not None:
             # Both ends of every new channel are written before any engine
-            # starts: senders retry until the target listens (600s).
+            # touches its GPU: senders retry until the target listens (600s).
             self.open_channels(plan, mode, new)
         for instance_id, extra, _ in new:
             self.started[instance_id] = extra
             self.ops.event(
-                "LOAD_START", instance=instance_id, gpus=extra["gpus"], tp=tp
+                "LOAD_START",
+                instance=instance_id,
+                gpus=extra["gpus"],
+                tp=tp,
+                prestarted=prestarted is not None,
             )
-            self.ops.start(extra)
+            if prestarted is not None:
+                Path(extra["start_gate"]).touch()
+            else:
+                self.ops.start(extra)
+        self.prestarted = None
 
     # ------------------------------------------------------- S5b channels
     def join_mode(self, plan):
@@ -957,6 +1027,7 @@ class ControllerConversionBackend:
         return True
 
     def restore_admission(self, plan):
+        self.drop_prestarted("conversion aborted")
         self.write_layout({r.instance_id: "ACTIVE" for r in self.refs(plan)})
         self.ops.event("ADMISSION_RESTORED", plan_id=plan["plan_id"])
 
@@ -1114,6 +1185,11 @@ class ConversionDriver:
             "a", encoding="utf-8"
         ) as stream:
             stream.write(json.dumps(record) + "\n")
+        if self.request.get("pre_tilt"):
+            tilt = sorted(i for b in record["tilt"] for i in members.get(b, ()))
+            if tilt != self.backend.layout_tilt:
+                self.backend.write_layout({}, pending=False, tilt=tilt)
+                self.backend.ops.event("PRE_TILT", instances=tilt)
         proposal = record["proposal"]
         if proposal is None:
             return
@@ -1126,7 +1202,8 @@ class ConversionDriver:
             self.request, bundle=proposal["bundle"], target_mode=proposal["target_mode"]
         )
         self.backend.ops.event("TRIGGER", request=self.request)
-        self.backend.write_layout({})  # hold the controller until terminal
+        # Hold the controller until terminal; the drain replaces the tilt.
+        self.backend.write_layout({}, tilt=[])
         self.executor.plan_create(
             "decided-" + proposal["bundle"],
             self.backend.registry.registry_revision,

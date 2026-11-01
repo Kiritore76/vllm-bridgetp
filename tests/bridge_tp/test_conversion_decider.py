@@ -203,6 +203,95 @@ class DeciderRuleTests(unittest.TestCase):
         self.assertEqual(members, MEMBERS)
 
 
+class PreTiltTests(unittest.TestCase):
+    def test_a_satisfied_candidate_tilts_its_bundle_until_released(self):
+        decider = d.ConversionDecider(EDGES)
+        record = decider.observe(status(arrivals=1080), BUNDLES, MEMBERS, 1000)
+        self.assertEqual(record["tilt"], ["B"])  # split candidate holds
+        record = decider.observe(status(arrivals=100), BUNDLES, MEMBERS, 1020)
+        self.assertEqual(record["tilt"], ["B"])  # within the 30s release
+        record = decider.observe(status(arrivals=100), BUNDLES, MEMBERS, 1031)
+        self.assertEqual(record["tilt"], [])
+        record = decider.observe(
+            status(arrivals=108, long_arrivals=48), BUNDLES, MEMBERS, 1032
+        )
+        self.assertEqual(record["tilt"], ["A"])
+
+    def test_driver_publishes_the_tilt_only_when_asked(self):
+        for pre_tilt in (False, True):
+            with tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                driver, events = DeciderDriverTests.driver(
+                    DeciderDriverTests(), root, "RECORD_ONLY"
+                )
+                driver.request = dict(driver.request, pre_tilt=pre_tilt)
+                for row in driver.backend.registry.instances.values():
+                    driver.backend.registry.transition(row.ref, "ACTIVE")
+                value = status(arrivals=1080)
+                value["unix_s"] = time.time()
+                (root / "layout_status.json").write_text(json.dumps(value))
+                driver.decide()
+                control = root / "layout_control.json"
+                if pre_tilt:
+                    self.assertEqual(
+                        json.loads(control.read_text())["tilt"], ["B-g2-tp2"]
+                    )
+                    self.assertIn("PRE_TILT", events)
+                else:
+                    self.assertFalse(control.exists())
+                    self.assertNotIn("PRE_TILT", events)
+
+
+class StartGateTests(unittest.TestCase):
+    def test_gate_blocks_until_opened_and_times_out(self):
+        import os
+        import threading
+        from unittest.mock import patch
+
+        from vllm.bridge_tp import start_gate
+
+        self.assertIsNone(start_gate.wait_for_start_gate())
+        with tempfile.TemporaryDirectory() as folder:
+            gate = Path(folder) / "gate"
+            with patch.dict(os.environ, {start_gate.ENV: str(gate)}):
+                threading.Timer(0.2, gate.touch).start()
+                waited = start_gate.wait_for_start_gate(poll_s=0.01)
+                self.assertGreaterEqual(waited, 0.15)
+            never = {
+                start_gate.ENV: str(gate) + "-never",
+                start_gate.TIMEOUT_ENV: "0.1",
+            }
+            with patch.dict(os.environ, never), self.assertRaises(TimeoutError):
+                start_gate.wait_for_start_gate(poll_s=0.01)
+
+    def test_worker_waits_at_the_gate_before_any_cuda_use(self):
+        import ast
+
+        root = Path(__file__).resolve().parents[2]
+        tree = ast.parse((root / "vllm/v1/worker/gpu_worker.py").read_text("utf-8"))
+        init = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "init_device"
+        )
+        calls = [  # the body only (decorators are not part of the call order)
+            n.func.id
+            for statement in init.body
+            for n in ast.walk(statement)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        ]
+        self.assertEqual(calls[0], "wait_for_start_gate")
+        first_if = next(n for n in init.body if isinstance(n, ast.If))
+        gate_line = next(
+            n.lineno
+            for n in ast.walk(init)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "wait_for_start_gate"
+        )
+        self.assertLess(gate_line, first_if.lineno)
+
+
 class DeciderDriverTests(unittest.TestCase):
     def driver(self, root, mode):
         registry, aliases = instance_pool.fixed_pair_registry(

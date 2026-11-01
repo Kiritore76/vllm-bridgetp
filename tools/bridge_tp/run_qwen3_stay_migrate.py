@@ -259,6 +259,16 @@ def main(argv=None):
         "execute its first proposal",
     )
     parser.add_argument(
+        "--conversion-prestart",
+        action="store_true",
+        help="start the replacement engines behind a start gate while draining",
+    )
+    parser.add_argument(
+        "--decider-pre-tilt",
+        action="store_true",
+        help="keep new long requests off a bundle the decider expects to convert",
+    )
+    parser.add_argument(
         "--sweep-rates",
         type=lambda text: tuple(int(v) for v in text.split(",")),
         default=None,
@@ -328,6 +338,10 @@ def main(argv=None):
         args.expanded_context = True
     if args.conversion_decider and not args.phase_shift:
         parser.error("the conversion decider runs on the phase-shift workload")
+    if args.conversion_prestart and not (args.conversion or args.conversion_decider):
+        parser.error("--conversion-prestart needs a conversion")
+    if args.decider_pre_tilt and not args.conversion_decider:
+        parser.error("--decider-pre-tilt needs --conversion-decider")
     if args.phase_shift:
         if (
             args.routine_four_mode
@@ -693,6 +707,8 @@ def main(argv=None):
                 else "EXECUTE",
                 deadline_s=600,
                 base_port=8400,
+                prestart=args.conversion_prestart,
+                pre_tilt=args.decider_pre_tilt,
             )
         if args.conversion and START_LAYOUT[args.conversion] != "L1A":
             spec["layout"] = dict(
@@ -709,6 +725,7 @@ def main(argv=None):
                 # A drain behind 8192-token outputs can take minutes.
                 deadline_s=600,
                 base_port=8400,
+                prestart=args.conversion_prestart,
             )
         spec.update(
             checkpoint=str(args.checkpoint),

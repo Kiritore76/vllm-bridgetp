@@ -103,6 +103,9 @@ def assess(scene_dir, run_dir=None, events_path=None, metrics_path=None):
         channel_retire=span(at("CHANNEL_PLAN_WRITTEN"), at("CHANNEL_RETIRE")),
         stop_to_released=span(at("CHANNEL_RETIRE"), at("RESOURCES_RELEASED")),
         rebuild={i: span(load[i], verified.get(i)) for i in load},
+        # Pre-start: engines started at quiesce, behind a start gate that
+        # opened at LOAD_START (rebuild then excludes their process start).
+        prestart_lead=span(at("PRESTART"), at("LOAD_START")),
         verified_to_published=span(max(verified.values(), default=None), published),
         quiesce_to_published=span(quiesce, published),
     )
