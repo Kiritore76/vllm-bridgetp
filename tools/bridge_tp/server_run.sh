@@ -3,11 +3,12 @@
 # 运行：
 #   cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 #
-# 当前任务：四卡短请求速率扫描（不转换）。看到达速率升高时，L0（4×TP1）是否在某个速率
-# 开始超过L2（2×TP2），即是否存在布局交叉。
+# 当前任务：入口优化后的高速率短请求扫描（不转换）。上次扫描控制器入口在约11 req/s
+# 成为瓶颈（每条到达都把整个历史账本写两遍进审计）；本版只记录仍在跑的条目。
+# 本次看：①名义速率是否真正到达（派发滞后应接近0）；②L0（4×TP1）的真实吞吐上限。
 # A={2,3}，B={0,1}；双32768/.88；每个引擎max-num-seqs 16（L0共64并发，L2共32）。
-# 负载：512输入/128输出（固定输出）的短请求，4、8、12、16 req/s各持续60s，然后排空。
-# 三种布局各4场，共12场，约1小时。L1A照常迁移；L0、L2不能迁移。
+# 负载：512输入/128输出（固定输出）的短请求，12、16、20、24 req/s各持续60s，然后排空。
+# L0、L2各4场，共8场，约40分钟。L1A路由有已知偏差，本次不跑。
 # 一场失败不中断其余布局；只有GPU未空闲时才停止。全程每秒采样GPU显存与利用率。
 # 每格只有1场，只作初筛。
 
@@ -16,8 +17,8 @@ venv=/root/autodl-tmp/bridgetp/.venv_bridge
 py=$venv/bin/python
 model=/root/autodl-tmp/models/Qwen3-8B
 branch=bridgetp/tp2-4090d-qwen3-8b
-task=qwen3_rate_sweep
-layouts="L0 L1A L2"
+task=qwen3_rate_sweep_hi
+layouts="L0 L2"
 
 cd "$repo" || exit 1
 source "$venv/bin/activate" || exit 1
@@ -62,7 +63,8 @@ for layout in $layouts; do
     echo "=== 开始：$name（$(date +%T)）==="
     date +%s.%N > "$run/$name.started_unix_s"
     "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
-        --rate-sweep --expanded-context --static-layout "$layout" \
+        --rate-sweep --sweep-rates 12,16,20,24 \
+        --expanded-context --static-layout "$layout" \
         --current-machine --repetitions 1 \
         --model "$model" \
         --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \

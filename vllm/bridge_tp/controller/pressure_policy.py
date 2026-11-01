@@ -293,6 +293,9 @@ def classify(pool: PoolReading, cfg: PressureConfig, now: float) -> Pressure:
     return Pressure(decode, prefill, capacity, zone, tuple(missing))
 
 
+LIVE_STATES = frozenset({"ACTIVE", "COMMITTED", "ACCOUNTED"})
+
+
 @dataclass
 class Reservation:
     key: str
@@ -515,7 +518,19 @@ class ReservationLedger:
             row.state = "ACCOUNTED"
 
     def snapshot(self) -> list[dict]:
-        return [asdict(r) for r in tuple(self.entries.values())]
+        # Reservation fields are scalars: a shallow copy equals asdict, cheaper.
+        return [dict(vars(r)) for r in tuple(self.entries.values())]
+
+    def live_snapshot(self) -> list[dict]:
+        """Entries routing and migration still read; terminal rows are inert."""
+        return [
+            dict(vars(r))
+            for r in tuple(self.entries.values())
+            if r.state in LIVE_STATES
+        ]
+
+    def added_since(self, keys) -> list[dict]:
+        return [dict(vars(r)) for k, r in tuple(self.entries.items()) if k not in keys]
 
 
 @dataclass(frozen=True)

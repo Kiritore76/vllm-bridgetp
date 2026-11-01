@@ -99,7 +99,30 @@ class ClassRoutingTests(unittest.TestCase):
             self.assertEqual(result.pool_id, expected)
             self.assertTrue(result.routing_reason.startswith("class-only"))
             self.assertEqual(co._owners["q"], expected)
-            self.assertEqual(record["reservation_after"][-1]["pool_id"], expected)
+            self.assertEqual(record["reservation_added"][-1]["pool_id"], expected)
+
+    def test_admission_record_omits_retired_rows(self):
+        for readings in (
+            [inst("a1"), inst("a2")],
+            [inst("a1"), inst("b1", "tp4")],
+        ):
+            co, records = coordinator()
+            for index in range(3):
+                co.admission_multi(f"q{index}", 512, 128, readings, TP, 10, f"k{index}")
+            co.ledger.entries["k0"].state = "COMPLETED"
+            co.admission_multi("q3", 512, 128, readings, TP, 10, "k3")
+            record = records[-1]
+            self.assertEqual(record["reservation_scope"], "live")
+            self.assertEqual(
+                [row["key"] for row in record["reservation_before"]], ["k1", "k2"]
+            )
+            self.assertEqual(
+                record["reservation_added"], [asdict(co.ledger.entries["k3"])]
+            )
+            self.assertEqual(
+                co.ledger.snapshot(),
+                [asdict(row) for row in co.ledger.entries.values()],
+            )
 
     def test_context_infeasible_class_only_raises(self):
         co, _ = coordinator()
@@ -116,7 +139,11 @@ class ClassRoutingTests(unittest.TestCase):
             expected = old.admission(*args, pair, now=10, key=f"k{index}")
             actual = new.admission_multi(*args, list(pair), TP, 10, f"k{index}")
             self.assertEqual(asdict(actual), asdict(expected))
-            for key in ("reservation_after", "routing_relief_after"):
+            for key in (
+                "reservation_before",
+                "reservation_added",
+                "routing_relief_after",
+            ):
                 self.assertEqual(new_records[-1][key], old_records[-1][key])
         self.assertEqual(new.ledger.snapshot(), old.ledger.snapshot())
         self.assertIs(new.policy_for("tp1"), new.policy)

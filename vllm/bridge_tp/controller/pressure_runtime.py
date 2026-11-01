@@ -146,7 +146,9 @@ class PressureCoordinator:
         return result
 
     def _admit_pair(self, policy, args, kwargs):
-        before = self.ledger.snapshot()
+        # Admission only adds rows. Recording the whole ever-growing ledger
+        # twice made each arrival O(all past requests) and capped ingress.
+        before, known = self.ledger.live_snapshot(), set(self.ledger.entries)
         pools = args[3] if len(args) > 3 else kwargs["pools"]
         now = kwargs.get("now", args[4] if len(args) > 4 else None)
         policy.observe_relief(now, pools[0])
@@ -190,8 +192,9 @@ class PressureCoordinator:
             "routing_relief_after": policy.relief.snapshot(),
             "decision_unix_s": now,
             "config_sha256": policy.cfg.sha256,
+            "reservation_scope": "live",
             "reservation_before": before,
-            "reservation_after": self.ledger.snapshot(),
+            "reservation_added": self.ledger.added_since(known),
         }
         if policy.cfg.kv_routing_priority:
             record["kv_routing_state"] = kv_before
@@ -288,7 +291,9 @@ class PressureCoordinator:
                     for row in ranking
                 }
             )
-        before = self.ledger.snapshot()
+        # Admission only adds rows. Recording the whole ever-growing ledger
+        # twice made each arrival O(all past requests) and capped ingress.
+        before, known = self.ledger.live_snapshot(), set(self.ledger.entries)
         chosen = feasible[0]
         self.ledger.track_ingress(key, request_id, chosen["pool_id"], prompt_tokens)
         result = Admission(
@@ -315,8 +320,9 @@ class PressureCoordinator:
             "routing_strategy": self.routing_strategy,
             "decision_unix_s": now,
             "config_sha256": self.policy.cfg.sha256,
+            "reservation_scope": "live",
             "reservation_before": before,
-            "reservation_after": self.ledger.snapshot(),
+            "reservation_added": self.ledger.added_since(known),
         }
         return result, record
 

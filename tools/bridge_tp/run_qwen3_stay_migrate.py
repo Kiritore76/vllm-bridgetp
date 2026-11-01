@@ -237,6 +237,12 @@ def main(argv=None):
         "(with --static-layout)",
     )
     parser.add_argument(
+        "--sweep-rates",
+        type=lambda text: tuple(int(v) for v in text.split(",")),
+        default=None,
+        help="comma-separated req/s for --rate-sweep (default 4,8,12,16)",
+    )
+    parser.add_argument(
         "--static-layout",
         choices=("L0", "L1A", "L2"),
         help="four-card layout screen: start directly in this layout on "
@@ -293,7 +299,15 @@ def main(argv=None):
             or not args.static_layout
         ):
             parser.error("rate-sweep is its own workload, run per static layout")
+        if args.sweep_rates is not None and (
+            not args.sweep_rates
+            or len(set(args.sweep_rates)) != len(args.sweep_rates)
+            or any(not 1 <= rate <= 64 for rate in args.sweep_rates)
+        ):
+            parser.error("sweep rates must be distinct integers in 1..64")
         args.updated_pressure_four_mode = True
+    elif args.sweep_rates is not None:
+        parser.error("--sweep-rates needs --rate-sweep")
     if args.routine_four_mode:
         if args.updated_pressure_four_mode:
             parser.error("routine and updated pressure trials are separate modes")
@@ -336,7 +350,9 @@ def main(argv=None):
         cfg = (
             long_burst.config(read(args.inputs))
             if args.long_burst_pair
-            else rate_sweep.config(read(args.inputs))
+            else rate_sweep.config(
+                read(args.inputs), args.sweep_rates or rate_sweep.RATES
+            )
             if args.rate_sweep
             else routine.config(read(args.inputs))
             if args.routine_four_mode

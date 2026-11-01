@@ -110,6 +110,28 @@ class StaticLayoutTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             runner.main(["--rate-sweep", "--expanded-context", *COMMON])
 
+    def test_rate_sweep_accepts_higher_rates(self):
+        code, value = plan(
+            "--rate-sweep",
+            "--expanded-context",
+            "--static-layout",
+            "L2",
+            "--sweep-rates",
+            "12,16,20,24",
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual([r["rate_req_s"] for r in value["recipes"]], [12, 16, 20, 24])
+        for bad in (["--sweep-rates", "8,8"], ["--sweep-rates", "0"]):
+            with (
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                plan(
+                    "--rate-sweep", "--expanded-context", "--static-layout", "L0", *bad
+                )
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            plan("--static-layout", "L0", "--sweep-rates", "12")
+
     def test_conflicting_options_are_rejected(self):
         for args in (
             ["--long-burst-memory-verify", "--static-layout", "L0"],
