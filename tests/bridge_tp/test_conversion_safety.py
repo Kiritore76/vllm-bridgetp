@@ -284,6 +284,30 @@ class CoordinatorAssistTests(unittest.TestCase):
         self.assertEqual(self.started, [])
 
 
+class UnsettledTests(unittest.TestCase):
+    def test_accounted_admission_keeps_the_pool_unsettled(self):
+        """S5a GPU drain arm (11-01): retiring a pool with an ACCOUNTED
+        admission stranded it; the controller then never finished."""
+        from types import SimpleNamespace as NS
+
+        from tools.bridge_tp import run_pressure_balanced_pilot as pilot
+
+        entries = [
+            NS(pool_id="tp1", state="ACCOUNTED"),
+            NS(pool_id="tp1", state="MOVED"),
+            NS(pool_id="tp1", state="COMPLETED"),
+            NS(pool_id="A-g3-tp1", state="ACTIVE"),
+            NS(pool_id="A-g3-tp1", state="COMMITTED"),
+        ]
+        self.assertEqual(pilot.unsettled_on(entries, "tp1"), 1)
+        self.assertEqual(pilot.unsettled_on(entries, "A-g3-tp1"), 2)
+        self.assertEqual(pilot.unsettled_on(entries, "tp4"), 0)
+        # Same states the controller's own completion check waits on.
+        source = Path(pilot.__file__).read_text(encoding="utf-8")
+        self.assertIn('row.state in {"ACTIVE", "COMMITTED", "ACCOUNTED"}', source)
+        self.assertEqual(pilot.UNSETTLED, {"ACTIVE", "COMMITTED", "ACCOUNTED"})
+
+
 class EndToEndTests(unittest.TestCase):
     def test_rolling_method_runs_the_assist_loop_and_completes(self):
         with tempfile.TemporaryDirectory() as directory:

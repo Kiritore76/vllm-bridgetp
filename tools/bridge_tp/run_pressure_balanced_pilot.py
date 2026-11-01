@@ -363,6 +363,21 @@ def pair_pools(manifest):
 REMAINING_QUANTILES = (0.5, 0.75, 0.9, 0.95, 0.99, 1.0)
 
 
+# Reservation states the controller still waits on before it can finish; an
+# ACCOUNTED admission completes only on its pool's next inventory sample.
+UNSETTLED = frozenset({"ACTIVE", "COMMITTED", "ACCOUNTED"})
+
+
+def unsettled_on(entries, pool_id):
+    """Reservations of ``pool_id`` whose settlement needs its inventory.
+
+    S5a GPU drain arm (11-01): an ACCOUNTED admission was not counted, the
+    pool was retired one inventory sample early, and the controller then
+    waited for it forever.
+    """
+    return sum(r.pool_id == pool_id and r.state in UNSETTLED for r in entries)
+
+
 def remaining_bins(row, candidate):
     """Conservative remaining-token bins [(upper_tokens, mass), ...] of a request.
 
@@ -832,10 +847,7 @@ def _run(args, prepared):
             instances[instance_of.get(pool, pool)] = dict(
                 pool_id=pool,
                 lifecycle=co.lifecycle(pool),
-                open_admissions=sum(
-                    r.pool_id == pool and r.state in {"ACTIVE", "COMMITTED"}
-                    for r in entries
-                ),
+                open_admissions=unsettled_on(entries, pool),
                 streams_pending=streams.get(pool, 0),
                 sessions=sessions.get(pool, 0),
                 requests=[] if raw is None else request_rows(raw),
@@ -953,10 +965,7 @@ def _run(args, prepared):
             # instance an unsettled migration names (a QUIESCING source may
             # still migrate out): stay QUIESCING until both settle.
             if state == "RETIRED" and (
-                any(
-                    r.pool_id == pool_id and r.state in {"ACTIVE", "COMMITTED"}
-                    for r in tuple(co.ledger.entries.values())
-                )
+                unsettled_on(tuple(co.ledger.entries.values()), pool_id)
                 or any(
                     pool_id in (target, co._session_source.get(session))
                     and co.ledger.entries[session].state == "ACTIVE"

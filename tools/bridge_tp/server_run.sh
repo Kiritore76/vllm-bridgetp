@@ -12,6 +12,8 @@
 #   drain：只等长请求自然结束（fast策略原有的迁移照常）。
 #   roll ：另外按方案A辅助迁出长请求（剩余>3倍迁移时间、TP2空闲才迁、每次转换最多2条）。
 # 全程每秒采样一次GPU显存与利用率。一场技术失败（退出码不是0或2）就停。
+# 第2次：第1次（093941_20421）drain场转换已完成，但退役时一条长请求的接入记录还差
+# 最后一次库存确认（ACCOUNTED），退役后再也收不到，控制器90s无进展超时；已修复，两场都重跑。
 
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
