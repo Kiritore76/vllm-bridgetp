@@ -118,3 +118,69 @@ def preconnect_plan(config) -> list[tuple[str, object]]:
         ("source-" + target.target, apply_target(config, target))
         for target in config.gpu_direct_targets
     ]
+
+
+FILE_ENV = "BRIDGETP_GPU_DIRECT_TARGETS_FILE"
+
+
+def read_target_file(path, expected_kv_heads: int) -> tuple[GpuDirectTarget, ...]:
+    """Targets a TP conversion assigned to this source (S5b); () when absent.
+
+    Same entries as ``BRIDGETP_GPU_DIRECT_TARGETS``, but the file may be empty
+    (no target yet, e.g. an L0 that will merge a TP2) and is rewritten while
+    the engine serves. Writers replace it atomically.
+    """
+    try:
+        with open(path, encoding="utf-8") as stream:
+            text = stream.read()
+    except FileNotFoundError:
+        return ()
+    if not json.loads(text or "[]"):
+        return ()
+    return parse_targets(text, expected_kv_heads)
+
+
+def merge_targets(listed, runtime) -> tuple[GpuDirectTarget, ...]:
+    """Startup targets plus file targets; a listed id keeps its startup entry."""
+    seen = {t.target for t in listed}
+    return tuple(listed) + tuple(t for t in runtime if t.target not in seen)
+
+
+class TargetFileFollower:
+    """Keep this source's channels equal to its target file (S5b).
+
+    ``connect(target)`` opens and warms a channel (blocking: the sender
+    retries until the target listens); ``drop(target)`` closes an idle one and
+    returns False while a session still uses it (retried next poll). Targets
+    are connected in id order, matching the target's source-id handshake
+    order, so preconnects cannot wait on each other in a cycle.
+    """
+
+    def __init__(self, path, expected_kv_heads, connect, drop, listed=()):
+        self.path, self.heads = path, expected_kv_heads
+        self.connect, self.drop = connect, drop
+        self.connected = {t.target: t for t in listed}
+        self.error = None
+
+    def poll(self) -> dict[str, list[str]]:
+        try:
+            wanted = {t.target: t for t in read_target_file(self.path, self.heads)}
+        except (OSError, ValueError) as error:  # half-written or invalid: retry
+            self.error = repr(error)
+            return dict(opened=[], closed=[], deferred=[])
+        self.error = None
+        for target_id, target in wanted.items():
+            if self.connected.get(target_id) not in (None, target):
+                raise ValueError(f"target {target_id} cannot change its channel")
+        closed, deferred, opened = [], [], []
+        for target_id in sorted(set(self.connected) - set(wanted)):
+            if self.drop(self.connected[target_id]):
+                del self.connected[target_id]
+                closed.append(target_id)
+            else:
+                deferred.append(target_id)
+        for target_id in sorted(set(wanted) - set(self.connected)):
+            self.connect(wanted[target_id])
+            self.connected[target_id] = wanted[target_id]
+            opened.append(target_id)
+        return dict(opened=opened, closed=closed, deferred=deferred)

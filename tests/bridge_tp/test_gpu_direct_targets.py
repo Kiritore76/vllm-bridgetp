@@ -10,8 +10,11 @@ from pathlib import Path
 
 from vllm.bridge_tp.gpu_direct_targets import (
     GpuDirectTarget,
+    TargetFileFollower,
+    merge_targets,
     parse_targets,
     preconnect_plan,
+    read_target_file,
     select_target,
 )
 from vllm.bridge_tp.runtime_control import RuntimeControl
@@ -165,6 +168,25 @@ class WiringTests(unittest.TestCase):
         self.assertIn("preconnect_plan", calls("preconnect_persistent_gpu_sender"))
         self.assertIn("_preconnect_one", calls("preconnect_persistent_gpu_sender"))
 
+    def test_target_file_is_followed_beside_serving(self):
+        """S5b: kv_stream starts the follower and merges file targets."""
+        tree = ast.parse(KV_STREAM.read_text(encoding="utf-8"))
+        functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+
+        def calls(name):
+            return {
+                n.func.id
+                for n in ast.walk(functions[name])
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            }
+
+        self.assertIn(
+            "_start_target_file_follower", calls("preconnect_persistent_gpu_sender")
+        )
+        self.assertIn("merge_targets", calls("get_bridge_tp_stream_config"))
+        follower = calls("_start_target_file_follower")
+        self.assertIn("TargetFileFollower", follower)
+
     def test_runtime_control_carries_the_target_instance(self):
         with tempfile.TemporaryDirectory() as folder:
             RuntimeControl(armed=True, target_instance="B-g5-tp2").write(folder)
@@ -176,6 +198,80 @@ class WiringTests(unittest.TestCase):
         target = GpuDirectTarget("B-g2-tp2", "127.0.0.1", 30400, 2, 1)
         with self.assertRaises(AttributeError):
             target.base_port = 1
+
+
+def row(target="B-g6-tp2", base_port=30400, generation=1):
+    return dict(
+        target=target,
+        host="127.0.0.1",
+        base_port=base_port,
+        tp=2,
+        generation=generation,
+    )
+
+
+class TargetFileTests(unittest.TestCase):
+    """S5b: a source's targets follow the conversion's file."""
+
+    def test_missing_or_empty_file_has_no_target(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "targets.json"
+            self.assertEqual(read_target_file(path, 8), ())
+            path.write_text("[]")
+            self.assertEqual(read_target_file(path, 8), ())
+            path.write_text(json.dumps([row()]))
+            (target,) = read_target_file(path, 8)
+            self.assertEqual((target.target, target.generation), ("B-g6-tp2", 1))
+            path.write_text(json.dumps([row(), row()]))
+            with self.assertRaises(ValueError):
+                read_target_file(path, 8)
+
+    def test_merge_keeps_startup_entries(self):
+        listed = parse_targets(json.dumps([row("B-g2-tp2")]), 8)
+        runtime = parse_targets(json.dumps([row("B-g2-tp2", 30500), row()]), 8)
+        merged = merge_targets(listed, runtime)
+        self.assertEqual([t.target for t in merged], ["B-g2-tp2", "B-g6-tp2"])
+        self.assertEqual(merged[0].base_port, 30400)
+
+    def test_follower_opens_new_and_closes_departed_idle_targets(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "targets.json"
+            calls, busy = [], set()
+
+            def drop(target):
+                calls.append(("drop", target.target))
+                return target.target not in busy
+
+            follower = TargetFileFollower(
+                path, 8, lambda t: calls.append(("connect", t.target)), drop
+            )
+            self.assertEqual(follower.poll()["opened"], [])
+            path.write_text(json.dumps([row("B-g9-tp2", 30410), row()]))
+            # Id order, as the target's handshakes.
+            self.assertEqual(follower.poll()["opened"], ["B-g6-tp2", "B-g9-tp2"])
+            self.assertEqual(follower.poll()["opened"], [])
+            busy.add("B-g6-tp2")
+            path.write_text(json.dumps([row("B-g9-tp2", 30410)]))
+            self.assertEqual(follower.poll()["deferred"], ["B-g6-tp2"])
+            busy.clear()
+            self.assertEqual(follower.poll()["closed"], ["B-g6-tp2"])
+            self.assertEqual(set(follower.connected), {"B-g9-tp2"})
+            # A half-written file is retried, not applied.
+            path.write_text("[{")
+            self.assertEqual(follower.poll(), dict(opened=[], closed=[], deferred=[]))
+            self.assertIsNotNone(follower.error)
+            path.write_text(json.dumps([row("B-g9-tp2", 30420)]))
+            with self.assertRaises(ValueError):
+                follower.poll()
+            self.assertEqual(
+                calls,
+                [
+                    ("connect", "B-g6-tp2"),
+                    ("connect", "B-g9-tp2"),
+                    ("drop", "B-g6-tp2"),
+                    ("drop", "B-g6-tp2"),
+                ],
+            )
 
 
 if __name__ == "__main__":

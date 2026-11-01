@@ -592,6 +592,107 @@ class LauncherTests(unittest.TestCase):
                         common,
                         args,
                     )
+            # S5b: single-class starts whose conversion joins migration.
+            joined = dict(request, join_migration=True)
+            single = dict(bundle_gpus=["2", "3", "0", "1"], base_port=8300)
+            plan = launch.build_scene(
+                dict(
+                    spec,
+                    layout=dict(single, name="L0"),
+                    conversion=dict(joined, bundle="B"),
+                ),
+                dict(name="l0-join", arrivals="a"),
+                root,
+                common,
+                args,
+            )
+            join = plan["join"]
+            self.assertEqual(join["mode"], "MERGE_TARGET")
+            self.assertIn("--deferred-migration", plan["controller_argv"])
+            self.assertNotIn("--no-migration", plan["controller_argv"])
+            self.assertEqual(
+                join["channels"],
+                {
+                    "A-g1-tp1": dict(base_port=30400, generation=1, pool="tp1"),
+                    "A-g3-tp1": dict(base_port=30410, generation=3, pool="A-g3-tp1"),
+                    "B-g4-tp1": dict(base_port=30420, generation=4, pool="B-g4-tp1"),
+                    "B-g5-tp1": dict(base_port=30430, generation=5, pool="B-g5-tp1"),
+                },
+            )
+            extra_config = json.loads(plan["target_argv"][-1])[
+                "kv_connector_extra_config"
+            ]
+            self.assertEqual(extra_config["bridgetp_gpu_direct_sources"], [])
+            self.assertEqual(
+                extra_config["bridgetp_gpu_direct_channel_plan"],
+                str(plan["channel_plan"]),
+            )
+            argv, env = launch.source_launch(plan)
+            # The full migration source (not the routing-only L0 engine).
+            self.assertEqual(argv, plan["source_argv"])
+            self.assertEqual(env["BRIDGETP_STREAM_ENABLED"], "1")
+            self.assertEqual(
+                env[launch.TARGETS_FILE_ENV], join["target_files"]["A-g1-tp1"]
+            )
+            for extra in plan["extra_engines"]:
+                argv, env = launch.extra_engine(plan, extra)
+                self.assertEqual(
+                    env[launch.TARGETS_FILE_ENV],
+                    join["target_files"][extra["instance_id"]],
+                )
+                self.assertNotIn("BRIDGETP_GPU_DIRECT_TARGETS", env)
+                self.assertEqual(extra["migration_channel"]["target"], "tp4")
+            launch.write_instances(plan)
+            controller_args = launch.controller.parse_args(plan["controller_argv"][2:])
+            checked = launch.controller.instance_manifest(
+                controller_args, NS(target_tp_size=2)
+            )
+            self.assertEqual(
+                [r["instance_id"] for r in launch.controller.channel_sources(checked)],
+                ["A-g3-tp1", "B-g4-tp1", "B-g5-tp1"],
+            )
+            plan = launch.build_scene(
+                dict(
+                    spec,
+                    layout=dict(single, name="L2"),
+                    conversion=dict(joined, target_mode="TP1"),
+                ),
+                dict(name="l2-join", arrivals="a"),
+                root,
+                common,
+                args,
+            )
+            self.assertEqual(plan["join"]["mode"], "SPLIT_SOURCES")
+            self.assertEqual(plan["join"]["channel_base_port"], 30500)
+            self.assertIn("--deferred-migration", plan["controller_argv"])
+            self.assertEqual(
+                json.loads(plan["target_argv"][-1])["kv_connector_extra_config"][
+                    "bridgetp_gpu_direct_sources"
+                ],
+                [],
+            )
+            backend_view = launch.pc_join(plan)
+            self.assertEqual(backend_view["target_id"], "B-g2-tp2")
+            self.assertEqual(backend_view["target_tp"], 2)
+            launch.write_instances(plan)
+            launch.controller.instance_manifest(
+                launch.controller.parse_args(plan["controller_argv"][2:]),
+                NS(target_tp_size=2),
+            )
+            for layout, bad in (
+                ("L0", dict(joined, bundle="A")),  # A is not the pair target
+                ("L2", dict(joined, target_mode="TP1", bundle="B")),  # pair
+                ("L0", dict(joined, bundle="B", method="SELECTIVE_ROLL")),
+                ("L1A", joined),
+            ):
+                with self.assertRaises(ValueError):
+                    launch.build_scene(
+                        dict(spec, layout=dict(single, name=layout), conversion=bad),
+                        dict(name="bad-join", arrivals="a"),
+                        root,
+                        common,
+                        args,
+                    )
             for layout in (
                 dict(
                     name="L0",

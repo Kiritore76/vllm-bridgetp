@@ -54,7 +54,14 @@ CONVERSIONS = {
     "L1A-L2": dict(bundle="A", target_mode="TP2"),
     # B: TP2(0,1) (pair target) -> TP1@0 + TP1@1.
     "L1A-L0": dict(bundle="B", target_mode="TP1"),
+    # S5b, single-class starts whose new instances join migration:
+    # L0 B: TP1@0 + TP1@1 -> TP2(0,1), the pair target of TP1@2 and TP1@3.
+    "L0-L1A": dict(bundle="B", target_mode="TP2", join_migration=True),
+    # L2 A: TP2(2,3) -> TP1@2 + TP1@3, new sources of the retained TP2(0,1).
+    "L2-L1A": dict(bundle="A", target_mode="TP1", join_migration=True),
 }
+# Layout a conversion edge starts from.
+START_LAYOUT = {name: name.split("-")[0] for name in CONVERSIONS}
 
 
 def adapt_plan(plan, arm, checkpoint, model):
@@ -109,8 +116,10 @@ def serving_preflight(plans):
         write(plan["config_path"], plan["config"])
         pilot.write_instances(plan)
         absent = pilot.absent_pair(plan)
+        # S5b: a conversion that joins migration starts the planned side too.
+        started = [] if plan.get("join") else absent
         argvs = [
-            plan[side + "_argv"] for side in ("source", "target") if side not in absent
+            plan[side + "_argv"] for side in ("source", "target") if side not in started
         ] + [
             pilot.extra_engine(plan, extra)[0]
             for extra in plan.get("extra_engines", ())
@@ -118,7 +127,7 @@ def serving_preflight(plans):
         for argv in argvs:
             parsed = make_arg_parser(FlexibleArgumentParser()).parse_args(argv[3:])
             validate_parsed_serve_args(parsed)
-        if not absent:
+        if not started:
             phase8_stager.parse_args(plan["stager_argv"][2:])
         parsed = pilot.controller.parse_args(
             plan["controller_argv"][2:] + ["--validate-only"]
@@ -264,8 +273,16 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.layout_l1a_channels and not args.long_burst_memory_verify:
         parser.error("layout-l1a-channels runs with long-burst-memory-verify only")
-    if args.conversion and not args.layout_l1a_channels:
+    joined = bool(
+        args.conversion and CONVERSIONS[args.conversion].get("join_migration")
+    )
+    if args.conversion and not joined and not args.layout_l1a_channels:
         parser.error("conversion runs on the L1A channel layout only")
+    if joined and (args.layout_l1a_channels or not args.long_burst_memory_verify):
+        parser.error(
+            "S5b edges start single-class (no L1A channel layout) on the "
+            "long-burst memory workload"
+        )
     if args.static_layout and (
         args.layout_l1a_channels
         or args.conversion
@@ -635,6 +652,13 @@ def main(argv=None):
                 bundle_gpus=["2", "3", "0", "1"],
                 base_port=8300,
                 migration_sources=True,
+            )
+        if args.conversion and START_LAYOUT[args.conversion] != "L1A":
+            spec["layout"] = dict(
+                name=START_LAYOUT[args.conversion],
+                bundle_gpus=["2", "3", "0", "1"],
+                base_port=8300,
+                migration_sources=False,
             )
         if args.conversion:
             spec["conversion"] = dict(

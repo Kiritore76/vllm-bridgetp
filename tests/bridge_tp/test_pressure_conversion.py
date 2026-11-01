@@ -214,7 +214,7 @@ class Harness:
         rows = {r["instance_id"]: r for r in self.manifest["instances"]}
         return {rows[i]["endpoint"] for i in self.stopped if i in rows}
 
-    def run(self, jobs):
+    def run(self, jobs, **overrides):
         actual_ingress = i.PressureIngress
 
         def make_ingress(*args, **kwargs):
@@ -252,6 +252,7 @@ class Harness:
             test_only_cancel_first_shadow=False,
             instances=self.root / "instances.json",
         )
+        vars(args).update(overrides)
         (self.root / "instances.json").write_text(json.dumps(self.manifest))
         controller = NS(
             source_url="source",
@@ -288,6 +289,191 @@ class Harness:
         return outcome
 
 
+class JoinHarness(Harness):
+    """S5b single-class starts on A={2,3}, B={0,1} whose conversion joins
+    migration: L0 (merge B into the absent pair target) or L2 (split A into
+    new channel sources of the retained pair target)."""
+
+    def __init__(self, root, layout, receipts_after_s=0.3):
+        self.root, self.slow = root, set()
+        self.calls, self.events, self.stopped = [], [], set()
+        self.lock = threading.Lock()
+        self.stagers, self.receipts_after_s = [], receipts_after_s
+        if layout == "L0":
+            extras = [
+                dict(bundle="A", tp=1, gpus=["3"], endpoint="a3", context_limit=8192),
+                dict(bundle="B", tp=1, gpus=["0"], endpoint="b0", context_limit=8192),
+                dict(bundle="B", tp=1, gpus=["1"], endpoint="b1", context_limit=8192),
+            ]
+            pair = dict(target_bundle=None)
+            bundle, mode = "B", "TP2"
+        else:
+            extras = [
+                dict(
+                    bundle="A", tp=2, gpus=["2", "3"], endpoint="a2", context_limit=8192
+                )
+            ]
+            pair = dict(source_bundle=None)
+            bundle, mode = "A", "TP1"
+        registry, aliases = instance_pool.fixed_pair_registry(
+            source_gpu="2",
+            target_gpus=["0", "1"],
+            source_url="source",
+            target_url="target:9",
+            identity="qwen",
+            source_context_limit=8192,
+            target_context_limit=8192,
+            extras=extras,
+            **pair,
+        )
+        self.registry = registry
+        manifest = instance_pool.registry_manifest(registry, aliases)
+        by_endpoint = {e["endpoint"]: e for e in extras}
+        self.path_of, self.readers = {}, {}
+        channels, files = {}, {}
+        for row in manifest["instances"]:
+            pool_id = row.get("legacy_pool") or row["instance_id"]
+            endpoint = row["endpoint"]
+            # The pair reads --source/--target-inventory; extras their own.
+            row["inventory_path"] = str(
+                root
+                / {"tp1": "source", "tp4": "target"}.get(
+                    pool_id, endpoint.replace(":", "_")
+                )
+            )
+            self.path_of[endpoint] = Path(row["inventory_path"])
+            self.readers[endpoint] = Reader(pool_id)
+            if layout == "L0":
+                generation = row["instance_generation"]
+                port = 30400 if pool_id == "tp1" else 30400 + 10 * (generation - 2)
+                channels[row["instance_id"]] = dict(
+                    base_port=port, generation=generation, pool=pool_id
+                )
+                files[row["instance_id"]] = str(
+                    root / f"gpu_targets_{row['instance_id']}.json"
+                )
+                Path(files[row["instance_id"]]).write_text("[]")
+                if endpoint in by_endpoint:
+                    row["migration_channel"] = dict(
+                        base_port=port, generation=generation, target="tp4", target_tp=2
+                    )
+                    row["predictor_events"] = str(root / f"pred_{row['instance_id']}")
+        self.manifest = manifest
+        self.alias_target()
+        for name in list(self.readers):
+            if name != "target":
+                self.publish(name)
+        self.channel_plan = root / "gpu_channel_plan.json"
+        self.channel_plan.write_text("[]")
+        if layout == "L2":
+            # The pair target receipts its first (empty) plan file load.
+            directory = root / "session-1" / "gpu_channel_plan_receipts"
+            directory.mkdir(parents=True)
+            for rank in (0, 1):
+                (directory / f"tp_rank_{rank}.json").write_text(
+                    json.dumps(dict(planned=[], completed_unix_s=time.time() - 60))
+                )
+        self.join = dict(
+            mode="MERGE_TARGET" if layout == "L0" else "SPLIT_SOURCES",
+            bundle=bundle,
+            pair_source=aliases.get("tp1"),
+            channels=channels,
+            target_files=files,
+            channel_base_port=30500,
+            folder=str(root),
+            target_tp=2,
+            target_host="127.0.0.1",
+            target_slot=dict(endpoint="target:9", inventory_path=str(root / "target")),
+            target_id=aliases.get("tp4"),
+            source_env={},
+        )
+        ops = NS(
+            stop=lambda ids: self.stopped.update(ids),
+            alive=lambda instance_id: instance_id not in self.stopped,
+            gpus_released=lambda gpus: True,
+            scrape=lambda endpoint, native: dict(
+                num_running=0,
+                num_waiting=0,
+                free_kv_blocks=native["free_blocks"],
+                sampled_unix_s=time.time(),
+            ),
+            start=self.start,
+            warm=lambda extra: None,
+            start_stager=lambda: self.stagers.append(time.time()),
+            event=self.event,
+        )
+        self.backend = pc.ControllerConversionBackend(
+            registry,
+            manifest,
+            root,
+            ops,
+            base_port=8400,
+            context_limits=(8192, 8192),
+            channel_plan=self.channel_plan,
+            target_tp_ranks=2 if layout == "L2" else 0,
+            join=self.join,
+        )
+        self.driver = pc.ConversionDriver(
+            self.backend,
+            dict(
+                bundle=bundle,
+                target_mode=mode,
+                trigger_s=0.3,
+                deadline_s=20,
+                base_port=8400,
+            ),
+            root / "conversion_plan.json",
+            interval_s=0.02,
+        )
+
+    def start(self, extra):
+        with self.lock:
+            # The pair-target slot publishes as pool tp4 (its planned env).
+            pool_id = "tp4" if extra.get("pair_slot") else extra["instance_id"]
+            self.readers[extra["endpoint"]] = Reader(pool_id)
+            self.path_of[extra["endpoint"]] = Path(extra["inventory_path"])
+            self.alias_target()
+            self.publish(extra["endpoint"])
+
+    def alias_target(self):
+        # The controller's configured pair-target URL is "target".
+        if "target:9" in self.readers:
+            self.readers["target"] = self.readers["target:9"]
+            self.path_of["target"] = self.path_of["target:9"]
+
+    def event(self, kind, **values):
+        super().event(kind, **values)
+        if kind == "CHANNEL_PLAN_JOINED":
+            # Both ends warm every joined channel a little later.
+            timer = threading.Timer(
+                self.receipts_after_s, self.warm_channels, args=(values,)
+            )
+            timer.daemon = True
+            timer.start()
+
+    def warm_channels(self, values):
+        target_dir = self.root / "session-1" / "gpu_channel_preconnect_receipts"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        plan = json.loads(self.channel_plan.read_text())
+        for row in plan:
+            if row["source"] not in values["sources"]:
+                continue
+            pool_id = (
+                self.join["channels"].get(row["source"], {}).get("pool", row["source"])
+            )
+            names = [f"tp_rank_{r}-{row['source']}.json" for r in (0, 1)]
+            names.append(f"source-{pool_id}-{values['target']}.json")
+            for name in names:
+                (target_dir / name).write_text(
+                    json.dumps(
+                        dict(
+                            status="WARMUP_COMPLETE",
+                            channel_generation=row["generation"],
+                        )
+                    )
+                )
+
+
 def jobs(count, spacing, busy=None):
     """``busy``: pair pool that the first two arrivals are pinned to."""
     return [
@@ -299,6 +485,10 @@ def jobs(count, spacing, busy=None):
         )
         for n in range(count)
     ]
+
+
+def result_rows(harness):
+    return json.loads((harness.root / "pressure_request_results.json").read_text())
 
 
 class ConversionTests(unittest.TestCase):
@@ -569,6 +759,167 @@ class ConversionTests(unittest.TestCase):
                 request,
                 edge,
             )
+
+    def check_joined(self, harness, outcome):
+        self.assertEqual(outcome["state"], "COMPLETED", outcome)
+        self.assertIsNone(outcome["error"])
+        kinds = [e["kind"] for e in harness.events]
+        for first, then in (
+            ("CHANNEL_RETIRE", "CHANNEL_PLAN_JOINED"),
+            ("CHANNEL_PLAN_JOINED", "LOAD_START"),
+            ("CHANNELS_READY", "ROUTE_PUBLISHED"),
+        ):
+            self.assertLess(kinds.index(first), kinds.index(then), (first, then))
+        ready = next(e for e in harness.events if e["kind"] == "CHANNELS_READY")
+        # Publication waited for both ends of every joined channel.
+        self.assertGreaterEqual(ready["ready_s"], harness.receipts_after_s * 0.9)
+        result = json.loads(
+            (harness.root / "pressure_request_results.json").read_text()
+        )
+        self.assertTrue(all(row["source_done"] for row in result))
+        return json.loads((harness.root / "layout_status.json").read_text())
+
+    def test_l0_merge_takes_the_pair_target_and_joins_retained_sources(self):
+        """S5b L0 -> L1A: TP1@0 + TP1@1 -> TP2(0,1), target of TP1@2 and TP1@3."""
+        with tempfile.TemporaryDirectory() as directory:
+            harness = JoinHarness(Path(directory), "L0")
+            outcome = harness.run(
+                jobs(16, 0.3), no_migration=False, deferred_migration=True
+            )
+            status = self.check_joined(harness, outcome)
+            self.assertEqual(harness.stopped, {"B-g4-tp1", "B-g5-tp1"})
+            self.assertEqual(len(harness.stagers), 1)
+            published = next(
+                e for e in harness.events if e["kind"] == "ROUTE_PUBLISHED"
+            )
+            self.assertEqual(published["instances"], ["B-g6-tp2"])
+            # The new TP2 took the absent pair target: same endpoint and
+            # inventory, pool tp4, the controller's migration target.
+            self.assertEqual(status["migration_target"], "B-g6-tp2")
+            self.assertEqual(status["instances"]["B-g6-tp2"]["pool_id"], "tp4")
+            self.assertEqual(harness.backend.rows["B-g6-tp2"]["endpoint"], "target:9")
+            self.assertEqual(
+                json.loads(harness.channel_plan.read_text()),
+                [
+                    dict(source="A-g1-tp1", base_port=30400, generation=1),
+                    dict(source="A-g3-tp1", base_port=30410, generation=3),
+                ],
+            )
+            for source, port, generation in (
+                ("A-g1-tp1", 30400, 1),
+                ("A-g3-tp1", 30410, 3),
+            ):
+                self.assertEqual(
+                    json.loads(Path(harness.join["target_files"][source]).read_text()),
+                    [
+                        dict(
+                            target="B-g6-tp2",
+                            host="127.0.0.1",
+                            base_port=port,
+                            tp=2,
+                            generation=generation,
+                        )
+                    ],
+                )
+            for source in ("B-g4-tp1", "B-g5-tp1"):
+                self.assertEqual(
+                    json.loads(Path(harness.join["target_files"][source]).read_text()),
+                    [],
+                )
+            audit = [
+                json.loads(line)
+                for line in (harness.root / "pressure_audit.jsonl")
+                .read_text()
+                .splitlines()
+            ]
+            self.assertIn(
+                dict(pool_id="tp4", change="ADDED"),
+                [
+                    c
+                    for r in audit
+                    if r["kind"] == "pressure_layout_applied"
+                    for c in r["changes"]
+                ],
+            )
+            self.assertEqual(len(result_rows(harness)), 16)
+            # Scene finalization drains and finalizes the merged target too.
+            from tools.bridge_tp import launch_pressure_balanced_pilot as launch
+
+            self.assertEqual(
+                launch.live_pair(
+                    dict(run_dir=harness.root, instances=harness.manifest)
+                ),
+                ["source", "target"],
+            )
+
+    def test_l2_split_adds_channel_sources_to_the_retained_target(self):
+        """S5b L2 -> L1A: TP2(2,3) -> TP1@2 + TP1@3, sources of TP2(0,1)."""
+        with tempfile.TemporaryDirectory() as directory:
+            harness = JoinHarness(Path(directory), "L2")
+            outcome = harness.run(
+                jobs(16, 0.3), no_migration=False, deferred_migration=True
+            )
+            status = self.check_joined(harness, outcome)
+            self.assertEqual(harness.stopped, {"A-g3-tp2"})
+            self.assertEqual(harness.stagers, [])  # running since the start
+            self.assertEqual(status["migration_target"], "B-g2-tp2")
+            self.assertEqual(
+                json.loads(harness.channel_plan.read_text()),
+                [
+                    dict(source="A-g4-tp1", base_port=30500, generation=4),
+                    dict(source="A-g5-tp1", base_port=30510, generation=5),
+                ],
+            )
+            control = json.loads((harness.root / "layout_control.json").read_text())
+            rows = {r["instance_id"]: r for r in control["instances"]}
+            self.assertEqual(
+                rows["A-g4-tp1"]["migration_channel"],
+                dict(base_port=30500, generation=4, target="B-g2-tp2", target_tp=2),
+            )
+            self.assertTrue(
+                rows["A-g5-tp1"]["predictor_events"].endswith("A-g5-tp1.jsonl")
+            )
+            self.assertEqual(
+                json.loads((harness.root / "gpu_targets_A-g5-tp1.json").read_text()),
+                [
+                    dict(
+                        target="B-g2-tp2",
+                        host="127.0.0.1",
+                        base_port=30510,
+                        tp=2,
+                        generation=5,
+                    )
+                ],
+            )
+            audit = [
+                json.loads(line)
+                for line in (harness.root / "pressure_audit.jsonl")
+                .read_text()
+                .splitlines()
+            ]
+            added = [
+                c["pool_id"]
+                for r in audit
+                if r["kind"] == "pressure_layout_applied"
+                for c in r["changes"]
+                if c["change"] == "ADDED"
+            ]
+            self.assertEqual(added, ["A-g4-tp1", "A-g5-tp1"])
+
+    def test_joined_channels_that_never_warm_fail_before_publishing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            harness = JoinHarness(Path(directory), "L2", receipts_after_s=600)
+            harness.backend.clock = lambda: time.time() + (
+                pc.CHANNEL_READY_S + 700 if harness.backend.joining else 0
+            )
+            plan = dict(plan_id="p", bundle_id="A", target_bundle_mode="TP1", refs=[])
+            harness.backend.started = {}
+            harness.backend.open_channels(plan, "SPLIT_SOURCES", [])
+            with self.assertRaisesRegex(RuntimeError, "joined channels"):
+                harness.backend.joining["channels"]["X-g9-tp1"] = dict(
+                    generation=9, pool="X-g9-tp1"
+                )
+                harness.backend.channels_ready(plan)
 
     def test_nothing_is_quiesced_until_every_target_rank_follows_the_plan(self):
         """S3b-3 GPU (10-31): a target that rejected the plan file stalled the

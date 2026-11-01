@@ -249,6 +249,29 @@ def assess(scene_dir, run_dir=None, events_path=None, metrics_path=None):
                 r.get("remaining_s") for r in rows if r["kind"] == "VALVE_CONTINUE"
             ],
         )
+    # S5b: channels the conversion opened for its new layout, and migrations
+    # after publication (a single-class start cannot migrate before it).
+    joined = None
+    if kinds["CHANNEL_PLAN_JOINED"]:
+        ready = kinds["CHANNELS_READY"][0] if kinds["CHANNELS_READY"] else None
+        starts = [
+            r
+            for r in audit
+            if r["kind"] == "pressure_actual_start"
+            and published is not None
+            and r["unix_s"] >= published
+        ]
+        joined = dict(
+            target=kinds["CHANNEL_PLAN_JOINED"][0]["target"],
+            sources=kinds["CHANNEL_PLAN_JOINED"][0]["sources"],
+            channels_ready=ready is not None,
+            channels_ready_s=ready["ready_s"] if ready else None,
+            stager_started=bool(kinds["STAGER_STARTED"]),
+            migrations_started_after_publish=len(starts),
+            migrations_committed=(metrics or {})
+            .get("summary", {})
+            .get("committed_requests"),
+        )
     result = json.loads((scene_dir / "conversion_result.json").read_text("utf-8"))
     final = [r for r in audit if r["kind"] == "pressure_final"]
     checks = dict(
@@ -266,6 +289,8 @@ def assess(scene_dir, run_dir=None, events_path=None, metrics_path=None):
         window_continuity=window["max_gap_s"] is None
         or window["max_gap_s"] <= MAX_GAP_S,
     )
+    if joined is not None:
+        checks["joined_channels_ready"] = joined["channels_ready"]
     return dict(
         schema="BRIDGETP_CONVERSION_ACCEPTANCE_V1",
         passed=all(checks.values()),
@@ -289,6 +314,7 @@ def assess(scene_dir, run_dir=None, events_path=None, metrics_path=None):
         service_by_arrival_phase=service,
         planner_shadow=shadow,
         safety=safety,
+        joined_migration=joined,
         scope="one conversion; mechanism checks decide pass; service is "
         "reported by phase, not judged",
     )

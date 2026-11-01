@@ -14,6 +14,9 @@ binds those steps to the live pilot:
 
 New instances join routing-only: after a conversion the migration pair is
 the original one if both sides survive, otherwise migration stays disabled.
+With ``join`` (S5b, a single-class start) the new instances join migration
+instead: the conversion closes the channels of what it retires (as above)
+and opens every TP1-to-TP-k channel of the new layout before publishing it.
 The conversion is triggered explicitly; nothing here selects a layout.
 """
 
@@ -54,6 +57,8 @@ def read_json(path):
 
 
 PLAN_RECEIPT = re.compile(r"tp_rank_\d+\.json")
+# S5b channel readiness: both ends of every channel the conversion opened.
+CHANNEL_READY_S = 180.0
 TEARDOWN_RECEIPT = re.compile(r"(tp_rank_\d+)-retired-(\d+)\.json")
 
 
@@ -68,6 +73,20 @@ def channel_receipts(root, pattern=PLAN_RECEIPT):
                 value = read_json(Path(directory) / name)
                 if value is not None:
                     rows.append((name, value))
+    return rows
+
+
+def preconnect_receipts(root):
+    """{file name: receipt} of channel warmups below ``root`` (both ends)."""
+    rows = {}
+    for directory, _, names in os.walk(root):
+        if Path(directory).name != "gpu_channel_preconnect_receipts":
+            continue
+        for name in names:
+            if name.endswith(".json"):
+                value = read_json(Path(directory) / name)
+                if value is not None:
+                    rows[name] = value
     return rows
 
 
@@ -130,6 +149,7 @@ class ControllerConversionBackend:
         shadow_planner=None,
         safety=None,
         speed_margin=0.8,
+        join=None,
     ):
         self.registry, self.ops, self.clock = registry, ops, clock
         self.run_dir = Path(run_dir)
@@ -158,6 +178,10 @@ class ControllerConversionBackend:
         self.last_shadow = None
         self.valve_continued = False
         self.reported_unacknowledged = False
+        # S5b: launcher join plan (mode, bundle, channels, target slot...).
+        self.join = join
+        self.joining = None  # channels this conversion opens, once written
+        self.stager_started = False
         self.lock = threading.Lock()
         # Engines are serving when the controller starts: the manifest's
         # PREPARING records become ACTIVE before the first plan.
@@ -184,6 +208,12 @@ class ControllerConversionBackend:
                 endpoint=row["endpoint"],
                 inventory_path=row.get("inventory_path", ""),
                 lifecycle=lifecycle,
+                # S5b: how a new instance joins migration.
+                **{
+                    k: row[k]
+                    for k in ("legacy_pool", "migration_channel", "predictor_events")
+                    if k in row
+                },
             )
         self.revision += 1
         if assist is not None:
@@ -689,6 +719,8 @@ class ControllerConversionBackend:
         )
         port = self.base_port + len(self.started)
         identity = self.registry.get(refs[0]).identity
+        mode = self.join_mode(plan)
+        new = []
         for devices in [gpus] if tp > 1 else [[g] for g in gpus]:
             generation += 1
             instance_id = f"{plan['bundle_id']}-g{generation}-tp{tp}"
@@ -703,6 +735,39 @@ class ControllerConversionBackend:
                 inventory_path=str(self.run_dir / f"inventory_{instance_id}.jsonl"),
             )
             port += 1
+            joined = {}
+            if mode == "MERGE_TARGET":
+                # The absent pair target: its planned port, inventory and run
+                # directory (the stager and sessions already point there).
+                slot = self.join["target_slot"]
+                extra.update(
+                    slot,
+                    port=int(slot["endpoint"].rsplit(":", 1)[1]),
+                    pair_slot="target",
+                )
+                joined = dict(legacy_pool="tp4")
+            elif mode == "SPLIT_SOURCES":
+                channel = dict(
+                    # 10 apart per channel source registered so far.
+                    base_port=self.join["channel_base_port"]
+                    + 10 * len(self.joined_sources()),
+                    generation=generation,
+                    target=self.join["target_id"],
+                    target_tp=self.join["target_tp"],
+                )
+                joined = dict(
+                    migration_channel=channel,
+                    predictor_events=str(
+                        self.run_dir / f"predictor_events_{instance_id}.jsonl"
+                    ),
+                )
+                extra.update(
+                    joined,
+                    targets_file=str(
+                        Path(self.join["folder"]) / f"gpu_targets_{instance_id}.json"
+                    ),
+                )
+            new.append((instance_id, extra, joined))
             self.registry.register(
                 pool.InstanceRecord(
                     pool.InstanceRef(instance_id, generation),
@@ -720,10 +785,124 @@ class ControllerConversionBackend:
                 context_limit=extra["context_limit"],
                 endpoint=extra["endpoint"],
                 inventory_path=extra["inventory_path"],
+                **joined,
             )
+        if mode is not None:
+            # Both ends of every new channel are written before any engine
+            # starts: senders retry until the target listens (600s).
+            self.open_channels(plan, mode, new)
+        for instance_id, extra, _ in new:
             self.started[instance_id] = extra
-            self.ops.event("LOAD_START", instance=instance_id, gpus=devices, tp=tp)
+            self.ops.event(
+                "LOAD_START", instance=instance_id, gpus=extra["gpus"], tp=tp
+            )
             self.ops.start(extra)
+
+    # ------------------------------------------------------- S5b channels
+    def join_mode(self, plan):
+        if self.join is None or plan["bundle_id"] != self.join["bundle"]:
+            return None
+        return self.join["mode"]
+
+    def joined_sources(self):
+        return [i for i, row in self.rows.items() if "migration_channel" in row]
+
+    def open_channels(self, plan, mode, new):
+        """Write the channels of the new layout: TP1 sources -> the TP-k.
+
+        MERGE_TARGET: every retained TP1 channel source and the new target.
+        SPLIT_SOURCES: the new TP1s and the retained pair target. The target
+        follows the channel plan file; each source follows its target file.
+        """
+        retired = {r.instance_id for r in self.refs(plan)}
+        if mode == "MERGE_TARGET":
+            target_id = new[0][0]
+            channels = {
+                source: value
+                for source, value in self.join["channels"].items()
+                if source not in retired
+                and self.registry.instances[source].lifecycle == "ACTIVE"
+            }
+            files = {s: self.join["target_files"][s] for s in channels}
+        else:
+            target_id = self.join["target_id"]
+            channels = {
+                instance_id: dict(
+                    base_port=joined["migration_channel"]["base_port"],
+                    generation=joined["migration_channel"]["generation"],
+                    pool=instance_id,
+                )
+                for instance_id, _, joined in new
+            }
+            files = {i: extra["targets_file"] for i, extra, _ in new}
+        rows = (
+            [] if mode == "MERGE_TARGET" else list(read_json(self.channel_plan) or [])
+        )
+        rows += [
+            dict(source=s, base_port=v["base_port"], generation=v["generation"])
+            for s, v in channels.items()
+        ]
+        atomic_json(self.channel_plan, sorted(rows, key=lambda r: r["source"]))
+        for source, value in channels.items():
+            atomic_json(
+                files[source],
+                [
+                    dict(
+                        target=target_id,
+                        host=self.join["target_host"],
+                        base_port=value["base_port"],
+                        tp=self.join["target_tp"],
+                        generation=value["generation"],
+                    )
+                ],
+            )
+        self.joining = dict(
+            target=target_id,
+            channels={
+                s: dict(generation=v["generation"], pool=v.get("pool", s))
+                for s, v in channels.items()
+            },
+            written_at=self.clock(),
+            ready_at=None,
+        )
+        self.ops.event(
+            "CHANNEL_PLAN_JOINED",
+            plan_id=plan["plan_id"],
+            target=target_id,
+            sources=sorted(channels),
+        )
+
+    def channels_ready(self, plan):
+        """Both ends warmed for every channel this conversion opened."""
+        joining = self.joining
+        receipts = preconnect_receipts(self.run_dir)
+        missing = []
+        for source, value in joining["channels"].items():
+            names = [
+                f"tp_rank_{rank}-{source}.json"
+                for rank in range(self.join["target_tp"])
+            ] + [f"source-{value['pool']}-{joining['target']}.json"]
+            for name in names:
+                row = receipts.get(name) or {}
+                if (
+                    row.get("status") != "WARMUP_COMPLETE"
+                    or row.get("channel_generation") != value["generation"]
+                ):
+                    missing.append(name)
+        if missing:
+            if self.clock() - joining["written_at"] > CHANNEL_READY_S + 600:
+                raise RuntimeError("joined channels not ready: " + ", ".join(missing))
+            return False
+        if joining["ready_at"] is None:
+            joining["ready_at"] = self.clock()
+            self.ops.event(
+                "CHANNELS_READY",
+                plan_id=plan["plan_id"],
+                target=joining["target"],
+                sources=sorted(joining["channels"]),
+                ready_s=round(joining["ready_at"] - joining["written_at"], 3),
+            )
+        return True
 
     def warm_and_verify(self, plan):
         """Health + warmup of every replacement, off the executor thread."""
@@ -743,7 +922,15 @@ class ControllerConversionBackend:
         errors = [r["error"] for r in rows if r["error"] is not None]
         if errors:
             raise RuntimeError(f"replacement warmup failed: {errors[0]}")
-        return bool(new) and all(r["done"] for r in rows)
+        if not (bool(new) and all(r["done"] for r in rows)):
+            return False
+        mode = self.join_mode(plan)
+        if mode == "MERGE_TARGET" and not self.stager_started:
+            # The merged TP-k is the pair target: its stager starts with it.
+            self.ops.start_stager()
+            self.stager_started = True
+            self.ops.event("STAGER_STARTED", plan_id=plan["plan_id"])
+        return mode is None or self.channels_ready(plan)
 
     def _warm(self, instance_id):
         try:

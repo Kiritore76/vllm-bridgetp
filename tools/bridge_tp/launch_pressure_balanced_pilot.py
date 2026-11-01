@@ -344,24 +344,32 @@ def build_scene(spec, scene, run_root, common, args):
                 # Channel generation = source instance generation: unique per
                 # run, and a rebuilt instance gets a new one.
                 extra["migration_channel"]["generation"] = row["instance_generation"]
-                extra["migration_channel"]["target"] = aliases["tp4"]
+                extra["migration_channel"]["target"] = aliases.get("tp4", "tp4")
                 extra["migration_channel"]["target_tp"] = target_tp
                 row["migration_channel"] = dict(extra["migration_channel"])
                 extra["predictor_events"] = row["predictor_events"] = str(
                     run_dir / f"predictor_events_{row['instance_id']}.jsonl"
                 )
+    request = conversion_request(spec, registry)
+    join = join_plan(
+        request, spec, args, aliases, pair_bundles, extras, run_root, scene
+    )
     if set(aliases) != {"tp1", "tp4"}:
-        # Single-class layout: routing only, nothing to migrate between.
-        argv.append("--no-migration")
+        # Single-class layout: nothing to migrate between until a conversion
+        # that joins migration (S5b) creates the other class.
+        argv.append("--deferred-migration" if join else "--no-migration")
     sources = (
         source_channel_list(args, aliases["tp1"], extras) if "tp1" in aliases else []
     )
-    request = conversion_request(spec, registry)
     channel_plan = None
-    if request is not None and sources:
+    if request is not None and (sources or join):
         # Conversion may retire a source: the target follows a channel plan
         # file (same rows as the static list) so its channel can be closed.
         channel_plan = run_root / scene["name"] / "gpu_channel_plan.json"
+    if join:
+        # S5b: the target's channels come only from the plan file the
+        # conversion rewrites; none exist before it (single-class start).
+        sources = []
     if len(sources) > 1 or channel_plan is not None:
         connector = json.loads(target_argv[-1])
         extra_config = connector["kv_connector_extra_config"]
@@ -375,6 +383,7 @@ def build_scene(spec, scene, run_root, common, args):
         context_limits=(args.max_model_len, args.tp4_max_model_len),
         channel_plan=channel_plan,
         channel_sources=sources,
+        join=join,
         run_dir=run_dir,
         instances=instances,
         instances_path=instances_path,
@@ -402,12 +411,17 @@ def layout_extras(spec, args, target_tp, run_dir):
     layout = spec.get("layout")
     if not layout:
         return ("A", "B"), []
-    channels = bool(layout.get("migration_sources"))
-    if channels and int(args.channel_generation) != 1:
-        raise ValueError("per-source channels need the pair source on generation 1")
     rows = load("instance_pool").layouts(target_tp, list(layout["bundle_gpus"]))[
         layout["name"]
     ]
+    # S5b: an L0 whose conversion merges a TP2 starts with every TP1 owning a
+    # channel; its target file stays empty until that TP2 exists.
+    joined_l0 = bool((spec.get("conversion") or {}).get("join_migration")) and {
+        r["tp_degree"] for r in rows
+    } == {1}
+    channels = bool(layout.get("migration_sources")) or joined_l0
+    if channels and int(args.channel_generation) != 1:
+        raise ValueError("per-source channels need the pair source on generation 1")
     source = [r for r in rows if r["tp_degree"] == 1 and r["gpu_ids"] == [args.tp1_gpu]]
     target = [
         r
@@ -415,7 +429,7 @@ def layout_extras(spec, args, target_tp, run_dir):
         if r["tp_degree"] == target_tp and r["gpu_ids"] == devices_of(args)
     ]
     classes = {r["tp_degree"] for r in rows}
-    if len(classes) == 1 and channels:
+    if len(classes) == 1 and channels and not joined_l0:
         raise ValueError("single-class layouts have no migration channels")
     if len(source) + len(target) != (2 if len(classes) == 2 else 1) or (
         classes == {1} and not source or classes == {target_tp} and not target
@@ -454,20 +468,28 @@ def live_pair(plan):
     aliases = plan.get("instances", {}).get("legacy_pool_aliases", {})
     status_path = plan["run_dir"] / "layout_status.json"
     status = read(status_path)["instances"] if status_path.exists() else {}
-    return [
+    sides = [
         side
         for side, pool in (("source", "tp1"), ("target", "tp4"))
         if side not in absent_pair(plan)
         and status.get(aliases.get(pool), {}).get("lifecycle") != "RETIRED"
     ]
+    if "target" in absent_pair(plan) and any(
+        row.get("pool_id") == "tp4" and row.get("lifecycle") != "RETIRED"
+        for row in status.values()
+    ):
+        # S5b: the conversion merged the absent pair target; it serves now.
+        sides.append("target")
+    return sides
 
 
 def conversion_request(spec, registry):
     """Validated explicit conversion of one bundle (S3b-3), or None.
 
     Optional: ``method`` DRAIN (default) or SELECTIVE_ROLL (S5a drain assist,
-    merging a TP1 bundle only) and ``safety`` overrides of the S5a gate,
-    valve and assist thresholds.
+    merging a TP1 bundle only), ``safety`` overrides of the S5a gate,
+    valve and assist thresholds, and ``join_migration`` (S5b: a single-class
+    start whose new instances join migration, see ``join_plan``).
     """
     from tools.bridge_tp.pressure_conversion import SAFETY
 
@@ -480,7 +502,10 @@ def conversion_request(spec, registry):
     required = {"bundle", "target_mode", "trigger_s", "deadline_s", "base_port"}
     method = request.get("method", "DRAIN")
     if (
-        not required <= set(request) <= required | {"method", "safety"}
+        not required
+        <= set(request)
+        <= required | {"method", "safety", "join_migration"}
+        or request.get("join_migration", False) not in (True, False)
         or method not in {"DRAIN", "SELECTIVE_ROLL"}
         or method == "SELECTIVE_ROLL"
         and request["target_mode"] != "TP2"
@@ -492,6 +517,84 @@ def conversion_request(spec, registry):
     ):
         raise ValueError("invalid conversion request")
     return dict(request)
+
+
+# S5b: a migration source's runtime target list (vllm/bridge_tp
+# gpu_direct_targets.FILE_ENV; not imported here to keep the launcher torch-free).
+TARGETS_FILE_ENV = "BRIDGETP_GPU_DIRECT_TARGETS_FILE"
+
+
+def join_plan(request, spec, args, aliases, pair_bundles, extras, run_root, scene):
+    """How a single-class start's conversion joins migration (S5b), or None.
+
+    - L0, bundle on the pair's TP-k GPUs -> TP-k (``MERGE_TARGET``): the new
+      TP-k takes the absent pair target (its ports, run directory, stager);
+      every TP1 starts as a migration source with an empty target file, and
+      the retained ones get the new TP-k written into it.
+    - L2, another bundle -> TP1 (``SPLIT_SOURCES``): the new TP1s are extra
+      sources of the retained pair target, added to its channel plan file.
+
+    The conversion closes the channels of instances it retires and opens the
+    ones its new layout needs; nothing else changes. DRAIN only.
+    """
+    if request is None or not request.get("join_migration"):
+        return None
+    folder = run_root / scene["name"]
+    name = spec["layout"]["name"]
+    target_tp = len(devices_of(args))
+    if request.get("method", "DRAIN") != "DRAIN":
+        raise ValueError("a conversion joining migration drains (no assist)")
+    if name == "L0":
+        devices = set(devices_of(args))
+        on_target = {e["bundle"] for e in extras if set(e["gpus"]) <= devices}
+        if request["target_mode"] != f"TP{target_tp}" or on_target != {
+            request["bundle"]
+        }:
+            raise ValueError("L0 joins migration by merging the pair-target bundle")
+        # ``pool`` is the source's BRIDGETP_PRESSURE_POOL: it names the
+        # source-side channel receipt.
+        channels = {
+            aliases["tp1"]: dict(
+                base_port=int(args.gpu_direct_base_port),
+                generation=int(args.channel_generation),
+                pool="tp1",
+            ),
+            **{
+                e["instance_id"]: dict(
+                    base_port=e["migration_channel"]["base_port"],
+                    generation=e["migration_channel"]["generation"],
+                    pool=e["instance_id"],
+                )
+                for e in extras
+                if "migration_channel" in e
+            },
+        }
+        files = {i: str(folder / f"gpu_targets_{i}.json") for i in channels}
+        for extra in extras:
+            if extra["instance_id"] in files:
+                extra["targets_file"] = files[extra["instance_id"]]
+        return dict(
+            mode="MERGE_TARGET",
+            bundle=request["bundle"],
+            pair_source=aliases["tp1"],
+            channels=channels,
+            target_files=files,
+            folder=str(folder),
+        )
+    if name == "L2":
+        if request["target_mode"] != "TP1" or request["bundle"] == pair_bundles[1]:
+            raise ValueError("L2 joins migration by splitting a non-pair bundle")
+        return dict(
+            mode="SPLIT_SOURCES",
+            bundle=request["bundle"],
+            pair_source=None,
+            channels={},
+            target_files={},
+            # Above every startup block (pair source + 10 per extra source).
+            channel_base_port=int(args.gpu_direct_base_port) + 100,
+            folder=str(folder),
+        )
+    raise ValueError("join_migration starts from an L0 or L2 layout")
 
 
 def source_launch(plan):
@@ -506,6 +609,13 @@ def source_launch(plan):
     """
     if "target" not in absent_pair(plan):
         return plan["source_argv"], plan["source_env"]
+    join = plan.get("join")
+    if join:
+        # S5b: a full migration source whose (empty) target file the
+        # conversion fills when it merges the TP2.
+        env = dict(plan["source_env"])
+        env[TARGETS_FILE_ENV] = join["target_files"][join["pair_source"]]
+        return plan["source_argv"], env
     argv = list(plan["source_argv"])
     if "--kv-transfer-config" in argv:
         index = argv.index("--kv-transfer-config")
@@ -570,6 +680,13 @@ def extra_engine(plan, extra):
             BRIDGETP_GPU_DIRECT_BASE_PORT=str(channel["base_port"]),
             BRIDGETP_CHANNEL_GENERATION=str(channel["generation"]),
             BRIDGETP_PREDICTOR_LIVE_EVENTS=extra["predictor_events"],
+        )
+    if channel and extra.get("targets_file"):
+        # S5b: targets follow the conversion's file (none yet, or the TP2
+        # this source joins), not a fixed startup list.
+        env[TARGETS_FILE_ENV] = extra["targets_file"]
+    elif channel:
+        env.update(
             # One listed target: its own preconnect receipt name, implied per
             # session (the pair source keeps the legacy source.json receipt).
             BRIDGETP_GPU_DIRECT_TARGETS=json.dumps(
@@ -795,7 +912,11 @@ def start_conversion(spec, scene, plan, common, processes, publish, requests):
         announce(scene["name"], "转换", **{"event": kind, **values})
 
     def start(extra):
-        argv, env = extra_engine(plan, extra)
+        if extra.get("pair_slot") == "target":
+            # S5b MERGE_TARGET: the planned (absent) pair target, unchanged.
+            argv, env = plan["target_argv"], plan["target_env"]
+        else:
+            argv, env = extra_engine(plan, extra)
         process = common.start_process(
             extra["instance_id"], argv, env, root / f"{extra['instance_id']}.log"
         )
@@ -815,8 +936,20 @@ def start_conversion(spec, scene, plan, common, processes, publish, requests):
             spec["run_timeout_s"],
         )
 
+    def start_stager():
+        stager = common.start_process(
+            "stager", plan["stager_argv"], os.environ.copy(), root / "stager.log"
+        )
+        processes.append(stager)
+        publish()
+        if spec.get("require_stager_process_ready"):
+            from tools.bridge_tp.qwen3_migration_diagnostics import wait_stager_ready
+
+            wait_stager_ready(run_dir / "migration_active", stager)
+
     ops = SimpleNamespace(
         stop=lambda ids: common.stop_processes([owned[i] for i in ids]),
+        start_stager=start_stager,
         alive=lambda i: common.process_group_alive(owned[i]),
         gpus_released=pc.nvidia_gpus_released,
         scrape=pc.scrape_metrics,
@@ -837,12 +970,32 @@ def start_conversion(spec, scene, plan, common, processes, publish, requests):
         shadow_planner=ShadowPlanner(load_profile(), manifest["instances"]),
         safety=plan["conversion"].get("safety"),
         speed_margin=load_profile()["speed_margin"],
+        join=pc_join(plan),
     )
     driver = pc.ConversionDriver(
         backend, plan["conversion"], root / "conversion_plan.json"
     )
     driver.start()
     return driver
+
+
+def pc_join(plan):
+    """The backend's S5b view: plan join rows plus the pair target slot."""
+    join = plan.get("join")
+    if join is None:
+        return None
+    config = plan["config"]
+    return dict(
+        join,
+        target_tp=config.get("target_tp_size", 4),
+        target_host=plan["source_env"].get("BRIDGETP_GPU_DIRECT_HOST", "127.0.0.1"),
+        target_slot=dict(
+            endpoint=config["target_url"],
+            inventory_path=str(plan["run_dir"] / "target_inventory.jsonl"),
+        ),
+        target_id=plan["instances"]["legacy_pool_aliases"].get("tp4"),
+        source_env=plan["source_env"],
+    )
 
 
 def finish_conversion(driver, root):
@@ -950,6 +1103,8 @@ def run_scene(
         absent = absent_pair(plan)
         if plan.get("channel_plan") is not None:
             common.write_json(plan["channel_plan"], plan["channel_sources"])
+        for path in (plan.get("join") or {}).get("target_files", {}).values():
+            common.write_json(Path(path), [])
         target_label = f"TP{plan['config'].get('target_tp_size', 4)}"
         if "target" not in absent:
             announce(scene["name"], f"启动{target_label}服务，等待就绪")
@@ -1016,9 +1171,12 @@ def run_scene(
             )
         if before_workload is not None:
             before_workload(plan)
-        if absent:
+        # S5b: an L2 that will split sources needs the pair target's stager
+        # from the start; an L0 merging a TP2 starts it with that TP2.
+        if absent and not (plan.get("join") and "target" not in absent):
             # Single-class layout: no pair to migrate between, so no stager.
             announce(scene["name"], "warmup完成；单类布局不启动stager；启动正式调度器")
+            stager = None
         else:
             announce(scene["name"], "warmup完成；启动stager和正式调度器")
             stager = common.start_process(
@@ -1026,7 +1184,7 @@ def run_scene(
             )
             processes.append(stager)
             publish_processes()
-        if spec.get("require_stager_process_ready") and not absent:
+        if spec.get("require_stager_process_ready") and stager is not None:
             from tools.bridge_tp.qwen3_migration_diagnostics import wait_stager_ready
 
             wait_stager_ready(mechanism_dir, stager)

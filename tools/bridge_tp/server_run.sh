@@ -3,23 +3,24 @@
 # 运行：
 #   cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 #
-# 当前任务：入口优化后的高速率短请求扫描（不转换）。上次扫描控制器入口在约11 req/s
-# 成为瓶颈（每条到达都把整个历史账本写两遍进审计）；本版只记录仍在跑的条目。
-# 本次看：①名义速率是否真正到达（派发滞后应接近0）；②L0（4×TP1）的真实吞吐上限。
-# A={2,3}，B={0,1}；双32768/.88；每个引擎max-num-seqs 16（L0共64并发，L2共32）。
-# 负载：512输入/128输出（固定输出）的短请求，12、16、20、24 req/s各持续60s，然后排空。
-# L0、L2各4场；L1A另加8 req/s共5场（新的排队感知路由：首选实例在排队而另一个排队更少、
-# 且提示放得下、KV未告警时，改发给另一个）。共13场，约65分钟。
-# 一场失败不中断其余布局；只有GPU未空闲时才停止。全程每秒采样GPU显存与利用率。
-# 每格只有1场，只作初筛。
+# 当前任务：S5b GPU检查——转换后新实例加入迁移（通道对账）。两场，每场约8-10分钟。
+#   L0-L1A：以L0启动（四个TP1都带迁移源配置，目标列表为空），30s时把B组TP1@0、TP1@1
+#           合成TP2(0,1)；新TP2接替迁移对目标（端口、会话目录不变，此时才启动stager），
+#           保留的TP1@2、TP1@3在运行中连上它。
+#   L2-L1A：以L2启动（保留的TP2(0,1)带接收端配置，通道计划为空，stager从开始就在），
+#           30s时把A组TP2(2,3)拆成TP1@2、TP1@3；两个新TP1作为迁移源连上TP2(0,1)。
+# 两场都是：退役实例的通道先关；新布局的每条TP1→TP2通道两端都留下预连回执后才发布路由。
+# A={2,3}，B={0,1}；双32768/.88；深长突发MIGRATE臂（短请求每2s一条，90-100s到达6条
+# 16384/8192长请求），这些长请求落在转换后的布局上，看能否真实迁往TP2。
+# 全程每秒采样一次GPU显存与利用率。一场技术失败（退出码不是0或2）就停。
 
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
 py=$venv/bin/python
 model=/root/autodl-tmp/models/Qwen3-8B
 branch=bridgetp/tp2-4090d-qwen3-8b
-task=qwen3_rate_sweep_hi
-layouts="L0 L1A L2"
+task=qwen3_conversion_join
+edges="L0-L1A L2-L1A"
 
 cd "$repo" || exit 1
 source "$venv/bin/activate" || exit 1
@@ -55,40 +56,37 @@ trap 'kill "$smi" 2>/dev/null' EXIT
 export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 export VLLM_USE_V2_MODEL_RUNNER=0 OMP_NUM_THREADS=1
 
-final=0
-for layout in $layouts; do
+status=0
+for edge in $edges; do
     [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || {
-        echo "上一场后GPU仍有计算进程，停止于 $layout 之前。"; final=1; break;
+        echo "上一场后GPU仍有计算进程，停止于 $edge 之前。"; status=1; break;
     }
-    name="ratesweep-$layout"
-    rates=12,16,20,24
-    [ "$layout" = L1A ] && rates=8,12,16,20,24
-    echo "=== 开始：$name，速率 $rates（$(date +%T)）==="
-    date +%s.%N > "$run/$name.started_unix_s"
+    echo "=== 开始：$edge 30s（$(date +%T)）==="
+    date +%s.%N > "$run/$edge.started_unix_s"
     "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
-        --rate-sweep --sweep-rates "$rates" \
-        --expanded-context --static-layout "$layout" \
+        --long-burst-memory-verify --conversion "$edge" \
+        --conversion-trigger-s 30 \
         --current-machine --repetitions 1 \
         --model "$model" \
         --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
         --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json" \
-        --output "$run/$name" --expected-revision "$head" 2>&1 | tee "$run/$name.console.log"
+        --output "$run/$edge" --expected-revision "$head" 2>&1 | tee "$run/$edge.console.log"
     status=${PIPESTATUS[0]}
-    echo "$name 退出码：$status" | tee -a "$run/exit_codes.txt"
-    [ "$status" = 0 ] || final=$status
+    echo "$edge 退出码：$status" | tee -a "$run/exit_codes.txt"
+    [ "$status" = 0 ] || [ "$status" = 2 ] || break
 done
 
 kill "$smi" 2>/dev/null
-# 每个布局的运行包已是compact包；外层只收它们和日志，不重复原始目录。
+# 每场的运行包已是compact包；外层只收它们和日志，不重复原始目录。
 excludes=()
-for layout in $layouts; do
-    excludes+=(--exclude="$(basename "$run")/ratesweep-$layout")
+for edge in $edges; do
+    excludes+=(--exclude="$(basename "$run")/$edge")
 done
 tar -C "$(dirname "$run")" -czf "$run.tar.gz" "${excludes[@]}" "$(basename "$run")"
 sha256sum "$run.tar.gz" > "$run.tar.gz.sha256"
 echo '=== 退出码 ==='
 cat "$run/exit_codes.txt"
-echo "最终退出码：$final"
+echo "最终退出码：$status"
 echo "请拿回：$run.tar.gz"
 echo "以及：$run.tar.gz.sha256"
-exit "$final"
+exit "$status"

@@ -27,8 +27,15 @@ from vllm.bridge_tp.gpu_direct_targets import (
     ENV as GPU_DIRECT_TARGETS_ENV,
 )
 from vllm.bridge_tp.gpu_direct_targets import (
+    FILE_ENV as GPU_DIRECT_TARGETS_FILE_ENV,
+)
+from vllm.bridge_tp.gpu_direct_targets import (
+    TargetFileFollower,
+    apply_target,
+    merge_targets,
     parse_targets,
     preconnect_plan,
+    read_target_file,
     select_target,
 )
 from vllm.bridge_tp.kv_export import (
@@ -160,8 +167,89 @@ def preconnect_persistent_gpu_sender(device: torch.device) -> None:
     base = BridgeTPStreamConfig.from_env()
     if not (base.enabled and base.persistent_channel and base.gpu_direct_history):
         raise ValueError("GPU-direct preconnect requires persistent streaming")
+    path = os.getenv(GPU_DIRECT_TARGETS_FILE_ENV)
+    if path:
+        # S5b: targets come and go with TP conversions. Only listed ones are
+        # opened at start (none: no legacy single-target fallback).
+        for label, config in preconnect_plan(base) if base.gpu_direct_targets else ():
+            _preconnect_one(config, device, label)
+        _start_target_file_follower(base, device, Path(path))
+        return
     for label, config in preconnect_plan(base):
         _preconnect_one(config, device, label)
+
+
+def _start_target_file_follower(base, device, path: Path) -> None:
+    """Open/close this source's channels as its target file changes (S5b).
+
+    Runs beside serving: a conversion adds a new TP-k target (the sender
+    retries until it listens) or removes a retiring one; a channel still in a
+    session is closed on a later poll.
+    """
+    pool = os.getenv("BRIDGETP_PRESSURE_POOL", "source")
+
+    def label(target) -> str:
+        return f"source-{pool}-{target.target}"
+
+    def connect(target) -> None:
+        _preconnect_one(apply_target(base, target), device, label(target))
+
+    def drop(target) -> bool:
+        key = _persistent_sender_key(apply_target(base, target), device)
+        with _persistent_gpu_senders_lock:
+            if key in _active_persistent_gpu_senders:
+                return False
+            sender = _persistent_gpu_senders.pop(key, None)
+        if sender is not None:
+            sender.abort()
+        _atomic_json_dump(
+            {
+                "status": "CHANNEL_CLOSED",
+                "target_instance": target.target,
+                "channel_generation": target.generation,
+                "completed_unix_s": time.time(),
+            },
+            base.run_dir
+            / "gpu_channel_preconnect_receipts"
+            / f"{label(target)}-retired.json",
+        )
+        return True
+
+    follower = TargetFileFollower(
+        path, base.expected_kv_heads, connect, drop, listed=base.gpu_direct_targets
+    )
+
+    def loop() -> None:
+        torch.cuda.set_device(device)
+        while True:
+            try:
+                result = follower.poll()
+                if result["opened"] or result["closed"]:
+                    logger.info("BridgeTP target file applied: %s", result)
+            except BaseException:
+                logger.exception("BridgeTP target file channel change failed")
+            time.sleep(0.5)
+
+    threading.Thread(target=loop, name="bridgetp-target-file", daemon=True).start()
+
+
+_target_file_state: dict[str, Any] = {}
+
+
+def _file_targets(path: str, heads: int):
+    """Targets of the conversion's file, re-parsed only when it changes."""
+    try:
+        stat = os.stat(path)
+        signature = (stat.st_size, stat.st_mtime_ns)
+    except FileNotFoundError:
+        return ()
+    if _target_file_state.get("signature") != signature:
+        try:
+            targets = read_target_file(path, heads)
+        except (OSError, ValueError):
+            return _target_file_state.get("targets", ())
+        _target_file_state.update(signature=signature, targets=targets)
+    return _target_file_state["targets"]
 
 
 def _preconnect_one(config: BridgeTPStreamConfig, device: torch.device, label: str):
@@ -445,6 +533,14 @@ def get_bridge_tp_stream_config() -> BridgeTPStreamConfig:
     base = get_bridge_tp_stream_env_config()
     if not base.enabled:
         return base
+    path = os.getenv(GPU_DIRECT_TARGETS_FILE_ENV)
+    if path:
+        base = replace(
+            base,
+            gpu_direct_targets=merge_targets(
+                base.gpu_direct_targets, _file_targets(path, base.expected_kv_heads)
+            ),
+        )
     control = _control_cache(str(base.run_dir)).get()
     if control is None:
         return base

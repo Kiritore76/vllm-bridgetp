@@ -70,6 +70,9 @@ def parse_args(argv=None):
     parser.add_argument("--tick-s", type=float, default=0.2)
     parser.add_argument("--no-progress-s", type=float, default=60)
     parser.add_argument("--no-migration", action="store_true")
+    # S5b: a single-class start whose conversion creates the other class;
+    # migration runs once the pair target and a channel source both serve.
+    parser.add_argument("--deferred-migration", action="store_true")
     parser.add_argument("--platform", choices=["a100", "qwen3"], default="a100")
     parser.add_argument("--qwen3-execute-migrations", action="store_true")
     parser.add_argument(
@@ -108,6 +111,8 @@ def parse_args(argv=None):
         expected = CHECKPOINT_SHA
         if not args.no_migration and not args.qwen3_execute_migrations:
             parser.error("Qwen3 migration execution must be explicitly enabled")
+    if args.deferred_migration and args.no_migration:
+        parser.error("deferred migration is a migrating run")
     if args.qwen3_execute_migrations and (
         args.platform != "qwen3" or args.no_migration
     ):
@@ -324,14 +329,22 @@ def instance_manifest(args, controller):
         )
     ):
         raise ValueError("controller needs one TP1 source and one TP-k target pair")
+    deferred = getattr(args, "deferred_migration", False)
     if len(aliases) == 1 and (
-        not args.no_migration
-        or any(row.get("migration_channel") for row in rows.values())
+        not (args.no_migration or deferred)
+        or args.no_migration
+        and any(row.get("migration_channel") for row in rows.values())
+        # S5b: only TP1s (an L0 that will merge the target) own channels.
+        or "tp4" in aliases
+        and any(row.get("migration_channel") for row in rows.values())
         or {row["tp_degree"] for row in rows.values()}
         != {expected[next(iter(aliases))][0]}
     ):
-        # Single-class layout (L0/L2): one side of the pair, routing only.
+        # Single-class layout (L0/L2): one side of the pair; it routes only,
+        # or (S5b) waits for the conversion that creates the other side.
         raise ValueError("single-class layout must be one class without migration")
+    if deferred and len(aliases) != 1:
+        raise ValueError("deferred migration starts single-class")
     endpoints = [row["endpoint"] for row in rows.values()]
     for row in extra_instances(manifest):
         if (
@@ -1002,6 +1015,12 @@ def _run(args, prepared):
         layout_state["assist"] = control.get("assist")
         changes, deferred = [], []
         for row in control["instances"]:
+            if row.get("legacy_pool") == "tp4" and row["instance_id"] not in alias_of:
+                # S5b: the conversion's new TP-k takes the absent pair target.
+                if not args.deferred_migration or "tp4" in tp_of:
+                    raise ValueError("layout control cannot add a pair target")
+                alias_of[row["instance_id"]] = "tp4"
+                instance_of["tp4"] = row["instance_id"]
             pool_id = alias_of.get(row["instance_id"], row["instance_id"])
             state = row["lifecycle"]
             if state not in {"ACTIVE", "QUIESCING", "RETIRED"}:
