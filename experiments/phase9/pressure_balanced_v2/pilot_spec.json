@@ -397,9 +397,9 @@
     "tests/bridge_tp/test_gpu_direct_targets.py": "fde9f51e4e718b0b68ffb8d98543a70f2b34dbf0ad85522893c561a75a20876e",
     "vllm/bridge_tp/source_channels.py": "3e9512bdb6fbfd16d339a492b9ffe3c419956c3ce60db4cc689a7a3c8e531596",
     "tests/bridge_tp/test_source_channels.py": "f7b3ce60a876213c39e0121fdcc68752a024edd52ac458df252fae4786c56702",
-    "tools/bridge_tp/pressure_conversion.py": "36702df54a6c05dfb34ee1702144160c14e6957cbc0b6217b5eb8361acfd80f9",
+    "tools/bridge_tp/pressure_conversion.py": "85c815ef7db6702453bb2a4f741a06060e017607b8373361030177e90419bad0",
     "tests/bridge_tp/test_pressure_conversion.py": "e07888a9fc55ef7cf11d30500ea3991d8e84a163dbec336b2e2321c00e2db911",
-    "tools/bridge_tp/conversion_acceptance.py": "1e6c96c4577cbc47c47233a7008f8d7d1c3f15ff4c355e2101ab6efddb34cf27",
+    "tools/bridge_tp/conversion_acceptance.py": "3b55c75485ef1382402c27583623996cfa1aca81a9d3df7a5005cf402ddd601f",
     "tools/bridge_tp/conversion_planner.py": "33d7c53d0c02b68db9f28e5b7b7ed2c1c1d353b8fa62358ccd1f908b4aaa244c",
     "experiments/platforms/qwen3_pressure_observation/conversion_profile.json": "503c4cf2f82a627c4f7420dc48a5d6fbd6ef3966cb7726f4b3948130f54f0cb8"
   },

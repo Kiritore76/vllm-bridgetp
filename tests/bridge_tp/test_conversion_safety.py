@@ -149,6 +149,62 @@ class ValveTests(Base):
         self.assertFalse(self.backend.kv_emergency(PLAN))
 
 
+class ValveRemainingTests(Base):
+    """User 11-01: when the valve trips near the end, finish the conversion."""
+
+    def shadow(self, ready, status="SUPPORTED", age=0.0, error=False):
+        self.backend.last_shadow = (
+            dict(evaluated_unix_s=self.now[0] - age, error="boom")
+            if error
+            else dict(
+                evaluated_unix_s=self.now[0] - age,
+                drain_only=dict(support_status=status, estimated_ready_s=ready),
+            )
+        )
+
+    def trip(self):
+        self.write(status(target_capacity=1.1))
+        self.assertFalse(self.backend.kv_emergency(PLAN))
+        self.now[0] += 3.5
+        self.write(status(target_capacity=1.1))
+
+    def test_nearly_done_finishes_instead_of_cancelling(self):
+        self.trip()
+        self.shadow(45.0)
+        self.assertFalse(self.backend.kv_emergency(PLAN))
+        self.assertFalse(self.backend.kv_emergency(PLAN))
+        rows = self.decisions("VALVE_CONTINUE")
+        self.assertEqual(len(rows), 1)  # logged once per conversion
+        self.assertEqual(rows[0]["remaining_s"], 45.0)
+        self.assertIn("SAFETY_CONTINUE", [e["kind"] for e in self.harness.events])
+
+    def test_far_from_done_still_cancels(self):
+        self.trip()
+        self.shadow(150.0)
+        self.assertTrue(self.backend.kv_emergency(PLAN))
+        self.assertEqual(self.decisions("VALVE_ABORT")[-1]["remaining_s"], 150.0)
+
+    def test_no_usable_estimate_cancels_as_before(self):
+        for kwargs in (
+            dict(ready=None, status="UNKNOWN"),
+            dict(ready=10.0, age=5.0),
+            dict(ready=None, error=True),
+        ):
+            self.trip()
+            self.shadow(**kwargs)
+            self.assertTrue(self.backend.kv_emergency(PLAN), kwargs)
+            self.backend.valve_since = None
+        self.backend.last_shadow = None
+        self.trip()
+        self.assertTrue(self.backend.kv_emergency(PLAN))
+
+    def test_threshold_is_configurable(self):
+        self.backend.safety["continue_if_remaining_s"] = 30.0
+        self.trip()
+        self.shadow(45.0)
+        self.assertTrue(self.backend.kv_emergency(PLAN))
+
+
 class AssistChoiceTests(Base):
     def choice(self, value):
         self.write(value)

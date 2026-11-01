@@ -245,6 +245,9 @@ def assess(scene_dir, run_dir=None, events_path=None, metrics_path=None):
             ),
             valve_warnings=sum(r["kind"] == "VALVE_WARNING" for r in rows),
             valve_aborted=any(r["kind"] == "VALVE_ABORT" for r in rows),
+            valve_continued=[
+                r.get("remaining_s") for r in rows if r["kind"] == "VALVE_CONTINUE"
+            ],
         )
     result = json.loads((scene_dir / "conversion_result.json").read_text("utf-8"))
     final = [r for r in audit if r["kind"] == "pressure_final"]

@@ -90,6 +90,10 @@ SAFETY = dict(
     gate_capacity_max=0.8,
     valve_capacity=1.0,
     valve_sustain_s=3.0,
+    # Valve trips but the conversion is nearly done: finish instead of
+    # cancelling (user 11-01); the estimate is the SHADOW planner's
+    # conservative drain-only READY (remaining drain + later stages).
+    continue_if_remaining_s=60.0,
     assist_factor=3.0,
     assist_max_committed=2,
     assist_max_attempts=4,
@@ -143,6 +147,8 @@ class ControllerConversionBackend:
         self.last_assist_reason = None
         # S4: read-only planner consulted while draining; never acts.
         self.shadow_planner, self.shadow_at = shadow_planner, -float("inf")
+        self.last_shadow = None
+        self.valve_continued = False
         self.reported_unacknowledged = False
         self.lock = threading.Lock()
         # Engines are serving when the controller starts: the manifest's
@@ -295,12 +301,31 @@ class ControllerConversionBackend:
     def quiesce(self, plan):
         self.write_layout({r.instance_id: "QUIESCING" for r in self.refs(plan)})
 
+    def remaining_s(self):
+        """Conservative time left to READY from the latest planner snapshot.
+
+        None (abort as before) unless a fresh, supported drain-only estimate
+        exists: stale, failed or UNKNOWN planner output never keeps the
+        retained side under pressure.
+        """
+        record = self.last_shadow
+        if record is None or "error" in record:
+            return None
+        if not 0 <= self.clock() - record["evaluated_unix_s"] <= 3:
+            return None
+        drain = record["drain_only"]
+        if drain["support_status"] != "SUPPORTED":
+            return None
+        return drain["estimated_ready_s"]
+
     def kv_emergency(self, plan):
         """Safety valve: retained KV about to hit its guard, sustained.
 
         Only hard safety aborts (before any engine stops): the plan is then
         cancelled and routing restored. Service-quality drops do not abort,
-        or a conversion under load would cancel and retry forever.
+        or a conversion under load would cancel and retry forever. When the
+        conservative remaining time is short the conversion finishes instead:
+        cancelling then would throw away the drain for a few seconds' relief.
         """
         status = self.status()
         if not self.fresh(status):
@@ -320,7 +345,21 @@ class ControllerConversionBackend:
             self.decision("VALVE_WARNING", instances=unsafe)
         if now - self.valve_since < self.safety["valve_sustain_s"]:
             return False
-        self.decision("VALVE_ABORT", instances=unsafe)
+        remaining = self.remaining_s()
+        if (
+            remaining is not None
+            and remaining <= self.safety["continue_if_remaining_s"]
+        ):
+            if not self.valve_continued:
+                self.valve_continued = True
+                self.decision("VALVE_CONTINUE", instances=unsafe, remaining_s=remaining)
+                self.ops.event(
+                    "SAFETY_CONTINUE",
+                    plan_id=plan["plan_id"],
+                    remaining_s=round(remaining, 3),
+                )
+            return False
+        self.decision("VALVE_ABORT", instances=unsafe, remaining_s=remaining)
         self.ops.event("SAFETY_ABORT", plan_id=plan["plan_id"], instances=unsafe)
         return True
 
@@ -422,6 +461,7 @@ class ControllerConversionBackend:
             record = self.shadow_planner(plan, status, now)
         except Exception as error:  # a planner fault must never stop the drain
             record = dict(evaluated_unix_s=now, error=repr(error))
+        self.last_shadow = record
         with (self.run_dir / "conversion_planner_shadow.jsonl").open(
             "a", encoding="utf-8"
         ) as stream:
