@@ -308,6 +308,42 @@ class UnsettledTests(unittest.TestCase):
         self.assertEqual(pilot.UNSETTLED, {"ACTIVE", "COMMITTED", "ACCOUNTED"})
 
 
+class AssistServiceTests(unittest.TestCase):
+    """The controller's post-move service check uses the active policy rule."""
+
+    def refusal(self, cfg=None, after=None, pending=0.0, **kwargs):
+        from types import SimpleNamespace as NS
+
+        from tools.bridge_tp import run_pressure_balanced_pilot as pilot
+
+        values = dict(target_decode_cost=0.2, target_health_after_supported=False)
+        values.update(kwargs)
+        return pilot.assist_service_refusal(
+            cfg or config(workload_pressure=True, health_service=True),
+            NS(pending_prompt_tokens=0, waiting=0),
+            after or NS(decode=0.35, prefill=0.0),
+            pending,
+            NS(**values),
+        )
+
+    def test_long_request_outside_the_reference_passes_under_workload_rule(self):
+        """S5a GPU (11-01): all 87 assists were refused on the health flag,
+        which is always False for >8K contexts the reference never measured."""
+        self.assertIsNone(self.refusal())
+
+    def test_budget_queue_and_unknown_cost_refuse(self):
+        from types import SimpleNamespace as NS
+
+        self.assertIn("budget", self.refusal(pending=0.6))
+        self.assertIn("budget", self.refusal(target_decode_cost=None))
+        self.assertIn("budget", self.refusal(after=NS(decode=None, prefill=0.0)))
+
+    def test_without_workload_pressure_the_health_flag_is_required(self):
+        cfg = config(health_service=True)
+        self.assertIn("health", self.refusal(cfg=cfg))
+        self.assertIsNone(self.refusal(cfg=cfg, target_health_after_supported=True))
+
+
 class EndToEndTests(unittest.TestCase):
     def test_rolling_method_runs_the_assist_loop_and_completes(self):
         with tempfile.TemporaryDirectory() as directory:

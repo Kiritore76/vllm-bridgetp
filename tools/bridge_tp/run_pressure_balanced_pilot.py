@@ -378,6 +378,31 @@ def unsettled_on(entries, pool_id):
     return sum(r.pool_id == pool_id and r.state in UNSETTLED for r in entries)
 
 
+def assist_service_refusal(policy_cfg, reading, after, pending_decode, candidate):
+    """Target service after a drain-assist move, or None if it holds.
+
+    The active policy's own non-emergency rule (PressurePolicy.decide). With
+    workload pressure the measured health reference is not consulted: it has
+    no long-context cells (bins 1-3), and requiring it refused every long
+    request (S5a GPU, 11-01).
+    """
+    cost = candidate.target_decode_cost
+    if not policy_cfg.workload_pressure and not candidate.target_health_after_supported:
+        return "target health not supported after one more decode"
+    if (
+        cost is None
+        or not math.isfinite(cost)
+        or cost < 0
+        or after.decode is None
+        or after.prefill is None
+        or after.decode + pending_decode + cost > policy_cfg.leave_ratio
+        or reading.pending_prompt_tokens
+        or reading.waiting
+    ):
+        return "target service budget exceeded after the move"
+    return None
+
+
 def remaining_bins(row, candidate):
     """Conservative remaining-token bins [(upper_tokens, mass), ...] of a request.
 
@@ -801,12 +826,21 @@ def _run(args, prepared):
             (candidate.prompt_tokens + candidate.max_output_tokens)
             / controller.block_size
         )
-        pending, _, _ = co.ledger.pending("tp4")
+        pending, pending_decode, _ = co.ledger.pending("tp4")
         free = target_pool.free_blocks
         if free is None or free - pending - required < cfg.capacity_guard_blocks:
             return "target KV cannot hold the final length plus guard"
-        if health_tracker is not None and not candidate.target_health_after_supported:
-            return "target health not supported after one more decode"
+        if cfg.health_service:
+            reading = co.ledger.routing_reading(target_pool)
+            refusal = assist_service_refusal(
+                co.policy.cfg,
+                reading,
+                p.classify(reading, co.policy.cfg, now),
+                pending_decode,
+                candidate,
+            )
+            if refusal:
+                return refusal
         return co.assist_start(
             now,
             source,

@@ -220,14 +220,24 @@ class ConnectorWiringTests(unittest.TestCase):
         import time
         from pathlib import Path
 
+        def atomic(value, path):
+            # Like the connector's: the poller below never sees a torn file.
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(f".{threading.get_ident()}.tmp")
+            temporary.write_text(json.dumps(value))
+            for _ in range(100):
+                try:
+                    temporary.replace(path)
+                    return
+                except PermissionError:  # Windows: the poller holds it open
+                    time.sleep(0.005)
+            raise TimeoutError("receipt replace kept failing")
+
         retire = self.method("_retire_source_receiver")
         retire.__globals__.update(
             time=time,
             logger=NS(warning=lambda *a: None, exception=lambda *a: None),
-            _atomic_json_dump=lambda value, path: (
-                path.parent.mkdir(parents=True, exist_ok=True),
-                path.write_text(json.dumps(value)),
-            ),
+            _atomic_json_dump=atomic,
         )
         release = threading.Event()
 
