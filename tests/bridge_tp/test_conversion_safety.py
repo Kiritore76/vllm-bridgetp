@@ -206,25 +206,52 @@ class ValveRemainingTests(Base):
 
 
 class AssistChoiceTests(Base):
+    """All-or-nothing evacuation (user 11-01, after S5a GPU run 4)."""
+
     def choice(self, value):
         self.write(value)
         return self.backend.assist_choice(PLAN, self.backend.status())
 
-    def test_longest_request_worth_migrating_is_chosen(self):
+    def answer(self, seq, rid, state="STARTED", **kwargs):
+        self.now[0] += 1.1
+        return self.choice(
+            status(assist_result=dict(seq=seq, request_id=rid, state=state), **kwargs)
+        )
+
+    def propose(self, requests):
+        """Run one decision step and return the published assist."""
+        self.write(status(requests=requests))
+        self.backend.assisted_step(PLAN, self.now[0])
+        return json.loads((self.root / "layout_control.json").read_text())["assist"]
+
+    def test_plans_every_long_request_longest_first(self):
         reason, choice = self.choice(
             status(requests=[row("a", 2000), row("b", 6000), row("c", 300)])
         )
         self.assertIsNone(reason)
         self.assertEqual(choice["request_id"], "b")
-        self.assertAlmostEqual(choice["natural_s"], 6000 / 16)
+        # c: 300 tokens at 16 tok/s = 18.75s <= 3 x 8s; it finishes anyway.
+        self.assertEqual(choice["evacuate"], ["b", "a"])
 
-    def test_short_remaining_is_left_to_finish(self):
-        # 3 x 8s budget = 24s; 380 tokens at 16 tok/s = 23.75s.
+    def test_nothing_long_means_no_evacuation(self):
         reason, choice = self.choice(status(requests=[row("a", 380)]))
         self.assertIsNone(choice)
         self.assertIn("worth", reason)
 
-    def test_target_service_quality_is_not_traded(self):
+    def test_a_long_request_that_cannot_move_blocks_the_whole_plan(self):
+        for blocked in (row("x", 6000, action=False), row("x", 6000, None)):
+            reason, choice = self.choice(status(requests=[row("a", 6000), blocked]))
+            self.assertIsNone(choice)
+            self.assertIn("all or none", reason)
+
+    def test_more_long_requests_than_the_cap_drain_naturally(self):
+        reason, choice = self.choice(
+            status(requests=[row(f"r{n}", 5000 + n) for n in range(5)])
+        )
+        self.assertIsNone(choice)
+        self.assertIn("exceed the cap 4", reason)
+
+    def test_the_plan_needs_a_quiet_safe_target(self):
         for kwargs, text in (
             (dict(target_zone="CRITICAL"), "SPARE"),
             (dict(target_sessions=1), "session"),
@@ -235,75 +262,98 @@ class AssistChoiceTests(Base):
             self.assertIsNone(choice)
             self.assertIn(text, reason)
 
-    def test_unstartable_or_unmeasured_requests_are_skipped(self):
-        reason, choice = self.choice(
-            status(requests=[row("a", 6000, action=False), row("b", 6000, None)])
-        )
-        self.assertIsNone(choice)
-
-    def test_one_at_a_time_and_capped_per_conversion(self):
-        self.write(status(requests=[row("a", 6000), row("b", 5000)]))
-        self.backend.assisted_step(PLAN, self.now[0])
-        control = json.loads((self.root / "layout_control.json").read_text())
+    def test_an_accepted_plan_moves_every_request_to_completion(self):
+        assist = self.propose([row("a", 6000), row("b", 5000)])
         self.assertEqual(
-            control["assist"], dict(seq=1, request_id="a", source="A-g1-tp1")
+            assist,
+            dict(seq=1, request_id="a", source="A-g1-tp1", evacuate=["a", "b"]),
         )
-        self.now[0] += 1.1
-        self.write(status(requests=[row("a", 6000), row("b", 5000)]))
-        self.backend.assisted_step(PLAN, self.now[0])
-        self.assertEqual(self.backend.assist_seq, 1)  # unanswered: wait
-        for seq, rid in ((1, "a"), (2, "b")):
-            self.now[0] += 1.1
-            self.write(
-                status(
-                    requests=[row("b", 5000), row("c", 4000)],
-                    assist_result=dict(seq=seq, request_id=rid, state="STARTED"),
-                )
-            )
-            self.backend.assisted_step(PLAN, self.now[0])
-        self.assertEqual(self.backend.assisted, ["a", "b"])
-        # Two committed assists reach the cap; cancelled ones do not count.
-        for sessions, capped in (
-            (dict(s1="COMMITTED", s2="CANCELLED"), False),
-            (dict(s1="COMMITTED", s2="ACCOUNTED"), True),
-        ):
-            self.now[0] += 1.1
-            reason, choice = self.choice(
-                status(
-                    requests=[row("c", 4000)],
-                    assist_result=dict(seq=3, request_id="c", state="STARTED"),
-                    assist_sessions=sessions,
-                )
-            )
-            self.assertEqual(choice is None, capped, reason)
-            if capped:
-                self.assertIn("committed", reason)
+        # Accepted. Mid-evacuation the target need not be SPARE any more: the
+        # controller's per-START KV and service checks remain the guard.
+        reason, choice = self.answer(
+            1, "a", requests=[row("b", 5000)], target_zone="CRITICAL"
+        )
+        self.assertIsNone(reason)
+        self.assertEqual(self.backend.evacuation, ["a", "b"])
+        self.assertEqual((choice["request_id"], "evacuate" in choice), ("b", False))
+        self.backend.assist_seq = 2
+        reason, choice = self.answer(2, "b", requests=[row("c", 4000)])
+        self.assertIsNone(choice)
+        self.assertEqual(reason, "evacuation complete")  # c was not planned
 
-    def test_attempts_are_capped_even_when_assists_keep_failing(self):
-        """S5a GPU (11-01): the same request was started again after a
-        cancel; retries are bounded so they cannot churn the target."""
-        self.backend.assisted = ["a", "a", "b", "b"]
-        self.backend.assist_seq = 4
+    def test_a_refused_plan_starts_nothing_and_may_be_proposed_again(self):
+        self.propose([row("a", 6000), row("b", 5000)])
+        reason, choice = self.answer(
+            1, "a", state="REFUSED", requests=[row("a", 6000), row("b", 5000)]
+        )
+        self.assertIsNone(self.backend.evacuation)
+        self.assertEqual(self.backend.assisted, [])
+        self.assertEqual(choice["evacuate"], ["a", "b"])
+
+    def test_a_refused_step_ends_the_evacuation(self):
+        self.propose([row("a", 6000), row("b", 5000)])
+        self.answer(1, "a", requests=[row("b", 5000)])
+        self.backend.assist_seq = 2
+        reason, choice = self.answer(2, "b", state="REFUSED", requests=[row("b", 5000)])
+        self.assertIsNone(choice)
+        self.assertIn("ended", reason)
+
+    def test_committed_and_attempt_caps(self):
         reason, choice = self.choice(
             status(
                 requests=[row("c", 4000)],
-                assist_result=dict(seq=4, request_id="b", state="STARTED"),
-                assist_sessions=dict(s1="CANCELLED", s2="CANCELLED"),
+                assist_sessions=dict(s1="COMMITTED", s2="ACCOUNTED", s3="COMPLETED")
+                | {"s4": "COMMITTED"},
             )
         )
-        self.assertIsNone(choice)
+        self.assertIn("committed", reason)
+        self.backend.assisted = ["a"] * 8
+        reason, choice = self.choice(status(requests=[row("c", 4000)]))
         self.assertIn("attempts", reason)
 
-    def test_a_refused_assist_is_not_counted(self):
-        self.backend.assist_seq = 1
-        reason, choice = self.choice(
-            status(
-                requests=[row("a", 6000)],
-                assist_result=dict(seq=1, request_id="a", state="REFUSED"),
+
+class EvacuationRefusalTests(unittest.TestCase):
+    def check(self, free=4000, pending=0, costs=(0.1, 0.1), **kwargs):
+        from types import SimpleNamespace as NS
+
+        from tools.bridge_tp import run_pressure_balanced_pilot as pilot
+
+        candidates = [
+            NS(
+                prompt_tokens=16384,
+                max_output_tokens=8192,
+                target_decode_cost=c,
+                target_health_after_supported=False,
             )
+            for c in costs
+        ]
+        values = dict(
+            candidates=candidates,
+            block_size=16,
+            guard_blocks=125,
+            pending_blocks=pending,
+            pending_decode=0.0,
+            service=True,
         )
-        self.assertIsNone(reason)
-        self.assertEqual(self.backend.assisted, [])
+        values.update(kwargs)
+        return pilot.evacuation_refusal(
+            config(workload_pressure=True, health_service=True),
+            NS(free_blocks=free, pending_prompt_tokens=0, waiting=0),
+            NS(decode=0.3, prefill=0.0),
+            **values,
+        )
+
+    def test_every_final_length_must_fit_with_the_guard(self):
+        # Two 24576-token requests need 3072 blocks; + 125 guard = 3197.
+        self.assertIsNone(self.check(free=3197))
+        self.assertIn("KV", self.check(free=3196))
+        self.assertIn("KV", self.check(free=4000, pending=900))
+
+    def test_the_service_budget_counts_every_added_decode(self):
+        self.assertIsNone(self.check(costs=(0.3, 0.3)))  # 0.3 + 0.6 <= 1.0
+        self.assertIn("budget", self.check(costs=(0.4, 0.4)))  # 1.1
+        self.assertIn("budget", self.check(costs=(0.1, None)))
+        self.assertIsNone(self.check(costs=(0.4, 0.4), service=False))
 
 
 class CoordinatorAssistTests(unittest.TestCase):

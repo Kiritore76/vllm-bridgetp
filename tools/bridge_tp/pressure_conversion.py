@@ -95,8 +95,12 @@ SAFETY = dict(
     # conservative drain-only READY (remaining drain + later stages).
     continue_if_remaining_s=60.0,
     assist_factor=3.0,
-    assist_max_committed=2,
-    assist_max_attempts=4,
+    # All-or-nothing evacuation (user 11-01): a partial one left the drain
+    # as long and still cost the target. S4/S5a: received migrations grow
+    # the TP2 by ~1.2 GB once, not per migration, so the cap is the size of
+    # a TP1 pair's long requests seen so far, not a memory budget.
+    assist_max_committed=4,
+    assist_max_attempts=8,
     decision_interval_s=1.0,
 )
 
@@ -145,6 +149,8 @@ class ControllerConversionBackend:
         self.assist_seq = 0
         self.assisted = []  # request ids whose assist START was published
         self.last_assist_reason = None
+        self.planned = None  # evacuation proposed, waiting for the controller
+        self.evacuation = None  # accepted plan; [] once a step was refused
         # S4: read-only planner consulted while draining; never acts.
         self.shadow_planner, self.shadow_at = shadow_planner, -float("inf")
         self.last_shadow = None
@@ -364,16 +370,18 @@ class ControllerConversionBackend:
         return True
 
     def assisted_step(self, plan, now):
-        """S5a: migrate the next long request out, or leave the drain natural.
+        """S5a: evacuate every long request of the bundle, or none of them.
 
-        Rolling: at most one assist START at a time and a fresh decision after
-        each. Eligible: a startable request whose conservative remaining time
-        exceeds ``assist_factor`` x the measured START-to-release budget,
-        longest first. The target must be SPARE (service quality is never
-        traded for a faster drain here), at most ``assist_max_committed``
-        assists commit and ``assist_max_attempts`` start per conversion, and
-        the controller re-checks KV for the final length and service before
-        starting.
+        A request is long when its conservative remaining time exceeds
+        ``assist_factor`` x the measured START-to-release budget; shorter ones
+        finish on their own. The drain ends with the last request, so moving
+        only some long requests saves nothing and still loads the target
+        (S5a GPU 11-01: 3 of 4 moved, drain 181s vs 184s). The evacuation
+        starts only if all long requests are startable, fit the cap and the
+        target is SPARE, and the controller accepts the whole set (KV for
+        every final length, service budget for every added decode). It then
+        moves them one at a time, longest first; each START is re-checked by
+        the controller, and a refused one ends the evacuation.
         """
         if self.clock() - self.assist_at < self.safety["decision_interval_s"]:
             return
@@ -386,15 +394,46 @@ class ControllerConversionBackend:
         if choice is None:
             return
         self.assist_seq += 1
-        self.write_layout(
-            {},
-            assist=dict(
-                seq=self.assist_seq,
-                request_id=choice["request_id"],
-                source=choice["instance"],
-            ),
+        assist = dict(
+            seq=self.assist_seq,
+            request_id=choice["request_id"],
+            source=choice["instance"],
         )
+        if "evacuate" in choice:
+            assist["evacuate"] = choice["evacuate"]
+            self.planned = dict(seq=self.assist_seq, requests=choice["evacuate"])
+        self.write_layout({}, assist=assist)
         self.ops.event("ASSIST_REQUESTED", seq=self.assist_seq, **choice)
+
+    def long_requests(self, plan, status):
+        """(long, blocked): rows worth moving, and why not all can be."""
+        budget = status.get("release_budget_s")
+        threshold = self.safety["assist_factor"] * budget
+        long, blocked = [], []
+        for instance in [r.instance_id for r in self.refs(plan)]:
+            for row in status["instances"][instance]["requests"]:
+                speed = row.get("tokens_s")
+                remaining = max(u for u, _ in row["remaining_bins"])
+                if not speed:
+                    # Unknown speed: its time is unknown, not short.
+                    blocked.append(row["request_id"])
+                    continue
+                natural = remaining / (speed * self.speed_margin)
+                if natural <= threshold:
+                    continue
+                if not row.get("action_available"):
+                    blocked.append(row["request_id"])
+                    continue
+                long.append(
+                    dict(
+                        request_id=row["request_id"],
+                        instance=instance,
+                        natural_s=round(natural, 3),
+                        transfer_s=budget,
+                    )
+                )
+        long.sort(key=lambda r: (-r["natural_s"], r["request_id"]))
+        return long, blocked
 
     def assist_choice(self, plan, status):
         if not self.fresh(status):
@@ -402,13 +441,17 @@ class ControllerConversionBackend:
         result = status.get("assist_result")
         if self.assist_seq and (result is None or result["seq"] != self.assist_seq):
             return "previous assist not answered yet", None
-        if (
-            result is not None
-            and result["seq"] == self.assist_seq
-            and result["state"] == "STARTED"
-            and len(self.assisted) < self.assist_seq
-        ):
-            self.assisted.append(result["request_id"])
+        if result is not None and result["seq"] == self.assist_seq:
+            started = result["state"] == "STARTED"
+            if started and len(self.assisted) < self.assist_seq:
+                self.assisted.append(result["request_id"])
+            planned = self.planned
+            if planned is not None and planned["seq"] == result["seq"]:
+                # The controller accepted (or refused) the whole evacuation.
+                self.evacuation = planned["requests"] if started else None
+                self.planned = None
+            elif not started and self.evacuation is not None:
+                self.evacuation = []  # a refused step ends the evacuation
         target = status.get("migration_target")
         instances = status["instances"]
         if target is None or instances.get(target, {}).get("lifecycle") != "ACTIVE":
@@ -416,41 +459,34 @@ class ControllerConversionBackend:
         refs = [r.instance_id for r in self.refs(plan)]
         if any(instances[i]["sessions"] for i in refs) or instances[target]["sessions"]:
             return "a migration session is active", None
-        # S4: the first received migration grew the 24 GB TP2 by ~1.2 GB once
-        # (later ones did not), leaving ~1 GB; assists per conversion stay
-        # capped until runs with more migrations confirm the headroom.
         states = list((status.get("assist_sessions") or {}).values())
         committed = sum(s in {"COMMITTED", "ACCOUNTED", "COMPLETED"} for s in states)
         if committed >= self.safety["assist_max_committed"]:
             return "committed assists at cap for this conversion", None
         if len(self.assisted) >= self.safety["assist_max_attempts"]:
             return "assist attempts at cap for this conversion", None
+        if status.get("release_budget_s") is None:
+            return "no measured transfer budget", None
+        long, blocked = self.long_requests(plan, status)
+        evacuation = self.evacuation
+        if evacuation is not None:
+            if evacuation == []:
+                return "evacuation ended by a refused step", None
+            remaining = [r for r in long if r["request_id"] in evacuation]
+            if not remaining:
+                return "evacuation complete", None
+            return None, remaining[0]
+        if not long:
+            return "no request worth migrating (natural <= factor x transfer)", None
+        if blocked:
+            return "a long request is not startable yet (all or none)", None
+        room = self.safety["assist_max_committed"] - committed
+        if len(long) > room:
+            return f"{len(long)} long requests exceed the cap {room}: drain", None
         pressure = instances[target].get("pressure") or {}
         if pressure.get("zone") != "SPARE":
             return f"target not SPARE ({pressure.get('zone')})", None
-        budget = status.get("release_budget_s")
-        if budget is None:
-            return "no measured transfer budget", None
-        best = None
-        for instance in refs:
-            for row in instances[instance]["requests"]:
-                speed = row.get("tokens_s")
-                if not row.get("action_available") or not speed:
-                    continue
-                remaining = max(u for u, _ in row["remaining_bins"])
-                natural = remaining / (speed * self.speed_margin)
-                if natural <= self.safety["assist_factor"] * budget:
-                    continue
-                if best is None or natural > best["natural_s"]:
-                    best = dict(
-                        request_id=row["request_id"],
-                        instance=instance,
-                        natural_s=round(natural, 3),
-                        transfer_s=budget,
-                    )
-        if best is None:
-            return "no request worth migrating (natural <= factor x transfer)", None
-        return None, best
+        return None, dict(long[0], evacuate=[r["request_id"] for r in long])
 
     def shadow(self, plan, status):
         now = self.clock()

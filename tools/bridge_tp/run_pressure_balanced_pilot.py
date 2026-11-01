@@ -403,6 +403,44 @@ def assist_service_refusal(policy_cfg, reading, after, pending_decode, candidate
     return None
 
 
+def evacuation_refusal(
+    policy_cfg,
+    reading,
+    after,
+    *,
+    candidates,
+    block_size,
+    guard_blocks,
+    pending_blocks,
+    pending_decode,
+    service,
+):
+    """Whole-evacuation check before its first START (S5a all-or-nothing).
+
+    Every request must fit at its final length (prompt + max output) on top
+    of pending promises while the guard stays free, and, with the health
+    service on, the target must stay within the policy's post-move service
+    budget with every added decode.
+    """
+    required = sum(
+        math.ceil((c.prompt_tokens + c.max_output_tokens) / block_size)
+        for c in candidates
+    )
+    free = reading.free_blocks
+    if free is None or free - pending_blocks - required < guard_blocks:
+        return "target KV cannot hold every final length plus guard"
+    if not service:
+        return None
+    costs = [c.target_decode_cost for c in candidates]
+    combined = SimpleNamespace(
+        target_decode_cost=None if None in costs else sum(costs),
+        target_health_after_supported=all(
+            c.target_health_after_supported for c in candidates
+        ),
+    )
+    return assist_service_refusal(policy_cfg, reading, after, pending_decode, combined)
+
+
 def remaining_bins(row, candidate):
     """Conservative remaining-token bins [(upper_tokens, mass), ...] of a request.
 
@@ -822,6 +860,27 @@ def _run(args, prepared):
             return "request is migrating or finished"
         if actions is None:
             return "no start binding (session not ready or no observed rates)"
+        if "evacuate" in assist:
+            by_id = {
+                c.request_id: c for cs in candidates_by_source.values() for c in cs
+            }
+            if not set(assist["evacuate"]) <= set(by_id):
+                return "an evacuation request is not a current candidate"
+            pending_blocks, pending_decode, _ = co.ledger.pending("tp4")
+            reading = co.ledger.routing_reading(target_pool)
+            refusal = evacuation_refusal(
+                co.policy.cfg,
+                reading,
+                p.classify(reading, co.policy.cfg, now),
+                candidates=[by_id[i] for i in assist["evacuate"]],
+                block_size=controller.block_size,
+                guard_blocks=cfg.capacity_guard_blocks,
+                pending_blocks=pending_blocks,
+                pending_decode=pending_decode,
+                service=cfg.health_service,
+            )
+            if refusal:
+                return refusal
         required = math.ceil(
             (candidate.prompt_tokens + candidate.max_output_tokens)
             / controller.block_size
