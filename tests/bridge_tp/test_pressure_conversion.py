@@ -784,7 +784,10 @@ class ConversionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             harness = JoinHarness(Path(directory), "L0")
             outcome = harness.run(
-                jobs(16, 0.3), no_migration=False, deferred_migration=True
+                jobs(16, 0.3),
+                no_migration=False,
+                deferred_migration=True,
+                max_seconds=30,
             )
             status = self.check_joined(harness, outcome)
             self.assertEqual(harness.stopped, {"B-g4-tp1", "B-g5-tp1"})
@@ -842,6 +845,34 @@ class ConversionTests(unittest.TestCase):
                 ],
             )
             self.assertEqual(len(result_rows(harness)), 16)
+            # Acceptance maps the merged target's pool (tp4, not in the launch
+            # manifest) to its instance (S5b GPU 11-01: 17 routed requests
+            # were counted as none and new_layout_serving failed).
+            from tools.bridge_tp import conversion_acceptance as acceptance
+
+            (harness.root / "conversion_events.jsonl").write_text(
+                "".join(json.dumps(e) + "\n" for e in harness.events)
+            )
+            (harness.root / "conversion_result.json").write_text(json.dumps(outcome))
+            published = next(
+                e["unix_s"] for e in harness.events if e["kind"] == "ROUTE_PUBLISHED"
+            )
+            with (harness.root / "pressure_audit.jsonl").open("a") as stream:
+                stream.write(
+                    json.dumps(
+                        dict(
+                            kind="pressure_dispatch",
+                            job_id="to-merged",
+                            pool="tp4",
+                            admission_finished_unix_s=published + 0.5,
+                        )
+                    )
+                    + "\n"
+                )
+            value = acceptance.assess(harness.root, run_dir=harness.root)
+            self.assertIn("B-g6-tp2", value["first_request_after_publish_s"])
+            self.assertTrue(value["checks"]["new_layout_serving"])
+            self.assertTrue(value["checks"]["joined_channels_ready"])
             # Scene finalization drains and finalizes the merged target too.
             from tools.bridge_tp import launch_pressure_balanced_pilot as launch
 
@@ -857,7 +888,10 @@ class ConversionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             harness = JoinHarness(Path(directory), "L2")
             outcome = harness.run(
-                jobs(16, 0.3), no_migration=False, deferred_migration=True
+                jobs(16, 0.3),
+                no_migration=False,
+                deferred_migration=True,
+                max_seconds=30,
             )
             status = self.check_joined(harness, outcome)
             self.assertEqual(harness.stopped, {"A-g3-tp2"})

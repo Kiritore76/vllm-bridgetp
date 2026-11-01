@@ -78,6 +78,14 @@ def assess(scene_dir, run_dir=None, events_path=None, metrics_path=None):
         r.get("legacy_pool") or r["instance_id"]: r["instance_id"]
         for r in manifest["instances"]
     }
+    # S5b: a merged TP-k takes the absent pair target's pool id mid-run; the
+    # controller's final status names the instance behind every pool.
+    status_path = run_dir / "layout_status.json"
+    if status_path.exists():
+        status = json.loads(status_path.read_text("utf-8"))["instances"]
+        for instance_id, row in status.items():
+            if row.get("pool_id") not in pool_of:
+                pool_of[row["pool_id"]] = instance_id
 
     def instance(pool):
         return pool_of.get(pool, pool)
