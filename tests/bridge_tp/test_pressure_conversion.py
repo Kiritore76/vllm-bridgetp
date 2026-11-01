@@ -196,6 +196,29 @@ class Harness:
             self.readers[extra["endpoint"]] = Reader(extra["instance_id"])
             self.path_of[extra["endpoint"]] = Path(extra["inventory_path"])
             self.publish(extra["endpoint"])
+        self.keep_fresh(extra["endpoint"])
+
+    def keep_fresh(self, endpoint):
+        """A serving engine keeps publishing inventory; an idle new instance
+        otherwise goes stale before routing reaches it under CPU load."""
+
+        def done():
+            try:
+                progress = self.root / "pressure_progress.json"
+                return json.loads(progress.read_text())["stage"] == "COMPLETED"
+            except (OSError, ValueError, KeyError):
+                return False
+
+        def loop():
+            while self.root.exists() and not done():
+                time.sleep(0.3)
+                try:
+                    with self.lock:
+                        self.publish(endpoint)
+                except OSError:  # the scene directory is gone
+                    return
+
+        threading.Thread(target=loop, daemon=True).start()
 
     def post(self, url, payload, timeout, sink):
         with self.lock:

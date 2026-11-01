@@ -257,6 +257,18 @@ class DeciderDriverTests(unittest.TestCase):
             control = json.loads((root / "layout_control.json").read_text())
             self.assertFalse(control["conversion_pending"])
 
+    def test_a_decider_run_without_conversion_is_a_valid_scene(self):
+        from tools.bridge_tp import launch_pressure_balanced_pilot as launch
+
+        decided = dict(decider="RECORD_ONLY", deadline_s=600, base_port=8400)
+        explicit = dict(bundle="A", target_mode="TP2", trigger_s=30)
+        self.assertTrue(launch.conversion_outcome_ok(decided, "NOT_TRIGGERED"))
+        self.assertFalse(launch.conversion_outcome_ok(explicit, "NOT_TRIGGERED"))
+        for request in (decided, explicit):
+            self.assertTrue(launch.conversion_outcome_ok(request, "COMPLETED"))
+            self.assertTrue(launch.conversion_outcome_ok(request, "ABORTED"))
+            self.assertFalse(launch.conversion_outcome_ok(request, "FENCED"))
+
     def test_stale_status_is_not_decided_on(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

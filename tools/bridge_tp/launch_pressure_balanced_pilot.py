@@ -1032,6 +1032,20 @@ def pc_join(plan):
     )
 
 
+def conversion_outcome_ok(request, state):
+    """Terminal states a scene accepts from its conversion driver.
+
+    ABORTED is the safe outcome of the S5a gate or valve: routing was restored
+    before any engine stopped. A decider that converted nothing (always, when
+    record-only) ends NOT_TRIGGERED: the decider GPU run of 11-01 failed here
+    after a complete workload. Anything else failed.
+    """
+    allowed = {"COMPLETED", "ABORTED"}
+    if "decider" in request:
+        allowed.add("NOT_TRIGGERED")
+    return state in allowed
+
+
 def finish_conversion(driver, root):
     outcome = driver.stop()
     (root / "conversion_result.json").write_text(
@@ -1322,9 +1336,7 @@ def run_scene(
             )
         if driver is not None:
             outcome = finish_conversion(driver, root)
-            # ABORTED is the safe outcome of the S5a gate or valve: routing
-            # was restored before any engine stopped. Anything else failed.
-            if outcome["state"] not in {"COMPLETED", "ABORTED"}:
+            if not conversion_outcome_ok(plan["conversion"], outcome["state"]):
                 raise RuntimeError(f"conversion ended in {outcome['state']}")
         if plan["config"].get("transfer_mode") == "FULL_SPEED":
             common.write_json(
