@@ -124,6 +124,36 @@ class ClassRoutingTests(unittest.TestCase):
                 [asdict(row) for row in co.ledger.entries.values()],
             )
 
+    def test_queue_routing_avoids_a_queueing_tp2(self):
+        # L1A at 8 req/s: equal projected scores, TP2 queues, TP1s start now.
+        def readings(now=10, waiting=12, **tp1):
+            return [
+                inst("a1", load=2.75, now=now, waiting=0, **tp1),
+                inst("a2", load=2.75, now=now, waiting=0, **tp1),
+                inst("b1", "tp4", load=2.6875, now=now, waiting=waiting),
+            ]
+
+        def route(queue_routing, rows, now=10):
+            co, records = coordinator(workload_cfg(queue_routing=queue_routing))
+            result = co.admission_multi("q", 512, 128, rows, TP, now, "k")
+            return result.pool_id, result.routing_reason
+
+        self.assertEqual(route(False, readings())[0], "b1")
+        pool_id, reason = route(True, readings())
+        self.assertIn(pool_id, {"a1", "a2"})
+        self.assertTrue(reason.startswith("queue-aware: preferred queues 12"))
+        self.assertEqual(route(True, readings(waiting=0))[0], "b1")
+        # Stale evidence or a TP1 without KV headroom keeps the old choice.
+        stale = route(True, readings(now=5), now=10)
+        self.assertEqual(stale, route(False, readings(now=5), now=10))
+        self.assertFalse(stale[1].startswith("queue-aware"))
+        self.assertEqual(route(True, readings(free_blocks=1))[0], "b1")
+        self.assertNotEqual(
+            workload_cfg(queue_routing=True).sha256, workload_cfg().sha256
+        )
+        with self.assertRaises(ValueError):
+            config(queue_routing=True)
+
     def test_context_infeasible_class_only_raises(self):
         co, _ = coordinator()
         with self.assertRaises(p.RoutingError):

@@ -8,7 +8,8 @@
 # 本次看：①名义速率是否真正到达（派发滞后应接近0）；②L0（4×TP1）的真实吞吐上限。
 # A={2,3}，B={0,1}；双32768/.88；每个引擎max-num-seqs 16（L0共64并发，L2共32）。
 # 负载：512输入/128输出（固定输出）的短请求，12、16、20、24 req/s各持续60s，然后排空。
-# L0、L2各4场，共8场，约40分钟。L1A路由有已知偏差，本次不跑。
+# L0、L2各4场；L1A另加8 req/s共5场（新的排队感知路由：首选实例在排队而另一个排队更少、
+# 且提示放得下、KV未告警时，改发给另一个）。共13场，约65分钟。
 # 一场失败不中断其余布局；只有GPU未空闲时才停止。全程每秒采样GPU显存与利用率。
 # 每格只有1场，只作初筛。
 
@@ -18,7 +19,7 @@ py=$venv/bin/python
 model=/root/autodl-tmp/models/Qwen3-8B
 branch=bridgetp/tp2-4090d-qwen3-8b
 task=qwen3_rate_sweep_hi
-layouts="L0 L2"
+layouts="L0 L1A L2"
 
 cd "$repo" || exit 1
 source "$venv/bin/activate" || exit 1
@@ -60,10 +61,12 @@ for layout in $layouts; do
         echo "上一场后GPU仍有计算进程，停止于 $layout 之前。"; final=1; break;
     }
     name="ratesweep-$layout"
-    echo "=== 开始：$name（$(date +%T)）==="
+    rates=12,16,20,24
+    [ "$layout" = L1A ] && rates=8,12,16,20,24
+    echo "=== 开始：$name，速率 $rates（$(date +%T)）==="
     date +%s.%N > "$run/$name.started_unix_s"
     "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
-        --rate-sweep --sweep-rates 12,16,20,24 \
+        --rate-sweep --sweep-rates "$rates" \
         --expanded-context --static-layout "$layout" \
         --current-machine --repetitions 1 \
         --model "$model" \

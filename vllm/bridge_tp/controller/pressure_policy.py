@@ -48,6 +48,10 @@ class PressureConfig:
     # Urgent KV relaxes target service vetoes; survival/physical gates remain.
     kv_emergency_priority: bool = False
     kv_routing_priority: bool = False
+    # Do not add to a queueing instance while the other one queues less:
+    # projected slot costs come from long-context profiles and overrate TP2
+    # for short requests (four-card rate sweep, 2026-11-01).
+    queue_routing: bool = False
     health_service: bool = False
     # Route from passive health/KV evidence, without fixed prompt cutoffs.
     pressure_routing: bool = False
@@ -82,6 +86,8 @@ class PressureConfig:
             and type(self.capacity_only) is bool
             and type(self.kv_emergency_priority) is bool
             and type(self.kv_routing_priority) is bool
+            and type(self.queue_routing) is bool
+            and (not self.queue_routing or self.workload_pressure)
             and (not self.kv_routing_priority or (
                 self.workload_pressure and self.capacity_lookahead_s > 0
             ))
@@ -121,6 +127,8 @@ class PressureConfig:
             values.pop("kv_emergency_priority")
         if not self.kv_routing_priority:
             values.pop("kv_routing_priority")
+        if not self.queue_routing:
+            values.pop("queue_routing")
         return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
@@ -1406,6 +1414,35 @@ def admit(
         pool.pool_id: prompt_fit(pool, prompt_tokens, ledger, cfg, now)
         for pool in pools
     }
+    if (
+        cfg.queue_routing
+        and projected is not None
+        and allowed_pool_id is None
+        and not routing_reason.startswith("TP1 projected KV warning")
+    ):
+        index = 0 if preferred.pool_id == pools[0].pool_id else 1
+        other = pools[1 - index]
+        queues = (source.waiting, target.waiting)
+        fresh = all(
+            0 <= now - t <= cfg.max_age_s
+            for pool in pools
+            for t in (pool.sampled_at, pool.published_at)
+        )
+        if (
+            fresh
+            and None not in queues
+            and pools[index].waiting
+            and queues[index] > queues[1 - index]
+            and other in eligible
+            and capacity[other.pool_id]["status"] == "FIT"
+            and projected[other.pool_id]["capacity"] is not None
+            and projected[other.pool_id]["capacity"] < 1
+        ):
+            preferred = other
+            routing_reason = (
+                f"queue-aware: preferred queues {queues[index]}, "
+                f"other {queues[1 - index]}"
+            )
     other_fit = [pool for pool in eligible if capacity[pool.pool_id]["status"] == "FIT"]
     if (
         allowed_pool_id is None

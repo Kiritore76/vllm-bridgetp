@@ -132,6 +132,7 @@ def updated_config(inputs):
             capacity_guard_blocks=125,
             kv_emergency_priority=True,
             kv_routing_priority=True,
+            queue_routing=True,
         ),
         urgent_target_admission=dict(
             ordinary_admission_slots=15,
