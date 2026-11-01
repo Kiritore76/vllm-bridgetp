@@ -994,8 +994,9 @@ def _run(args, prepared):
             return
         try:
             control = read(path)
-        except json.JSONDecodeError:
-            # A writer without atomic replace; retry on the next tick.
+        except (json.JSONDecodeError, PermissionError):
+            # A writer without atomic replace, or (Windows) a replace in
+            # progress; retry on the next tick.
             return
         layout_state["pending"] = bool(control.get("conversion_pending"))
         layout_state["assist"] = control.get("assist")

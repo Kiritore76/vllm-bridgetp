@@ -3,27 +3,21 @@
 # 运行：
 #   cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 #
-# 当前任务：四卡静态布局初筛（不转换）。看不同负载下三种布局是否各有优势。
-# A={2,3}，B={0,1}；双32768/.88。直接以布局启动：
-#   L0 ：TP1@0、TP1@1、TP1@2、TP1@3（不能迁移）
-#   L1A：TP1@2、TP1@3、TP2@0,1（两个TP1都有到TP2的通道，fast策略照常迁移）
-#   L2 ：TP2@2,3、TP2@0,1（不能迁移）
-# 负载（与之前实验相同，固定输出）：
-#   routine：routine_mixed、moderate_decode、transient_burst（上下文都在8K以内）
-#   longburst：deep_long_burst（短请求每2s一条，90-100s到达6条16384/8192长请求）
-# 每个布局：routine 3场 + longburst 1场。
-# 第2次：只补跑L0（4场，约40分钟）。第1次（133349_1180）L1A、L2已完成；L0的源TP1仍带
-# 迁移发送配置，启动时去连不存在的TP2接收端而超时退出，已修复为只路由引擎。
+# 当前任务：四卡短请求速率扫描（不转换）。看到达速率升高时，L0（4×TP1）是否在某个速率
+# 开始超过L2（2×TP2），即是否存在布局交叉。
+# A={2,3}，B={0,1}；双32768/.88；每个引擎max-num-seqs 16（L0共64并发，L2共32）。
+# 负载：512输入/128输出（固定输出）的短请求，4、8、12、16 req/s各持续60s，然后排空。
+# 三种布局各4场，共12场，约1小时。L1A照常迁移；L0、L2不能迁移。
 # 一场失败不中断其余布局；只有GPU未空闲时才停止。全程每秒采样GPU显存与利用率。
-# 每格只有1场，只作初筛，不是正式布局比较（正式的放六卡）。
+# 每格只有1场，只作初筛。
 
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
 py=$venv/bin/python
 model=/root/autodl-tmp/models/Qwen3-8B
 branch=bridgetp/tp2-4090d-qwen3-8b
-task=qwen3_static_layout_screen
-layouts="L0"
+task=qwen3_rate_sweep
+layouts="L0 L1A L2"
 
 cd "$repo" || exit 1
 source "$venv/bin/activate" || exit 1
@@ -60,39 +54,30 @@ export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 export VLLM_USE_V2_MODEL_RUNNER=0 OMP_NUM_THREADS=1
 
 final=0
-for family in routine longburst; do
-    for layout in $layouts; do
-        [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || {
-            echo "上一场后GPU仍有计算进程，停止于 $family-$layout 之前。"; final=1; break 2;
-        }
-        if [ "$family" = routine ]; then
-            mode=(--routine-four-mode --expanded-context)
-        else
-            mode=(--long-burst-pair)
-        fi
-        name="$family-$layout"
-        echo "=== 开始：$name（$(date +%T)）==="
-        date +%s.%N > "$run/$name.started_unix_s"
-        "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
-            "${mode[@]}" --static-layout "$layout" \
-            --current-machine --repetitions 1 \
-            --model "$model" \
-            --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
-            --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json" \
-            --output "$run/$name" --expected-revision "$head" 2>&1 | tee "$run/$name.console.log"
-        status=${PIPESTATUS[0]}
-        echo "$name 退出码：$status" | tee -a "$run/exit_codes.txt"
-        [ "$status" = 0 ] || final=$status
-    done
+for layout in $layouts; do
+    [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || {
+        echo "上一场后GPU仍有计算进程，停止于 $layout 之前。"; final=1; break;
+    }
+    name="ratesweep-$layout"
+    echo "=== 开始：$name（$(date +%T)）==="
+    date +%s.%N > "$run/$name.started_unix_s"
+    "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
+        --rate-sweep --expanded-context --static-layout "$layout" \
+        --current-machine --repetitions 1 \
+        --model "$model" \
+        --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
+        --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json" \
+        --output "$run/$name" --expected-revision "$head" 2>&1 | tee "$run/$name.console.log"
+    status=${PIPESTATUS[0]}
+    echo "$name 退出码：$status" | tee -a "$run/exit_codes.txt"
+    [ "$status" = 0 ] || final=$status
 done
 
 kill "$smi" 2>/dev/null
-# 每场的运行包已是compact包；外层只收它们和日志，不重复原始目录。
+# 每个布局的运行包已是compact包；外层只收它们和日志，不重复原始目录。
 excludes=()
-for family in routine longburst; do
-    for layout in $layouts; do
-        excludes+=(--exclude="$(basename "$run")/$family-$layout")
-    done
+for layout in $layouts; do
+    excludes+=(--exclude="$(basename "$run")/ratesweep-$layout")
 done
 tar -C "$(dirname "$run")" -czf "$run.tar.gz" "${excludes[@]}" "$(basename "$run")"
 sha256sum "$run.tar.gz" > "$run.tar.gz.sha256"

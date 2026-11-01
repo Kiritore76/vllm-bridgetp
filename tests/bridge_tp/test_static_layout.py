@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import unittest
+from pathlib import Path
 
 from tools.bridge_tp import run_qwen3_stay_migrate as runner
 
@@ -83,6 +84,31 @@ class StaticLayoutTests(unittest.TestCase):
         # With a target (L1A, L2's absent source aside) nothing changes.
         plan["instances"] = dict(legacy_pool_aliases={"tp1": "a", "tp4": "b"})
         self.assertEqual(launch.source_launch(plan), (argv, env))
+
+    def test_rate_sweep_runs_four_steady_short_rates_per_layout(self):
+        from tools.bridge_tp import qwen3_rate_sweep as sweep
+
+        code, value = plan(
+            "--rate-sweep", "--expanded-context", "--static-layout", "L0"
+        )
+        self.assertEqual((code, value["runs"], value["arms"]), (0, 4, ["stay"]))
+        self.assertEqual([r["rate_req_s"] for r in value["recipes"]], [4, 8, 12, 16])
+        cfg = sweep.config(json.loads(Path(INPUTS).read_text(encoding="utf-8")))
+        for recipe in cfg["recipes"]:
+            jobs = recipe["jobs"]
+            rate = recipe["rate_req_s"]
+            self.assertEqual(len(jobs), rate * 60)
+            self.assertAlmostEqual(jobs[1]["at_s"] - jobs[0]["at_s"], 1 / rate, 5)
+            self.assertLess(jobs[-1]["at_s"], 60)
+            self.assertEqual(
+                {
+                    (len(j["request"]["prompt"]), j["request"]["max_tokens"])
+                    for j in jobs
+                },
+                {(512, 128)},
+            )
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            runner.main(["--rate-sweep", "--expanded-context", *COMMON])
 
     def test_conflicting_options_are_rejected(self):
         for args in (

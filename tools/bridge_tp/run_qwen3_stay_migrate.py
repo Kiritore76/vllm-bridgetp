@@ -18,6 +18,7 @@ from tools.bridge_tp import qwen3_long_burst_pair as long_burst  # noqa: E402
 from tools.bridge_tp import qwen3_migration_matrix as matrix  # noqa: E402
 from tools.bridge_tp import qwen3_pressure_four_mode as pressure_four  # noqa: E402
 from tools.bridge_tp import qwen3_pressure_observation as observation  # noqa: E402
+from tools.bridge_tp import qwen3_rate_sweep as rate_sweep  # noqa: E402
 from tools.bridge_tp import qwen3_resident_pressure as resident  # noqa: E402
 from tools.bridge_tp import qwen3_routine_four_mode as routine  # noqa: E402
 from tools.bridge_tp import qwen3_stay_migrate as matched  # noqa: E402
@@ -230,6 +231,12 @@ def main(argv=None):
         help="S3b-3: explicit DRAIN conversion of one L1A bundle while serving",
     )
     parser.add_argument(
+        "--rate-sweep",
+        action="store_true",
+        help="short 512/128 requests at 4/8/12/16 req/s for 60s each "
+        "(with --static-layout)",
+    )
+    parser.add_argument(
         "--static-layout",
         choices=("L0", "L1A", "L2"),
         help="four-card layout screen: start directly in this layout on "
@@ -258,7 +265,7 @@ def main(argv=None):
         or args.conversion
         or args.long_burst_memory_verify
         or args.long_burst_deep_stay
-        or not (args.routine_four_mode or args.long_burst_pair)
+        or not (args.routine_four_mode or args.long_burst_pair or args.rate_sweep)
         or not args.current_machine
     ):
         parser.error(
@@ -278,6 +285,15 @@ def main(argv=None):
             parser.error("long-burst-pair is a separate STAY/MIGRATE experiment")
         args.updated_pressure_four_mode = True
         args.expanded_context = True
+    if args.rate_sweep:
+        if (
+            args.routine_four_mode
+            or args.long_burst_pair
+            or args.updated_pressure_four_mode
+            or not args.static_layout
+        ):
+            parser.error("rate-sweep is its own workload, run per static layout")
+        args.updated_pressure_four_mode = True
     if args.routine_four_mode:
         if args.updated_pressure_four_mode:
             parser.error("routine and updated pressure trials are separate modes")
@@ -320,6 +336,8 @@ def main(argv=None):
         cfg = (
             long_burst.config(read(args.inputs))
             if args.long_burst_pair
+            else rate_sweep.config(read(args.inputs))
+            if args.rate_sweep
             else routine.config(read(args.inputs))
             if args.routine_four_mode
             else pressure_four.updated_config(read(args.inputs))
