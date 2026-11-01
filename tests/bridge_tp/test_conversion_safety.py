@@ -290,13 +290,36 @@ class AssistChoiceTests(Base):
         self.assertEqual(self.backend.assisted, [])
         self.assertEqual(choice["evacuate"], ["a", "b"])
 
-    def test_a_refused_step_ends_the_evacuation(self):
+    def test_a_refused_step_is_retried_and_ends_only_if_refusals_persist(self):
+        """S5a GPU (11-01): a 512-token prompt queued on the target for 0.2s
+        refused step 4 of 4 and ended the evacuation."""
         self.propose([row("a", 6000), row("b", 5000)])
         self.answer(1, "a", requests=[row("b", 5000)])
         self.backend.assist_seq = 2
         reason, choice = self.answer(2, "b", state="REFUSED", requests=[row("b", 5000)])
+        self.assertIsNone(reason)  # retried at once under the same checks
+        self.assertEqual(choice["request_id"], "b")
+        self.now[0] += 25
+        self.assertIsNotNone(
+            self.answer(2, "b", state="REFUSED", requests=[row("b", 5000)])[1]
+        )
+        self.now[0] += 10  # refused for more than 30s
+        reason, choice = self.answer(2, "b", state="REFUSED", requests=[row("b", 5000)])
         self.assertIsNone(choice)
-        self.assertIn("ended", reason)
+        self.assertIn("too long", reason)
+
+    def test_a_start_resets_the_refusal_clock(self):
+        self.propose([row("a", 6000), row("b", 5000), row("c", 4000)])
+        self.answer(1, "a", requests=[row("b", 5000), row("c", 4000)])
+        self.backend.assist_seq = 2
+        self.answer(2, "b", state="REFUSED", requests=[row("b", 5000), row("c", 4000)])
+        self.now[0] += 25
+        self.answer(2, "b", requests=[row("c", 4000)])  # started after all
+        self.assertIsNone(self.backend.refused_since)
+        self.backend.assist_seq = 3
+        self.now[0] += 25
+        reason, choice = self.answer(3, "c", state="REFUSED", requests=[row("c", 4000)])
+        self.assertEqual(choice["request_id"], "c")
 
     def test_committed_and_attempt_caps(self):
         reason, choice = self.choice(

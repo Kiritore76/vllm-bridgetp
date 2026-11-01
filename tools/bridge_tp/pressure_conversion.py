@@ -101,6 +101,7 @@ SAFETY = dict(
     # a TP1 pair's long requests seen so far, not a memory budget.
     assist_max_committed=4,
     assist_max_attempts=8,
+    evacuation_patience_s=30.0,
     decision_interval_s=1.0,
 )
 
@@ -150,7 +151,8 @@ class ControllerConversionBackend:
         self.assisted = []  # request ids whose assist START was published
         self.last_assist_reason = None
         self.planned = None  # evacuation proposed, waiting for the controller
-        self.evacuation = None  # accepted plan; [] once a step was refused
+        self.evacuation = None  # accepted plan; [] once it gave up
+        self.refused_since = None
         # S4: read-only planner consulted while draining; never acts.
         self.shadow_planner, self.shadow_at = shadow_planner, -float("inf")
         self.last_shadow = None
@@ -381,7 +383,8 @@ class ControllerConversionBackend:
         target is SPARE, and the controller accepts the whole set (KV for
         every final length, service budget for every added decode). It then
         moves them one at a time, longest first; each START is re-checked by
-        the controller, and a refused one ends the evacuation.
+        the controller, and a refused one is retried until refusals have
+        lasted ``evacuation_patience_s``.
         """
         if self.clock() - self.assist_at < self.safety["decision_interval_s"]:
             return
@@ -450,8 +453,20 @@ class ControllerConversionBackend:
                 # The controller accepted (or refused) the whole evacuation.
                 self.evacuation = planned["requests"] if started else None
                 self.planned = None
-            elif not started and self.evacuation is not None:
-                self.evacuation = []  # a refused step ends the evacuation
+            elif self.evacuation:
+                # A refused step is "not now" (S5a GPU 11-01: one 512-token
+                # prompt queued for 0.2s ended an evacuation 3/4 done); it is
+                # retried under the same checks and ends only if refusals
+                # persist for evacuation_patience_s.
+                if started:
+                    self.refused_since = None
+                elif self.refused_since is None:
+                    self.refused_since = self.clock()
+                elif (
+                    self.clock() - self.refused_since
+                    > self.safety["evacuation_patience_s"]
+                ):
+                    self.evacuation = []
         target = status.get("migration_target")
         instances = status["instances"]
         if target is None or instances.get(target, {}).get("lifecycle") != "ACTIVE":
@@ -471,7 +486,7 @@ class ControllerConversionBackend:
         evacuation = self.evacuation
         if evacuation is not None:
             if evacuation == []:
-                return "evacuation ended by a refused step", None
+                return "evacuation ended: steps refused for too long", None
             remaining = [r for r in long if r["request_id"] in evacuation]
             if not remaining:
                 return "evacuation complete", None
