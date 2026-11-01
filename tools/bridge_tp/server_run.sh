@@ -11,7 +11,9 @@
 # 负载（与之前实验相同，固定输出）：
 #   routine：routine_mixed、moderate_decode、transient_burst（上下文都在8K以内）
 #   longburst：deep_long_burst（短请求每2s一条，90-100s到达6条16384/8192长请求）
-# 每个布局：routine 3场 + longburst 1场；共12场，约1.5-2小时。
+# 每个布局：routine 3场 + longburst 1场。
+# 第2次：只补跑L0（4场，约40分钟）。第1次（133349_1180）L1A、L2已完成；L0的源TP1仍带
+# 迁移发送配置，启动时去连不存在的TP2接收端而超时退出，已修复为只路由引擎。
 # 一场失败不中断其余布局；只有GPU未空闲时才停止。全程每秒采样GPU显存与利用率。
 # 每格只有1场，只作初筛，不是正式布局比较（正式的放六卡）。
 
@@ -21,6 +23,7 @@ py=$venv/bin/python
 model=/root/autodl-tmp/models/Qwen3-8B
 branch=bridgetp/tp2-4090d-qwen3-8b
 task=qwen3_static_layout_screen
+layouts="L0"
 
 cd "$repo" || exit 1
 source "$venv/bin/activate" || exit 1
@@ -58,7 +61,7 @@ export VLLM_USE_V2_MODEL_RUNNER=0 OMP_NUM_THREADS=1
 
 final=0
 for family in routine longburst; do
-    for layout in L0 L1A L2; do
+    for layout in $layouts; do
         [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || {
             echo "上一场后GPU仍有计算进程，停止于 $family-$layout 之前。"; final=1; break 2;
         }
@@ -87,7 +90,7 @@ kill "$smi" 2>/dev/null
 # 每场的运行包已是compact包；外层只收它们和日志，不重复原始目录。
 excludes=()
 for family in routine longburst; do
-    for layout in L0 L1A L2; do
+    for layout in $layouts; do
         excludes+=(--exclude="$(basename "$run")/$family-$layout")
     done
 done

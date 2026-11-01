@@ -41,6 +41,49 @@ class StaticLayoutTests(unittest.TestCase):
                 [r["scenario"] for r in value["recipes"]], ["deep_long_burst"]
             )
 
+    def test_l0_pair_source_starts_as_a_routing_only_engine(self):
+        """Static screen (11-01): the L0 source still preconnected to a TP2
+        receiver that L0 does not have and failed to start."""
+        from tools.bridge_tp import launch_pressure_balanced_pilot as launch
+
+        env = {
+            "PATH": "/bin",
+            "CUDA_VISIBLE_DEVICES": "2",
+            "BRIDGETP_PRESSURE_POOL": "tp1",
+            "BRIDGETP_PRESSURE_INVENTORY_PATH": "/run/source_inventory.jsonl",
+            "BRIDGETP_PERFORMANCE_TRACE_DIR": "/run/trace/source",
+            "BRIDGETP_PERFORMANCE_FINALIZE_TOKEN": "t",
+            "BRIDGETP_GPU_DIRECT_PRECONNECT": "1",
+            "BRIDGETP_STREAM_ENABLED": "1",
+            "BRIDGETP_TAKEOVER_ENABLED": "1",
+            "BRIDGETP_PREDICTOR_LIVE_EVENTS": "/run/predictor_events.jsonl",
+        }
+        argv = ["python", "-m", "serve", "--port", "8001", "--kv-transfer-config", "{}"]
+        plan = dict(
+            source_env=env,
+            source_argv=argv,
+            instances=dict(legacy_pool_aliases={"tp1": "A-g1-tp1"}),
+        )
+        out_argv, out_env = launch.source_launch(plan)
+        self.assertNotIn("--kv-transfer-config", out_argv)
+        self.assertEqual(
+            sorted(out_env),
+            sorted(
+                [
+                    "PATH",
+                    "CUDA_VISIBLE_DEVICES",
+                    "BRIDGETP_PRESSURE_POOL",
+                    "BRIDGETP_PRESSURE_INVENTORY_PATH",
+                    "BRIDGETP_PERFORMANCE_TRACE_DIR",
+                    "BRIDGETP_PERFORMANCE_FINALIZE_TOKEN",
+                ]
+            ),
+        )
+        self.assertEqual(plan["source_env"], env)  # the plan itself is untouched
+        # With a target (L1A, L2's absent source aside) nothing changes.
+        plan["instances"] = dict(legacy_pool_aliases={"tp1": "a", "tp4": "b"})
+        self.assertEqual(launch.source_launch(plan), (argv, env))
+
     def test_conflicting_options_are_rejected(self):
         for args in (
             ["--long-burst-memory-verify", "--static-layout", "L0"],

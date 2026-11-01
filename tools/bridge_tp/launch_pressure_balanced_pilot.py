@@ -494,6 +494,31 @@ def conversion_request(spec, registry):
     return dict(request)
 
 
+def source_launch(plan):
+    """(argv, env) the pair source TP1 starts with.
+
+    Without a target (L0) it is a routing-only engine like the extras: a
+    migration sender would preconnect to a TP2 receiver that does not exist
+    and the engine would fail to start (static screen, 11-01: timed out
+    connecting to 127.0.0.1:30400). Only inventory and performance-trace
+    settings stay; the runner may add sender settings after planning, so
+    this is applied at launch.
+    """
+    if "target" not in absent_pair(plan):
+        return plan["source_argv"], plan["source_env"]
+    argv = list(plan["source_argv"])
+    if "--kv-transfer-config" in argv:
+        index = argv.index("--kv-transfer-config")
+        del argv[index : index + 2]
+    env = {
+        k: v
+        for k, v in plan["source_env"].items()
+        if not k.startswith("BRIDGETP_")
+        or k.startswith(("BRIDGETP_PRESSURE_", "BRIDGETP_PERFORMANCE_"))
+    }
+    return argv, env
+
+
 def absent_pair(plan):
     """Pair sides ("source"/"target") a single-class layout does not start."""
     aliases = plan.get("instances", {}).get("legacy_pool_aliases", {"tp1": 0, "tp4": 0})
@@ -941,11 +966,9 @@ def run_scene(
             )
         if "source" not in absent:
             announce(scene["name"], "启动TP1服务")
+            source_argv, source_env = source_launch(plan)
             source = common.start_process(
-                "source TP1",
-                plan["source_argv"],
-                plan["source_env"],
-                root / "source.log",
+                "source TP1", source_argv, source_env, root / "source.log"
             )
             processes.append(source)
             publish_processes()
