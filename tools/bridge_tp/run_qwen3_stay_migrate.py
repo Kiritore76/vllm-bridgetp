@@ -16,6 +16,7 @@ from tools.bridge_tp import qwen3_kv_guard_trial as guard_trial  # noqa: E402
 from tools.bridge_tp import qwen3_kv_priority_verify as priority  # noqa: E402
 from tools.bridge_tp import qwen3_long_burst_pair as long_burst  # noqa: E402
 from tools.bridge_tp import qwen3_migration_matrix as matrix  # noqa: E402
+from tools.bridge_tp import qwen3_phase_shift as phase_shift  # noqa: E402
 from tools.bridge_tp import qwen3_pressure_four_mode as pressure_four  # noqa: E402
 from tools.bridge_tp import qwen3_pressure_observation as observation  # noqa: E402
 from tools.bridge_tp import qwen3_rate_sweep as rate_sweep  # noqa: E402
@@ -246,6 +247,18 @@ def main(argv=None):
         "(with --static-layout)",
     )
     parser.add_argument(
+        "--phase-shift",
+        action="store_true",
+        help="short peak, long-request phase, calm tail (with --static-layout "
+        "and --conversion-decider)",
+    )
+    parser.add_argument(
+        "--conversion-decider",
+        choices=("record", "execute"),
+        help="rule-based conversion decider: record what it would convert, or "
+        "execute its first proposal",
+    )
+    parser.add_argument(
         "--sweep-rates",
         type=lambda text: tuple(int(v) for v in text.split(",")),
         default=None,
@@ -288,7 +301,12 @@ def main(argv=None):
         or args.conversion
         or args.long_burst_memory_verify
         or args.long_burst_deep_stay
-        or not (args.routine_four_mode or args.long_burst_pair or args.rate_sweep)
+        or not (
+            args.routine_four_mode
+            or args.long_burst_pair
+            or args.rate_sweep
+            or args.phase_shift
+        )
         or not args.current_machine
     ):
         parser.error(
@@ -308,6 +326,19 @@ def main(argv=None):
             parser.error("long-burst-pair is a separate STAY/MIGRATE experiment")
         args.updated_pressure_four_mode = True
         args.expanded_context = True
+    if args.conversion_decider and not args.phase_shift:
+        parser.error("the conversion decider runs on the phase-shift workload")
+    if args.phase_shift:
+        if (
+            args.routine_four_mode
+            or args.long_burst_pair
+            or args.rate_sweep
+            or args.updated_pressure_four_mode
+            or args.static_layout != "L1A"
+            or not args.conversion_decider
+        ):
+            parser.error("phase-shift is its own workload: static L1A with a decider")
+        args.updated_pressure_four_mode = True
     if args.rate_sweep:
         if (
             args.routine_four_mode
@@ -367,6 +398,8 @@ def main(argv=None):
         cfg = (
             long_burst.config(read(args.inputs))
             if args.long_burst_pair
+            else phase_shift.config(read(args.inputs))
+            if args.phase_shift
             else rate_sweep.config(
                 read(args.inputs), args.sweep_rates or rate_sweep.RATES
             )
@@ -653,6 +686,14 @@ def main(argv=None):
                 base_port=8300,
                 migration_sources=True,
             )
+        if args.conversion_decider:
+            spec["conversion"] = dict(
+                decider="RECORD_ONLY"
+                if args.conversion_decider == "record"
+                else "EXECUTE",
+                deadline_s=600,
+                base_port=8400,
+            )
         if args.conversion and START_LAYOUT[args.conversion] != "L1A":
             spec["layout"] = dict(
                 name=START_LAYOUT[args.conversion],
@@ -675,7 +716,12 @@ def main(argv=None):
             policy_config=str(observation.ASSETS / "policy.json"),
             service_evidence=str(observation.ASSETS / "service_evidence.json"),
             health_reference=str(observation.ASSETS / "health_reference.json"),
-            run_timeout_s=900 if args.four_mode or matrix_mode else 600,
+            # Phase shift: arrivals end at 840s, then 2048-token outputs drain.
+            run_timeout_s=1200
+            if args.phase_shift
+            else 900
+            if args.four_mode or matrix_mode
+            else 600,
             startup_timeout_s=900,
             no_progress_s=90,
             require_stager_process_ready=True,

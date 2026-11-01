@@ -24,6 +24,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from tools.bridge_tp import conversion_decider as decision  # noqa: E402
 from tools.bridge_tp import pressure_health_reference as health  # noqa: E402
 from tools.bridge_tp.pressure_cpu import load  # noqa: E402
 from tools.bridge_tp.pressure_progress import (  # noqa: E402
@@ -823,7 +824,14 @@ def _run(args, prepared):
         assist=None,
         assist_seen=None,
         assist_result=None,
+        # (unix_s, source) of migration starts, for the conversion decider.
+        migration_starts=[],
     )
+
+    def note_migration_start(source, value):
+        layout_state["migration_starts"].append((time.time(), source))
+        return value
+
     instance_of = dict(manifest["legacy_pool_aliases"]) if manifest else {}
 
     def request_rows(raw):
@@ -834,6 +842,7 @@ def _run(args, prepared):
             rows.append(
                 dict(
                     request_id=row["request_id"],
+                    prompt_tokens=row["prompt_tokens"],
                     generated=row["generated"],
                     max_output_tokens=row["max_output_tokens"],
                     remaining_bins=bins,
@@ -958,6 +967,7 @@ def _run(args, prepared):
                 sessions=sessions.get(pool, 0),
                 requests=[] if raw is None else request_rows(raw),
                 pressure=layout_state["pressure"].get(pool),
+                tp_degree=tp_of[pool],
                 inventory=None
                 if raw is None
                 else dict(
@@ -966,8 +976,30 @@ def _run(args, prepared):
                     running=raw["running"],
                     waiting=raw["waiting"],
                     requests=len(raw["requests"]),
+                    free_blocks=raw["free_blocks"],
+                    total_blocks=raw["total_blocks"],
+                    block_size=raw["block_size"],
                 ),
             )
+        # Conversion decision signals (record-only decider): arrivals and
+        # migration starts of the last window.
+        window = decision.WINDOW_S
+        recent = [
+            len(v.payload["prompt"]) + int(v.payload["max_tokens"])
+            for v in dispatched.values()
+            if 0 <= now - v.dispatched_at <= window
+        ]
+        long_requests = [n for n in recent if n >= decision.LONG_TOKENS]
+        starts = layout_state["migration_starts"]
+        while starts and now - starts[0][0] > window:
+            starts.pop(0)
+        workload = dict(
+            window_s=window,
+            arrivals=len(recent),
+            long_arrivals=len(long_requests),
+            long_final_tokens=sum(long_requests),
+            migration_starts=[[round(now - t, 3), source] for t, source in starts],
+        )
         path = args.run_dir / "layout_status.json"
         temporary = path.with_suffix(".tmp")
         temporary.write_text(
@@ -983,6 +1015,7 @@ def _run(args, prepared):
                     if "tp4" in polled and polled["tp4"] is not None
                     else None,
                     assist_result=layout_state["assist_result"],
+                    workload=workload,
                     # Ledger state of every drain-assist session (S5a cap).
                     assist_sessions={
                         sid: co.ledger.entries[sid].state
@@ -1489,7 +1522,9 @@ def _run(args, prepared):
                     c.request_id: r.BoundAction(
                         c.request_id,
                         session.migration_id,
-                        lambda c=c, runtime=runtimes[source]: session.start(c, runtime),
+                        lambda c=c, runtime=runtimes[source], source=source: (
+                            note_migration_start(source, session.start(c, runtime))
+                        ),
                     )
                     for source, cs in candidates_by_source.items()
                     if rates_by_source[source]

@@ -1018,7 +1018,14 @@ class ConversionDriver:
 
     ``request`` = dict(bundle, target_mode, trigger_s, deadline_s); the trigger
     counts from ``start()``. The driver never creates a second plan.
+
+    With ``decider`` (RECORD_ONLY or EXECUTE, plus ``edges``) the rule-based
+    decider is evaluated every ``decision_interval_s`` and every record goes
+    to ``conversion_decider.jsonl``. RECORD_ONLY never converts; EXECUTE
+    converts the first proposal (one plan per run for now).
     """
+
+    decision_interval_s = 1.0
 
     TERMINAL = {"COMPLETED", "ABORTED", "RECOVERY_REQUIRED"}
 
@@ -1032,11 +1039,24 @@ class ConversionDriver:
         self.error = None
         self.thread = None
         self.triggered_at = None
+        self.decider = None
+        if "decider" in request:
+            from tools.bridge_tp.conversion_decider import ConversionDecider
+
+            self.decider = ConversionDecider(
+                request["edges"],
+                request.get("rules"),
+                execute=request["decider"] == "EXECUTE",
+            )
+        self.decided_at = -float("inf")
+        self.decisions = 0
+        self.proposals = []
 
     def start(self):
         self.origin = time.monotonic()
-        # The controller must not finish before this plan reaches its end.
-        self.backend.write_layout({})
+        # The controller must not finish before this plan reaches its end; a
+        # decider holds it only once it has created a plan.
+        self.backend.write_layout({}, pending=self.decider is None)
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
@@ -1046,7 +1066,9 @@ class ConversionDriver:
     def _loop(self):
         try:
             while not self.stop_event.is_set():
-                if self.executor.plan is None:
+                if self.executor.plan is None and self.decider is not None:
+                    self.decide()
+                elif self.executor.plan is None:
                     if time.monotonic() - self.origin >= self.request["trigger_s"]:
                         self.triggered_at = time.time()
                         self.backend.ops.event("TRIGGER", request=self.request)
@@ -1075,6 +1097,48 @@ class ConversionDriver:
             # Terminal, failed or stopped: release the controller.
             self.backend.write_layout({}, pending=False)
 
+    def decide(self):
+        """One decider evaluation; EXECUTE turns the first proposal into a plan."""
+        if time.monotonic() - self.decided_at < self.decision_interval_s:
+            return
+        self.decided_at = time.monotonic()
+        status = self.backend.status()
+        if not self.backend.fresh(status):
+            return
+        from tools.bridge_tp.conversion_decider import registry_layout
+
+        bundles, members = registry_layout(self.backend.registry)
+        record = self.decider.observe(status, bundles, members, time.time())
+        self.decisions += 1
+        with (self.backend.run_dir / "conversion_decider.jsonl").open(
+            "a", encoding="utf-8"
+        ) as stream:
+            stream.write(json.dumps(record) + "\n")
+        proposal = record["proposal"]
+        if proposal is None:
+            return
+        self.proposals.append(dict(proposal, unix_s=record["evaluated_unix_s"]))
+        self.backend.ops.event("DECIDER_PROPOSAL", mode=record["mode"], **proposal)
+        if not self.decider.execute:
+            return
+        self.triggered_at = time.time()
+        self.request = dict(
+            self.request, bundle=proposal["bundle"], target_mode=proposal["target_mode"]
+        )
+        self.backend.ops.event("TRIGGER", request=self.request)
+        self.backend.write_layout({})  # hold the controller until terminal
+        self.executor.plan_create(
+            "decided-" + proposal["bundle"],
+            self.backend.registry.registry_revision,
+            proposal["bundle"],
+            proposal["target_mode"],
+            "DRAIN",
+            "ACTIVE",
+            time.time() + self.request["deadline_s"],
+            "NO_PROFILE",
+        )
+        self.decider.converted(time.time())
+
     def stop(self, timeout_s=30):
         self.stop_event.set()
         if self.thread is not None:
@@ -1085,4 +1149,9 @@ class ConversionDriver:
             triggered_unix_s=self.triggered_at,
             plan=self.executor.plan_status() if self.executor.plan else None,
             driver_alive=self.thread is not None and self.thread.is_alive(),
+            **(
+                dict(decisions=self.decisions, proposals=self.proposals)
+                if self.decider is not None
+                else {}
+            ),
         )

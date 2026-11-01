@@ -3,24 +3,24 @@
 # 运行：
 #   cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 #
-# 当前任务：S5b GPU检查——转换后新实例加入迁移（通道对账）。两场，每场约8-10分钟。
-#   L0-L1A：以L0启动（四个TP1都带迁移源配置，目标列表为空），30s时把B组TP1@0、TP1@1
-#           合成TP2(0,1)；新TP2接替迁移对目标（端口、会话目录不变，此时才启动stager），
-#           保留的TP1@2、TP1@3在运行中连上它。
-#   L2-L1A：以L2启动（保留的TP2(0,1)带接收端配置，通道计划为空，stager从开始就在），
-#           30s时把A组TP2(2,3)拆成TP1@2、TP1@3；两个新TP1作为迁移源连上TP2(0,1)。
-# 两场都是：退役实例的通道先关；新布局的每条TP1→TP2通道两端都留下预连回执后才发布路由。
-# A={2,3}，B={0,1}；双32768/.88；深长突发MIGRATE臂（短请求每2s一条，90-100s到达6条
-# 16384/8192长请求），这些长请求落在转换后的布局上，看能否真实迁往TP2。
-# 全程每秒采样一次GPU显存与利用率。一场技术失败（退出码不是0或2）就停。
+# 当前任务：转换决策器第一轮——只记录、不执行（一场，约20分钟）。
+# 以L1A启动（A={2,3}：TP1@2、TP1@3；B={0,1}：TP2(0,1)），双32768/.88，fast策略照常迁移。
+# 分阶段负载：
+#   P1 短请求高峰（0-360s）：512/128，前60s 4 req/s，之后9 req/s（约L1A短请求容量的70%）
+#      → 预期决策器提议“拆B组TP2”（L1A→L0）；
+#   P2 长请求阶段（360-720s）：短请求0.5 req/s + 6144/2048长请求0.4 req/s（约占44%）
+#      → 预期提议“合A组TP1”（L1A→L2）；
+#   P3 平静尾段（720-840s）：512/128 3 req/s → 不应提议。
+# 决策器每秒判断一次，全部写入conversion_decider.jsonl；不会真的转换。
+# 规则与初值：窗口120s、持续3分钟（紧急60s）、收益≥3倍代价、同一方向冷却10分钟。
+# 全程每秒采样一次GPU显存与利用率。
 
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
 py=$venv/bin/python
 model=/root/autodl-tmp/models/Qwen3-8B
 branch=bridgetp/tp2-4090d-qwen3-8b
-task=qwen3_conversion_join
-edges="L0-L1A L2-L1A"
+task=qwen3_decider_record
 
 cd "$repo" || exit 1
 source "$venv/bin/activate" || exit 1
@@ -56,33 +56,23 @@ trap 'kill "$smi" 2>/dev/null' EXIT
 export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 export VLLM_USE_V2_MODEL_RUNNER=0 OMP_NUM_THREADS=1
 
-status=0
-for edge in $edges; do
-    [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || {
-        echo "上一场后GPU仍有计算进程，停止于 $edge 之前。"; status=1; break;
-    }
-    echo "=== 开始：$edge 30s（$(date +%T)）==="
-    date +%s.%N > "$run/$edge.started_unix_s"
-    "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
-        --long-burst-memory-verify --conversion "$edge" \
-        --conversion-trigger-s 30 \
-        --current-machine --repetitions 1 \
-        --model "$model" \
-        --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
-        --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json" \
-        --output "$run/$edge" --expected-revision "$head" 2>&1 | tee "$run/$edge.console.log"
-    status=${PIPESTATUS[0]}
-    echo "$edge 退出码：$status" | tee -a "$run/exit_codes.txt"
-    [ "$status" = 0 ] || [ "$status" = 2 ] || break
-done
+name=phase-shift-record
+echo "=== 开始：$name（$(date +%T)）==="
+date +%s.%N > "$run/$name.started_unix_s"
+"$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
+    --phase-shift --static-layout L1A --conversion-decider record \
+    --expanded-context --current-machine --repetitions 1 \
+    --model "$model" \
+    --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
+    --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json" \
+    --output "$run/$name" --expected-revision "$head" 2>&1 | tee "$run/$name.console.log"
+status=${PIPESTATUS[0]}
+echo "$name 退出码：$status" | tee -a "$run/exit_codes.txt"
 
 kill "$smi" 2>/dev/null
-# 每场的运行包已是compact包；外层只收它们和日志，不重复原始目录。
-excludes=()
-for edge in $edges; do
-    excludes+=(--exclude="$(basename "$run")/$edge")
-done
-tar -C "$(dirname "$run")" -czf "$run.tar.gz" "${excludes[@]}" "$(basename "$run")"
+# 运行包已是compact包；外层只收它和日志，不重复原始目录。
+tar -C "$(dirname "$run")" -czf "$run.tar.gz" \
+    --exclude="$(basename "$run")/$name" "$(basename "$run")"
 sha256sum "$run.tar.gz" > "$run.tar.gz.sha256"
 echo '=== 退出码 ==='
 cat "$run/exit_codes.txt"

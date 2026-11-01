@@ -498,6 +498,8 @@ def conversion_request(spec, registry):
         return None
     if not spec.get("layout"):
         raise ValueError("conversion needs an explicit layout")
+    if "decider" in request:
+        return decider_request(request, registry)
     bundles = {row.bundle_id for row in registry.instances.values()}
     required = {"bundle", "target_mode", "trigger_s", "deadline_s", "base_port"}
     method = request.get("method", "DRAIN")
@@ -522,6 +524,38 @@ def conversion_request(spec, registry):
 # S5b: a migration source's runtime target list (vllm/bridge_tp
 # gpu_direct_targets.FILE_ENV; not imported here to keep the launcher torch-free).
 TARGETS_FILE_ENV = "BRIDGETP_GPU_DIRECT_TARGETS_FILE"
+
+
+def decider_request(request, registry):
+    """Rule-based decider instead of an explicit edge (user 11-01).
+
+    RECORD_ONLY logs what it would convert; EXECUTE converts its first
+    proposal (one DRAIN conversion per run). The edges are those of the start
+    layout: merge a TP1 bundle, split a TP-k bundle.
+    """
+    from tools.bridge_tp.conversion_decider import RULES
+
+    required = {"decider", "deadline_s", "base_port"}
+    if (
+        not required <= set(request) <= required | {"rules"}
+        or request["decider"] not in {"RECORD_ONLY", "EXECUTE"}
+        or not set(request.get("rules", {})) <= set(RULES)
+        or request["deadline_s"] <= 0
+        or int(request["base_port"]) <= 0
+    ):
+        raise ValueError("invalid conversion decider request")
+    from tools.bridge_tp.conversion_decider import layout_name
+
+    degrees = {}
+    for row in registry.instances.values():
+        degrees[row.bundle_id] = row.tp_degree
+    edges = {
+        layout_name(degrees): [
+            [bundle, "TP2" if tp == 1 else "TP1"]
+            for bundle, tp in sorted(degrees.items())
+        ]
+    }
+    return dict(request, edges=edges)
 
 
 def join_plan(request, spec, args, aliases, pair_bundles, extras, run_root, scene):

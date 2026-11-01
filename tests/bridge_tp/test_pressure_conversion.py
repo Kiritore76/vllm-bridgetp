@@ -777,7 +777,20 @@ class ConversionTests(unittest.TestCase):
             (harness.root / "pressure_request_results.json").read_text()
         )
         self.assertTrue(all(row["source_done"] for row in result))
-        return json.loads((harness.root / "layout_status.json").read_text())
+        status = json.loads((harness.root / "layout_status.json").read_text())
+        # Conversion-decider signals published by the controller.
+        self.assertEqual(
+            set(status["workload"]),
+            {
+                "window_s",
+                "arrivals",
+                "long_arrivals",
+                "long_final_tokens",
+                "migration_starts",
+            },
+        )
+        self.assertEqual({v["tp_degree"] for v in status["instances"].values()}, {1, 2})
+        return status
 
     def test_l0_merge_takes_the_pair_target_and_joins_retained_sources(self):
         """S5b L0 -> L1A: TP1@0 + TP1@1 -> TP2(0,1), target of TP1@2 and TP1@3."""
