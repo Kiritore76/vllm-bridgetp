@@ -230,6 +230,12 @@ def main(argv=None):
         help="S3b-3: explicit DRAIN conversion of one L1A bundle while serving",
     )
     parser.add_argument(
+        "--static-layout",
+        choices=("L0", "L1A", "L2"),
+        help="four-card layout screen: start directly in this layout on "
+        "A={2,3}, B={0,1}; L1A migrates (per-source channels), L0/L2 cannot",
+    )
+    parser.add_argument(
         "--conversion-assist",
         action="store_true",
         help="S5a: SELECTIVE_ROLL drain assist (merging edge L1A-L2 only)",
@@ -247,6 +253,18 @@ def main(argv=None):
         parser.error("layout-l1a-channels runs with long-burst-memory-verify only")
     if args.conversion and not args.layout_l1a_channels:
         parser.error("conversion runs on the L1A channel layout only")
+    if args.static_layout and (
+        args.layout_l1a_channels
+        or args.conversion
+        or args.long_burst_memory_verify
+        or args.long_burst_deep_stay
+        or not (args.routine_four_mode or args.long_burst_pair)
+        or not args.current_machine
+    ):
+        parser.error(
+            "static-layout screens the routine or long-burst workloads on the "
+            "current machine, without conversion or other layout options"
+        )
     if args.conversion_assist and args.conversion != "L1A-L2":
         parser.error("drain assist merges TP1s into a TP2 (L1A-L2) only")
     if not 0 <= args.conversion_trigger_s < 300:
@@ -316,6 +334,19 @@ def main(argv=None):
                 "; deep STAY supplement; compare separately with completed MIGRATE"
                 if args.long_burst_deep_stay
                 else "; one failed-workload memory verification, not a new pair"
+            )
+        if args.static_layout:
+            # One arm: the layout as it would run. Only L1A has a pair.
+            cfg["arms"] = ["migrate" if args.static_layout == "L1A" else "stay"]
+            if args.long_burst_pair:
+                cfg["recipes"] = [
+                    r for r in cfg["recipes"] if r["scenario"] == "deep_long_burst"
+                ]
+            for recipe in cfg["recipes"]:
+                recipe["arm_order_offset"] = 0
+            cfg["note"] += (
+                f"; four-card static layout screen {args.static_layout}, one arm, "
+                "one run per workload; not a formal layout comparison"
             )
         values = cfg["recipes"]
     elif args.kv_priority_verify:
@@ -557,6 +588,13 @@ def main(argv=None):
         spec = migration_spec(args.model)
         if args.expanded_context:
             expanded_context_spec(spec, read(args.model / "config.json"))
+        if args.static_layout:
+            spec["layout"] = dict(
+                name=args.static_layout,
+                bundle_gpus=["2", "3", "0", "1"],
+                base_port=8300,
+                migration_sources=args.static_layout == "L1A",
+            )
         if args.layout_l1a_channels:
             spec["layout"] = dict(
                 name="L1A",
@@ -722,7 +760,7 @@ def main(argv=None):
                     )
                     # Its invariants name the fixed pair; after a conversion
                     # new instances take redirects too, so only record it.
-                    if not args.conversion and (
+                    if not (args.conversion or args.static_layout) and (
                         not row["kv_routing"]["invariants_pass"]
                         or row["kv_routing"]["checked_arrivals"] != len(raw)
                     ):
@@ -763,7 +801,7 @@ def main(argv=None):
                         args.output / "migration_matrix_summary.json",
                         matrix.aggregate(evaluations),
                     )
-                else:
+                elif not args.static_layout:  # one arm: no pair summary
                     write(
                         args.output
                         / (
@@ -949,6 +987,15 @@ def main(argv=None):
                     if accepted
                     else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
                 )
+        if args.static_layout:
+            done = len(ledger) == run_count and all(
+                r["status"] == "COMPLETED" for r in ledger
+            )
+            result, code = (
+                (dict(status="COMPLETED_STATIC_LAYOUT", layout=args.static_layout), 0)
+                if done
+                else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
+            )
     except KeyboardInterrupt:
         result, code = dict(status="INTERRUPTED"), 130
     except Exception as error:
@@ -968,7 +1015,9 @@ def main(argv=None):
             total_profile_attempts=previous_attempts + len(ledger),
             inherited_runs=inherited,
             maximum_live_runs=run_count,
-            experiment_mode="conversion-" + args.conversion
+            experiment_mode="static-layout-" + args.static_layout
+            if args.static_layout
+            else "conversion-" + args.conversion
             if args.conversion
             else "long-burst-deep-stay"
             if args.long_burst_deep_stay

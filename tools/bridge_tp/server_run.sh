@@ -3,37 +3,24 @@
 # 运行：
 #   cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 #
-# 当前任务：S5a GPU检查，同负载同触发的一对：DRAIN（纯排空）对 ROLL（辅助排空），
-# 每场约8-10分钟，共约20分钟。
-# 布局与负载同S4：L1A，A={2,3}，B={0,1}；TP1@2、TP1@3、TP2@0,1；双32768/.88；
-# 深长突发MIGRATE臂（短请求每2s一条，90-100s到达6条16384/8192长请求）。
-# 两场都在控制器启动后110s请求转换L1A-L2，都先经过启动闸门（TP2空闲才停止接入，
-# 等满180s后只看KV余量）和安全阀（TP2 KV持续3s压到安全余量就恢复接入）。
-#   drain：只等长请求自然结束（fast策略原有的迁移照常）。
-#   roll ：另外按方案A辅助迁出长请求（剩余>3倍迁移时间、TP2空闲才迁、每次转换最多2条）。
-# 全程每秒采样一次GPU显存与利用率。一场技术失败（退出码不是0或2）就停。
-# 第2次：第1次（093941_20421）drain场转换已完成，但退役时一条长请求的接入记录还差
-# 最后一次库存确认（ACCOUNTED），退役后再也收不到，控制器90s无进展超时；已修复。
-# 第3次：第2次（095943_13279）两场转换都完成，但roll场87次辅助迁移全被控制器以“健康参考
-# 不支持”拒绝（参考只覆盖8K以内上下文，长请求永远不支持）；改为与fast策略相同的迁入后
-# 负载预算检查，两场都重跑。
-# 第4次：第3次（103558_4576）辅助迁移启动了3次，但其中2次被fast策略“源端压力已恢复”的
-# 取消规则取消（排空中的源本来就空闲），只提交1条，排空没缩短；现在辅助迁移不受这条规则
-# 约束，上限改为“提交2条、尝试4次”，两场都重跑。
-# 同时加入安全阀新规则：阀触发时若规划器估计转换剩余不到60s就继续转完，否则才取消。
-# 第5次：第4次（111729_3221）辅助迁移按设计提交2条，但A组4条长请求还剩1条，排空181s对184s；
-# 改为“全迁或不迁”：所有长请求都可迁、数量≤4、TP2空闲且控制器确认整组KV和负载预算都放得下，
-# 才依次全部迁走，否则纯排空。两场都重跑。
-# 第6次：第5次（115931_15409）整组计划被接受、3条已提交，第4条因TP2上一个512 token短请求
-# 排队0.2s被拒，迁移随即结束，排空180.5s对183.3s；现在被拒的一步会在同样检查下重试，
-# 连续被拒超过30s才放弃。两场都重跑。
+# 当前任务：四卡静态布局初筛（不转换）。看不同负载下三种布局是否各有优势。
+# A={2,3}，B={0,1}；双32768/.88。直接以布局启动：
+#   L0 ：TP1@0、TP1@1、TP1@2、TP1@3（不能迁移）
+#   L1A：TP1@2、TP1@3、TP2@0,1（两个TP1都有到TP2的通道，fast策略照常迁移）
+#   L2 ：TP2@2,3、TP2@0,1（不能迁移）
+# 负载（与之前实验相同，固定输出）：
+#   routine：routine_mixed、moderate_decode、transient_burst（上下文都在8K以内）
+#   longburst：deep_long_burst（短请求每2s一条，90-100s到达6条16384/8192长请求）
+# 每个布局：routine 3场 + longburst 1场；共12场，约1.5-2小时。
+# 一场失败不中断其余布局；只有GPU未空闲时才停止。全程每秒采样GPU显存与利用率。
+# 每格只有1场，只作初筛，不是正式布局比较（正式的放六卡）。
 
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
 py=$venv/bin/python
 model=/root/autodl-tmp/models/Qwen3-8B
 branch=bridgetp/tp2-4090d-qwen3-8b
-task=qwen3_conversion_assist
+task=qwen3_static_layout_screen
 
 cd "$repo" || exit 1
 source "$venv/bin/activate" || exit 1
@@ -69,38 +56,46 @@ trap 'kill "$smi" 2>/dev/null' EXIT
 export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 export VLLM_USE_V2_MODEL_RUNNER=0 OMP_NUM_THREADS=1
 
-status=0
-for arm in drain roll; do
-    [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || {
-        echo "上一场后GPU仍有计算进程，停止于 $arm 之前。"; status=1; break;
-    }
-    extra=()
-    [ "$arm" = roll ] && extra=(--conversion-assist)
-    echo "=== 开始：L1A-L2 110s，$arm（$(date +%T)）==="
-    date +%s.%N > "$run/$arm.started_unix_s"
-    "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
-        --long-burst-memory-verify --layout-l1a-channels --conversion L1A-L2 \
-        --conversion-trigger-s 110 "${extra[@]}" \
-        --current-machine --repetitions 1 \
-        --model "$model" \
-        --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
-        --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json" \
-        --output "$run/$arm" --expected-revision "$head" 2>&1 | tee "$run/$arm.console.log"
-    status=${PIPESTATUS[0]}
-    echo "$arm 退出码：$status" | tee -a "$run/exit_codes.txt"
-    [ "$status" = 0 ] || [ "$status" = 2 ] || break
+final=0
+for family in routine longburst; do
+    for layout in L0 L1A L2; do
+        [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || {
+            echo "上一场后GPU仍有计算进程，停止于 $family-$layout 之前。"; final=1; break 2;
+        }
+        if [ "$family" = routine ]; then
+            mode=(--routine-four-mode --expanded-context)
+        else
+            mode=(--long-burst-pair)
+        fi
+        name="$family-$layout"
+        echo "=== 开始：$name（$(date +%T)）==="
+        date +%s.%N > "$run/$name.started_unix_s"
+        "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
+            "${mode[@]}" --static-layout "$layout" \
+            --current-machine --repetitions 1 \
+            --model "$model" \
+            --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
+            --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json" \
+            --output "$run/$name" --expected-revision "$head" 2>&1 | tee "$run/$name.console.log"
+        status=${PIPESTATUS[0]}
+        echo "$name 退出码：$status" | tee -a "$run/exit_codes.txt"
+        [ "$status" = 0 ] || final=$status
+    done
 done
 
 kill "$smi" 2>/dev/null
 # 每场的运行包已是compact包；外层只收它们和日志，不重复原始目录。
-tar -C "$(dirname "$run")" -czf "$run.tar.gz" \
-    --exclude="$(basename "$run")/drain" \
-    --exclude="$(basename "$run")/roll" \
-    "$(basename "$run")"
+excludes=()
+for family in routine longburst; do
+    for layout in L0 L1A L2; do
+        excludes+=(--exclude="$(basename "$run")/$family-$layout")
+    done
+done
+tar -C "$(dirname "$run")" -czf "$run.tar.gz" "${excludes[@]}" "$(basename "$run")"
 sha256sum "$run.tar.gz" > "$run.tar.gz.sha256"
 echo '=== 退出码 ==='
 cat "$run/exit_codes.txt"
-echo "最终退出码：$status"
+echo "最终退出码：$final"
 echo "请拿回：$run.tar.gz"
 echo "以及：$run.tar.gz.sha256"
-exit "$status"
+exit "$final"
