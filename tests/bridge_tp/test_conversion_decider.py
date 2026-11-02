@@ -358,6 +358,39 @@ class DeciderDriverTests(unittest.TestCase):
             self.assertTrue(launch.conversion_outcome_ok(request, "ABORTED"))
             self.assertFalse(launch.conversion_outcome_ok(request, "FENCED"))
 
+    def test_a_failed_result_write_does_not_stop_scene_cleanup(self):
+        """Disk full (11-01): the write raised in run_scene's finally, ahead of
+        stop_processes, and the engines outlived the scene."""
+        import ast
+
+        from tools.bridge_tp import launch_pressure_balanced_pilot as launch
+
+        stopped = []
+        driver = NS(stop=lambda: stopped.append(1) or dict(state="NOT_TRIGGERED"))
+        with tempfile.TemporaryDirectory() as folder:
+            missing = Path(folder) / "gone"
+            with self.assertRaises(OSError):
+                launch.finish_conversion(driver, missing)
+            self.assertIsNone(launch.finish_conversion_best_effort(driver, missing))
+        self.assertEqual(len(stopped), 2)
+        tree = ast.parse(Path(launch.__file__).read_text("utf-8"))
+        run_scene = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == "run_scene"
+        )
+        (handler,) = [
+            n for n in ast.walk(run_scene) if isinstance(n, ast.Try) and n.finalbody
+        ]
+        names = [
+            n.func.id if isinstance(n.func, ast.Name) else n.func.attr
+            for statement in handler.finalbody
+            for n in ast.walk(statement)
+            if isinstance(n, ast.Call) and isinstance(n.func, (ast.Name, ast.Attribute))
+        ]
+        self.assertNotIn("finish_conversion", names)
+        self.assertIn("finish_conversion_best_effort", names)
+
     def test_stale_status_is_not_decided_on(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

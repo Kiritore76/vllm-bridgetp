@@ -60,7 +60,7 @@
     "tools/bridge_tp/inspect_stream_run.py": "14c293fde1c4c59f96e3efccf53f1c7135f143ddb3f6f8f501abc13daa32a369",
     "tools/bridge_tp/inspect_takeover_run.py": "2dd402d3af6c0e97369188be223efeb2cb771a42635b7314caf9fde978eac3dc",
     "tools/bridge_tp/isolated_collector.py": "8f889d05b722b62f060f55726f461b3b388f3c743eff36511210b257ddf42e8b",
-    "tools/bridge_tp/launch_pressure_balanced_pilot.py": "69c2918c52cd9e257f3b72bd3e377a9225ab62e424063b06ba693f72cfafe1d8",
+    "tools/bridge_tp/launch_pressure_balanced_pilot.py": "d8a2798ddae9c149de5ec65709c4e94c31bd0cdf20abfa9019c098c743f1ed53",
     "tools/bridge_tp/measure_agreement.py": "f4c11d8ebdb440054abf466d9fbaa397b51e8a03752f2dd046f7452f98647096",
     "tools/bridge_tp/output_quality.py": "e15ad4eb3dcb41917b402efd65ab1a7eee2e5d85f4d03cb57570ed60db4c7ec5",
     "tools/bridge_tp/phase8_stager.py": "5048849ff8c36d6635a1574202fe7d3125c59c5869a99534ecde2b0ff9fb8372",

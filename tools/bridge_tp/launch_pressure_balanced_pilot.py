@@ -1067,6 +1067,17 @@ def finish_conversion(driver, root):
     return outcome
 
 
+def finish_conversion_best_effort(driver, root):
+    """Scene-failure path: stop the driver; a failed result write must not
+    prevent the caller from stopping its engines. The scene's own failure is
+    what propagates."""
+    try:
+        return finish_conversion(driver, root)
+    except Exception as error:
+        print(f"[收尾] 转换结果未写入：{error!r}", flush=True)
+        return None
+
+
 def run_scene(
     spec,
     scene,
@@ -1364,10 +1375,13 @@ def run_scene(
         raise
     finally:
         scene_failed = sys.exc_info()[0] is not None
+        # Nothing that can fail (a full disk, 11-01) may run ahead of stopping
+        # the owned engines: they outlived the scene and held the GPUs.
         if driver is not None and driver.thread is not None:
-            finish_conversion(driver, root)
+            finish_conversion_best_effort(driver, root)
         if monitor:
-            (root / "host_monitor.stop").touch()
+            with contextlib.suppress(OSError):
+                (root / "host_monitor.stop").touch()
             with contextlib.suppress(subprocess.TimeoutExpired):
                 monitor.process.wait(timeout=8)
         announce(scene["name"], "清理本场受管进程，核对退出")
