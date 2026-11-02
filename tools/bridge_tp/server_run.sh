@@ -3,12 +3,13 @@
 # 运行：
 #   cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 #
-# 当前任务：提交补齐加短请求分流，L1A两场，约25分钟（用户11-02：先做补齐，分流稍微改一下，重跑）。
-# 1. burst_short8 L1A-kvshort：短8 req/s + 6条长请求（16384/8192）。
-#    上一次提交等待94.31s，TP2排队约98条、TTFT P95 34.81s。
-#    看：提交不再等待（commit_filled_source_tokens），P95是否下降，有没有抢占或长中断。
-# 2. burst_short2 L1A-kvshort：短2 req/s + 6条长请求，确认低负载没有变差（上次soft 360.2，迁移2次）。
-# 都直接以静态L1A启动（A={2,3}，B={0,1}，双32768/.88），无转换、无决策器，迁移开启。
+# 当前任务：确定两条短请求转换线（用户11-02），7场，约1.5小时。
+# 第一组 L2转L1A：burst_short6、burst_short7，短6或7 req/s，120s起每2s一条长请求（16384/8192）共6条。
+#   burst_short6 L1A-kvshort；burst_short7 L1A-kvshort、L2。短6的L2已有；短8时L2已过载。
+# 第二组 L1A转L0：steady_short10、steady_short12，warm 4 req/s 60s，然后短10或12 req/s到420s，
+#   长请求每100s一条共3条（16384/8192），再加60s收尾。各跑 L1A-kvshort、L0。
+# 都直接以静态布局启动（A={2,3}，B={0,1}，双32768/.88），无转换、无决策器。
+# 看：全部请求完成、退出码0；短请求TTFT、E2E、排队和长中断。短8起控制器已到单核上限，第二组数字可能偏大。
 # 磁盘可用不足8GB或GPU未空闲就停；一场失败不中断其余场。
 # 每场的无损compact包校验通过后删除该场原始目录，所以磁盘占用不随场数累积；
 # 没有得到有效compact包的场保留原始目录。全程每秒采样GPU显存与利用率。
@@ -20,7 +21,7 @@ model=/root/autodl-tmp/models/Qwen3-8B
 branch=bridgetp/tp2-4090d-qwen3-8b
 task=qwen3_layout_boundary
 # 每场：负载:布局；L1A-stay不执行迁移，L1A-kvshort短请求不受KV保护分流
-scenes="burst_short8:L1A-kvshort burst_short2:L1A-kvshort"
+scenes="burst_short6:L1A-kvshort burst_short7:L1A-kvshort burst_short7:L2 steady_short10:L1A-kvshort steady_short10:L0 steady_short12:L1A-kvshort steady_short12:L0"
 
 cd "$repo" || exit 1
 source "$venv/bin/activate" || exit 1

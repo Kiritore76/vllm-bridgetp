@@ -102,6 +102,33 @@ SCENARIOS = {
         ),
         long=(16384, 8192),
     ),
+    "burst_short7": dict(
+        phases=(
+            (0, 120, 7.0, 0.0, "warm"),
+            (120, 132, 7.0, 0.5, "burst"),
+            (132, 420, 7.0, 0.0, "after"),
+            (420, 480, 1.0, 0.0, "tail"),
+        ),
+        long=(16384, 8192),
+    ),
+    # Where L0 starts to beat L1A (user 11-02): sustained short load with a few
+    # very long requests, spaced so that they rarely share a TP1.
+    "steady_short10": dict(
+        phases=(
+            (0, 60, 4.0, 0.0, "warm"),
+            (60, 420, 10.0, 0.01, "peak"),
+            (420, 480, 1.0, 0.0, "tail"),
+        ),
+        long=(16384, 8192),
+    ),
+    "steady_short12": dict(
+        phases=(
+            (0, 60, 4.0, 0.0, "warm"),
+            (60, 420, 12.0, 0.01, "peak"),
+            (420, 480, 1.0, 0.0, "tail"),
+        ),
+        long=(16384, 8192),
+    ),
     "burst_short8": dict(
         phases=(
             (0, 120, 8.0, 0.0, "warm"),

@@ -155,6 +155,7 @@ class StaticLayoutTests(unittest.TestCase):
             ("burst_short2", 2),
             ("burst_short3", 3),
             ("burst_short6", 6),
+            ("burst_short7", 7),
             ("burst_short8", 8),
         ):
             jobs = phase.jobs(inputs, scenario)
@@ -169,6 +170,30 @@ class StaticLayoutTests(unittest.TestCase):
             )
             short = [j for j in jobs if j["workload_role"] == "short_probe"]
             self.assertEqual(sum(j["at_s"] < 420 for j in short), 420 * rate)
+
+    def test_steady_short_scenarios_keep_a_few_spaced_long_requests(self):
+        from tools.bridge_tp import qwen3_phase_shift as phase
+
+        inputs = json.loads(Path(INPUTS).read_text(encoding="utf-8"))
+        for scenario, rate in (("steady_short10", 10), ("steady_short12", 12)):
+            jobs = phase.jobs(inputs, scenario)
+            long = [j for j in jobs if j["workload_role"] == "long_input_output"]
+            self.assertEqual([j["at_s"] for j in long], [60, 160, 260])
+            peak = [
+                j
+                for j in jobs
+                if j["workload_role"] == "short_probe" and 60 <= j["at_s"] < 420
+            ]
+            self.assertEqual(len(peak), 360 * rate)
+            code, value = plan(
+                "--phase-shift",
+                "--phase-scenario",
+                scenario,
+                "--expanded-context",
+                "--static-layout",
+                "L0",
+            )
+            self.assertEqual((code, value["runs"], value["arms"]), (0, 1, ["stay"]))
 
     def test_burst9_is_the_most_l1a_holds_at_final_length(self):
         from tools.bridge_tp import qwen3_phase_shift as phase
