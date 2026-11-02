@@ -151,7 +151,12 @@ class StaticLayoutTests(unittest.TestCase):
         from tools.bridge_tp import qwen3_phase_shift as phase
 
         inputs = json.loads(Path(INPUTS).read_text(encoding="utf-8"))
-        for scenario, rate in (("burst_short6", 6), ("burst_short8", 8)):
+        for scenario, rate in (
+            ("burst_short2", 2),
+            ("burst_short3", 3),
+            ("burst_short6", 6),
+            ("burst_short8", 8),
+        ):
             jobs = phase.jobs(inputs, scenario)
             long = [j for j in jobs if j["workload_role"] == "long_input_output"]
             self.assertEqual([j["at_s"] for j in long], [120 + 2 * i for i in range(6)])

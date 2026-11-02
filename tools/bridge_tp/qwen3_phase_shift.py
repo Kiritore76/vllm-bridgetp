@@ -70,6 +70,26 @@ SCENARIOS = {
         ),
         long=(6144, 2048),
     ),
+    # The deep long burst (user 11-02) migrated at 0.5 req/s of short requests
+    # and did not at 6: the rungs between, on the same six long requests.
+    "burst_short2": dict(
+        phases=(
+            (0, 120, 2.0, 0.0, "warm"),
+            (120, 132, 2.0, 0.5, "burst"),
+            (132, 420, 2.0, 0.0, "after"),
+            (420, 480, 1.0, 0.0, "tail"),
+        ),
+        long=(16384, 8192),
+    ),
+    "burst_short3": dict(
+        phases=(
+            (0, 120, 3.0, 0.0, "warm"),
+            (120, 132, 3.0, 0.5, "burst"),
+            (132, 420, 3.0, 0.0, "after"),
+            (420, 480, 1.0, 0.0, "tail"),
+        ),
+        long=(16384, 8192),
+    ),
     # Migration's own case (user 11-02): a burst of six very long requests over
     # steady short load near the L2 limit. L0 cannot hold them, L2 queues the
     # short requests, and no layout has time to convert.
