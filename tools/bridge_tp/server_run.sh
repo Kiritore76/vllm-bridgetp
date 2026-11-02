@@ -3,12 +3,12 @@
 # 运行：
 #   cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 #
-# 当前任务：重跑 burst_short8 L1A 一场（用户11-02：先修再跑），约12分钟。L2、L0已有结果，不重跑。
-# 上一次：第一次迁移提交时控制器只收到第3899个token，边界在4842，StreamViolation退出。
-# 现在提交前等控制器收齐边界之前的源端token，审计记录 commit_waits_for_source_stream 和等待时长。
-# 负载：短8 req/s，120s起每2s一条长请求（16384/8192）共6条，420s，再加60s收尾。
-# 直接以L1A启动（A={2,3}，B={0,1}，双32768/.88），无转换、无决策器，迁移开启。
-# 看：全部请求完成、退出码0；提交等了多久；与L2（TTFT中位最高44s）、L0（中断135s）相比如何。
+# 当前任务：提交补齐加短请求分流，L1A两场，约25分钟（用户11-02：先做补齐，分流稍微改一下，重跑）。
+# 1. burst_short8 L1A-kvshort：短8 req/s + 6条长请求（16384/8192）。
+#    上一次提交等待94.31s，TP2排队约98条、TTFT P95 34.81s。
+#    看：提交不再等待（commit_filled_source_tokens），P95是否下降，有没有抢占或长中断。
+# 2. burst_short2 L1A-kvshort：短2 req/s + 6条长请求，确认低负载没有变差（上次soft 360.2，迁移2次）。
+# 都直接以静态L1A启动（A={2,3}，B={0,1}，双32768/.88），无转换、无决策器，迁移开启。
 # 磁盘可用不足8GB或GPU未空闲就停；一场失败不中断其余场。
 # 每场的无损compact包校验通过后删除该场原始目录，所以磁盘占用不随场数累积；
 # 没有得到有效compact包的场保留原始目录。全程每秒采样GPU显存与利用率。
@@ -19,8 +19,8 @@ py=$venv/bin/python
 model=/root/autodl-tmp/models/Qwen3-8B
 branch=bridgetp/tp2-4090d-qwen3-8b
 task=qwen3_layout_boundary
-# 每场：负载:布局；L1A-stay是同引擎同通道、不执行迁移的对照
-scenes="burst_short8:L1A"
+# 每场：负载:布局；L1A-stay不执行迁移，L1A-kvshort短请求不受KV保护分流
+scenes="burst_short8:L1A-kvshort burst_short2:L1A-kvshort"
 
 cd "$repo" || exit 1
 source "$venv/bin/activate" || exit 1
@@ -63,6 +63,7 @@ for scene in $scenes; do
     layout=${scene##*:}
     extra=()
     [ "$layout" = L1A-stay ] && extra=(--static-no-migrate)
+    [ "$layout" = L1A-kvshort ] && extra=(--kv-short-exempt)
     name="$scenario-$layout"
     excludes+=(--exclude="$(basename "$run")/$name")
     avail=$(df --output=avail -k "$run" | tail -1)
@@ -75,7 +76,7 @@ for scene in $scenes; do
     echo "=== 开始：$name（$(date +%T)）==="
     date +%s.%N > "$run/$name.started_unix_s"
     "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
-        --phase-shift --phase-scenario "$scenario" --static-layout "${layout%-stay}" "${extra[@]}" \
+        --phase-shift --phase-scenario "$scenario" --static-layout "${layout%%-*}" "${extra[@]}" \
         --expanded-context --current-machine --repetitions 1 \
         --model "$model" \
         --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \

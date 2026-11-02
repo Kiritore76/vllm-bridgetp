@@ -124,6 +124,30 @@ class ClassRoutingTests(unittest.TestCase):
                 [asdict(row) for row in co.ledger.entries.values()],
             )
 
+    def test_queue_routing_returns_short_requests_to_a_warned_tp1(self):
+        cfg = replace(
+            workload_cfg(queue_routing=True),
+            capacity_lookahead_s=8.0,
+            kv_routing_priority=True,
+        )
+
+        warned = dict(free_blocks=179, growth_blocks_s=7.25)
+
+        def route(limit):
+            rows = [
+                inst("a1", load=2.75, now=10, waiting=0, **warned),
+                inst("a2", load=2.75, now=10, waiting=0, **warned),
+                inst("b1", "tp4", load=2.6875, now=10, waiting=40),
+            ]
+            co, _ = coordinator(replace(cfg, kv_short_exempt_blocks=limit))
+            result = co.admission_multi("q", 512, 128, rows, TP, 10, "k")
+            return result.pool_id, result.routing_reason
+
+        self.assertEqual(route(0)[0], "b1")
+        pool_id, reason = route(64)
+        self.assertIn(pool_id, {"a1", "a2"})
+        self.assertTrue(reason.startswith("queue-aware"), reason)
+
     def test_queue_routing_avoids_a_queueing_tp2(self):
         # L1A at 8 req/s: equal projected scores, TP2 queues, TP1s start now.
         def readings(now=10, waiting=12, **tp1):

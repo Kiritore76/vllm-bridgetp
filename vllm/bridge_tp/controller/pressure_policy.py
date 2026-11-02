@@ -52,6 +52,9 @@ class PressureConfig:
     # projected slot costs come from long-context profiles and overrate TP2
     # for short requests (four-card rate sweep, 2026-11-01).
     queue_routing: bool = False
+    # Requests up to this final size stay eligible for TP1 under KV protection
+    # while they physically fit; KV is relieved by migrating long requests.
+    kv_short_exempt_blocks: int = 0
     health_service: bool = False
     # Route from passive health/KV evidence, without fixed prompt cutoffs.
     pressure_routing: bool = False
@@ -88,6 +91,9 @@ class PressureConfig:
             and type(self.kv_routing_priority) is bool
             and type(self.queue_routing) is bool
             and (not self.queue_routing or self.workload_pressure)
+            and type(self.kv_short_exempt_blocks) is int
+            and self.kv_short_exempt_blocks >= 0
+            and (not self.kv_short_exempt_blocks or self.kv_routing_priority)
             and (not self.kv_routing_priority or (
                 self.workload_pressure and self.capacity_lookahead_s > 0
             ))
@@ -129,6 +135,8 @@ class PressureConfig:
             values.pop("kv_routing_priority")
         if not self.queue_routing:
             values.pop("queue_routing")
+        if not self.kv_short_exempt_blocks:
+            values.pop("kv_short_exempt_blocks")
         return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
@@ -1342,6 +1350,11 @@ def admit(
     )
     if cfg.pressure_routing:
         routing_reason = "TP1 pressure and TP4 spare" if prefer_target else "prefer TP1"
+    short_fit = (
+        cfg.kv_routing_priority
+        and routing_strategy == "pressure"
+        and kv_routing.short_fits(pools[0], ledger, cfg, now, prompt_tokens, output_cap)
+    )
     if cfg.workload_pressure and routing_strategy == "pressure":
         projected = {
             reading.pool_id: projected_pressure(
@@ -1349,10 +1362,14 @@ def admit(
             )
             for reading in (source, target)
         }
-        a, b = (projected[pool.pool_id]["score"] for pool in pools)
+        # A short request that fits is balanced on service alone: KV relief is
+        # left to migrating long requests.
+        scored = "service" if short_fit else "score"
+        a, b = (projected[pool.pool_id][scored] for pool in pools)
         ac, bc = (projected[pool.pool_id]["capacity"] for pool in pools)
         if (
-            a is not None
+            not short_fit
+            and a is not None
             and b is not None
             and ac is not None
             and bc is not None
@@ -1435,8 +1452,13 @@ def admit(
             and queues[index] > queues[1 - index]
             and other in eligible
             and capacity[other.pool_id]["status"] == "FIT"
-            and projected[other.pool_id]["capacity"] is not None
-            and projected[other.pool_id]["capacity"] < 1
+            and (
+                (short_fit and other is pools[0])
+                or (
+                    projected[other.pool_id]["capacity"] is not None
+                    and projected[other.pool_id]["capacity"] < 1
+                )
+            )
         ):
             preferred = other
             routing_reason = (
@@ -1482,7 +1504,14 @@ def admit(
         and all(pool in eligible for pool in pools)
     ):
         routing_kv = kv_routing.preference(
-            pools, ledger, cfg, now, prompt_tokens, capacity, kv_routing_state
+            pools,
+            ledger,
+            cfg,
+            now,
+            prompt_tokens,
+            capacity,
+            kv_routing_state,
+            short_fit=short_fit,
         )
         routing_kv["previous_pool_id"] = eligible[0].pool_id
         if routing_kv["redirect"]:

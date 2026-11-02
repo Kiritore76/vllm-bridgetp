@@ -297,6 +297,11 @@ def main(argv=None):
         help="static L1A with the same engines and channels but no migration",
     )
     parser.add_argument(
+        "--kv-short-exempt",
+        action="store_true",
+        help="static L1A: short requests stay eligible for TP1 under KV protection",
+    )
+    parser.add_argument(
         "--conversion-assist",
         action="store_true",
         help="S5a: SELECTIVE_ROLL drain assist (merging edge L1A-L2 only)",
@@ -343,6 +348,8 @@ def main(argv=None):
         args.static_layout != "L1A" or args.conversion_decider
     ):
         parser.error("--static-no-migrate is a static L1A control without a decider")
+    if args.kv_short_exempt and args.static_layout != "L1A":
+        parser.error("--kv-short-exempt is a static L1A routing option")
     if args.conversion_assist and args.conversion != "L1A-L2":
         parser.error("drain assist merges TP1s into a TP2 (L1A-L2) only")
     if not 0 <= args.conversion_trigger_s < 300:
@@ -460,6 +467,10 @@ def main(argv=None):
             # One arm: the layout as it would run. Only L1A has a pair.
             migrate = args.static_layout == "L1A" and not args.static_no_migrate
             cfg["arms"] = ["migrate" if migrate else "stay"]
+            if args.kv_short_exempt:
+                cfg["policy_overrides"] = dict(
+                    cfg["policy_overrides"], kv_short_exempt_blocks=64
+                )
             if args.long_burst_pair:
                 cfg["recipes"] = [
                     r for r in cfg["recipes"] if r["scenario"] == "deep_long_burst"

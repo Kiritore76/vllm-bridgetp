@@ -49,6 +49,27 @@ def risk(pool, ledger, cfg, now, prompt_tokens=0):
     )
 
 
+def short_fits(pool, ledger, cfg, now, prompt_tokens, output_cap):
+    """A short request physically fits, so KV relief can stay with migration.
+
+    The guard and projected growth are left out on purpose: they are what raises
+    the KV warning, and that warning is answered by migrating a long request
+    (user 11-02). Twice the request keeps it from taking the last free blocks.
+    """
+    limit = cfg.kv_short_exempt_blocks
+    value = risk(pool, ledger, cfg, now) if limit > 0 else None
+    if value is None:
+        return False
+    final = math.ceil((prompt_tokens + output_cap) / pool.block_size)
+    available = (
+        value["free_blocks"]
+        - value["native_unallocated_blocks"]
+        - value["unpublished_prompt_blocks"]
+        - value["migration_pending_blocks"]
+    )
+    return final <= limit and available >= 2 * final
+
+
 class KVRouteProtection:
     def __init__(self):
         self.active = False
@@ -80,7 +101,7 @@ class KVRouteProtection:
         return dict(vars(self))
 
 
-def preference(pools, ledger, cfg, now, prompt_tokens, fits, state):
+def preference(pools, ledger, cfg, now, prompt_tokens, fits, state, short_fit=False):
     source, target = [risk(pool, ledger, cfg, now, prompt_tokens) for pool in pools]
     held = bool(state and state.get("active"))
     urgent = source is not None and source["pressure"] >= 1
@@ -95,6 +116,9 @@ def preference(pools, ledger, cfg, now, prompt_tokens, fits, state):
     if source is None or target is None:
         result["mode"] = "KV_EVIDENCE_UNAVAILABLE"
         result["reason"] = "KV evidence unavailable; original routing"
+    elif short_fit and (urgent or held):
+        result["mode"] = "KV_SHORT_EXEMPT"
+        result["reason"] = "short request fits TP1; migration relieves KV"
     elif urgent or held:
         result["mode"] = "KV_URGENT" if urgent else "KV_RECOVERY_HOLD"
         source_fit, target_fit = [fits[pool.pool_id]["status"] for pool in pools]

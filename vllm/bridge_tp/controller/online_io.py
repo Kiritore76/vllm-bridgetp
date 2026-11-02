@@ -173,6 +173,7 @@ class ProxyRecorder:
         self._lock = threading.Lock()
         self._target_offset: int | None = None
         self._pending_target: list[tuple[int, int, float]] = []
+        self._known_output: list[int] | None = None
 
     def on_source_token(self, index: int, token_id: int, unix_s: float) -> None:
         with self._lock:
@@ -196,8 +197,18 @@ class ProxyRecorder:
                 return
             self._publish(self.proxy.on_target_token(global_index, token_id, unix_s))
 
+    def set_known_output(self, known_output: list[int]) -> None:
+        with self._lock:
+            self._known_output = known_output
+
+    def filled_source_tokens(self) -> int:
+        with self._lock:
+            return self.proxy._filled_source
+
     def on_commit(self, unix_s: float) -> None:
         with self._lock:
+            if self._known_output is not None:
+                self._publish(self.proxy.fill_to_cutover(self._known_output, unix_s))
             self.proxy.on_commit(unix_s)
             for index, token_id, _token_unix_s in self._pending_target:
                 self._publish(self.proxy.on_target_token(index, token_id, unix_s))

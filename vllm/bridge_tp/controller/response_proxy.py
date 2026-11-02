@@ -103,6 +103,8 @@ class ResponseProxy:
     _held: list[tuple[int, int, float]] = field(default_factory=list, repr=False)
     _discarded_source: int = field(default=0, repr=False)
     _verified_overlap: int = field(default=0, repr=False)
+    _known_source: Sequence[int] = field(default=(), repr=False)
+    _filled_source: int = field(default=0, repr=False)
     _last_source_emit_s: float | None = field(default=None, repr=False)
     _first_target_emit_s: float | None = field(default=None, repr=False)
 
@@ -140,6 +142,13 @@ class ResponseProxy:
     ) -> list[EmittedToken]:
         if self.committed:
             # source raced past the abort; its output is no longer authoritative
+            if index < len(self._known_source) and (
+                self._known_source[index] != token_id
+            ):
+                raise StreamViolation(
+                    f"{self.external_request_id}: late source token {index} differs "
+                    "from the frozen boundary history"
+                )
             self._discarded_source += 1
             return []
         if (
@@ -166,6 +175,32 @@ class ResponseProxy:
                 f"already-emitted high water {self.high_water}"
             )
         self.cutover_index = cutover_index
+
+    def fill_to_cutover(
+        self, known_output: Sequence[int], unix_s: float
+    ) -> list[EmittedToken]:
+        """Emit what the stream has not delivered yet, from frozen history.
+
+        Late source tokens would be discarded after commit, and waiting for them
+        keeps the source KV while a loaded controller catches up.
+        """
+        if self.cutover_index is None or len(known_output) != self.cutover_index:
+            raise StreamViolation(
+                f"{self.external_request_id}: known output does not end at the cutover"
+            )
+        for position in range(self.high_water):
+            if self.emitted[position].token_id != known_output[position]:
+                raise StreamViolation(
+                    f"{self.external_request_id}: stream differs from frozen history "
+                    f"at index {position}"
+                )
+        self._known_source = known_output
+        out = [
+            self._emit(index, known_output[index], unix_s, "source")
+            for index in range(self.high_water, self.cutover_index)
+        ]
+        self._filled_source += len(out)
+        return out
 
     def on_commit(self, unix_s: float) -> None:
         if self.cutover_index is None:
@@ -241,6 +276,7 @@ class ResponseProxy:
             "external_request_id": self.external_request_id,
             "mode": self.mode.value,
             "emitted_tokens": len(self.emitted),
+            "filled_source_tokens": self._filled_source,
             "source_origin_tokens": sum(
                 1 for t in self.emitted if t.origin == "source"
             ),

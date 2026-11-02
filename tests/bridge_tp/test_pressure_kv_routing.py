@@ -77,6 +77,45 @@ class KVRoutingTests(unittest.TestCase):
         self.assertGreater(new.routing_kv["target"]["pressure"], 1)
         self.assertTrue(new.routing_kv["changed_route"])
 
+    def test_short_request_that_fits_stays_on_tp1_under_kv_protection(self):
+        def admit(source, prompt=512, output=128, limit=64):
+            cfg = dataclasses.replace(config(), kv_short_exempt_blocks=limit)
+            target = reading("tp4", load=5, free_blocks=6529)
+            return p.admit(
+                "new",
+                prompt,
+                output,
+                (source, target),
+                cfg,
+                p.ReservationLedger(),
+                10,
+                "new-key",
+            )
+
+        warned = reading(load=2, free_blocks=179, growth_blocks_s=7.25)
+        self.assertEqual(
+            route(warned, reading("tp4", load=5, free_blocks=6529), prompt=512).pool_id,
+            "tp4",
+        )
+        kept = admit(warned)
+        self.assertEqual(kept.pool_id, "tp1")
+        self.assertEqual(kept.routing_kv["mode"], "KV_SHORT_EXEMPT")
+        self.assertFalse(kept.routing_kv["redirect"])
+        # Long requests, and short ones that would take the last blocks, move.
+        self.assertEqual(admit(warned, prompt=2048, output=2048).pool_id, "tp4")
+        tight = reading(load=2, free_blocks=60, growth_blocks_s=7.25)
+        self.assertEqual(admit(tight).pool_id, "tp4")
+        pending = reading(
+            load=2, free_blocks=179, growth_blocks_s=7.25, unallocated_prompt_blocks=128
+        )
+        self.assertEqual(admit(pending).pool_id, "tp4")
+        # Off by default, and only meaningful with KV routing.
+        self.assertEqual(admit(warned, limit=0).pool_id, "tp4")
+        with self.assertRaises(ValueError):
+            dataclasses.replace(
+                config(enabled=False), kv_short_exempt_blocks=64
+            ).__post_init__()
+
     def test_both_no_fit_can_choose_safer_native_queue_without_faking_kv(self):
         source = reading(
             load=2,

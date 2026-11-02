@@ -192,6 +192,7 @@ class KVPriorityTests(unittest.TestCase):
         old_values.pop("kv_emergency_priority")
         old_values.pop("kv_routing_priority")
         old_values.pop("queue_routing")
+        old_values.pop("kv_short_exempt_blocks")
         expected = hashlib.sha256(
             json.dumps(old_values, sort_keys=True).encode()
         ).hexdigest()

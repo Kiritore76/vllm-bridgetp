@@ -115,6 +115,7 @@ class RollingPressureSession:
         self.target_future = None
         self.settled = False
         self.stream_wait_since = None
+        self.commit_fills = False
         self.cleanup_requires_shutdown = False
         self.cancel_future = None
         self.cleanup_executor = None
@@ -326,6 +327,11 @@ class RollingPressureSession:
                     raise RuntimeError("rolling freeze differs from manifest")
                 record.cutover_output_tokens = boundary
                 stream.recorder.set_cutover(boundary, time.time())
+                known = cutover.get("all_known_token_ids")
+                if known is not None:
+                    start = int(cutover["num_prompt_tokens"])
+                    stream.recorder.set_known_output(known[start : start + boundary])
+                    self.commit_fills = True
                 self.machine.transition(
                     record.migration_id,
                     MigrationState.READY_NOT_COMMITTED,
@@ -337,9 +343,10 @@ class RollingPressureSession:
                 )
             # The engine reaches the boundary before the client stream does when
             # the controller lags (GPU 11-02: 942 tokens behind). After commit
-            # late source tokens are discarded, so the stream must arrive first.
+            # late source tokens are discarded, so commit fills them from the
+            # manifest; without one the stream must arrive first.
             emitted = stream.recorder.progress()[0]
-            if emitted < record.cutover_output_tokens:
+            if not self.commit_fills and emitted < record.cutover_output_tokens:
                 if self.stream_wait_since is None:
                     self.stream_wait_since = time.time()
                     self.audit.write(
@@ -369,6 +376,14 @@ class RollingPressureSession:
                 time.time(),
                 False,
             )
+            if record.state == MigrationState.TAKEOVER and self.commit_fills:
+                self.audit.write(
+                    {
+                        "kind": "commit_filled_source_tokens",
+                        "migration_id": record.migration_id,
+                        "filled_tokens": stream.recorder.filled_source_tokens(),
+                    }
+                )
         if record.state == MigrationState.TAKEOVER:
             self._confirm_release()
         elif record.state in {MigrationState.ROLLED_BACK, MigrationState.FAILED}:

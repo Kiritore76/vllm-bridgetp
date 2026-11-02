@@ -156,6 +156,44 @@ class SessionTests(unittest.TestCase):
         self.assertTrue(self.recorder.proxy.committed)
         self.assertFalse(self.settlements)  # commit alone does not establish release
 
+    def test_commit_fills_the_stream_from_the_frozen_boundary_at_once(self):
+        known = list(range(45))
+        io.atomic_json_dump(
+            {
+                "cutover_num_output_tokens": 45,
+                "num_prompt_tokens": 2,
+                "all_known_token_ids": [900, 901, *known, 46],
+            },
+            self.path / "cutover_manifest.json",
+        )
+        io.atomic_json_dump(
+            {"cutover_output_tokens": 45}, self.path / "rolling_freeze_selection.json"
+        )
+        self.driver.adapter.ranks = {0, 1, 2, 3}
+        self.driver.tick(self.view, self.snapshot)
+        self.assertEqual(self.driver.adapter.commits, 1)
+        proxy = self.recorder.proxy
+        self.assertEqual(proxy.high_water, 45)
+        self.assertEqual(proxy._filled_source, 5)
+        self.assertEqual([proxy.emitted[i].token_id for i in (40, 44)], [40, 44])
+        # The late tail of the source stream is discarded; a different token is
+        # not, and neither is a gap on the target side.
+        self.recorder.on_source_token(40, 40, 3)
+        self.assertEqual(proxy._discarded_source, 1)
+        with self.assertRaises(RuntimeError):
+            self.recorder.on_source_token(41, 999, 3)
+        self.recorder.on_target_token(0, 450, 4)
+        self.assertEqual(proxy.emitted[45].origin, "target")
+
+    def test_commit_refuses_a_stream_that_differs_from_frozen_history(self):
+        known = list(range(45))
+        known[7] = 999
+        recorder = self.recorder
+        recorder.set_cutover(45, 2)
+        recorder.set_known_output(known)
+        with self.assertRaises(RuntimeError):
+            recorder.on_commit(3)
+
     def test_commit_waits_until_the_client_stream_reaches_the_boundary(self):
         io.atomic_json_dump(
             {"cutover_num_output_tokens": 45}, self.path / "cutover_manifest.json"
