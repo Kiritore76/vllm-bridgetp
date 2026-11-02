@@ -3,16 +3,11 @@
 # 运行：
 #   cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 #
-# 当前任务：决策器真正执行转换（每场最多一次），看短时倾斜有没有优势。约2–2.5小时。
-# 都从L1A启动（A={2,3}：TP1@2、TP1@3；B={0,1}：TP2(0,1)），双32768/.88，fast策略照常迁移。
-# 四种负载，每种两场，只差倾斜：
-#   -tilt  ：提议前60s起（接收方空闲时）不再把新的长请求派给要转换的组，最多90s；
-#   -notilt：不倾斜。
-# 两场都：提议前60s预启动新引擎（闸门挡在碰GPU之前），合并时用辅助迁移。
-#   merge_heavy   ：短0.5 + 长0.4 req/s（6144/2048），420s；长请求多于辅助迁移上限。
-#   merge_moderate：短0.5 + 长0.25 req/s（6144/2048），420s；TP2在倾斜时还有余量。
-#   merge_deep    ：短0.5 + 长0.05 req/s（16384/8192），420s；靠KV压力而不是长请求比例触发。
-#   split_trickle ：短9 + 长0.1 req/s（6144/2048），360s；TP2上一直有零星长请求。
+# 当前任务：验证TP2崩溃修复。上一批merge_deep两场都因TP2引擎崩溃失败：KV满时已迁入的请求
+# 被抢占，带着迁移标记回到等待队列，被按已轮转的会话检查而抛错。现在这种请求在TP2上本地重算。
+# 重跑同一负载（短0.5 + 长0.05 req/s，16384/8192，420s），有/无短时倾斜各一场，约25–30分钟。
+# L1A起步（A={2,3}，B={0,1}），双32768/.88，决策器执行转换（每场最多一次），开预启动和辅助迁移。
+# 看：引擎不再崩溃、全部请求完成；被抢占的迁入请求重算时的输出中断有多长。
 # 磁盘可用不足8GB（单场原始数据实测最多约5.4GB）或GPU未空闲就停；一场失败不中断其余场。
 # 每场的无损compact包校验通过后删除该场原始目录，所以磁盘占用不随场数累积；
 # 没有得到有效compact包的场保留原始目录。全程每秒采样GPU显存与利用率。
@@ -22,8 +17,8 @@ venv=/root/autodl-tmp/bridgetp/.venv_bridge
 py=$venv/bin/python
 model=/root/autodl-tmp/models/Qwen3-8B
 branch=bridgetp/tp2-4090d-qwen3-8b
-task=qwen3_decided_conversion
-scenarios="merge_heavy merge_moderate merge_deep split_trickle"
+task=qwen3_preempt_fix
+scenarios="merge_deep"
 
 cd "$repo" || exit 1
 source "$venv/bin/activate" || exit 1

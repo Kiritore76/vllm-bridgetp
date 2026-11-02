@@ -499,6 +499,9 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         self._remote_attention_servers: dict[str, RemoteAttentionRankServer] = {}
         self._completed_recvs: set[str] = set()
         self._reported_recvs: set[str] = set()
+        # Target requests whose migration finished (scheduler side). A later
+        # preemption recomputes them locally like any other request.
+        self._finalized_target_requests: set[str] = set()
         self._load_errors: dict[str, BaseException] = {}
         self._copy_done_events: dict[str, torch.cuda.Event] = {}
         self._model_wait_streams: set[tuple[str, int]] = set()
@@ -627,6 +630,12 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         return manifest
 
     def _request_matches(self, request: Request) -> bool:
+        # A preempted request returns to the waiting queue with its migration
+        # marker, but only RUNNING requests are preempted, so its transfer is
+        # over. Matching it against the current session would fail and stop the
+        # engine (TP2 at 99.7% KV, GPU 11-02); it just recomputes locally.
+        if request.request_id in self._finalized_target_requests:
+            return False
         params = request.kv_transfer_params or {}
         migration_id = params.get(MIGRATION_PARAM)
         if migration_id is None:
@@ -2796,6 +2805,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         self._release_persistent_payload_buffer(request_id)
         self._pending_requests.pop(request_id, None)
         self._active_requests.pop(request_id, None)
+        self._finalized_target_requests.discard(request_id)
         getattr(self, "_urgent_resume_requests", set()).discard(request_id)
         self._load_threads.pop(request_id, None)
         self._load_errors.pop(request_id, None)
@@ -2869,6 +2879,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             request.num_prompt_tokens = len(token_ids)
             request.block_hashes.clear()
             request.update_block_hashes()
+            self._finalized_target_requests.add(request_id)
             if getattr(self, "urgent_shadow_admission", False):
                 self._urgent_resume_requests.add(request_id)
             if self.ready_sync_mode == _READY_SYNC_STREAM_EVENT:

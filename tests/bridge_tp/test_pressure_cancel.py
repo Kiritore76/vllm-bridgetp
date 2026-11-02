@@ -482,6 +482,7 @@ class ReceiverCancelTests(unittest.TestCase):
                 manifest_path=root / "migration_active" / "session_manifest.json",
                 _release_persistent_payload_buffer=Mock(),
                 _pending_requests={},
+                _finalized_target_requests=set(),
                 _active_requests={},
                 _load_threads={},
                 _load_errors={},

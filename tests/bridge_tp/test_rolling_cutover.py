@@ -542,6 +542,7 @@ class TestActualTargetCallback(unittest.TestCase):
                 namespace,
             )
             connector = types.SimpleNamespace(
+                _finalized_target_requests=set(),
                 _active_requests={"target1": request},
                 gpu_resident_shadow=True,
                 manifest_path=root / "session_manifest.json",
@@ -558,6 +559,71 @@ class TestActualTargetCallback(unittest.TestCase):
             proof = json.loads((root / "rolling_target_finalized.json").read_text())
             self.assertEqual(proof["reserved_known_tokens"], 72)
             self.assertEqual(proof["num_tokens"], 32)
+            self.assertEqual(connector._finalized_target_requests, {"target1"})
+
+    def test_preempted_finalized_request_recomputes_instead_of_matching(self):
+        """GPU 11-02: a migrated request preempted at 99.7% KV came back with
+        its marker, failed against the rotated session and stopped the engine."""
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "vllm/bridge_tp/streaming_connector.py"
+        )
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        cls = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "BridgeTPStreamingConnector"
+        )
+        wanted = {"_request_matches", "get_num_new_matched_tokens"}
+        methods = [
+            n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in wanted
+        ]
+        self.assertEqual(len(methods), 2)
+        namespace = {"MIGRATION_PARAM": "marker"}
+        future = ast.parse("from __future__ import annotations").body[0]
+        exec(
+            compile(
+                ast.Module(body=[future, *methods], type_ignores=[]), str(path), "exec"
+            ),
+            namespace,
+        )
+        request = types.SimpleNamespace(
+            request_id="target1",
+            kv_transfer_params={"marker": "m-old"},
+            prompt_token_ids=[1, 2, 3],
+            num_tokens=4,
+        )
+
+        class Connector:
+            gpu_resident_shadow = False
+            _claimed_target_request_id = None
+
+            def __init__(self):
+                self._finalized_target_requests = set()
+                self.loaded = []
+
+            def _load_manifest(self, expected=None):
+                self.loaded.append(expected)
+                raise ValueError("the session has rotated")
+
+            def _request_matches(self, request):
+                return namespace["_request_matches"](self, request)
+
+        connector = Connector()
+        matched = namespace["get_num_new_matched_tokens"]
+        # Still in its migration: checked against the session, as before.
+        with self.assertRaisesRegex(ValueError, "rotated"):
+            matched(connector, request, 0)
+        self.assertEqual(connector.loaded, ["m-old"])
+        # Finalized, then preempted: an ordinary local recompute.
+        connector._finalized_target_requests.add("target1")
+        self.assertEqual(matched(connector, request, 0), (0, False))
+        self.assertEqual(connector.loaded, ["m-old"])
+        # Another request is not affected.
+        other = types.SimpleNamespace(
+            request_id="other", kv_transfer_params=None, prompt_token_ids=[1]
+        )
+        self.assertEqual(matched(connector, other, 0), (0, False))
 
 
 class TestSafeRollingCancel(unittest.TestCase):
