@@ -3,12 +3,11 @@
 # 运行：
 #   cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 #
-# 当前任务：L1A与L2的分界，6144/2048这一组6场，约1.3小时。16384/8192组6场已通过
-# （qwen3_layout_boundary_20261102_161052_16419）：L2 soft +2.0%/+7.5%/+9.0%。
-# 都直接以静态布局启动（A={2,3}，B={0,1}，双32768/.88），不转换，无决策器；L1A照常迁移。
-# 负载：短0.5 + 长0.1/0.25/0.4 req/s（6144/2048），420s，再加60s收尾。
-# 看：全部请求完成、退出码0；吞吐为主的负载上L2是否仍胜过L1A，merge_heavy上L2能否撑住。
-# 这批之后：short_mid/split_trickle 各跑L0、L1A、L2。
+# 当前任务：迁移价值测试第一场 burst_short6 静态L1A（用户11-02：先跑一个，没问题再跑其余），
+# 约12–15分钟。负载：短6 req/s，120s起每2s一条长请求共6条（16384/8192），420s，再加60s收尾。
+# 直接以L1A启动（A={2,3}，B={0,1}，双32768/.88），无转换、无决策器，迁移开启。
+# 看：全部请求完成、退出码0，确认新负载可用。
+# 没问题后的其余场次：burst_short6 的 L2、L0、L1A不迁移；burst_short8 的 L1A、L2、L0、L1A不迁移。
 # 磁盘可用不足8GB或GPU未空闲就停；一场失败不中断其余场。
 # 每场的无损compact包校验通过后删除该场原始目录，所以磁盘占用不随场数累积；
 # 没有得到有效compact包的场保留原始目录。全程每秒采样GPU显存与利用率。
@@ -19,8 +18,8 @@ py=$venv/bin/python
 model=/root/autodl-tmp/models/Qwen3-8B
 branch=bridgetp/tp2-4090d-qwen3-8b
 task=qwen3_layout_boundary
-# 每场：负载:布局
-scenes="merge_moderate:L2 merge_moderate:L1A merge_light:L2 merge_light:L1A merge_heavy:L2 merge_heavy:L1A"
+# 每场：负载:布局；L1A-stay是同引擎同通道、不执行迁移的对照
+scenes="burst_short6:L1A"
 
 cd "$repo" || exit 1
 source "$venv/bin/activate" || exit 1
@@ -61,6 +60,8 @@ excludes=()
 for scene in $scenes; do
     scenario=${scene%%:*}
     layout=${scene##*:}
+    extra=()
+    [ "$layout" = L1A-stay ] && extra=(--static-no-migrate)
     name="$scenario-$layout"
     excludes+=(--exclude="$(basename "$run")/$name")
     avail=$(df --output=avail -k "$run" | tail -1)
@@ -73,7 +74,7 @@ for scene in $scenes; do
     echo "=== 开始：$name（$(date +%T)）==="
     date +%s.%N > "$run/$name.started_unix_s"
     "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
-        --phase-shift --phase-scenario "$scenario" --static-layout "$layout" \
+        --phase-shift --phase-scenario "$scenario" --static-layout "${layout%-stay}" "${extra[@]}" \
         --expanded-context --current-machine --repetitions 1 \
         --model "$model" \
         --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \

@@ -70,6 +70,27 @@ SCENARIOS = {
         ),
         long=(6144, 2048),
     ),
+    # Migration's own case (user 11-02): a burst of six very long requests over
+    # steady short load near the L2 limit. L0 cannot hold them, L2 queues the
+    # short requests, and no layout has time to convert.
+    "burst_short6": dict(
+        phases=(
+            (0, 120, 6.0, 0.0, "warm"),
+            (120, 132, 6.0, 0.5, "burst"),
+            (132, 420, 6.0, 0.0, "after"),
+            (420, 480, 1.0, 0.0, "tail"),
+        ),
+        long=(16384, 8192),
+    ),
+    "burst_short8": dict(
+        phases=(
+            (0, 120, 8.0, 0.0, "warm"),
+            (120, 132, 8.0, 0.5, "burst"),
+            (132, 420, 8.0, 0.0, "after"),
+            (420, 480, 1.0, 0.0, "tail"),
+        ),
+        long=(16384, 8192),
+    ),
     # A short peak with a trickle of long requests, which keep the TP-k from
     # ever being free of them unless routed away.
     "split_trickle": dict(

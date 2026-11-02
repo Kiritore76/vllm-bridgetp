@@ -292,6 +292,11 @@ def main(argv=None):
         "A={2,3}, B={0,1}; L1A migrates (per-source channels), L0/L2 cannot",
     )
     parser.add_argument(
+        "--static-no-migrate",
+        action="store_true",
+        help="static L1A with the same engines and channels but no migration",
+    )
+    parser.add_argument(
         "--conversion-assist",
         action="store_true",
         help="S5a: SELECTIVE_ROLL drain assist (merging edge L1A-L2 only)",
@@ -334,6 +339,10 @@ def main(argv=None):
             "static-layout screens the routine or long-burst workloads on the "
             "current machine, without conversion or other layout options"
         )
+    if args.static_no_migrate and (
+        args.static_layout != "L1A" or args.conversion_decider
+    ):
+        parser.error("--static-no-migrate is a static L1A control without a decider")
     if args.conversion_assist and args.conversion != "L1A-L2":
         parser.error("drain assist merges TP1s into a TP2 (L1A-L2) only")
     if not 0 <= args.conversion_trigger_s < 300:
@@ -449,7 +458,8 @@ def main(argv=None):
             )
         if args.static_layout:
             # One arm: the layout as it would run. Only L1A has a pair.
-            cfg["arms"] = ["migrate" if args.static_layout == "L1A" else "stay"]
+            migrate = args.static_layout == "L1A" and not args.static_no_migrate
+            cfg["arms"] = ["migrate" if migrate else "stay"]
             if args.long_burst_pair:
                 cfg["recipes"] = [
                     r for r in cfg["recipes"] if r["scenario"] == "deep_long_burst"

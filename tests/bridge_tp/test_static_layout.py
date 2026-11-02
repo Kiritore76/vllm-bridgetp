@@ -147,6 +147,47 @@ class StaticLayoutTests(unittest.TestCase):
                 )
                 self.assertEqual((code, value["runs"], value["arms"]), (0, 1, [arm]))
 
+    def test_burst_scenarios_add_six_long_requests_to_steady_short_load(self):
+        from tools.bridge_tp import qwen3_phase_shift as phase
+
+        inputs = json.loads(Path(INPUTS).read_text(encoding="utf-8"))
+        for scenario, rate in (("burst_short6", 6), ("burst_short8", 8)):
+            jobs = phase.jobs(inputs, scenario)
+            long = [j for j in jobs if j["workload_role"] == "long_input_output"]
+            self.assertEqual([j["at_s"] for j in long], [120 + 2 * i for i in range(6)])
+            self.assertEqual(
+                {
+                    (len(j["request"]["prompt"]), j["request"]["max_tokens"])
+                    for j in long
+                },
+                {(16384, 8192)},
+            )
+            short = [j for j in jobs if j["workload_role"] == "short_probe"]
+            self.assertEqual(sum(j["at_s"] < 420 for j in short), 420 * rate)
+
+    def test_static_no_migrate_is_an_l1a_control(self):
+        code, value = plan(
+            "--phase-shift",
+            "--phase-scenario",
+            "burst_short6",
+            "--expanded-context",
+            "--static-layout",
+            "L1A",
+            "--static-no-migrate",
+        )
+        self.assertEqual((code, value["runs"], value["arms"]), (0, 1, ["stay"]))
+        for args in (
+            ["--static-layout", "L2"],
+            ["--static-layout", "L1A", "--conversion-decider", "record"],
+        ):
+            with (
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                plan(
+                    "--phase-shift", "--expanded-context", "--static-no-migrate", *args
+                )
+
     def test_only_l1a_runs_a_decider_on_a_phase_workload(self):
         code, value = plan(
             "--phase-shift",
