@@ -3,13 +3,13 @@
 # 运行：
 #   cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 #
-# 当前任务：L1A与L2的分界，第一场 merge_deep 静态L2（用户11-02：先跑一个，没问题再跑其余），
-# 约12–15分钟。直接以L2启动（A={2,3}，B={0,1}，双32768/.88），不转换、不迁移、无决策器。
-# 负载：短0.5 + 长0.05 req/s（16384/8192），420s，再加60s收尾。
-# 看：全部请求完成、退出码0；与L1A起步的同负载（qwen3_preempt_fix_20261102_143534_9148，
-# SLO 262/291，soft 318.6，最大中断132.7s）相比L2是否明显更好。单场噪声约soft 5%、SLO 15%。
-# 没问题后的其余场次：merge_light/merge_moderate/merge_heavy、deep_light/deep_mid/merge_deep
-# 各跑L1A和L2；short_mid/split_trickle各跑L0、L1A、L2。
+# 当前任务：L1A与L2的分界，16384/8192这一组余下5场，约1–1.3小时。第一场 merge_deep L2 已通过
+# （qwen3_layout_boundary_20261102_155352_18330，soft 358.1，SLO 280/291）。
+# 都直接以静态布局启动（A={2,3}，B={0,1}，双32768/.88），不转换，无决策器；L1A照常迁移。
+# 负载：短0.5 + 长0.05/0.035/0.02 req/s（16384/8192），420s，再加60s收尾。
+# 看：全部请求完成、退出码0；长请求到达率降到多少时L2不再明显胜过L1A。
+# 这批之后：merge_light/merge_moderate/merge_heavy 各跑L1A和L2；
+# short_mid/split_trickle 各跑L0、L1A、L2。
 # 磁盘可用不足8GB或GPU未空闲就停；一场失败不中断其余场。
 # 每场的无损compact包校验通过后删除该场原始目录，所以磁盘占用不随场数累积；
 # 没有得到有效compact包的场保留原始目录。全程每秒采样GPU显存与利用率。
@@ -21,7 +21,7 @@ model=/root/autodl-tmp/models/Qwen3-8B
 branch=bridgetp/tp2-4090d-qwen3-8b
 task=qwen3_layout_boundary
 # 每场：负载:布局
-scenes="merge_deep:L2"
+scenes="merge_deep:L1A deep_mid:L2 deep_mid:L1A deep_light:L2 deep_light:L1A"
 
 cd "$repo" || exit 1
 source "$venv/bin/activate" || exit 1
