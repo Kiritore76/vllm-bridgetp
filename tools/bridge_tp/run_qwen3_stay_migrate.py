@@ -259,6 +259,17 @@ def main(argv=None):
         "execute its first proposal",
     )
     parser.add_argument(
+        "--phase-scenario",
+        choices=sorted(phase_shift.SCENARIOS),
+        default="phase_shift",
+        help="workload of --phase-shift",
+    )
+    parser.add_argument(
+        "--decider-assist",
+        action="store_true",
+        help="a decided merge drains with SELECTIVE_ROLL (drain assist)",
+    )
+    parser.add_argument(
         "--conversion-prestart",
         action="store_true",
         help="start the replacement engines behind a start gate while draining",
@@ -340,8 +351,8 @@ def main(argv=None):
         parser.error("the conversion decider runs on the phase-shift workload")
     if args.conversion_prestart and not (args.conversion or args.conversion_decider):
         parser.error("--conversion-prestart needs a conversion")
-    if args.decider_pre_tilt and not args.conversion_decider:
-        parser.error("--decider-pre-tilt needs --conversion-decider")
+    if (args.decider_pre_tilt or args.decider_assist) and not args.conversion_decider:
+        parser.error("this option needs --conversion-decider")
     if args.phase_shift:
         if (
             args.routine_four_mode
@@ -412,7 +423,7 @@ def main(argv=None):
         cfg = (
             long_burst.config(read(args.inputs))
             if args.long_burst_pair
-            else phase_shift.config(read(args.inputs))
+            else phase_shift.config(read(args.inputs), args.phase_scenario)
             if args.phase_shift
             else rate_sweep.config(
                 read(args.inputs), args.sweep_rates or rate_sweep.RATES
@@ -709,6 +720,7 @@ def main(argv=None):
                 base_port=8400,
                 prestart=args.conversion_prestart,
                 pre_tilt=args.decider_pre_tilt,
+                assist=args.decider_assist,
             )
         if args.conversion and START_LAYOUT[args.conversion] != "L1A":
             spec["layout"] = dict(

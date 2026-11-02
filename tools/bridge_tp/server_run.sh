@@ -3,22 +3,25 @@
 # 运行：
 #   cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 #
-# 当前任务：加快布局转换的两项改动的GPU检查，两场，约30分钟。
-#   prestart-roll：同S5a第6次（L1A，110s转换L1A-L2，辅助排空ROLL，深长突发），另开预启动：
-#     排空一开始就启动新TP2进程（import、起服务、起工作进程），工作进程在碰GPU之前停在
-#     启动闸门上，旧引擎释放GPU后才放行。对照S5a第6次：停止接入→恢复路由79.6s、重建约37s。
-#   tilt-record：同上次决策器只记录的分阶段负载（L1A，P1短请求高峰、P2长请求、P3平静），
-#     另开路由预倾斜：决策器某个候选一满足，就不再把新的长请求派给那一组（短请求照常），
-#     候选不满足30s后恢复。决策器仍只记录、不转换。看提议时那一组上剩下的长请求是否明显变少。
-# A={2,3}，B={0,1}；双32768/.88。全程每秒采样一次GPU显存与利用率。
-# 一场技术失败（退出码不是0或2）就停。
+# 当前任务：决策器真正执行转换（每场最多一次），看短时倾斜有没有优势。约2–2.5小时。
+# 都从L1A启动（A={2,3}：TP1@2、TP1@3；B={0,1}：TP2(0,1)），双32768/.88，fast策略照常迁移。
+# 四种负载，每种两场，只差倾斜：
+#   -tilt  ：提议前60s起（接收方空闲时）不再把新的长请求派给要转换的组，最多90s；
+#   -notilt：不倾斜。
+# 两场都：提议前60s预启动新引擎（闸门挡在碰GPU之前），合并时用辅助迁移。
+#   merge_heavy   ：短0.5 + 长0.4 req/s（6144/2048），420s；长请求多于辅助迁移上限。
+#   merge_moderate：短0.5 + 长0.25 req/s（6144/2048），420s；TP2在倾斜时还有余量。
+#   merge_deep    ：短0.5 + 长0.05 req/s（16384/8192），420s；靠KV压力而不是长请求比例触发。
+#   split_trickle ：短9 + 长0.1 req/s（6144/2048），360s；TP2上一直有零星长请求。
+# 磁盘可用不足20GB或GPU未空闲就停；一场失败不中断其余场。全程每秒采样GPU显存与利用率。
 
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
 py=$venv/bin/python
 model=/root/autodl-tmp/models/Qwen3-8B
 branch=bridgetp/tp2-4090d-qwen3-8b
-task=qwen3_fast_conversion
+task=qwen3_decided_conversion
+scenarios="merge_heavy merge_moderate merge_deep split_trickle"
 
 cd "$repo" || exit 1
 source "$venv/bin/activate" || exit 1
@@ -54,44 +57,45 @@ trap 'kill "$smi" 2>/dev/null' EXIT
 export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 export VLLM_USE_V2_MODEL_RUNNER=0 OMP_NUM_THREADS=1
 
-common=(
-    --current-machine --repetitions 1
-    --model "$model"
-    --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt"
-    --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json"
-    --expected-revision "$head"
-)
-status=0
-for name in prestart-roll tilt-record; do
-    [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || {
-        echo "上一场后GPU仍有计算进程，停止于 $name 之前。"; status=1; break;
-    }
-    if [ "$name" = prestart-roll ]; then
-        mode=(--long-burst-memory-verify --layout-l1a-channels --conversion L1A-L2
-              --conversion-trigger-s 110 --conversion-assist --conversion-prestart)
-    else
-        mode=(--phase-shift --static-layout L1A --conversion-decider record
-              --decider-pre-tilt --expanded-context)
-    fi
-    echo "=== 开始：$name（$(date +%T)）==="
-    date +%s.%N > "$run/$name.started_unix_s"
-    "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py "${mode[@]}" "${common[@]}" \
-        --output "$run/$name" 2>&1 | tee "$run/$name.console.log"
-    status=${PIPESTATUS[0]}
-    echo "$name 退出码：$status" | tee -a "$run/exit_codes.txt"
-    [ "$status" = 0 ] || [ "$status" = 2 ] || break
+final=0
+excludes=()
+for scenario in $scenarios; do
+    for arm in tilt notilt; do
+        name="$scenario-$arm"
+        excludes+=(--exclude="$(basename "$run")/$name")
+        avail=$(df --output=avail -k "$run" | tail -1)
+        [ "$avail" -ge 20971520 ] || {
+            echo "磁盘可用不足20GB，停止于 $name 之前。"; final=1; break 2;
+        }
+        [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || {
+            echo "上一场后GPU仍有计算进程，停止于 $name 之前。"; final=1; break 2;
+        }
+        extra=()
+        [ "$arm" = tilt ] && extra=(--decider-pre-tilt)
+        echo "=== 开始：$name（$(date +%T)）==="
+        date +%s.%N > "$run/$name.started_unix_s"
+        "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
+            --phase-shift --phase-scenario "$scenario" --static-layout L1A \
+            --conversion-decider execute --decider-assist --conversion-prestart \
+            "${extra[@]}" \
+            --expanded-context --current-machine --repetitions 1 \
+            --model "$model" \
+            --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
+            --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json" \
+            --output "$run/$name" --expected-revision "$head" 2>&1 | tee "$run/$name.console.log"
+        status=${PIPESTATUS[0]}
+        echo "$name 退出码：$status" | tee -a "$run/exit_codes.txt"
+        [ "$status" = 0 ] || final=$status
+    done
 done
 
 kill "$smi" 2>/dev/null
 # 每场的运行包已是compact包；外层只收它们和日志，不重复原始目录。
-tar -C "$(dirname "$run")" -czf "$run.tar.gz" \
-    --exclude="$(basename "$run")/prestart-roll" \
-    --exclude="$(basename "$run")/tilt-record" \
-    "$(basename "$run")"
+tar -C "$(dirname "$run")" -czf "$run.tar.gz" "${excludes[@]}" "$(basename "$run")"
 sha256sum "$run.tar.gz" > "$run.tar.gz.sha256"
 echo '=== 退出码 ==='
 cat "$run/exit_codes.txt"
-echo "最终退出码：$status"
+echo "最终退出码：$final"
 echo "请拿回：$run.tar.gz"
 echo "以及：$run.tar.gz.sha256"
-exit "$status"
+exit "$final"

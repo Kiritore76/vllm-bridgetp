@@ -19,21 +19,55 @@ from tools.bridge_tp import qwen3_pressure_four_mode as pressure
 from tools.bridge_tp import qwen3_rate_sweep as rate_sweep
 from tools.bridge_tp import qwen3_stay_migrate as matched
 
-PHASES = (
-    # (start, end, short req/s, long req/s)
-    (0, 60, 4.0, 0.0, "P1_short"),
-    (60, 360, 9.0, 0.0, "P1_short"),
-    (360, 720, 0.5, 0.4, "P2_long"),
-    (720, 840, 3.0, 0.0, "P3_calm"),
-)
-LONG_PROMPT, LONG_OUTPUT = 6144, 2048
+# (start, end, short req/s, long req/s, phase label) and the long request.
+SCENARIOS = {
+    "phase_shift": dict(
+        phases=(
+            (0, 60, 4.0, 0.0, "P1_short"),
+            (60, 360, 9.0, 0.0, "P1_short"),
+            (360, 720, 0.5, 0.4, "P2_long"),
+            (720, 840, 3.0, 0.0, "P3_calm"),
+        ),
+        long=(6144, 2048),
+    ),
+    # Executed conversions (user 11-02): each scenario gives one decider rule
+    # its case, with time left to see the new layout after the conversion.
+    # Many mid-length long requests: more than assist's cap on a TP1 bundle.
+    "merge_heavy": dict(
+        phases=((0, 420, 0.5, 0.4, "long"), (420, 480, 1.0, 0.0, "tail")),
+        long=(6144, 2048),
+    ),
+    # Fewer of them: the TP-k still has room during a tilt.
+    "merge_moderate": dict(
+        phases=((0, 420, 0.5, 0.25, "long"), (420, 480, 1.0, 0.0, "tail")),
+        long=(6144, 2048),
+    ),
+    # Few, very long: KV pressure rather than their share; assist matters most.
+    "merge_deep": dict(
+        phases=((0, 420, 0.5, 0.05, "long"), (420, 480, 1.0, 0.0, "tail")),
+        long=(16384, 8192),
+    ),
+    # A short peak with a trickle of long requests, which keep the TP-k from
+    # ever being free of them unless routed away.
+    "split_trickle": dict(
+        phases=(
+            (0, 60, 4.0, 0.0, "warm"),
+            (60, 420, 9.0, 0.1, "peak"),
+            (420, 480, 1.0, 0.0, "tail"),
+        ),
+        long=(6144, 2048),
+    ),
+}
+PHASES = SCENARIOS["phase_shift"]["phases"]
+LONG_PROMPT, LONG_OUTPUT = SCENARIOS["phase_shift"]["long"]
 
 
-def jobs(inputs):
+def jobs(inputs, scenario="phase_shift"):
+    value = SCENARIOS[scenario]
     short = rate_sweep.request(inputs)
-    long = long_burst.request(inputs, LONG_PROMPT, LONG_OUTPUT)
+    long = long_burst.request(inputs, *value["long"])
     rows = []
-    for start, end, short_rate, long_rate, phase in PHASES:
+    for start, end, short_rate, long_rate, phase in value["phases"]:
         for rate, body, role in (
             (short_rate, short, "short_probe"),
             (long_rate, long, "long_input_output"),
@@ -56,15 +90,15 @@ def jobs(inputs):
     return rows
 
 
-def config(inputs):
+def config(inputs, scenario="phase_shift"):
     cfg = pressure.updated_config(inputs)
-    values = jobs(inputs)
+    values = jobs(inputs, scenario)
     cfg.update(
         schema="QWEN3_PHASE_SHIFT_V1",
         recipes=[
             dict(
-                name="phase-shift-r1",
-                scenario="phase_shift",
+                name=scenario.replace("_", "-") + "-r1",
+                scenario=scenario,
                 repetition=1,
                 arm_order_offset=0,
                 fixed_output=True,
@@ -72,10 +106,10 @@ def config(inputs):
                 input_sha256=matched.digest(values),
                 planned_output_tokens=sum(j["request"]["max_tokens"] for j in values),
                 routing_scope="all arrivals use the layout's router; no forced pool",
-                phases=[list(p) for p in PHASES],
+                phases=[list(p) for p in SCENARIOS[scenario]["phases"]],
             )
         ],
-        note="short peak, long-request phase, calm tail; for the conversion "
-        "decider; one run, a functional check, not a comparison",
+        note="phases for the conversion decider; one run per scenario, a "
+        "functional check, not a comparison",
     )
     return cfg

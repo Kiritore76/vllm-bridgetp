@@ -12,15 +12,20 @@ tuned later from real runs:
   capacity (or the TP-k queues): convert while it is still calm, before the
   peak. Never a bundle that serves a long request.
 
-A candidate must hold for ``hold_s`` (``urgent_hold_s`` when a TP1's KV is
-at its guard: liveness under pressure), and a capacity-motivated split must
+A candidate must hold for ``hold_s`` (``urgent_hold_s`` when an instance's KV
+is at its guard: liveness under pressure), and a capacity-motivated split must
 gain ``benefit_factor`` times the capacity a conversion removes. Hard safety
-stays with the conversion's start gate and valve.
+stays with the conversion's start gate and valve. Inputs are the
+controller's ``layout_status.json`` and the registry's current layout. KV and
+queue readings flip every second (decider GPU 11-01), so conditions use their
+recent maximum and majority.
 
-Pre-tilt: while a candidate is satisfied (and ``tilt_release_s`` after),
-its bundle is reported in ``tilt``; the driver may then keep new long
-requests off it, so a later drain has little left to wait for. Inputs are the
-controller's ``layout_status.json`` and the registry's current layout.
+Prepare stage, ``tilt_lead_s`` before a proposal and only while the other
+bundles are quiet (the start gate's service check, moved ahead of the load
+the tilt itself adds): the driver may pre-start the replacement engines and
+keep new long requests off the bundle, for at most ``tilt_max_s``. A candidate
+that stops holding ends it at once. A long tilt only moved the pressure onto
+one TP-k (GPU 11-02), and 53s were enough to clear a bundle.
 """
 
 from __future__ import annotations
@@ -45,7 +50,11 @@ RULES = dict(
     benefit_factor=3.0,
     conversion_s=60.0,
     cooldown_s=600.0,
-    tilt_release_s=30.0,
+    tilt_lead_s=60.0,
+    tilt_max_s=90.0,
+    prepare_capacity_max=0.8,
+    smooth_capacity_s=15.0,
+    smooth_waiting_s=10.0,
 )
 
 
@@ -85,9 +94,27 @@ class ConversionDecider:
         self.since = {}
         self.proposed_at = {}
         self.converted_at = None
-        self.satisfied_at = {}  # bundle -> last time a candidate held
+        self.prepared = None  # dict(key, bundle, target_mode, at)
+        self.history = []  # (now, tp1 cap, any cap, tp-k cap, tp-k waiting)
 
-    def signals(self, status, bundles, members):
+    def smooth(self, now, tp1_cap, any_cap, tpk_cap, waiting):
+        r = self.rules
+        self.history.append((now, tp1_cap, any_cap, tpk_cap, waiting))
+        horizon = max(r["smooth_capacity_s"], r["smooth_waiting_s"])
+        self.history = [h for h in self.history if now - h[0] <= horizon]
+
+        def peak(index):
+            values = [
+                h[index]
+                for h in self.history
+                if now - h[0] <= r["smooth_capacity_s"] and h[index] is not None
+            ]
+            return max(values, default=None)
+
+        recent = [h[4] for h in self.history if now - h[0] <= r["smooth_waiting_s"]]
+        return peak(1), peak(2), peak(3), sum(recent) * 2 > len(recent)
+
+    def signals(self, status, bundles, members, now):
         r = self.rules
         workload = status.get("workload") or {}
         arrivals = workload.get("arrivals", 0)
@@ -97,11 +124,12 @@ class ConversionDecider:
         }
         tp1 = {i for b, ids in members.items() if bundles[b] == 1 for i in ids}
 
-        def capacity(i):
-            return ((instances.get(i) or {}).get("pressure") or {}).get("capacity")
+        def pressure(i):
+            return (instances.get(i) or {}).get("pressure") or {}
 
-        caps = {i: capacity(i) for i in instances}
+        caps = {i: pressure(i).get("capacity") for i in instances}
         tp1_caps = [c for i, c in caps.items() if i in tp1 and c is not None]
+        tpk_caps = [c for i, c in caps.items() if i not in tp1 and c is not None]
         starts = [s for _, s in workload.get("migration_starts", ())]
         long_demand = {
             b: sum(
@@ -112,6 +140,19 @@ class ConversionDecider:
             )
             for b, ids in members.items()
         }
+        waiting_now = any(
+            ((instances.get(i) or {}).get("inventory") or {}).get("waiting")
+            for b, ids in members.items()
+            if bundles[b] > 1
+            for i in ids
+        )
+        tp1_max, any_max, tpk_max, waiting = self.smooth(
+            now,
+            max(tp1_caps, default=None),
+            max((c for c in caps.values() if c is not None), default=None),
+            max(tpk_caps, default=None),
+            waiting_now,
+        )
         return dict(
             layout=layout_name(bundles),
             arrivals=arrivals,
@@ -120,46 +161,62 @@ class ConversionDecider:
             else None,
             short_rate=(arrivals - workload.get("long_arrivals", 0)) / window,
             tp1_migrations_per_min=sum(s in tp1 for s in starts) / (window / 60),
-            tp1_capacity_max=max(tp1_caps, default=None),
-            capacity_max=max((c for c in caps.values() if c is not None), default=None),
-            tpk_waiting=any(
-                ((instances.get(i) or {}).get("inventory") or {}).get("waiting")
-                for b, ids in members.items()
-                if bundles[b] > 1
-                for i in ids
-            ),
+            tp1_capacity_max=tp1_max,
+            tpk_capacity_max=tpk_max,
+            capacity_max=any_max,
+            tpk_waiting=waiting,
             bundle_long_tokens=long_demand,
+            tpk_long_tokens=sum(
+                tokens for b, tokens in long_demand.items() if bundles[b] > 1
+            ),
+            quiet={
+                b: all(
+                    pressure(i).get("zone") == "SPARE"
+                    and pressure(i).get("capacity") is not None
+                    and pressure(i)["capacity"] < r["prepare_capacity_max"]
+                    for i in ids
+                )
+                for b, ids in members.items()
+            },
         )
 
     def check(self, edge, s, bundles):
-        """(failed reasons, urgent) of one edge under the current signals."""
+        """(failed reasons, waiting reasons, urgent) of one edge.
+
+        ``failed`` stops the hold; ``waiting`` only delays the proposal: a
+        split waits for its bundle to finish long requests, for at most
+        ``tilt_max_s`` past the hold (liveness: then it simply drains).
+        """
         r = self.rules
         bundle, mode = edge
         after = dict(bundles, **{bundle: 1 if mode == "TP1" else 2})
         capacity_now = SHORT_CAPACITY_REQ_S[s["layout"]]
         capacity_after = SHORT_CAPACITY_REQ_S[layout_name(after)]
-        failed, urgent = [], False
+        failed, waiting, urgent = [], [], False
         if mode != "TP1":  # MERGE
             if bundles.get(bundle) != 1:
-                return ["bundle is not TP1"], False
+                return ["bundle is not TP1"], [], False
             share = s["long_share"]
+            tp1_cap, tpk_cap = s["tp1_capacity_max"], s["tpk_capacity_max"]
+            # The TP-k counts too: keeping long requests off the TP1s moves
+            # their pressure there (GPU 11-02).
+            tpk_long_pressure = bool(s["tpk_long_tokens"]) and tpk_cap is not None
             need = [
                 share is not None and share >= r["merge_long_share"],
                 s["tp1_migrations_per_min"] >= r["merge_tp1_migrations_per_min"],
-                s["tp1_capacity_max"] is not None
-                and s["tp1_capacity_max"] >= r["merge_tp1_capacity"],
+                tp1_cap is not None and tp1_cap >= r["merge_tp1_capacity"],
+                tpk_long_pressure and tpk_cap >= r["merge_tp1_capacity"],
             ]
             if not any(need):
-                failed.append("no long-request pressure on TP1")
+                failed.append("no long-request pressure")
             if s["short_rate"] * r["merge_short_margin"] > capacity_after:
                 failed.append("merged layout cannot carry the short rate")
-            urgent = (
-                s["tp1_capacity_max"] is not None
-                and s["tp1_capacity_max"] >= r["urgent_capacity"]
+            urgent = (tp1_cap is not None and tp1_cap >= r["urgent_capacity"]) or (
+                tpk_long_pressure and tpk_cap >= r["urgent_capacity"]
             )
         else:  # SPLIT
             if bundles.get(bundle, 1) == 1:
-                return ["bundle is not TP-k"], False
+                return ["bundle is not TP-k"], [], False
             share = s["long_share"]
             if share is None or share > r["split_long_share"]:
                 failed.append("long share not low (or too few arrivals)")
@@ -174,18 +231,18 @@ class ConversionDecider:
             ):
                 failed.append("short load not approaching capacity")
             if s["bundle_long_tokens"].get(bundle):
-                failed.append("bundle serves a long request")
+                waiting.append("bundle serves a long request")
             gain = (capacity_after - capacity_now) * r["cooldown_s"]
             cost = capacity_now / 2 * r["conversion_s"]
             if gain < r["benefit_factor"] * cost:
                 failed.append("capacity gain below benefit factor")
-        return failed, urgent
+        return failed, waiting, urgent
 
     def observe(self, status, bundles, members, now):
         """One decision record; ``proposal`` is the edge to convert, if any."""
         r = self.rules
-        s = self.signals(status, bundles, members)
-        candidates, proposal = {}, None
+        s = self.signals(status, bundles, members, now)
+        candidates, proposal, approaching = {}, None, None
         cooling = (
             self.execute
             and self.converted_at is not None
@@ -193,41 +250,70 @@ class ConversionDecider:
         )
         for edge in self.edges.get(s["layout"], ()):
             key = f"{edge[0]}->{edge[1]}"
-            failed, urgent = self.check(edge, s, bundles)
+            failed, waiting, urgent = self.check(edge, s, bundles)
             if failed:
                 self.since.pop(key, None)
             else:
                 self.since.setdefault(key, now)
-                self.satisfied_at[edge[0]] = now
             held = now - self.since[key] if key in self.since else 0.0
             need = r["urgent_hold_s"] if urgent else r["hold_s"]
             repeated = (
                 not self.execute
                 and now - self.proposed_at.get(key, -float("inf")) < r["cooldown_s"]
             )
-            ready = not failed and held >= need and not cooling and not repeated
+            usable = not failed and not cooling and not repeated
+            patient = not waiting or held >= need + r["tilt_max_s"]
+            ready = usable and held >= need and patient
             candidates[key] = dict(
-                failed=failed, urgent=urgent, held_s=round(held, 3), ready=ready
+                failed=failed,
+                waiting=waiting,
+                urgent=urgent,
+                held_s=round(held, 3),
+                ready=ready,
             )
+            if usable and held >= need - r["tilt_lead_s"] and approaching is None:
+                approaching = (key, edge)
             if ready and proposal is None:
                 proposal = dict(bundle=edge[0], target_mode=edge[1], held_s=held)
                 self.proposed_at[key] = now
                 self.since.pop(key, None)
-        tilt = sorted(
-            bundle
-            for bundle, at in self.satisfied_at.items()
-            if bundle in bundles and now - at <= r["tilt_release_s"]
+        self.update_prepared(approaching, s, bundles, now)
+        prepared = self.prepared
+        tilt = (
+            [prepared["bundle"]]
+            if prepared and now - prepared["at"] <= r["tilt_max_s"]
+            else []
         )
-        return dict(
+        record = dict(
             evaluated_unix_s=now,
             mode="EXECUTE" if self.execute else "RECORD_ONLY",
             signals=s,
             candidates=candidates,
             cooling=cooling,
             proposal=proposal,
+            prepared=dict(prepared) if prepared else None,
             tilt=tilt,
         )
+        if proposal is not None and not self.execute:
+            self.prepared = None  # record only: this hold is over
+        return record
+
+    def update_prepared(self, approaching, s, bundles, now):
+        """Enter the prepare stage once the others are quiet; leave at once."""
+        prepared = self.prepared
+        if prepared is not None and (
+            approaching is None or approaching[0] != prepared["key"]
+        ):
+            self.prepared = prepared = None
+        if prepared is None and approaching is not None:
+            key, edge = approaching
+            others = [b for b in bundles if b != edge[0]]
+            if others and all(s["quiet"].get(b) for b in others):
+                self.prepared = dict(
+                    key=key, bundle=edge[0], target_mode=edge[1], at=now
+                )
 
     def converted(self, now):
         self.converted_at = now
         self.since.clear()
+        self.prepared = None

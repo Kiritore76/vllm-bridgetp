@@ -86,7 +86,7 @@ class DeciderRuleTests(unittest.TestCase):
         self.assertEqual(
             first["candidates"]["A->TP2"]["failed"],
             [
-                "no long-request pressure on TP1",
+                "no long-request pressure",
                 "merged layout cannot carry the short rate",
             ],
         )
@@ -117,8 +117,9 @@ class DeciderRuleTests(unittest.TestCase):
             decider = d.ConversionDecider(EDGES)
             records = run(decider, value, 200)
             self.assertFalse(any(r["proposal"] for r in records), reason)
-            failed = records[-1]["candidates"]["B->TP1"]["failed"]
-            self.assertTrue(any(f.startswith(reason) for f in failed), failed)
+            row = records[-1]["candidates"]["B->TP1"]
+            reasons = row["failed"] + row["waiting"]
+            self.assertTrue(any(f.startswith(reason) for f in reasons), reasons)
 
     def test_long_share_merges_the_tp1_bundle(self):
         decider = d.ConversionDecider(EDGES)
@@ -161,7 +162,7 @@ class DeciderRuleTests(unittest.TestCase):
         records += run(decider, status(arrivals=1080, capacity=0.7), 5, start=1101)
         records += run(decider, status(arrivals=1080), 200, start=1107)
         first = next(r for r in records if r["proposal"])
-        self.assertEqual(first["evaluated_unix_s"], 1107 + 180)
+        self.assertEqual(first["evaluated_unix_s"], 1106 + 16 + 180)
 
     def test_record_only_never_repeats_an_edge_within_the_cooldown(self):
         decider = d.ConversionDecider(EDGES)
@@ -203,43 +204,212 @@ class DeciderRuleTests(unittest.TestCase):
         self.assertEqual(members, MEMBERS)
 
 
-class PreTiltTests(unittest.TestCase):
-    def test_a_satisfied_candidate_tilts_its_bundle_until_released(self):
+class PrepareStageTests(unittest.TestCase):
+    def test_tilt_starts_shortly_before_the_proposal(self):
         decider = d.ConversionDecider(EDGES)
-        record = decider.observe(status(arrivals=1080), BUNDLES, MEMBERS, 1000)
-        self.assertEqual(record["tilt"], ["B"])  # split candidate holds
-        record = decider.observe(status(arrivals=100), BUNDLES, MEMBERS, 1020)
-        self.assertEqual(record["tilt"], ["B"])  # within the 30s release
-        record = decider.observe(status(arrivals=100), BUNDLES, MEMBERS, 1031)
-        self.assertEqual(record["tilt"], [])
-        record = decider.observe(
-            status(arrivals=108, long_arrivals=48), BUNDLES, MEMBERS, 1032
-        )
-        self.assertEqual(record["tilt"], ["A"])
+        records = run(decider, status(arrivals=1080), 180)
+        tilted = [r["evaluated_unix_s"] - 1000 for r in records if r["tilt"]]
+        self.assertEqual((tilted[0], tilted[-1]), (120, 180))
+        self.assertEqual(records[120]["tilt"], ["B"])
+        self.assertEqual(records[120]["prepared"]["target_mode"], "TP1")
+        self.assertIsNotNone(records[180]["proposal"])
 
-    def test_driver_publishes_the_tilt_only_when_asked(self):
+    def test_tilt_needs_the_other_bundle_quiet_but_the_proposal_does_not(self):
+        decider = d.ConversionDecider(EDGES)
+        value = status(arrivals=108, long_arrivals=48)
+        value["instances"]["B-g2-tp2"]["pressure"]["zone"] = "CRITICAL"
+        records = run(decider, value, 180)
+        self.assertFalse(any(r["tilt"] for r in records))
+        self.assertIsNone(records[-1]["prepared"])
+        self.assertIsNotNone(records[-1]["proposal"])  # liveness
+
+    def test_a_failed_candidate_ends_the_tilt_at_once(self):
+        decider = d.ConversionDecider(EDGES)
+        records = run(decider, status(arrivals=1080), 130)
+        self.assertEqual(records[-1]["tilt"], ["B"])
+        record = decider.observe(status(arrivals=100), BUNDLES, MEMBERS, 1131)
+        self.assertEqual(record["tilt"], [])
+        self.assertIsNone(record["prepared"])
+
+    def test_tilt_has_a_time_limit(self):
+        decider = d.ConversionDecider(EDGES)
+        value = status(arrivals=1080, long_on="B-g2-tp2")
+        records = run(decider, value, 300)
+        tilted = [r["evaluated_unix_s"] - 1000 for r in records if r["tilt"]]
+        self.assertEqual((tilted[0], tilted[-1]), (120, 210))
+
+    def test_a_long_request_delays_a_split_for_a_bounded_time(self):
+        decider = d.ConversionDecider(EDGES)
+        value = status(arrivals=1080, long_on="B-g2-tp2")
+        records = run(decider, value, 300)
+        (first,) = [r for r in records if r["proposal"]]
+        self.assertEqual(first["evaluated_unix_s"] - 1000, 270)  # hold + limit
+        self.assertEqual(records[200]["candidates"]["B->TP1"]["failed"], [])
+        self.assertEqual(
+            records[200]["candidates"]["B->TP1"]["waiting"],
+            ["bundle serves a long request"],
+        )
+        # Once it is free the split goes ahead, without waiting for the limit.
+        decider = d.ConversionDecider(EDGES)
+        run(decider, value, 199)
+        record = decider.observe(status(arrivals=1080), BUNDLES, MEMBERS, 1200)
+        self.assertIsNotNone(record["proposal"])
+
+    def test_pressure_moved_to_the_tp2_still_merges_urgently(self):
+        decider = d.ConversionDecider(EDGES)
+        value = status(arrivals=120, capacity=1.5, tp1_capacity=0.1, long_on="B-g2-tp2")
+        records = run(decider, value, 100)
+        first = next(r for r in records if r["proposal"])
+        self.assertEqual(first["evaluated_unix_s"] - 1000, 60)
+        self.assertEqual(first["proposal"]["bundle"], "A")
+        self.assertTrue(first["candidates"]["A->TP2"]["urgent"])
+        # A TP-k full of short requests is not a reason to merge.
+        decider = d.ConversionDecider(EDGES)
+        records = run(
+            decider, status(arrivals=120, capacity=1.5, tp1_capacity=0.1), 100
+        )
+        self.assertFalse(any(r["proposal"] for r in records))
+
+    def test_signals_are_smoothed(self):
+        decider = d.ConversionDecider(EDGES)
+        decider.observe(status(arrivals=120, tp1_capacity=1.4), BUNDLES, MEMBERS, 1000)
+        record = decider.observe(status(arrivals=120), BUNDLES, MEMBERS, 1001)
+        self.assertEqual(record["signals"]["tp1_capacity_max"], 1.4)
+        record = decider.observe(status(arrivals=120), BUNDLES, MEMBERS, 1016)
+        self.assertEqual(record["signals"]["tp1_capacity_max"], 0.2)
+        # One waiting sample in ten seconds is not a queue; most of them are.
+        decider = d.ConversionDecider(EDGES)
+        for t in range(10):
+            value = status(arrivals=120, waiting=3 if t == 5 else 0)
+            record = decider.observe(value, BUNDLES, MEMBERS, 1000 + t)
+            self.assertFalse(record["signals"]["tpk_waiting"])
+        decider = d.ConversionDecider(EDGES)
+        for t in range(10):
+            value = status(arrivals=120, waiting=0 if t == 5 else 3)
+            record = decider.observe(value, BUNDLES, MEMBERS, 1000 + t)
+        self.assertTrue(record["signals"]["tpk_waiting"])
+
+
+class PrepareDriverTests(unittest.TestCase):
+    def driver(self, root, mode, **request):
+        driver, events = DeciderDriverTests.driver(DeciderDriverTests(), root, mode)
+        driver.request = dict(driver.request, **request)
+        driver.decider.rules["hold_s"] = 60.0  # prepare at once, proposal at 60s
+        driver.events = events
+        return driver
+
+    @staticmethod
+    def tick(driver, root, value):
+        value["unix_s"] = time.time()
+        (root / "layout_status.json").write_text(json.dumps(value))
+        driver.decided_at = -float("inf")
+        driver.decide()
+
+    def test_tilt_is_published_only_when_asked(self):
         for pre_tilt in (False, True):
             with tempfile.TemporaryDirectory() as folder:
                 root = Path(folder)
-                driver, events = DeciderDriverTests.driver(
-                    DeciderDriverTests(), root, "RECORD_ONLY"
-                )
-                driver.request = dict(driver.request, pre_tilt=pre_tilt)
-                for row in driver.backend.registry.instances.values():
-                    driver.backend.registry.transition(row.ref, "ACTIVE")
-                value = status(arrivals=1080)
-                value["unix_s"] = time.time()
-                (root / "layout_status.json").write_text(json.dumps(value))
-                driver.decide()
+                driver = self.driver(root, "RECORD_ONLY", pre_tilt=pre_tilt)
+                self.tick(driver, root, status(arrivals=1080))
                 control = root / "layout_control.json"
                 if pre_tilt:
                     self.assertEqual(
                         json.loads(control.read_text())["tilt"], ["B-g2-tp2"]
                     )
-                    self.assertIn("PRE_TILT", events)
+                    self.assertIn("PRE_TILT", driver.events)
                 else:
                     self.assertFalse(control.exists())
-                    self.assertNotIn("PRE_TILT", events)
+                    self.assertNotIn("PRE_TILT", driver.events)
+
+    def test_execute_prestarts_while_prepared_and_drops_when_it_ends(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            driver = self.driver(root, "EXECUTE", pre_tilt=True)
+            started, stopped = [], []
+            ops = driver.backend.ops
+            ops.start = lambda extra: started.append(extra["instance_id"])
+            ops.stop = stopped.extend
+            driver.backend.prestart_enabled = True
+            self.tick(driver, root, status(arrivals=1080))
+            self.assertEqual(started, ["B-g4-tp1", "B-g5-tp1"])
+            self.tick(driver, root, status(arrivals=1080))
+            self.assertEqual(len(started), 2)  # still the same preparation
+            self.tick(driver, root, status(arrivals=100))
+            self.assertEqual(stopped, ["B-g4-tp1", "B-g5-tp1"])
+            self.assertEqual(driver.backend.layout_tilt, [])
+            self.assertIsNone(driver.backend.prestarted)
+
+    def test_record_only_never_prestarts(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            driver = self.driver(root, "RECORD_ONLY")
+            driver.backend.ops.start = lambda extra: self.fail("started an engine")
+            driver.backend.prestart_enabled = True
+            self.tick(driver, root, status(arrivals=1080))
+
+    def test_a_tilted_proposal_skips_only_the_service_part_of_the_gate(self):
+        for pre_tilt in (False, True):
+            with tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                driver = self.driver(root, "EXECUTE", pre_tilt=pre_tilt, assist=True)
+                driver.decider.rules["hold_s"] = 0.0
+                value = status(arrivals=108, long_arrivals=48)
+                self.tick(driver, root, value)
+                plan = driver.executor.plan
+                self.assertEqual(plan["bundle_id"], "A")
+                self.assertEqual(plan["method"], "SELECTIVE_ROLL")
+                backend = driver.backend
+                self.assertEqual(backend.service_gate_passed, pre_tilt)
+                # The tilt lasts until quiesce; the controller is held.
+                control = json.loads((root / "layout_control.json").read_text())
+                self.assertTrue(control["conversion_pending"])
+                self.assertEqual(bool(control["tilt"]), pre_tilt)
+                # The TP2 got busy from the tilt: only KV headroom is checked.
+                busy = status(arrivals=108, long_arrivals=48)
+                busy["unix_s"] = time.time()
+                busy["instances"]["B-g2-tp2"]["pressure"]["zone"] = "CRITICAL"
+                (root / "layout_status.json").write_text(json.dumps(busy))
+                self.assertEqual(backend.gate(plan), pre_tilt)
+                full = json.loads(json.dumps(busy))
+                full["instances"]["B-g2-tp2"]["pressure"]["capacity"] = 0.95
+                (root / "layout_status.json").write_text(json.dumps(full))
+                self.assertFalse(backend.gate(plan))
+
+    def test_a_decided_split_drains(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            driver = self.driver(root, "EXECUTE", assist=True)
+            driver.decider.rules["hold_s"] = 0.0
+            self.tick(driver, root, status(arrivals=1080))
+            self.assertEqual(driver.executor.plan["method"], "DRAIN")
+
+    def test_the_tilt_time_limit_covers_a_waiting_gate(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            driver = self.driver(root, "RECORD_ONLY", pre_tilt=True)
+            self.tick(driver, root, status(arrivals=1080))
+            self.assertTrue(driver.backend.layout_tilt)
+            driver.end_expired_tilt()
+            self.assertTrue(driver.backend.layout_tilt)
+            driver.tilt_since = time.monotonic() - 91
+            driver.end_expired_tilt()
+            self.assertEqual(driver.backend.layout_tilt, [])
+
+    def test_quiesce_clears_the_tilt(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            driver = self.driver(root, "RECORD_ONLY", pre_tilt=True)
+            self.tick(driver, root, status(arrivals=1080))
+            driver.backend.rows["B-g2-tp2"].setdefault("endpoint", "t")
+            driver.backend.quiesce(
+                dict(
+                    plan_id="p",
+                    bundle_id="B",
+                    target_bundle_mode="TP1",
+                    refs=[dict(instance_id="B-g2-tp2", instance_generation=2)],
+                )
+            )
+            self.assertEqual(driver.backend.layout_tilt, [])
 
 
 class StartGateTests(unittest.TestCase):
@@ -433,6 +603,42 @@ class DeciderDriverTests(unittest.TestCase):
 
 
 class PhaseShiftTests(unittest.TestCase):
+    def test_scenarios_give_each_rule_its_case(self):
+        from tools.bridge_tp import qwen3_phase_shift as phase
+
+        root = Path(__file__).resolve().parents[2]
+        inputs = json.loads(
+            (
+                root / "experiments/platforms/qwen3_pressure_observation/inputs.json"
+            ).read_text(encoding="utf-8")
+        )
+
+        def share(scenario):
+            jobs = [  # what the decider's window sees during the main phase
+                j
+                for j in phase.jobs(inputs, scenario)
+                if j["workload_phase"] in {"long", "peak"}
+            ]
+            long = [
+                j
+                for j in jobs
+                if len(j["request"]["prompt"]) + j["request"]["max_tokens"]
+                >= d.LONG_TOKENS
+            ]
+            return long, len(long) / len(jobs)
+
+        self.assertGreater(share("merge_heavy")[1], d.RULES["merge_long_share"])
+        self.assertGreater(share("merge_moderate")[1], d.RULES["merge_long_share"])
+        long, value = share("merge_deep")
+        self.assertLess(value, d.RULES["merge_long_share"])
+        self.assertEqual(
+            (len(long[0]["request"]["prompt"]), long[0]["request"]["max_tokens"]),
+            (16384, 8192),
+        )
+        long, value = share("split_trickle")
+        self.assertTrue(long)
+        self.assertLess(value, d.RULES["split_long_share"])
+
     def test_phases_give_each_rule_its_window(self):
         from tools.bridge_tp import qwen3_phase_shift as phase
 

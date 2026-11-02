@@ -187,6 +187,7 @@ class ControllerConversionBackend:
         # Pre-start the replacements behind a start gate while draining.
         self.prestart_enabled = prestart
         self.prestarted = None
+        self.service_gate_passed = False
         self.lock = threading.Lock()
         # Engines are serving when the controller starts: the manifest's
         # PREPARING records become ACTIVE before the first plan.
@@ -291,7 +292,9 @@ class ControllerConversionBackend:
             self.hard_ok(v, self.safety["gate_capacity_max"]) for v in retained.values()
         ):
             reason = "retained KV headroom (hard)"
-        elif waited >= self.safety["relax_after_s"]:
+        elif waited >= self.safety["relax_after_s"] or self.service_gate_passed:
+            # Passed: the decider checked the others were quiet before the
+            # tilt it added to them; only hard safety is left to check.
             reason = None
         elif not all(
             (v.get("pressure") or {}).get("zone") == "SPARE" for v in retained.values()
@@ -346,7 +349,10 @@ class ControllerConversionBackend:
         return self.gate(plan)
 
     def quiesce(self, plan):
-        self.write_layout({r.instance_id: "QUIESCING" for r in self.refs(plan)})
+        # Routing closes for the bundle: the tilt has nothing left to do.
+        self.write_layout(
+            {r.instance_id: "QUIESCING" for r in self.refs(plan)}, tilt=[]
+        )
         self.prestart(plan)
 
     def remaining_s(self):
@@ -1093,7 +1099,10 @@ class ConversionDriver:
     With ``decider`` (RECORD_ONLY or EXECUTE, plus ``edges``) the rule-based
     decider is evaluated every ``decision_interval_s`` and every record goes
     to ``conversion_decider.jsonl``. RECORD_ONLY never converts; EXECUTE
-    converts the first proposal (one plan per run for now).
+    converts the first proposal (one plan per run for now). In the decider's
+    prepare stage, EXECUTE with ``prestart`` starts the replacements and
+    ``pre_tilt`` keeps new long requests off the bundle; ``assist`` drains a
+    merging bundle with SELECTIVE_ROLL.
     """
 
     decision_interval_s = 1.0
@@ -1122,6 +1131,8 @@ class ConversionDriver:
         self.decided_at = -float("inf")
         self.decisions = 0
         self.proposals = []
+        self.tilt_since = None
+        self.prepared_key = None
 
     def start(self):
         self.origin = time.monotonic()
@@ -1154,6 +1165,7 @@ class ConversionDriver:
                             "NO_PROFILE",
                         )
                 else:
+                    self.end_expired_tilt()
                     before = self.state()
                     after = self.executor.plan_execute(time.time())["state"]
                     if after != before:
@@ -1185,11 +1197,7 @@ class ConversionDriver:
             "a", encoding="utf-8"
         ) as stream:
             stream.write(json.dumps(record) + "\n")
-        if self.request.get("pre_tilt"):
-            tilt = sorted(i for b in record["tilt"] for i in members.get(b, ()))
-            if tilt != self.backend.layout_tilt:
-                self.backend.write_layout({}, pending=False, tilt=tilt)
-                self.backend.ops.event("PRE_TILT", instances=tilt)
+        self.apply_prepared(record, members)
         proposal = record["proposal"]
         if proposal is None:
             return
@@ -1202,19 +1210,71 @@ class ConversionDriver:
             self.request, bundle=proposal["bundle"], target_mode=proposal["target_mode"]
         )
         self.backend.ops.event("TRIGGER", request=self.request)
-        # Hold the controller until terminal; the drain replaces the tilt.
-        self.backend.write_layout({}, tilt=[])
+        # The start gate's service check ran before the load this tilt added.
+        self.backend.service_gate_passed = bool(self.backend.layout_tilt)
+        # Hold the controller until terminal; the tilt stays until routing
+        # closes for the bundle at quiesce.
+        self.backend.write_layout({})
         self.executor.plan_create(
             "decided-" + proposal["bundle"],
             self.backend.registry.registry_revision,
             proposal["bundle"],
             proposal["target_mode"],
-            "DRAIN",
+            "SELECTIVE_ROLL"
+            if self.request.get("assist") and proposal["target_mode"] != "TP1"
+            else "DRAIN",
             "ACTIVE",
             time.time() + self.request["deadline_s"],
             "NO_PROFILE",
         )
         self.decider.converted(time.time())
+
+    def apply_prepared(self, record, members):
+        """Tilt and pre-start of the decider's prepare stage, while it lasts."""
+        request, backend = self.request, self.backend
+        if request.get("pre_tilt"):
+            tilt = sorted(i for b in record["tilt"] for i in members.get(b, ()))
+            if tilt != backend.layout_tilt:
+                backend.write_layout({}, pending=False, tilt=tilt)
+                backend.ops.event("PRE_TILT", instances=tilt)
+                self.tilt_since = time.monotonic() if tilt else None
+        if not (self.decider.execute and backend.prestart_enabled):
+            return
+        prepared = record["prepared"]
+        key = prepared["key"] if prepared else None
+        if key == self.prepared_key:
+            return
+        backend.drop_prestarted("the decider's candidate stopped holding")
+        self.prepared_key = key
+        if prepared is not None:
+            refs = [
+                dict(
+                    instance_id=i,
+                    instance_generation=backend.registry.instances[
+                        i
+                    ].ref.instance_generation,
+                )
+                for i in members[prepared["bundle"]]
+            ]
+            backend.prestart(
+                dict(
+                    plan_id="prepare-" + prepared["bundle"],
+                    bundle_id=prepared["bundle"],
+                    target_bundle_mode=prepared["target_mode"],
+                    refs=refs,
+                )
+            )
+
+    def end_expired_tilt(self):
+        """The tilt's time limit also covers a start gate still waiting."""
+        if (
+            self.tilt_since is not None
+            and self.backend.layout_tilt
+            and time.monotonic() - self.tilt_since > self.decider.rules["tilt_max_s"]
+        ):
+            self.tilt_since = None
+            self.backend.write_layout({}, tilt=[])
+            self.backend.ops.event("PRE_TILT", instances=[])
 
     def stop(self, timeout_s=30):
         self.stop_event.set()

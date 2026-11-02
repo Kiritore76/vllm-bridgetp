@@ -538,9 +538,12 @@ def decider_request(request, registry):
 
     required = {"decider", "deadline_s", "base_port"}
     if (
-        not required <= set(request) <= required | {"rules", "prestart", "pre_tilt"}
+        not required
+        <= set(request)
+        <= required | {"rules", "prestart", "pre_tilt", "assist"}
         or request.get("prestart", False) not in (True, False)
         or request.get("pre_tilt", False) not in (True, False)
+        or request.get("assist", False) not in (True, False)
         or request["decider"] not in {"RECORD_ONLY", "EXECUTE"}
         or not set(request.get("rules", {})) <= set(RULES)
         or request["deadline_s"] <= 0
