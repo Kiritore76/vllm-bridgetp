@@ -114,6 +114,7 @@ class RollingPressureSession:
         self.stream = None
         self.target_future = None
         self.settled = False
+        self.stream_wait_since = None
         self.cleanup_requires_shutdown = False
         self.cancel_future = None
         self.cleanup_executor = None
@@ -334,6 +335,31 @@ class RollingPressureSession:
                 self.audit.write(
                     {"kind": "rolling_cutover_selected", "selection": selection}
                 )
+            # The engine reaches the boundary before the client stream does when
+            # the controller lags (GPU 11-02: 942 tokens behind). After commit
+            # late source tokens are discarded, so the stream must arrive first.
+            emitted = stream.recorder.progress()[0]
+            if emitted < record.cutover_output_tokens:
+                if self.stream_wait_since is None:
+                    self.stream_wait_since = time.time()
+                    self.audit.write(
+                        {
+                            "kind": "commit_waits_for_source_stream",
+                            "migration_id": record.migration_id,
+                            "emitted_tokens": emitted,
+                            "cutover_output_tokens": record.cutover_output_tokens,
+                        }
+                    )
+                return
+            if self.stream_wait_since is not None:
+                self.audit.write(
+                    {
+                        "kind": "source_stream_caught_up",
+                        "migration_id": record.migration_id,
+                        "waited_s": time.time() - self.stream_wait_since,
+                    }
+                )
+                self.stream_wait_since = None
             self.old.step_shadow_only_takeover(
                 self.machine,
                 self.adapter,

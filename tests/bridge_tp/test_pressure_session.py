@@ -156,6 +156,29 @@ class SessionTests(unittest.TestCase):
         self.assertTrue(self.recorder.proxy.committed)
         self.assertFalse(self.settlements)  # commit alone does not establish release
 
+    def test_commit_waits_until_the_client_stream_reaches_the_boundary(self):
+        io.atomic_json_dump(
+            {"cutover_num_output_tokens": 45}, self.path / "cutover_manifest.json"
+        )
+        io.atomic_json_dump(
+            {"cutover_output_tokens": 45}, self.path / "rolling_freeze_selection.json"
+        )
+        self.driver.adapter.ranks = {0, 1, 2, 3}
+        self.driver.tick(self.view, self.snapshot)
+        self.assertEqual(self.driver.adapter.commits, 0)
+        self.assertEqual(self.recorder.proxy.cutover_index, 45)
+        for index in range(40, 44):
+            self.recorder.on_source_token(index, index, 2 + index * 0.01)
+        self.driver.tick(self.view, self.snapshot)
+        self.assertEqual(self.driver.adapter.commits, 0)
+        self.recorder.on_source_token(44, 44, 3)
+        self.recorder.on_source_token(45, 45, 3)  # past the boundary: held back
+        self.driver.tick(self.view, self.snapshot)
+        self.assertEqual(self.driver.adapter.commits, 1)
+        self.recorder.on_target_token(0, 450, 4)
+        self.assertEqual(self.recorder.proxy.high_water, 46)
+        self.assertEqual(self.recorder.proxy.emitted[45].origin, "target")
+
     def test_full_speed_arms_and_ticks_with_unlimited_rate_without_M2(self):
         old = self.driver
         backend = NS(
