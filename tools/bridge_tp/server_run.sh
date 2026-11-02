@@ -3,12 +3,12 @@
 # 运行：
 #   cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 #
-# 当前任务：迁移价值测试2场，约25分钟。上一场 burst_short6 L1A 跑通但0次迁移（6条长请求放得下）。
-# 1. burst9_short6 L1A：短6 req/s，120s起每2s一条长请求共9条（16384/8192）。按最终长度L1A正好
-#    最多放9条（TP2 7条，每个TP1 1条），放置对了才放得下。看：迁移是否发生、有没有长中断。
-# 2. burst_short6 L2：与上一场同负载（6条），看没有KV压力时L1A和L2的差别。
+# 当前任务：L1A有没有必要存在（用户11-02：只比L0、L1A、L2），补齐突发负载两行，3场，约35分钟。
+# burst_short6 已有L1A（soft 482.4）、L2（402.7），缺L0；burst9_short6 已有L1A（473.5），缺L2、L0。
+# 负载：短6 req/s，120s起每2s一条长请求（16384/8192），共6或9条，420s，再加60s收尾。
 # 都直接以静态布局启动（A={2,3}，B={0,1}，双32768/.88），无转换、无决策器。
-# 没问题后：burst9_short6 的 L1A不迁移、L2、L0。
+# 看：全部请求完成、退出码0；L1A是否同时胜过L0和L2。L0放不下这么多长请求，预计有长中断。
+# 这批之后按结果选：短3 req/s的突发，或 short_mid、split_trickle。
 # 磁盘可用不足8GB或GPU未空闲就停；一场失败不中断其余场。
 # 每场的无损compact包校验通过后删除该场原始目录，所以磁盘占用不随场数累积；
 # 没有得到有效compact包的场保留原始目录。全程每秒采样GPU显存与利用率。
@@ -20,7 +20,7 @@ model=/root/autodl-tmp/models/Qwen3-8B
 branch=bridgetp/tp2-4090d-qwen3-8b
 task=qwen3_layout_boundary
 # 每场：负载:布局；L1A-stay是同引擎同通道、不执行迁移的对照
-scenes="burst9_short6:L1A burst_short6:L2"
+scenes="burst_short6:L0 burst9_short6:L2 burst9_short6:L0"
 
 cd "$repo" || exit 1
 source "$venv/bin/activate" || exit 1
