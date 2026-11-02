@@ -91,6 +91,18 @@ SCENARIOS = {
         ),
         long=(16384, 8192),
     ),
+    # Six fit without moving anything (GPU 11-02: no migration). Nine is the
+    # most L1A can hold at final length (1536 blocks; 7 on the TP2, 1 per TP1),
+    # so it fits only if placement ends up right, whatever arrival did.
+    "burst9_short6": dict(
+        phases=(
+            (0, 120, 6.0, 0.0, "warm"),
+            (120, 138, 6.0, 0.5, "burst"),
+            (138, 420, 6.0, 0.0, "after"),
+            (420, 480, 1.0, 0.0, "tail"),
+        ),
+        long=(16384, 8192),
+    ),
     # A short peak with a trickle of long requests, which keep the TP-k from
     # ever being free of them unless routed away.
     "split_trickle": dict(

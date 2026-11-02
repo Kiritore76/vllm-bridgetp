@@ -165,6 +165,19 @@ class StaticLayoutTests(unittest.TestCase):
             short = [j for j in jobs if j["workload_role"] == "short_probe"]
             self.assertEqual(sum(j["at_s"] < 420 for j in short), 420 * rate)
 
+    def test_burst9_is_the_most_l1a_holds_at_final_length(self):
+        from tools.bridge_tp import qwen3_phase_shift as phase
+
+        inputs = json.loads(Path(INPUTS).read_text(encoding="utf-8"))
+        long = [
+            j
+            for j in phase.jobs(inputs, "burst9_short6")
+            if j["workload_role"] == "long_input_output"
+        ]
+        self.assertEqual([j["at_s"] for j in long], [120 + 2 * i for i in range(9)])
+        final = (16384 + 8192) // 16
+        self.assertEqual(2 * (2325 // final) + 11712 // final, len(long))
+
     def test_static_no_migrate_is_an_l1a_control(self):
         code, value = plan(
             "--phase-shift",
