@@ -51,6 +51,15 @@ class Reader:
 class Harness:
     """L1A on A={2,3}, B={0,1}: TP1@2 (pair source), TP1@3, TP2(0,1) target."""
 
+    finished = None
+    refreshers = None
+
+    def __new__(cls, *args, **kwargs):
+        value = super().__new__(cls)
+        value.finished = threading.Event()
+        value.refreshers = []
+        return value
+
     def __init__(
         self,
         root,
@@ -218,8 +227,8 @@ class Harness:
         self.keep_fresh(extra["endpoint"])
 
     def keep_fresh(self, endpoint):
-        """A serving engine keeps publishing inventory; an idle new instance
-        otherwise goes stale before routing reaches it under CPU load."""
+        """A serving engine keeps publishing inventory; an idle instance
+        otherwise goes stale under CPU load."""
 
         def done():
             try:
@@ -229,15 +238,19 @@ class Harness:
                 return False
 
         def loop():
-            while self.root.exists() and not done():
-                time.sleep(0.3)
+            while self.root.exists() and not done() and not self.finished.is_set():
+                self.finished.wait(0.3)
+                if self.finished.is_set():
+                    return
                 try:
                     with self.lock:
                         self.publish(endpoint)
                 except OSError:  # the scene directory is gone
                     return
 
-        threading.Thread(target=loop, daemon=True).start()
+        thread = threading.Thread(target=loop, daemon=True)
+        self.refreshers.append(thread)
+        thread.start()
 
     def post(self, url, payload, timeout, sink):
         with self.lock:
@@ -257,6 +270,12 @@ class Harness:
         return {rows[i]["endpoint"] for i in self.stopped if i in rows}
 
     def run(self, jobs, **overrides):
+        self.finished.clear()
+        # Serving engines publish continuously; a drain needs a fresh sample
+        # after each completion, which one sample per request can miss when the
+        # controller's tick runs slow under CPU load.
+        for endpoint in tuple(self.readers):
+            self.keep_fresh(endpoint)
         actual_ingress = i.PressureIngress
 
         def make_ingress(*args, **kwargs):
@@ -328,6 +347,10 @@ class Harness:
                 )
         finally:
             outcome = self.driver.stop()
+            # Nothing may write to the scene directory once the test removes it.
+            self.finished.set()
+            for thread in self.refreshers:
+                thread.join(5)
         return outcome
 
 
@@ -576,7 +599,7 @@ class ConversionTests(unittest.TestCase):
             for r in audit
             if r["kind"] == "pressure_dispatch"
             and r["pool"] in old
-            and r["admission_finished_unix_s"] > quiesced
+            and r["dispatch_entered_unix_s"] > quiesced
         ]
         self.assertEqual(late, [])
         # The converted bundle had requests in flight at the trigger; the
@@ -642,6 +665,7 @@ class ConversionTests(unittest.TestCase):
                 for r in harness.manifest["instances"]
                 if r["instance_id"] in retired
             ),
+            dispatch_entered_unix_s=quiesced + 0.5,
             admission_finished_unix_s=quiesced + 0.5,
         )
         (root / "pressure_audit.jsonl").write_text(
@@ -1035,6 +1059,7 @@ class ConversionTests(unittest.TestCase):
                             kind="pressure_dispatch",
                             job_id="to-merged",
                             pool="tp4",
+                            dispatch_entered_unix_s=published + 0.5,
                             admission_finished_unix_s=published + 0.5,
                         )
                     )

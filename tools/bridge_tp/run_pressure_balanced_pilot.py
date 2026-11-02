@@ -366,6 +366,16 @@ def instance_manifest(args, controller):
     return manifest
 
 
+def acknowledged_blocks(entry, owned_blocks):
+    """High-water mark of a migrated request's allocation on its target.
+
+    A preemption there drops its owned blocks to zero (GPU 11-02); that is not
+    a retraction of what was allocated. Its recompute is demand the inventory
+    already reports as unallocated prompt, not this promise.
+    """
+    return max(entry.allocated_blocks, min(owned_blocks, entry.blocks))
+
+
 def pair_pools(manifest):
     """Historical pool ids of the pair sides this run starts with."""
     if manifest is None:
@@ -1669,7 +1679,9 @@ def _run(args, prepared):
                     co.observe_migration(
                         entry.key,
                         inventories[t]["pool_id"],
-                        allocated_blocks=min(targets[0]["owned_blocks"], entry.blocks),
+                        allocated_blocks=acknowledged_blocks(
+                            entry, targets[0]["owned_blocks"]
+                        ),
                         service_observed=entry.service_observed
                         or targets[0]["generated"] >= 2,
                         prefill_observed=True,

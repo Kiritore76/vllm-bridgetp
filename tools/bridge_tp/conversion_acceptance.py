@@ -133,8 +133,11 @@ def assess(scene_dir, run_dir=None, events_path=None, metrics_path=None):
     late = sorted(
         r["job_id"]
         for r in dispatch
+        # Entry, not finish: one that entered before quiesce may have chosen
+        # while the instance was open (the drain waits for it); one entering
+        # after cannot choose it unless routing really failed to close.
         if quiesce is not None
-        and r["admission_finished_unix_s"] > quiesce
+        and r["dispatch_entered_unix_s"] > quiesce
         and instance(r["pool"]) in retired
     )
     first_new = {}

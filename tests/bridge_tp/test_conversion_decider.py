@@ -412,6 +412,28 @@ class PrepareDriverTests(unittest.TestCase):
             self.assertEqual(driver.backend.layout_tilt, [])
 
 
+class PreemptedMigrationTests(unittest.TestCase):
+    def test_allocation_acknowledgement_survives_a_target_preemption(self):
+        from tools.bridge_tp import run_pressure_balanced_pilot as pilot
+
+        policy = load("pressure_policy")
+        ledger = policy.ReservationLedger()
+        ledger.entries["m"] = policy.Reservation(
+            "m", "r", "tp4", 1200, 0.0, 0, "migration", state="COMMITTED"
+        )
+        entry = ledger.entries["m"]
+        for owned, expected in ((500, 500), (1145, 1145), (0, 1145), (510, 1145)):
+            value = pilot.acknowledged_blocks(entry, owned)
+            self.assertEqual(value, expected)
+            ledger.observe("m", allocated_blocks=value, service_observed=True)
+        self.assertEqual(entry.state, "COMMITTED")
+        # Allocation beyond the promise is capped, and completes the promise.
+        value = pilot.acknowledged_blocks(entry, 5000)
+        self.assertEqual(value, 1200)
+        ledger.observe("m", allocated_blocks=value, service_observed=True)
+        self.assertEqual(entry.state, "ACCOUNTED")
+
+
 class StartGateTests(unittest.TestCase):
     def test_gate_blocks_until_opened_and_times_out(self):
         import os

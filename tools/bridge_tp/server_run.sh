@@ -3,11 +3,12 @@
 # 运行：
 #   cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 #
-# 当前任务：验证TP2崩溃修复。上一批merge_deep两场都因TP2引擎崩溃失败：KV满时已迁入的请求
-# 被抢占，带着迁移标记回到等待队列，被按已轮转的会话检查而抛错。现在这种请求在TP2上本地重算。
-# 重跑同一负载（短0.5 + 长0.05 req/s，16384/8192，420s），有/无短时倾斜各一场，约25–30分钟。
-# L1A起步（A={2,3}，B={0,1}），双32768/.88，决策器执行转换（每场最多一次），开预启动和辅助迁移。
-# 看：引擎不再崩溃、全部请求完成；被抢占的迁入请求重算时的输出中断有多长。
+# 当前任务：验证迁入请求在TP2上被抢占后系统不再中断。只跑一场（用户11-02：先跑一个，没问题
+# 再跑接下来的），约12–15分钟。上一批：引擎崩溃已修好，但控制器把被抢占后减少的块数当成违规
+# 而退出（allocation acknowledgement must be monotonic），现已修复。
+# 负载 merge_deep：短0.5 + 长0.05 req/s（16384/8192），420s，不倾斜。
+# L1A起步（A={2,3}，B={0,1}），双32768/.88，决策器执行转换（最多一次），开预启动和辅助迁移。
+# 看：全部请求完成、退出码0；被抢占的迁入请求重算时的输出中断有多长。
 # 磁盘可用不足8GB（单场原始数据实测最多约5.4GB）或GPU未空闲就停；一场失败不中断其余场。
 # 每场的无损compact包校验通过后删除该场原始目录，所以磁盘占用不随场数累积；
 # 没有得到有效compact包的场保留原始目录。全程每秒采样GPU显存与利用率。
@@ -19,6 +20,7 @@ model=/root/autodl-tmp/models/Qwen3-8B
 branch=bridgetp/tp2-4090d-qwen3-8b
 task=qwen3_preempt_fix
 scenarios="merge_deep"
+arms="notilt"
 
 cd "$repo" || exit 1
 source "$venv/bin/activate" || exit 1
@@ -57,7 +59,7 @@ export VLLM_USE_V2_MODEL_RUNNER=0 OMP_NUM_THREADS=1
 final=0
 excludes=()
 for scenario in $scenarios; do
-    for arm in tilt notilt; do
+    for arm in $arms; do
         name="$scenario-$arm"
         excludes+=(--exclude="$(basename "$run")/$name")
         avail=$(df --output=avail -k "$run" | tail -1)
