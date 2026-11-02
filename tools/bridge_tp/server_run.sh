@@ -3,13 +3,14 @@
 # 运行：
 #   cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 #
-# 当前任务：验证迁入请求在TP2上被抢占后系统不再中断。只跑一场（用户11-02：先跑一个，没问题
-# 再跑接下来的），约12–15分钟。上一批：引擎崩溃已修好，但控制器把被抢占后减少的块数当成违规
-# 而退出（allocation acknowledgement must be monotonic），现已修复。
-# 负载 merge_deep：短0.5 + 长0.05 req/s（16384/8192），420s，不倾斜。
-# L1A起步（A={2,3}，B={0,1}），双32768/.88，决策器执行转换（最多一次），开预启动和辅助迁移。
-# 看：全部请求完成、退出码0；被抢占的迁入请求重算时的输出中断有多长。
-# 磁盘可用不足8GB（单场原始数据实测最多约5.4GB）或GPU未空闲就停；一场失败不中断其余场。
+# 当前任务：L1A与L2的分界，第一场 merge_deep 静态L2（用户11-02：先跑一个，没问题再跑其余），
+# 约12–15分钟。直接以L2启动（A={2,3}，B={0,1}，双32768/.88），不转换、不迁移、无决策器。
+# 负载：短0.5 + 长0.05 req/s（16384/8192），420s，再加60s收尾。
+# 看：全部请求完成、退出码0；与L1A起步的同负载（qwen3_preempt_fix_20261102_143534_9148，
+# SLO 262/291，soft 318.6，最大中断132.7s）相比L2是否明显更好。单场噪声约soft 5%、SLO 15%。
+# 没问题后的其余场次：merge_light/merge_moderate/merge_heavy、deep_light/deep_mid/merge_deep
+# 各跑L1A和L2；short_mid/split_trickle各跑L0、L1A、L2。
+# 磁盘可用不足8GB或GPU未空闲就停；一场失败不中断其余场。
 # 每场的无损compact包校验通过后删除该场原始目录，所以磁盘占用不随场数累积；
 # 没有得到有效compact包的场保留原始目录。全程每秒采样GPU显存与利用率。
 
@@ -18,9 +19,9 @@ venv=/root/autodl-tmp/bridgetp/.venv_bridge
 py=$venv/bin/python
 model=/root/autodl-tmp/models/Qwen3-8B
 branch=bridgetp/tp2-4090d-qwen3-8b
-task=qwen3_preempt_fix
-scenarios="merge_deep"
-arms="notilt"
+task=qwen3_layout_boundary
+# 每场：负载:布局
+scenes="merge_deep:L2"
 
 cd "$repo" || exit 1
 source "$venv/bin/activate" || exit 1
@@ -58,41 +59,37 @@ export VLLM_USE_V2_MODEL_RUNNER=0 OMP_NUM_THREADS=1
 
 final=0
 excludes=()
-for scenario in $scenarios; do
-    for arm in $arms; do
-        name="$scenario-$arm"
-        excludes+=(--exclude="$(basename "$run")/$name")
-        avail=$(df --output=avail -k "$run" | tail -1)
-        [ "$avail" -ge 8388608 ] || {
-            echo "磁盘可用不足8GB，停止于 $name 之前。"; final=1; break 2;
-        }
-        [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || {
-            echo "上一场后GPU仍有计算进程，停止于 $name 之前。"; final=1; break 2;
-        }
-        extra=()
-        [ "$arm" = tilt ] && extra=(--decider-pre-tilt)
-        echo "=== 开始：$name（$(date +%T)）==="
-        date +%s.%N > "$run/$name.started_unix_s"
-        "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
-            --phase-shift --phase-scenario "$scenario" --static-layout L1A \
-            --conversion-decider execute --decider-assist --conversion-prestart \
-            "${extra[@]}" \
-            --expanded-context --current-machine --repetitions 1 \
-            --model "$model" \
-            --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
-            --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json" \
-            --output "$run/$name" --expected-revision "$head" 2>&1 | tee "$run/$name.console.log"
-        status=${PIPESTATUS[0]}
-        echo "$name 退出码：$status" | tee -a "$run/exit_codes.txt"
-        [ "$status" = 0 ] || final=$status
-        # 压缩包完整才删原始目录；sidecar哈希和tar目录都要通过。
-        if (cd "$run" && sha256sum -c "$name.tar.gz.sha256" >/dev/null 2>&1)             && tar -tzf "$run/$name.tar.gz" >/dev/null 2>&1; then
-            rm -rf -- "${run:?}/$name"
-            echo "$name 原始目录已删除（compact包已校验）"
-        else
-            echo "$name 没有有效compact包，保留原始目录"
-        fi
-    done
+for scene in $scenes; do
+    scenario=${scene%%:*}
+    layout=${scene##*:}
+    name="$scenario-$layout"
+    excludes+=(--exclude="$(basename "$run")/$name")
+    avail=$(df --output=avail -k "$run" | tail -1)
+    [ "$avail" -ge 8388608 ] || {
+        echo "磁盘可用不足8GB，停止于 $name 之前。"; final=1; break;
+    }
+    [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || {
+        echo "上一场后GPU仍有计算进程，停止于 $name 之前。"; final=1; break;
+    }
+    echo "=== 开始：$name（$(date +%T)）==="
+    date +%s.%N > "$run/$name.started_unix_s"
+    "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
+        --phase-shift --phase-scenario "$scenario" --static-layout "$layout" \
+        --expanded-context --current-machine --repetitions 1 \
+        --model "$model" \
+        --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
+        --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json" \
+        --output "$run/$name" --expected-revision "$head" 2>&1 | tee "$run/$name.console.log"
+    status=${PIPESTATUS[0]}
+    echo "$name 退出码：$status" | tee -a "$run/exit_codes.txt"
+    [ "$status" = 0 ] || final=$status
+    # 压缩包完整才删原始目录；sidecar哈希和tar目录都要通过。
+    if (cd "$run" && sha256sum -c "$name.tar.gz.sha256" >/dev/null 2>&1)             && tar -tzf "$run/$name.tar.gz" >/dev/null 2>&1; then
+        rm -rf -- "${run:?}/$name"
+        echo "$name 原始目录已删除（compact包已校验）"
+    else
+        echo "$name 没有有效compact包，保留原始目录"
+    fi
 done
 
 kill "$smi" 2>/dev/null

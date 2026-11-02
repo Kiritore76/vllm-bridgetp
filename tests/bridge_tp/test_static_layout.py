@@ -132,6 +132,42 @@ class StaticLayoutTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             plan("--static-layout", "L0", "--sweep-rates", "12")
 
+    def test_phase_workloads_run_on_every_layout_without_a_decider(self):
+        grid = ["merge_light", "merge_moderate", "merge_heavy"]
+        grid += ["deep_light", "deep_mid", "merge_deep", "short_mid", "split_trickle"]
+        for scenario in grid:
+            for layout, arm in (("L0", "stay"), ("L1A", "migrate"), ("L2", "stay")):
+                code, value = plan(
+                    "--phase-shift",
+                    "--phase-scenario",
+                    scenario,
+                    "--expanded-context",
+                    "--static-layout",
+                    layout,
+                )
+                self.assertEqual((code, value["runs"], value["arms"]), (0, 1, [arm]))
+
+    def test_only_l1a_runs_a_decider_on_a_phase_workload(self):
+        code, value = plan(
+            "--phase-shift",
+            "--expanded-context",
+            "--static-layout",
+            "L1A",
+            "--conversion-decider",
+            "record",
+        )
+        self.assertEqual((code, value["arms"]), (0, ["migrate"]))
+        for args in (
+            ["--static-layout", "L2", "--conversion-decider", "record"],
+            ["--conversion-decider", "record"],
+            [],
+        ):
+            with (
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                plan("--phase-shift", "--expanded-context", *args)
+
     def test_conflicting_options_are_rejected(self):
         for args in (
             ["--long-burst-memory-verify", "--static-layout", "L0"],

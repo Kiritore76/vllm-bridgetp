@@ -47,6 +47,29 @@ SCENARIOS = {
         phases=((0, 420, 0.5, 0.05, "long"), (420, 480, 1.0, 0.0, "tail")),
         long=(16384, 8192),
     ),
+    # Layout boundary (user 11-02): where a static L2 starts to beat L1A. The
+    # grid is these two, merge_moderate/merge_heavy, and deep_*/merge_deep.
+    "merge_light": dict(
+        phases=((0, 420, 0.5, 0.1, "long"), (420, 480, 1.0, 0.0, "tail")),
+        long=(6144, 2048),
+    ),
+    "deep_light": dict(
+        phases=((0, 420, 0.5, 0.02, "long"), (420, 480, 1.0, 0.0, "tail")),
+        long=(16384, 8192),
+    ),
+    "deep_mid": dict(
+        phases=((0, 420, 0.5, 0.035, "long"), (420, 480, 1.0, 0.0, "tail")),
+        long=(16384, 8192),
+    ),
+    # Below split_trickle's peak: the short side of the boundary.
+    "short_mid": dict(
+        phases=(
+            (0, 60, 4.0, 0.0, "warm"),
+            (60, 420, 6.0, 0.1, "peak"),
+            (420, 480, 1.0, 0.0, "tail"),
+        ),
+        long=(6144, 2048),
+    ),
     # A short peak with a trickle of long requests, which keep the TP-k from
     # ever being free of them unless routed away.
     "split_trickle": dict(

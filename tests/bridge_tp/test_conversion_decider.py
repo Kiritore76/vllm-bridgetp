@@ -661,6 +661,42 @@ class PhaseShiftTests(unittest.TestCase):
         self.assertTrue(long)
         self.assertLess(value, d.RULES["split_long_share"])
 
+    def test_boundary_grid_steps_the_long_rate_at_fixed_sizes(self):
+        from tools.bridge_tp import qwen3_phase_shift as phase
+
+        root = Path(__file__).resolve().parents[2]
+        inputs = json.loads(
+            (
+                root / "experiments/platforms/qwen3_pressure_observation/inputs.json"
+            ).read_text(encoding="utf-8")
+        )
+
+        def longs(scenario):
+            rows = [
+                j
+                for j in phase.jobs(inputs, scenario)
+                if j["workload_role"] == "long_input_output"
+            ]
+            sizes = {
+                (len(j["request"]["prompt"]), j["request"]["max_tokens"]) for j in rows
+            }
+            return len(rows), sizes
+
+        for scenario, count in (
+            ("merge_light", 42),
+            ("merge_moderate", 105),
+            ("merge_heavy", 168),
+        ):
+            self.assertEqual(longs(scenario), (count, {(6144, 2048)}))
+        for scenario, count in (
+            ("deep_light", 8),
+            ("deep_mid", 14),
+            ("merge_deep", 21),
+        ):
+            self.assertEqual(longs(scenario), (count, {(16384, 8192)}))
+        self.assertEqual(longs("short_mid"), (36, {(6144, 2048)}))
+        self.assertEqual(longs("split_trickle"), (36, {(6144, 2048)}))
+
     def test_phases_give_each_rule_its_window(self):
         from tools.bridge_tp import qwen3_phase_shift as phase
 

@@ -359,10 +359,13 @@ def main(argv=None):
             or args.long_burst_pair
             or args.rate_sweep
             or args.updated_pressure_four_mode
-            or args.static_layout != "L1A"
-            or not args.conversion_decider
+            or not args.static_layout
+            or (args.conversion_decider and args.static_layout != "L1A")
         ):
-            parser.error("phase-shift is its own workload: static L1A with a decider")
+            parser.error(
+                "phase-shift is its own workload on a static layout; "
+                "only L1A runs a decider"
+            )
         args.updated_pressure_four_mode = True
     if args.rate_sweep:
         if (
