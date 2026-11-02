@@ -13,7 +13,9 @@
 #   merge_moderate：短0.5 + 长0.25 req/s（6144/2048），420s；TP2在倾斜时还有余量。
 #   merge_deep    ：短0.5 + 长0.05 req/s（16384/8192），420s；靠KV压力而不是长请求比例触发。
 #   split_trickle ：短9 + 长0.1 req/s（6144/2048），360s；TP2上一直有零星长请求。
-# 磁盘可用不足20GB或GPU未空闲就停；一场失败不中断其余场。全程每秒采样GPU显存与利用率。
+# 磁盘可用不足8GB（单场原始数据实测最多约5.4GB）或GPU未空闲就停；一场失败不中断其余场。
+# 每场的无损compact包校验通过后删除该场原始目录，所以磁盘占用不随场数累积；
+# 没有得到有效compact包的场保留原始目录。全程每秒采样GPU显存与利用率。
 
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
@@ -64,8 +66,8 @@ for scenario in $scenarios; do
         name="$scenario-$arm"
         excludes+=(--exclude="$(basename "$run")/$name")
         avail=$(df --output=avail -k "$run" | tail -1)
-        [ "$avail" -ge 20971520 ] || {
-            echo "磁盘可用不足20GB，停止于 $name 之前。"; final=1; break 2;
+        [ "$avail" -ge 8388608 ] || {
+            echo "磁盘可用不足8GB，停止于 $name 之前。"; final=1; break 2;
         }
         [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || {
             echo "上一场后GPU仍有计算进程，停止于 $name 之前。"; final=1; break 2;
@@ -86,6 +88,13 @@ for scenario in $scenarios; do
         status=${PIPESTATUS[0]}
         echo "$name 退出码：$status" | tee -a "$run/exit_codes.txt"
         [ "$status" = 0 ] || final=$status
+        # 压缩包完整才删原始目录；sidecar哈希和tar目录都要通过。
+        if (cd "$run" && sha256sum -c "$name.tar.gz.sha256" >/dev/null 2>&1)             && tar -tzf "$run/$name.tar.gz" >/dev/null 2>&1; then
+            rm -rf -- "${run:?}/$name"
+            echo "$name 原始目录已删除（compact包已校验）"
+        else
+            echo "$name 没有有效compact包，保留原始目录"
+        fi
     done
 done
 
