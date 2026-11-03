@@ -1246,6 +1246,8 @@ class ConversionDriver:
             "NO_PROFILE",
         )
         self.decider.converted(time.time())
+        # A tilt that waited for its bundle: the gate gets the usual limit.
+        self.tilt_since = time.monotonic() if self.backend.layout_tilt else None
 
     def apply_prepared(self, record, members):
         """Tilt and pre-start of the decider's prepare stage, while it lasts."""

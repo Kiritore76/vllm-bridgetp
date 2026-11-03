@@ -29,9 +29,14 @@ majority.
 Prepare stage, ``tilt_lead_s`` before a proposal and only while the other
 bundles are quiet (the start gate's service check, moved ahead of the load
 the tilt itself adds): the driver may pre-start the replacement engines and
-keep new long requests off the bundle, for at most ``tilt_max_s``. A candidate
-that stops holding ends it at once. A long tilt only moved the pressure onto
-one TP-k (GPU 11-02), and 53s were enough to clear a bundle.
+keep new long requests off the bundle. A candidate that stops holding ends it
+at once. A bundle waiting for its long requests would otherwise never clear
+while they keep arriving (replay 11-03), so that wait needs only KV room on the
+other bundles, not their quiet, and keeps the long requests away for up to
+``split_tilt_max_s``, longer than a deep long request runs. A long tilt moved
+the pressure onto one TP-k (GPU 11-02), so it pauses while another bundle lacks
+that room. Nothing is drained or stopped by a tilt. ``tilt_max_s`` limits a tilt
+once a plan's start gate is waiting.
 """
 
 from __future__ import annotations
@@ -67,6 +72,7 @@ RULES = dict(
     cooldown_s=120.0,
     tilt_lead_s=60.0,
     tilt_max_s=90.0,
+    split_tilt_max_s=360.0,
     prepare_capacity_max=0.8,
     smooth_capacity_s=15.0,
     smooth_waiting_s=10.0,
@@ -111,6 +117,7 @@ class ConversionDecider:
         self.converted_at = None
         self.prepared = None  # dict(key, bundle, target_mode, at)
         self.history = []  # (now, tp1 cap, tp-k cap, tp-k waiting)
+        self.no_room_at = -float("inf")
 
     def smooth(self, now, tp1_cap, tpk_cap, waiting):
         r = self.rules
@@ -175,9 +182,12 @@ class ConversionDecider:
             tpk_capacity_max=tpk_max,
             tpk_waiting=waiting,
             quiet={
+                b: all(pressure(i).get("zone") == "SPARE" for i in ids)
+                for b, ids in members.items()
+            },
+            kv_room={
                 b: all(
-                    pressure(i).get("zone") == "SPARE"
-                    and pressure(i).get("capacity") is not None
+                    pressure(i).get("capacity") is not None
                     and pressure(i)["capacity"] < r["prepare_capacity_max"]
                     for i in ids
                 )
@@ -270,16 +280,22 @@ class ConversionDecider:
                 ready=ready,
             )
             if usable and held >= need - r["tilt_lead_s"] and approaching is None:
-                approaching = (key, edge)
+                approaching = (key, edge, bool(waiting))
             if ready and proposal is None:
                 proposal = dict(bundle=edge[0], target_mode=edge[1], held_s=held)
                 self.proposed_at[key] = now
                 self.since.pop(key, None)
         self.update_prepared(approaching, s, bundles, now)
         prepared = self.prepared
+        if prepared and not all(
+            room for b, room in s["kv_room"].items() if b != prepared["bundle"]
+        ):
+            self.no_room_at = now
         tilt = (
             [prepared["bundle"]]
-            if prepared and now - prepared["at"] <= r["tilt_max_s"]
+            if prepared
+            and now - prepared["at"] <= r["split_tilt_max_s"]
+            and now - self.no_room_at > r["smooth_capacity_s"]
             else []
         )
         record = dict(
@@ -297,16 +313,18 @@ class ConversionDecider:
         return record
 
     def update_prepared(self, approaching, s, bundles, now):
-        """Enter the prepare stage once the others are quiet; leave at once."""
+        """Enter once the others allow it (see the module doc); leave at once."""
         prepared = self.prepared
         if prepared is not None and (
             approaching is None or approaching[0] != prepared["key"]
         ):
             self.prepared = prepared = None
         if prepared is None and approaching is not None:
-            key, edge = approaching
+            key, edge, waiting = approaching
             others = [b for b in bundles if b != edge[0]]
-            if others and all(s["quiet"].get(b) for b in others):
+            if others and all(
+                s["kv_room"].get(b) and (waiting or s["quiet"].get(b)) for b in others
+            ):
                 self.prepared = dict(
                     key=key, bundle=edge[0], target_mode=edge[1], at=now
                 )

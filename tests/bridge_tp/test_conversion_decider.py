@@ -295,11 +295,46 @@ class PrepareStageTests(unittest.TestCase):
         self.assertEqual(record["tilt"], [])
         self.assertIsNone(record["prepared"])
 
-    def test_tilt_has_a_time_limit(self):
+    def test_a_waiting_split_keeps_long_requests_away_until_its_limit(self):
         decider = d.ConversionDecider(d.EDGES)
-        records = run(decider, status(short=12, deep={"B-g2-tp2": 1}), 300)
+        records = run(decider, status(short=12, deep={"B-g2-tp2": 1}), 600)
         tilted = [r["evaluated_unix_s"] - 1000 for r in records if r["tilt"]]
-        self.assertEqual((tilted[0], tilted[-1]), (60, 150))
+        self.assertEqual((tilted[0], tilted[-1]), (60, 420))
+        self.assertEqual(len(tilted), 361)
+        # The limit only ends the tilt: the split still waits, without draining.
+        self.assertFalse(any(r["proposal"] for r in records))
+
+    def test_a_waiting_split_needs_kv_room_elsewhere_not_quiet(self):
+        busy = status(short=8, deep={"A-tp2": 1}, instances=L2_INSTANCES)
+        busy["instances"]["B-tp2"]["pressure"]["zone"] = "CRITICAL"
+        decider = d.ConversionDecider(d.EDGES)
+        records = run(decider, busy, 100, bundles=L2, members=L2_MEMBERS)
+        self.assertEqual(records[-1]["tilt"], ["A"])
+        # The same bundle without long requests would not tilt under this load.
+        free = status(short=8, instances=L2_INSTANCES)
+        free["instances"]["B-tp2"]["pressure"]["zone"] = "CRITICAL"
+        decider = d.ConversionDecider(d.EDGES)
+        records = run(decider, free, 70, bundles=L2, members=L2_MEMBERS)
+        self.assertFalse(any(r["tilt"] for r in records))
+        # KV near full on the other bundle: no tilt to enter.
+        full = status(short=8, deep={"A-tp2": 1}, instances=L2_INSTANCES)
+        full["instances"]["B-tp2"]["pressure"]["capacity"] = 0.9
+        decider = d.ConversionDecider(d.EDGES)
+        records = run(decider, full, 100, bundles=L2, members=L2_MEMBERS)
+        self.assertFalse(any(r["tilt"] for r in records))
+
+    def test_a_long_tilt_pauses_while_the_other_bundle_lacks_kv_room(self):
+        value = status(short=12, deep={"B-g2-tp2": 1})
+        decider = d.ConversionDecider(d.EDGES)
+        records = run(decider, value, 100)
+        self.assertEqual(records[-1]["tilt"], ["B"])
+        full = status(short=12, deep={"B-g2-tp2": 1}, tp1_capacity=0.9)
+        record = decider.observe(full, BUNDLES, MEMBERS, 1101)
+        self.assertEqual(record["tilt"], [])
+        # Room again, after the capacity smoothing.
+        records = run(decider, value, 20, start=1102)
+        tilted = [r["evaluated_unix_s"] - 1000 for r in records if r["tilt"]]
+        self.assertEqual(tilted[0], 117)
 
     def test_signals_are_smoothed(self):
         decider = d.ConversionDecider(d.EDGES)
