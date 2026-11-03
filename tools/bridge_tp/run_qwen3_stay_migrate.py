@@ -851,7 +851,7 @@ def main(argv=None):
             # Phase shift: arrivals end at 840s, then 2048-token outputs drain.
             # Mixed: arrivals end at 1980s; the slowest layout drains long after.
             run_timeout_s=3600
-            if args.phase_shift and args.phase_scenario == "mixed"
+            if args.phase_shift and args.phase_scenario.startswith("mixed")
             else 2400
             if args.conversion_cycle
             else 1200
@@ -917,13 +917,13 @@ def main(argv=None):
             if args.thread_profile:
                 plan["controller_argv"].append("--thread-profile")
             if args.hold_queue:
-                # About half a second of 512-token prefill per engine (profile
-                # 1.3-1.6e-4 s/token); initial values, not tuned.
+                # About two seconds in the engine queue (GPU 11-03); the long limit
+                # is about one long request's life. Initial values, not tuned.
                 plan["controller_argv"] += [
                     "--hold-unstarted",
                     "8",
                     "--hold-long-wait-s",
-                    "60",
+                    "300",
                 ]
             if args.expanded_context:
                 plan["expected_context_limits"] = (32768, 32768)

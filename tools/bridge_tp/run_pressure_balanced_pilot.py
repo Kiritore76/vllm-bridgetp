@@ -106,8 +106,9 @@ def parse_args(argv=None):
     parser.add_argument(
         "--hold-long-wait-s",
         type=float,
-        default=60.0,
-        help="a held long request is sent after this long even without KV room",
+        default=300.0,
+        help="a held long request is sent after this long without fresh KV evidence "
+        "or engine room; measured too little KV keeps it waiting",
     )
     parser.add_argument("--test-only-cancel-first-shadow", action="store_true")
     args = parser.parse_args(argv)

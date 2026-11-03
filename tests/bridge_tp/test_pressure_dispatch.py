@@ -113,6 +113,50 @@ class HoldQueueTests(unittest.TestCase):
         # Past the limit it goes first, even with no room or evidence.
         self.assertEqual(self.names(queue.next(stale, 60.0, 100.0))[0], "long")
 
+    def test_a_measured_full_pool_takes_no_short_request(self):
+        queue = self.queue()
+        queue.add(hold_job("a"), 0.0)
+        full = hold_pool("tp4", free=20, unallocated=20)
+        pools = [hold_pool("tp1"), full]
+        self.assertEqual(self.names(queue.next(pools, 1.0, 100.0)), ("a", ["tp1"]))
+        queue.add(hold_job("b"), 0.0)
+        self.assertIsNone(queue.next([full], 1.0, 100.0))
+        full.free_blocks = 21
+        self.assertEqual(self.names(queue.next([full], 1.0, 100.0))[0], "b")
+
+    def test_a_short_request_ignores_the_growth_of_long_requests(self):
+        queue = self.queue(limit=8)
+        running = stream("tp4", tokens=800, prompt=16384, output=8192)
+        queue.sent(hold_job("old", 16384, 8192), running)
+        queue.add(hold_job("a"), 0.0)
+        self.assertEqual(
+            self.names(queue.next([hold_pool("tp4", free=10)], 1.0, 100.0))[0], "a"
+        )
+
+    def test_a_long_request_past_its_limit_waits_while_kv_is_measured_short(self):
+        queue = self.queue(wait=60)
+        queue.add(hold_job("long", 16384, 8192), 0.0)
+        tight = [hold_pool("tp1", free=1500), hold_pool("tp4", free=1500)]
+        self.assertIsNone(queue.next(tight, 500.0, 100.0))
+        self.assertEqual(queue.waiting(), 1)
+        tight[1].free_blocks = 1536
+        self.assertEqual(self.names(queue.next(tight, 500.0, 100.0)), ("long", ["tp4"]))
+
+    def test_past_its_limit_a_long_request_only_passes_unmeasured_pools(self):
+        queue = self.queue(wait=60)
+        queue.add(hold_job("long", 16384, 8192), 0.0)
+        pools = [hold_pool("tp1", free=1500), hold_pool("tp4", sampled_at=90.0)]
+        self.assertIsNone(queue.next(pools, 59.0, 100.0))
+        self.assertEqual(self.names(queue.next(pools, 60.0, 100.0)), ("long", ["tp4"]))
+
+    def test_past_its_limit_a_long_request_may_exceed_the_unstarted_limit(self):
+        queue = self.queue(limit=1, wait=60)
+        queue.sent(hold_job("a"), stream("tp1"))
+        queue.add(hold_job("long", 16384, 8192), 0.0)
+        pools = [hold_pool("tp1")]
+        self.assertIsNone(queue.next(pools, 59.0, 100.0))
+        self.assertEqual(self.names(queue.next(pools, 60.0, 100.0))[0], "long")
+
     def test_long_requests_already_sent_keep_their_growth_reserved(self):
         queue = self.queue(limit=8)
         running = stream("tp4", tokens=800, prompt=16384, output=8192)

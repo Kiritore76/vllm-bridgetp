@@ -191,6 +191,15 @@ SCENARIOS = {
         long=(6144, 2048),
     ),
 }
+# 12 req/s is past what static L1A serves (GPU 11-03: about 11.25), so its p1 only
+# measured how long the phase was; 10 keeps L1A steady.
+SCENARIOS["mixed_p1_10"] = dict(
+    SCENARIOS["mixed"],
+    phases=tuple(
+        (start, end, 10.0 if phase == "p1_short" else short, long_rate, phase)
+        for start, end, short, long_rate, phase in SCENARIOS["mixed"]["phases"]
+    ),
+)
 PHASES = SCENARIOS["phase_shift"]["phases"]
 LONG_PROMPT, LONG_OUTPUT = SCENARIOS["phase_shift"]["long"]
 

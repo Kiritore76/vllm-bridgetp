@@ -195,6 +195,31 @@ class StaticLayoutTests(unittest.TestCase):
             )
             self.assertEqual((code, value["runs"], value["arms"]), (0, 1, ["stay"]))
 
+    def test_mixed_p1_10_only_lowers_the_first_phase(self):
+        from tools.bridge_tp import qwen3_phase_shift as phase
+
+        inputs = json.loads(Path(INPUTS).read_text(encoding="utf-8"))
+        base, lower = phase.jobs(inputs, "mixed"), phase.jobs(inputs, "mixed_p1_10")
+
+        def outside_p1(jobs):
+            return [
+                (j["at_s"], j["workload_role"])
+                for j in jobs
+                if j["workload_phase"] != "p1_short"
+            ]
+
+        short = [
+            j
+            for j in lower
+            if j["workload_phase"] == "p1_short" and j["workload_role"] == "short_probe"
+        ]
+        self.assertEqual(len(short), 6000)
+        self.assertEqual(outside_p1(base), outside_p1(lower))
+        self.assertEqual(
+            [j["at_s"] for j in base if j["workload_role"] == "long_input_output"],
+            [j["at_s"] for j in lower if j["workload_role"] == "long_input_output"],
+        )
+
     def test_mixed_runs_each_layouts_load_in_turn(self):
         from tools.bridge_tp import qwen3_phase_shift as phase
 
@@ -249,7 +274,7 @@ class StaticLayoutTests(unittest.TestCase):
         code, value = plan(
             "--phase-shift",
             "--phase-scenario",
-            "mixed",
+            "mixed_p1_10",
             "--static-layout",
             "L1A",
             "--kv-short-exempt",

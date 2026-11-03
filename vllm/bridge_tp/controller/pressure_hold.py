@@ -4,8 +4,10 @@
 A request sent to an engine queue stays there even after another pool goes idle,
 and its queued prompt stops long requests from migrating off (mixed static L1A,
 GPU 11-03). Room is counted from the controller's own streams, so stale telemetry
-cannot open or close it. Only a long request's KV fit reads telemetry; without
-fresh evidence it waits, bounded by ``long_wait_s``.
+cannot open or close it. Fresh telemetry showing too little KV also keeps a request
+here: sent into a full engine it only waits there and pushes others out (GPU 11-03,
+user decision). Without fresh evidence a short request is sent and a long request
+waits, bounded by ``long_wait_s``.
 """
 
 import math
@@ -15,8 +17,10 @@ from collections import deque
 class HoldQueue:
     """Short and long requests each leave in arrival order.
 
-    A long request without KV room waits alone so short requests keep flowing;
-    past ``long_wait_s`` it is sent first, room or not. One thread calls this.
+    A long request without KV room waits alone so short requests keep flowing.
+    Past ``long_wait_s`` it is sent first, to a pool it fits or one with no fresh
+    evidence; while every pool measures too little KV it keeps waiting. One thread
+    calls this.
     """
 
     poll_s = 0.05
@@ -61,23 +65,37 @@ class HoldQueue:
                 total += math.ceil(max(0, left) / block_size)
         return total
 
-    def _long_fits(self, pool, job, wall):
-        if (
-            pool.free_blocks is None
-            or type(pool.unallocated_prompt_blocks) is not int
-            or pool.block_size <= 0
-            or not 0 <= wall - pool.sampled_at <= self.max_age_s
-        ):
-            return False
+    def _fresh(self, pool, wall):
+        return (
+            pool.free_blocks is not None
+            and type(pool.unallocated_prompt_blocks) is int
+            and pool.block_size > 0
+            and 0 <= wall - pool.sampled_at <= self.max_age_s
+        )
+
+    @staticmethod
+    def _final_blocks(pool, job):
         request = job["request"]
-        final = math.ceil(
+        return math.ceil(
             (len(request["prompt"]) + int(request["max_tokens"])) / pool.block_size
         )
+
+    def _long_fits(self, pool, job, wall):
         return (
-            pool.free_blocks
+            self._fresh(pool, wall)
+            and pool.free_blocks
             - pool.unallocated_prompt_blocks
             - self._reserved_blocks(pool.pool_id, pool.block_size)
-            >= final
+            >= self._final_blocks(pool, job)
+        )
+
+    def _short_fits(self, pool, job, wall):
+        # Short requests end in seconds, so long requests' later growth is not
+        # charged, and stale telemetry must not stop them.
+        return (
+            not self._fresh(pool, wall)
+            or pool.free_blocks - pool.unallocated_prompt_blocks
+            >= self._final_blocks(pool, job)
         )
 
     def _release(self, queue, now, pools):
@@ -91,13 +109,21 @@ class HoldQueue:
         room = [p for p in pools if len(self.unstarted.get(p.pool_id, ())) < self.limit]
         if self.long and pools:
             job, arrived = self.long[0]
-            if now - arrived >= self.long_wait_s:
-                return self._release(self.long, now, pools)
             fits = [p for p in room if self._long_fits(p, job, wall)]
             if fits:
                 return self._release(self.long, now, fits)
-        if self.short and room:
-            return self._release(self.short, now, room)
+            if now - arrived >= self.long_wait_s:
+                allowed = [
+                    p
+                    for p in pools
+                    if not self._fresh(p, wall) or self._long_fits(p, job, wall)
+                ]
+                if allowed:
+                    return self._release(self.long, now, allowed)
+        if self.short:
+            allowed = [p for p in room if self._short_fits(p, self.short[0][0], wall)]
+            if allowed:
+                return self._release(self.short, now, allowed)
         return None
 
     def sent(self, job, value):
