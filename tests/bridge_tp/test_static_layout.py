@@ -287,6 +287,19 @@ class StaticLayoutTests(unittest.TestCase):
         )
         self.assertEqual((code, value["runs"]), (0, 1))
 
+    def test_the_mixed_static_l2_can_hold(self):
+        code, value = plan(
+            "--phase-shift",
+            "--phase-scenario",
+            "mixed_p1_10",
+            "--static-layout",
+            "L2",
+            "--hold-queue",
+            "--thread-profile",
+            "--expanded-context",
+        )
+        self.assertEqual((code, value["runs"], value["arms"]), (0, 1, ["stay"]))
+
     def test_the_overload_gate_needs_short_exemption(self):
         with self.assertRaises(SystemExit):
             plan("--static-layout", "L1A", "--overload-migrate")
