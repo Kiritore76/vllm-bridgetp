@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 当前任务：混合负载第一场：静态L1A（短请求分流+迁移）长时运行验证，决策器只记录不执行。
-# 不是四模式对比；确认控制器长时运行和记录的判断没问题后，再放其余布局。
+# 当前任务：重跑混合负载静态L1A一场，带控制器线程剖析，定位p3遥测变旧的原因。
+# 代码和负载与上一场相同，决策器只记录；不是四模式对比，也不修路由。
 # cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
@@ -24,14 +24,14 @@ revision=$(git rev-parse HEAD)
     echo 'GPU上有计算进程，停止，未清理任何进程。'; exit 1;
 }
 mkdir -p /root/autodl-tmp/bridgetp/results || exit 1
-run=/root/autodl-tmp/bridgetp/results/qwen3_mixed_$(date +%Y%m%d_%H%M%S)_${RANDOM}
+run=/root/autodl-tmp/bridgetp/results/qwen3_mixed_profile_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 avail=$(df --output=avail -k "$run" | tail -1)
-[ "$avail" -ge 8388608 ] || { echo '磁盘可用不足8GB。'; exit 1; }
+[ "$avail" -ge 20971520 ] || { echo '磁盘可用不足20GB（上一场原始数据约11GB）。'; exit 1; }
 printf '%s\n' "$revision" > "$run/revision.txt"
 echo "本批目录：$run"
 echo 'A={GPU2,GPU3}，B={GPU0,GPU1}；双32768/.88，四卡。'
-echo '静态L1A，开迁移和短请求分流，决策器只记录，不转换。'
+echo '静态L1A，开迁移和短请求分流，决策器只记录，不转换；带控制器线程剖析。'
 echo '混合负载：短12+少量长→短1+长0.05/s→短8+两次6条突发，到达共1980秒。'
 echo '长请求16384输入/8192输出；约40–50分钟，控制器上限60分钟；不自动重试，不删除原始目录。'
 export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
@@ -43,7 +43,7 @@ smi=$!
 trap 'kill "$smi" 2>/dev/null || true' EXIT
 "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
     --phase-shift --phase-scenario mixed --static-layout L1A \
-    --kv-short-exempt --conversion-decider record \
+    --kv-short-exempt --conversion-decider record --thread-profile \
     --expanded-context --current-machine --repetitions 1 \
     --model "$model" \
     --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
