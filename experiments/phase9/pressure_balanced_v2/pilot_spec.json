@@ -137,7 +137,7 @@
     "tools/bridge_tp/run_predictor_regularization_a100.py": "efdf52117542a0438437782eb029ff7403d5aa57e30b5e2b784cd81baa1b0d93",
     "tools/bridge_tp/run_predictor_tail_pilot.py": "1f22c18994ed77e01f42636760794dd1fea58d6b4b9f1f4ee21c40dc2f5d517d",
     "tools/bridge_tp/run_predictor_targeted4_pilot.py": "1e975e6750d24298af771ab9f94e76ae64b4f95993fdd4bf5f157ecbb6408019",
-    "tools/bridge_tp/run_pressure_balanced_pilot.py": "738aa0e166e727b72d0a0f93e1a1ce2d151aab2f9d23cf0dd010dcd5e83ceb4c",
+    "tools/bridge_tp/run_pressure_balanced_pilot.py": "51ded5a42e037e84495056f8d6973f43a6cc6a4b46b34181288130bb1393a17c",
     "tools/bridge_tp/run_randomized_goodoutput_pilot_a100.py": "6595b0f923c3fd601d01cb60c49fc5ef58054ae4bb52cc070aa70bae8cc67994",
     "tools/bridge_tp/run_remote_attention_validation.py": "3bc15acc9e45323f5084c5f9aaabef37336852af1470541beed55c4c4a8e19a3",
     "tools/bridge_tp/run_shadow_rate_load_matrix.py": "ad901d156ea287d9167547018c72445bcc4ce4a6c1b8a7bd1e751554c2f876fe",
@@ -398,7 +398,7 @@
     "vllm/bridge_tp/source_channels.py": "3e9512bdb6fbfd16d339a492b9ffe3c419956c3ce60db4cc689a7a3c8e531596",
     "tests/bridge_tp/test_source_channels.py": "f7b3ce60a876213c39e0121fdcc68752a024edd52ac458df252fae4786c56702",
     "tools/bridge_tp/pressure_conversion.py": "3cb2426ed28378634d39c44e05017dda781b266e3659848636af22583e4d6377",
-    "tests/bridge_tp/test_pressure_conversion.py": "9e54fbe0825a86830af28719f0c7fb2d450b770ad34329cd3b7854cd0b0f5960",
+    "tests/bridge_tp/test_pressure_conversion.py": "f703987720682da0b8b9c042b08918371c5bca91a8fc74a93c797e2d2112941a",
     "tools/bridge_tp/conversion_acceptance.py": "1a22369c18c78c3645c3d1b6e57fa3831477c1f7d4e2b91ada4097e2a5abe9b3",
     "tools/bridge_tp/conversion_planner.py": "33d7c53d0c02b68db9f28e5b7b7ed2c1c1d353b8fa62358ccd1f908b4aaa244c",
     "experiments/platforms/qwen3_pressure_observation/conversion_profile.json": "503c4cf2f82a627c4f7420dc48a5d6fbd6ef3966cb7726f4b3948130f54f0cb8"

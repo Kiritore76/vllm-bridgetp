@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import atexit
-import contextlib
 import hashlib
 import json
 import math
@@ -952,15 +951,15 @@ def _run(args, prepared):
             required,
         )
 
-    def publish_layout_status(now, polled, dispatched):
+    def publish_layout_status(now, polled, dispatched, *, force=False):
         """Controller-side drain evidence per instance for the conversion executor.
 
         Counts what only the controller knows (open admissions, streams it still
         relays, migration sessions); the executor pairs it with fresh native
         evidence before declaring an instance drained.
         """
-        if now - layout_state["status_at"] < 0.5:
-            return
+        if not force and now - layout_state["status_at"] < 0.5:
+            return False
         layout_state["status_at"] = now
         entries = co.ledger.live_rows()
         streams, sessions = {}, {}
@@ -1047,8 +1046,11 @@ def _run(args, prepared):
             encoding="utf-8",
         )
         # A Windows reader may hold it; the next tick retries.
-        with contextlib.suppress(PermissionError):
+        try:
             os.replace(temporary, path)
+        except PermissionError:
+            return False
+        return True
 
     def apply_layout_control():
         """Reconcile instances with the conversion executor's layout file."""
@@ -1851,6 +1853,24 @@ def _run(args, prepared):
                     for previous_session in session.sessions
                 )
             ):
+                # Layout additions use asynchronous inventory readers. An
+                # applied ACTIVE row alone does not prove they have observed
+                # the serving engine, especially after the last request.
+                if any(
+                    polled.get(pool) is None
+                    for pool in slots
+                    if co.lifecycle(pool) == "ACTIVE"
+                ):
+                    time.sleep(args.tick_s)
+                    continue
+                # A conversion can publish its last revision immediately after
+                # a periodic status sample. Flush the applied layout before
+                # exit, retrying next tick if a Windows reader holds the file.
+                if not publish_layout_status(
+                    time.time(), polled, dispatched, force=True
+                ):
+                    time.sleep(args.tick_s)
+                    continue
                 outcome = (
                     "COMPLETED_PENDING_OWNER_CLEANUP"
                     if session.cleanup_requires_shutdown

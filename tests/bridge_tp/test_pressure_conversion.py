@@ -499,6 +499,7 @@ class JoinHarness(Harness):
             self.path_of[extra["endpoint"]] = Path(extra["inventory_path"])
             self.alias_target()
             self.publish(extra["endpoint"])
+        self.keep_fresh(extra["endpoint"])
 
     def alias_target(self):
         # The controller's configured pair-target URL is "target".
@@ -973,6 +974,87 @@ class ConversionTests(unittest.TestCase):
         )
         self.assertEqual({v["tp_degree"] for v in status["instances"].values()}, {1, 2})
         return status
+
+    def test_completed_join_publishes_final_status_after_periodic_sample(self):
+        """Completion cannot leave the last, pre-join periodic status on disk."""
+        for deny_first_final_write, delay_target_inventory in (
+            (False, False),
+            (True, False),
+            (False, True),
+        ):
+            with self.subTest(
+                deny_first_final_write=deny_first_final_write,
+                delay_target_inventory=delay_target_inventory,
+            ):
+                self.check_join_final_status(
+                    deny_first_final_write, delay_target_inventory
+                )
+
+    def check_join_final_status(self, deny_first_final_write, delay_target_inventory):
+        with tempfile.TemporaryDirectory() as directory:
+            harness = JoinHarness(Path(directory), "L0")
+            waiting, sampled = threading.Event(), threading.Event()
+            event, replace = harness.backend.ops.event, pc.os.replace
+            denied = []
+            delayed = []
+            reader_type = load("pressure_inventory_process").ProcessInventory
+            original_poll = reader_type.poll
+
+            def poll(reader, now):
+                value = original_poll(reader, now)
+                if (
+                    delay_target_inventory
+                    and reader.pool_id == "tp4"
+                    and harness.driver.state() == "COMPLETED"
+                    and not delayed
+                ):
+                    delayed.append(True)
+                    return None
+                return value
+
+            def on_event(kind, **values):
+                event(kind, **values)
+                if kind == "CHANNELS_READY":
+                    # Hold publication until the controller just wrote a
+                    # periodic status. All requests have already finished.
+                    waiting.set()
+                    self.assertTrue(sampled.wait(5))
+
+            def on_replace(source, target):
+                if Path(target).name != "layout_status.json":
+                    return replace(source, target)
+                value = json.loads(Path(source).read_text())
+                if (
+                    deny_first_final_write
+                    and not denied
+                    and harness.driver.state() == "COMPLETED"
+                    and value["layout_revision"] == harness.backend.revision
+                ):
+                    denied.append(value["layout_revision"])
+                    raise PermissionError("transient status reader")
+                replace(source, target)
+                if waiting.is_set():
+                    sampled.set()
+
+            harness.backend.ops.event = on_event
+            with (
+                patch.object(pc.os, "replace", side_effect=on_replace),
+                patch.object(reader_type, "poll", new=poll),
+            ):
+                outcome = harness.run(
+                    jobs(1, 0.3),
+                    no_migration=False,
+                    deferred_migration=True,
+                    max_seconds=30,
+                )
+            self.assertTrue(sampled.is_set())
+            status = self.check_joined(harness, outcome)
+            control = json.loads((harness.root / "layout_control.json").read_text())
+            self.assertEqual(status["layout_revision"], control["revision"])
+            self.assertEqual(status["migration_target"], "B-g6-tp2")
+            self.assertFalse(outcome["driver_alive"])
+            self.assertEqual(len(denied), int(deny_first_final_write))
+            self.assertEqual(len(delayed), int(delay_target_inventory))
 
     def test_l0_merge_takes_the_pair_target_and_joins_retained_sources(self):
         """S5b L0 -> L1A: TP1@0 + TP1@1 -> TP2(0,1), target of TP1@2 and TP1@3."""
