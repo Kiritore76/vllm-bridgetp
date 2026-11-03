@@ -28,7 +28,9 @@ from tools.bridge_tp import conversion_decider as decision  # noqa: E402
 from tools.bridge_tp import pressure_health_reference as health  # noqa: E402
 from tools.bridge_tp.pressure_cpu import load  # noqa: E402
 from tools.bridge_tp.pressure_progress import (  # noqa: E402
+    DueJobs,
     ProgressWatch,
+    StreamTracker,
     completed_streams,
     inventory_progress,
     save_progress,
@@ -962,7 +964,7 @@ def _run(args, prepared):
         layout_state["status_at"] = now
         entries = co.ledger.live_rows()
         streams, sessions = {}, {}
-        for value in dispatched.values():
+        for value in tracker.open.values():
             if not value.future.done():
                 # A committed migration moves ownership (keyed by server id).
                 owner = co._owners.get(
@@ -1004,8 +1006,7 @@ def _run(args, prepared):
         window = decision.WINDOW_S
         recent = [
             len(v.payload["prompt"]) + int(v.payload["max_tokens"])
-            for v in dispatched.values()
-            if 0 <= now - v.dispatched_at <= window
+            for v in tracker.recent(now, window)
         ]
         long_requests = [n for n in recent if n >= decision.LONG_TOKENS]
         starts = layout_state["migration_starts"]
@@ -1232,6 +1233,7 @@ def _run(args, prepared):
             args.max_seconds,
         )
         dispatcher.start()
+        tracker, due_jobs = StreamTracker(), DueJobs(jobs)
         if cfg.health_service:
             for slot in slots.values():
                 slot["metrics"] = metrics_for(slot["scraper"])
@@ -1240,6 +1242,7 @@ def _run(args, prepared):
             load("pause_diagnostics").tick()
             apply_layout_control()
             dispatched = dispatcher.snapshot()
+            tracker.update(dispatched, session)
             now, elapsed = time.time(), time.monotonic() - started
             readers = [slot["reader"] for slot in slots.values()]
             polled = {pool_id: s["reader"].poll(now) for pool_id, s in slots.items()}
@@ -1706,18 +1709,12 @@ def _run(args, prepared):
                         co.ledger.complete(entry.key, evidence=True)
             if session.rotate():
                 last_view = None
-            for value in dispatched.values():
-                if value.future.done():
-                    value.future.result()
-            due_queued = [
-                job["id"]
-                for job in jobs
-                if elapsed >= job["at_s"] and job["id"] not in dispatched
-            ]
-            completed = completed_streams(dispatched, session)
+            tracker.update(dispatched, session)
+            due_queued = due_jobs.queued(elapsed, dispatched)
+            completed = tracker.completed(session)
             last_inventory_progress = inventory_progress(inventories)
             marker = workload_progress(
-                dispatched,
+                tracker.open,
                 last_inventory_progress,
                 session,
                 co.ledger.live_rows(),
@@ -1803,7 +1800,7 @@ def _run(args, prepared):
                 audit.write(dict(kind="pressure_progress", **status))
             watch.update(
                 time.monotonic(),
-                marker,
+                (tracker.retired, len(dispatched), marker),
                 work_due=bool(
                     due_queued
                     or len(dispatched) > completed
@@ -1829,7 +1826,7 @@ def _run(args, prepared):
             )
             if (
                 len(dispatched) == len(jobs)
-                and all(v.future.done() for v in dispatched.values())
+                and tracker.all_done()
                 # A live conversion keeps the controller serving until it ends.
                 and not layout_state["pending"]
                 and not any(

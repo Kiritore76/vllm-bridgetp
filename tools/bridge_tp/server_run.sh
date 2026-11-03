@@ -3,11 +3,13 @@
 # 运行：
 #   cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 #
-# 当前任务：确认控制器修复（用户11-03：修复并重跑），1场 steady_short10 L0，约12分钟。
-# 上次（qwen3_layout_boundary_20261103_081337_17366）派发线程CPU从0.68涨到12.92s/30s，
-# 短10约300s后请求来不及发。现在账本只遍历在途记录。
-# 负载：warm 4 req/s 60s，短10 req/s到420s，长请求（16384/8192）每100s一条共3条，60s收尾。
-# 继续开 --thread-profile。看：全部完成、退出码0；派发线程不再上涨；请求不再晚发。
+# 当前任务：控制器修好后重定短请求线（用户11-03：修复并重跑），8场，约1.6小时。
+# 主线程不再遍历全部历史流；上一版派发线程已修。之前短7及以上的结果都受控制器影响。
+# burst_short7、burst_short8：短7或8 req/s，120s起每2s一条长请求（16384/8192）共6条。
+# steady_short10、steady_short12：warm 4 req/s 60s，短10或12 req/s到420s，长请求每100s一条共3条。
+# 都直接以静态布局启动（A={2,3}，B={0,1}，双32768/.88）。L1A-kvshort迁移开启、短请求不受KV保护分流。
+# 最后一场带线程剖析，确认主线程和派发线程不再随时间上涨。
+# 看：全部请求完成、退出码0；控制器CPU、派发延迟；短请求TTFT、E2E和长中断。
 # 磁盘可用不足8GB或GPU未空闲就停；一场失败不中断其余场。
 # 每场的无损compact包校验通过后删除该场原始目录，所以磁盘占用不随场数累积；
 # 没有得到有效compact包的场保留原始目录。全程每秒采样GPU显存与利用率。
@@ -18,8 +20,8 @@ py=$venv/bin/python
 model=/root/autodl-tmp/models/Qwen3-8B
 branch=bridgetp/tp2-4090d-qwen3-8b
 task=qwen3_layout_boundary
-# 每场：负载:布局；L1A-stay不执行迁移，L1A-kvshort短请求不受KV保护分流
-scenes="steady_short10:L0"
+# 每场：负载:布局；L1A-stay不执行迁移，L1A-kvshort短请求不受KV保护分流，-prof带线程剖析
+scenes="burst_short7:L1A-kvshort burst_short7:L2 burst_short8:L1A-kvshort burst_short8:L0 burst_short8:L2 steady_short10:L1A-kvshort steady_short12:L1A-kvshort steady_short12:L0-prof"
 
 cd "$repo" || exit 1
 source "$venv/bin/activate" || exit 1
@@ -63,6 +65,7 @@ for scene in $scenes; do
     extra=()
     [ "$layout" = L1A-stay ] && extra=(--static-no-migrate)
     [ "$layout" = L1A-kvshort ] && extra=(--kv-short-exempt)
+    [ "$layout" = L0-prof ] && extra=(--thread-profile)
     name="$scenario-$layout"
     excludes+=(--exclude="$(basename "$run")/$name")
     avail=$(df --output=avail -k "$run" | tail -1)
@@ -75,7 +78,7 @@ for scene in $scenes; do
     echo "=== 开始：$name（$(date +%T)）==="
     date +%s.%N > "$run/$name.started_unix_s"
     "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
-        --phase-shift --phase-scenario "$scenario" --static-layout "${layout%%-*}" "${extra[@]}" --thread-profile \
+        --phase-shift --phase-scenario "$scenario" --static-layout "${layout%%-*}" "${extra[@]}" \
         --expanded-context --current-machine --repetitions 1 \
         --model "$model" \
         --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \

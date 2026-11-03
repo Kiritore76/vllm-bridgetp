@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Small, atomic progress snapshots and a workload-aware no-progress deadline."""
 
+import collections
+import itertools
 import json
 import os
 from pathlib import Path
@@ -45,6 +47,72 @@ def completed_streams(dispatched, target_stream=None, target_future=None):
         )
         for stream in dispatched.values()
     )
+
+
+class StreamTracker:
+    """What each control tick still has to look at among all dispatched streams.
+
+    Scanning every past stream each tick grew with run length (GPU 11-03). A
+    stream leaves once it can no longer change: its source ended without error,
+    no migration session is waiting on it, and nothing was committed to a target,
+    because a committed stream keeps emitting after its source ends.
+    """
+
+    def __init__(self):
+        self.open = {}
+        self.retired = 0
+        self.seen = 0
+        self.arrivals = collections.deque()
+
+    def update(self, dispatched, session=None):
+        for key in itertools.islice(dispatched, self.seen, None):
+            self.open[key] = dispatched[key]
+            self.arrivals.append(dispatched[key])
+        self.seen = len(dispatched)
+        pending = {
+            id(s.stream)
+            for s in getattr(session, "sessions", ())
+            if s.target_future is not None and not s.target_future.done()
+        }
+        for key, stream in tuple(self.open.items()):
+            if not stream.future.done():
+                continue
+            stream.future.result()  # a failed stream stops the run, as before
+            committed = stream.recorder.progress()[2]
+            if not committed and id(stream) not in pending:
+                del self.open[key]
+                self.retired += 1
+
+    def completed(self, session):
+        return self.retired + completed_streams(self.open, session)
+
+    def all_done(self):
+        return all(stream.future.done() for stream in self.open.values())
+
+    def recent(self, now, window):
+        """Streams dispatched in the last ``window`` seconds."""
+        while self.arrivals and now - self.arrivals[0].dispatched_at > window:
+            self.arrivals.popleft()
+        return [v for v in self.arrivals if 0 <= now - v.dispatched_at <= window]
+
+
+class DueJobs:
+    """Jobs due and not yet dispatched; the dispatcher works in this same order."""
+
+    def __init__(self, jobs):
+        self.jobs = sorted(jobs, key=lambda job: job["at_s"])
+        self.next = 0
+
+    def queued(self, elapsed, dispatched):
+        while self.next < len(self.jobs) and self.jobs[self.next]["id"] in dispatched:
+            self.next += 1
+        out = []
+        for job in itertools.islice(self.jobs, self.next, None):
+            if elapsed < job["at_s"]:
+                break
+            if job["id"] not in dispatched:
+                out.append(job["id"])
+        return out
 
 
 def inventory_progress(inventories):
