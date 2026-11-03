@@ -3,12 +3,12 @@
 # 运行：
 #   cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 #
-# 当前任务：确认主线程修复（用户11-03：先跑一场），burst_short7 L1A-kvshort，约12分钟。
-# 主线程不再遍历全部历史流，这个改动还没上过GPU；这场带迁移，也带线程剖析。
-# 负载：短7 req/s，120s起每2s一条长请求（16384/8192）共6条，420s，再加60s收尾。
-# 直接以L1A启动（A={2,3}，B={0,1}，双32768/.88），迁移开启，短请求不受KV保护分流。
-# 看：全部请求完成、退出码0；迁移提交正常；主线程和派发线程CPU不再随时间上涨。
-# 没问题后的其余7场：burst_short7 L2；burst_short8 L1A-kvshort、L0、L2；steady_short10 L1A-kvshort；steady_short12 L1A-kvshort、L0。
+# 当前任务：确认主线程修复和迁移流（用户11-03：先跑一场），burst_short8 L1A-kvshort，约12分钟。
+# 上一场 burst_short7 跑通但0次迁移；policy.tick 从17ms涨到120ms，每个tick审计都写整本账，现已改。
+# 负载：短8 req/s，120s起每2s一条长请求（16384/8192）共6条，420s，再加60s收尾。
+# 直接以L1A启动（A={2,3}，B={0,1}，双32768/.88），迁移开启，短请求不受KV保护分流，带线程剖析。
+# 看：全部请求完成、退出码0；发生迁移且提交正常；主线程不再随时间上涨；审计文件明显变小。
+# 没问题后的其余7场：burst_short7 L1A-kvshort、L2；burst_short8 L0、L2；steady_short10 L1A-kvshort；steady_short12 L1A-kvshort、L0。
 # 磁盘可用不足8GB或GPU未空闲就停；一场失败不中断其余场。
 # 每场的无损compact包校验通过后删除该场原始目录，所以磁盘占用不随场数累积；
 # 没有得到有效compact包的场保留原始目录。全程每秒采样GPU显存与利用率。
@@ -20,7 +20,7 @@ model=/root/autodl-tmp/models/Qwen3-8B
 branch=bridgetp/tp2-4090d-qwen3-8b
 task=qwen3_layout_boundary
 # 每场：负载:布局；L1A-stay不执行迁移，L1A-kvshort短请求不受KV保护分流，-prof带线程剖析
-scenes="burst_short7:L1A-kvshort-prof"
+scenes="burst_short8:L1A-kvshort-prof"
 
 cd "$repo" || exit 1
 source "$venv/bin/activate" || exit 1

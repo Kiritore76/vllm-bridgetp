@@ -393,7 +393,9 @@ class PressureCoordinator:
                 owner = self._owners.get(c.request_id)
                 if owner is not None and owner != c.owner:
                     raise ValueError("inventory contradicts confirmed ownership")
-            before = self.ledger.snapshot()
+            # Each tick recording every past row made it O(run length) and the
+            # audit hundreds of MB (GPU 11-03); settlements keep the full ledger.
+            before = self.ledger.live_snapshot()
             self.policy.observe_relief(now, source)
             if self.routing_strategy == "pressure":
                 self.policy.relief.acknowledge(now)
@@ -404,13 +406,14 @@ class PressureCoordinator:
                 "decision": asdict(decision),
                 "source_reading": asdict(self.ledger.routing_reading(source)),
                 "target_reading": asdict(self.ledger.routing_reading(target)),
+                "reservation_scope": "live",
                 "reservation_before": before,
                 "execution": "ADVISORY",
                 "routing_relief": self.policy.relief.snapshot(),
                 "prediction_inputs": prediction_inputs(candidates),
             }
             if decision.request_id is None or actions is None:
-                record["reservation_after"] = self.ledger.snapshot()
+                record["reservation_after"] = self.ledger.live_snapshot()
             else:
                 selected = next(
                     c for c in candidates if c.request_id == decision.request_id
@@ -447,7 +450,7 @@ class PressureCoordinator:
                     {
                         "session_id": action.session_id,
                         "execution": "RESERVED",
-                        "reservation_after": self.ledger.snapshot(),
+                        "reservation_after": self.ledger.live_snapshot(),
                     }
                 )
         # Audit errors prevent START and retain the commitment for recovery.
@@ -499,7 +502,7 @@ class PressureCoordinator:
                     owner = self._owners.get(c.request_id)
                     if owner is not None and owner != c.owner:
                         raise ValueError("inventory contradicts confirmed ownership")
-            before = self.ledger.snapshot()
+            before = self.ledger.live_snapshot()
             # A quiescing source may still migrate out; targets must be ACTIVE.
             sources = sorted(
                 i
@@ -588,6 +591,7 @@ class PressureCoordinator:
                     if e is not chosen and e["best"]["key"] is not None
                 ],
                 "global_session_active": session_active,
+                "reservation_scope": "live",
                 "reservation_before": before,
                 "execution": "ADVISORY",
             }
@@ -657,7 +661,7 @@ class PressureCoordinator:
                 self._session_source[action.session_id] = s
                 self._owners.setdefault(selected.request_id, s)
                 record.update(session_id=action.session_id, execution="RESERVED")
-            record["reservation_after"] = self.ledger.snapshot()
+            record["reservation_after"] = self.ledger.live_snapshot()
         self.audit(record)
         if action is None:
             return None

@@ -269,7 +269,9 @@ class PressureIngress:
 
     def for_server_id(self, request_id: str) -> IngressStream:
         with self._lock:
-            matches = [v for v in self.streams.values() if v.server_id == request_id]
+            matches = [
+                v for v in self._open_streams.values() if v.server_id == request_id
+            ] or [v for v in self.streams.values() if v.server_id == request_id]
         if len(matches) != 1:
             raise ValueError("selected request is not bound to one existing stream")
         return matches[0]
