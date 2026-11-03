@@ -3,13 +3,12 @@
 # 运行：
 #   cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 #
-# 当前任务：控制器修好后重定短请求线（用户11-03：修复并重跑），8场，约1.6小时。
-# 主线程不再遍历全部历史流；上一版派发线程已修。之前短7及以上的结果都受控制器影响。
-# burst_short7、burst_short8：短7或8 req/s，120s起每2s一条长请求（16384/8192）共6条。
-# steady_short10、steady_short12：warm 4 req/s 60s，短10或12 req/s到420s，长请求每100s一条共3条。
-# 都直接以静态布局启动（A={2,3}，B={0,1}，双32768/.88）。L1A-kvshort迁移开启、短请求不受KV保护分流。
-# 最后一场带线程剖析，确认主线程和派发线程不再随时间上涨。
-# 看：全部请求完成、退出码0；控制器CPU、派发延迟；短请求TTFT、E2E和长中断。
+# 当前任务：确认主线程修复（用户11-03：先跑一场），burst_short7 L1A-kvshort，约12分钟。
+# 主线程不再遍历全部历史流，这个改动还没上过GPU；这场带迁移，也带线程剖析。
+# 负载：短7 req/s，120s起每2s一条长请求（16384/8192）共6条，420s，再加60s收尾。
+# 直接以L1A启动（A={2,3}，B={0,1}，双32768/.88），迁移开启，短请求不受KV保护分流。
+# 看：全部请求完成、退出码0；迁移提交正常；主线程和派发线程CPU不再随时间上涨。
+# 没问题后的其余7场：burst_short7 L2；burst_short8 L1A-kvshort、L0、L2；steady_short10 L1A-kvshort；steady_short12 L1A-kvshort、L0。
 # 磁盘可用不足8GB或GPU未空闲就停；一场失败不中断其余场。
 # 每场的无损compact包校验通过后删除该场原始目录，所以磁盘占用不随场数累积；
 # 没有得到有效compact包的场保留原始目录。全程每秒采样GPU显存与利用率。
@@ -21,7 +20,7 @@ model=/root/autodl-tmp/models/Qwen3-8B
 branch=bridgetp/tp2-4090d-qwen3-8b
 task=qwen3_layout_boundary
 # 每场：负载:布局；L1A-stay不执行迁移，L1A-kvshort短请求不受KV保护分流，-prof带线程剖析
-scenes="burst_short7:L1A-kvshort burst_short7:L2 burst_short8:L1A-kvshort burst_short8:L0 burst_short8:L2 steady_short10:L1A-kvshort steady_short12:L1A-kvshort steady_short12:L0-prof"
+scenes="burst_short7:L1A-kvshort-prof"
 
 cd "$repo" || exit 1
 source "$venv/bin/activate" || exit 1
@@ -64,8 +63,8 @@ for scene in $scenes; do
     layout=${scene##*:}
     extra=()
     [ "$layout" = L1A-stay ] && extra=(--static-no-migrate)
-    [ "$layout" = L1A-kvshort ] && extra=(--kv-short-exempt)
-    [ "$layout" = L0-prof ] && extra=(--thread-profile)
+    case "$layout" in *kvshort*) extra+=(--kv-short-exempt) ;; esac
+    case "$layout" in *-prof) extra+=(--thread-profile) ;; esac
     name="$scenario-$layout"
     excludes+=(--exclude="$(basename "$run")/$name")
     avail=$(df --output=avail -k "$run" | tail -1)
