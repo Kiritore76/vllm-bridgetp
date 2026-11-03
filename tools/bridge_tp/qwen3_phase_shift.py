@@ -163,6 +163,25 @@ SCENARIOS = {
     ),
     # A short peak with a trickle of long requests, which keep the TP-k from
     # ever being free of them unless routed away.
+    # Each layout's own load in one run (user 11-03): L0's (steady_short12), L2's
+    # (deep_mid's upper rate), then L1A's (burst_short8, twice). A burst waits for
+    # the long requests of the phase before, and the next for it: together they
+    # would exceed every layout's KV, which no layout could show anything about.
+    # P1 is long enough to outlast entering L0 (replay 11-03: about 340s).
+    "mixed": dict(
+        phases=(
+            (0, 60, 4.0, 0.0, "warm"),
+            (60, 660, 12.0, 0.01, "p1_short"),
+            (660, 1080, 1.0, 0.05, "p2_long"),
+            (1080, 1350, 8.0, 0.0, "p3_mixed"),
+            (1350, 1362, 8.0, 0.5, "p3_mixed"),
+            (1362, 1650, 8.0, 0.0, "p3_mixed"),
+            (1650, 1662, 8.0, 0.5, "p3_mixed"),
+            (1662, 1920, 8.0, 0.0, "p3_mixed"),
+            (1920, 1980, 1.0, 0.0, "tail"),
+        ),
+        long=(16384, 8192),
+    ),
     "split_trickle": dict(
         phases=(
             (0, 60, 4.0, 0.0, "warm"),

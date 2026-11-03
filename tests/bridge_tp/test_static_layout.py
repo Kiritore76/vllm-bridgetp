@@ -195,6 +195,56 @@ class StaticLayoutTests(unittest.TestCase):
             )
             self.assertEqual((code, value["runs"], value["arms"]), (0, 1, ["stay"]))
 
+    def test_mixed_runs_each_layouts_load_in_turn(self):
+        from tools.bridge_tp import qwen3_phase_shift as phase
+
+        inputs = json.loads(Path(INPUTS).read_text(encoding="utf-8"))
+        jobs = phase.jobs(inputs, "mixed")
+        long = [j for j in jobs if j["workload_role"] == "long_input_output"]
+        self.assertEqual(
+            {(len(j["request"]["prompt"]), j["request"]["max_tokens"]) for j in long},
+            {(16384, 8192)},
+        )
+
+        def starts(name):
+            return [j["at_s"] for j in long if j["workload_phase"] == name]
+
+        def rate(name):
+            rows = [
+                j
+                for j in jobs
+                if j["workload_phase"] == name and j["workload_role"] == "short_probe"
+            ]
+            times = [j["at_s"] for j in rows]
+            return round(len(rows) / (max(times) - min(times)), 1)
+
+        self.assertEqual(starts("p1_short"), [60 + 100 * n for n in range(6)])
+        self.assertEqual(len(starts("p2_long")), 21)
+        # Two bursts of six, each after the long requests before it ended.
+        self.assertEqual(
+            starts("p3_mixed"),
+            [1350 + 2 * n for n in range(6)] + [1650 + 2 * n for n in range(6)],
+        )
+        self.assertGreaterEqual(1350 - starts("p2_long")[-1], 270)
+        self.assertEqual(
+            (rate("p1_short"), rate("p2_long"), rate("p3_mixed")), (12.0, 1.0, 8.0)
+        )
+        self.assertEqual(len({j["id"] for j in jobs}), len(jobs))
+
+    def test_the_mixed_static_l1a_can_record_decisions(self):
+        code, value = plan(
+            "--phase-shift",
+            "--phase-scenario",
+            "mixed",
+            "--static-layout",
+            "L1A",
+            "--kv-short-exempt",
+            "--conversion-decider",
+            "record",
+            "--expanded-context",
+        )
+        self.assertEqual((code, value["runs"]), (0, 1))
+
     def test_burst9_is_the_most_l1a_holds_at_final_length(self):
         from tools.bridge_tp import qwen3_phase_shift as phase
 
