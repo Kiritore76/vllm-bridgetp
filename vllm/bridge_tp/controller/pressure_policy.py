@@ -327,6 +327,37 @@ class Reservation:
     state: str = "ACTIVE"
 
 
+class LedgerEntries(dict):
+    """All rows for audit; hot paths read only the unsettled ones.
+
+    Terminal states never return to a live one, so a row is dropped from the live
+    index the first time it is seen settled. Reading every past row on each
+    arrival grew with run length and saturated the controller (GPU 11-03).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._live = {}
+        self._order = []
+        self._request_ids = set()
+
+    def __setitem__(self, key, value):
+        if key not in self:
+            self._order.append(key)
+        super().__setitem__(key, value)
+        self._live[key] = value
+        self._request_ids.add(value.request_id)
+
+    def live(self):
+        rows = []
+        for key, row in tuple(self._live.items()):
+            if row.state in LIVE_STATES:
+                rows.append(row)
+            else:
+                self._live.pop(key, None)
+        return tuple(rows)
+
+
 class ReservationLedger:
     """Migration commitments plus zero-resource ingress observation records.
 
@@ -336,12 +367,15 @@ class ReservationLedger:
     """
 
     def __init__(self) -> None:
-        self.entries: dict[str, Reservation] = {}
+        self.entries: LedgerEntries = LedgerEntries()
+
+    def live_rows(self) -> tuple[Reservation, ...]:
+        return self.entries.live()
 
     def pending(self, pool_id: str) -> tuple[int, float, int]:
         rows = [
             r
-            for r in tuple(self.entries.values())
+            for r in self.live_rows()
             if r.pool_id == pool_id and r.state in {"ACTIVE", "COMMITTED"}
         ]
         return (
@@ -353,16 +387,14 @@ class ReservationLedger:
     def channel_available(self, pool_id: str) -> bool:
         return not any(
             r.pool_id == pool_id and r.kind == "migration" and r.state == "ACTIVE"
-            for r in tuple(self.entries.values())
+            for r in self.live_rows()
         )
 
     def track_ingress(
         self, key: str, request_id: str, pool_id: str, prompt_tokens: int
     ) -> None:
         """Track identity/unpublished prompt demand without reserving capacity."""
-        if key in self.entries or any(
-            row.request_id == request_id for row in tuple(self.entries.values())
-        ):
+        if key in self.entries or request_id in self.entries._request_ids:
             raise ValueError("ingress identity already tracked")
         if prompt_tokens < 0:
             raise ValueError("invalid prompt length")
@@ -373,7 +405,7 @@ class ReservationLedger:
     def unobserved_ingress(self, pool_id: str) -> tuple[int, int]:
         rows = [
             row
-            for row in tuple(self.entries.values())
+            for row in self.live_rows()
             if row.pool_id == pool_id
             and row.kind == "admission"
             and row.state in {"ACTIVE", "COMMITTED"}
@@ -388,7 +420,7 @@ class ReservationLedger:
         if value and value.get("status") == "OBSERVED":
             extra = sum(
                 workload.slot_cost(value["profile"], row.prefill_tokens)[0]
-                for row in tuple(self.entries.values())
+                for row in self.live_rows()
                 if row.pool_id == pool.pool_id
                 and row.kind == "admission"
                 and row.state in {"ACTIVE", "COMMITTED"}
@@ -407,7 +439,7 @@ class ReservationLedger:
                 pool.unallocated_prompt_blocks
                 + sum(
                     math.ceil(row.prefill_tokens / pool.block_size)
-                    for row in tuple(self.entries.values())
+                    for row in self.live_rows()
                     if row.pool_id == pool.pool_id
                     and row.kind == "admission"
                     and row.state in {"ACTIVE", "COMMITTED"}
@@ -435,7 +467,7 @@ class ReservationLedger:
                 and r.pool_id != value.pool_id
                 and r.state == "COMMITTED"
             )
-            for r in tuple(self.entries.values())
+            for r in self.live_rows()
         ):
             raise ValueError("request already reserved")
         if (
@@ -539,14 +571,14 @@ class ReservationLedger:
 
     def live_snapshot(self) -> list[dict]:
         """Entries routing and migration still read; terminal rows are inert."""
-        return [
-            dict(vars(r))
-            for r in tuple(self.entries.values())
-            if r.state in LIVE_STATES
-        ]
+        return [dict(vars(r)) for r in self.live_rows()]
 
-    def added_since(self, keys) -> list[dict]:
-        return [dict(vars(r)) for k, r in tuple(self.entries.items()) if k not in keys]
+    def mark(self) -> int:
+        """Position for ``added_since``, without copying every key."""
+        return len(self.entries._order)
+
+    def added_since(self, mark: int) -> list[dict]:
+        return [dict(vars(self.entries[k])) for k in self.entries._order[mark:]]
 
 
 @dataclass(frozen=True)
@@ -936,7 +968,7 @@ class PressurePolicy:
                     and row.pool_id == source.pool_id
                     and row.state == "COMMITTED"
                 )
-                for row in self.ledger.entries.values()
+                for row in self.ledger.live_rows()
             ):
                 reasons.append("request has an unsettled commitment")
             if (
@@ -1218,7 +1250,7 @@ def prompt_fit(pool, prompt_tokens, ledger, cfg, now):
     required = math.ceil(prompt_tokens / pool.block_size)
     unpublished = sum(
         math.ceil(row.prefill_tokens / pool.block_size)
-        for row in ledger.entries.values()
+        for row in ledger.live_rows()
         if row.pool_id == pool.pool_id
         and row.kind == "admission"
         and row.state in {"ACTIVE", "COMMITTED"}
@@ -1260,6 +1292,13 @@ def projected_pressure(reading, prompt_tokens, cfg, ledger, now):
     )
 
 
+def admission_rows(ledger, routing_strategy):
+    """Weighted round robin counts every past admission; the others only live ones."""
+    if routing_strategy == "weighted-round-robin":
+        return ledger.entries.values()
+    return ledger.live_rows()
+
+
 def admission_count(ledger, pool_id, routing_strategy="pressure"):
     """In-flight admissions used by the normalized least-inflight fallback."""
     return sum(
@@ -1269,7 +1308,7 @@ def admission_count(ledger, pool_id, routing_strategy="pressure"):
             routing_strategy == "weighted-round-robin"
             or row.state in {"ACTIVE", "COMMITTED", "ACCOUNTED"}
         )
-        for row in ledger.entries.values()
+        for row in admission_rows(ledger, routing_strategy)
     )
 
 
@@ -1392,7 +1431,7 @@ def admit(
                     row.pool_id == pool.pool_id
                     and row.kind == "admission"
                     and row.state in {"ACTIVE", "COMMITTED", "ACCOUNTED"}
-                    for row in ledger.entries.values()
+                    for row in ledger.live_rows()
                 )
                 for pool in pools
             ]
@@ -1408,7 +1447,7 @@ def admit(
                     routing_strategy == "weighted-round-robin"
                     or row.state in {"ACTIVE", "COMMITTED", "ACCOUNTED"}
                 )
-                for row in ledger.entries.values()
+                for row in admission_rows(ledger, routing_strategy)
             )
             for pool in pools
         ]

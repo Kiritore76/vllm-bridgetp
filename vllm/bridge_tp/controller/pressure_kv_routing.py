@@ -22,7 +22,7 @@ def risk(pool, ledger, cfg, now, prompt_tokens=0):
         return None
     unpublished = sum(
         math.ceil(row.prefill_tokens / pool.block_size)
-        for row in ledger.entries.values()
+        for row in ledger.live_rows()
         if row.pool_id == pool.pool_id
         and row.kind == "admission"
         and row.state in {"ACTIVE", "COMMITTED"}

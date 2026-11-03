@@ -148,7 +148,7 @@ class PressureCoordinator:
     def _admit_pair(self, policy, args, kwargs):
         # Admission only adds rows. Recording the whole ever-growing ledger
         # twice made each arrival O(all past requests) and capped ingress.
-        before, known = self.ledger.live_snapshot(), set(self.ledger.entries)
+        before, known = self.ledger.live_snapshot(), self.ledger.mark()
         pools = args[3] if len(args) > 3 else kwargs["pools"]
         now = kwargs.get("now", args[4] if len(args) > 4 else None)
         policy.observe_relief(now, pools[0])
@@ -293,7 +293,7 @@ class PressureCoordinator:
             )
         # Admission only adds rows. Recording the whole ever-growing ledger
         # twice made each arrival O(all past requests) and capped ingress.
-        before, known = self.ledger.live_snapshot(), set(self.ledger.entries)
+        before, known = self.ledger.live_snapshot(), self.ledger.mark()
         chosen = feasible[0]
         self.ledger.track_ingress(key, request_id, chosen["pool_id"], prompt_tokens)
         result = Admission(
@@ -511,7 +511,7 @@ class PressureCoordinator:
             )
             session_active = any(
                 r.kind == "migration" and r.state == "ACTIVE"
-                for r in self.ledger.entries.values()
+                for r in self.ledger.live_rows()
             )
             evaluations = []
             for s in sources if targets else ():
@@ -709,7 +709,7 @@ class PressureCoordinator:
                 return "target is not active"
             if any(
                 r.kind == "migration" and r.state == "ACTIVE"
-                for r in self.ledger.entries.values()
+                for r in self.ledger.live_rows()
             ):
                 return "a migration session is active"
             if not 0 <= now - target_reading.sampled_at <= self.policy.cfg.max_age_s:
@@ -807,7 +807,7 @@ class PressureCoordinator:
             self.ledger.settle(session_id, outcome, evidence=evidence)
             if outcome == "COMMITTED":
                 self._owners[request_id] = target
-                for row in self.ledger.entries.values():
+                for row in self.ledger.live_rows():
                     if (
                         row.request_id == request_id
                         and row.kind == "admission"

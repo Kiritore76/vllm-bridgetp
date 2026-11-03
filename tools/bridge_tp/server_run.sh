@@ -3,11 +3,11 @@
 # 运行：
 #   cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 #
-# 当前任务：查控制器CPU为什么随时间上涨（用户11-03），1场 steady_short10 L0，约12分钟。
-# 上次这场CPU从每分钟19s涨到60s，有名字的操作只有约5s，主循环从每分钟277次掉到50次。
+# 当前任务：确认控制器修复（用户11-03：修复并重跑），1场 steady_short10 L0，约12分钟。
+# 上次（qwen3_layout_boundary_20261103_081337_17366）派发线程CPU从0.68涨到12.92s/30s，
+# 短10约300s后请求来不及发。现在账本只遍历在途记录。
 # 负载：warm 4 req/s 60s，短10 req/s到420s，长请求（16384/8192）每100s一条共3条，60s收尾。
-# 这次打开 --thread-profile，控制器 thread_profile.jsonl 记录各线程组CPU和所在位置。
-# 看：全部请求完成、退出码0。
+# 继续开 --thread-profile。看：全部完成、退出码0；派发线程不再上涨；请求不再晚发。
 # 磁盘可用不足8GB或GPU未空闲就停；一场失败不中断其余场。
 # 每场的无损compact包校验通过后删除该场原始目录，所以磁盘占用不随场数累积；
 # 没有得到有效compact包的场保留原始目录。全程每秒采样GPU显存与利用率。

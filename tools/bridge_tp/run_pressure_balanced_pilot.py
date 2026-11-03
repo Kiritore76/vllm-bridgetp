@@ -960,7 +960,7 @@ def _run(args, prepared):
         if now - layout_state["status_at"] < 0.5:
             return
         layout_state["status_at"] = now
-        entries = tuple(co.ledger.entries.values())
+        entries = co.ledger.live_rows()
         streams, sessions = {}, {}
         for value in dispatched.values():
             if not value.future.done():
@@ -1141,7 +1141,7 @@ def _run(args, prepared):
             # instance an unsettled migration names (a QUIESCING source may
             # still migrate out): stay QUIESCING until both settle.
             if state == "RETIRED" and (
-                unsettled_on(tuple(co.ledger.entries.values()), pool_id)
+                unsettled_on(co.ledger.live_rows(), pool_id)
                 or any(
                     pool_id in (target, co._session_source.get(session))
                     and co.ledger.entries[session].state == "ACTIVE"
@@ -1281,7 +1281,7 @@ def _run(args, prepared):
                         dispatched,
                         last_inventory_progress,
                         session,
-                        tuple(co.ledger.entries.values()),
+                        co.ledger.live_rows(),
                     ),
                     work_due=any(elapsed >= job["at_s"] for job in jobs),
                     reason="waiting for inventory reconciliation; "
@@ -1720,7 +1720,7 @@ def _run(args, prepared):
                 dispatched,
                 last_inventory_progress,
                 session,
-                tuple(co.ledger.entries.values()),
+                co.ledger.live_rows(),
             )
             pressures = [
                 p.classify(co.ledger.routing_reading(pool), co.policy.cfg, now)
@@ -1813,7 +1813,7 @@ def _run(args, prepared):
                             session.cleanup_requires_shutdown
                             and row.kind == "migration"
                         )
-                        for row in tuple(co.ledger.entries.values())
+                        for row in co.ledger.live_rows()
                     )
                     or session.record
                     and not session.settled
@@ -1837,7 +1837,7 @@ def _run(args, prepared):
                     and not (
                         session.cleanup_requires_shutdown and row.kind == "migration"
                     )
-                    for row in tuple(co.ledger.entries.values())
+                    for row in co.ledger.live_rows()
                 )
                 and all(
                     previous_session.record is None

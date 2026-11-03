@@ -91,6 +91,7 @@ class PressureIngress:
             else post
         )
         self.streams = {}
+        self._open_streams = {}  # what reconcile still has to look at
         self._lock = threading.RLock()
         self.reconcile_log_interval_s = reconcile_log_interval_s
         self._reconcile_logged_at = {}
@@ -152,6 +153,7 @@ class PressureIngress:
             value.dispatch_entered_at = entered
             value.admission_finished_at = self.clock()
             self.streams[client_id] = value
+            self._open_streams[client_id] = value
 
             def consume():
                 value.http_thread_started_at = self.clock()
@@ -177,11 +179,12 @@ class PressureIngress:
             raise ValueError("cannot reconcile stale/future inventory")
         records = []
         with self._lock, self.coordinator._lock:
-            for value in self.streams.values():
-                if value.pool_id != inventory["pool_id"]:
-                    continue
+            for client_id, value in tuple(self._open_streams.items()):
                 entry = self.coordinator.ledger.entries[value.reservation_key]
                 if entry.state in {"MOVED", "COMPLETED", "CANCELLED", "FAILED"}:
+                    del self._open_streams[client_id]
+                    continue
+                if value.pool_id != inventory["pool_id"]:
                     continue
                 before = (value.server_id, dict(vars(entry)))
                 # vLLM completion creates cmpl-<client-id>-<prompt-index>-<suffix>.
@@ -275,7 +278,7 @@ class PressureIngress:
         """First pilot does not recover ownership from an in-memory ledger."""
         if any(
             r.state in {"ACTIVE", "COMMITTED", "ACCOUNTED"}
-            for r in self.coordinator.ledger.entries.values()
+            for r in self.coordinator.ledger.live_rows()
         ):
             raise RuntimeError(
                 "active commitments require reconciliation before restart"
