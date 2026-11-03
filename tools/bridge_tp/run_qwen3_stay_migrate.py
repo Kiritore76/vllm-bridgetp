@@ -297,6 +297,11 @@ def main(argv=None):
         help="static L1A with the same engines and channels but no migration",
     )
     parser.add_argument(
+        "--thread-profile",
+        action="store_true",
+        help="sample controller threads into thread_profile.jsonl",
+    )
+    parser.add_argument(
         "--kv-short-exempt",
         action="store_true",
         help="static L1A: short requests stay eligible for TP1 under KV protection",
@@ -830,6 +835,8 @@ def main(argv=None):
             plans = [p for p in plans if p[2]["name"] in missing]
         for _, arm, _, plan in plans:
             adapt_plan(plan, arm, args.checkpoint, args.model)
+            if args.thread_profile:
+                plan["controller_argv"].append("--thread-profile")
             if args.expanded_context:
                 plan["expected_context_limits"] = (32768, 32768)
                 plan["source_env"].update(

@@ -94,6 +94,7 @@ def parse_args(argv=None):
         help="launcher instance manifest; recorded and checked against tp1/tp4",
     )
     parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument("--thread-profile", action="store_true")
     parser.add_argument("--test-only-cancel-first-shadow", action="store_true")
     args = parser.parse_args(argv)
     if args.maximum_migrations < 0:
@@ -589,7 +590,12 @@ def run(args, prepared):
             native_diagnostics.installed(observer),
             load("pause_diagnostics").GCMonitor(observer),
         ):
-            return _run(args, prepared)
+            if not args.thread_profile:
+                return _run(args, prepared)
+            with load("thread_profile").ThreadProfile(
+                args.run_dir / "thread_profile.jsonl"
+            ):
+                return _run(args, prepared)
     finally:
         observer.close()
 

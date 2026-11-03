@@ -3,13 +3,11 @@
 # 运行：
 #   cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 #
-# 当前任务：确定两条短请求转换线（用户11-02），7场，约1.5小时。
-# 第一组 L2转L1A：burst_short6、burst_short7，短6或7 req/s，120s起每2s一条长请求（16384/8192）共6条。
-#   burst_short6 L1A-kvshort；burst_short7 L1A-kvshort、L2。短6的L2已有；短8时L2已过载。
-# 第二组 L1A转L0：steady_short10、steady_short12，warm 4 req/s 60s，然后短10或12 req/s到420s，
-#   长请求每100s一条共3条（16384/8192），再加60s收尾。各跑 L1A-kvshort、L0。
-# 都直接以静态布局启动（A={2,3}，B={0,1}，双32768/.88），无转换、无决策器。
-# 看：全部请求完成、退出码0；短请求TTFT、E2E、排队和长中断。短8起控制器已到单核上限，第二组数字可能偏大。
+# 当前任务：查控制器CPU为什么随时间上涨（用户11-03），1场 steady_short10 L0，约12分钟。
+# 上次这场CPU从每分钟19s涨到60s，有名字的操作只有约5s，主循环从每分钟277次掉到50次。
+# 负载：warm 4 req/s 60s，短10 req/s到420s，长请求（16384/8192）每100s一条共3条，60s收尾。
+# 这次打开 --thread-profile，控制器 thread_profile.jsonl 记录各线程组CPU和所在位置。
+# 看：全部请求完成、退出码0。
 # 磁盘可用不足8GB或GPU未空闲就停；一场失败不中断其余场。
 # 每场的无损compact包校验通过后删除该场原始目录，所以磁盘占用不随场数累积；
 # 没有得到有效compact包的场保留原始目录。全程每秒采样GPU显存与利用率。
@@ -21,7 +19,7 @@ model=/root/autodl-tmp/models/Qwen3-8B
 branch=bridgetp/tp2-4090d-qwen3-8b
 task=qwen3_layout_boundary
 # 每场：负载:布局；L1A-stay不执行迁移，L1A-kvshort短请求不受KV保护分流
-scenes="burst_short6:L1A-kvshort burst_short7:L1A-kvshort burst_short7:L2 steady_short10:L1A-kvshort steady_short10:L0 steady_short12:L1A-kvshort steady_short12:L0"
+scenes="steady_short10:L0"
 
 cd "$repo" || exit 1
 source "$venv/bin/activate" || exit 1
@@ -77,7 +75,7 @@ for scene in $scenes; do
     echo "=== 开始：$name（$(date +%T)）==="
     date +%s.%N > "$run/$name.started_unix_s"
     "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
-        --phase-shift --phase-scenario "$scenario" --static-layout "${layout%%-*}" "${extra[@]}" \
+        --phase-shift --phase-scenario "$scenario" --static-layout "${layout%%-*}" "${extra[@]}" --thread-profile \
         --expanded-context --current-machine --repetitions 1 \
         --model "$model" \
         --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
