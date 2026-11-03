@@ -26,8 +26,6 @@ revision=$(git rev-parse HEAD)
 mkdir -p /root/autodl-tmp/bridgetp/results || exit 1
 run=/root/autodl-tmp/bridgetp/results/qwen3_mixed_hold_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
-avail=$(df --output=avail -k "$run" | tail -1)
-[ "$avail" -ge 20971520 ] || { echo '磁盘可用不足20GB（上一场原始数据约11GB）。'; exit 1; }
 printf '%s\n' "$revision" > "$run/revision.txt"
 echo "本批目录：$run"
 echo 'A={GPU2,GPU3}，B={GPU0,GPU1}；双32768/.88，四卡。'
