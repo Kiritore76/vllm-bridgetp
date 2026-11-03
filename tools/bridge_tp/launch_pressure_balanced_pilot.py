@@ -377,7 +377,7 @@ def build_scene(spec, scene, run_root, common, args):
         if channel_plan is not None:
             extra_config["bridgetp_gpu_direct_channel_plan"] = str(channel_plan)
         target_argv[-1] = json.dumps(connector)
-    return dict(
+    plan = dict(
         registry=registry,
         conversion=request,
         context_limits=(args.max_model_len, args.tp4_max_model_len),
@@ -397,6 +397,11 @@ def build_scene(spec, scene, run_root, common, args):
         stager_argv=stager_argv,
         controller_argv=argv,
     )
+    if request is not None and "sequence" in request:
+        from tools.bridge_tp.conversion_sequence import prepare_plan
+
+        prepare_plan(plan)
+    return plan
 
 
 def layout_extras(spec, args, target_tp, run_dir):
@@ -498,6 +503,12 @@ def conversion_request(spec, registry):
         return None
     if not spec.get("layout"):
         raise ValueError("conversion needs an explicit layout")
+    if "sequence" in request:
+        from tools.bridge_tp.conversion_sequence import validate
+
+        if spec["layout"]["name"] != "L1A":
+            raise ValueError("the explicit cycle starts in four-card L1A")
+        return validate(request)
     if "decider" in request:
         return decider_request(request, registry)
     bundles = {row.bundle_id for row in registry.instances.values()}
@@ -955,6 +966,23 @@ def start_conversion(spec, scene, plan, common, processes, publish, requests):
         if extra.get("pair_slot") == "target":
             # S5b MERGE_TARGET: the planned (absent) pair target, unchanged.
             argv, env = plan["target_argv"], dict(plan["target_env"])
+            if plan.get("sequence_context"):
+                argv = list(argv)
+                index = argv.index("--kv-transfer-config") + 1
+                connector = json.loads(argv[index])
+                connector["kv_connector_extra_config"][
+                    "bridgetp_gpu_direct_sources"
+                ] = read(plan["channel_plan"])
+                argv[index] = json.dumps(connector)
+                env.update(
+                    BRIDGETP_PRESSURE_POOL=extra["instance_id"],
+                    BRIDGETP_PRESSURE_INVENTORY_PATH=extra["inventory_path"],
+                )
+                if "BRIDGETP_PERFORMANCE_TRACE_DIR" in env:
+                    env["BRIDGETP_PERFORMANCE_TRACE_DIR"] = str(
+                        Path(env["BRIDGETP_PERFORMANCE_TRACE_DIR"]).parent
+                        / extra["instance_id"]
+                    )
         else:
             argv, env = extra_engine(plan, extra)
         if extra.get("start_gate"):
@@ -1005,7 +1033,13 @@ def start_conversion(spec, scene, plan, common, processes, publish, requests):
         event=event,
     )
     target_tp = plan["config"].get("target_tp_size", 4)
-    backend = pc.ControllerConversionBackend(
+    backend_type, sequence_args = pc.ControllerConversionBackend, {}
+    if plan.get("sequence_context"):
+        from tools.bridge_tp.conversion_sequence import SequenceBackend
+
+        backend_type = SequenceBackend
+        sequence_args = dict(sequence_context=plan["sequence_context"])
+    backend = backend_type(
         plan["registry"],
         manifest,
         run_dir,
@@ -1019,10 +1053,14 @@ def start_conversion(spec, scene, plan, common, processes, publish, requests):
         speed_margin=load_profile()["speed_margin"],
         join=pc_join(plan),
         prestart=bool(plan["conversion"].get("prestart")),
+        **sequence_args,
     )
-    driver = pc.ConversionDriver(
-        backend, plan["conversion"], root / "conversion_plan.json"
-    )
+    driver_type = pc.ConversionDriver
+    if plan.get("sequence_context"):
+        from tools.bridge_tp.conversion_sequence import ConversionSequenceDriver
+
+        driver_type = ConversionSequenceDriver
+    driver = driver_type(backend, plan["conversion"], root / "conversion_plan.json")
     driver.start()
     return driver
 
@@ -1178,6 +1216,8 @@ def run_scene(
             common.write_json(plan["channel_plan"], plan["channel_sources"])
         for path in (plan.get("join") or {}).get("target_files", {}).values():
             common.write_json(Path(path), [])
+        for path, targets in plan.get("sequence_target_files", {}).items():
+            common.write_json(Path(path), targets)
         target_label = f"TP{plan['config'].get('target_tp_size', 4)}"
         if "target" not in absent:
             announce(scene["name"], f"启动{target_label}服务，等待就绪")
@@ -1286,6 +1326,14 @@ def run_scene(
         deadline = time.monotonic() + spec["run_timeout_s"] + 60
         last_progress_at = -float("inf")
         while worker.process.poll() is None:
+            if (
+                plan.get("sequence_context")
+                and driver is not None
+                and (driver.error is not None or driver.state() == "RECOVERY_REQUIRED")
+            ):
+                raise RuntimeError(
+                    f"conversion sequence failed: {driver.error or driver.state()}"
+                )
             if time.monotonic() > deadline:
                 raise TimeoutError("owned controller deadline reached")
             if time.monotonic() - last_progress_at >= 10:

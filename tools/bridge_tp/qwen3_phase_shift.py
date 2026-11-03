@@ -21,6 +21,17 @@ from tools.bridge_tp import qwen3_stay_migrate as matched
 
 # (start, end, short req/s, long req/s, phase label) and the long request.
 SCENARIOS = {
+    # Explicit cycle mechanism check, not the later mixed performance trial.
+    "conversion_cycle": dict(
+        phases=(
+            (0, 300, 1.0, 0.0, "cycle_background"),
+            (300, 312, 1.0, 0.5, "first_l1a_burst"),
+            (312, 840, 1.0, 0.0, "cycle_background"),
+            (840, 852, 1.0, 0.5, "second_l1a_burst"),
+            (852, 1080, 1.0, 0.0, "cycle_tail"),
+        ),
+        long=(16384, 8192),
+    ),
     "phase_shift": dict(
         phases=(
             (0, 60, 4.0, 0.0, "P1_short"),

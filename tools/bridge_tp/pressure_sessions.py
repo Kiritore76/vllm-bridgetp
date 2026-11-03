@@ -81,6 +81,16 @@ class PressureSessions:
     def ready_for_start(self):
         return self.record is None
 
+    def bind_target(self, pool_id, endpoint, epoch):
+        self.sessions[-1].bind_target(pool_id, endpoint, epoch)
+
+    @staticmethod
+    def _channel_key(session):
+        return (
+            PressureSessions._source(session),
+            getattr(session, "target_epoch", None),
+        )
+
     def rotate(self):
         if not self.multiple or not self.record or not self.settled:
             return False
@@ -116,9 +126,11 @@ class PressureSessions:
         rows = [json.loads(path.read_text()) for path in paths]
         # Each TP1 source has its own persistent channel (S1-d2): its receipts
         # count that channel's sessions, not every session of the run.
-        source = self._source(self.sessions[-1])
+        source = self._channel_key(self.sessions[-1])
         channel_sessions = sum(
-            self._source(s) == source for s in self.sessions if s.record is not None
+            self._channel_key(s) == source
+            for s in self.sessions
+            if s.record is not None
         )
         sender, *rest = rows
         count = load("tp_geometry").session_target_tp(self.run_dir)
@@ -144,6 +156,44 @@ class PressureSessions:
             or stager.get("returncode") != 0
         ):
             raise ValueError("migration rotation receipts disagree")
+        # A later layout conversion may close this now-idle communicator.
+        # Preserve the verified idle boundary before its live receipts change.
+        idle = dict(
+            status="VERIFIED_CHANNEL_IDLE",
+            migration_id=self.migration_id,
+            source_request_id=self.record.request_id,
+            target_epoch=getattr(self.sessions[-1], "target_epoch", None),
+            verified_unix_s=time.time(),
+            sender={
+                k: sender.get(k)
+                for k in (
+                    "communicator_lifecycle",
+                    "migration_id",
+                    "source_request_id",
+                    "channel_create_count",
+                    "channel_destroy_count",
+                    "channel_session_count",
+                )
+            },
+            ranks=[
+                {
+                    k: row.get(k)
+                    for k in (
+                        "status",
+                        "migration_id",
+                        "session_request_id",
+                        "tp_rank",
+                        "channel_create_count",
+                        "channel_destroy_count",
+                        "channel_session_count",
+                    )
+                }
+                for row in targets
+            ],
+        )
+        temporary = self.run_dir / "channel_idle_verified.tmp"
+        temporary.write_text(json.dumps(idle), encoding="utf-8")
+        os.replace(temporary, self.run_dir / "channel_idle_verified.json")
         old_id = self.migration_id
         self.adapter.close()  # Release the UDP notification port before rebinding.
         self._new()
@@ -172,6 +222,39 @@ class PressureSessions:
             if cleanup_executor is not None:
                 cleanup_executor.shutdown(wait=False, cancel_futures=False)
             session.adapter.close()
+
+
+def verified_idle(root, migration_id, request_id):
+    """An IDLE boundary certified by rotate, before a later channel retirement."""
+    path = Path(root) / "channel_idle_verified.json"
+    if not path.is_file():
+        return False
+    value = json.loads(path.read_text())
+    sender, ranks = value.get("sender", {}), value.get("ranks", [])
+    return (
+        value.get("status") == "VERIFIED_CHANNEL_IDLE"
+        and value.get("migration_id") == sender.get("migration_id") == migration_id
+        and value.get("source_request_id")
+        == sender.get("source_request_id")
+        == request_id
+        and sender.get("communicator_lifecycle") == "PERSISTENT_CHANNEL_IDLE"
+        and type(sender.get("channel_session_count")) is int
+        and sender["channel_session_count"] > 0
+        and len(ranks) == 2
+        and all(
+            row.get("tp_rank") == rank
+            and row.get("status") == "PERSISTENT_CHANNEL_IDLE"
+            and row.get("migration_id") == migration_id
+            and row.get("session_request_id") == request_id
+            and row.get("channel_session_count") == sender.get("channel_session_count")
+            for rank, row in enumerate(ranks)
+        )
+        and all(
+            row.get("channel_create_count") == 1
+            and row.get("channel_destroy_count") == 0
+            for row in [sender, *ranks]
+        )
+    )
 
 
 def follow_stager(argv, run=None):

@@ -138,6 +138,7 @@ def serving_preflight(plans):
 
 def closed_loop_proof(plan, arm):
     from tools.bridge_tp.pressure_session import channel_idle
+    from tools.bridge_tp.pressure_sessions import verified_idle
 
     directory = plan["run_dir"]
     audit = [
@@ -175,8 +176,16 @@ def closed_loop_proof(plan, arm):
                 or not state.get("source_abort_dispatched")
                 or release.get("status") != "SOURCE_KV_RELEASED"
                 or release.get("request_id") != state.get("source_request_id")
-                or not channel_idle(
-                    run_dir, session["migration_id"], state["source_request_id"]
+                or not (
+                    channel_idle(
+                        run_dir, session["migration_id"], state["source_request_id"]
+                    )
+                    or (
+                        plan.get("sequence_context")
+                        and verified_idle(
+                            run_dir, session["migration_id"], state["source_request_id"]
+                        )
+                    )
                 )
             ):
                 raise ValueError(
@@ -224,6 +233,7 @@ def main(argv=None):
     parser.add_argument("--long-burst-pair", action="store_true")
     parser.add_argument("--long-burst-memory-verify", action="store_true")
     parser.add_argument("--long-burst-deep-stay", action="store_true")
+    parser.add_argument("--conversion-cycle", action="store_true")
     parser.add_argument("--expanded-context", action="store_true")
     parser.add_argument("--kv-priority-verify", action="store_true")
     parser.add_argument("--kv-routing-verify", action="store_true")
@@ -320,6 +330,27 @@ def main(argv=None):
     )
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
+    if args.conversion_cycle:
+        if any(
+            (
+                args.conversion,
+                args.conversion_decider,
+                args.static_layout,
+                args.static_no_migrate,
+                args.phase_shift,
+                args.long_burst_pair,
+                args.layout_l1a_channels,
+                args.long_burst_memory_verify,
+                args.long_burst_deep_stay,
+                args.routine_four_mode,
+                args.rate_sweep,
+                args.updated_pressure_four_mode,
+            )
+        ):
+            parser.error("conversion-cycle is one standalone explicit sequence")
+        args.phase_shift, args.static_layout = True, "L1A"
+        args.phase_scenario = "conversion_cycle"
+        args.expanded_context = True
     if args.layout_l1a_channels and not args.long_burst_memory_verify:
         parser.error("layout-l1a-channels runs with long-burst-memory-verify only")
     joined = bool(
@@ -485,6 +516,11 @@ def main(argv=None):
             cfg["note"] += (
                 f"; four-card static layout screen {args.static_layout}, one arm, "
                 "one run per workload; not a formal layout comparison"
+            )
+        if args.conversion_cycle:
+            cfg["horizon_s"] = 1080.0
+            cfg["note"] += (
+                "; explicit four-edge mechanism check; no performance comparison"
             )
         values = cfg["recipes"]
     elif args.kv_priority_verify:
@@ -768,6 +804,26 @@ def main(argv=None):
                 base_port=8400,
                 prestart=args.conversion_prestart,
             )
+        if args.conversion_cycle:
+            spec["conversion"] = dict(
+                base_port=8400,
+                prestart=True,
+                sequence=[
+                    dict(
+                        bundle=bundle,
+                        target_mode=mode,
+                        trigger_s=at,
+                        deadline_s=600,
+                        method=method,
+                    )
+                    for bundle, mode, at, method in (
+                        ("A", "TP2", 60, "SELECTIVE_ROLL"),
+                        ("A", "TP1", 180, "DRAIN"),
+                        ("B", "TP1", 480, "DRAIN"),
+                        ("B", "TP2", 720, "DRAIN"),
+                    )
+                ],
+            )
         spec.update(
             checkpoint=str(args.checkpoint),
             checkpoint_sha256=CHECKPOINT_SHA,
@@ -775,7 +831,9 @@ def main(argv=None):
             service_evidence=str(observation.ASSETS / "service_evidence.json"),
             health_reference=str(observation.ASSETS / "health_reference.json"),
             # Phase shift: arrivals end at 840s, then 2048-token outputs drain.
-            run_timeout_s=1200
+            run_timeout_s=2400
+            if args.conversion_cycle
+            else 1200
             if args.phase_shift
             else 900
             if args.four_mode or matrix_mode
@@ -860,6 +918,11 @@ def main(argv=None):
             )
             ledger.append(row)
             write(args.output / "attempt_ledger.json", ledger)
+            finalizer = comparison.finalize
+            if args.conversion_cycle:
+                from tools.bridge_tp.conversion_sequence import finalize
+
+                finalizer = finalize
             pilot.run_scene(
                 spec,
                 scene,
@@ -871,7 +934,7 @@ def main(argv=None):
                     if args.long_burst_pair
                     else prepare_native(current, common)
                 ),
-                before_shutdown=lambda current: comparison.finalize(current, common),
+                before_shutdown=lambda current, fn=finalizer: fn(current, common),
                 diagnose_pauses=True,
             )
             if not read(plan["run_dir"].parent / "owned_shutdown_receipt.json")[
@@ -880,7 +943,10 @@ def main(argv=None):
                 raise RuntimeError("owned process cleanup failed")
             proof = closed_loop_proof(plan, arm)
             summary, requests, audit = matched.metrics(
-                plan["run_dir"], recipe["jobs"], natural_eos=not recipe["fixed_output"]
+                plan["run_dir"],
+                recipe["jobs"],
+                natural_eos=not recipe["fixed_output"],
+                horizon=cfg["horizon_s"] if args.conversion_cycle else 300.0,
             )
             write(plan["run_dir"].parent / "closed_loop_acceptance.json", proof)
             write(
@@ -894,6 +960,16 @@ def main(argv=None):
                 write(
                     plan["run_dir"].parent / "conversion_acceptance.json",
                     row["conversion"],
+                )
+            if args.conversion_cycle:
+                from tools.bridge_tp.conversion_sequence import assess
+
+                row["conversion_sequence"] = assess(
+                    plan["run_dir"].parent, len(recipe["jobs"])
+                )
+                write(
+                    plan["run_dir"].parent / "conversion_sequence_acceptance.json",
+                    row["conversion_sequence"],
                 )
             row.update(status="COMPLETED", summary=summary, closed_loop=proof)
             if args.long_burst_memory_verify:
@@ -1160,6 +1236,13 @@ def main(argv=None):
                 if done
                 else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
             )
+        if args.conversion_cycle:
+            accepted = len(ledger) == 1 and ledger[0]["conversion_sequence"]["passed"]
+            result, code = (
+                (dict(status="COMPLETED_CONVERSION_SEQUENCE"), 0)
+                if accepted
+                else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
+            )
     except KeyboardInterrupt:
         result, code = dict(status="INTERRUPTED"), 130
     except Exception as error:
@@ -1179,7 +1262,9 @@ def main(argv=None):
             total_profile_attempts=previous_attempts + len(ledger),
             inherited_runs=inherited,
             maximum_live_runs=run_count,
-            experiment_mode="static-layout-" + args.static_layout
+            experiment_mode="conversion-cycle"
+            if args.conversion_cycle
+            else "static-layout-" + args.static_layout
             if args.static_layout
             else "conversion-" + args.conversion
             if args.conversion

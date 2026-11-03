@@ -170,7 +170,9 @@ class ControllerConversionBackend:
         self.valve_since = None
         self.assist_at = -float("inf")
         self.assist_seq = 0
+        self.assist_step_start_seq = 0
         self.assisted = []  # request ids whose assist START was published
+        self.assist_committed_baseline = 0
         self.last_assist_reason = None
         self.planned = None  # evacuation proposed, waiting for the controller
         self.evacuation = None  # accepted plan; [] once it gave up
@@ -217,7 +219,12 @@ class ControllerConversionBackend:
                 # S5b: how a new instance joins migration.
                 **{
                     k: row[k]
-                    for k in ("legacy_pool", "migration_channel", "predictor_events")
+                    for k in (
+                        "legacy_pool",
+                        "migration_channel",
+                        "predictor_events",
+                        "migration_target",
+                    )
                     if k in row
                 },
             )
@@ -488,11 +495,17 @@ class ControllerConversionBackend:
         if not self.fresh(status):
             return "status stale", None
         result = status.get("assist_result")
-        if self.assist_seq and (result is None or result["seq"] != self.assist_seq):
+        if self.assist_seq > self.assist_step_start_seq and (
+            result is None or result["seq"] != self.assist_seq
+        ):
             return "previous assist not answered yet", None
-        if result is not None and result["seq"] == self.assist_seq:
+        if (
+            self.assist_seq > self.assist_step_start_seq
+            and result is not None
+            and result["seq"] == self.assist_seq
+        ):
             started = result["state"] == "STARTED"
-            if started and len(self.assisted) < self.assist_seq:
+            if started and result["request_id"] not in self.assisted:
                 self.assisted.append(result["request_id"])
             planned = self.planned
             if planned is not None and planned["seq"] == result["seq"]:
@@ -521,7 +534,11 @@ class ControllerConversionBackend:
         if any(instances[i]["sessions"] for i in refs) or instances[target]["sessions"]:
             return "a migration session is active", None
         states = list((status.get("assist_sessions") or {}).values())
-        committed = sum(s in {"COMMITTED", "ACCOUNTED", "COMPLETED"} for s in states)
+        committed = max(
+            0,
+            sum(s in {"COMMITTED", "ACCOUNTED", "COMPLETED"} for s in states)
+            - self.assist_committed_baseline,
+        )
         if committed >= self.safety["assist_max_committed"]:
             return "committed assists at cap for this conversion", None
         if len(self.assisted) >= self.safety["assist_max_attempts"]:
@@ -654,14 +671,15 @@ class ControllerConversionBackend:
         if self.channel_closing is None:
             rows = read_json(self.channel_plan) or []
             generations = {r.instance_generation for r in self.refs(plan)}
+            selected = getattr(self, "_close_generations", generations)
             closing = sorted(
-                r["generation"] for r in rows if r["generation"] in generations
+                r["generation"] for r in rows if r["generation"] in selected
             )
             written_at = self.clock()
             if closing:
                 atomic_json(
                     self.channel_plan,
-                    [r for r in rows if r["generation"] not in generations],
+                    [r for r in rows if r["generation"] not in selected],
                 )
             self.channel_closing = dict(
                 generations=closing, written_at=written_at, closed={}

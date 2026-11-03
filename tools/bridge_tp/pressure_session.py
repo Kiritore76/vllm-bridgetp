@@ -71,6 +71,9 @@ class RollingPressureSession:
             old = backend
 
         self.old, self.run_dir, self.config = old, run_dir, config
+        self.target_url = config.target_url
+        self.target_instance = "tp4"
+        self.target_epoch = None
         self.coordinator, self.ingress, self.executor = coordinator, ingress, executor
         self.audit, self.request_timeout_s = audit, request_timeout_s
         self.migration_id = migration_id
@@ -176,6 +179,14 @@ class RollingPressureSession:
             )
             self.cancel(reason)
 
+    def bind_target(self, pool_id, endpoint, epoch):
+        """Bind an unused session to this incarnation of the migration target."""
+        if self.record is not None:
+            raise ValueError("cannot retarget a started migration")
+        self.target_instance, self.target_epoch = pool_id, epoch
+        self.target_url = endpoint
+        self.adapter.target_url = endpoint.rstrip("/")
+
     def _bind_source(self, candidate):
         """Point commit/cleanup at the engine that owns the selected request.
 
@@ -208,6 +219,7 @@ class RollingPressureSession:
         if self.record is not None:
             raise ValueError("one session per migration driver")
         stream = self.ingress.for_server_id(candidate.request_id)
+        stream.recorder.target_pool = self.target_instance
         cap = stream.payload["max_tokens"]
         if candidate.max_output_tokens != cap or cap > 8192:
             raise ValueError("selected request stop contract differs from live stream")
@@ -260,6 +272,8 @@ class RollingPressureSession:
                 "request_id": candidate.request_id,
                 "migration_id": self.migration_id,
                 "rate": rate.to_json(),
+                "target_instance": self.target_instance,
+                "target_epoch": self.target_epoch,
                 "transfer_mode": self.transfer_mode,
             }
         )
@@ -306,7 +320,7 @@ class RollingPressureSession:
             adapter=self.adapter,
             recorder=stream.recorder,
             executor=self.executor,
-            target_url=self.config.target_url,
+            target_url=self.target_url,
             request_timeout_s=self.request_timeout_s,
             target_future=self.target_future,
             gpu_resident_shadow=True,
@@ -539,7 +553,7 @@ class RollingPressureSession:
                 raise ValueError("cancelled target abort receipt identity differs")
         prefix = f"cmpl-bridgetp-phase9-target-{self.run_dir.name}-0"
         if (
-            inventory["pool_id"] != "tp4"
+            inventory["pool_id"] != self.target_instance
             or not 0 <= now - inventory["sampled_at"] <= max_age_s
             or inventory["sampled_at"]
             <= source.get("cleanup_http_completed_unix_s", source["updated_unix_s"])

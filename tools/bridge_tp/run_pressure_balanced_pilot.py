@@ -832,6 +832,7 @@ def _run(args, prepared):
 
     layout_state = dict(
         signature=None,
+        migration_target="tp4" if "tp4" in pair else None,
         revision=None,
         status_at=-math.inf,
         candidates={},
@@ -907,7 +908,7 @@ def _run(args, prepared):
             }
             if not set(assist["evacuate"]) <= set(by_id):
                 return "an evacuation request is not a current candidate"
-            pending_blocks, pending_decode, _ = co.ledger.pending("tp4")
+            pending_blocks, pending_decode, _ = co.ledger.pending(target_pool.pool_id)
             reading = co.ledger.routing_reading(target_pool)
             refusal = evacuation_refusal(
                 co.policy.cfg,
@@ -926,7 +927,7 @@ def _run(args, prepared):
             (candidate.prompt_tokens + candidate.max_output_tokens)
             / controller.block_size
         )
-        pending, pending_decode, _ = co.ledger.pending("tp4")
+        pending, pending_decode, _ = co.ledger.pending(target_pool.pool_id)
         free = target_pool.free_blocks
         if free is None or free - pending - required < cfg.capacity_guard_blocks:
             return "target KV cannot hold the final length plus guard"
@@ -944,7 +945,7 @@ def _run(args, prepared):
         return co.assist_start(
             now,
             source,
-            "tp4",
+            target_pool.pool_id,
             candidate,
             actions.get(candidate.request_id),
             target_pool,
@@ -1027,12 +1028,16 @@ def _run(args, prepared):
                 dict(
                     schema="PRESSURE_LAYOUT_STATUS_V1",
                     unix_s=time.time(),
+                    workload_origin_unix_s=origin_unix_s,
                     layout_revision=layout_state["revision"],
                     instances=instances,
                     # Measured START-to-source-release budget (S4 planner).
                     release_budget_s=lookup.release_budget,
-                    migration_target=instance_of.get("tp4", "tp4")
-                    if "tp4" in polled and polled["tp4"] is not None
+                    migration_target=instance_of.get(
+                        layout_state["migration_target"],
+                        layout_state["migration_target"],
+                    )
+                    if polled.get(layout_state["migration_target"]) is not None
                     else None,
                     assist_result=layout_state["assist_result"],
                     workload=workload,
@@ -1082,8 +1087,13 @@ def _run(args, prepared):
                     raise ValueError("layout control cannot add a pair target")
                 alias_of[row["instance_id"]] = "tp4"
                 instance_of["tp4"] = row["instance_id"]
+                layout_state["migration_target"] = "tp4"
             pool_id = alias_of.get(row["instance_id"], row["instance_id"])
             state = row["lifecycle"]
+            if row.get("migration_target") and state == "ACTIVE":
+                layout_state["migration_target"] = pool_id
+            if state == "RETIRED" and pool_id == layout_state["migration_target"]:
+                layout_state["migration_target"] = None
             if state not in {"ACTIVE", "QUIESCING", "RETIRED"}:
                 raise ValueError("layout control lifecycle " + state)
             if pool_id not in tp_of:
@@ -1416,7 +1426,18 @@ def _run(args, prepared):
             index_of = {pool.pool_id: n for n, pool in enumerate(pools)}
             # Migration needs the pair target and a live source; retired or
             # not-yet-observed instances simply drop out (S3b-1).
-            t = index_of.get("tp4")
+            target_pool_id = layout_state["migration_target"]
+            t = index_of.get(target_pool_id)
+            if (
+                t is not None
+                and session.ready_for_start
+                and hasattr(session, "bind_target")
+            ):
+                session.bind_target(
+                    target_pool_id,
+                    ingress.urls[target_pool_id],
+                    instance_of.get(target_pool_id, target_pool_id),
+                )
             candidates_by_source, runtimes, rates_by_source = {}, {}, {}
             # Published (next tick) with each request's planner row.
             layout_state["candidates"] = {}
@@ -1602,14 +1623,14 @@ def _run(args, prepared):
                     "policy.tick",
                     co.tick_multi,
                     now,
-                    {"tp4": pools[t]}
+                    {target_pool_id: pools[t]}
                     | {
                         source: pools[index_of[source]]
                         for source in candidates_by_source
                     },
                     tp_of,
                     {
-                        (source, "tp4"): cs
+                        (source, target_pool_id): cs
                         for source, cs in candidates_by_source.items()
                     },
                     actions,
@@ -1730,7 +1751,7 @@ def _run(args, prepared):
             layout_state["pressure"] = {
                 pool: asdict(value) for pool, value in by_pool.items()
             }
-            source_p, target_p = by_pool.get("tp1"), by_pool.get("tp4")
+            source_p, target_p = by_pool.get("tp1"), by_pool.get(target_pool_id)
             if time.monotonic() - last_status_at >= 5:
                 last_status_at = time.monotonic()
                 status = dict(

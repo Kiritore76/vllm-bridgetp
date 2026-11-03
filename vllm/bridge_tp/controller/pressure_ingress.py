@@ -26,6 +26,7 @@ class ObservedRecorder(ProxyRecorder):
         self.service_id = external_id
         self.target_service_id = external_id + ":target"
         self.target_arrived = False
+        self.target_pool = "tp4"
 
     def on_source_token(self, index, token_id, unix_s):
         self.service.token(self.service_id, unix_s)
@@ -33,7 +34,7 @@ class ObservedRecorder(ProxyRecorder):
 
     def on_target_token(self, index, token_id, unix_s):
         if not self.target_arrived:
-            self.service.arrive(self.target_service_id, "tp4", unix_s)
+            self.service.arrive(self.target_service_id, self.target_pool, unix_s)
             self.target_arrived = True
         self.service.token(self.target_service_id, unix_s)
         super().on_target_token(index, token_id, unix_s)
