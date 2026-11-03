@@ -31,6 +31,172 @@ d, i, o, r, io = (
 )
 
 
+h = load("pressure_hold")
+
+
+def hold_job(name, prompt=1, output=8, at_s=0.0):
+    return dict(
+        id=name, at_s=at_s, request=dict(prompt=[1] * prompt, max_tokens=output)
+    )
+
+
+def stream(pool_id, tokens=0, done=False, prompt=1, output=8):
+    return NS(
+        pool_id=pool_id,
+        recorder=NS(tokens_seen=tokens, target_arrived=False, target_pool="tp4"),
+        future=NS(done=lambda: done),
+        payload=dict(prompt=[1] * prompt, max_tokens=output),
+    )
+
+
+def hold_pool(name, free=2000, unallocated=0, sampled_at=100.0):
+    return NS(
+        pool_id=name,
+        free_blocks=free,
+        unallocated_prompt_blocks=unallocated,
+        block_size=16,
+        sampled_at=sampled_at,
+    )
+
+
+class HoldQueueTests(unittest.TestCase):
+    def queue(self, limit=2, wait=60, active=lambda _: True):
+        return h.HoldQueue(limit, wait, 8192, 2.0, active)
+
+    def names(self, released):
+        return released[0]["id"], [p.pool_id for p in released[1]]
+
+    def test_short_requests_leave_in_order_and_only_while_a_pool_has_room(self):
+        queue = self.queue(limit=1)
+        pools = [hold_pool("tp1"), hold_pool("tp4")]
+        for n in "abc":
+            queue.add(hold_job(n), 0.0)
+        first = queue.next(pools, 1.0, 100.0)
+        self.assertEqual(self.names(first), ("a", ["tp1", "tp4"]))
+        self.assertEqual(first[0]["held_s"], 1.0)
+        waiting = stream("tp1")
+        queue.sent(first[0], waiting)
+        self.assertEqual(self.names(queue.next(pools, 1.0, 100.0)), ("b", ["tp4"]))
+        queue.sent(hold_job("b"), stream("tp4"))
+        self.assertIsNone(queue.next(pools, 1.0, 100.0))
+        # The first token, not completion, frees the place in line.
+        waiting.recorder.tokens_seen = 1
+        self.assertEqual(self.names(queue.next(pools, 1.0, 100.0)), ("c", ["tp1"]))
+        self.assertEqual(queue.waiting(), 0)
+
+    def test_stale_telemetry_does_not_stop_short_requests(self):
+        queue = self.queue()
+        queue.add(hold_job("a"), 0.0)
+        pools = [hold_pool("tp1", free=None, unallocated=None, sampled_at=1.0)]
+        self.assertEqual(self.names(queue.next(pools, 1.0, 100.0))[0], "a")
+
+    def test_a_long_request_without_room_waits_alone(self):
+        queue = self.queue()
+        queue.add(hold_job("long", 16384, 8192), 0.0)
+        queue.add(hold_job("short"), 0.5)
+        tight = [hold_pool("tp1", free=1500), hold_pool("tp4", unallocated=600)]
+        self.assertEqual(self.names(queue.next(tight, 1.0, 100.0))[0], "short")
+        self.assertIsNone(queue.next(tight, 1.0, 100.0))
+        self.assertEqual(queue.waiting(), 1)
+        roomy = [hold_pool("tp1"), hold_pool("tp4", free=1000)]
+        self.assertEqual(self.names(queue.next(roomy, 1.0, 100.0)), ("long", ["tp1"]))
+
+    def test_a_long_request_needs_fresh_evidence_until_its_limit(self):
+        queue = self.queue(wait=60)
+        queue.add(hold_job("long", 16384, 8192), 0.0)
+        queue.add(hold_job("short"), 0.0)
+        stale = [hold_pool("tp1", sampled_at=90.0)]
+        self.assertEqual(self.names(queue.next(stale, 59.0, 100.0))[0], "short")
+        queue.sent(hold_job("short"), stream("tp1"))
+        queue.sent(hold_job("other"), stream("tp1"))
+        self.assertIsNone(queue.next(stale, 59.0, 100.0))
+        # Past the limit it goes first, even with no room or evidence.
+        self.assertEqual(self.names(queue.next(stale, 60.0, 100.0))[0], "long")
+
+    def test_long_requests_already_sent_keep_their_growth_reserved(self):
+        queue = self.queue(limit=8)
+        running = stream("tp4", tokens=800, prompt=16384, output=8192)
+        queue.sent(hold_job("old", 16384, 8192), running)
+        queue.add(hold_job("new", 16384, 8192), 0.0)
+        self.assertIsNone(queue.next([hold_pool("tp4", free=1800)], 1.0, 100.0))
+        self.assertEqual(
+            self.names(queue.next([hold_pool("tp4", free=2000)], 1.0, 100.0))[0],
+            "new",
+        )
+
+    def test_a_migrated_long_request_is_charged_to_its_target(self):
+        queue = self.queue(limit=8)
+        moved = stream("tp1", tokens=800, prompt=16384, output=8192)
+        moved.recorder.target_arrived = True
+        queue.sent(hold_job("old", 16384, 8192), moved)
+        queue.add(hold_job("new", 16384, 8192), 0.0)
+        self.assertEqual(
+            self.names(
+                queue.next(
+                    [hold_pool("tp1", free=1600), hold_pool("tp4", free=1600)],
+                    1.0,
+                    100.0,
+                )
+            ),
+            ("new", ["tp1"]),
+        )
+
+    def test_retired_instances_are_not_offered(self):
+        queue = self.queue(active=lambda pool_id: pool_id != "tp1")
+        queue.add(hold_job("a"), 0.0)
+        pools = [hold_pool("tp1"), hold_pool("tp4")]
+        self.assertEqual(self.names(queue.next(pools, 1.0, 100.0)), ("a", ["tp4"]))
+
+    def test_dispatcher_sends_held_requests_in_order_as_engines_start(self):
+        sent, open_streams = [], []
+
+        def submit(job, pools):
+            value = stream(pools[0].pool_id)
+            sent.append((job["id"], job.get("held_s")))
+            open_streams.append(value)
+            return value
+
+        jobs = [hold_job(str(n), at_s=0.0) for n in range(3)]
+        now = time.time()
+        dispatcher = d.ScheduledDispatch(
+            jobs,
+            submit,
+            [hold_pool("tp1", sampled_at=now)],
+            time.monotonic(),
+            5.0,
+            hold=self.queue(limit=1),
+        )
+        dispatcher.start()
+        time.sleep(0.2)
+        self.assertEqual([name for name, _ in sent], ["0"])
+        self.assertEqual(sorted(dispatcher.snapshot()), ["0"])
+        for _ in range(2):
+            open_streams[-1].recorder.tokens_seen = 1
+            time.sleep(0.2)
+        open_streams[-1].recorder.tokens_seen = 1
+        dispatcher.thread.join(2)
+        self.assertFalse(dispatcher.thread.is_alive())
+        self.assertEqual([name for name, _ in sent], ["0", "1", "2"])
+        self.assertGreater(sent[-1][1], sent[0][1])
+
+    def test_fixed_routes_bypass_the_hold(self):
+        sent = []
+        job = dict(hold_job("fixed"), route="tp4")
+
+        def submit(job, pools):
+            sent.append(job["id"])
+            return stream("tp4")
+
+        hold = self.queue(limit=1, active=lambda _: False)
+        dispatcher = d.ScheduledDispatch(
+            [job], submit, [], time.monotonic(), 5.0, hold=hold
+        )
+        dispatcher.start()
+        dispatcher.thread.join(2)
+        self.assertEqual(sent, ["fixed"])
+        self.assertFalse(dispatcher.thread.is_alive())
+
+
 class DispatchTests(unittest.TestCase):
     def test_blocked_control_does_not_delay_arrivals(self):
         sent = threading.Event()

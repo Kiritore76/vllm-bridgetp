@@ -312,6 +312,16 @@ def main(argv=None):
         help="sample controller threads into thread_profile.jsonl",
     )
     parser.add_argument(
+        "--hold-queue",
+        action="store_true",
+        help="static layout: hold arrivals in the controller while no pool has room",
+    )
+    parser.add_argument(
+        "--overload-migrate",
+        action="store_true",
+        help="static L1A: sustained source overload migrates without a drained queue",
+    )
+    parser.add_argument(
         "--kv-short-exempt",
         action="store_true",
         help="static L1A: short requests stay eligible for TP1 under KV protection",
@@ -386,6 +396,10 @@ def main(argv=None):
         parser.error("--static-no-migrate is a static L1A control without a decider")
     if args.kv_short_exempt and args.static_layout != "L1A":
         parser.error("--kv-short-exempt is a static L1A routing option")
+    if args.hold_queue and not args.static_layout:
+        parser.error("--hold-queue is a static layout option")
+    if args.overload_migrate and not args.kv_short_exempt:
+        parser.error("--overload-migrate needs --kv-short-exempt")
     if args.conversion_assist and args.conversion != "L1A-L2":
         parser.error("drain assist merges TP1s into a TP2 (L1A-L2) only")
     if not 0 <= args.conversion_trigger_s < 300:
@@ -506,6 +520,10 @@ def main(argv=None):
             if args.kv_short_exempt:
                 cfg["policy_overrides"] = dict(
                     cfg["policy_overrides"], kv_short_exempt_blocks=64
+                )
+            if args.overload_migrate:
+                cfg["policy_overrides"] = dict(
+                    cfg["policy_overrides"], overload_migrates=True
                 )
             if args.long_burst_pair:
                 cfg["recipes"] = [
@@ -898,6 +916,15 @@ def main(argv=None):
             adapt_plan(plan, arm, args.checkpoint, args.model)
             if args.thread_profile:
                 plan["controller_argv"].append("--thread-profile")
+            if args.hold_queue:
+                # About half a second of 512-token prefill per engine (profile
+                # 1.3-1.6e-4 s/token); initial values, not tuned.
+                plan["controller_argv"] += [
+                    "--hold-unstarted",
+                    "8",
+                    "--hold-long-wait-s",
+                    "60",
+                ]
             if args.expanded_context:
                 plan["expected_context_limits"] = (32768, 32768)
                 plan["source_env"].update(

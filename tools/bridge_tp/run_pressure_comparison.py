@@ -413,7 +413,9 @@ def result_metrics(rows, jobs, origin, lag_budget, natural_eos=False):
         if times != sorted(times):
             raise RuntimeError("visible token times regressed")
         gaps = [b - a for a, b in zip(times, times[1:])]
-        started = transport["request_started_unix_s"]
+        # Time held in the controller is queueing the client saw, not dispatch lag.
+        held = (row.get("dispatch_timing") or {}).get("held_s", 0.0)
+        started = transport["request_started_unix_s"] - held
         lag = started - origin - job["at_s"]
         metrics.append(
             dict(

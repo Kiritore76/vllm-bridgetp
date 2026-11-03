@@ -245,6 +245,31 @@ class StaticLayoutTests(unittest.TestCase):
         )
         self.assertEqual((code, value["runs"]), (0, 1))
 
+    def test_the_mixed_static_l1a_can_hold_and_migrate_under_overload(self):
+        code, value = plan(
+            "--phase-shift",
+            "--phase-scenario",
+            "mixed",
+            "--static-layout",
+            "L1A",
+            "--kv-short-exempt",
+            "--hold-queue",
+            "--overload-migrate",
+            "--conversion-decider",
+            "record",
+            "--thread-profile",
+            "--expanded-context",
+        )
+        self.assertEqual((code, value["runs"]), (0, 1))
+
+    def test_the_overload_gate_needs_short_exemption(self):
+        with self.assertRaises(SystemExit):
+            plan("--static-layout", "L1A", "--overload-migrate")
+
+    def test_the_hold_queue_is_for_static_layouts(self):
+        with self.assertRaises(SystemExit):
+            plan("--hold-queue")
+
     def test_burst9_is_the_most_l1a_holds_at_final_length(self):
         from tools.bridge_tp import qwen3_phase_shift as phase
 

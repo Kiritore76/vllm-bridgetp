@@ -55,6 +55,11 @@ class PressureConfig:
     # Requests up to this final size stay eligible for TP1 under KV protection
     # while they physically fit; KV is relieved by migrating long requests.
     kv_short_exempt_blocks: int = 0
+    # Sustained source overload moves long requests without waiting for its queue
+    # to drain: that gate only protects the service judgement from prompt noise,
+    # and a loaded source never drains (user 11-03, mixed static L1A).
+    overload_migrates: bool = False
+    overload_sustain_s: float = 10.0
     health_service: bool = False
     # Route from passive health/KV evidence, without fixed prompt cutoffs.
     pressure_routing: bool = False
@@ -94,6 +99,8 @@ class PressureConfig:
             and type(self.kv_short_exempt_blocks) is int
             and self.kv_short_exempt_blocks >= 0
             and (not self.kv_short_exempt_blocks or self.kv_routing_priority)
+            and (not self.overload_migrates or self.kv_short_exempt_blocks)
+            and self.overload_sustain_s >= 0
             and (not self.kv_routing_priority or (
                 self.workload_pressure and self.capacity_lookahead_s > 0
             ))
@@ -137,6 +144,9 @@ class PressureConfig:
             values.pop("queue_routing")
         if not self.kv_short_exempt_blocks:
             values.pop("kv_short_exempt_blocks")
+        if not self.overload_migrates:
+            values.pop("overload_migrates")
+            values.pop("overload_sustain_s")
         return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
@@ -681,6 +691,7 @@ SOURCE_STATE = (
     "_last_tick",
     "_latched",
     "_service_confirmation",
+    "_overload_since",
     "relief",
     "kv_route",
 )
@@ -700,6 +711,7 @@ class PressurePolicy:
         self._latched = False
         self._retry_after = self.shared.retry_after
         self._service_confirmation = None
+        self._overload_since = None
         self.relief = RoutingRelief()
         self.kv_route = kv_routing.KVRouteProtection()
 
@@ -836,6 +848,16 @@ class PressurePolicy:
                 )
             )
         )
+        overload = False
+        if cfg.overload_migrates and not emergency:
+            if s.zone == "OVERLOAD" and not s.missing:
+                if self._overload_since is None:
+                    self._overload_since = now
+                overload = now - self._overload_since >= cfg.overload_sustain_s
+            else:
+                self._overload_since = None
+        if overload:
+            emergency = True
         if emergency:
             self._service_confirmation = None
         required = (
@@ -871,6 +893,8 @@ class PressurePolicy:
             self._since = None
             self._service_confirmation = None
             return decision("migration channel occupied")
+        if overload and now - self._last_start < cfg.cooldown_s:
+            return decision("migration cooldown")
         if not emergency:
             if cfg.routing_relief and (
                 not self.relief.active or not self.relief.confirming
@@ -960,6 +984,12 @@ class PressurePolicy:
             )
             if c.finished or c.migrating or c.owner != source.pool_id:
                 reasons.append("not active local owner")
+            if (
+                overload
+                and (c.prompt_tokens + c.max_output_tokens) / source.block_size
+                <= cfg.kv_short_exempt_blocks
+            ):
+                reasons.append("short request stays under overload relief")
             if any(
                 row.request_id == c.request_id
                 and row.state in {"ACTIVE", "COMMITTED"}
@@ -1215,7 +1245,11 @@ class PressurePolicy:
             )
             row["selected"] = c.request_id == selected.request_id
         return decision(
-            "capacity relief" if emergency else "sustained pressure; " + policy,
+            "overload relief"
+            if overload
+            else "capacity relief"
+            if emergency
+            else "sustained pressure; " + policy,
             selected.request_id,
             rows,
         )

@@ -55,6 +55,56 @@ class ReliefTests(unittest.TestCase):
             )
         self.assertEqual(policy.relief.phase, "WAIT_ROUTER")
 
+    def overload_policy(self):
+        return p.PressurePolicy(
+            cfg(
+                routing_relief=True,
+                kv_routing_priority=True,
+                kv_short_exempt_blocks=64,
+                overload_migrates=True,
+                overload_sustain_s=2,
+            ),
+            p.ReservationLedger(),
+        )
+
+    def test_sustained_overload_moves_a_long_request_past_a_full_queue(self):
+        policy = self.overload_policy()
+        results = [
+            policy.decide(
+                now,
+                source(now, waiting=50, pending_prompt_tokens=25600, decode_ratio=2),
+                reading("tp4", now=now, waiting=500, pending_prompt_tokens=256000),
+                [candidate(sampled_at=now, published_at=now)],
+            )
+            for now in range(10, 14)
+        ]
+        self.assertEqual([r.action for r in results[:2]], ["STAY", "STAY"])
+        self.assertEqual(results[-1].action, "START_SHADOW")
+        self.assertEqual(results[-1].reason, "overload relief")
+
+    def test_overload_keeps_short_requests_in_place(self):
+        policy = self.overload_policy()
+        short = dict(prompt_tokens=512, max_output_tokens=128)
+        for now in range(10, 15):
+            result = policy.decide(
+                now,
+                source(now, waiting=50, decode_ratio=2),
+                reading("tp4", now=now),
+                [candidate(sampled_at=now, published_at=now, **short)],
+            )
+        self.assertEqual(result.action, "STAY")
+        self.assertIn(
+            "short request stays under overload relief",
+            result.candidates[0]["rejections"],
+        )
+
+    def test_overload_off_leaves_the_policy_identity_alone(self):
+        self.assertEqual(
+            cfg(overload_sustain_s=99).sha256, cfg(overload_sustain_s=10).sha256
+        )
+        with self.assertRaises(ValueError):
+            cfg(overload_migrates=True)
+
     def test_fresh_timestamp_and_missing_prefill_counter_fail_closed(self):
         for changes in (dict(prefill_generation=None), dict(sampled_at=10)):
             co, _ = coordinator()

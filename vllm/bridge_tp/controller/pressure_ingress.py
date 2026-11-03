@@ -27,12 +27,15 @@ class ObservedRecorder(ProxyRecorder):
         self.target_service_id = external_id + ":target"
         self.target_arrived = False
         self.target_pool = "tp4"
+        self.tokens_seen = 0
 
     def on_source_token(self, index, token_id, unix_s):
+        self.tokens_seen += 1
         self.service.token(self.service_id, unix_s)
         super().on_source_token(index, token_id, unix_s)
 
     def on_target_token(self, index, token_id, unix_s):
+        self.tokens_seen += 1
         if not self.target_arrived:
             self.service.arrive(self.target_service_id, self.target_pool, unix_s)
             self.target_arrived = True
@@ -54,6 +57,7 @@ class IngressStream:
     admission_finished_at: float | None = None
     executor_submitted_at: float | None = None
     http_thread_started_at: float | None = None
+    held_s: float = 0.0
 
 
 class PressureIngress:

@@ -96,10 +96,25 @@ def parse_args(argv=None):
     )
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--thread-profile", action="store_true")
+    parser.add_argument(
+        "--hold-unstarted",
+        type=int,
+        default=0,
+        help="hold arrivals in the controller while each pool has this many "
+        "requests sent but not started; 0 sends every arrival when due",
+    )
+    parser.add_argument(
+        "--hold-long-wait-s",
+        type=float,
+        default=60.0,
+        help="a held long request is sent after this long even without KV room",
+    )
     parser.add_argument("--test-only-cancel-first-shadow", action="store_true")
     args = parser.parse_args(argv)
     if args.maximum_migrations < 0:
         parser.error("maximum migrations must be nonnegative")
+    if args.hold_unstarted < 0 or args.hold_long_wait_s < 0:
+        parser.error("hold settings must be nonnegative")
     if min(args.source_context_limit, args.target_context_limit) <= 0:
         parser.error("positive configured context limits required")
     if any(
@@ -553,6 +568,7 @@ def dispatch_due(
             ),
         )
         dispatched[job["id"]] = value
+        value.held_s = job.get("held_s", 0.0)
         audit.write(
             dict(
                 kind="pressure_dispatch",
@@ -566,7 +582,8 @@ def dispatch_due(
                 client_id=value.client_id,
                 pool=value.pool_id,
                 frozen_cap=value.payload["max_tokens"],
-                ingress_capacity_gate=False,
+                ingress_capacity_gate="held_s" in job,
+                held_s=value.held_s,
                 dispatch_entered_unix_s=value.dispatch_entered_at,
                 admission_finished_unix_s=value.admission_finished_at,
                 executor_submitted_unix_s=value.executor_submitted_at,
@@ -1243,6 +1260,15 @@ def _run(args, prepared):
             unknown_routing_pools(args, controller.block_size, extras, pair),
             started,
             args.max_seconds,
+            hold=load("pressure_hold").HoldQueue(
+                args.hold_unstarted,
+                args.hold_long_wait_s,
+                decision.LONG_TOKENS,
+                cfg.max_age_s,
+                lambda pool_id: co.lifecycle(pool_id) == "ACTIVE",
+            )
+            if getattr(args, "hold_unstarted", 0)
+            else None,
         )
         dispatcher.start()
         tracker, due_jobs = StreamTracker(), DueJobs(jobs)
@@ -1968,6 +1994,7 @@ def _run(args, prepared):
                         admission_finished_unix_s=value.admission_finished_at,
                         executor_submitted_unix_s=value.executor_submitted_at,
                         http_thread_started_unix_s=value.http_thread_started_at,
+                        held_s=value.held_s,
                     ),
                 )
             )
