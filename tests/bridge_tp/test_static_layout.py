@@ -287,6 +287,29 @@ class StaticLayoutTests(unittest.TestCase):
         )
         self.assertEqual((code, value["runs"]), (0, 1))
 
+    def test_every_hold_retest_scene_plans(self):
+        short_exempt = ("--kv-short-exempt", "--overload-migrate")
+        for layout, scene, extra in (
+            ("L1A", "merge_deep", short_exempt),
+            ("L1A", "deep_mid", short_exempt),
+            ("L2", "merge_deep", ()),
+            ("L0", "burst_short8", ()),
+            ("L1A", "burst_short8", short_exempt),
+            ("L2", "burst_short6", ()),
+            ("L1A", "burst_short6", short_exempt),
+        ):
+            code, value = plan(
+                "--phase-shift",
+                "--phase-scenario",
+                scene,
+                "--static-layout",
+                layout,
+                "--hold-queue",
+                "--expanded-context",
+                *extra,
+            )
+            self.assertEqual((code, value["runs"]), (0, 1), (layout, scene))
+
     def test_the_mixed_static_l2_can_hold(self):
         code, value = plan(
             "--phase-shift",
