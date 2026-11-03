@@ -474,6 +474,8 @@ def assess(scene, expected_requests=None):
     rows = pc.read_json(run / "pressure_request_results.json")
     proof = pc.read_json(scene / "closed_loop_acceptance.json")
     admission_closed, late_dispatches = {}, []
+    # The audit's closing evidence_footer carries no timestamp.
+    audit = [row for row in audit if "unix_s" in row]
     for event in sorted(audit, key=lambda row: row["unix_s"]):
         if event["kind"] == "pressure_instance_lifecycle":
             admission_closed[event["instance_id"]] = (

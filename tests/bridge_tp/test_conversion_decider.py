@@ -21,21 +21,27 @@ EDGES = {"L1A": [["A", "TP2"], ["B", "TP1"]]}
 
 
 def status(
-    arrivals=0,
+    short=0.0,
     long_arrivals=0,
     capacity=0.2,
     tp1_capacity=None,
     waiting=0,
-    starts=(),
-    long_on=None,
+    deep=None,
+    instances=None,
 ):
+    """``short`` req/s; ``deep``: {instance: deep long requests in flight}."""
+
     def row(instance, tp):
         cap = tp1_capacity if tp == 1 and tp1_capacity is not None else capacity
-        requests = []
-        if instance == long_on:
-            requests.append(
-                dict(prompt_tokens=6144, max_output_tokens=2048, generated=10)
+        requests = [
+            dict(
+                request_id=f"{instance}-{n}",
+                prompt_tokens=16384,
+                max_output_tokens=8192,
+                generated=10,
             )
+            for n in range((deep or {}).get(instance, 0))
+        ]
         return dict(
             lifecycle="ACTIVE",
             pressure=dict(capacity=cap, zone="SPARE"),
@@ -47,137 +53,195 @@ def status(
     return dict(
         unix_s=time.time(),
         instances={
-            "A-g1-tp1": row("A-g1-tp1", 1),
-            "A-g3-tp1": row("A-g3-tp1", 1),
-            "B-g2-tp2": row("B-g2-tp2", 2),
+            name: row(name, tp)
+            for name, tp in (
+                instances or {"A-g1-tp1": 1, "A-g3-tp1": 1, "B-g2-tp2": 2}
+            ).items()
         },
         workload=dict(
-            window_s=120,
-            arrivals=arrivals,
+            window_s=60,
+            arrivals=int(short * 60) + long_arrivals,
             long_arrivals=long_arrivals,
-            migration_starts=[[1.0, s] for s in starts],
+            migration_starts=[],
         ),
     )
 
 
-def run(decider, value, seconds, step=1.0, start=1000.0):
+L0 = {"A": 1, "B": 1}
+L0_MEMBERS = {"A": ["A1", "A2"], "B": ["B1", "B2"]}
+L0_INSTANCES = dict(A1=1, A2=1, B1=1, B2=1)
+L2 = {"A": 2, "B": 2}
+L2_MEMBERS = {"A": ["A-tp2"], "B": ["B-tp2"]}
+L2_INSTANCES = {"A-tp2": 2, "B-tp2": 2}
+# Seven deep long requests on L1A: above the 9817 blocks of L1A -> L2.
+MANY_LONG = {"A-g1-tp1": 2, "A-g3-tp1": 2, "B-g2-tp2": 3}
+
+
+def run(
+    decider, value, seconds, step=1.0, start=1000.0, bundles=BUNDLES, members=MEMBERS
+):
     records, now = [], start
     while now <= start + seconds:
-        records.append(decider.observe(value, BUNDLES, MEMBERS, now))
+        records.append(decider.observe(value, bundles, members, now))
         now += step
     return records
 
 
+def edge(record):
+    proposal = record["proposal"]
+    return proposal["bundle"], proposal["target_mode"]
+
+
 class DeciderRuleTests(unittest.TestCase):
-    def test_short_load_near_capacity_splits_after_the_hold(self):
-        decider = d.ConversionDecider(EDGES)
-        # 9 req/s short (72% of the L1A capacity), no long, no KV pressure.
-        records = run(decider, status(arrivals=1080), 200)
-        proposals = [r for r in records if r["proposal"]]
-        self.assertEqual(len(proposals), 1)
-        first = proposals[0]
-        self.assertEqual(
-            (first["proposal"]["bundle"], first["proposal"]["target_mode"]),
-            ("B", "TP1"),
-        )
-        self.assertGreaterEqual(first["proposal"]["held_s"], 180)
-        self.assertEqual(first["evaluated_unix_s"] - 1000, 180)
-        # 9 req/s short is also more than the merged L2 could carry.
-        self.assertEqual(
-            first["candidates"]["A->TP2"]["failed"],
-            [
-                "no long-request pressure",
-                "merged layout cannot carry the short rate",
-            ],
-        )
-
-    def test_calm_short_load_does_not_split(self):
-        decider = d.ConversionDecider(EDGES)
-        records = run(decider, status(arrivals=360), 300)  # 3 req/s
-        self.assertFalse(any(r["proposal"] for r in records))
-        self.assertIn(
-            "short load not approaching capacity",
-            records[-1]["candidates"]["B->TP1"]["failed"],
-        )
-        # A queueing TP-k is enough even at a moderate rate.
-        decider = d.ConversionDecider(EDGES)
-        records = run(decider, status(arrivals=360, waiting=3), 200)
-        self.assertEqual(sum(bool(r["proposal"]) for r in records), 1)
-
-    def test_split_needs_no_kv_pressure_and_no_long_request_on_the_bundle(self):
-        for value, reason in (
-            (status(arrivals=1080, capacity=0.6), "KV pressure somewhere"),
-            (
-                status(arrivals=1080, long_on="B-g2-tp2"),
-                "bundle serves a long request",
-            ),
-            (status(arrivals=1080, long_arrivals=200), "long share not low"),
-            (status(arrivals=5), "long share not low"),
-        ):
-            decider = d.ConversionDecider(EDGES)
-            records = run(decider, value, 200)
-            self.assertFalse(any(r["proposal"] for r in records), reason)
-            row = records[-1]["candidates"]["B->TP1"]
-            reasons = row["failed"] + row["waiting"]
-            self.assertTrue(any(f.startswith(reason) for f in reasons), reasons)
-
-    def test_long_share_merges_the_tp1_bundle(self):
-        decider = d.ConversionDecider(EDGES)
-        # 0.9 req/s of which 44% long: the merged L2 carries 0.5 req/s short.
-        records = run(decider, status(arrivals=108, long_arrivals=48), 200)
+    def test_many_short_few_long_on_l1a_goes_to_l0_after_the_longer_hold(self):
+        decider = d.ConversionDecider(d.EDGES)
+        records = run(decider, status(short=12, deep={"A-g1-tp1": 3}), 130)
         (first,) = [r for r in records if r["proposal"]]
-        self.assertEqual(
-            (first["proposal"]["bundle"], first["proposal"]["target_mode"]),
-            ("A", "TP2"),
-        )
+        self.assertEqual(edge(first), ("B", "TP1"))
+        self.assertEqual(first["evaluated_unix_s"] - 1000, 120)
 
-    def test_merge_needs_the_short_rate_to_fit_the_merged_layout(self):
-        decider = d.ConversionDecider(EDGES)
-        # 11 req/s short: L2 (9.5 req/s) cannot carry it with the margin.
-        value = status(arrivals=1800, long_arrivals=540)
-        records = run(decider, value, 200)
+    def test_entering_l0_is_strict(self):
+        for value, reason in (
+            (status(short=10), "short rate within what L1A carries"),
+            (
+                status(short=12, deep={"A-g1-tp1": 2, "A-g3-tp1": 2}),
+                "too many long-request blocks for L0",
+            ),
+        ):
+            decider = d.ConversionDecider(d.EDGES)
+            records = run(decider, value, 300)
+            self.assertFalse(any(r["proposal"] for r in records), reason)
+            self.assertIn(reason, records[-1]["candidates"]["B->TP1"]["failed"])
+
+    def test_a_split_waits_without_limit_for_its_long_requests(self):
+        decider = d.ConversionDecider(d.EDGES)
+        value = status(short=12, deep={"B-g2-tp2": 1})
+        records = run(decider, value, 2000)
+        self.assertFalse(any(r["proposal"] for r in records))
+        row = records[-1]["candidates"]["B->TP1"]
+        self.assertEqual(row["failed"], [])
+        self.assertEqual(row["waiting"], ["bundle serves a long request"])
+        # Once it is free the split goes ahead at once.
+        record = decider.observe(status(short=12), BUNDLES, MEMBERS, 3001)
+        self.assertEqual(edge(record), ("B", "TP1"))
+
+    def test_sustained_long_requests_merge_but_a_burst_is_left_to_migration(self):
+        decider = d.ConversionDecider(d.EDGES)
+        value = status(short=1, long_arrivals=2, deep=MANY_LONG)
+        records = run(decider, value, 80)
+        (first,) = [r for r in records if r["proposal"]]
+        self.assertEqual(edge(first), ("A", "TP2"))
+        self.assertEqual(first["evaluated_unix_s"] - 1000, 75)
+        # The same blocks with no new long request: a burst.
+        decider = d.ConversionDecider(d.EDGES)
+        records = run(decider, status(short=1, deep=MANY_LONG), 300)
         self.assertFalse(any(r["proposal"] for r in records))
         self.assertIn(
-            "merged layout cannot carry the short rate",
+            "no new long request: a burst is left to migration",
             records[-1]["candidates"]["A->TP2"]["failed"],
         )
 
-    def test_frequent_tp1_migration_or_kv_at_guard_merges_urgently(self):
-        decider = d.ConversionDecider(EDGES)
-        starts = ["A-g1-tp1", "A-g3-tp1", "A-g1-tp1", "A-g3-tp1"]  # 2/min
-        records = run(decider, status(arrivals=120, starts=starts), 200)
+    def test_merge_to_l2_needs_few_short_and_many_blocks(self):
+        for value, reason in (
+            (
+                status(short=7, long_arrivals=2, deep=MANY_LONG),
+                "short rate too high for L2",
+            ),
+            (
+                status(short=1, long_arrivals=2, deep={"B-g2-tp2": 6}),
+                "too few long-request blocks",
+            ),
+        ):
+            decider = d.ConversionDecider(d.EDGES)
+            records = run(decider, value, 300)
+            self.assertFalse(any(r["proposal"] for r in records), reason)
+            self.assertIn(reason, records[-1]["candidates"]["A->TP2"]["failed"])
+
+    def test_kv_at_guard_merges_urgently(self):
+        decider = d.ConversionDecider(d.EDGES)
+        value = status(short=1, long_arrivals=2, deep=MANY_LONG, tp1_capacity=1.05)
+        records = run(decider, value, 40)
         first = next(r for r in records if r["proposal"])
-        self.assertEqual(first["evaluated_unix_s"] - 1000, 180)
-        self.assertGreater(first["signals"]["tp1_migrations_per_min"], 1.9)
-        # A TP1 at its KV guard: the shorter urgent hold (liveness).
-        decider = d.ConversionDecider(EDGES)
-        records = run(decider, status(arrivals=120, tp1_capacity=1.05), 100)
-        first = next(r for r in records if r["proposal"])
-        self.assertEqual(first["evaluated_unix_s"] - 1000, 60)
+        self.assertEqual(first["evaluated_unix_s"] - 1000, 30)
         self.assertTrue(first["candidates"]["A->TP2"]["urgent"])
 
-    def test_a_broken_condition_restarts_the_hold(self):
-        decider = d.ConversionDecider(EDGES)
-        records = run(decider, status(arrivals=1080), 100)
-        records += run(decider, status(arrivals=1080, capacity=0.7), 5, start=1101)
-        records += run(decider, status(arrivals=1080), 200, start=1107)
+    def test_short_rate_leaves_l2_urgently_when_it_queues(self):
+        for waiting, at in ((0, 75), (3, 30)):
+            decider = d.ConversionDecider(d.EDGES)
+            value = status(short=8, waiting=waiting, instances=L2_INSTANCES)
+            records = run(decider, value, 80, bundles=L2, members=L2_MEMBERS)
+            first = next(r for r in records if r["proposal"])
+            self.assertEqual(edge(first), ("A", "TP1"))
+            self.assertEqual(first["evaluated_unix_s"] - 1000, at)
+        # Between the lines nothing happens; a long request delays the split.
+        decider = d.ConversionDecider(d.EDGES)
+        value = status(short=6.5, instances=L2_INSTANCES)
+        records = run(decider, value, 300, bundles=L2, members=L2_MEMBERS)
+        self.assertFalse(any(r["proposal"] for r in records))
+        decider = d.ConversionDecider(d.EDGES)
+        value = status(short=8, deep={"A-tp2": 1}, instances=L2_INSTANCES)
+        records = run(decider, value, 1000, bundles=L2, members=L2_MEMBERS)
+        self.assertFalse(any(r["proposal"] for r in records))
+
+    def test_long_requests_leave_l0_quickly_even_through_a_drain(self):
+        decider = d.ConversionDecider(d.EDGES)
+        value = status(
+            short=12, deep=dict(A1=1, A2=1, B1=1, B2=1), instances=L0_INSTANCES
+        )
+        records = run(decider, value, 40, bundles=L0, members=L0_MEMBERS)
         first = next(r for r in records if r["proposal"])
-        self.assertEqual(first["evaluated_unix_s"], 1106 + 16 + 180)
+        self.assertEqual(edge(first), ("B", "TP2"))
+        self.assertEqual(first["evaluated_unix_s"] - 1000, 30)
+
+    def test_l0_gives_the_tp2_back_when_l1a_carries_the_short_rate(self):
+        decider = d.ConversionDecider(d.EDGES)
+        value = status(short=9, instances=L0_INSTANCES)
+        records = run(decider, value, 80, bundles=L0, members=L0_MEMBERS)
+        first = next(r for r in records if r["proposal"])
+        self.assertEqual(first["evaluated_unix_s"] - 1000, 75)
+        # That calm direction does not drain a long request.
+        decider = d.ConversionDecider(d.EDGES)
+        value = status(short=9, deep=dict(B1=1), instances=L0_INSTANCES)
+        records = run(decider, value, 1000, bundles=L0, members=L0_MEMBERS)
+        self.assertFalse(any(r["proposal"] for r in records))
+        # Short requests above the line keep L0.
+        decider = d.ConversionDecider(d.EDGES)
+        value = status(short=10, instances=L0_INSTANCES)
+        records = run(decider, value, 300, bundles=L0, members=L0_MEMBERS)
+        self.assertFalse(any(r["proposal"] for r in records))
+
+    def test_a_migrating_long_request_counts_once(self):
+        decider = d.ConversionDecider(d.EDGES)
+        value = status(deep={"A-g1-tp1": 1})
+        value["instances"]["B-g2-tp2"]["requests"] = value["instances"]["A-g1-tp1"][
+            "requests"
+        ]
+        record = decider.observe(value, BUNDLES, MEMBERS, 1000)
+        self.assertEqual(record["signals"]["long_blocks"], 1536)
+        self.assertEqual(record["signals"]["bundle_long_blocks"], dict(A=1536, B=1536))
+
+    def test_a_broken_condition_restarts_the_hold(self):
+        decider = d.ConversionDecider(d.EDGES)
+        records = run(decider, status(short=12), 100)
+        records += run(decider, status(short=10), 5, start=1101)
+        records += run(decider, status(short=12), 200, start=1107)
+        first = next(r for r in records if r["proposal"])
+        self.assertEqual(first["evaluated_unix_s"], 1107 + 120)
 
     def test_record_only_never_repeats_an_edge_within_the_cooldown(self):
-        decider = d.ConversionDecider(EDGES)
-        records = run(decider, status(arrivals=1080), 900)
+        decider = d.ConversionDecider(d.EDGES)
+        records = run(decider, status(short=12), 400)
         times = [r["evaluated_unix_s"] - 1000 for r in records if r["proposal"]]
-        self.assertEqual(times, [180, 780])  # cooldown 600s per edge
+        self.assertEqual(times, [120, 241, 362])
         self.assertEqual(records[0]["mode"], "RECORD_ONLY")
 
     def test_execute_cools_down_every_edge_after_a_conversion(self):
-        decider = d.ConversionDecider(EDGES, execute=True)
+        decider = d.ConversionDecider(d.EDGES, execute=True)
         decider.converted(1000)
-        records = run(decider, status(arrivals=1080), 700, start=1001)
+        records = run(decider, status(short=12), 200, start=1001)
         times = [r["evaluated_unix_s"] - 1000 for r in records if r["proposal"]]
         # The condition held through the cooldown: proposed as it ends.
-        self.assertEqual(times, [600])
+        self.assertEqual(times, [121])
         self.assertTrue(records[0]["cooling"])
 
     def test_layout_names_and_registry_layout(self):
@@ -206,86 +270,53 @@ class DeciderRuleTests(unittest.TestCase):
 
 class PrepareStageTests(unittest.TestCase):
     def test_tilt_starts_shortly_before_the_proposal(self):
-        decider = d.ConversionDecider(EDGES)
-        records = run(decider, status(arrivals=1080), 180)
+        decider = d.ConversionDecider(d.EDGES)
+        records = run(decider, status(short=12), 120)
         tilted = [r["evaluated_unix_s"] - 1000 for r in records if r["tilt"]]
-        self.assertEqual((tilted[0], tilted[-1]), (120, 180))
-        self.assertEqual(records[120]["tilt"], ["B"])
-        self.assertEqual(records[120]["prepared"]["target_mode"], "TP1")
-        self.assertIsNotNone(records[180]["proposal"])
+        self.assertEqual((tilted[0], tilted[-1]), (60, 120))
+        self.assertEqual(records[60]["tilt"], ["B"])
+        self.assertEqual(records[60]["prepared"]["target_mode"], "TP1")
+        self.assertIsNotNone(records[120]["proposal"])
 
     def test_tilt_needs_the_other_bundle_quiet_but_the_proposal_does_not(self):
-        decider = d.ConversionDecider(EDGES)
-        value = status(arrivals=108, long_arrivals=48)
+        decider = d.ConversionDecider(d.EDGES)
+        value = status(short=1, long_arrivals=2, deep=MANY_LONG)
         value["instances"]["B-g2-tp2"]["pressure"]["zone"] = "CRITICAL"
-        records = run(decider, value, 180)
+        records = run(decider, value, 75)
         self.assertFalse(any(r["tilt"] for r in records))
         self.assertIsNone(records[-1]["prepared"])
         self.assertIsNotNone(records[-1]["proposal"])  # liveness
 
     def test_a_failed_candidate_ends_the_tilt_at_once(self):
-        decider = d.ConversionDecider(EDGES)
-        records = run(decider, status(arrivals=1080), 130)
+        decider = d.ConversionDecider(d.EDGES)
+        records = run(decider, status(short=12), 70)
         self.assertEqual(records[-1]["tilt"], ["B"])
-        record = decider.observe(status(arrivals=100), BUNDLES, MEMBERS, 1131)
+        record = decider.observe(status(short=1), BUNDLES, MEMBERS, 1071)
         self.assertEqual(record["tilt"], [])
         self.assertIsNone(record["prepared"])
 
     def test_tilt_has_a_time_limit(self):
-        decider = d.ConversionDecider(EDGES)
-        value = status(arrivals=1080, long_on="B-g2-tp2")
-        records = run(decider, value, 300)
+        decider = d.ConversionDecider(d.EDGES)
+        records = run(decider, status(short=12, deep={"B-g2-tp2": 1}), 300)
         tilted = [r["evaluated_unix_s"] - 1000 for r in records if r["tilt"]]
-        self.assertEqual((tilted[0], tilted[-1]), (120, 210))
-
-    def test_a_long_request_delays_a_split_for_a_bounded_time(self):
-        decider = d.ConversionDecider(EDGES)
-        value = status(arrivals=1080, long_on="B-g2-tp2")
-        records = run(decider, value, 300)
-        (first,) = [r for r in records if r["proposal"]]
-        self.assertEqual(first["evaluated_unix_s"] - 1000, 270)  # hold + limit
-        self.assertEqual(records[200]["candidates"]["B->TP1"]["failed"], [])
-        self.assertEqual(
-            records[200]["candidates"]["B->TP1"]["waiting"],
-            ["bundle serves a long request"],
-        )
-        # Once it is free the split goes ahead, without waiting for the limit.
-        decider = d.ConversionDecider(EDGES)
-        run(decider, value, 199)
-        record = decider.observe(status(arrivals=1080), BUNDLES, MEMBERS, 1200)
-        self.assertIsNotNone(record["proposal"])
-
-    def test_pressure_moved_to_the_tp2_still_merges_urgently(self):
-        decider = d.ConversionDecider(EDGES)
-        value = status(arrivals=120, capacity=1.5, tp1_capacity=0.1, long_on="B-g2-tp2")
-        records = run(decider, value, 100)
-        first = next(r for r in records if r["proposal"])
-        self.assertEqual(first["evaluated_unix_s"] - 1000, 60)
-        self.assertEqual(first["proposal"]["bundle"], "A")
-        self.assertTrue(first["candidates"]["A->TP2"]["urgent"])
-        # A TP-k full of short requests is not a reason to merge.
-        decider = d.ConversionDecider(EDGES)
-        records = run(
-            decider, status(arrivals=120, capacity=1.5, tp1_capacity=0.1), 100
-        )
-        self.assertFalse(any(r["proposal"] for r in records))
+        self.assertEqual((tilted[0], tilted[-1]), (60, 150))
 
     def test_signals_are_smoothed(self):
-        decider = d.ConversionDecider(EDGES)
-        decider.observe(status(arrivals=120, tp1_capacity=1.4), BUNDLES, MEMBERS, 1000)
-        record = decider.observe(status(arrivals=120), BUNDLES, MEMBERS, 1001)
+        decider = d.ConversionDecider(d.EDGES)
+        decider.observe(status(short=2, tp1_capacity=1.4), BUNDLES, MEMBERS, 1000)
+        record = decider.observe(status(short=2), BUNDLES, MEMBERS, 1001)
         self.assertEqual(record["signals"]["tp1_capacity_max"], 1.4)
-        record = decider.observe(status(arrivals=120), BUNDLES, MEMBERS, 1016)
+        record = decider.observe(status(short=2), BUNDLES, MEMBERS, 1016)
         self.assertEqual(record["signals"]["tp1_capacity_max"], 0.2)
         # One waiting sample in ten seconds is not a queue; most of them are.
-        decider = d.ConversionDecider(EDGES)
+        decider = d.ConversionDecider(d.EDGES)
         for t in range(10):
-            value = status(arrivals=120, waiting=3 if t == 5 else 0)
+            value = status(short=2, waiting=3 if t == 5 else 0)
             record = decider.observe(value, BUNDLES, MEMBERS, 1000 + t)
             self.assertFalse(record["signals"]["tpk_waiting"])
-        decider = d.ConversionDecider(EDGES)
+        decider = d.ConversionDecider(d.EDGES)
         for t in range(10):
-            value = status(arrivals=120, waiting=0 if t == 5 else 3)
+            value = status(short=2, waiting=0 if t == 5 else 3)
             record = decider.observe(value, BUNDLES, MEMBERS, 1000 + t)
         self.assertTrue(record["signals"]["tpk_waiting"])
 
@@ -294,7 +325,8 @@ class PrepareDriverTests(unittest.TestCase):
     def driver(self, root, mode, **request):
         driver, events = DeciderDriverTests.driver(DeciderDriverTests(), root, mode)
         driver.request = dict(driver.request, **request)
-        driver.decider.rules["hold_s"] = 60.0  # prepare at once, proposal at 60s
+        # Prepare at once, proposal at 60s.
+        driver.decider.rules.update(hold_s=60.0, l0_hold_s=60.0)
         driver.events = events
         return driver
 
@@ -310,7 +342,7 @@ class PrepareDriverTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as folder:
                 root = Path(folder)
                 driver = self.driver(root, "RECORD_ONLY", pre_tilt=pre_tilt)
-                self.tick(driver, root, status(arrivals=1080))
+                self.tick(driver, root, status(short=12))
                 control = root / "layout_control.json"
                 if pre_tilt:
                     self.assertEqual(
@@ -330,11 +362,11 @@ class PrepareDriverTests(unittest.TestCase):
             ops.start = lambda extra: started.append(extra["instance_id"])
             ops.stop = stopped.extend
             driver.backend.prestart_enabled = True
-            self.tick(driver, root, status(arrivals=1080))
+            self.tick(driver, root, status(short=12))
             self.assertEqual(started, ["B-g4-tp1", "B-g5-tp1"])
-            self.tick(driver, root, status(arrivals=1080))
+            self.tick(driver, root, status(short=12))
             self.assertEqual(len(started), 2)  # still the same preparation
-            self.tick(driver, root, status(arrivals=100))
+            self.tick(driver, root, status(short=1))
             self.assertEqual(stopped, ["B-g4-tp1", "B-g5-tp1"])
             self.assertEqual(driver.backend.layout_tilt, [])
             self.assertIsNone(driver.backend.prestarted)
@@ -345,15 +377,15 @@ class PrepareDriverTests(unittest.TestCase):
             driver = self.driver(root, "RECORD_ONLY")
             driver.backend.ops.start = lambda extra: self.fail("started an engine")
             driver.backend.prestart_enabled = True
-            self.tick(driver, root, status(arrivals=1080))
+            self.tick(driver, root, status(short=12))
 
     def test_a_tilted_proposal_skips_only_the_service_part_of_the_gate(self):
         for pre_tilt in (False, True):
             with tempfile.TemporaryDirectory() as folder:
                 root = Path(folder)
                 driver = self.driver(root, "EXECUTE", pre_tilt=pre_tilt, assist=True)
-                driver.decider.rules["hold_s"] = 0.0
-                value = status(arrivals=108, long_arrivals=48)
+                driver.decider.rules.update(hold_s=0.0, l0_hold_s=0.0)
+                value = status(short=1, long_arrivals=2, deep=MANY_LONG)
                 self.tick(driver, root, value)
                 plan = driver.executor.plan
                 self.assertEqual(plan["bundle_id"], "A")
@@ -365,7 +397,7 @@ class PrepareDriverTests(unittest.TestCase):
                 self.assertTrue(control["conversion_pending"])
                 self.assertEqual(bool(control["tilt"]), pre_tilt)
                 # The TP2 got busy from the tilt: only KV headroom is checked.
-                busy = status(arrivals=108, long_arrivals=48)
+                busy = status(short=1, long_arrivals=2, deep=MANY_LONG)
                 busy["unix_s"] = time.time()
                 busy["instances"]["B-g2-tp2"]["pressure"]["zone"] = "CRITICAL"
                 (root / "layout_status.json").write_text(json.dumps(busy))
@@ -379,15 +411,15 @@ class PrepareDriverTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             driver = self.driver(root, "EXECUTE", assist=True)
-            driver.decider.rules["hold_s"] = 0.0
-            self.tick(driver, root, status(arrivals=1080))
+            driver.decider.rules.update(hold_s=0.0, l0_hold_s=0.0)
+            self.tick(driver, root, status(short=12))
             self.assertEqual(driver.executor.plan["method"], "DRAIN")
 
     def test_the_tilt_time_limit_covers_a_waiting_gate(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             driver = self.driver(root, "RECORD_ONLY", pre_tilt=True)
-            self.tick(driver, root, status(arrivals=1080))
+            self.tick(driver, root, status(short=12))
             self.assertTrue(driver.backend.layout_tilt)
             driver.end_expired_tilt()
             self.assertTrue(driver.backend.layout_tilt)
@@ -399,7 +431,7 @@ class PrepareDriverTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             driver = self.driver(root, "RECORD_ONLY", pre_tilt=True)
-            self.tick(driver, root, status(arrivals=1080))
+            self.tick(driver, root, status(short=12))
             driver.backend.rows["B-g2-tp2"].setdefault("endpoint", "t")
             driver.backend.quiesce(
                 dict(
@@ -517,8 +549,8 @@ class DeciderDriverTests(unittest.TestCase):
             driver.start()
             control = json.loads((root / "layout_control.json").read_text())
             self.assertFalse(control["conversion_pending"])
-            value = status(arrivals=1080)
-            driver.decider.rules["hold_s"] = 0.0
+            value = status(short=12)
+            driver.decider.rules.update(hold_s=0.0, l0_hold_s=0.0)
             for _ in range(3):
                 value["unix_s"] = time.time()
                 (root / "layout_status.json").write_text(json.dumps(value))
@@ -587,13 +619,13 @@ class DeciderDriverTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             driver, _ = self.driver(root, "RECORD_ONLY")
-            value = status(arrivals=1080)
+            value = status(short=12)
             value["unix_s"] = time.time() - 10
             (root / "layout_status.json").write_text(json.dumps(value))
             driver.decide()
             self.assertEqual(driver.decisions, 0)
 
-    def test_launcher_builds_the_start_layout_edges(self):
+    def test_launcher_uses_the_edges_of_every_layout(self):
         from tools.bridge_tp import launch_pressure_balanced_pilot as launch
 
         registry, _ = instance_pool.fixed_pair_registry(
@@ -612,7 +644,8 @@ class DeciderDriverTests(unittest.TestCase):
         value = launch.conversion_request(
             dict(layout=dict(name="L1A"), conversion=request), registry
         )
-        self.assertEqual(value["edges"], EDGES)
+        self.assertEqual(value["edges"], d.EDGES)
+        self.assertEqual(value["edges"]["L1A"], EDGES["L1A"])
         for bad in (
             dict(request, decider="MAYBE"),
             dict(request, rules=dict(nothing=1)),
@@ -625,7 +658,7 @@ class DeciderDriverTests(unittest.TestCase):
 
 
 class PhaseShiftTests(unittest.TestCase):
-    def test_scenarios_give_each_rule_its_case(self):
+    def test_scenarios_keep_their_long_share(self):
         from tools.bridge_tp import qwen3_phase_shift as phase
 
         root = Path(__file__).resolve().parents[2]
@@ -649,17 +682,17 @@ class PhaseShiftTests(unittest.TestCase):
             ]
             return long, len(long) / len(jobs)
 
-        self.assertGreater(share("merge_heavy")[1], d.RULES["merge_long_share"])
-        self.assertGreater(share("merge_moderate")[1], d.RULES["merge_long_share"])
+        self.assertGreater(share("merge_heavy")[1], 0.30)
+        self.assertGreater(share("merge_moderate")[1], 0.30)
         long, value = share("merge_deep")
-        self.assertLess(value, d.RULES["merge_long_share"])
+        self.assertLess(value, 0.30)
         self.assertEqual(
             (len(long[0]["request"]["prompt"]), long[0]["request"]["max_tokens"]),
             (16384, 8192),
         )
         long, value = share("split_trickle")
         self.assertTrue(long)
-        self.assertLess(value, d.RULES["split_long_share"])
+        self.assertLess(value, 0.10)
 
     def test_boundary_grid_steps_the_long_rate_at_fixed_sizes(self):
         from tools.bridge_tp import qwen3_phase_shift as phase

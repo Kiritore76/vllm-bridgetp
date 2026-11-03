@@ -517,7 +517,11 @@ class SequenceEvidenceTests(unittest.TestCase):
 
             def check():
                 (root / "controller/pressure_audit.jsonl").write_text(
-                    "\n".join(json.dumps(v) for v in audit)
+                    "\n".join(
+                        json.dumps(v)
+                        # The audit writer's last row has no timestamp.
+                        for v in [*audit, dict(kind="evidence_footer", dropped=0)]
+                    )
                 )
                 (root / "closed_loop_acceptance.json").write_text(json.dumps(proof))
                 return seq.assess(root, 1)

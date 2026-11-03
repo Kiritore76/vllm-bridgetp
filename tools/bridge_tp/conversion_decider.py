@@ -1,24 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Rule-based TP layout conversion decider (user 11-01; record-only first).
+"""Rule-based TP layout conversion decider (user 11-03; record-only first).
 
-Two rules from the measured four-card behaviour, kept simple on purpose and
-tuned later from real runs:
+Does the current mix of requests suit the current layout? Two inputs, the
+short-request rate and the final blocks of the long requests in flight, and
+one neighbouring layout at a time (L0 and L2 are two steps apart):
 
-- MERGE a TP1 bundle into a TP-k when long requests take over: their share
-  of recent arrivals is high, TP1s migrate often, or a TP1's KV runs near its
-  guard. Only if the merged layout still carries the short-request rate.
-- SPLIT a TP-k bundle into TP1s when short requests take over while nothing
-  is under KV pressure and the short load approaches the current layout's
-  capacity (or the TP-k queues): convert while it is still calm, before the
-  peak. Never a bundle that serves a long request.
+- L1A -> L2: few short requests, many long ones, and long ones still arriving.
+  A burst that stopped arriving is left to migration.
+- L1A -> L0: strict, because L0 has no TP2 left for long requests. Short
+  requests must exceed what L1A carries and few long ones may be in flight.
+- L2 -> L1A: short requests exceed what L2 carries.
+- L0 -> L1A: as soon as the TP1s cannot hold the long requests, or, more
+  calmly, once L1A carries the short requests again.
 
-A candidate must hold for ``hold_s`` (``urgent_hold_s`` when an instance's KV
-is at its guard: liveness under pressure), and a capacity-motivated split must
-gain ``benefit_factor`` times the capacity a conversion removes. Hard safety
-stays with the conversion's start gate and valve. Inputs are the
-controller's ``layout_status.json`` and the registry's current layout. KV and
-queue readings flip every second (decider GPU 11-01), so conditions use their
-recent maximum and majority.
+Thresholds are initial values from one run per cell (static layouts, 11-03)
+with a gap between opposite directions. Long-request blocks use the output cap,
+not the unknown final length, so a shorter output makes them an overestimate.
+
+A split never drains a long request: it has nowhere to migrate (no TP2 -> TP1),
+so a split waits, without limit, until its bundle has none (user 11-03). L0 ->
+L1A under long pressure is the exception: nothing else relieves L0, so it
+drains. A candidate must hold for its hold time. Hard safety stays with the
+conversion's start gate and valve. Inputs are the controller's
+``layout_status.json`` and the registry's current layout. KV and queue readings
+flip every second (decider GPU 11-01), so they use their recent maximum and
+majority.
 
 Prepare stage, ``tilt_lead_s`` before a proposal and only while the other
 bundles are quiet (the start gate's service check, moved ahead of the load
@@ -30,26 +36,35 @@ one TP-k (GPU 11-02), and 53s were enough to clear a bundle.
 
 from __future__ import annotations
 
-WINDOW_S = 120.0
-# A request is long when prompt + output cap reaches this (one TP1 holds ~4).
+WINDOW_S = 60.0
+# A request is long when prompt + output cap reaches this.
 LONG_TOKENS = 8192
-# Four-card short-request (512/128) capacity, req/s (rate sweep, 11-01).
-SHORT_CAPACITY_REQ_S = {"L0": 16.5, "L1A": 12.5, "L2": 9.5}
+BLOCK_TOKENS = 16
+# A deep long request (16384 + 8192 tokens) ends at 1536 blocks.
+DEEP_BLOCKS = 1536
+# A at TP1 and B at TP2 in L1A: B stays the migration target towards L2.
+EDGES = {
+    "L0": [["B", "TP2"]],
+    "L1A": [["A", "TP2"], ["B", "TP1"]],
+    "L2": [["A", "TP1"]],
+}
 RULES = dict(
-    min_arrivals=10,
-    merge_long_share=0.30,
-    merge_tp1_migrations_per_min=2.0,
-    merge_tp1_capacity=0.9,
-    merge_short_margin=1.25,
-    split_long_share=0.10,
-    split_max_capacity=0.5,
-    split_short_load=0.6,
-    hold_s=180.0,
-    urgent_hold_s=60.0,
+    # L1A -> L2: 0.6 of the 16362 blocks of L1A.
+    l2_max_short=6.0,
+    l2_min_long_blocks=9817,
+    # L2 -> L1A.
+    l2_leave_short=7.0,
+    # L1A -> L0: L1A queued at 12 req/s and did not at 10.
+    l0_min_short=11.0,
+    l0_max_long_blocks=3 * DEEP_BLOCKS,
+    # L0 -> L1A: each of the four TP1s holds one deep long request.
+    l0_leave_long_blocks=4 * DEEP_BLOCKS,
+    l0_leave_short=9.0,
+    hold_s=75.0,
+    l0_hold_s=120.0,
+    urgent_hold_s=30.0,
     urgent_capacity=1.0,
-    benefit_factor=3.0,
-    conversion_s=60.0,
-    cooldown_s=600.0,
+    cooldown_s=120.0,
     tilt_lead_s=60.0,
     tilt_max_s=90.0,
     prepare_capacity_max=0.8,
@@ -95,11 +110,11 @@ class ConversionDecider:
         self.proposed_at = {}
         self.converted_at = None
         self.prepared = None  # dict(key, bundle, target_mode, at)
-        self.history = []  # (now, tp1 cap, any cap, tp-k cap, tp-k waiting)
+        self.history = []  # (now, tp1 cap, tp-k cap, tp-k waiting)
 
-    def smooth(self, now, tp1_cap, any_cap, tpk_cap, waiting):
+    def smooth(self, now, tp1_cap, tpk_cap, waiting):
         r = self.rules
-        self.history.append((now, tp1_cap, any_cap, tpk_cap, waiting))
+        self.history.append((now, tp1_cap, tpk_cap, waiting))
         horizon = max(r["smooth_capacity_s"], r["smooth_waiting_s"])
         self.history = [h for h in self.history if now - h[0] <= horizon]
 
@@ -111,13 +126,14 @@ class ConversionDecider:
             ]
             return max(values, default=None)
 
-        recent = [h[4] for h in self.history if now - h[0] <= r["smooth_waiting_s"]]
-        return peak(1), peak(2), peak(3), sum(recent) * 2 > len(recent)
+        recent = [h[3] for h in self.history if now - h[0] <= r["smooth_waiting_s"]]
+        return peak(1), peak(2), sum(recent) * 2 > len(recent)
 
     def signals(self, status, bundles, members, now):
         r = self.rules
         workload = status.get("workload") or {}
         arrivals = workload.get("arrivals", 0)
+        long_arrivals = workload.get("long_arrivals", 0)
         window = workload.get("window_s", WINDOW_S)
         instances = {
             i: v for i, v in status["instances"].items() if v["lifecycle"] == "ACTIVE"
@@ -127,48 +143,37 @@ class ConversionDecider:
         def pressure(i):
             return (instances.get(i) or {}).get("pressure") or {}
 
+        def long_blocks(ids):
+            """Final blocks by request: a migrating one is on two instances."""
+            blocks = {}
+            for i in ids:
+                for q in (instances.get(i) or {}).get("requests", ()):
+                    tokens = q["prompt_tokens"] + q["max_output_tokens"]
+                    if tokens >= LONG_TOKENS:
+                        blocks[q["request_id"]] = -(-tokens // BLOCK_TOKENS)
+            return sum(blocks.values())
+
         caps = {i: pressure(i).get("capacity") for i in instances}
         tp1_caps = [c for i, c in caps.items() if i in tp1 and c is not None]
         tpk_caps = [c for i, c in caps.items() if i not in tp1 and c is not None]
-        starts = [s for _, s in workload.get("migration_starts", ())]
-        long_demand = {
-            b: sum(
-                q["prompt_tokens"] + q["max_output_tokens"]
-                for i in ids
-                for q in (instances.get(i) or {}).get("requests", ())
-                if q.get("prompt_tokens", 0) + q["max_output_tokens"] >= LONG_TOKENS
-            )
-            for b, ids in members.items()
-        }
         waiting_now = any(
             ((instances.get(i) or {}).get("inventory") or {}).get("waiting")
             for b, ids in members.items()
             if bundles[b] > 1
             for i in ids
         )
-        tp1_max, any_max, tpk_max, waiting = self.smooth(
-            now,
-            max(tp1_caps, default=None),
-            max((c for c in caps.values() if c is not None), default=None),
-            max(tpk_caps, default=None),
-            waiting_now,
+        tp1_max, tpk_max, waiting = self.smooth(
+            now, max(tp1_caps, default=None), max(tpk_caps, default=None), waiting_now
         )
         return dict(
             layout=layout_name(bundles),
-            arrivals=arrivals,
-            long_share=workload.get("long_arrivals", 0) / arrivals
-            if arrivals >= r["min_arrivals"]
-            else None,
-            short_rate=(arrivals - workload.get("long_arrivals", 0)) / window,
-            tp1_migrations_per_min=sum(s in tp1 for s in starts) / (window / 60),
+            short_rate=(arrivals - long_arrivals) / window,
+            long_arrivals=long_arrivals,
+            long_blocks=long_blocks(instances),
+            bundle_long_blocks={b: long_blocks(ids) for b, ids in members.items()},
             tp1_capacity_max=tp1_max,
             tpk_capacity_max=tpk_max,
-            capacity_max=any_max,
             tpk_waiting=waiting,
-            bundle_long_tokens=long_demand,
-            tpk_long_tokens=sum(
-                tokens for b, tokens in long_demand.items() if bundles[b] > 1
-            ),
             quiet={
                 b: all(
                     pressure(i).get("zone") == "SPARE"
@@ -183,59 +188,47 @@ class ConversionDecider:
     def check(self, edge, s, bundles):
         """(failed reasons, waiting reasons, urgent) of one edge.
 
-        ``failed`` stops the hold; ``waiting`` only delays the proposal: a
-        split waits for its bundle to finish long requests, for at most
-        ``tilt_max_s`` past the hold (liveness: then it simply drains).
+        ``failed`` stops the hold; ``waiting`` only delays the proposal.
         """
         r = self.rules
         bundle, mode = edge
-        after = dict(bundles, **{bundle: 1 if mode == "TP1" else 2})
-        capacity_now = SHORT_CAPACITY_REQ_S[s["layout"]]
-        capacity_after = SHORT_CAPACITY_REQ_S[layout_name(after)]
+        after = layout_name(dict(bundles, **{bundle: 1 if mode == "TP1" else 2}))
+        short, blocks = s["short_rate"], s["long_blocks"]
         failed, waiting, urgent = [], [], False
-        if mode != "TP1":  # MERGE
-            if bundles.get(bundle) != 1:
-                return ["bundle is not TP1"], [], False
-            share = s["long_share"]
+        bundle_busy = bool(s["bundle_long_blocks"].get(bundle))
+        if (s["layout"], after) == ("L1A", "L2"):
+            if short > r["l2_max_short"]:
+                failed.append("short rate too high for L2")
+            if blocks < r["l2_min_long_blocks"]:
+                failed.append("too few long-request blocks")
+            if not s["long_arrivals"]:
+                failed.append("no new long request: a burst is left to migration")
             tp1_cap, tpk_cap = s["tp1_capacity_max"], s["tpk_capacity_max"]
-            # The TP-k counts too: keeping long requests off the TP1s moves
-            # their pressure there (GPU 11-02).
-            tpk_long_pressure = bool(s["tpk_long_tokens"]) and tpk_cap is not None
-            need = [
-                share is not None and share >= r["merge_long_share"],
-                s["tp1_migrations_per_min"] >= r["merge_tp1_migrations_per_min"],
-                tp1_cap is not None and tp1_cap >= r["merge_tp1_capacity"],
-                tpk_long_pressure and tpk_cap >= r["merge_tp1_capacity"],
-            ]
-            if not any(need):
-                failed.append("no long-request pressure")
-            if s["short_rate"] * r["merge_short_margin"] > capacity_after:
-                failed.append("merged layout cannot carry the short rate")
             urgent = (tp1_cap is not None and tp1_cap >= r["urgent_capacity"]) or (
-                tpk_long_pressure and tpk_cap >= r["urgent_capacity"]
+                tpk_cap is not None and tpk_cap >= r["urgent_capacity"]
             )
-        else:  # SPLIT
-            if bundles.get(bundle, 1) == 1:
-                return ["bundle is not TP-k"], [], False
-            share = s["long_share"]
-            if share is None or share > r["split_long_share"]:
-                failed.append("long share not low (or too few arrivals)")
-            if (
-                s["capacity_max"] is None
-                or s["capacity_max"] >= r["split_max_capacity"]
-            ):
-                failed.append("KV pressure somewhere")
-            if not (
-                s["short_rate"] >= r["split_short_load"] * capacity_now
-                or s["tpk_waiting"]
-            ):
-                failed.append("short load not approaching capacity")
-            if s["bundle_long_tokens"].get(bundle):
+        elif (s["layout"], after) == ("L1A", "L0"):
+            if short < r["l0_min_short"]:
+                failed.append("short rate within what L1A carries")
+            if blocks > r["l0_max_long_blocks"]:
+                failed.append("too many long-request blocks for L0")
+            if bundle_busy:
                 waiting.append("bundle serves a long request")
-            gain = (capacity_after - capacity_now) * r["cooldown_s"]
-            cost = capacity_now / 2 * r["conversion_s"]
-            if gain < r["benefit_factor"] * cost:
-                failed.append("capacity gain below benefit factor")
+        elif (s["layout"], after) == ("L2", "L1A"):
+            if short < r["l2_leave_short"]:
+                failed.append("short rate within what L2 carries")
+            urgent = s["tpk_waiting"]
+            if bundle_busy:
+                waiting.append("bundle serves a long request")
+        elif (s["layout"], after) == ("L0", "L1A"):
+            if blocks >= r["l0_leave_long_blocks"]:
+                urgent = True  # Nothing else relieves L0: this one drains.
+            elif short > r["l0_leave_short"]:
+                failed.append("L0 still suits the load")
+            elif bundle_busy:
+                waiting.append("bundle serves a long request")
+        else:
+            failed.append("not a neighbouring layout")
         return failed, waiting, urgent
 
     def observe(self, status, bundles, members, now):
@@ -256,14 +249,19 @@ class ConversionDecider:
             else:
                 self.since.setdefault(key, now)
             held = now - self.since[key] if key in self.since else 0.0
-            need = r["urgent_hold_s"] if urgent else r["hold_s"]
+            need = (
+                r["urgent_hold_s"]
+                if urgent
+                else r["l0_hold_s"]
+                if edge[1] == "TP1" and s["layout"] == "L1A"
+                else r["hold_s"]
+            )
             repeated = (
                 not self.execute
                 and now - self.proposed_at.get(key, -float("inf")) < r["cooldown_s"]
             )
             usable = not failed and not cooling and not repeated
-            patient = not waiting or held >= need + r["tilt_max_s"]
-            ready = usable and held >= need and patient
+            ready = usable and held >= need and not waiting
             candidates[key] = dict(
                 failed=failed,
                 waiting=waiting,
