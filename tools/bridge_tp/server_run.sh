@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# 当前任务：保留队列下补测布局差距，第一批3场，各决定一条切换线；其余4场看结果再放。
-# 不转换，无决策器。清单和旧结果见multi/QWEN3_AUTO_SWITCH_PLAN_20261103_CN.md。
+# 当前任务：保留队列只看prompt、迁移目标只看当前长度，验证3场。
+# 替代qwen3_retest_a里依赖未来长度的结论；不转换，无决策器。
 # cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 set -uo pipefail
-scenes='merge_deep:L1A burst_short8:L0 burst_short6:L2'
+scenes='merge_deep:L1A burst_short8:L0 long_output:L1A'
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
 py=$venv/bin/python
@@ -25,15 +25,15 @@ revision=$(git rev-parse HEAD)
     echo 'GPU上有计算进程，停止，未清理任何进程。'; exit 1;
 }
 mkdir -p /root/autodl-tmp/bridgetp/results || exit 1
-run=/root/autodl-tmp/bridgetp/results/qwen3_retest_a_$(date +%Y%m%d_%H%M%S)_${RANDOM}
+run=/root/autodl-tmp/bridgetp/results/qwen3_retest_b_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 printf '%s\n' "$revision" > "$run/revision.txt"
 echo "本批目录：$run"
 echo 'A={GPU2,GPU3}，B={GPU0,GPU1}；双32768/.88，四卡。'
 echo "共3场，依次运行：$scenes"
-echo '请求留在控制器：每引擎未开始8条；遥测确认KV不够时继续等待；只有遥测失效时长请求等满300秒才发出。'
-echo 'L1A另开迁移、短请求分流和过载迁移；都不转换，无决策器。'
-echo '长请求16384输入/8192输出；每场约15分钟，上限20分钟，共约45分钟；不自动重试，不删除原始目录。'
+echo '请求留在控制器：每引擎未开始8条；只看prompt是否放得下，不看输出长度，也不为增长预留。'
+echo 'L1A另开迁移、短请求分流和过载迁移，迁移目标只看当前长度；都不转换，无决策器。'
+echo '长请求16384输入/8192输出；long_output为512输入/8192输出。每场约15分钟，上限20分钟，共约45分钟；不自动重试，不删除原始目录。'
 export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 export VLLM_USE_V2_MODEL_RUNNER=0 OMP_NUM_THREADS=1
 "$py" -m compileall -q -j 0 "$repo/vllm" "$repo/tools" > "$run/compileall.log" 2>&1 || exit 1
@@ -48,7 +48,7 @@ for scene in $scenes; do
     layout=${scene##*:}
     name="$scenario-$layout"
     extra=()
-    [ "$layout" = L1A ] && extra=(--kv-short-exempt --overload-migrate)
+    [ "$layout" = L1A ] && extra=(--kv-short-exempt --overload-migrate --migrate-current-length)
     [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || {
         echo "上一场后GPU仍有计算进程，停止于 $name 之前。"; final=1; break;
     }

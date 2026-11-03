@@ -200,6 +200,16 @@ SCENARIOS["mixed_p1_10"] = dict(
         for start, end, short, long_rate, phase in SCENARIOS["mixed"]["phases"]
     ),
 )
+# A short prompt that only grows long: nothing about it is visible on arrival, so
+# TP1 fills during output and only migration can help (user 11-04).
+SCENARIOS["long_output"] = dict(
+    phases=(
+        (0, 60, 4.0, 0.0, "warm"),
+        (60, 420, 4.0, 0.1, "peak"),
+        (420, 480, 1.0, 0.0, "tail"),
+    ),
+    long=(512, 8192),
+)
 PHASES = SCENARIOS["phase_shift"]["phases"]
 LONG_PROMPT, LONG_OUTPUT = SCENARIOS["phase_shift"]["long"]
 

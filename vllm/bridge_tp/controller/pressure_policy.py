@@ -60,6 +60,9 @@ class PressureConfig:
     # and a loaded source never drains (user 11-03, mixed static L1A).
     overload_migrates: bool = False
     overload_sustain_s: float = 10.0
+    # A migration target only has to hold what the request is now: output length
+    # is not known, and TP2 has room to spare (user 11-04).
+    migration_current_length: bool = False
     health_service: bool = False
     # Route from passive health/KV evidence, without fixed prompt cutoffs.
     pressure_routing: bool = False
@@ -147,6 +150,8 @@ class PressureConfig:
         if not self.overload_migrates:
             values.pop("overload_migrates")
             values.pop("overload_sustain_s")
+        if not self.migration_current_length:
+            values.pop("migration_current_length")
         return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
@@ -980,7 +985,15 @@ class PressurePolicy:
                 reasons.append("no bound source stream/action adapter")
             cap = max(0, min(8192, c.max_output_tokens) - c.generated)
             required_blocks = math.ceil(
-                (c.prompt_tokens + min(8192, c.max_output_tokens)) / target.block_size
+                (
+                    c.prompt_tokens
+                    + (
+                        c.generated
+                        if cfg.migration_current_length
+                        else min(8192, c.max_output_tokens)
+                    )
+                )
+                / target.block_size
             )
             if c.finished or c.migrating or c.owner != source.pool_id:
                 reasons.append("not active local owner")

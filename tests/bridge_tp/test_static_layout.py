@@ -287,10 +287,19 @@ class StaticLayoutTests(unittest.TestCase):
         )
         self.assertEqual((code, value["runs"]), (0, 1))
 
+    def test_current_length_migration_is_for_static_l1a(self):
+        with self.assertRaises(SystemExit):
+            plan("--static-layout", "L2", "--migrate-current-length")
+
     def test_every_hold_retest_scene_plans(self):
-        short_exempt = ("--kv-short-exempt", "--overload-migrate")
+        short_exempt = (
+            "--kv-short-exempt",
+            "--overload-migrate",
+            "--migrate-current-length",
+        )
         for layout, scene, extra in (
             ("L1A", "merge_deep", short_exempt),
+            ("L1A", "long_output", short_exempt),
             ("L1A", "deep_mid", short_exempt),
             ("L2", "merge_deep", ()),
             ("L0", "burst_short8", ()),

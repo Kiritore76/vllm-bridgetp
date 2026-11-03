@@ -4,10 +4,10 @@
 A request sent to an engine queue stays there even after another pool goes idle,
 and its queued prompt stops long requests from migrating off (mixed static L1A,
 GPU 11-03). Room is counted from the controller's own streams, so stale telemetry
-cannot open or close it. Fresh telemetry showing too little KV also keeps a request
-here: sent into a full engine it only waits there and pushes others out (GPU 11-03,
-user decision). Without fresh evidence a short request is sent and a long request
-waits, bounded by ``long_wait_s``.
+cannot open or close it. Only the prompt decides whether a request fits: output
+length is not known here, and growth is migration's job (user 11-02, 11-04). Fresh
+telemetry showing too little KV for the prompt keeps a request here. Without fresh
+evidence a small prompt is sent and a long one waits, bounded by ``long_wait_s``.
 """
 
 import math
@@ -15,10 +15,10 @@ from collections import deque
 
 
 class HoldQueue:
-    """Short and long requests each leave in arrival order.
+    """Small and long prompts each leave in arrival order.
 
-    A long request without KV room waits alone so short requests keep flowing.
-    Past ``long_wait_s`` it is sent first, to a pool it fits or one with no fresh
+    A long prompt without KV room waits alone so small prompts keep flowing. Past
+    ``long_wait_s`` it is sent first, to a pool it fits or one with no fresh
     evidence; while every pool measures too little KV it keeps waiting. One thread
     calls this.
     """
@@ -33,11 +33,9 @@ class HoldQueue:
         self.active = active
         self.short, self.long = deque(), deque()
         self.unstarted = {}
-        self.running_long = []
 
     def is_long(self, job):
-        request = job["request"]
-        return len(request["prompt"]) + int(request["max_tokens"]) >= self.long_tokens
+        return len(job["request"]["prompt"]) >= self.long_tokens
 
     def add(self, job, arrived):
         (self.long if self.is_long(job) else self.short).append((job, arrived))
@@ -50,20 +48,6 @@ class HoldQueue:
             self.unstarted[pool_id] = [
                 v for v in values if not (v.recorder.tokens_seen or v.future.done())
             ]
-        self.running_long = [v for v in self.running_long if not v.future.done()]
-
-    def _reserved_blocks(self, pool_id, block_size):
-        """What the long requests already sent here will still allocate."""
-        total = 0
-        for value in self.running_long:
-            recorder = value.recorder
-            owner = recorder.target_pool if recorder.target_arrived else value.pool_id
-            if owner == pool_id:
-                left = int(value.payload["max_tokens"]) - recorder.tokens_seen
-                if not recorder.tokens_seen:
-                    left += len(value.payload["prompt"])
-                total += math.ceil(max(0, left) / block_size)
-        return total
 
     def _fresh(self, pool, wall):
         return (
@@ -73,29 +57,9 @@ class HoldQueue:
             and 0 <= wall - pool.sampled_at <= self.max_age_s
         )
 
-    @staticmethod
-    def _final_blocks(pool, job):
-        request = job["request"]
-        return math.ceil(
-            (len(request["prompt"]) + int(request["max_tokens"])) / pool.block_size
-        )
-
-    def _long_fits(self, pool, job, wall):
-        return (
-            self._fresh(pool, wall)
-            and pool.free_blocks
-            - pool.unallocated_prompt_blocks
-            - self._reserved_blocks(pool.pool_id, pool.block_size)
-            >= self._final_blocks(pool, job)
-        )
-
-    def _short_fits(self, pool, job, wall):
-        # Short requests end in seconds, so long requests' later growth is not
-        # charged, and stale telemetry must not stop them.
-        return (
-            not self._fresh(pool, wall)
-            or pool.free_blocks - pool.unallocated_prompt_blocks
-            >= self._final_blocks(pool, job)
+    def _prompt_fits(self, pool, job):
+        return pool.free_blocks - pool.unallocated_prompt_blocks >= math.ceil(
+            len(job["request"]["prompt"]) / pool.block_size
         )
 
     def _release(self, queue, now, pools):
@@ -109,24 +73,29 @@ class HoldQueue:
         room = [p for p in pools if len(self.unstarted.get(p.pool_id, ())) < self.limit]
         if self.long and pools:
             job, arrived = self.long[0]
-            fits = [p for p in room if self._long_fits(p, job, wall)]
+            fits = [
+                p for p in room if self._fresh(p, wall) and self._prompt_fits(p, job)
+            ]
             if fits:
                 return self._release(self.long, now, fits)
             if now - arrived >= self.long_wait_s:
                 allowed = [
                     p
                     for p in pools
-                    if not self._fresh(p, wall) or self._long_fits(p, job, wall)
+                    if not self._fresh(p, wall) or self._prompt_fits(p, job)
                 ]
                 if allowed:
                     return self._release(self.long, now, allowed)
         if self.short:
-            allowed = [p for p in room if self._short_fits(p, self.short[0][0], wall)]
+            job = self.short[0][0]
+            allowed = [
+                p
+                for p in room
+                if not self._fresh(p, wall) or self._prompt_fits(p, job)
+            ]
             if allowed:
                 return self._release(self.short, now, allowed)
         return None
 
     def sent(self, job, value):
         self.unstarted.setdefault(value.pool_id, []).append(value)
-        if self.is_long(job):
-            self.running_long.append(value)

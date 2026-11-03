@@ -322,6 +322,11 @@ def main(argv=None):
         help="static L1A: sustained source overload migrates without a drained queue",
     )
     parser.add_argument(
+        "--migrate-current-length",
+        action="store_true",
+        help="static L1A: a migration target only has to hold the current length",
+    )
+    parser.add_argument(
         "--kv-short-exempt",
         action="store_true",
         help="static L1A: short requests stay eligible for TP1 under KV protection",
@@ -400,6 +405,8 @@ def main(argv=None):
         parser.error("--hold-queue is a static layout option")
     if args.overload_migrate and not args.kv_short_exempt:
         parser.error("--overload-migrate needs --kv-short-exempt")
+    if args.migrate_current_length and args.static_layout != "L1A":
+        parser.error("--migrate-current-length is a static L1A option")
     if args.conversion_assist and args.conversion != "L1A-L2":
         parser.error("drain assist merges TP1s into a TP2 (L1A-L2) only")
     if not 0 <= args.conversion_trigger_s < 300:
@@ -524,6 +531,10 @@ def main(argv=None):
             if args.overload_migrate:
                 cfg["policy_overrides"] = dict(
                     cfg["policy_overrides"], overload_migrates=True
+                )
+            if args.migrate_current_length:
+                cfg["policy_overrides"] = dict(
+                    cfg["policy_overrides"], migration_current_length=True
                 )
             if args.long_burst_pair:
                 cfg["recipes"] = [

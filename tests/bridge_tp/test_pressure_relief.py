@@ -82,6 +82,43 @@ class ReliefTests(unittest.TestCase):
         self.assertEqual(results[-1].action, "START_SHADOW")
         self.assertEqual(results[-1].reason, "overload relief")
 
+    def test_a_target_only_has_to_hold_the_current_length_when_asked(self):
+        def decide(**changes):
+            policy = p.PressurePolicy(
+                cfg(
+                    routing_relief=True,
+                    kv_routing_priority=True,
+                    kv_short_exempt_blocks=64,
+                    overload_migrates=True,
+                    overload_sustain_s=2,
+                    **changes,
+                ),
+                p.ReservationLedger(),
+            )
+            for now in range(10, 14):
+                result = policy.decide(
+                    now,
+                    source(
+                        now, waiting=50, pending_prompt_tokens=25600, decode_ratio=2
+                    ),
+                    reading("tp4", now=now, free_blocks=100),
+                    [candidate(sampled_at=now, published_at=now)],
+                )
+            return result
+
+        # 1024 prompt + 20 generated is 66 blocks; with 6000 of output, 440.
+        self.assertIn(
+            "target physical commitments exceed free blocks",
+            decide().candidates[0]["rejections"],
+        )
+        result = decide(migration_current_length=True)
+        self.assertEqual(result.action, "START_SHADOW")
+        self.assertEqual(result.candidates[0]["target_required_blocks"], 66)
+
+    def test_current_length_off_leaves_the_policy_identity_alone(self):
+        self.assertEqual(cfg().sha256, cfg(migration_current_length=False).sha256)
+        self.assertNotEqual(cfg().sha256, cfg(migration_current_length=True).sha256)
+
     def test_overload_keeps_short_requests_in_place(self):
         policy = self.overload_policy()
         short = dict(prompt_tokens=512, max_output_tokens=128)

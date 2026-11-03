@@ -90,18 +90,18 @@ class HoldQueueTests(unittest.TestCase):
         pools = [hold_pool("tp1", free=None, unallocated=None, sampled_at=1.0)]
         self.assertEqual(self.names(queue.next(pools, 1.0, 100.0))[0], "a")
 
-    def test_a_long_request_without_room_waits_alone(self):
+    def test_a_long_prompt_without_room_waits_alone(self):
         queue = self.queue()
         queue.add(hold_job("long", 16384, 8192), 0.0)
         queue.add(hold_job("short"), 0.5)
-        tight = [hold_pool("tp1", free=1500), hold_pool("tp4", unallocated=600)]
+        tight = [hold_pool("tp1", free=1000), hold_pool("tp4", unallocated=1000)]
         self.assertEqual(self.names(queue.next(tight, 1.0, 100.0))[0], "short")
         self.assertIsNone(queue.next(tight, 1.0, 100.0))
         self.assertEqual(queue.waiting(), 1)
         roomy = [hold_pool("tp1"), hold_pool("tp4", free=1000)]
         self.assertEqual(self.names(queue.next(roomy, 1.0, 100.0)), ("long", ["tp1"]))
 
-    def test_a_long_request_needs_fresh_evidence_until_its_limit(self):
+    def test_a_long_prompt_needs_fresh_evidence_until_its_limit(self):
         queue = self.queue(wait=60)
         queue.add(hold_job("long", 16384, 8192), 0.0)
         queue.add(hold_job("short"), 0.0)
@@ -112,6 +112,36 @@ class HoldQueueTests(unittest.TestCase):
         self.assertIsNone(queue.next(stale, 59.0, 100.0))
         # Past the limit it goes first, even with no room or evidence.
         self.assertEqual(self.names(queue.next(stale, 60.0, 100.0))[0], "long")
+
+    def test_only_the_prompt_decides_whether_a_request_fits(self):
+        for output in (8, 8192):
+            queue = self.queue()
+            queue.add(hold_job("long", 16384, output), 0.0)
+            self.assertIsNone(queue.next([hold_pool("tp1", free=1023)], 1.0, 100.0))
+            self.assertEqual(
+                self.names(queue.next([hold_pool("tp1", free=1024)], 1.0, 100.0))[0],
+                "long",
+            )
+
+    def test_a_short_prompt_with_a_long_output_is_not_long(self):
+        queue = self.queue()
+        job = hold_job("a", 512, 8192)
+        self.assertFalse(queue.is_long(job))
+        queue.add(job, 0.0)
+        self.assertIsNone(queue.next([hold_pool("tp1", free=31)], 1.0, 100.0))
+        self.assertEqual(
+            self.names(queue.next([hold_pool("tp1", free=32)], 1.0, 100.0))[0], "a"
+        )
+
+    def test_running_requests_reserve_nothing_for_their_growth(self):
+        queue = self.queue(limit=8)
+        running = stream("tp4", tokens=800, prompt=16384, output=8192)
+        queue.sent(hold_job("old", 16384, 8192), running)
+        queue.add(hold_job("new", 16384, 8192), 0.0)
+        self.assertEqual(
+            self.names(queue.next([hold_pool("tp4", free=1024)], 1.0, 100.0))[0],
+            "new",
+        )
 
     def test_a_measured_full_pool_takes_no_short_request(self):
         queue = self.queue()
@@ -124,66 +154,29 @@ class HoldQueueTests(unittest.TestCase):
         full.free_blocks = 21
         self.assertEqual(self.names(queue.next([full], 1.0, 100.0))[0], "b")
 
-    def test_a_short_request_ignores_the_growth_of_long_requests(self):
-        queue = self.queue(limit=8)
-        running = stream("tp4", tokens=800, prompt=16384, output=8192)
-        queue.sent(hold_job("old", 16384, 8192), running)
-        queue.add(hold_job("a"), 0.0)
-        self.assertEqual(
-            self.names(queue.next([hold_pool("tp4", free=10)], 1.0, 100.0))[0], "a"
-        )
-
-    def test_a_long_request_past_its_limit_waits_while_kv_is_measured_short(self):
+    def test_a_long_prompt_past_its_limit_waits_while_kv_is_measured_short(self):
         queue = self.queue(wait=60)
         queue.add(hold_job("long", 16384, 8192), 0.0)
-        tight = [hold_pool("tp1", free=1500), hold_pool("tp4", free=1500)]
+        tight = [hold_pool("tp1", free=1000), hold_pool("tp4", free=1000)]
         self.assertIsNone(queue.next(tight, 500.0, 100.0))
         self.assertEqual(queue.waiting(), 1)
-        tight[1].free_blocks = 1536
+        tight[1].free_blocks = 1024
         self.assertEqual(self.names(queue.next(tight, 500.0, 100.0)), ("long", ["tp4"]))
 
-    def test_past_its_limit_a_long_request_only_passes_unmeasured_pools(self):
+    def test_past_its_limit_a_long_prompt_only_passes_unmeasured_pools(self):
         queue = self.queue(wait=60)
         queue.add(hold_job("long", 16384, 8192), 0.0)
-        pools = [hold_pool("tp1", free=1500), hold_pool("tp4", sampled_at=90.0)]
+        pools = [hold_pool("tp1", free=1000), hold_pool("tp4", sampled_at=90.0)]
         self.assertIsNone(queue.next(pools, 59.0, 100.0))
         self.assertEqual(self.names(queue.next(pools, 60.0, 100.0)), ("long", ["tp4"]))
 
-    def test_past_its_limit_a_long_request_may_exceed_the_unstarted_limit(self):
+    def test_past_its_limit_a_long_prompt_may_exceed_the_unstarted_limit(self):
         queue = self.queue(limit=1, wait=60)
         queue.sent(hold_job("a"), stream("tp1"))
         queue.add(hold_job("long", 16384, 8192), 0.0)
         pools = [hold_pool("tp1")]
         self.assertIsNone(queue.next(pools, 59.0, 100.0))
         self.assertEqual(self.names(queue.next(pools, 60.0, 100.0))[0], "long")
-
-    def test_long_requests_already_sent_keep_their_growth_reserved(self):
-        queue = self.queue(limit=8)
-        running = stream("tp4", tokens=800, prompt=16384, output=8192)
-        queue.sent(hold_job("old", 16384, 8192), running)
-        queue.add(hold_job("new", 16384, 8192), 0.0)
-        self.assertIsNone(queue.next([hold_pool("tp4", free=1800)], 1.0, 100.0))
-        self.assertEqual(
-            self.names(queue.next([hold_pool("tp4", free=2000)], 1.0, 100.0))[0],
-            "new",
-        )
-
-    def test_a_migrated_long_request_is_charged_to_its_target(self):
-        queue = self.queue(limit=8)
-        moved = stream("tp1", tokens=800, prompt=16384, output=8192)
-        moved.recorder.target_arrived = True
-        queue.sent(hold_job("old", 16384, 8192), moved)
-        queue.add(hold_job("new", 16384, 8192), 0.0)
-        self.assertEqual(
-            self.names(
-                queue.next(
-                    [hold_pool("tp1", free=1600), hold_pool("tp4", free=1600)],
-                    1.0,
-                    100.0,
-                )
-            ),
-            ("new", ["tp1"]),
-        )
 
     def test_retired_instances_are_not_offered(self):
         queue = self.queue(active=lambda pool_id: pool_id != "tp1")
