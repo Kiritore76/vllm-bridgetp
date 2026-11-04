@@ -178,6 +178,70 @@ class HoldQueueTests(unittest.TestCase):
         self.assertIsNone(queue.next(pools, 59.0, 100.0))
         self.assertEqual(self.names(queue.next(pools, 60.0, 100.0))[0], "long")
 
+    def placing(self, **kwargs):
+        return h.HoldQueue(
+            8,
+            60,
+            8192,
+            2.0,
+            lambda _: True,
+            degree={"tp1": 1, "g3": 1, "tp4": 2}.get,
+            tp1_long_kv=0.7,
+            **kwargs,
+        )
+
+    def test_a_tp1_with_a_long_request_takes_no_second_one(self):
+        queue = self.placing()
+        queue.add(hold_job("first", 16384, 8192), 0.0)
+        pools = [hold_pool("tp1"), hold_pool("g3")]
+        job, allowed = queue.next(pools, 1.0, 100.0)
+        self.assertEqual([p.pool_id for p in allowed], ["tp1", "g3"])
+        queue.sent(job, stream("tp1", prompt=16384, output=8192))
+        queue.add(hold_job("second", 16384, 8192), 0.0)
+        self.assertEqual(self.names(queue.next(pools, 1.0, 100.0)), ("second", ["g3"]))
+
+    def test_it_counts_a_request_that_grew_past_short_size(self):
+        queue = self.placing()
+        grown = stream("tp1", tokens=600, prompt=512, output=8192)
+        queue.sent(hold_job("a", 512, 8192), grown)
+        queue.add(hold_job("long", 16384, 8192), 0.0)
+        pools = [hold_pool("tp1"), hold_pool("tp4")]
+        self.assertEqual(self.names(queue.next(pools, 1.0, 100.0)), ("long", ["tp4"]))
+
+    def test_a_finished_or_moved_request_frees_the_tp1(self):
+        queue = self.placing()
+        moved = stream("tp1", tokens=800, prompt=16384, output=8192)
+        moved.recorder.target_arrived = True
+        queue.sent(hold_job("a", 16384, 8192), moved)
+        queue.add(hold_job("long", 16384, 8192), 0.0)
+        released = queue.next([hold_pool("tp1")], 1.0, 100.0)
+        self.assertEqual(self.names(released)[0], "long")
+
+    def test_past_seventy_percent_only_short_requests_go(self):
+        queue = self.placing()
+        queue.add(hold_job("long", 16384, 8192), 0.0)
+        queue.add(hold_job("short", 512, 128), 0.0)
+        pool = hold_pool("tp1", free=1100)
+        pool.total_blocks = 4000
+        self.assertEqual(self.names(queue.next([pool], 1.0, 100.0)), ("short", ["tp1"]))
+        self.assertIsNone(queue.next([pool], 1.0, 100.0))
+        pool.free_blocks = 1300
+        self.assertEqual(self.names(queue.next([pool], 1.0, 100.0))[0], "long")
+
+    def test_a_long_prompt_past_its_limit_still_avoids_a_tp1_with_a_long_request(self):
+        queue = self.placing()
+        queue.sent(hold_job("a", 16384, 8192), stream("tp1", prompt=16384, output=8192))
+        queue.add(hold_job("long", 16384, 8192), 0.0)
+        self.assertIsNone(queue.next([hold_pool("tp1")], 500.0, 100.0))
+
+    def test_tp2_is_not_limited_by_this_rule(self):
+        queue = self.placing()
+        queue.sent(hold_job("a", 16384, 8192), stream("tp4", prompt=16384, output=8192))
+        queue.add(hold_job("long", 16384, 8192), 0.0)
+        pool = hold_pool("tp4", free=1100)
+        pool.total_blocks = 11712
+        self.assertEqual(self.names(queue.next([pool], 1.0, 100.0))[0], "long")
+
     def test_it_counts_arrivals_rather_than_sends(self):
         queue = self.queue(limit=1)
         for at, name in enumerate("abc"):

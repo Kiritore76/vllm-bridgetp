@@ -104,6 +104,13 @@ def parse_args(argv=None):
         "requests sent but not started; 0 sends every arrival when due",
     )
     parser.add_argument(
+        "--hold-tp1-long-kv",
+        type=float,
+        default=0.0,
+        help="a TP1 takes no long prompt with a long request on it or this share "
+        "of its KV in use; 0 applies neither",
+    )
+    parser.add_argument(
         "--hold-long-wait-s",
         type=float,
         default=300.0,
@@ -1301,6 +1308,8 @@ def _run(args, prepared):
                 decision.LONG_TOKENS,
                 cfg.max_age_s,
                 lambda pool_id: co.lifecycle(pool_id) == "ACTIVE",
+                degree=tp_of.get,
+                tp1_long_kv=getattr(args, "hold_tp1_long_kv", 0.0),
             )
             if getattr(args, "hold_unstarted", 0)
             else None,

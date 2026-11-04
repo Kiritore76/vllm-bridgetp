@@ -330,6 +330,7 @@ def pool_reading(
         sampled_at=sampled_at,
         published_at=observed_at,
         free_blocks=inventory["free_blocks"],
+        total_blocks=inventory.get("total_blocks"),
         block_size=inventory["block_size"],
         context_limit=inventory["context_limit"],
         decode_ratio=ratio,

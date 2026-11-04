@@ -537,7 +537,10 @@ def main(argv=None):
                 )
             if args.overload_migrate:
                 cfg["policy_overrides"] = dict(
-                    cfg["policy_overrides"], overload_migrates=True
+                    cfg["policy_overrides"],
+                    overload_migrates=True,
+                    overload_min_waiting=4,
+                    overload_kv_fraction=0.7,
                 )
             if args.migrate_current_length:
                 cfg["policy_overrides"] = dict(
@@ -948,6 +951,8 @@ def main(argv=None):
                     "8",
                     "--hold-long-wait-s",
                     "300",
+                    "--hold-tp1-long-kv",
+                    "0.7",
                 ]
             if args.expanded_context:
                 plan["expected_context_limits"] = (32768, 32768)

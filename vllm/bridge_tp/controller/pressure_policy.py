@@ -60,6 +60,10 @@ class PressureConfig:
     # and a loaded source never drains (user 11-03, mixed static L1A).
     overload_migrates: bool = False
     overload_sustain_s: float = 10.0
+    # Load alone is not overload: the source must also queue or be filling up, or a
+    # long request leaves a TP1 that serves everyone fine (user 11-04). Zero: off.
+    overload_min_waiting: int = 0
+    overload_kv_fraction: float = 0.0
     # A migration target only has to hold what the request is now: output length
     # is not known, and TP2 has room to spare (user 11-04).
     migration_current_length: bool = False
@@ -109,6 +113,8 @@ class PressureConfig:
             and (not self.kv_short_exempt_blocks or self.kv_routing_priority)
             and (not self.overload_migrates or self.kv_short_exempt_blocks)
             and self.overload_sustain_s >= 0
+            and self.overload_min_waiting >= 0
+            and 0 <= self.overload_kv_fraction <= 1
             and (not self.kv_routing_priority or (
                 self.workload_pressure and self.capacity_lookahead_s > 0
             ))
@@ -155,6 +161,9 @@ class PressureConfig:
         if not self.overload_migrates:
             values.pop("overload_migrates")
             values.pop("overload_sustain_s")
+        if not self.overload_min_waiting:
+            values.pop("overload_min_waiting")
+            values.pop("overload_kv_fraction")
         if not self.migration_current_length:
             values.pop("migration_current_length")
             values.pop("migration_target_reserve_blocks")
@@ -196,6 +205,7 @@ class PoolReading:
     workload: dict | None = None
     service_evidence: dict | None = None
     prefill_generation: int | None = None
+    total_blocks: int | None = None
 
 
 @dataclass(frozen=True)
@@ -862,7 +872,11 @@ class PressurePolicy:
         )
         overload = False
         if cfg.overload_migrates and not emergency:
-            if s.zone == "OVERLOAD" and not s.missing:
+            if (
+                s.zone == "OVERLOAD"
+                and not s.missing
+                and overload_pressed(source, cfg)
+            ):
                 if self._overload_since is None:
                     self._overload_since = now
                 overload = now - self._overload_since >= cfg.overload_sustain_s
@@ -1278,6 +1292,19 @@ class PressurePolicy:
             selected.request_id,
             rows,
         )
+
+
+def overload_pressed(source, cfg):
+    """The source queues or is filling up, beyond merely running a lot."""
+    if not cfg.overload_min_waiting:
+        return True
+    if (source.waiting or 0) >= cfg.overload_min_waiting:
+        return True
+    return bool(
+        source.total_blocks
+        and source.free_blocks is not None
+        and 1 - source.free_blocks / source.total_blocks >= cfg.overload_kv_fraction
+    )
 
 
 def target_refusal(cfg, target, pending_blocks, required_blocks):

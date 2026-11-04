@@ -138,6 +138,30 @@ class ReliefTests(unittest.TestCase):
             )
         return result
 
+    def pressed(self, **changes):
+        config = cfg(
+            routing_relief=True,
+            kv_routing_priority=True,
+            kv_short_exempt_blocks=64,
+            overload_migrates=True,
+            overload_min_waiting=4,
+            overload_kv_fraction=0.7,
+        )
+        return p.overload_pressed(replace(source(10), **changes), config)
+
+    def test_load_alone_is_not_overload(self):
+        self.assertFalse(self.pressed(waiting=3, free_blocks=1000, total_blocks=2325))
+
+    def test_a_queue_is_overload(self):
+        self.assertTrue(self.pressed(waiting=4, free_blocks=2000, total_blocks=2325))
+
+    def test_filling_up_is_overload(self):
+        self.assertTrue(self.pressed(waiting=0, free_blocks=697, total_blocks=2325))
+        self.assertFalse(self.pressed(waiting=0, free_blocks=698, total_blocks=2325))
+
+    def test_without_the_total_only_the_queue_counts(self):
+        self.assertFalse(self.pressed(waiting=0, free_blocks=1, total_blocks=None))
+
     def test_overload_keeps_a_kv_reserve_on_the_target(self):
         # 66 blocks now: 1171 + 66 needed, unallocated prompts counted.
         self.assertEqual(

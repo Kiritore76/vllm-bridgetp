@@ -195,6 +195,8 @@ class KVPriorityTests(unittest.TestCase):
         old_values.pop("kv_short_exempt_blocks")
         old_values.pop("overload_migrates")
         old_values.pop("overload_sustain_s")
+        old_values.pop("overload_min_waiting")
+        old_values.pop("overload_kv_fraction")
         old_values.pop("migration_current_length")
         old_values.pop("migration_target_reserve_blocks")
         old_values.pop("migration_target_running_max")

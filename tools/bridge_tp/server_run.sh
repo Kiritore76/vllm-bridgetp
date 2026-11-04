@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 当前任务：门控修改后的混合负载自动转换一场；确认后再放同代码静态L1A、L2。
-# 负载mixed_p1_10；提早启动、门控按方向放宽、可取消，迁移目标看当前长度、KV余量和运行槽。
+# 当前任务：放置和过载条件修改后的混合负载自动转换一场；确认后再放同代码静态L1A、L2。
+# TP1有长请求或KV≥70%时不接长prompt，短请求不受影响；过载迁移要求排队≥4或KV≥70%。
 # cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 set -uo pipefail
 scenes='mixed_p1_10:auto'

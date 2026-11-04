@@ -8,6 +8,10 @@ cannot open or close it. Only the prompt decides whether a request fits: output
 length is not known here, and growth is migration's job (user 11-02, 11-04). Fresh
 telemetry showing too little KV for the prompt keeps a request here. Without fresh
 evidence a small prompt is sent and a long one waits, bounded by ``long_wait_s``.
+
+With ``tp1_long_kv``, a TP1 takes no long prompt while it already serves a request
+past short size or its KV is used this far (user 11-04): two long requests on one
+TP1 preempt each other and stop its queue. Short requests are not affected.
 """
 
 import bisect
@@ -25,8 +29,18 @@ class HoldQueue:
     """
 
     poll_s = 0.05
+    short_blocks = 64
 
-    def __init__(self, unstarted_limit, long_wait_s, long_tokens, max_age_s, active):
+    def __init__(
+        self,
+        unstarted_limit,
+        long_wait_s,
+        long_tokens,
+        max_age_s,
+        active,
+        degree=None,
+        tp1_long_kv=0.0,
+    ):
         if unstarted_limit <= 0 or long_wait_s < 0 or long_tokens <= 0:
             raise ValueError("invalid hold settings")
         self.limit, self.long_wait_s = unstarted_limit, long_wait_s
@@ -34,6 +48,8 @@ class HoldQueue:
         self.active = active
         self.short, self.long = deque(), deque()
         self.unstarted = {}
+        self.running = []
+        self.degree, self.tp1_long_kv = degree, tp1_long_kv
         # Read from the status thread: only appended to or replaced whole.
         self.arrived_at = []
         self.held_long = ()
@@ -63,6 +79,7 @@ class HoldQueue:
             self.unstarted[pool_id] = [
                 v for v in values if not (v.recorder.tokens_seen or v.future.done())
             ]
+        self.running = [v for v in self.running if not v.future.done()]
 
     def _fresh(self, pool, wall):
         return (
@@ -75,6 +92,25 @@ class HoldQueue:
     def _prompt_fits(self, pool, job):
         return pool.free_blocks - pool.unallocated_prompt_blocks >= math.ceil(
             len(job["request"]["prompt"]) / pool.block_size
+        )
+
+    def _takes_long(self, pool):
+        if not self.tp1_long_kv or self.degree(pool.pool_id) != 1:
+            return True
+        limit = self.short_blocks * pool.block_size
+        for value in self.running:
+            recorder = value.recorder
+            owner = recorder.target_pool if recorder.target_arrived else value.pool_id
+            if (
+                owner == pool.pool_id
+                and len(value.payload["prompt"]) + recorder.tokens_seen > limit
+            ):
+                return False
+        total = getattr(pool, "total_blocks", None)
+        return not (
+            total
+            and pool.free_blocks is not None
+            and 1 - pool.free_blocks / total >= self.tp1_long_kv
         )
 
     def _release(self, queue, now, pools):
@@ -91,7 +127,11 @@ class HoldQueue:
         if self.long and pools:
             job, arrived = self.long[0]
             fits = [
-                p for p in room if self._fresh(p, wall) and self._prompt_fits(p, job)
+                p
+                for p in room
+                if self._fresh(p, wall)
+                and self._prompt_fits(p, job)
+                and self._takes_long(p)
             ]
             if fits:
                 return self._release(self.long, now, fits)
@@ -99,7 +139,8 @@ class HoldQueue:
                 allowed = [
                     p
                     for p in pools
-                    if not self._fresh(p, wall) or self._prompt_fits(p, job)
+                    if self._takes_long(p)
+                    and (not self._fresh(p, wall) or self._prompt_fits(p, job))
                 ]
                 if allowed:
                     return self._release(self.long, now, allowed)
@@ -116,3 +157,4 @@ class HoldQueue:
 
     def sent(self, job, value):
         self.unstarted.setdefault(value.pool_id, []).append(value)
+        self.running.append(value)
