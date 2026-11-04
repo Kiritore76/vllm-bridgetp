@@ -1124,6 +1124,8 @@ class ConversionDriver:
     """
 
     decision_interval_s = 1.0
+    # Pre-start replacements in the decider's prepare stage.
+    prepare_prestart = True
 
     TERMINAL = {"COMPLETED", "ABORTED", "RECOVERY_REQUIRED"}
 
@@ -1223,6 +1225,10 @@ class ConversionDriver:
         self.backend.ops.event("DECIDER_PROPOSAL", mode=record["mode"], **proposal)
         if not self.decider.execute:
             return
+        self.start_proposal(proposal)
+
+    def start_proposal(self, proposal):
+        """The first proposal becomes this run's only plan."""
         self.triggered_at = time.time()
         self.request = dict(
             self.request, bundle=proposal["bundle"], target_mode=proposal["target_mode"]
@@ -1258,7 +1264,11 @@ class ConversionDriver:
                 backend.write_layout({}, pending=False, tilt=tilt)
                 backend.ops.event("PRE_TILT", instances=tilt)
                 self.tilt_since = time.monotonic() if tilt else None
-        if not (self.decider.execute and backend.prestart_enabled):
+        if not (
+            self.prepare_prestart
+            and self.decider.execute
+            and backend.prestart_enabled
+        ):
             return
         prepared = record["prepared"]
         key = prepared["key"] if prepared else None

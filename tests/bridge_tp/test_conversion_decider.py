@@ -92,6 +92,59 @@ def edge(record):
     return proposal["bundle"], proposal["target_mode"]
 
 
+class CurrentLengthTests(unittest.TestCase):
+    def decider(self):
+        return d.ConversionDecider(d.EDGES, dict(current_length=True))
+
+    def signals(self, decider, value, now=1000.0):
+        return decider.signals(value, BUNDLES, MEMBERS, now)
+
+    def test_a_short_request_with_a_large_cap_is_not_long_yet(self):
+        value = status()
+        value["instances"]["B-g2-tp2"]["requests"] = [
+            dict(request_id="a", prompt_tokens=512, max_output_tokens=8192, generated=9)
+        ]
+        s = self.signals(self.decider(), value)
+        self.assertEqual((s["long_blocks"], s["long_arrivals"]), (0, 0))
+        self.assertGreater(
+            self.signals(d.ConversionDecider(d.EDGES), value)["long_blocks"], 0
+        )
+
+    def test_it_counts_the_current_length_once_a_request_turns_long(self):
+        value = status()
+        value["instances"]["B-g2-tp2"]["requests"] = [
+            dict(
+                request_id="a",
+                prompt_tokens=512,
+                max_output_tokens=8192,
+                generated=7680,
+            )
+        ]
+        s = self.signals(self.decider(), value)
+        self.assertEqual((s["long_blocks"], s["long_arrivals"]), (512, 1))
+
+    def test_a_long_request_is_new_only_for_one_window(self):
+        decider = self.decider()
+        value = status(deep={"B-g2-tp2": 1}, long_arrivals=5)
+        self.assertEqual(self.signals(decider, value, 1000.0)["long_arrivals"], 1)
+        self.assertEqual(self.signals(decider, value, 1059.0)["long_arrivals"], 1)
+        self.assertEqual(self.signals(decider, value, 1061.0)["long_arrivals"], 0)
+        # Still in flight and first seen long-ago: it does not count again.
+        self.assertEqual(self.signals(decider, value, 1062.0)["long_arrivals"], 1)
+
+    def test_held_long_prompts_count_as_demand_and_as_new(self):
+        value = status()
+        value["workload"]["held_long_prompt_tokens"] = [16384, 16384]
+        s = self.signals(self.decider(), value)
+        self.assertEqual((s["long_blocks"], s["long_arrivals"]), (2048, 2))
+
+    def test_the_default_still_reads_output_caps(self):
+        value = status(deep={"B-g2-tp2": 1})
+        self.assertEqual(
+            self.signals(d.ConversionDecider(d.EDGES), value)["long_blocks"], 1536
+        )
+
+
 class DeciderRuleTests(unittest.TestCase):
     def test_many_short_few_long_on_l1a_goes_to_l0_after_the_longer_hold(self):
         decider = d.ConversionDecider(d.EDGES)

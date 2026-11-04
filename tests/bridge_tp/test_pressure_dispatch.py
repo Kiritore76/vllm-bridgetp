@@ -178,6 +178,22 @@ class HoldQueueTests(unittest.TestCase):
         self.assertIsNone(queue.next(pools, 59.0, 100.0))
         self.assertEqual(self.names(queue.next(pools, 60.0, 100.0))[0], "long")
 
+    def test_it_counts_arrivals_rather_than_sends(self):
+        queue = self.queue(limit=1)
+        for at, name in enumerate("abc"):
+            queue.add(hold_job(name), float(at))
+        queue.next([hold_pool("tp1")], 2.0, 100.0)
+        self.assertEqual(queue.arrivals_since(0.5), 2)
+        self.assertEqual(queue.arrivals_since(10.0), 0)
+
+    def test_it_publishes_the_long_prompts_it_holds(self):
+        queue = self.queue()
+        queue.add(hold_job("long", 16384, 8192), 0.0)
+        queue.add(hold_job("short"), 0.0)
+        self.assertEqual(queue.held_long, (16384,))
+        queue.next([hold_pool("tp1")], 1.0, 100.0)
+        self.assertEqual(queue.held_long, ())
+
     def test_retired_instances_are_not_offered(self):
         queue = self.queue(active=lambda pool_id: pool_id != "tp1")
         queue.add(hold_job("a"), 0.0)

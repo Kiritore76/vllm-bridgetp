@@ -287,6 +287,38 @@ class StaticLayoutTests(unittest.TestCase):
         )
         self.assertEqual((code, value["runs"]), (0, 1))
 
+    def test_the_automatic_run_plans(self):
+        code, value = plan(
+            "--phase-shift",
+            "--phase-scenario",
+            "mixed_p1_10",
+            "--static-layout",
+            "L1A",
+            "--kv-short-exempt",
+            "--hold-queue",
+            "--overload-migrate",
+            "--migrate-current-length",
+            "--conversion-decider",
+            "execute",
+            "--decider-multi",
+            "--decider-pre-tilt",
+            "--decider-assist",
+            "--conversion-prestart",
+            "--expanded-context",
+        )
+        self.assertEqual((code, value["runs"]), (0, 1))
+
+    def test_many_conversions_need_an_executing_decider(self):
+        with self.assertRaises(SystemExit):
+            plan(
+                "--phase-shift",
+                "--static-layout",
+                "L1A",
+                "--conversion-decider",
+                "record",
+                "--decider-multi",
+            )
+
     def test_current_length_migration_is_for_static_l1a(self):
         with self.assertRaises(SystemExit):
             plan("--static-layout", "L2", "--migrate-current-length")

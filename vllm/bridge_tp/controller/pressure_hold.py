@@ -10,6 +10,7 @@ telemetry showing too little KV for the prompt keeps a request here. Without fre
 evidence a small prompt is sent and a long one waits, bounded by ``long_wait_s``.
 """
 
+import bisect
 import math
 from collections import deque
 
@@ -33,12 +34,26 @@ class HoldQueue:
         self.active = active
         self.short, self.long = deque(), deque()
         self.unstarted = {}
+        # Read from the status thread: only appended to or replaced whole.
+        self.arrived_at = []
+        self.held_long = ()
 
     def is_long(self, job):
         return len(job["request"]["prompt"]) >= self.long_tokens
 
     def add(self, job, arrived):
         (self.long if self.is_long(job) else self.short).append((job, arrived))
+        self.arrived_at.append(arrived)
+        if self.is_long(job):
+            self._publish_long()
+
+    def _publish_long(self):
+        self.held_long = tuple(len(job["request"]["prompt"]) for job, _ in self.long)
+
+    def arrivals_since(self, cut):
+        """Arrivals, not sends: a held queue caps what the engines receive."""
+        times = self.arrived_at
+        return len(times) - bisect.bisect_left(times, cut)
 
     def waiting(self):
         return len(self.short) + len(self.long)
@@ -64,6 +79,8 @@ class HoldQueue:
 
     def _release(self, queue, now, pools):
         job, arrived = queue.popleft()
+        if queue is self.long:
+            self._publish_long()
         return dict(job, held_s=now - arrived), tuple(pools)
 
     def next(self, pools, now, wall):

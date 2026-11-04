@@ -1030,15 +1030,20 @@ def _run(args, prepared):
         starts = layout_state["migration_starts"]
         while starts and now - starts[0][0] > window:
             starts.pop(0)
+        hold = dispatcher.hold if dispatcher is not None else None
         workload = dict(
             window_s=window,
-            arrivals=len(recent),
+            arrivals=len(recent)
+            if hold is None
+            else hold.arrivals_since(time.monotonic() - window),
             long_arrivals=len(long_requests),
             long_final_tokens=sum(long_requests),
             migration_starts=[[round(now - t, 3), source] for t, source in starts],
             tilt=sorted(layout_state["tilt"]),
             tilted_long_requests=layout_state["tilted"],
         )
+        if hold is not None:
+            workload["held_long_prompt_tokens"] = list(hold.held_long)
         path = args.run_dir / "layout_status.json"
         temporary = path.with_suffix(".tmp")
         temporary.write_text(
@@ -1234,7 +1239,12 @@ def _run(args, prepared):
             if (
                 tilt
                 and job.get("route") is None
-                and len(request["prompt"]) + int(request["max_tokens"])
+                and len(request["prompt"])
+                + (
+                    0
+                    if getattr(args, "hold_unstarted", 0)
+                    else int(request["max_tokens"])
+                )
                 >= decision.LONG_TOKENS
             ):
                 # Keep new long requests off a bundle the decider expects to

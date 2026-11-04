@@ -16,6 +16,10 @@ one neighbouring layout at a time (L0 and L2 are two steps apart):
 Thresholds are initial values from one run per cell (static layouts, 11-03)
 with a gap between opposite directions. Long-request blocks use the output cap,
 not the unknown final length, so a shorter output makes them an overestimate.
+With ``current_length`` they use what is known instead (user 11-04): a request is
+long once prompt + generated reaches ``LONG_TOKENS``, it counts at that length,
+and long prompts held in the controller count too. The block thresholds came from
+final lengths, so this signal reaches them later; they have not been retuned.
 
 A split never drains a long request: it has nowhere to migrate (no TP2 -> TP1),
 so a split waits, without limit, until its bundle has none (user 11-03). L0 ->
@@ -76,6 +80,7 @@ RULES = dict(
     prepare_capacity_max=0.8,
     smooth_capacity_s=15.0,
     smooth_waiting_s=10.0,
+    current_length=False,
 )
 
 
@@ -118,6 +123,7 @@ class ConversionDecider:
         self.prepared = None  # dict(key, bundle, target_mode, at)
         self.history = []  # (now, tp1 cap, tp-k cap, tp-k waiting)
         self.no_room_at = -float("inf")
+        self.long_seen = {}  # request id -> when first seen long
 
     def smooth(self, now, tp1_cap, tpk_cap, waiting):
         r = self.rules
@@ -151,14 +157,33 @@ class ConversionDecider:
             return (instances.get(i) or {}).get("pressure") or {}
 
         def long_blocks(ids):
-            """Final blocks by request: a migrating one is on two instances."""
+            """Blocks by request: a migrating one is on two instances."""
             blocks = {}
             for i in ids:
                 for q in (instances.get(i) or {}).get("requests", ()):
-                    tokens = q["prompt_tokens"] + q["max_output_tokens"]
+                    tokens = q["prompt_tokens"] + (
+                        q["generated"]
+                        if r["current_length"]
+                        else q["max_output_tokens"]
+                    )
                     if tokens >= LONG_TOKENS:
                         blocks[q["request_id"]] = -(-tokens // BLOCK_TOKENS)
             return sum(blocks.values())
+
+        total_blocks = long_blocks(instances)
+        if r["current_length"]:
+            # Long arrivals are not known from output caps; a request counts as
+            # new when it first turns long, and a held long prompt is new too.
+            held = workload.get("held_long_prompt_tokens", ())
+            for i in instances:
+                for q in instances[i].get("requests", ()):
+                    if q["prompt_tokens"] + q["generated"] >= LONG_TOKENS:
+                        self.long_seen.setdefault(q["request_id"], now)
+            self.long_seen = {
+                k: v for k, v in self.long_seen.items() if now - v <= window
+            }
+            long_arrivals = len(self.long_seen) + len(held)
+            total_blocks += sum(-(-n // BLOCK_TOKENS) for n in held)
 
         caps = {i: pressure(i).get("capacity") for i in instances}
         tp1_caps = [c for i, c in caps.items() if i in tp1 and c is not None]
@@ -176,7 +201,7 @@ class ConversionDecider:
             layout=layout_name(bundles),
             short_rate=(arrivals - long_arrivals) / window,
             long_arrivals=long_arrivals,
-            long_blocks=long_blocks(instances),
+            long_blocks=total_blocks,
             bundle_long_blocks={b: long_blocks(ids) for b, ids in members.items()},
             tp1_capacity_max=tp1_max,
             tpk_capacity_max=tpk_max,

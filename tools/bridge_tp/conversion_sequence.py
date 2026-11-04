@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Serialized explicit conversion plans; no workload-based decisions."""
+"""Serialized conversion plans, explicit or proposed by the decider."""
 
 from __future__ import annotations
 
@@ -333,109 +333,120 @@ class ConversionSequenceDriver(pc.ConversionDriver):
             dict(state=self.sequence_state, error=self.error, steps=self.history),
         )
 
+    def wait_for_clock(self):
+        """False when stopped first."""
+        if not hasattr(self.backend, "status"):
+            return True
+        until = time.monotonic() + 900
+        while True:
+            status = self.backend.status()
+            if (
+                self.backend.fresh(status)
+                and status.get("workload_origin_unix_s") is not None
+            ):
+                self.origin = time.monotonic() - (
+                    time.time() - status["workload_origin_unix_s"]
+                )
+                return True
+            if time.monotonic() >= until:
+                raise TimeoutError("controller workload clock not published")
+            if self.stop_event.wait(self.interval_s):
+                return False
+
+    def after_begin(self, step):
+        """A step has begun; its plan does not exist yet."""
+
+    def run_step(self, plan_id, step):
+        """One plan to its end and acknowledgement; None when stopped first."""
+        self.request = step
+        self.backend.begin_step(plan_id, step)
+        self.after_begin(step)
+        self.executor = pc.conversion.ConversionExecutor(
+            self.backend.registry,
+            self.backend,
+            self.root / "conversions" / plan_id / "plan.json",
+            clock=time.time,
+        )
+        self.triggered_at = time.time()
+        self.backend.ops.event("TRIGGER", plan_id=plan_id, request=step)
+        self.executor.plan_create(
+            plan_id,
+            self.backend.registry.registry_revision,
+            step["bundle"],
+            step["target_mode"],
+            step.get("method", "DRAIN"),
+            "ACTIVE",
+            time.time() + step["deadline_s"],
+            "NO_PROFILE",
+        )
+        while not self.stop_event.is_set():
+            self.end_expired_tilt()
+            before = self.executor.plan["state"]
+            after = self.executor.plan_execute(time.time())["state"]
+            if after != before:
+                self.backend.ops.event("PLAN_STATE", plan_id=plan_id, state=after)
+            if after in self.TERMINAL:
+                break
+            self.stop_event.wait(self.interval_s)
+        if self.stop_event.is_set():
+            return None
+        self.history.append(
+            dict(
+                plan_id=plan_id,
+                request=step,
+                triggered_unix_s=self.triggered_at,
+                completed_unix_s=time.time(),
+                plan=self.executor.plan_status(),
+                layout_revision=self.backend.revision,
+                controller_acknowledged=False,
+                layout=(
+                    {r.bundle_id: r.tp_degree for r in self.backend.active().values()}
+                    if hasattr(self.backend, "active")
+                    else None
+                ),
+                active_instances=(
+                    {
+                        i: dict(
+                            tp_degree=r.tp_degree,
+                            generation=r.ref.instance_generation,
+                            bundle=r.bundle_id,
+                            endpoint=r.endpoint,
+                        )
+                        for i, r in self.backend.active().items()
+                    }
+                    if hasattr(self.backend, "active")
+                    else None
+                ),
+            )
+        )
+        self.save_sequence()
+        if after != "RECOVERY_REQUIRED":
+            until = time.monotonic() + 30
+            while not self.backend.step_acknowledged():
+                if time.monotonic() >= until:
+                    raise TimeoutError("controller did not acknowledge conversion")
+                if self.stop_event.wait(self.interval_s):
+                    return None
+            self.history[-1].update(
+                controller_acknowledged=True, completed_unix_s=time.time()
+            )
+            self.save_sequence()
+        return after
+
     def _loop(self):
         try:
-            if hasattr(self.backend, "status"):
-                until = time.monotonic() + 900
-                while True:
-                    status = self.backend.status()
-                    if (
-                        self.backend.fresh(status)
-                        and status.get("workload_origin_unix_s") is not None
-                    ):
-                        self.origin = time.monotonic() - (
-                            time.time() - status["workload_origin_unix_s"]
-                        )
-                        break
-                    if time.monotonic() >= until:
-                        raise TimeoutError("controller workload clock not published")
-                    if self.stop_event.wait(self.interval_s):
-                        return
+            if not self.wait_for_clock():
+                return
             for number, step in enumerate(self.sequence_request["sequence"], 1):
                 while time.monotonic() - self.origin < step["trigger_s"]:
                     if self.stop_event.wait(self.interval_s):
                         return
                 if self.stop_event.is_set():
                     return
-                self.request = step
                 plan_id = f"sequence-{number:04d}-{step['bundle']}"
-                self.backend.begin_step(plan_id, step)
-                self.executor = pc.conversion.ConversionExecutor(
-                    self.backend.registry,
-                    self.backend,
-                    self.root / "conversions" / plan_id / "plan.json",
-                    clock=time.time,
-                )
-                self.triggered_at = time.time()
-                self.backend.ops.event("TRIGGER", plan_id=plan_id, request=step)
-                self.executor.plan_create(
-                    plan_id,
-                    self.backend.registry.registry_revision,
-                    step["bundle"],
-                    step["target_mode"],
-                    step.get("method", "DRAIN"),
-                    "ACTIVE",
-                    time.time() + step["deadline_s"],
-                    "NO_PROFILE",
-                )
-                while not self.stop_event.is_set():
-                    before = self.executor.plan["state"]
-                    after = self.executor.plan_execute(time.time())["state"]
-                    if after != before:
-                        self.backend.ops.event(
-                            "PLAN_STATE", plan_id=plan_id, state=after
-                        )
-                    if after in self.TERMINAL:
-                        break
-                    self.stop_event.wait(self.interval_s)
-                if self.stop_event.is_set():
+                after = self.run_step(plan_id, step)
+                if after is None:
                     return
-                self.history.append(
-                    dict(
-                        plan_id=plan_id,
-                        request=step,
-                        triggered_unix_s=self.triggered_at,
-                        completed_unix_s=time.time(),
-                        plan=self.executor.plan_status(),
-                        layout_revision=self.backend.revision,
-                        controller_acknowledged=False,
-                        layout=(
-                            {
-                                r.bundle_id: r.tp_degree
-                                for r in self.backend.active().values()
-                            }
-                            if hasattr(self.backend, "active")
-                            else None
-                        ),
-                        active_instances=(
-                            {
-                                i: dict(
-                                    tp_degree=r.tp_degree,
-                                    generation=r.ref.instance_generation,
-                                    bundle=r.bundle_id,
-                                    endpoint=r.endpoint,
-                                )
-                                for i, r in self.backend.active().items()
-                            }
-                            if hasattr(self.backend, "active")
-                            else None
-                        ),
-                    )
-                )
-                self.save_sequence()
-                if after != "RECOVERY_REQUIRED":
-                    until = time.monotonic() + 30
-                    while not self.backend.step_acknowledged():
-                        if time.monotonic() >= until:
-                            raise TimeoutError(
-                                "controller did not acknowledge conversion"
-                            )
-                        if self.stop_event.wait(self.interval_s):
-                            return
-                    self.history[-1].update(
-                        controller_acknowledged=True, completed_unix_s=time.time()
-                    )
-                    self.save_sequence()
                 if after == "RECOVERY_REQUIRED" or (
                     after == "ABORTED" and step.get("on_abort", "STOP") != "CONTINUE"
                 ):
@@ -457,8 +468,90 @@ class ConversionSequenceDriver(pc.ConversionDriver):
         return dict(result, steps=self.history, sequence=True)
 
 
-def assess(scene, expected_requests=None):
-    """Separate cycle correctness, migration coverage and planned-time latency."""
+class DecidedSequenceDriver(ConversionSequenceDriver):
+    """Serial plans proposed by the decider while the workload runs.
+
+    A safely ABORTED plan is not final: the decider may propose again after its
+    cooldown. RECOVERY_REQUIRED or an error stops all conversion. Between plans
+    the controller is free to finish; the plan itself holds it.
+    """
+
+    prepare_prestart = False  # A plan pre-starts its own replacements.
+
+    def __init__(self, backend, request, journal_path, interval_s=0.2):
+        pc.ConversionDriver.__init__(self, backend, request, journal_path, interval_s)
+        self.sequence_request = request
+        self.root = Path(journal_path).parent
+        self.history = []
+        self.sequence_state = "RUNNING"
+        self.number = 0
+        self.tilt_before_step = []
+
+    def _loop(self):
+        try:
+            if not self.wait_for_clock():
+                self.sequence_state = "COMPLETED"
+                return
+            while (
+                not self.stop_event.is_set() and self.sequence_state == "RUNNING"
+            ):
+                self.decide()
+                self.stop_event.wait(self.interval_s)
+            if self.sequence_state == "RUNNING":
+                self.sequence_state = "COMPLETED"
+        except Exception as error:
+            self.error = repr(error)
+            self.sequence_state = "FAILED"
+            self.backend.ops.event("DRIVER_ERROR", error=self.error)
+        finally:
+            if self.sequence_state == "RUNNING":
+                self.sequence_state = "INTERRUPTED"
+            self.save_sequence()
+            self.backend.write_layout({}, pending=False)
+
+    def after_begin(self, step):
+        # Beginning clears the tilt, but routing keeps it until the bundle closes;
+        # the start gate's service check ran before the load the tilt added.
+        tilt = self.tilt_before_step
+        if tilt:
+            self.backend.write_layout({}, tilt=tilt)
+            self.backend.service_gate_passed = True
+            self.tilt_since = time.monotonic()
+
+    def start_proposal(self, proposal):
+        limit = self.sequence_request.get("max_conversions", 4)
+        if self.number >= limit:
+            self.backend.ops.event("DECIDER_LIMIT", limit=limit, **proposal)
+            return
+        self.number += 1
+        bundle, mode = proposal["bundle"], proposal["target_mode"]
+        step = dict(
+            bundle=bundle,
+            target_mode=mode,
+            deadline_s=self.sequence_request["deadline_s"],
+            # Only a merge towards L2 has a TP-k to move requests to.
+            method="SELECTIVE_ROLL"
+            if self.sequence_request.get("assist") and (bundle, mode) == ("A", "TP2")
+            else "DRAIN",
+            held_s=proposal["held_s"],
+        )
+        self.tilt_before_step = list(self.backend.layout_tilt)
+        after = self.run_step(f"decided-{self.number:04d}-{bundle}", step)
+        self.decider.converted(time.time())
+        self.prepared_key = None
+        if after is None:
+            return
+        self.backend.write_layout({}, pending=False)
+        if after == "RECOVERY_REQUIRED":
+            self.sequence_state = after
+
+
+def assess(scene, expected_requests=None, decided=False):
+    """Separate cycle correctness, migration coverage and planned-time latency.
+
+    ``decided``: the decider chose the steps, so their number and layouts are
+    results, not expectations, and a safely aborted step is allowed.
+    """
     from tools.bridge_tp.qwen3_four_mode import distribution
 
     scene = Path(scene)
@@ -583,12 +676,11 @@ def assess(scene, expected_requests=None):
     complete = (
         result.get("state") == "COMPLETED"
         and result.get("error") is None
-        and len(steps) == 4
-        and [v["layout"] for v in steps] == expected
+        and (decided or (len(steps) == 4 and [v["layout"] for v in steps] == expected))
         and all(
-            v["state"] == "COMPLETED"
-            and v["evidence_ordered"]
-            and v["controller_applied"]
+            v["state"] == "ABORTED"
+            if decided and v["state"] != "COMPLETED"
+            else v["evidence_ordered"] and v["controller_applied"]
             for v in phases
         )
         and all(v.get("controller_acknowledged") for v in steps)
@@ -602,7 +694,9 @@ def assess(scene, expected_requests=None):
             for r in rows
         )
     )
-    coverage = len(windows) == 2 and all(v["committed_migrations"] > 0 for v in windows)
+    coverage = decided or (
+        len(windows) == 2 and all(v["committed_migrations"] > 0 for v in windows)
+    )
     for phase, step in zip(phases, steps):
         phase["planned_latency"] = latency(
             [
@@ -621,7 +715,7 @@ def assess(scene, expected_requests=None):
         migration_windows=windows,
         phases=phases,
         planned_latency=latency(rows),
-        note="one explicit mechanism check, not automatic-policy performance evidence; "
+        note="a mechanism check, not automatic-policy performance evidence; "
         "inspect host_monitor controller CPU before interpreting latencies; "
         "commit-filled token timestamps make handoff incomparable with older runs",
     )

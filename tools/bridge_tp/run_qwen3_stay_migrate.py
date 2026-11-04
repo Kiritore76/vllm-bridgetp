@@ -285,6 +285,11 @@ def main(argv=None):
         help="start the replacement engines behind a start gate while draining",
     )
     parser.add_argument(
+        "--decider-multi",
+        action="store_true",
+        help="keep converting as the decider proposes, deciding on known lengths",
+    )
+    parser.add_argument(
         "--decider-pre-tilt",
         action="store_true",
         help="keep new long requests off a bundle the decider expects to convert",
@@ -426,6 +431,8 @@ def main(argv=None):
         parser.error("--conversion-prestart needs a conversion")
     if (args.decider_pre_tilt or args.decider_assist) and not args.conversion_decider:
         parser.error("this option needs --conversion-decider")
+    if args.decider_multi and args.conversion_decider != "execute":
+        parser.error("--decider-multi needs --conversion-decider execute")
     if args.phase_shift:
         if (
             args.routine_four_mode
@@ -816,6 +823,10 @@ def main(argv=None):
                 pre_tilt=args.decider_pre_tilt,
                 assist=args.decider_assist,
             )
+            if args.decider_multi:
+                spec["conversion"].update(
+                    multi=True, max_conversions=4, rules=dict(current_length=True)
+                )
         if args.conversion and START_LAYOUT[args.conversion] != "L1A":
             spec["layout"] = dict(
                 name=START_LAYOUT[args.conversion],
@@ -960,7 +971,7 @@ def main(argv=None):
             ledger.append(row)
             write(args.output / "attempt_ledger.json", ledger)
             finalizer = comparison.finalize
-            if args.conversion_cycle:
+            if args.conversion_cycle or args.decider_multi:
                 from tools.bridge_tp.conversion_sequence import finalize
 
                 finalizer = finalize
@@ -1007,6 +1018,16 @@ def main(argv=None):
 
                 row["conversion_sequence"] = assess(
                     plan["run_dir"].parent, len(recipe["jobs"])
+                )
+                write(
+                    plan["run_dir"].parent / "conversion_sequence_acceptance.json",
+                    row["conversion_sequence"],
+                )
+            if args.decider_multi:
+                from tools.bridge_tp.conversion_sequence import assess
+
+                row["conversion_sequence"] = assess(
+                    plan["run_dir"].parent, len(recipe["jobs"]), decided=True
                 )
                 write(
                     plan["run_dir"].parent / "conversion_sequence_acceptance.json",
@@ -1277,7 +1298,7 @@ def main(argv=None):
                 if done
                 else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
             )
-        if args.conversion_cycle:
+        if args.conversion_cycle or args.decider_multi:
             accepted = len(ledger) == 1 and ledger[0]["conversion_sequence"]["passed"]
             result, code = (
                 (dict(status="COMPLETED_CONVERSION_SEQUENCE"), 0)

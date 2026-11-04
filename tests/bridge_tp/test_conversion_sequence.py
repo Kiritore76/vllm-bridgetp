@@ -40,6 +40,113 @@ class Executor:
         return dict(self.plan)
 
 
+class DecidedDriverTests(unittest.TestCase):
+    def run_driver(self, states, **request):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.events, self.writes, self.begun = [], [], []
+        backend = NS(
+            registry=NS(registry_revision=1),
+            states=list(states),
+            revision=0,
+            run_dir=root,
+            layout_tilt=["A1"],
+            service_gate_passed=False,
+            ops=NS(event=lambda kind, **v: self.events.append(dict(kind=kind, **v))),
+            step_acknowledged=lambda: True,
+            write_layout=lambda *a, **k: self.writes.append(k),
+        )
+
+        def begin(plan_id, step):
+            self.begun.append((plan_id, step))
+            backend.layout_tilt = []
+
+        backend.begin_step = begin
+        request = dict(
+            decider="EXECUTE",
+            edges={},
+            deadline_s=5,
+            base_port=8400,
+            assist=True,
+            multi=True,
+            **request,
+        )
+        with patch.object(seq.pc.conversion, "ConversionExecutor", Executor):
+            driver = seq.DecidedSequenceDriver(
+                backend, request, root / "conversion_plan.json", interval_s=0.001
+            )
+            driver.origin = time.monotonic()
+            return driver, backend
+
+    def propose(self, driver, *edges):
+        with patch.object(seq.pc.conversion, "ConversionExecutor", Executor):
+            for bundle, mode in edges:
+                driver.start_proposal(
+                    dict(bundle=bundle, target_mode=mode, held_s=75.0)
+                )
+
+    def test_it_runs_plans_in_turn_and_frees_the_controller_between_them(self):
+        driver, _ = self.run_driver(["COMPLETED", "COMPLETED"])
+        self.propose(driver, ("A", "TP2"), ("A", "TP1"))
+        self.assertEqual(
+            [s["target_mode"] for _, s in self.begun], ["TP2", "TP1"]
+        )
+        self.assertEqual(
+            [p for p, _ in self.begun], ["decided-0001-A", "decided-0002-A"]
+        )
+        self.assertEqual(len(driver.history), 2)
+        self.assertEqual(self.writes[-1]["pending"], False)
+        self.assertEqual(driver.sequence_state, "RUNNING")
+
+    def test_only_a_merge_towards_l2_is_assisted(self):
+        driver, _ = self.run_driver(["COMPLETED"] * 3)
+        self.propose(driver, ("A", "TP2"), ("A", "TP1"), ("B", "TP2"))
+        self.assertEqual(
+            [s["method"] for _, s in self.begun],
+            ["SELECTIVE_ROLL", "DRAIN", "DRAIN"],
+        )
+
+    def test_a_safe_abort_leaves_later_proposals_open(self):
+        driver, _ = self.run_driver(["ABORTED", "COMPLETED"])
+        self.propose(driver, ("A", "TP2"), ("A", "TP2"))
+        self.assertEqual(driver.sequence_state, "RUNNING")
+        self.assertEqual(len(self.begun), 2)
+
+    def test_recovery_required_ends_all_conversion(self):
+        driver, _ = self.run_driver(["RECOVERY_REQUIRED"])
+        self.propose(driver, ("A", "TP2"))
+        self.assertEqual(driver.sequence_state, "RECOVERY_REQUIRED")
+        self.assertEqual(driver.state(), "RECOVERY_REQUIRED")
+
+    def test_the_limit_stops_conversions_but_keeps_the_record(self):
+        driver, _ = self.run_driver(["COMPLETED"], max_conversions=1)
+        self.propose(driver, ("A", "TP2"), ("A", "TP1"))
+        self.assertEqual(len(self.begun), 1)
+        self.assertIn("DECIDER_LIMIT", [e["kind"] for e in self.events])
+
+    def test_a_tilt_survives_the_step_and_passes_the_service_gate(self):
+        driver, backend = self.run_driver(["COMPLETED"])
+        self.propose(driver, ("A", "TP2"))
+        self.assertTrue(backend.service_gate_passed)
+        self.assertIn(dict(tilt=["A1"]), self.writes)
+
+    def test_the_decider_cools_down_after_each_plan(self):
+        driver, _ = self.run_driver(["COMPLETED"])
+        driver.decider.since["A->TP2"] = 1.0
+        self.propose(driver, ("A", "TP2"))
+        self.assertIsNotNone(driver.decider.converted_at)
+        self.assertEqual(driver.decider.since, {})
+
+    def test_it_does_not_prestart_in_the_prepare_stage(self):
+        self.assertFalse(seq.DecidedSequenceDriver.prepare_prestart)
+
+    def test_decided_assessment_does_not_expect_a_fixed_sequence(self):
+        import inspect
+
+        self.assertIn("decided", inspect.signature(seq.assess).parameters)
+
+
 class SequenceDriverTests(unittest.TestCase):
     def run_driver(self, steps, states):
         self.temp = tempfile.TemporaryDirectory()
@@ -227,6 +334,85 @@ class LiveCycleTests(unittest.TestCase):
             self.assertEqual(
                 len(json.loads((h.root / "pressure_request_results.json").read_text())),
                 40,
+            )
+
+    def test_the_decider_converts_twice_with_requests_held_in_the_controller(self):
+        class Scripted:
+            """The real driver and controller; only the choice of edge is fixed."""
+
+            execute, rules = True, dict(tilt_max_s=90.0)
+
+            def __init__(self):
+                self.edges = [("A", "TP2"), ("A", "TP1")]
+                self.converted_times = 0
+
+            def observe(self, status, bundles, members, now):
+                bundle, mode = self.edges.pop(0) if self.edges else (None, None)
+                return dict(
+                    mode="EXECUTE",
+                    evaluated_unix_s=now,
+                    prepared=None,
+                    tilt=[],
+                    proposal=dict(bundle=bundle, target_mode=mode, held_s=1.0)
+                    if bundle
+                    else None,
+                )
+
+            def converted(self, now):
+                self.converted_times += 1
+
+        with tempfile.TemporaryDirectory() as directory:
+            h = CycleHarness(Path(directory), [step()])
+            request = dict(
+                decider="EXECUTE",
+                edges={},
+                deadline_s=20,
+                base_port=8400,
+                assist=False,
+                multi=True,
+            )
+            h.driver = seq.DecidedSequenceDriver(
+                h.backend, request, h.root / "conversion_plan.json", interval_s=0.02
+            )
+            h.driver.decider = scripted = Scripted()
+            result = h.run(
+                jobs(40, 0.15), max_seconds=40, hold_unstarted=2, hold_long_wait_s=30.0
+            )
+            self.assertEqual(result["state"], "COMPLETED", result)
+            self.assertIsNone(result["error"], result)
+            self.assertEqual(
+                [r["plan"]["state"] for r in result["steps"]],
+                ["COMPLETED", "COMPLETED"],
+            )
+            self.assertEqual(scripted.converted_times, 2)
+            self.assertEqual(
+                [r["layout"] for r in result["steps"]],
+                [{"A": 2, "B": 2}, {"A": 1, "B": 2}],
+            )
+            self.assertTrue(all(r["controller_acknowledged"] for r in result["steps"]))
+            rows = json.loads((h.root / "pressure_request_results.json").read_text())
+            self.assertEqual(len(rows), 40)
+            self.assertTrue(all("held_s" in r["dispatch_timing"] for r in rows))
+            self.assertTrue(
+                all(r["source_done"] and not r["source_error"] for r in rows)
+            )
+            closed, late = {}, []
+            audit = (h.root / "pressure_audit.jsonl").read_text().splitlines()
+            events = [json.loads(line) for line in audit]
+            for event in sorted(
+                (e for e in events if "unix_s" in e), key=lambda e: e["unix_s"]
+            ):
+                if event["kind"] == "pressure_instance_lifecycle":
+                    closed[event["instance_id"]] = event["to"] != "ACTIVE"
+                elif event["kind"] == "pressure_dispatch" and closed.get(event["pool"]):
+                    late.append(event["job_id"])
+            self.assertEqual(late, [])
+            self.assertTrue(
+                all(
+                    e["ingress_capacity_gate"]
+                    for e in events
+                    if e["kind"] == "pressure_dispatch"
+                )
             )
 
     def test_prestart_cycle_and_safe_abort_then_retry(self):

@@ -397,7 +397,7 @@ def build_scene(spec, scene, run_root, common, args):
         stager_argv=stager_argv,
         controller_argv=argv,
     )
-    if request is not None and "sequence" in request:
+    if request is not None and ("sequence" in request or request.get("multi")):
         from tools.bridge_tp.conversion_sequence import prepare_plan
 
         prepare_plan(plan)
@@ -542,7 +542,8 @@ def decider_request(request):
     """Rule-based decider instead of an explicit edge (user 11-01).
 
     RECORD_ONLY logs what it would convert; EXECUTE converts its first
-    proposal (one DRAIN conversion per run).
+    proposal (one DRAIN conversion per run), or with ``multi`` keeps converting
+    serially up to ``max_conversions``.
     """
     from tools.bridge_tp.conversion_decider import EDGES, RULES
 
@@ -550,7 +551,13 @@ def decider_request(request):
     if (
         not required
         <= set(request)
-        <= required | {"rules", "prestart", "pre_tilt", "assist"}
+        <= required | {"rules", "prestart", "pre_tilt", "assist", "multi"}
+        | {"max_conversions"}
+        or request.get("multi", False) not in (True, False)
+        or request.get("multi")
+        and request["decider"] != "EXECUTE"
+        or type(request.get("max_conversions", 1)) is not int
+        or request.get("max_conversions", 1) < 1
         or request.get("prestart", False) not in (True, False)
         or request.get("pre_tilt", False) not in (True, False)
         or request.get("assist", False) not in (True, False)
@@ -1044,7 +1051,11 @@ def start_conversion(spec, scene, plan, common, processes, publish, requests):
         **sequence_args,
     )
     driver_type = pc.ConversionDriver
-    if plan.get("sequence_context"):
+    if plan["conversion"].get("multi"):
+        from tools.bridge_tp.conversion_sequence import DecidedSequenceDriver
+
+        driver_type = DecidedSequenceDriver
+    elif plan.get("sequence_context"):
         from tools.bridge_tp.conversion_sequence import ConversionSequenceDriver
 
         driver_type = ConversionSequenceDriver
