@@ -188,6 +188,11 @@ class ControllerConversionBackend:
         self.stager_started = False
         # Pre-start the replacements behind a start gate while draining.
         self.prestart_enabled = prestart
+        # STRICT: retained KV room and quiet. PHYSICAL: only retained KV below
+        # exhaustion. NONE: this conversion is the relief, so neither the gate
+        # nor the valve holds it back. The decider's driver sets it per edge.
+        self.gate_mode = "STRICT"
+        self.assist_requires_spare = True
         self.prestarted = None
         self.service_gate_passed = False
         self.lock = threading.Lock()
@@ -293,13 +298,24 @@ class ControllerConversionBackend:
             self.decision("GATE", open=False, waited_s=waited, reason="status stale")
             return False
         retained = self.retained(plan, status)
+        mode = self.gate_mode
         if not retained:
             reason = "no retained instance"
-        elif not all(
-            self.hard_ok(v, self.safety["gate_capacity_max"]) for v in retained.values()
+        elif mode != "NONE" and not all(
+            self.hard_ok(
+                v,
+                self.safety["valve_capacity"]
+                if mode == "PHYSICAL"
+                else self.safety["gate_capacity_max"],
+            )
+            for v in retained.values()
         ):
             reason = "retained KV headroom (hard)"
-        elif waited >= self.safety["relax_after_s"] or self.service_gate_passed:
+        elif (
+            mode != "STRICT"
+            or waited >= self.safety["relax_after_s"]
+            or self.service_gate_passed
+        ):
             # Passed: the decider checked the others were quiet before the
             # tilt it added to them; only hard safety is left to check.
             reason = None
@@ -388,6 +404,8 @@ class ControllerConversionBackend:
         conservative remaining time is short the conversion finishes instead:
         cancelling then would throw away the drain for a few seconds' relief.
         """
+        if self.gate_mode == "NONE":
+            return False
         status = self.status()
         if not self.fresh(status):
             return False
@@ -562,7 +580,7 @@ class ControllerConversionBackend:
         if len(long) > room:
             return f"{len(long)} long requests exceed the cap {room}: drain", None
         pressure = instances[target].get("pressure") or {}
-        if pressure.get("zone") != "SPARE":
+        if self.assist_requires_spare and pressure.get("zone") != "SPARE":
             return f"target not SPARE ({pressure.get('zone')})", None
         return None, dict(long[0], evacuate=[r["request_id"] for r in long])
 

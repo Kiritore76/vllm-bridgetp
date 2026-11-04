@@ -825,7 +825,9 @@ def main(argv=None):
             )
             if args.decider_multi:
                 spec["conversion"].update(
-                    multi=True, max_conversions=4, rules=dict(current_length=True)
+                    multi=True,
+                    max_conversions=4,
+                    rules=dict(current_length=True, trend_lookahead_s=60.0),
                 )
         if args.conversion and START_LAYOUT[args.conversion] != "L1A":
             spec["layout"] = dict(

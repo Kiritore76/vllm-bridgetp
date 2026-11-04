@@ -122,6 +122,85 @@ class ManyConversionsRequestTests(unittest.TestCase):
             launch.decider_request(request)
 
 
+class TrendTests(unittest.TestCase):
+    RULES = dict(current_length=True, trend_lookahead_s=60.0)
+
+    def grow(self, decider, seconds, every, start=1000.0, carry=0):
+        """A new deep long request every ``every`` seconds, none ending."""
+        records = []
+        for second in range(seconds):
+            value = status(short=1)
+            count = carry + second // every + 1
+            value["instances"]["B-g2-tp2"]["requests"] = [
+                dict(
+                    request_id=str(n),
+                    prompt_tokens=16384,
+                    max_output_tokens=8192,
+                    generated=0,
+                )
+                for n in range(count)
+            ]
+            records.append(
+                decider.observe(value, BUNDLES, MEMBERS, start + second)
+            )
+        return records
+
+    def test_sustained_arrivals_propose_before_the_threshold_is_reached(self):
+        decider = d.ConversionDecider(d.EDGES, self.RULES, execute=True)
+        records = self.grow(decider, 200, 20)
+        first = next(r for r in records if r["proposal"])
+        self.assertLess(first["signals"]["long_blocks"], 9817)
+        self.assertEqual(first["proposal"]["layout"], "L1A")
+
+    def test_without_the_trend_it_waits_for_the_threshold(self):
+        decider = d.ConversionDecider(d.EDGES, dict(current_length=True), execute=True)
+        first = next(r for r in self.grow(decider, 300, 20) if r["proposal"])
+        self.assertGreaterEqual(first["signals"]["long_blocks"], 9817)
+
+    def test_a_finished_burst_is_left_to_migration(self):
+        decider = d.ConversionDecider(d.EDGES, self.RULES, execute=True)
+        records = []
+        for second in range(200):
+            value = status(short=1)
+            count = 0 if second < 60 else min(6, (second - 60) // 2 + 1)
+            value["instances"]["B-g2-tp2"]["requests"] = [
+                dict(
+                    request_id=str(n),
+                    prompt_tokens=16384,
+                    max_output_tokens=8192,
+                    generated=0,
+                )
+                for n in range(count)
+            ]
+            records.append(decider.observe(value, BUNDLES, MEMBERS, 1000.0 + second))
+        self.assertFalse([r for r in records if r["proposal"]])
+
+    def test_the_trend_is_off_by_default(self):
+        self.assertEqual(d.RULES["trend_lookahead_s"], 0.0)
+
+
+class CancelReasonTests(unittest.TestCase):
+    def reason(self, edge, layout, short=0.0, blocks=0):
+        return d.ConversionDecider(d.EDGES).cancel_reason(edge, layout, short, blocks)
+
+    def test_a_merge_stops_when_short_requests_exceed_l2(self):
+        self.assertIsNone(self.reason(("A", "TP2"), "L1A", short=6.0))
+        self.assertTrue(self.reason(("A", "TP2"), "L1A", short=6.1))
+
+    def test_a_split_stops_when_l2_carries_the_short_requests_again(self):
+        self.assertIsNone(self.reason(("A", "TP1"), "L2", short=7.0))
+        self.assertTrue(self.reason(("A", "TP1"), "L2", short=6.9))
+
+    def test_entering_l0_stops_when_it_no_longer_fits(self):
+        self.assertIsNone(self.reason(("B", "TP1"), "L1A", short=11.0))
+        self.assertTrue(self.reason(("B", "TP1"), "L1A", short=10.0))
+        self.assertTrue(self.reason(("B", "TP1"), "L1A", short=12.0, blocks=5000))
+
+    def test_leaving_l0_under_long_pressure_does_not_stop(self):
+        self.assertIsNone(self.reason(("B", "TP2"), "L0", short=12.0, blocks=6144))
+        self.assertTrue(self.reason(("B", "TP2"), "L0", short=12.0, blocks=100))
+
+
 class CurrentLengthTests(unittest.TestCase):
     def decider(self):
         return d.ConversionDecider(d.EDGES, dict(current_length=True))

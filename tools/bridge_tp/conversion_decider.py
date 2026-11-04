@@ -23,6 +23,13 @@ follows its rate, which has its own threshold. A bundle still counts as serving 
 long request only from ``LONG_TOKENS``. The block thresholds came from final
 lengths, so this signal reaches them later; they have not been retuned.
 
+``trend_lookahead_s`` starts L1A -> L2 on the trend (user 11-04): the demand may
+reach its threshold by extrapolating the last window's observed growth, while a
+long request is still new within ``trend_recent_s``, for ``trend_hold_s``. A burst
+stops being new before that hold ends, so it stays with migration.
+
+``cancel_reason`` says when a proposal already in progress no longer fits.
+
 A split never drains a long request: it has nowhere to migrate (no TP2 -> TP1),
 so a split waits, without limit, until its bundle has none (user 11-03). L0 ->
 L1A under long pressure is the exception: nothing else relieves L0, so it
@@ -86,6 +93,10 @@ RULES = dict(
     smooth_capacity_s=15.0,
     smooth_waiting_s=10.0,
     current_length=False,
+    trend_lookahead_s=0.0,
+    trend_hold_s=45.0,
+    trend_recent_s=30.0,
+    cancel_hold_s=15.0,
 )
 
 
@@ -129,6 +140,7 @@ class ConversionDecider:
         self.history = []  # (now, tp1 cap, tp-k cap, tp-k waiting)
         self.no_room_at = -float("inf")
         self.long_seen = {}  # request id -> when first seen long
+        self.block_history = []  # (now, demand blocks)
 
     def smooth(self, now, tp1_cap, tpk_cap, waiting):
         r = self.rules
@@ -152,6 +164,7 @@ class ConversionDecider:
         workload = status.get("workload") or {}
         arrivals = workload.get("arrivals", 0)
         long_arrivals = workload.get("long_arrivals", 0)
+        short_rate = (arrivals - long_arrivals) / workload.get("window_s", WINDOW_S)
         window = workload.get("window_s", WINDOW_S)
         instances = {
             i: v for i, v in status["instances"].items() if v["lifecycle"] == "ACTIVE"
@@ -196,6 +209,17 @@ class ConversionDecider:
             }
             long_arrivals = len(self.long_seen) + len(held)
             total_blocks += sum(-(-n // BLOCK_TOKENS) for n in held)
+        trend_blocks = total_blocks
+        if r["trend_lookahead_s"]:
+            self.block_history.append((now, total_blocks))
+            self.block_history = [h for h in self.block_history if now - h[0] <= window]
+            then, before = self.block_history[0]
+            recent = workload.get("held_long_prompt_tokens") or any(
+                now - seen <= r["trend_recent_s"] for seen in self.long_seen.values()
+            )
+            if recent and now - then >= r["trend_recent_s"]:
+                rate = max(0.0, (total_blocks - before) / (now - then))
+                trend_blocks = total_blocks + rate * r["trend_lookahead_s"]
 
         caps = {i: pressure(i).get("capacity") for i in instances}
         tp1_caps = [c for i, c in caps.items() if i in tp1 and c is not None]
@@ -211,9 +235,10 @@ class ConversionDecider:
         )
         return dict(
             layout=layout_name(bundles),
-            short_rate=(arrivals - long_arrivals) / window,
+            short_rate=short_rate,
             long_arrivals=long_arrivals,
             long_blocks=total_blocks,
+            trend_blocks=round(trend_blocks),
             bundle_long_blocks={b: long_blocks(ids) for b, ids in members.items()},
             tp1_capacity_max=tp1_max,
             tpk_capacity_max=tpk_max,
@@ -246,7 +271,7 @@ class ConversionDecider:
         if (s["layout"], after) == ("L1A", "L2"):
             if short > r["l2_max_short"]:
                 failed.append("short rate too high for L2")
-            if blocks < r["l2_min_long_blocks"]:
+            if s.get("trend_blocks", blocks) < r["l2_min_long_blocks"]:
                 failed.append("too few long-request blocks")
             if not s["long_arrivals"]:
                 failed.append("no new long request: a burst is left to migration")
@@ -301,6 +326,8 @@ class ConversionDecider:
                 if urgent
                 else r["l0_hold_s"]
                 if edge[1] == "TP1" and s["layout"] == "L1A"
+                else r["trend_hold_s"]
+                if r["trend_lookahead_s"] and tuple(edge) == ("A", "TP2")
                 else r["hold_s"]
             )
             repeated = (
@@ -319,7 +346,12 @@ class ConversionDecider:
             if usable and held >= need - r["tilt_lead_s"] and approaching is None:
                 approaching = (key, edge, bool(waiting))
             if ready and proposal is None:
-                proposal = dict(bundle=edge[0], target_mode=edge[1], held_s=held)
+                proposal = dict(
+                    bundle=edge[0],
+                    target_mode=edge[1],
+                    held_s=held,
+                    layout=s["layout"],
+                )
                 self.proposed_at[key] = now
                 self.since.pop(key, None)
         self.update_prepared(approaching, s, bundles, now)
@@ -365,6 +397,37 @@ class ConversionDecider:
                 self.prepared = dict(
                     key=key, bundle=edge[0], target_mode=edge[1], at=now
                 )
+
+    def cancel_reason(self, edge, layout, short, blocks):
+        """Why a conversion in progress no longer fits the load, or None."""
+        r = self.rules
+        bundle, mode = edge
+        after = {
+            ("L1A", "A", "TP2"): "L2",
+            ("L1A", "B", "TP1"): "L0",
+            ("L2", "A", "TP1"): "L1A",
+            ("L0", "B", "TP2"): "L1A",
+        }.get((layout, bundle, mode))
+        if after == "L2" and short > r["l2_max_short"]:
+            return "short rate too high for L2"
+        if after == "L0" and (
+            short < r["l0_min_short"] or blocks > r["l0_max_long_blocks"]
+        ):
+            return "L0 no longer suits the load"
+        if layout == "L2" and short < r["l2_leave_short"]:
+            return "short rate within what L2 carries"
+        if (
+            layout == "L0"
+            and blocks < r["l0_leave_long_blocks"]
+            and short > r["l0_leave_short"]
+        ):
+            return "L0 suits the load again"
+        return None
+
+    def cancelled(self):
+        """A cancelled conversion started nothing, so it needs no cooldown."""
+        self.since.clear()
+        self.prepared = None
 
     def converted(self, now):
         self.converted_at = now

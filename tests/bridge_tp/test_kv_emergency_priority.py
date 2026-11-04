@@ -196,6 +196,8 @@ class KVPriorityTests(unittest.TestCase):
         old_values.pop("overload_migrates")
         old_values.pop("overload_sustain_s")
         old_values.pop("migration_current_length")
+        old_values.pop("migration_target_reserve_blocks")
+        old_values.pop("migration_target_running_max")
         expected = hashlib.sha256(
             json.dumps(old_values, sort_keys=True).encode()
         ).hexdigest()

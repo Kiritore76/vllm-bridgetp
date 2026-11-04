@@ -703,7 +703,7 @@ class PressureCoordinator:
         The request is picked by the conversion's drain plan, not by pressure;
         everything else is the policy path's: one global session, a fresh
         target reading, an exact action binding and an atomic ledger
-        reservation (here sized for the request's final length). Returns None
+        reservation (sized by the caller's length rule). Returns None
         once started, otherwise the refusal reason; nothing is retried here.
         """
         with self._lock:

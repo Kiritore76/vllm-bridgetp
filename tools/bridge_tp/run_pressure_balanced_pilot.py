@@ -462,8 +462,19 @@ def evacuation_refusal(
     Every request must fit at its final length (prompt + max output) on top
     of pending promises while the guard stays free, and, with the health
     service on, the target must stay within the policy's post-move service
-    budget with every added decode.
+    budget with every added decode. With ``migration_current_length`` it only
+    has to fit at its current length, under the policy's target checks.
     """
+    if policy_cfg.migration_current_length:
+        return p.target_refusal(
+            policy_cfg,
+            reading,
+            pending_blocks,
+            sum(
+                math.ceil((c.prompt_tokens + c.generated) / block_size)
+                for c in candidates
+            ),
+        )
     required = sum(
         math.ceil((c.prompt_tokens + c.max_output_tokens) / block_size)
         for c in candidates
@@ -941,15 +952,28 @@ def _run(args, prepared):
             )
             if refusal:
                 return refusal
+        current = co.policy.cfg.migration_current_length
         required = math.ceil(
-            (candidate.prompt_tokens + candidate.max_output_tokens)
+            (
+                candidate.prompt_tokens
+                + (candidate.generated if current else candidate.max_output_tokens)
+            )
             / controller.block_size
         )
         pending, pending_decode, _ = co.ledger.pending(target_pool.pool_id)
         free = target_pool.free_blocks
-        if free is None or free - pending - required < cfg.capacity_guard_blocks:
+        if current:
+            refusal = p.target_refusal(
+                co.policy.cfg,
+                co.ledger.routing_reading(target_pool),
+                pending,
+                required,
+            )
+            if refusal:
+                return refusal
+        elif free is None or free - pending - required < cfg.capacity_guard_blocks:
             return "target KV cannot hold the final length plus guard"
-        if cfg.health_service:
+        if cfg.health_service and not current:
             reading = co.ledger.routing_reading(target_pool)
             refusal = assist_service_refusal(
                 co.policy.cfg,

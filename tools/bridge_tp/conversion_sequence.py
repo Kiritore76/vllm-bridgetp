@@ -356,6 +356,9 @@ class ConversionSequenceDriver(pc.ConversionDriver):
     def after_begin(self, step):
         """A step has begun; its plan does not exist yet."""
 
+    def plan_tick(self):
+        """Once per cycle while a plan runs."""
+
     def run_step(self, plan_id, step):
         """One plan to its end and acknowledgement; None when stopped first."""
         self.request = step
@@ -381,6 +384,7 @@ class ConversionSequenceDriver(pc.ConversionDriver):
         )
         while not self.stop_event.is_set():
             self.end_expired_tilt()
+            self.plan_tick()
             before = self.executor.plan["state"]
             after = self.executor.plan_execute(time.time())["state"]
             if after != before:
@@ -486,6 +490,10 @@ class DecidedSequenceDriver(ConversionSequenceDriver):
         self.sequence_state = "RUNNING"
         self.number = 0
         self.tilt_before_step = []
+        self.step_edge = None
+        self.cancel_since = None
+        self.cancel_checked = -float("inf")
+        backend.assist_requires_spare = False
 
     def _loop(self):
         try:
@@ -510,6 +518,12 @@ class DecidedSequenceDriver(ConversionSequenceDriver):
             self.backend.write_layout({}, pending=False)
 
     def after_begin(self, step):
+        # Only L1A -> L0 is optional enough for the strict gate (user 11-03, 11-04).
+        self.backend.gate_mode = {
+            ("A", "TP2"): "NONE",
+            ("A", "TP1"): "PHYSICAL",
+            ("B", "TP2"): "PHYSICAL",
+        }.get((step["bundle"], step["target_mode"]), "STRICT")
         # Beginning clears the tilt, but routing keeps it until the bundle closes;
         # the start gate's service check ran before the load the tilt added.
         tilt = self.tilt_before_step
@@ -517,6 +531,47 @@ class DecidedSequenceDriver(ConversionSequenceDriver):
             self.backend.write_layout({}, tilt=tilt)
             self.backend.service_gate_passed = True
             self.tilt_since = time.monotonic()
+
+    def plan_tick(self):
+        """Cancel while waiting or draining once the proposal no longer fits."""
+        now = time.monotonic()
+        state = self.executor.plan["state"]
+        if (
+            state not in {"CREATED", "DRAINING"}
+            or now - self.cancel_checked < self.decision_interval_s
+        ):
+            return
+        self.cancel_checked = now
+        status = self.backend.status()
+        if not self.backend.fresh(status):
+            return
+        from tools.bridge_tp.conversion_decider import registry_layout
+
+        wall = time.time()
+        bundles, members = registry_layout(self.backend.registry)
+        layout, edge = self.step_edge
+        s = self.decider.signals(status, bundles, members, wall)
+        reason = self.decider.cancel_reason(
+            edge, layout, s["short_rate"], s["long_blocks"]
+        )
+        if reason is None:
+            self.cancel_since = None
+            return
+        if self.cancel_since is None:
+            self.cancel_since = now
+        if now - self.cancel_since < self.decider.rules["cancel_hold_s"]:
+            return
+        # A drain nearly done costs less to finish than to throw away.
+        remaining = self.backend.remaining_s() if state == "DRAINING" else None
+        if (
+            remaining is not None
+            and remaining <= self.backend.safety["continue_if_remaining_s"]
+        ):
+            return
+        self.backend.ops.event(
+            "DECIDER_CANCEL", state=state, reason=reason, remaining_s=remaining
+        )
+        self.executor.plan_cancel()
 
     def start_proposal(self, proposal):
         limit = self.sequence_request.get("max_conversions", 4)
@@ -536,10 +591,16 @@ class DecidedSequenceDriver(ConversionSequenceDriver):
             held_s=proposal["held_s"],
         )
         self.tilt_before_step = list(self.backend.layout_tilt)
+        self.step_edge = (proposal.get("layout"), (bundle, mode))
+        self.cancel_since = None
+        self.cancel_checked = -float("inf")
         after = self.run_step(f"decided-{self.number:04d}-{bundle}", step)
         # The prepare stage reads its options (pre_tilt) from the request.
         self.request = self.sequence_request
-        self.decider.converted(time.time())
+        if after == "ABORTED":
+            self.decider.cancelled()
+        else:
+            self.decider.converted(time.time())
         self.prepared_key = None
         if after is None:
             return

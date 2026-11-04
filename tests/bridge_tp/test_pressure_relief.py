@@ -111,8 +111,81 @@ class ReliefTests(unittest.TestCase):
             "target physical commitments exceed free blocks",
             decide().candidates[0]["rejections"],
         )
-        result = decide(migration_current_length=True)
+        result = decide(
+            migration_current_length=True, migration_target_reserve_blocks=0
+        )
         self.assertEqual(result.action, "START_SHADOW")
+        self.assertEqual(result.candidates[0]["target_required_blocks"], 66)
+
+    def overload_on_target(self, **target):
+        policy = p.PressurePolicy(
+            cfg(
+                routing_relief=True,
+                kv_routing_priority=True,
+                kv_short_exempt_blocks=64,
+                overload_migrates=True,
+                overload_sustain_s=2,
+                migration_current_length=True,
+            ),
+            p.ReservationLedger(),
+        )
+        for now in range(10, 14):
+            result = policy.decide(
+                now,
+                source(now, waiting=50, pending_prompt_tokens=25600, decode_ratio=2),
+                replace(reading("tp4", now=now), **target),
+                [candidate(sampled_at=now, published_at=now)],
+            )
+        return result
+
+    def test_overload_keeps_a_kv_reserve_on_the_target(self):
+        # 66 blocks now: 1171 + 66 needed, unallocated prompts counted.
+        self.assertEqual(
+            self.overload_on_target(free_blocks=1237).action, "START_SHADOW"
+        )
+        result = self.overload_on_target(free_blocks=1236)
+        self.assertIn(
+            "target KV reserve too small", result.candidates[0]["rejections"]
+        )
+        result = self.overload_on_target(
+            free_blocks=1237, unallocated_prompt_blocks=1
+        )
+        self.assertIn(
+            "target KV reserve too small", result.candidates[0]["rejections"]
+        )
+
+    def test_overload_does_not_fill_running_slots_with_a_queue(self):
+        target = reading("tp4", now=13)
+        workload = dict(target.workload or {}, requests=17)
+        result = self.overload_on_target(
+            free_blocks=9000, waiting=2, workload=workload
+        )
+        self.assertIn(
+            "target running slots full with a queue",
+            result.candidates[0]["rejections"],
+        )
+
+    def test_a_source_out_of_kv_only_needs_physical_room(self):
+        policy = p.PressurePolicy(
+            cfg(
+                routing_relief=True,
+                kv_routing_priority=True,
+                kv_short_exempt_blocks=64,
+                overload_migrates=True,
+                migration_current_length=True,
+            ),
+            p.ReservationLedger(),
+        )
+        result = policy.decide(
+            10,
+            source(10, free_blocks=50),
+            reading("tp4", now=10, free_blocks=100),
+            [candidate(sampled_at=10, published_at=10)],
+        )
+        self.assertNotIn(
+            "target KV reserve too small",
+            result.candidates[0]["rejections"],
+        )
         self.assertEqual(result.candidates[0]["target_required_blocks"], 66)
 
     def test_current_length_off_leaves_the_policy_identity_alone(self):

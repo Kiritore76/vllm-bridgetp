@@ -63,6 +63,11 @@ class PressureConfig:
     # A migration target only has to hold what the request is now: output length
     # is not known, and TP2 has room to spare (user 11-04).
     migration_current_length: bool = False
+    # Known-state room on the target: about a tenth of a TP2's 11712 blocks left
+    # after the move, and no move into full running slots with a queue. Initial
+    # values, not tuned (mixed L1A, long_output GPU 11-04).
+    migration_target_reserve_blocks: int = 1171
+    migration_target_running_max: int = 15
     health_service: bool = False
     # Route from passive health/KV evidence, without fixed prompt cutoffs.
     pressure_routing: bool = False
@@ -152,6 +157,8 @@ class PressureConfig:
             values.pop("overload_sustain_s")
         if not self.migration_current_length:
             values.pop("migration_current_length")
+            values.pop("migration_target_reserve_blocks")
+            values.pop("migration_target_running_max")
         return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
@@ -1033,6 +1040,11 @@ class PressurePolicy:
                 reasons.append("source stop contract was not context feasible")
             if pending_blocks + required_blocks > target.free_blocks:
                 reasons.append("target physical commitments exceed free blocks")
+            elif cfg.migration_current_length and (overload or not emergency):
+                # A source running out of KV only needs the physical check above.
+                refusal = target_refusal(cfg, target, pending_blocks, required_blocks)
+                if refusal:
+                    reasons.append(refusal)
             if (
                 c.owned_blocks is None
                 or c.releasable_blocks is None
@@ -1266,6 +1278,26 @@ class PressurePolicy:
             selected.request_id,
             rows,
         )
+
+
+def target_refusal(cfg, target, pending_blocks, required_blocks):
+    """Why the target should not take this move now, from what it reports now."""
+    native = target.unallocated_prompt_blocks
+    unallocated = native if type(native) is int and native > 0 else 0
+    if (
+        target.free_blocks is None
+        or target.free_blocks - unallocated - pending_blocks - required_blocks
+        < cfg.migration_target_reserve_blocks
+    ):
+        return "target KV reserve too small"
+    requests = (target.workload or {}).get("requests")
+    if (
+        target.waiting
+        and type(requests) is int
+        and requests - target.waiting >= cfg.migration_target_running_max
+    ):
+        return "target running slots full with a queue"
+    return None
 
 
 @dataclass(frozen=True)

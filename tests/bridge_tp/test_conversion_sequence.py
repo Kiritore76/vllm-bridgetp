@@ -53,6 +53,8 @@ class DecidedDriverTests(unittest.TestCase):
             run_dir=root,
             layout_tilt=["A1"],
             service_gate_passed=False,
+            status=lambda: None,
+            fresh=lambda status: False,
             ops=NS(event=lambda kind, **v: self.events.append(dict(kind=kind, **v))),
             step_acknowledged=lambda: True,
             write_layout=lambda *a, **k: self.writes.append(k),
@@ -83,7 +85,7 @@ class DecidedDriverTests(unittest.TestCase):
         with patch.object(seq.pc.conversion, "ConversionExecutor", Executor):
             for bundle, mode in edges:
                 driver.start_proposal(
-                    dict(bundle=bundle, target_mode=mode, held_s=75.0)
+                    dict(bundle=bundle, target_mode=mode, held_s=75.0, layout="L1A")
                 )
 
     def test_it_runs_plans_in_turn_and_frees_the_controller_between_them(self):
@@ -98,6 +100,67 @@ class DecidedDriverTests(unittest.TestCase):
         self.assertEqual(len(driver.history), 2)
         self.assertEqual(self.writes[-1]["pending"], False)
         self.assertEqual(driver.sequence_state, "RUNNING")
+
+    def ticking(self, state, remaining=None, short=8.0):
+        driver, backend = self.run_driver(["COMPLETED"])
+        cancels = []
+        driver.executor = NS(
+            plan=dict(state=state), plan_cancel=lambda: cancels.append(True)
+        )
+        driver.step_edge = ("L1A", ("A", "TP2"))
+        backend.status = lambda: dict()
+        backend.fresh = lambda status: True
+        backend.remaining_s = lambda: remaining
+        backend.safety = dict(continue_if_remaining_s=60.0)
+        backend.registry = NS(instances={})
+        driver.decider.signals = lambda *a: dict(short_rate=short, long_blocks=0)
+        driver.decider.rules = dict(driver.decider.rules, cancel_hold_s=0.0)
+        return driver, cancels
+
+    def test_it_cancels_while_waiting_when_the_load_no_longer_fits(self):
+        driver, cancels = self.ticking("CREATED")
+        driver.plan_tick()
+        self.assertEqual(cancels, [True])
+        self.assertEqual(self.events[-1]["kind"], "DECIDER_CANCEL")
+
+    def test_it_cancels_a_drain_with_long_left(self):
+        driver, cancels = self.ticking("DRAINING", remaining=120.0)
+        driver.plan_tick()
+        self.assertEqual(cancels, [True])
+
+    def test_it_finishes_a_drain_nearly_done(self):
+        driver, cancels = self.ticking("DRAINING", remaining=30.0)
+        driver.plan_tick()
+        self.assertEqual(cancels, [])
+
+    def test_it_does_not_cancel_after_the_drain(self):
+        driver, cancels = self.ticking("FENCED")
+        driver.plan_tick()
+        self.assertEqual(cancels, [])
+
+    def test_it_keeps_going_while_the_load_still_fits(self):
+        driver, cancels = self.ticking("CREATED", short=1.0)
+        driver.plan_tick()
+        self.assertEqual(cancels, [])
+
+    def test_a_cancelled_conversion_has_no_cooldown(self):
+        driver, _ = self.run_driver(["ABORTED"])
+        self.propose(driver, ("A", "TP2"))
+        self.assertIsNone(driver.decider.converted_at)
+
+    def test_each_edge_gets_its_gate(self):
+        driver, backend = self.run_driver(["COMPLETED"] * 3)
+        modes = []
+        original = driver.after_begin
+
+        def spy(step):
+            original(step)
+            modes.append(backend.gate_mode)
+
+        driver.after_begin = spy
+        self.propose(driver, ("A", "TP2"), ("A", "TP1"), ("B", "TP1"))
+        self.assertEqual(modes, ["NONE", "PHYSICAL", "STRICT"])
+        self.assertFalse(backend.assist_requires_spare)
 
     def test_the_prepare_stage_keeps_its_options_after_a_plan(self):
         driver, _ = self.run_driver(["COMPLETED"], pre_tilt=True)
@@ -362,6 +425,12 @@ class LiveCycleTests(unittest.TestCase):
                     if bundle
                     else None,
                 )
+
+            def signals(self, *args):
+                return dict(short_rate=0.0, long_blocks=0)
+
+            def cancel_reason(self, *args):
+                return None
 
             def converted(self, now):
                 self.converted_times += 1
