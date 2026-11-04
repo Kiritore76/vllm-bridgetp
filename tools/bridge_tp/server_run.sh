@@ -13,7 +13,16 @@ cd "$repo" || exit 1
 source "$venv/bin/activate" || exit 1
 [ -z "$(git status --porcelain)" ] || { echo '代码有未提交改动，停止并保留。'; exit 1; }
 [ "$(git branch --show-current)" = "$branch" ] || { echo '分支不匹配。'; exit 1; }
-git fetch origin "refs/heads/$branch:refs/remotes/origin/$branch" || exit 1
+# GitHub认证偶尔被拒（11-04实测约一半），重试；始终拿不到远端就停止。
+fetched=0
+for attempt in $(seq 1 20); do
+    if git fetch origin "refs/heads/$branch:refs/remotes/origin/$branch"; then
+        fetched=1
+        break
+    fi
+    sleep 3
+done
+[ "$fetched" = 1 ] || { echo '20次都拿不到远端，停止。'; exit 1; }
 revision=$(git rev-parse HEAD)
 [ "$revision" = "$(git rev-parse "origin/$branch")" ] || {
     echo '先执行 git pull --ff-only 再运行。'; exit 1;
