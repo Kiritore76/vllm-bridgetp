@@ -92,6 +92,36 @@ def edge(record):
     return proposal["bundle"], proposal["target_mode"]
 
 
+class ManyConversionsRequestTests(unittest.TestCase):
+    def request(self, **changes):
+        return dict(
+            decider="EXECUTE",
+            deadline_s=600,
+            base_port=8400,
+            multi=True,
+            max_conversions=4,
+            rules=dict(current_length=True),
+            prestart=True,
+            pre_tilt=True,
+            assist=True,
+            **changes,
+        )
+
+    def test_the_launcher_accepts_it(self):
+        from tools.bridge_tp import launch_pressure_balanced_pilot as launch
+
+        value = launch.decider_request(self.request())
+        self.assertTrue(value["multi"])
+        self.assertEqual(value["edges"], d.EDGES)
+
+    def test_record_only_cannot_convert_many_times(self):
+        from tools.bridge_tp import launch_pressure_balanced_pilot as launch
+
+        request = dict(self.request(), decider="RECORD_ONLY")
+        with self.assertRaises(ValueError):
+            launch.decider_request(request)
+
+
 class CurrentLengthTests(unittest.TestCase):
     def decider(self):
         return d.ConversionDecider(d.EDGES, dict(current_length=True))

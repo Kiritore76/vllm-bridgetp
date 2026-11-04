@@ -402,8 +402,8 @@
     "tools/bridge_tp/conversion_acceptance.py": "1a22369c18c78c3645c3d1b6e57fa3831477c1f7d4e2b91ada4097e2a5abe9b3",
     "tools/bridge_tp/conversion_planner.py": "33d7c53d0c02b68db9f28e5b7b7ed2c1c1d353b8fa62358ccd1f908b4aaa244c",
     "experiments/platforms/qwen3_pressure_observation/conversion_profile.json": "503c4cf2f82a627c4f7420dc48a5d6fbd6ef3966cb7726f4b3948130f54f0cb8",
-    "tools/bridge_tp/conversion_sequence.py": "1db357cce5a18d885bc747d8bbb9efdcdd67a3268dfb4b243c197b1f16a44755",
-    "tests/bridge_tp/test_conversion_sequence.py": "1e3ed46c26c975b19df05018dcbd99ebb8343f648592ed1302d1e5aeabf05acb",
+    "tools/bridge_tp/conversion_sequence.py": "788a1c2e83d42a2fd32726920764aa5a4ca420065d2296536ab7782a248651c1",
+    "tests/bridge_tp/test_conversion_sequence.py": "6278a9eddee4cf003cb69f569303cfb7ecbf0ccf26f1b3cdfc5cb816d752e0ca",
     "vllm/bridge_tp/controller/pressure_hold.py": "64f7e974d429d91cf8475f2b0788c957d5246bfc08e8af544c43b099914651eb"
   },
   "server_settings": {

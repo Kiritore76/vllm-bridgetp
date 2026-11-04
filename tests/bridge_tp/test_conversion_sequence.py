@@ -99,6 +99,11 @@ class DecidedDriverTests(unittest.TestCase):
         self.assertEqual(self.writes[-1]["pending"], False)
         self.assertEqual(driver.sequence_state, "RUNNING")
 
+    def test_the_prepare_stage_keeps_its_options_after_a_plan(self):
+        driver, _ = self.run_driver(["COMPLETED"], pre_tilt=True)
+        self.propose(driver, ("A", "TP2"))
+        self.assertTrue(driver.request["pre_tilt"])
+
     def test_only_a_merge_towards_l2_is_assisted(self):
         driver, _ = self.run_driver(["COMPLETED"] * 3)
         self.propose(driver, ("A", "TP2"), ("A", "TP1"), ("B", "TP2"))

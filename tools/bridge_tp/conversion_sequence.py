@@ -537,6 +537,8 @@ class DecidedSequenceDriver(ConversionSequenceDriver):
         )
         self.tilt_before_step = list(self.backend.layout_tilt)
         after = self.run_step(f"decided-{self.number:04d}-{bundle}", step)
+        # The prepare stage reads its options (pre_tilt) from the request.
+        self.request = self.sequence_request
         self.decider.converted(time.time())
         self.prepared_key = None
         if after is None:
