@@ -110,6 +110,35 @@ class CurrentLengthTests(unittest.TestCase):
             self.signals(d.ConversionDecider(d.EDGES), value)["long_blocks"], 0
         )
 
+    def test_it_counts_what_a_growing_request_occupies_before_it_turns_long(self):
+        value = status()
+        value["instances"]["B-g2-tp2"]["requests"] = [
+            dict(
+                request_id="a",
+                prompt_tokens=512,
+                max_output_tokens=8192,
+                generated=1088,
+            )
+        ]
+        s = self.signals(self.decider(), value)
+        self.assertEqual(s["long_blocks"], 100)
+        # Not a long request yet: not new, and its bundle is not held for it.
+        self.assertEqual(s["long_arrivals"], 0)
+        self.assertEqual(s["bundle_long_blocks"]["B"], 0)
+
+    def test_short_traffic_does_not_count_as_demand(self):
+        value = status()
+        value["instances"]["B-g2-tp2"]["requests"] = [
+            dict(
+                request_id=str(n),
+                prompt_tokens=512,
+                max_output_tokens=128,
+                generated=128,
+            )
+            for n in range(15)
+        ]
+        self.assertEqual(self.signals(self.decider(), value)["long_blocks"], 0)
+
     def test_it_counts_the_current_length_once_a_request_turns_long(self):
         value = status()
         value["instances"]["B-g2-tp2"]["requests"] = [

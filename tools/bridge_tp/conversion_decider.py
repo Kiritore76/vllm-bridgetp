@@ -16,10 +16,12 @@ one neighbouring layout at a time (L0 and L2 are two steps apart):
 Thresholds are initial values from one run per cell (static layouts, 11-03)
 with a gap between opposite directions. Long-request blocks use the output cap,
 not the unknown final length, so a shorter output makes them an overestimate.
-With ``current_length`` they use what is known instead (user 11-04): a request is
-long once prompt + generated reaches ``LONG_TOKENS``, it counts at that length,
-and long prompts held in the controller count too. The block thresholds came from
-final lengths, so this signal reaches them later; they have not been retuned.
+With ``current_length`` the demand is what requests occupy now instead (user
+11-04): prompt + generated of every request past short-request size, plus long
+prompts held in the controller. Short traffic is left out because its occupancy
+follows its rate, which has its own threshold. A bundle still counts as serving a
+long request only from ``LONG_TOKENS``. The block thresholds came from final
+lengths, so this signal reaches them later; they have not been retuned.
 
 A split never drains a long request: it has nowhere to migrate (no TP2 -> TP1),
 so a split waits, without limit, until its bundle has none (user 11-03). L0 ->
@@ -49,6 +51,9 @@ WINDOW_S = 60.0
 # A request is long when prompt + output cap reaches this.
 LONG_TOKENS = 8192
 BLOCK_TOKENS = 16
+# Past this a request occupies more than a short one ever does (512 + 128 tokens
+# is 40 blocks; the routing's short exemption is the same 64).
+SHORT_BLOCKS = 64
 # A deep long request (16384 + 8192 tokens) ends at 1536 blocks.
 DEEP_BLOCKS = 1536
 # A at TP1 and B at TP2 in L1A: B stays the migration target towards L2.
@@ -172,6 +177,13 @@ class ConversionDecider:
 
         total_blocks = long_blocks(instances)
         if r["current_length"]:
+            occupied = {}
+            for i in instances:
+                for q in instances[i].get("requests", ()):
+                    blocks = -(-(q["prompt_tokens"] + q["generated"]) // BLOCK_TOKENS)
+                    if blocks > SHORT_BLOCKS:
+                        occupied[q["request_id"]] = blocks
+            total_blocks = sum(occupied.values())
             # Long arrivals are not known from output caps; a request counts as
             # new when it first turns long, and a held long prompt is new too.
             held = workload.get("held_long_prompt_tokens", ())
