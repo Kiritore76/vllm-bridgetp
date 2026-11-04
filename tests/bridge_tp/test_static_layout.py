@@ -195,6 +195,36 @@ class StaticLayoutTests(unittest.TestCase):
             )
             self.assertEqual((code, value["runs"], value["arms"]), (0, 1, ["stay"]))
 
+    def test_the_long_p2_load(self):
+        from tools.bridge_tp import qwen3_phase_shift as phase
+
+        inputs = json.loads(Path(INPUTS).read_text(encoding="utf-8"))
+        jobs = phase.jobs(inputs, "mixed_long_p2")
+        long = [j for j in jobs if j["workload_role"] == "long_input_output"]
+
+        def count(name):
+            return sum(j["workload_phase"] == name for j in long)
+
+        self.assertEqual(
+            (count("p1_short"), count("p2_long"), count("p3_mixed")), (3, 45, 12)
+        )
+        self.assertEqual(max(j["at_s"] for j in jobs), 1919.0)
+        for layout, extra in (
+            ("L1A", ("--kv-short-exempt", "--overload-migrate")),
+            ("L2", ()),
+        ):
+            code, value = plan(
+                "--phase-shift",
+                "--phase-scenario",
+                "mixed_long_p2",
+                "--static-layout",
+                layout,
+                "--hold-queue",
+                "--expanded-context",
+                *extra,
+            )
+            self.assertEqual((code, value["runs"]), (0, 1))
+
     def test_mixed_p1_10_only_lowers_the_first_phase(self):
         from tools.bridge_tp import qwen3_phase_shift as phase
 

@@ -200,6 +200,23 @@ SCENARIOS["mixed_p1_10"] = dict(
         for start, end, short, long_rate, phase in SCENARIOS["mixed"]["phases"]
     ),
 )
+# Where converting starts to pay (user 11-04): long-request demand above L1A's room
+# for 900s instead of 420s. P1 and p3 only need to outlast their transients; p3
+# keeps its two bursts at the same offsets.
+SCENARIOS["mixed_long_p2"] = dict(
+    phases=(
+        (0, 60, 4.0, 0.0, "warm"),
+        (60, 360, 10.0, 0.01, "p1_short"),
+        (360, 1260, 1.0, 0.05, "p2_long"),
+        (1260, 1530, 8.0, 0.0, "p3_mixed"),
+        (1530, 1542, 8.0, 0.5, "p3_mixed"),
+        (1542, 1830, 8.0, 0.0, "p3_mixed"),
+        (1830, 1842, 8.0, 0.5, "p3_mixed"),
+        (1842, 1860, 8.0, 0.0, "p3_mixed"),
+        (1860, 1920, 1.0, 0.0, "tail"),
+    ),
+    long=(16384, 8192),
+)
 # A short prompt that only grows long: nothing about it is visible on arrival, so
 # TP1 fills during output and only migration can help (user 11-04).
 SCENARIOS["long_output"] = dict(
