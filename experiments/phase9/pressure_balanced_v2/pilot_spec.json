@@ -271,7 +271,7 @@
     "experiments/phase9/pressure_balanced_v2/health_sustained.json": "a684253451ceb1d33331afd852beeea4dbc9f725c4fa70d53cc19b28bac1eb5f",
     "tools/bridge_tp/pressure_sessions.py": "cba8942b7db24a4e2c956a4a184a88beaf6d606028125da261197b7033441199",
     "tests/bridge_tp/test_pressure_sessions.py": "12c72a068821f6e7691cd517bb3184d864414e7f64d9561e900cf41626428705",
-    "experiments/phase9/pressure_balanced_v2/EVALUATION_STANDARD_CN.md": "fedf01ecfabb244f2c198cf0c4763a63741061c2323ee3888f2c0c837ee3cad8",
+    "experiments/phase9/pressure_balanced_v2/EVALUATION_STANDARD_CN.md": "8c84f3858edf1279ad4351606fa9607e8eaa48c93c8e554cb566a35596a78a26",
     "experiments/phase9/pressure_balanced_v2/PARAMETER_STATUS_CN.md": "8283c9dd80b5545295dfa91a2cd7660a91c18a761f470d34e9ade0dd5328f0ce",
     "vllm/bridge_tp/controller/pressure_cancel.py": "4e49b50be7d8ff57feec753fc8942cd158ebdb1d2b7f4b713ddcbd5b5abc5e19",
     "tests/bridge_tp/test_pressure_cancel.py": "3ad41184d93c215db6a1e887fbb32aaba9b33c4c70e53914418bd6812afbeb71",
