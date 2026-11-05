@@ -1069,11 +1069,17 @@ def _run(args, prepared):
         # Conversion decision signals (record-only decider): arrivals and
         # migration starts of the last window.
         window = decision.WINDOW_S
+        streams = tracker.recent(now, window)
         recent = [
-            len(v.payload["prompt"]) + int(v.payload["max_tokens"])
-            for v in tracker.recent(now, window)
+            len(v.payload["prompt"]) + int(v.payload["max_tokens"]) for v in streams
         ]
         long_requests = [n for n in recent if n >= decision.LONG_TOKENS]
+        short_window = decision.SHORT_WINDOW_S
+        in_short_window = [
+            n
+            for v, n in zip(streams, recent, strict=True)
+            if now - v.dispatched_at <= short_window
+        ]
         starts = layout_state["migration_starts"]
         while starts and now - starts[0][0] > window:
             starts.pop(0)
@@ -1085,6 +1091,13 @@ def _run(args, prepared):
             else hold.arrivals_since(time.monotonic() - window),
             long_arrivals=len(long_requests),
             long_final_tokens=sum(long_requests),
+            short_window_s=short_window,
+            short_window_arrivals=len(in_short_window)
+            if hold is None
+            else hold.arrivals_since(time.monotonic() - short_window),
+            short_window_long=sum(
+                n >= decision.LONG_TOKENS for n in in_short_window
+            ),
             migration_starts=[[round(now - t, 3), source] for t, source in starts],
             tilt=sorted(layout_state["tilt"]),
             tilted_long_requests=layout_state["tilted"],

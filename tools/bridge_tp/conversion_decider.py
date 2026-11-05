@@ -55,6 +55,9 @@ once a plan's start gate is waiting.
 from __future__ import annotations
 
 WINDOW_S = 60.0
+# The short rate alone reads a shorter window. At 60s a short rate back at 8/s
+# still read 5.6/s, and a 120s long blip converted to L2 (rotation GPU 11-05).
+SHORT_WINDOW_S = 30.0
 # A request is long when prompt + output cap reaches this.
 LONG_TOKENS = 8192
 BLOCK_TOKENS = 16
@@ -168,6 +171,14 @@ class ConversionDecider:
         arrivals = workload.get("arrivals", 0)
         long_arrivals = workload.get("long_arrivals", 0)
         short_rate = (arrivals - long_arrivals) / workload.get("window_s", WINDOW_S)
+        if "short_window_s" in workload:
+            short_rate = (
+                max(
+                    0,
+                    workload["short_window_arrivals"] - workload["short_window_long"],
+                )
+                / workload["short_window_s"]
+            )
         window = workload.get("window_s", WINDOW_S)
         instances = {
             i: v for i, v in status["instances"].items() if v["lifecycle"] == "ACTIVE"

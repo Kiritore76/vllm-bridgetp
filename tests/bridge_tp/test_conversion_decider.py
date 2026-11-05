@@ -145,6 +145,42 @@ class TrendTests(unittest.TestCase):
             )
         return records
 
+    def test_the_short_rate_reads_its_shorter_window(self):
+        decider = d.ConversionDecider(d.EDGES, self.RULES, execute=True)
+        value = status(short=4)
+        value["workload"].update(
+            short_window_s=d.SHORT_WINDOW_S,
+            short_window_arrivals=240,
+            short_window_long=0,
+        )
+        signals = decider.signals(value, BUNDLES, MEMBERS, 1000.0)
+        self.assertEqual(signals["short_rate"], 8.0)
+
+    def test_a_long_blip_ending_into_short_load_does_not_reach_l2(self):
+        # Rotation GPU 11-05: enough long blocks, short 4/s and then 8/s.
+        decider = d.ConversionDecider(d.EDGES, self.RULES, execute=True)
+        records = []
+        for second in range(200):
+            value = status(short=4, deep={"B-g2-tp2": 7}, long_arrivals=1)
+            value["workload"].update(
+                short_window_s=d.SHORT_WINDOW_S,
+                short_window_arrivals=240 if second >= 20 else 120,
+                short_window_long=0,
+            )
+            records.append(
+                decider.observe(value, BUNDLES, MEMBERS, 1000.0 + second)
+            )
+        self.assertFalse(any(r["proposal"] for r in records))
+        self.assertIn(
+            "short rate too high for L2",
+            records[-1]["candidates"]["A->TP2"]["failed"],
+        )
+
+    def test_without_the_short_window_the_old_rate_still_applies(self):
+        decider = d.ConversionDecider(d.EDGES, self.RULES, execute=True)
+        signals = decider.signals(status(short=4), BUNDLES, MEMBERS, 1000.0)
+        self.assertEqual(signals["short_rate"], 4.0)
+
     def test_sustained_arrivals_propose_before_the_threshold_is_reached(self):
         decider = d.ConversionDecider(d.EDGES, self.RULES, execute=True)
         records = self.grow(decider, 200, 20)
