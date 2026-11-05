@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 当前任务：同TP迁移冒烟第一场，TP1→TP1（GPU2→GPU3），无背景负载，手动触发。
-# 通过后才下发TP2→TP2。只验证机制，不是负载收益。
+# 当前任务：同TP迁移冒烟第二场，TP2→TP2（GPU2,3→GPU0,1），无背景负载，手动触发。
+# 只验证机制，不是负载收益。TP1→TP1的结果回收前不能当作前提已满足。
 set -uo pipefail
-same_tp=1
+same_tp=2
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
 py=$venv/bin/python
