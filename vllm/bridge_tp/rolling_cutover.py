@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .controller.tp_geometry import session_target_tp
+from .controller.tp_geometry import session_source_tp, session_target_tp
 
 MECHANISM = "ROLLING_NO_HISTORY_WAIT_V1"
 
@@ -52,9 +52,26 @@ def resident_progress(run_dir: Path, migration_id: str) -> tuple[bool, int | Non
 
 
 def applied_progress(run_dir: Path, migration_id: str, initial_end: int) -> int | None:
-    """Read contiguous all-rank ACK receipts from the original sender path."""
+    """Tokens applied on every target rank, from the senders' ACK receipts.
+
+    One sender covers all ranks. On the same TP each rank has its own sender,
+    whose batches need not line up, so the whole KV is at the slowest rank.
+    """
+    root = run_dir / "gpu_direct_delta_sender_receipts"
+    source_tp = session_source_tp(run_dir)
+    if source_tp == 1:
+        return _applied_end(root, migration_id, initial_end)
+    ends = [
+        _applied_end(root / f"rank_{rank}", migration_id, initial_end)
+        for rank in range(source_tp)
+    ]
+    return None if None in ends else min(ends)
+
+
+def _applied_end(directory: Path, migration_id: str, initial_end: int) -> int | None:
+    """End of the contiguous receipts of one sender after ``initial_end``."""
     receipts = []
-    for path in (run_dir / "gpu_direct_delta_sender_receipts").glob("*.json"):
+    for path in directory.glob("*.json"):
         value = read_json(path)
         start, end = value.get("start_token"), value.get("end_token")
         if value.get("migration_id") != migration_id:
@@ -336,7 +353,7 @@ def rolling_evidence_errors(
         first_s = first["published_unix_s"]
         first_acks = [
             read_json(path)
-            for path in (run_dir / "gpu_direct_delta_sender_receipts").glob("*.json")
+            for path in (run_dir / "gpu_direct_delta_sender_receipts").rglob("*.json")
         ]
         ack_deadline = (
             first_s

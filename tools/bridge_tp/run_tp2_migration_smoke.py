@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Explicit TP1-to-TP2 execution smoke using the existing rolling mechanism.
+"""Explicit migration execution smoke using the existing rolling mechanism.
+
+TP1 to TP2 by default; ``--same-tp`` migrates between two TP1s or two TP2s and
+compares the unified output with the same request served without migration.
 
 This bypasses policy trigger selection ONLY. It does not bypass target native
 allocation, exact rank readiness, commit, ownership or source-release gates.
@@ -50,6 +53,23 @@ def migration_request(inputs, max_tokens, request_id):
     )
 
 
+# (source GPUs, target GPUs) by same-TP degree; None is the TP1-to-TP2 default.
+SAME_TP_GPUS = {None: ("2", "0,1"), 1: ("2", "3"), 2: ("2,3", "0,1")}
+
+
+def compare_tokens(unified, reference):
+    """Where a migrated output first differs from the unmigrated one, if at all."""
+    first = next(
+        (i for i, (a, b) in enumerate(zip(unified, reference)) if a != b), None
+    )
+    return dict(
+        identical=first is None and len(unified) == len(reference),
+        unified_tokens=len(unified),
+        reference_tokens=len(reference),
+        first_difference=first,
+    )
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", type=Path, required=True)
@@ -66,7 +86,10 @@ def main(argv=None):
     parser.add_argument("--target-background", type=int, choices=(0, 2, 4), default=0)
     parser.add_argument("--diagnostic-probe", action="store_true")
     parser.add_argument("--channel-ablation", action="store_true")
+    parser.add_argument("--same-tp", type=int, choices=(1, 2))
     args = parser.parse_args(argv)
+    if args.same_tp and args.platform != "qwen3":
+        raise ValueError("same-TP smoke runs on Qwen3")
     if args.channel_ablation and (
         not args.diagnostic_probe or args.target_background != 4
     ):
@@ -86,9 +109,10 @@ def main(argv=None):
         print(
             json.dumps(
                 dict(
-                    target_tp=2,
-                    source_gpu="2",
-                    target_gpus="0,1",
+                    target_tp=args.same_tp or 2,
+                    source_tp=args.same_tp or 1,
+                    source_gpu=SAME_TP_GPUS[args.same_tp][0],
+                    target_gpus=SAME_TP_GPUS[args.same_tp][1],
                     trigger="explicit mechanism smoke",
                     history_tokens=args.history_tokens,
                     rate=0,
@@ -130,6 +154,14 @@ def main(argv=None):
             raise ValueError("frozen model config differs")
         if pilot.sha(spec["checkpoint"]) != spec["checkpoint_sha256"]:
             raise ValueError("frozen predictor differs")
+    if args.same_tp:
+        source_gpus, target_gpus = SAME_TP_GPUS[args.same_tp]
+        spec["server_settings"].update(
+            source_tp_size=args.same_tp,
+            target_tp_size=args.same_tp,
+            tp1_gpu=source_gpus,
+            tp4_gpus=target_gpus,
+        )
     common, settings = pilot.arguments(spec)
     args.out_root.mkdir(parents=True, exist_ok=False)
     freeze(args.out_root / "source_identity")
@@ -462,6 +494,22 @@ def main(argv=None):
             common.write_json(directory / f"background-{index}-result.json", response)
         wait_empty(directory, after_generations=[r["generation"] for r in native])
         full_speed = pilot.verify_full_speed(directory)
+        reference_match = None
+        if args.same_tp:
+            # Strict greedy: migration must not change a single token.
+            reference = io.post_streaming_completion(
+                config.target_url,
+                migration_request(inputs, 6144, "reference"),
+                args.timeout_s,
+                lambda *values: None,
+                directory / "reference_failure.json",
+                retain_chunks=False,
+            )
+            unified = [row["token_id"] for row in emissions]
+            reference_match = compare_tokens(unified, reference["token_ids"])
+            common.write_json(directory / "reference_tokens.json", reference_match)
+            if not reference_match["identical"]:
+                raise RuntimeError(f"migration changed output: {reference_match}")
         if args.diagnostic_probe:
             control_batch(
                 io,
@@ -490,7 +538,9 @@ def main(argv=None):
             status="COMPLETED",
             mechanism_only=True,
             natural_policy_trigger=False,
-            target_tp=2,
+            target_tp=args.same_tp or 2,
+            source_tp=args.same_tp or 1,
+            reference_tokens=reference_match,
             target_background_requests=args.target_background,
             predictor_loaded=bool(args.predictor_checkpoint) or args.platform == "a100",
             source_finish=source["finish_reason"],

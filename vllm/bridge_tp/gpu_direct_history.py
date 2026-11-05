@@ -780,11 +780,22 @@ class GpuDirectHistoryReceiver:
 
 
 class GpuDirectHistorySender:
-    """Reshard TP1 KV on GPU and send each shard to its TP4 rank."""
+    """Send KV over one communicator per connected target rank.
 
-    def __init__(self, *, device: torch.device, host: str, port: int) -> None:
+    A TP1 source connects to every target rank and splits its KV. A rank of a
+    same-TP source connects only to its own target rank (``rank_base``) and
+    splits nothing. Internally connections count from 0; the rank on the wire
+    is the target's.
+    """
+
+    rank_base = 0
+
+    def __init__(
+        self, *, device: torch.device, host: str, port: int, rank_base: int = 0
+    ) -> None:
         del host, port
         self.device = _cuda_device(device)
+        self.rank_base = rank_base
         self.nccl: NCCLLibrary | None = None
         self.connections: list[socket.socket] = []
         self.comms: list[Any] = []
@@ -823,7 +834,7 @@ class GpuDirectHistorySender:
         with torch.cuda.device(self.device):
             payloads = [
                 torch.full(
-                    (_WARMUP_ELEMENTS,), rank + 1,
+                    (_WARMUP_ELEMENTS,), self.rank_base + rank + 1,
                     dtype=torch.float16, device=self.device,
                 )
                 for rank in range(self.target_tp_size)
@@ -841,19 +852,21 @@ class GpuDirectHistorySender:
                 {
                     "op": "WARMUP",
                     "channel_generation": self.channel_generation,
-                    "target_tp_rank": rank,
+                    "target_tp_rank": self.rank_base + rank,
                     "numel": _WARMUP_ELEMENTS,
                     "dtype": "float16",
                 },
             )
         for rank, connection in enumerate(self.connections):
             ready = recv_json(connection)
-            if ready != {"status": "WARMUP_READY", "target_tp_rank": rank}:
+            wire_rank = self.rank_base + rank
+            if ready != {"status": "WARMUP_READY", "target_tp_rank": wire_rank}:
                 raise ProtocolViolation(f"GPU-direct rank {rank} warmup not ready")
         _send_group(self.nccl, self.comms, payloads, streams)
         for rank, connection in enumerate(self.connections):
             complete = recv_json(connection)
-            if complete != {"status": "WARMUP_COMPLETE", "target_tp_rank": rank}:
+            wire_rank = self.rank_base + rank
+            if complete != {"status": "WARMUP_COMPLETE", "target_tp_rank": wire_rank}:
                 raise ProtocolViolation(f"GPU-direct rank {rank} warmup failed")
         self.streams = streams
         self.warmup_completed_unix_s = time.time()
@@ -883,7 +896,7 @@ class GpuDirectHistorySender:
                     connection,
                     {
                         "migration_id": "",
-                        "target_tp_rank": rank,
+                        "target_tp_rank": self.rank_base + rank,
                         "nccl_unique_id_b64": base64.b64encode(
                             bytes(unique_id.internal)
                         ).decode("ascii"),
@@ -900,7 +913,7 @@ class GpuDirectHistorySender:
                     ready.get("status") != "CHANNEL_READY"
                     or int(ready.get("channel_generation", -1))
                     != channel_generation
-                    or int(ready.get("target_tp_rank", -1)) != rank
+                    or int(ready.get("target_tp_rank", -1)) != self.rank_base + rank
                 ):
                     raise ProtocolViolation(
                         f"GPU-direct rank {rank} preconnect identity differs"
@@ -947,7 +960,7 @@ class GpuDirectHistorySender:
             payload_type=payload_type,
             token_start=token_start,
             token_end=token_end,
-            rank=rank,
+            rank=self.rank_base + rank,
         )
 
     def send(
@@ -1017,7 +1030,7 @@ class GpuDirectHistorySender:
                         connection,
                         {
                             "migration_id": migration_id,
-                            "target_tp_rank": rank,
+                            "target_tp_rank": self.rank_base + rank,
                             "nccl_unique_id_b64": base64.b64encode(
                                 bytes(unique_id.internal)
                             ).decode("ascii"),
@@ -1038,7 +1051,8 @@ class GpuDirectHistorySender:
                         )
                     if persistent_channel and (
                         int(ready.get("channel_generation", -1)) != channel_generation
-                        or int(ready.get("target_tp_rank", -1)) != rank
+                        or int(ready.get("target_tp_rank", -1))
+                        != self.rank_base + rank
                     ):
                         raise ProtocolViolation(
                             f"GPU-direct rank {rank} channel identity differs"
@@ -1378,7 +1392,7 @@ class GpuDirectHistorySender:
             ] * target_tp_size
             result = [
                 {
-                    "target_tp_rank": rank,
+                    "target_tp_rank": self.rank_base + rank,
                     "raw_tensor_bytes": count,
                     "transfer_ms": elapsed_ms,
                     "channel_reused": reuse_channel,
@@ -1574,9 +1588,9 @@ class GpuDirectHistorySender:
                 {
                     "op": "DELTA",
                     "migration_id": migration_id,
-                    "target_tp_rank": rank,
+                    "target_tp_rank": self.rank_base + rank,
                     "tensor_id": (
-                        f"{migration_id}#delta#rank{rank}#"
+                        f"{migration_id}#delta#rank{self.rank_base + rank}#"
                         f"{start_token}:{end_token}"
                     ),
                     "start_token": start_token,

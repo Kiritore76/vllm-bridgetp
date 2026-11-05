@@ -16,24 +16,52 @@ from pathlib import Path
 
 from tools.bridge_tp.pressure_cpu import load
 
+# Several source ranks start at one exact token, named in advance. The ranks
+# must see the control block before it; 32 tokens is about a second of decoding.
+SAME_TP_TRIGGER_LEAD_TOKENS = 32
 
-def channel_idle(run_dir, migration_id, request_id):
-    """Five matching IDLE receipts, never a socket-close inference."""
+
+def read_failure(run_dir):
+    """A source rank's refusal or failure (vllm.bridge_tp.source_ranks)."""
     import json
 
-    paths = [run_dir / "gpu_direct_sender.json"] + [
+    try:
+        return json.loads((run_dir / "source_rank_failed.json").read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def sender_receipt_paths(run_dir):
+    """One receipt per source rank; rank 0 keeps the historical name."""
+    source_tp = load("tp_geometry").session_source_tp(run_dir)
+    return [run_dir / "gpu_direct_sender.json"] + [
+        run_dir / f"gpu_direct_sender_rank_{rank}.json" for rank in range(1, source_tp)
+    ]
+
+
+def channel_idle(run_dir, migration_id, request_id):
+    """All matching IDLE receipts, never a socket-close inference."""
+    import json
+
+    senders = sender_receipt_paths(run_dir)
+    paths = senders + [
         run_dir / "persistent_channel_receipts" / f"tp_rank_{rank}.json"
         for rank in range(load("tp_geometry").session_target_tp(run_dir))
     ]
     if not all(path.is_file() for path in paths):
         return False
-    sender, *targets = [json.loads(path.read_text()) for path in paths]
+    rows = [json.loads(path.read_text()) for path in paths]
+    sender_rows, targets = rows[: len(senders)], rows[len(senders) :]
+    sender = sender_rows[0]
     return not (
         type(sender.get("channel_session_count")) is not int
         or sender["channel_session_count"] < 1
-        or sender.get("communicator_lifecycle") != "PERSISTENT_CHANNEL_IDLE"
-        or sender.get("migration_id") != migration_id
-        or sender.get("source_request_id") != request_id
+        or any(
+            row.get("communicator_lifecycle") != "PERSISTENT_CHANNEL_IDLE"
+            or row.get("migration_id") != migration_id
+            or row.get("source_request_id") != request_id
+            for row in sender_rows
+        )
         or any(
             row.get("status") != "PERSISTENT_CHANNEL_IDLE"
             or row.get("migration_id") != migration_id
@@ -45,7 +73,7 @@ def channel_idle(run_dir, migration_id, request_id):
             row.get("channel_create_count") != 1
             or row.get("channel_destroy_count") != 0
             or row.get("channel_session_count") != sender.get("channel_session_count")
-            for row in [sender, *targets]
+            for row in [*sender_rows, *targets]
         )
     )
 
@@ -223,7 +251,12 @@ class RollingPressureSession:
         cap = stream.payload["max_tokens"]
         if candidate.max_output_tokens != cap or cap > 8192:
             raise ValueError("selected request stop contract differs from live stream")
-        if candidate.generated + 1 >= cap - 1 or stream.future.done():
+        # Several source ranks start at one exact token, named in advance.
+        source_tp = getattr(self.config, "source_tp_size", 1)
+        trigger = candidate.generated + (
+            SAME_TP_TRIGGER_LEAD_TOKENS if source_tp > 1 else 1
+        )
+        if trigger >= cap - 1 or stream.future.done():
             raise ValueError("source ended or has no safe output budget")
         now = time.time()
         self.stream = stream
@@ -252,12 +285,12 @@ class RollingPressureSession:
         ).write(self.run_dir)
         rate = self._rate_decision(snapshot, before_start=True)
         self.adapter.arm_shadow(
-            candidate.generated + 1,
+            trigger,
             rate.rate_bytes_s / 1024**3,
             cutover_output_tokens=cap - 1,
             note="pressure-balanced-v1 selected request",
         )
-        self.record.trigger_output_tokens = candidate.generated + 1
+        self.record.trigger_output_tokens = trigger
         self.record.trigger_path = TriggerPath.PRESSURE_FEEDBACK
         self.record.t_decision = now
         self.machine.transition(
@@ -297,6 +330,10 @@ class RollingPressureSession:
         if stream.future.done():
             stream.future.result()
             self.cancel("source completed before takeover")
+            return
+        failure = read_failure(self.run_dir)
+        if failure is not None:
+            self.cancel(f"source rank {failure['rank']}: {failure['error']}")
             return
         snapshot = replace(snapshot, state=record.state.value)
         rate = self._rate_decision(snapshot)
@@ -471,10 +508,11 @@ class RollingPressureSession:
         # Cleanup without a manifest cannot establish that a pending START was
         # never consumed; retain the promise and surface the uncertainty.
         binding = self.adapter.refresh_binding()
-        if binding is None:
+        refused = binding is None and read_failure(self.run_dir) is not None
+        if binding is None and not refused:
             binding = self.adapter.wait_for_preparing_binding(timeout_s=30)
         if binding is None:
-            if (
+            if refused or (
                 self.stream.future.done()
                 and self.stream.future.exception() is None
                 and self.target_future is None

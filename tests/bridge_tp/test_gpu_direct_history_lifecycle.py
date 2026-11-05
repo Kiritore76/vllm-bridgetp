@@ -125,6 +125,67 @@ class TestGpuDirectHistoryLifecycle(unittest.TestCase):
         self.assertIsNone(sender.lifecycle.active_session)
         self.assertIsNotNone(sender.warmup_completed_unix_s)
 
+    def test_same_tp_sender_speaks_for_its_own_target_rank(self) -> None:
+        import torch
+
+        from vllm.bridge_tp.gpu_direct_history import GpuDirectHistorySender
+        from vllm.bridge_tp.stream_protocol import (
+            PayloadType,
+            PersistentChannelLifecycle,
+        )
+
+        sender = object.__new__(GpuDirectHistorySender)
+        sender.rank_base = 1
+        sender.device = torch.device("cuda:0")
+        sender.nccl = Mock()
+        sender.connections = [Mock()]
+        sender.comms = [Mock()]
+        sender.target_tp_size = 1
+        sender.channel_generation = 7
+        sender.persistent_channel = True
+        sender.warmup_completed_unix_s = None
+        sender.lifecycle = PersistentChannelLifecycle(
+            topology_key="test", expected_ranks=frozenset({0}), channel_generation=7,
+        )
+        sender.lifecycle.mark_open()
+        payload = Mock()
+        payload.numel.return_value = 256
+        payload.element_size.return_value = 2
+        responses = [
+            {"status": "WARMUP_READY", "target_tp_rank": 1},
+            {"status": "WARMUP_COMPLETE", "target_tp_rank": 1},
+        ]
+        with (
+            patch("vllm.bridge_tp.gpu_direct_history.send_json") as send,
+            patch(
+                "vllm.bridge_tp.gpu_direct_history.recv_json", side_effect=responses
+            ),
+            patch("vllm.bridge_tp.gpu_direct_history._send_group"),
+            patch(
+                "vllm.bridge_tp.gpu_direct_history.torch.full", return_value=payload
+            ) as full,
+            patch("vllm.bridge_tp.gpu_direct_history.torch.cuda.Stream"),
+            patch("vllm.bridge_tp.gpu_direct_history.torch.cuda.current_stream"),
+            patch(
+                "vllm.bridge_tp.gpu_direct_history.torch.cuda.device",
+                return_value=nullcontext(),
+            ),
+        ):
+            sender.warmup_preconnected_channel()
+        self.assertEqual(send.call_args.args[1]["target_tp_rank"], 1)
+        # The receiver of rank 1 expects the value rank + 1.
+        self.assertEqual(full.call_args.args[1], 2)
+        sender._active_migration_id = "m"
+        sender._active_request_id = "r"
+        sender._next_sequence_by_rank = {0: 0}
+        envelope = sender._next_envelope(
+            rank=0,
+            payload_type=PayloadType.START_SESSION,
+            token_start=0,
+            token_end=0,
+        )
+        self.assertEqual(envelope.rank, 1)
+
     def test_preconnected_receiver_verifies_warmup_without_session(self) -> None:
         import torch
 

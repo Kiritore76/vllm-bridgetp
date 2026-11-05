@@ -120,9 +120,9 @@ class ControllerConfig:
         return config
 
     def validate(self) -> None:
-        from .tp_geometry import validate_target_tp
+        from .tp_geometry import validate_session_tp
 
-        validate_target_tp(self.target_tp_size)
+        validate_session_tp(self.target_tp_size)
         if self.tp1_total_kv_blocks <= 0 or self.tp4_total_kv_blocks <= 0:
             raise ValueError(
                 "tp1_total_kv_blocks and tp4_total_kv_blocks must be measured from "

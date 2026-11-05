@@ -324,8 +324,8 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             )
         )
         parallel = vllm_config.parallel_config
-        if parallel.tensor_parallel_size not in (2, 4):
-            raise ValueError("BridgeTP requires tensor_parallel_size=2 or 4")
+        if parallel.tensor_parallel_size not in (1, 2, 4):
+            raise ValueError("BridgeTP requires tensor_parallel_size=1, 2 or 4")
         self._target_tp_size = parallel.tensor_parallel_size
         if parallel.pipeline_parallel_size != 1:
             raise ValueError("BridgeTP Phase 6 does not support pipeline parallelism")
@@ -581,10 +581,15 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             manifest = json.load(file)
         required = {
             "protocol_version": PROTOCOL_VERSION,
-            "source_tp_size": 1,
             "target_tp_size": self._target_tp_size,
             "pending_known_tokens": 1,
         }
+        # TP1 splits its KV for any target; a larger source has this TP's shards.
+        if manifest.get("source_tp_size") not in (1, self._target_tp_size):
+            raise ValueError(
+                f"source TP{manifest.get('source_tp_size')} cannot migrate to "
+                f"TP{self._target_tp_size}"
+            )
         for key, value in required.items():
             if manifest.get(key) != value:
                 raise ValueError(

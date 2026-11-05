@@ -39,11 +39,13 @@ class PlanTests(unittest.TestCase):
         plan = parse_plan([A, A3], 2)
         self.assertEqual([c.generation for c in plan], [1, 3])
         self.assertEqual(parse_plan([], 2), ())
+        same_tp = parse_plan([row("A-g4-tp2", 30400, 1)], 2)
+        self.assertEqual(same_tp[0].source, "A-g4-tp2")
         for bad in (
             [A, row("A-g1-tp1", 30410, 3)],
             [A, row("A-g3-tp1", 30410, 1)],
             [A, row("A-g3-tp1", 30402, 3)],
-            [row("B-g2-tp2", 30400, 1)],
+            [row("B-g2-tp4", 30400, 1)],
             [row("A-g1-tp1", 30400, -1)],
             [dict(A, extra=1)],
             "A",

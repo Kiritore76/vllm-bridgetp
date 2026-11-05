@@ -792,6 +792,7 @@ class TestActualSourceHook(unittest.TestCase):
             enqueue_gpu_delta=MagicMock(return_value=True),
             lifecycle_lock=threading.Lock(),
             config=config,
+            role=types.SimpleNamespace(leader=True, paired=False),
         )
         path = Path(__file__).resolve().parents[2] / "vllm/bridge_tp/phase8_source.py"
         tree = ast.parse(path.read_text(encoding="utf-8"))

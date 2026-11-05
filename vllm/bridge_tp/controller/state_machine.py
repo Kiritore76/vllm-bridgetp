@@ -83,8 +83,8 @@ class MigrationStateMachine:
     # ---- lifecycle ----------------------------------------------------
     def create(self, migration_id: str, request_id: str,
                expected_ranks: int = 4) -> MigrationRecord:
-        if type(expected_ranks) is not int or expected_ranks not in (2, 4):
-            raise ValueError("target rank count must be 2 or 4")
+        if type(expected_ranks) is not int or expected_ranks not in (1, 2, 4):
+            raise ValueError("target rank count must be 1, 2 or 4")
         with self._lock:
             existing = self._records.get(migration_id)
             if existing is not None:

@@ -51,6 +51,17 @@ from vllm.bridge_tp.runtime_control import (
     RuntimeControl,
     mark_control_honored,
 )
+from vllm.bridge_tp.source_ranks import (
+    JOIN_TIMEOUT_S,
+    PeerFailed,
+    SourceRole,
+    local_role,
+    read_failure,
+    report_failure,
+    report_stage,
+    trigger_check,
+    wait_for_peers,
+)
 from vllm.bridge_tp.stream_protocol import (
     PROTOCOL_VERSION,
     recv_json,
@@ -101,16 +112,20 @@ def _abort_retained_gpu_senders() -> None:
             logger.exception("BridgeTP persistent sender shutdown failed")
 
 
+def _sender_addresses(config: BridgeTPStreamConfig) -> list[str]:
+    """Target ranks this process connects to: all, or its own on the same TP."""
+    return local_role().target_addresses(
+        config.gpu_direct_host, config.gpu_direct_base_port, config.target_tp_size
+    )
+
+
 def _persistent_sender_key(
     config: BridgeTPStreamConfig, device: torch.device
 ) -> str:
     device_index = device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
-    addresses = ",".join(
-        f"{config.gpu_direct_host}:{config.gpu_direct_base_port + rank}"
-        for rank in range(config.target_tp_size)
-    )
+    addresses = ",".join(_sender_addresses(config))
     return (
         f"cuda:{device_index}|tp={config.target_tp_size}|"
         f"generation={config.channel_generation}|{addresses}"
@@ -136,6 +151,7 @@ def _acquire_persistent_gpu_sender(
                 port=(
                     config.gpu_direct_base_port + config.target_tp_size
                 ),
+                rank_base=local_role().rank_base(),
             )
             _persistent_gpu_senders[key] = sender
         _active_persistent_gpu_senders.add(key)
@@ -211,7 +227,7 @@ def _start_target_file_follower(base, device, path: Path) -> None:
             },
             base.run_dir
             / "gpu_channel_preconnect_receipts"
-            / f"{label(target)}-retired.json",
+            / local_role().own_file(f"{label(target)}-retired.json"),
         )
         return True
 
@@ -259,10 +275,7 @@ def _preconnect_one(config: BridgeTPStreamConfig, device: torch.device, label: s
         if sender.nccl is None:
             sender.preconnect(
                 channel_generation=config.channel_generation,
-                target_addresses=[
-                    f"{config.gpu_direct_host}:{config.gpu_direct_base_port + rank}"
-                    for rank in range(config.target_tp_size)
-                ],
+                target_addresses=_sender_addresses(config),
             )
         if sender.warmup_completed_unix_s is None:
             warmup_started = time.perf_counter()
@@ -278,7 +291,9 @@ def _preconnect_one(config: BridgeTPStreamConfig, device: torch.device, label: s
                     "warmup_ms": (time.perf_counter() - warmup_started) * 1000,
                     "completed_unix_s": sender.warmup_completed_unix_s,
                 },
-                config.run_dir / "gpu_channel_preconnect_receipts" / f"{label}.json",
+                config.run_dir
+                / "gpu_channel_preconnect_receipts"
+                / local_role().own_file(f"{label}.json"),
             )
     except BaseException:
         _discard_persistent_gpu_sender(key, sender)
@@ -436,8 +451,8 @@ class BridgeTPStreamConfig:
             config.persistent_channel and config.gpu_direct_history
         ):
             raise ValueError("multiple GPU-direct targets need persistent channels")
-        if config.target_tp_size not in (2, 4):
-            raise ValueError("BridgeTP streaming requires target TP=2 or TP=4")
+        if config.target_tp_size not in (1, 2, 4):
+            raise ValueError("BridgeTP streaming requires target TP=1, 2 or 4")
         if config.expected_kv_heads % config.target_tp_size:
             raise ValueError("KV heads must divide over target TP ranks")
         if not 0 < config.chunk_bytes <= 16 * 1024 * 1024:
@@ -735,8 +750,13 @@ class _GpuDirectHistoryPublisher:
         block_axis: int,
         block_size: int,
         history_end_token: int,
+        role: SourceRole | None = None,
     ) -> None:
+        role = role or SourceRole()
         self.config = config
+        self.role = role
+        self.aborted = False
+        self.receipt_path = config.run_dir / role.own_file("gpu_direct_sender.json")
         self.request_id = request_id
         self.kv_caches = kv_caches
         self.layer_names = layer_names
@@ -779,7 +799,7 @@ class _GpuDirectHistoryPublisher:
                     "reason": reason,
                     "completed_unix_s": time.time(),
                 },
-                self.config.run_dir / "gpu_direct_sender.json",
+                self.receipt_path,
             )
             return True
 
@@ -793,6 +813,8 @@ class _GpuDirectHistoryPublisher:
     ) -> None:
         if not self.config.gpu_direct_delta:
             raise RuntimeError("GPU-direct delta is not enabled")
+        if self.aborted:
+            return
         if self.failure is not None:
             raise RuntimeError(self.failure)
         event = torch.cuda.Event()
@@ -823,6 +845,8 @@ class _GpuDirectHistoryPublisher:
         return coalesce_delta(first, self.delta_queue)
 
     def wait_for_deltas(self) -> None:
+        if self.aborted:
+            return
         self.delta_queue.join()
         if self.failure is not None:
             raise RuntimeError(self.failure)
@@ -830,10 +854,48 @@ class _GpuDirectHistoryPublisher:
             raise RuntimeError("; ".join(self.delta_errors))
 
     def stop_deltas(self) -> None:
-        if self.config.gpu_direct_delta:
+        if self.config.gpu_direct_delta and not self.aborted:
             self.delta_queue.put(None)
 
+    def _leader_published(self) -> bool:
+        """Nothing goes on the wire before rank 0 has published the session."""
+        run_dir = self.config.run_dir
+        deadline = time.monotonic() + 2 * JOIN_TIMEOUT_S
+        while time.monotonic() < deadline:
+            if (run_dir / "session_manifest.json").exists():
+                return True
+            if read_failure(run_dir) or (run_dir / "cleanup_request.json").exists():
+                return False
+            time.sleep(0.005)
+        return False
+
+    def _abort_before_wire(self) -> None:
+        """Rank 0 refused: no session exists and the channel was never touched."""
+        self.aborted = True
+        _published_request_ids.discard(self.request_id)
+        _published_sessions.pop(self.request_id, None)
+        _atomic_json_dump(
+            {
+                "format_version": 1,
+                "status": "CANCELLED_BEFORE_HISTORY_TRANSFER",
+                "migration_id": self.config.migration_id,
+                "reason": "the session was not published",
+                "completed_unix_s": time.time(),
+            },
+            self.receipt_path,
+        )
+        while True:
+            try:
+                self.delta_queue.get_nowait()
+            except queue.Empty:
+                return
+            else:
+                self.delta_queue.task_done()
+
     def _run(self) -> None:
+        if not self.role.leader and not self._leader_published():
+            self._abort_before_wire()
+            return
         from vllm.bridge_tp.gpu_direct_history import (
             INTEGRITY,
             TRANSPORT,
@@ -864,6 +926,7 @@ class _GpuDirectHistoryPublisher:
                     host=self.config.gpu_direct_host,
                     port=self.config.gpu_direct_base_port
                     + self.config.target_tp_size,
+                    rank_base=self.role.rank_base(),
                 )
             ranks = sender.send(
                 migration_id=self.config.migration_id,
@@ -876,18 +939,20 @@ class _GpuDirectHistoryPublisher:
                 block_ids=self.block_ids,
                 block_axis=self.block_axis,
                 head_axis=self.config.head_axis,
-                target_tp_size=self.config.target_tp_size,
-                target_addresses=[
-                    f"{self.config.gpu_direct_host}:"
-                    f"{self.config.gpu_direct_base_port + rank}"
-                    for rank in range(self.config.target_tp_size)
-                ],
+                target_tp_size=self.role.sender_tp(self.config.target_tp_size),
+                target_addresses=self.role.target_addresses(
+                    self.config.gpu_direct_host,
+                    self.config.gpu_direct_base_port,
+                    self.config.target_tp_size,
+                ),
                 keep_open=self.config.gpu_direct_delta,
                 history_pacing=self.config.gpu_direct_history_pacing,
                 source_pack_budget_bytes=int(os.environ.get(
                     "BRIDGETP_HISTORY_PACK_BUDGET_BYTES", "0")),
+                # The rate limits the whole source; each rank carries its share.
                 history_rate_provider=(
                     lambda: get_bridge_tp_stream_config().aggregate_rate_gib_s
+                    / self.role.tp_size
                 ),
             )
             if self.config.gpu_direct_delta:
@@ -898,9 +963,7 @@ class _GpuDirectHistoryPublisher:
                         "history_completed_unix_s": time.time(),
                     }
                 )
-                _atomic_json_dump(
-                    receipt, self.config.run_dir / "gpu_direct_sender.json"
-                )
+                _atomic_json_dump(receipt, self.receipt_path)
                 while True:
                     work = self.delta_queue.get()
                     consumed = 1
@@ -965,7 +1028,9 @@ class _GpuDirectHistoryPublisher:
                             block_axis=self.block_axis,
                             block_size=self.block_size,
                             head_axis=self.config.head_axis,
-                            expected_kv_heads=self.config.expected_kv_heads,
+                            expected_kv_heads=self.role.sender_heads(
+                                self.config.expected_kv_heads
+                            ),
                             start_token=work["start_token"],
                             end_token=work["end_token"],
                         )
@@ -983,8 +1048,7 @@ class _GpuDirectHistoryPublisher:
                                 **record,
                                 "completed_unix_s": time.time(),
                             },
-                            self.config.run_dir
-                            / "gpu_direct_delta_sender_receipts"
+                            self.role.delta_receipt_dir(self.config.run_dir)
                             / (
                                 f"delta_{work['start_token']:012d}_"
                                 f"{work['end_token']:012d}.json"
@@ -1049,9 +1113,7 @@ class _GpuDirectHistoryPublisher:
                 else:
                     self.delta_queue.task_done()
         finally:
-            _atomic_json_dump(
-                receipt, self.config.run_dir / "gpu_direct_sender.json"
-            )
+            _atomic_json_dump(receipt, self.receipt_path)
 
 
 def _publish_request(
@@ -1070,8 +1132,14 @@ def _publish_request(
     tp_world_size: int,
     async_scheduling: bool,
 ) -> None:
-    if tp_world_size != 1 or tp_rank != 0:
-        raise ValueError("BridgeTP Phase 6 source must be TP1 rank 0")
+    role = SourceRole(tp_world_size, tp_rank)
+    role.check_target(config.target_tp_size)
+    if role.paired and (
+        not config.persistent_channel
+        or not config.gpu_direct_delta
+        or config.stop_and_copy
+    ):
+        raise ValueError("a same-TP source needs persistent GPU-direct delta")
     if async_scheduling:
         raise ValueError("BridgeTP Phase 6 requires --no-async-scheduling")
     if scheduler_output.scheduled_spec_decode_tokens:
@@ -1085,7 +1153,15 @@ def _publish_request(
     request_index = input_batch.req_id_to_index[request_id]
     request = requests[request_id]
     num_output_tokens = len(request.output_token_ids)
-    if num_output_tokens < config.after_output_tokens:
+    start = trigger_check(role, num_output_tokens, config.after_output_tokens)
+    if start == "WAIT":
+        return
+    if start == "MISSED":
+        _refuse_session(
+            config,
+            role,
+            f"output {num_output_tokens} passed start {config.after_output_tokens}",
+        )
         return
     num_scheduled = int(scheduler_output.num_scheduled_tokens.get(request_id, 0))
     num_computed_before = int(input_batch.num_computed_tokens_cpu[request_index])
@@ -1113,22 +1189,26 @@ def _publish_request(
         )
     from vllm.bridge_tp.experiment_timeline import emit_event
 
-    emit_event(
-        config.run_dir,
-        "source_worker",
-        "SNAPSHOT_COPY_STARTED",
-        request_id=request_id,
-        migration_id=config.migration_id,
-        num_output_tokens=num_output_tokens,
-        stop_and_copy=config.stop_and_copy,
-    )
+    if role.leader:
+        emit_event(
+            config.run_dir,
+            "source_worker",
+            "SNAPSHOT_COPY_STARTED",
+            request_id=request_id,
+            migration_id=config.migration_id,
+            num_output_tokens=num_output_tokens,
+            stop_and_copy=config.stop_and_copy,
+        )
 
     block_ids, block_size = _get_request_block_ids(
         input_batch, request_index, num_computed
     )
     block_axis = _get_block_axis(attn_groups, cache_dtype, block_size)
     layer_names = _ordered_layer_names(kv_cache_config)
-    raw_source_bytes = _estimate_dump_bytes(kv_caches, block_axis, len(block_ids))
+    # This process holds one rank's share of the source KV.
+    raw_source_bytes = role.tp_size * _estimate_dump_bytes(
+        kv_caches, block_axis, len(block_ids)
+    )
     pack_budget = int(os.environ.get("BRIDGETP_HISTORY_PACK_BUDGET_BYTES", "0"))
     if config.gpu_direct_history and pack_budget:
         from vllm.bridge_tp.bounded_history import packing_plan
@@ -1138,7 +1218,7 @@ def _publish_request(
             block_ids,
             block_axis,
             config.head_axis,
-            config.target_tp_size,
+            role.sender_tp(config.target_tp_size),
             pack_budget,
         )
         reserve = int(
@@ -1166,16 +1246,40 @@ def _publish_request(
                 raw_history_bytes=raw_source_bytes,
                 updated_unix_s=time.time(),
             ),
-            config.run_dir / "source_history_memory_receipt.json",
+            config.run_dir / role.own_file("source_history_memory_receipt.json"),
         )
         if not allowed:
             # No publisher or wire session has been started. Leave inference
             # running; retry only at the next normal iteration boundary.
+            if role.paired:
+                # The other ranks copy this boundary or none: there is no retry.
+                _refuse_session(config, role, "not enough GPU memory for history")
             return
+    if role.paired:
+        # All ranks must be at this token before any of them touches a channel.
+        boundary = dict(
+            migration_id=config.migration_id,
+            output_tokens=num_output_tokens,
+            num_computed_tokens=num_computed,
+        )
+        if role.leader:
+            try:
+                wait_for_peers(
+                    config.run_dir,
+                    role,
+                    "start",
+                    timeout_s=JOIN_TIMEOUT_S,
+                    expected=boundary,
+                )
+            except (PeerFailed, TimeoutError) as error:
+                _refuse_session(config, role, str(error))
+                return
+        else:
+            report_stage(config.run_dir, role, "start", **boundary)
     snapshot_started = time.perf_counter()
     session_token = secrets.token_hex(32)
     config.run_dir.mkdir(parents=True, exist_ok=True)
-    if (config.run_dir / "session_manifest.json").exists():
+    if role.leader and (config.run_dir / "session_manifest.json").exists():
         raise FileExistsError(
             f"Phase 6 run directory was already used: {config.run_dir}"
         )
@@ -1193,8 +1297,10 @@ def _publish_request(
         ):
             dump_shape = list(cache.shape)
             dump_shape[block_axis] = len(block_ids)
-            if int(dump_shape[config.head_axis]) != config.expected_kv_heads:
+            local_heads = role.sender_heads(config.expected_kv_heads)
+            if int(dump_shape[config.head_axis]) != local_heads:
                 raise ValueError("source KV head count differs from configuration")
+            dump_shape[config.head_axis] = config.expected_kv_heads
             rank_shape = list(dump_shape)
             rank_shape[config.head_axis] //= config.target_tp_size
             layer_records.append(
@@ -1234,6 +1340,7 @@ def _publish_request(
                 block_axis=block_axis,
                 block_size=block_size,
                 history_end_token=num_computed,
+                role=role,
             )
         )
         d2h_ms = 0.0
@@ -1330,6 +1437,27 @@ def _publish_request(
         for publisher in publishers:
             publisher.start()
     _publishers.extend(publishers)
+    if not role.leader:
+        # Rank 0 publishes the session; a follower only sends its own KV.
+        _published_request_ids.add(request_id)
+        _published_sessions[request_id] = (
+            config.migration_id,
+            config.run_dir.resolve(),
+        )
+        from vllm.bridge_tp.phase8_source import start_phase8_source
+
+        start_phase8_source(
+            config=config,
+            request_id=request_id,
+            session_token=session_token,
+            initial_num_computed_tokens=num_computed,
+            block_size=block_size,
+            block_axis=block_axis,
+            layer_names=layer_names,
+            history_publishers=publishers,
+            role=role,
+        )
+        return
 
     computed_token_ids = [request.get_token_id(i) for i in range(num_computed)]
     pending_token_ids = [
@@ -1352,7 +1480,7 @@ def _publish_request(
         "session_token": session_token,
         "model": model_name,
         "source_request_id": request_id,
-        "source_tp_size": 1,
+        "source_tp_size": role.tp_size,
         "target_tp_size": config.target_tp_size,
         "cache_dtype": cache_dtype,
         "block_size": block_size,
@@ -1447,6 +1575,7 @@ def _publish_request(
             block_axis=block_axis,
             layer_names=layer_names,
             history_publishers=publishers,
+            role=role,
         )
     elif config.stop_and_copy:
         # The request cannot generate after this snapshot, so the initial
@@ -1538,6 +1667,21 @@ def _publish_source_progress(
     )
 
 
+_refused_sessions: set[str] = set()
+
+
+def _refuse_session(config, role: SourceRole, reason: str) -> None:
+    """This rank cannot join the session; the controller cancels it."""
+    _refused_sessions.add(config.migration_id)
+    report_failure(config.run_dir, role, reason)
+    logger.warning(
+        "BridgeTP rank %d refused session %s: %s",
+        role.rank,
+        config.migration_id,
+        reason,
+    )
+
+
 def _allow_cancelled_republish(config, request_id):
     """Retry a live source only in a fresh, previously cleaned session."""
     previous = _published_sessions.get(request_id)
@@ -1577,11 +1721,12 @@ def maybe_publish_kv_stream(
     tp_world_size: int,
     async_scheduling: bool,
 ) -> None:
-    """Publish one live TP1 request once it reaches the configured boundary."""
+    """Publish one live request once it reaches the configured boundary."""
     global _disabled_after_error
     config = get_bridge_tp_stream_config()
     if not config.enabled or _disabled_after_error:
         return
+    role = SourceRole(tp_world_size, tp_rank)
     try:
         if config.persistent_channel:
             # A committed source request disappears from the live scheduler.
@@ -1606,7 +1751,7 @@ def maybe_publish_kv_stream(
             # clean-control requests must not overwrite its progress evidence
             # or reuse its ports and run directory.
             return
-        if RuntimeControl.path(config.run_dir).exists():
+        if role.leader and RuntimeControl.path(config.run_dir).exists():
             _publish_source_progress(
                 config=config,
                 request_id=request_id,
@@ -1614,7 +1759,7 @@ def maybe_publish_kv_stream(
                 input_batch=input_batch,
                 scheduler_output=scheduler_output,
             )
-        if not config.armed:
+        if not config.armed or config.migration_id in _refused_sessions:
             return
         if (
             config.persistent_channel
@@ -1652,7 +1797,9 @@ def maybe_publish_kv_stream(
             tp_world_size=tp_world_size,
             async_scheduling=async_scheduling,
         )
-    except Exception:
+    except Exception as error:
+        if role.paired:
+            report_failure(config.run_dir, role, f"{type(error).__name__}: {error}")
         if config.strict:
             raise
         _disabled_after_error = True

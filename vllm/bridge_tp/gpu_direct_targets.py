@@ -21,7 +21,7 @@ import re
 from dataclasses import dataclass, replace
 
 ENV = "BRIDGETP_GPU_DIRECT_TARGETS"
-_TARGET_ID = re.compile(r"tp4|[A-Z]-g[0-9]+-tp[0-9]+")
+_TARGET_ID = re.compile(r"tp[14]|[A-Z]-g[0-9]+-tp[0-9]+")
 
 
 @dataclass(frozen=True)
@@ -62,7 +62,7 @@ def parse_targets(text: str, expected_kv_heads: int) -> tuple[GpuDirectTarget, .
         )
         if (
             not _TARGET_ID.fullmatch(target.target)
-            or target.tp not in (2, 4)
+            or target.tp not in (1, 2, 4)
             or expected_kv_heads % target.tp
             or target.generation < 0
             or not 1024 <= target.base_port <= 65535 - target.tp

@@ -21,7 +21,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-_SOURCE_ID = re.compile(r"tp1|[A-Z]-g[0-9]+-tp1")
+_SOURCE_ID = re.compile(r"tp[14]|[A-Z]-g[0-9]+-tp[0-9]+")
 
 
 @dataclass(frozen=True)
@@ -48,6 +48,8 @@ def parse_plan(rows: Any, target_tp: int) -> tuple[SourceChannel, ...]:
         )
         if (
             not _SOURCE_ID.fullmatch(channel.source)
+            # TP1 splits for any target; a larger source only has this TP's shards.
+            or int(channel.source.rsplit("tp", 1)[1]) not in (1, target_tp)
             or channel.generation < 0
             or not 1024 <= channel.base_port <= 65535 - target_tp
         ):

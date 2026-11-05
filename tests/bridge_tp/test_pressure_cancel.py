@@ -1031,6 +1031,8 @@ class SourceCancelRaceTests(unittest.TestCase):
                 cancel_deferred_history=lambda reason: 0,
                 delta_batches=1,
                 delta_tokens=4,
+                role=NS(leader=True, paired=False, own_file=lambda name: name),
+                history_publishers=[],
             )
             method = actual_method(
                 "vllm/bridge_tp/phase8_source.py",

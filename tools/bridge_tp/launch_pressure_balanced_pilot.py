@@ -145,19 +145,26 @@ def arguments(spec):
     values.update(model_path=Path(spec["model_path"]), python_bin=Path(sys.executable))
     args = SimpleNamespace(**values)
     target_tp = getattr(args, "target_tp_size", 4)
-    if target_tp not in (2, 4):
-        raise ValueError("target TP must be 2 or 4")
+    source_tp = getattr(args, "source_tp_size", 1)
+    # TP1 splits for TP2/TP4; otherwise both sides have the same TP (user 11-05).
+    if target_tp not in (2, 4) and (target_tp, source_tp) != (1, 1):
+        raise ValueError("target TP must be 2 or 4, or 1 from a TP1")
+    if source_tp not in (1, target_tp):
+        raise ValueError("source TP must be 1 or the target's TP")
     devices = devices_of(args)
+    source_devices = str(args.tp1_gpu).split(",")
     if (
         len(devices) != target_tp
         or len(set(devices)) != target_tp
-        or args.tp1_gpu in devices
+        or len(source_devices) != source_tp
+        or len(set(source_devices)) != source_tp
+        or set(source_devices) & set(devices)
     ):
         raise ValueError("source/target GPUs must be disjoint and match TP")
     context_profile = spec.get("context_profile")
     limits = (8192, 16384)
     if context_profile is not None:
-        if context_profile != "QWEN3_NATIVE_32K_BOTH_V1" or target_tp != 2:
+        if context_profile != "QWEN3_NATIVE_32K_BOTH_V1" or target_tp not in (1, 2):
             raise ValueError("unknown or incompatible context profile")
         limits = (32768, 32768)
     if (
@@ -176,6 +183,7 @@ def arguments(spec):
 
 def build_scene(spec, scene, run_root, common, args):
     target_tp = getattr(args, "target_tp_size", 4)
+    source_tp = getattr(args, "source_tp_size", 1)
     run_dir = run_root / scene["name"] / "controller"
     multiple = spec.get("maximum_migrations", 1) != 1
     mechanism_dir = run_dir / "migration_active" if multiple else run_dir
@@ -192,6 +200,8 @@ def build_scene(spec, scene, run_root, common, args):
         ready_notification_mode="UDP",
         ready_notification_port=args.ready_notification_port,
     )
+    if source_tp != 1:
+        config.update(source_tp_size=source_tp)
     inherited = {k: v for k, v in os.environ.items() if k.startswith("BRIDGETP_")}
     try:
         for key in inherited:
@@ -252,7 +262,7 @@ def build_scene(spec, scene, run_root, common, args):
             "bridgetp_release_persistent_payload_buffer"
         ] = False
         target_argv[-1] = json.dumps(connector)
-    source_argv = common.server_command(args, 1, args.tp1_port)
+    source_argv = common.server_command(args, source_tp, args.tp1_port)
     stager_argv = [
         sys.executable,
         str(ROOT / "tools/bridge_tp/pressure_sessions.py")

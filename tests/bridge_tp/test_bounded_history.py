@@ -14,6 +14,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from vllm.bridge_tp.bounded_history import HistoryPacker, packing_plan
+from vllm.bridge_tp.source_ranks import SourceRole
 from vllm.bridge_tp.stream_protocol import PayloadType, PersistentChannelLifecycle
 
 
@@ -60,6 +61,7 @@ class BoundedHistoryTests(unittest.TestCase):
                 pack_budget=128,
                 raw_source_bytes=123,
                 request_id="r",
+                role=SourceRole(),
                 config=NS(
                     gpu_direct_history=True,
                     head_axis=3,
@@ -178,6 +180,7 @@ class BoundedHistoryTests(unittest.TestCase):
             channel_generation=1,
             topology_key="a|b",
             target_tp_size=2,
+            rank_base=0,
             connections=[Mock(), Mock()],
             comms=[Mock(), Mock()],
             streams=[Mock(), Mock()],

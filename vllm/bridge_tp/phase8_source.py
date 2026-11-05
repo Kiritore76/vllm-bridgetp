@@ -26,6 +26,12 @@ import torch
 
 from vllm.bridge_tp.kv_export import _get_request_block_ids
 from vllm.bridge_tp.runtime_control import RuntimeControl
+from vllm.bridge_tp.source_ranks import (
+    SourceRole,
+    report_failure,
+    report_stage,
+    wait_for_peers,
+)
 from vllm.bridge_tp.stream_protocol import (
     PROTOCOL_VERSION,
     recv_json,
@@ -77,6 +83,7 @@ class _Phase8SourceState:
     finalized: bool = False
     finalizing: bool = False
     stopped: bool = False
+    role: SourceRole = SourceRole()
     lifecycle_lock: threading.RLock = field(
         default_factory=threading.RLock,
         repr=False,
@@ -299,6 +306,8 @@ class _Phase8SourceState:
         # A cleanup request may race the final freeze/manifest publication.
         # Stay alive until ownership commits, even after delta work ended.
         while not cleanup_path.exists():
+            if any(getattr(p, "aborted", False) for p in self.history_publishers):
+                return  # The session was never published: nothing to clean.
             state_path = self.config.run_dir / "takeover_state.json"
             if state_path.is_file():
                 state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -314,7 +323,8 @@ class _Phase8SourceState:
                     "error": error,
                     "updated_unix_s": time.time(),
                 },
-                self.config.run_dir / "source_cleanup_progress.json",
+                self.config.run_dir
+                / self.role.own_file("source_cleanup_progress.json"),
             )
 
         try:
@@ -343,6 +353,19 @@ class _Phase8SourceState:
             request = json.loads(cleanup_path.read_text(encoding="utf-8"))
             reason = request.get("reason", "source ended before cutover")
             cancelled_history_ranks = self.cancel_deferred_history(str(reason))
+            if not self.role.leader:
+                # Rank 0 resumes the request once every rank has stopped.
+                report_stage(self.config.run_dir, self.role, "cleaned")
+                progress("CLEANED")
+                return
+            if self.role.paired:
+                progress("WAIT_OTHER_RANKS")
+                wait_for_peers(
+                    self.config.run_dir,
+                    self.role,
+                    "cleaned",
+                    timeout_s=self.config.socket_timeout_s,
+                )
             if not request.get("abort_source", True):
                 _atomic_json_dump(
                     {
@@ -371,6 +394,8 @@ class _Phase8SourceState:
         except Exception as error:
             progress("FAILED", repr(error))
             logger.exception("BridgeTP Phase 8 source cleanup failed")
+            if not self.role.leader:
+                report_failure(self.config.run_dir, self.role, repr(error))
 
 
 _state: _Phase8SourceState | None = None
@@ -386,9 +411,14 @@ def start_phase8_source(
     block_axis: int,
     layer_names: list[str],
     history_publishers: list[Any] | None = None,
+    role: SourceRole | None = None,
 ) -> None:
     global _state
-    if _state is not None and not _state.finalized:
+    if (
+        _state is not None
+        and not _state.finalized
+        and not any(getattr(p, "aborted", False) for p in _state.history_publishers)
+    ):
         raise RuntimeError("BridgeTP Phase 8 source session already exists")
     _state = _Phase8SourceState(
         config=config,
@@ -399,6 +429,7 @@ def start_phase8_source(
         block_axis=block_axis,
         layer_names=list(layer_names),
         history_publishers=list(history_publishers or []),
+        role=role or SourceRole(),
     )
     _state.start()
 
@@ -528,6 +559,31 @@ def _finalize_cutover(
     delta_drain_completed_monotonic_ns = time.monotonic_ns()
     if (config.run_dir / "cleanup_request.json").exists():
         raise _ShadowAbandoned("migration was abandoned during final delta drain")
+    role = state.role
+    if not role.leader:
+        with state.lifecycle_lock:
+            state.finalized = True
+        state.stop_workers()
+        report_stage(
+            config.run_dir,
+            role,
+            "final_delta",
+            output_tokens=output_tokens,
+            num_computed_tokens=num_computed,
+        )
+        return
+    if role.paired:
+        # The whole KV is only final once every rank's last delta is applied.
+        wait_for_peers(
+            config.run_dir,
+            role,
+            "final_delta",
+            timeout_s=config.socket_timeout_s,
+            expected=dict(
+                output_tokens=output_tokens, num_computed_tokens=num_computed
+            ),
+            abandoned=(config.run_dir / "cleanup_request.json").exists,
+        )
     # S_NEW starts its historical copy only at the irreversible boundary.
     state.start_history_transfer()
     with state.lifecycle_lock:
@@ -645,6 +701,15 @@ def _background_finalize_cutover(**kwargs: Any) -> None:
         state.stop_workers()
     except Exception as error:
         logger.exception("BridgeTP background final delta failed")
+        if not state.role.leader:
+            # Rank 0 resumes the request when it sees this report.
+            report_failure(
+                state.config.run_dir, state.role, f"{type(error).__name__}: {error}"
+            )
+            with state.lifecycle_lock:
+                state.finalized = True
+            state.stop_workers()
+            return
         if (state.config.run_dir / "cutover_manifest.json").exists():
             # The controller may already be committing this cutover.
             return
@@ -722,79 +787,96 @@ def maybe_publish_phase8_delta(
                 or reservation.get('migration_id') != config.migration_id
                 or reservation.get('source_request_id') != request_id):
             raise ValueError('rolling reservation identity differs from source')
-        planner = getattr(state, 'rolling_planner', None)
-        if planner is None:
-            import os
-
-            minimum_lead = int(os.getenv('BRIDGETP_ROLLING_MIN_LEAD_TOKENS', '128'))
-            if minimum_lead <= 0:
-                raise ValueError('rolling minimum lead must be positive')
-            planner = RollingPlanner(
-                reservation['reservation_output_tokens'],
-                minimum_lead_tokens=minimum_lead,
-            )
-            state.rolling_planner = planner
-            state.rolling_history_ready = False
-        if not state.rolling_history_ready:
-            state.rolling_history_ready, _ = resident_progress(
-                config.run_dir, config.migration_id,
-            )
-        watermark = applied_progress(
-            config.run_dir, config.migration_id, reservation['initial_end_token'],
-        )
-        publishers = getattr(state, 'history_publishers', ())
-        publisher = publishers[0] if publishers else None
-        records = tuple(getattr(publisher, 'delta_records', ())[-8:])
-        inflight = getattr(publisher, 'delta_inflight', None)
-        decision = planner.observe(
-            output_tokens=output_tokens, computed_tokens=num_computed,
-            resident_end=watermark, history_ready=state.rolling_history_ready,
-            delta_applied=watermark is not None, unix_s=time.time(),
-            delta_records=records, delta_inflight=inflight,
-            initial_end=reservation['initial_end_token'],
-        )
-        if decision is not None:
-            decision.update(migration_id=config.migration_id,
-                            source_request_id=request_id, mechanism=MECHANISM)
-            _atomic_json_dump(decision, config.run_dir / 'rolling_source_plan.json')
-            with (config.run_dir / 'rolling_source_plans.jsonl').open(
-                'a', encoding='utf-8',
-            ) as handle:
-                handle.write(json.dumps(decision) + '\n')
-            if decision['status'] == 'RESERVATION_EXHAUSTED':
-                # No unreserved delta or request freeze. The controller cleans
-                # Shadow while the ordinary source request continues.
+        if not state.role.leader:
+            # Rank 0 plans. A boundary is published at least the minimum lead
+            # ahead (128 tokens), and only moves after it was passed.
+            plan = read_json(config.run_dir / 'rolling_source_plan.json')
+            if plan.get('status') == 'RESERVATION_EXHAUSTED':
                 state.rolling_exhausted = True
                 return
-        if (num_computed >= reservation['num_prompt_tokens']
-                + planner.reservation_output_tokens):
-            return
-        # Plan only after exact history residency. Planning does not freeze;
-        # live applied-delta evidence remains mandatory at the actual boundary.
-        boundary = planner.boundary or reservation['source_max_output_tokens']
-        config = replace(config, phase8_cutover_output_tokens=boundary)
-        if output_tokens == planner.boundary:
-            if (not state.rolling_history_ready or watermark is None
-                    or watermark > num_computed):
-                raise RuntimeError('rolling freeze lacks exact applied watermark')
-            _atomic_json_dump(
-                {
-                    'format_version': 1, 'mechanism': MECHANISM,
-                    'migration_id': config.migration_id,
-                    'source_request_id': request_id,
-                    'version': planner.version,
-                    'cutover_output_tokens': boundary,
-                    'reservation_output_tokens': planner.reservation_output_tokens,
-                    'computed_tokens': num_computed,
-                    'resident_end': watermark,
-                    'delta_lag_tokens': max(0, num_computed - watermark),
-                    'history_ready': True, 'first_delta_applied': True,
-                    'freeze_policy': 'FREEZE_AT_BOUNDARY_DRAIN_TAIL',
-                    'maximum_pre_freeze_delta_lag_tokens': None,
-                    'selected_unix_s': time.time(),
-                },
-                config.run_dir / 'rolling_freeze_selection.json',
+            if (num_computed >= reservation['num_prompt_tokens']
+                    + reservation['reservation_output_tokens']):
+                return
+            config = replace(
+                config,
+                phase8_cutover_output_tokens=plan.get(
+                    'cutover_output_tokens', reservation['source_max_output_tokens']
+                ),
             )
+        if state.role.leader:
+            planner = getattr(state, 'rolling_planner', None)
+            if planner is None:
+                import os
+
+                minimum_lead = int(os.getenv('BRIDGETP_ROLLING_MIN_LEAD_TOKENS', '128'))
+                if minimum_lead <= 0:
+                    raise ValueError('rolling minimum lead must be positive')
+                planner = RollingPlanner(
+                    reservation['reservation_output_tokens'],
+                    minimum_lead_tokens=minimum_lead,
+                )
+                state.rolling_planner = planner
+                state.rolling_history_ready = False
+            if not state.rolling_history_ready:
+                state.rolling_history_ready, _ = resident_progress(
+                    config.run_dir, config.migration_id,
+                )
+            watermark = applied_progress(
+                config.run_dir, config.migration_id, reservation['initial_end_token'],
+            )
+            publishers = getattr(state, 'history_publishers', ())
+            publisher = publishers[0] if publishers else None
+            records = tuple(getattr(publisher, 'delta_records', ())[-8:])
+            inflight = getattr(publisher, 'delta_inflight', None)
+            decision = planner.observe(
+                output_tokens=output_tokens, computed_tokens=num_computed,
+                resident_end=watermark, history_ready=state.rolling_history_ready,
+                delta_applied=watermark is not None, unix_s=time.time(),
+                delta_records=records, delta_inflight=inflight,
+                initial_end=reservation['initial_end_token'],
+            )
+            if decision is not None:
+                decision.update(migration_id=config.migration_id,
+                                source_request_id=request_id, mechanism=MECHANISM)
+                _atomic_json_dump(decision, config.run_dir / 'rolling_source_plan.json')
+                with (config.run_dir / 'rolling_source_plans.jsonl').open(
+                    'a', encoding='utf-8',
+                ) as handle:
+                    handle.write(json.dumps(decision) + '\n')
+                if decision['status'] == 'RESERVATION_EXHAUSTED':
+                    # No unreserved delta or request freeze. The controller cleans
+                    # Shadow while the ordinary source request continues.
+                    state.rolling_exhausted = True
+                    return
+            if (num_computed >= reservation['num_prompt_tokens']
+                    + planner.reservation_output_tokens):
+                return
+            # Plan only after exact history residency. Planning does not freeze;
+            # live applied-delta evidence remains mandatory at the actual boundary.
+            boundary = planner.boundary or reservation['source_max_output_tokens']
+            config = replace(config, phase8_cutover_output_tokens=boundary)
+            if output_tokens == planner.boundary:
+                if (not state.rolling_history_ready or watermark is None
+                        or watermark > num_computed):
+                    raise RuntimeError('rolling freeze lacks exact applied watermark')
+                _atomic_json_dump(
+                    {
+                        'format_version': 1, 'mechanism': MECHANISM,
+                        'migration_id': config.migration_id,
+                        'source_request_id': request_id,
+                        'version': planner.version,
+                        'cutover_output_tokens': boundary,
+                        'reservation_output_tokens': planner.reservation_output_tokens,
+                        'computed_tokens': num_computed,
+                        'resident_end': watermark,
+                        'delta_lag_tokens': max(0, num_computed - watermark),
+                        'history_ready': True, 'first_delta_applied': True,
+                        'freeze_policy': 'FREEZE_AT_BOUNDARY_DRAIN_TAIL',
+                        'maximum_pre_freeze_delta_lag_tokens': None,
+                        'selected_unix_s': time.time(),
+                    },
+                    config.run_dir / 'rolling_freeze_selection.json',
+                )
     if output_tokens > config.phase8_cutover_output_tokens:
         raise ValueError("Phase 8 skipped its exact cutover output-token boundary")
     block_ids, block_size = _get_request_block_ids(
@@ -869,13 +951,18 @@ def maybe_publish_phase8_delta(
         # Claim finalization before publishing FREEZE. The cleanup watcher
         # waits for this owner and publishes RESUME only after it has finished.
         state.finalizing = True
-    if enabled_from_env() and not getattr(config, "stop_and_copy", False):
+    if not state.role.leader:
+        # Rank 0 asks the one scheduler to freeze; this rank only waits for it.
+        freeze_request = dict(requested_unix_ns=None)
+    elif enabled_from_env() and not getattr(config, "stop_and_copy", False):
         freeze_request = request_freeze(
             config.run_dir,
             request_id,
             output_tokens=output_tokens,
             num_computed_tokens=num_computed,
         )
+    elif state.role.paired:
+        raise ValueError("a same-TP source needs the request freeze gate")
     # Copy request-owned metadata while the model step still owns the exact
     # boundary.  The finalizer must not inspect a mutable request later.
     finalizer_kwargs = {

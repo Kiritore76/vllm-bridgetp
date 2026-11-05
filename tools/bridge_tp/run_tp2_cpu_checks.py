@@ -37,6 +37,7 @@ TESTS = [
     "distribution_predictor_runtime",
     "predictor_mlp4_scratch",
     "tp2_reconfiguration",
+    "same_tp_migration",
     "performance_trace",
     "pressure_session",
     "pressure_sessions",

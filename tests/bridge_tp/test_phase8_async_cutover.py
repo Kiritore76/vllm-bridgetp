@@ -29,6 +29,7 @@ class TestBackgroundCutover(unittest.TestCase):
         )
         state = SimpleNamespace(
             config=config,
+            role=phase8_source.SourceRole(),
             request_id="anchor",
             session_token="session",
             last_computed_token=2174,
@@ -188,6 +189,70 @@ class TestBackgroundCutover(unittest.TestCase):
                 )
             )
             self.assertIn("wrong token boundary", error["error"])
+
+    def _wait_for(self, predicate):
+        for _ in range(300):
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_follower_reports_and_never_freezes_or_publishes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, state, request, batch, output = self._setup(root, lambda: None)
+            state.role = phase8_source.SourceRole(2, 1)
+            self._publish(config, state, request, batch, output)
+            self.assertFalse((root / "request_freeze_control.json").exists())
+            report = root / "source_rank_reports" / "final_delta_rank_1.json"
+            self.assertFalse(report.exists())
+            RequestFreezeGate(root).record_frozen(request, scheduler_step=1)
+            self.assertTrue(self._wait_for(report.exists))
+            row = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(row["output_tokens"], 128)
+            self.assertEqual(row["num_computed_tokens"], 2175)
+            self.assertFalse((root / "cutover_manifest.json").exists())
+            self.assertTrue(state.stopped)
+
+    def test_leader_publishes_only_after_every_rank_reported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, state, request, batch, output = self._setup(root, lambda: None)
+            state.role = phase8_source.SourceRole(2, 0)
+            self._publish(config, state, request, batch, output)
+            self.assertTrue((root / "request_freeze_control.json").exists())
+            RequestFreezeGate(root).record_frozen(request, scheduler_step=1)
+            time.sleep(0.2)
+            self.assertFalse((root / "cutover_manifest.json").exists())
+            phase8_source.report_stage(
+                root,
+                phase8_source.SourceRole(2, 1),
+                "final_delta",
+                output_tokens=128,
+                num_computed_tokens=2175,
+            )
+            manifest = root / "cutover_manifest.json"
+            self.assertTrue(self._wait_for(manifest.exists))
+
+    def test_leader_resumes_when_a_rank_fails_at_the_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, state, request, batch, output = self._setup(root, lambda: None)
+            state.role = phase8_source.SourceRole(2, 0)
+            self._publish(config, state, request, batch, output)
+            RequestFreezeGate(root).record_frozen(request, scheduler_step=1)
+            phase8_source.report_failure(
+                root, phase8_source.SourceRole(2, 1), "delta failed"
+            )
+            control = root / "request_freeze_control.json"
+            self.assertTrue(
+                self._wait_for(
+                    lambda: json.loads(control.read_text(encoding="utf-8"))["action"]
+                    == "RESUME"
+                )
+            )
+            self.assertTrue((root / "cutover_finalize_error.json").exists())
+            self.assertFalse((root / "cutover_manifest.json").exists())
 
 
 if __name__ == "__main__":

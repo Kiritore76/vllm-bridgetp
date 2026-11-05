@@ -16,7 +16,10 @@ from typing import Any
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 
-from vllm.bridge_tp.controller.tp_geometry import session_target_tp
+from vllm.bridge_tp.controller.tp_geometry import (
+    session_source_tp,
+    session_target_tp,
+)
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -473,7 +476,11 @@ async def retire_diagnostic_channel(raw_request: Request) -> dict[str, Any]:
         results = await raw_request.app.state.engine_client.collective_rpc(
             "bridge_tp_retire_diagnostic_channel", timeout=60.0
         )
-    expected = 1 if role == "source" else session_target_tp(Path(root))
+    expected = (
+        session_source_tp(Path(root))
+        if role == "source"
+        else session_target_tp(Path(root))
+    )
     if any(r.get("status") == "REJECTED" for r in results):
         raise HTTPException(status_code=409, detail=dict(role=role, ranks=results))
     if len(results) != expected or any(

@@ -18,6 +18,7 @@ from vllm.bridge_tp.gpu_direct_targets import (
     select_target,
 )
 from vllm.bridge_tp.runtime_control import RuntimeControl
+from vllm.bridge_tp.source_ranks import SourceRole
 
 KV_STREAM = Path(__file__).resolve().parents[2] / "vllm/bridge_tp/kv_stream.py"
 
@@ -129,17 +130,22 @@ class SelectTests(unittest.TestCase):
 
     def test_targets_get_distinct_persistent_sender_keys(self):
         tree = ast.parse(KV_STREAM.read_text(encoding="utf-8"))
-        fn = next(
+        functions = [
             n
             for n in tree.body
-            if isinstance(n, ast.FunctionDef) and n.name == "_persistent_sender_key"
-        )
-        fn.returns = None
-        for arg in fn.args.args:
-            arg.annotation = None
-        ns = {}
+            if isinstance(n, ast.FunctionDef)
+            and n.name in ("_persistent_sender_key", "_sender_addresses")
+        ]
+        for fn in functions:
+            fn.returns = None
+            for arg in fn.args.args:
+                arg.annotation = None
+        ns = dict(local_role=SourceRole)
         exec(
-            compile(ast.Module(body=[fn], type_ignores=[]), str(KV_STREAM), "exec"), ns
+            compile(
+                ast.Module(body=functions, type_ignores=[]), str(KV_STREAM), "exec"
+            ),
+            ns,
         )
 
         class Device:

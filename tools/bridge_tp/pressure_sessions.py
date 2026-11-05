@@ -108,7 +108,10 @@ class PressureSessions:
                 return False
             if not entry.service_observed:
                 return False
-        paths = [self.run_dir / "gpu_direct_sender.json"] + [
+        from tools.bridge_tp.pressure_session import sender_receipt_paths
+
+        senders = sender_receipt_paths(self.run_dir)
+        paths = senders + [
             self.run_dir / "persistent_channel_receipts" / f"tp_rank_{rank}.json"
             for rank in range(load("tp_geometry").session_target_tp(self.run_dir))
         ]
@@ -132,18 +135,22 @@ class PressureSessions:
             for s in self.sessions
             if s.record is not None
         )
-        sender, *rest = rows
+        sender_rows, rest = rows[: len(senders)], rows[len(senders) :]
+        sender = sender_rows[0]
         count = load("tp_geometry").session_target_tp(self.run_dir)
         targets, finalized, stager = rest[:count], rest[count], rest[count + 1]
         if (
-            sender.get("communicator_lifecycle") != "PERSISTENT_CHANNEL_IDLE"
-            or sender.get("migration_id") != self.migration_id
-            or sender.get("source_request_id") != self.record.request_id
+            any(
+                row.get("communicator_lifecycle") != "PERSISTENT_CHANNEL_IDLE"
+                or row.get("migration_id") != self.migration_id
+                or row.get("source_request_id") != self.record.request_id
+                for row in sender_rows
+            )
             or any(
                 row.get("channel_create_count") != 1
                 or row.get("channel_destroy_count") != 0
                 or row.get("channel_session_count") != channel_sessions
-                for row in [sender, *targets]
+                for row in [*sender_rows, *targets]
             )
             or any(
                 row.get("status") != "PERSISTENT_CHANNEL_IDLE"
