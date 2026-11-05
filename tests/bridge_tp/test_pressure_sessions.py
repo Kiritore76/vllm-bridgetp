@@ -202,6 +202,14 @@ class RepeatedSessions(unittest.TestCase):
         for policy in policies.values():
             self.assertEqual(policy.note_started.call_count, 3)
 
+    def test_a_request_that_ended_right_after_takeover_still_rotates(self):
+        """GPU 11-05: never sampled with output, so no later migration ran."""
+        self.entry.service_observed = False
+        self.assertFalse(self.sequence.rotate())
+        self.entry.state = "COMPLETED"
+        with patch("tools.bridge_tp.pressure_sessions.publish_active"):
+            self.assertTrue(self.sequence.rotate())
+
     def test_missing_rank_or_native_confirmation_or_shutdown_blocks_reuse(self):
         self.entry.service_observed = False
         self.assertFalse(self.sequence.rotate())

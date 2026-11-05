@@ -106,7 +106,10 @@ class PressureSessions:
             self.stream.future.result()
             if entry.state not in {"COMMITTED", "ACCOUNTED", "COMPLETED"}:
                 return False
-            if not entry.service_observed:
+            # A request that ends right after takeover may never be sampled with
+            # output on its target (GPU 11-05: 7s left, then no rotation and no
+            # more migrations). Completion is stronger evidence than a sample.
+            if not entry.service_observed and entry.state != "COMPLETED":
                 return False
         from tools.bridge_tp.pressure_session import sender_receipt_paths
 
