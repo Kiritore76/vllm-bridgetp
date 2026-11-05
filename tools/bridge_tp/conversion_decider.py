@@ -96,6 +96,9 @@ RULES = dict(
     trend_lookahead_s=0.0,
     trend_hold_s=45.0,
     trend_recent_s=30.0,
+    # L2 -> L1A need not wait for the group's long requests: they migrate to
+    # the other TP2 first (same-TP migration, user 11-05).
+    evacuate_busy=False,
     cancel_hold_s=15.0,
 )
 
@@ -290,7 +293,7 @@ class ConversionDecider:
             if short < r["l2_leave_short"]:
                 failed.append("short rate within what L2 carries")
             urgent = s["tpk_waiting"]
-            if bundle_busy:
+            if bundle_busy and not r["evacuate_busy"]:
                 waiting.append("bundle serves a long request")
         elif (s["layout"], after) == ("L0", "L1A"):
             if blocks >= r["l0_leave_long_blocks"]:

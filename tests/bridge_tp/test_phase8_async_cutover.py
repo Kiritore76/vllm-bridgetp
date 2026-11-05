@@ -244,14 +244,14 @@ class TestBackgroundCutover(unittest.TestCase):
             phase8_source.report_failure(
                 root, phase8_source.SourceRole(2, 1), "delta failed"
             )
+            error = root / "cutover_finalize_error.json"
+            self.assertTrue(self._wait_for(error.exists))
+            # Not read while it is being replaced: Windows refuses the replace.
+            time.sleep(0.2)
             control = root / "request_freeze_control.json"
-            self.assertTrue(
-                self._wait_for(
-                    lambda: json.loads(control.read_text(encoding="utf-8"))["action"]
-                    == "RESUME"
-                )
+            self.assertEqual(
+                json.loads(control.read_text(encoding="utf-8"))["action"], "RESUME"
             )
-            self.assertTrue((root / "cutover_finalize_error.json").exists())
             self.assertFalse((root / "cutover_manifest.json").exists())
 
 

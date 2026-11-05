@@ -562,7 +562,10 @@ def decider_request(request):
         not required
         <= set(request)
         <= required | {"rules", "prestart", "pre_tilt", "assist", "multi"}
-        | {"max_conversions"}
+        | {"max_conversions", "evacuate"}
+        or request.get("evacuate", False) not in (True, False)
+        or request.get("evacuate")
+        and not request.get("multi")
         or request.get("multi", False) not in (True, False)
         or request.get("multi")
         and request["decider"] != "EXECUTE"
@@ -735,8 +738,12 @@ def extra_engine(plan, extra):
         env.update(
             BRIDGETP_GPU_DIRECT_BASE_PORT=str(channel["base_port"]),
             BRIDGETP_CHANNEL_GENERATION=str(channel["generation"]),
-            BRIDGETP_PREDICTOR_LIVE_EVENTS=extra["predictor_events"],
         )
+        if extra.get("predictor_events"):
+            env["BRIDGETP_PREDICTOR_LIVE_EVENTS"] = extra["predictor_events"]
+        else:
+            # A TP2 source only moves requests out of a group being retired.
+            env = {k: v for k, v in env.items() if "_PREDICTOR_" not in k}
     if channel and extra.get("targets_file"):
         # S5b: targets follow the conversion's file (none yet, or the TP2
         # this source joins), not a fixed startup list.

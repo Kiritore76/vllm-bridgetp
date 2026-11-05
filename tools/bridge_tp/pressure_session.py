@@ -252,7 +252,9 @@ class RollingPressureSession:
         if candidate.max_output_tokens != cap or cap > 8192:
             raise ValueError("selected request stop contract differs from live stream")
         # Several source ranks start at one exact token, named in advance.
-        source_tp = getattr(self.config, "source_tp_size", 1)
+        source_tp = getattr(candidate, "source_tp", None) or getattr(
+            self.config, "source_tp_size", 1
+        )
         trigger = candidate.generated + (
             SAME_TP_TRIGGER_LEAD_TOKENS if source_tp > 1 else 1
         )

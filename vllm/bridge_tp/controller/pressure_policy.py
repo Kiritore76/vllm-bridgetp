@@ -641,6 +641,8 @@ class Candidate:
     target_health_after_supported: bool = False
     # Causal per-request client-visible rate in the current source window.
     source_tokens_s: float | None = None
+    # Ranks of the instance holding it: several start at one token named ahead.
+    source_tp: int = 1
 
     def audit(self) -> dict:
         return {

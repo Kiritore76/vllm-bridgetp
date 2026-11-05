@@ -697,6 +697,7 @@ class PressureCoordinator:
         action: BoundAction | None,
         target_reading: PoolReading,
         required_blocks: int,
+        before_quiesce: bool = False,
     ) -> str | None:
         """S5a: start one conversion-assist migration chosen outside the policy.
 
@@ -707,7 +708,10 @@ class PressureCoordinator:
         once started, otherwise the refusal reason; nothing is retried here.
         """
         with self._lock:
-            if self.lifecycle(source) != "QUIESCING":
+            # Leaving a same-TP group: it keeps serving until its long
+            # requests are out, then quiesces (user 11-05).
+            allowed = ("QUIESCING", "ACTIVE") if before_quiesce else ("QUIESCING",)
+            if self.lifecycle(source) not in allowed:
                 return "source is not quiescing"
             if self.lifecycle(target) != "ACTIVE":
                 return "target is not active"

@@ -280,6 +280,11 @@ def main(argv=None):
         help="a decided merge drains with SELECTIVE_ROLL (drain assist)",
     )
     parser.add_argument(
+        "--decider-evacuate",
+        action="store_true",
+        help="leaving L2 migrates the group's long requests to the other TP2 first",
+    )
+    parser.add_argument(
         "--conversion-prestart",
         action="store_true",
         help="start the replacement engines behind a start gate while draining",
@@ -431,6 +436,8 @@ def main(argv=None):
         parser.error("--conversion-prestart needs a conversion")
     if (args.decider_pre_tilt or args.decider_assist) and not args.conversion_decider:
         parser.error("this option needs --conversion-decider")
+    if args.decider_evacuate and not args.decider_multi:
+        parser.error("--decider-evacuate needs --decider-multi")
     if args.decider_multi and args.conversion_decider != "execute":
         parser.error("--decider-multi needs --conversion-decider execute")
     if args.phase_shift:
@@ -832,6 +839,9 @@ def main(argv=None):
                     max_conversions=4,
                     rules=dict(current_length=True, trend_lookahead_s=60.0),
                 )
+                if args.decider_evacuate:
+                    spec["conversion"]["evacuate"] = True
+                    spec["conversion"]["rules"]["evacuate_busy"] = True
         if args.conversion and START_LAYOUT[args.conversion] != "L1A":
             spec["layout"] = dict(
                 name=START_LAYOUT[args.conversion],

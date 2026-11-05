@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# 当前任务：重跑同TP迁移冒烟第二场，TP2→TP2（GPU2,3→GPU0,1），无背景负载，手动触发。上次stager读错回执目录（已修）。
-# TP1→TP1已通过（qwen3_same_tp1_20261105_131218_26158）。只验证机制，不是负载收益。
+# 当前任务：长p2负载mixed_long_p2上跑一场自动转换，转回L1A时先把长请求迁到另一个TP2再停接入。
+# 对照是已有的两轮自动转换和静态L1A。负载相同，到达序列相同。
+# cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 set -uo pipefail
-same_tp=2
+scenes='mixed_long_p2:auto'
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
 py=$venv/bin/python
@@ -33,13 +34,16 @@ revision=$(git rev-parse HEAD)
     echo 'GPU上有计算进程，停止，未清理任何进程。'; exit 1;
 }
 mkdir -p /root/autodl-tmp/bridgetp/results || exit 1
-run=/root/autodl-tmp/bridgetp/results/qwen3_same_tp${same_tp}_$(date +%Y%m%d_%H%M%S)_${RANDOM}
+run=/root/autodl-tmp/bridgetp/results/qwen3_evacuate_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 printf '%s\n' "$revision" > "$run/revision.txt"
 echo "本批目录：$run"
-echo "同TP迁移冒烟：TP${same_tp}→TP${same_tp}，一条2048输入、6144输出的请求，输出到2048个token时手动迁移。"
-echo '迁移完成后，同一请求再跑一遍不迁移的版本，逐token对比，不一致判失败。'
-echo '约10–15分钟，上限20分钟；不自动重试，不删除原始目录。'
+echo 'A={GPU2,GPU3}，B={GPU0,GPU1}；双32768/.88，四卡。'
+echo "场次：$scenes"
+echo '请求留在控制器：每引擎未开始8条；只看prompt是否放得下，不看输出长度，也不为增长预留。'
+echo '运行：自动转换（从L1A开始），开迁移、短请求分流、过载迁移和转回迁移；通道只在转回时建立。'
+echo '负载：短10+少量长300秒→短1+长0.05/s共900秒→短8+两次6条突发600秒，到达共1920秒；长请求16384输入/8192输出。'
+echo '约45分钟，控制器上限60分钟；不自动重试，不删除原始目录。'
 export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 export VLLM_USE_V2_MODEL_RUNNER=0 OMP_NUM_THREADS=1
 "$py" -m compileall -q -j 0 "$repo/vllm" "$repo/tools" > "$run/compileall.log" 2>&1 || exit 1
@@ -47,20 +51,51 @@ nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu \
     --format=csv,noheader -lms 1000 > "$run/gpu_samples.csv" &
 smi=$!
 trap 'kill "$smi" 2>/dev/null || true' EXIT
-"$py" -B tools/bridge_tp/run_tp2_migration_smoke.py \
-    --platform qwen3 --same-tp "$same_tp" \
-    --model-path "$model" \
-    --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json" \
-    --out-root "$run/same-tp${same_tp}" \
-    --expected-revision "$revision" \
-    --history-tokens 2048 --timeout-s 1200 --no-archive 2>&1 | tee "$run/same-tp${same_tp}.console.log"
-final=${PIPESTATUS[0]}
-echo "same-tp${same_tp} 退出码：$final" | tee -a "$run/exit_codes.txt"
+final=0
+excludes=()
+for scene in $scenes; do
+    scenario=${scene%%:*}
+    layout=${scene##*:}
+    name="$scenario-$layout"
+    extra=()
+    static=$layout
+    case "$layout" in
+        L1A) extra=(--kv-short-exempt --overload-migrate --migrate-current-length) ;;
+        auto)
+            static=L1A
+            extra=(--kv-short-exempt --overload-migrate --migrate-current-length
+                --conversion-decider execute --decider-multi --decider-pre-tilt
+                --decider-assist --decider-evacuate --conversion-prestart)
+            ;;
+    esac
+    [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || {
+        echo "上一场后GPU仍有计算进程，停止于 $name 之前。"; final=1; break;
+    }
+    echo "=== 开始：$name（$(date +%T)）==="
+    "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
+        --phase-shift --phase-scenario "$scenario" --static-layout "$static" \
+        --hold-queue "${extra[@]}" \
+        --expanded-context --current-machine --repetitions 1 \
+        --model "$model" \
+        --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
+        --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json" \
+        --output "$run/$name" --expected-revision "$revision" 2>&1 | tee "$run/$name.console.log"
+    status=${PIPESTATUS[0]}
+    echo "$name 退出码：$status" | tee -a "$run/exit_codes.txt"
+    [ "$status" = 0 ] || final=$status
+    # 有有效内层无损包时，外层只收该包与日志，不重复原始目录；原始目录仍保留。
+    if (cd "$run" && sha256sum -c "$name.tar.gz.sha256" >/dev/null 2>&1) \
+        && tar -tzf "$run/$name.tar.gz" >/dev/null 2>&1; then
+        excludes+=(--exclude="$(basename "$run")/$name")
+    else
+        echo "$name 内层包未通过校验，外层包含原始目录用于诊断。"
+    fi
+done
 kill "$smi" 2>/dev/null || true
 wait "$smi" 2>/dev/null || true
-tar -C "$(dirname "$run")" -czf "$run.tar.gz" "$(basename "$run")" || exit 1
+tar -C "$(dirname "$run")" "${excludes[@]}" -czf "$run.tar.gz" "$(basename "$run")" || exit 1
 sha256sum "$run.tar.gz" > "$run.tar.gz.sha256" || exit 1
-cat "$run/same-tp${same_tp}/result.json" 2>/dev/null
+cat "$run/exit_codes.txt" 2>/dev/null
 echo "总退出码：$final"
 echo "请拿回：$run.tar.gz"
 echo "以及：$run.tar.gz.sha256"

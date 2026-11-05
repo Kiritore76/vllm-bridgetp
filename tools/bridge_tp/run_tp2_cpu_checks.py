@@ -38,6 +38,7 @@ TESTS = [
     "predictor_mlp4_scratch",
     "tp2_reconfiguration",
     "same_tp_migration",
+    "same_tp_evacuation",
     "performance_trace",
     "pressure_session",
     "pressure_sessions",

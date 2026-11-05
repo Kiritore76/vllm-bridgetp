@@ -523,9 +523,23 @@ def remaining_bins(row, candidate):
     return [(u, round(m, 6)) for u, m in bins], "PREDICTED"
 
 
+class NoPrediction:
+    """Predictor of a source that only migrates when its group is retired."""
+
+    @staticmethod
+    def advisory(*args, **kwargs):
+        return dict(status="UNAVAILABLE")
+
+
 def channel_sources(manifest):
     """Routing-only TP1 rows that also own a migration channel (S1-d2c)."""
     return [r for r in extra_instances(manifest) if r.get("migration_channel")]
+
+
+def policy_sources(candidates_by_source, evacuation_sources):
+    """What the migration policy may choose from: never a same-TP source."""
+    excluded = {row[0] for row in evacuation_sources}
+    return {s: cs for s, cs in candidates_by_source.items() if s not in excluded}
 
 
 def extra_instances(manifest):
@@ -765,6 +779,7 @@ def _run(args, prepared):
             align_history=getattr(args, "platform", "a100") == "qwen3",
         )
 
+    evacuation_sources = []
     # Migration sources: the pair source, then every TP1 with its own channel.
     migration_sources = [("tp1", args.source_inventory, predictor)] * (
         "tp1" in pair
@@ -999,6 +1014,7 @@ def _run(args, prepared):
             actions.get(candidate.request_id),
             target_pool,
             required,
+            before_quiesce=bool(assist.get("before_quiesce")),
         )
 
     def publish_layout_status(now, polled, dispatched, *, force=False):
@@ -1190,6 +1206,12 @@ def _run(args, prepared):
                             predictor_for(row["predictor_events"]),
                         )
                     )
+                elif row.get("migration_channel"):
+                    # Same-TP source: only a conversion retiring it may migrate
+                    # from it, so the migration policy never sees this list.
+                    evacuation_sources.append(
+                        (pool_id, Path(row["inventory_path"]), NoPrediction())
+                    )
                 changes.append(dict(pool_id=pool_id, change="ADDED"))
             # The file may skip a step between polls (ACTIVE straight to
             # RETIRED); walk the coordinator's transitions in order.
@@ -1224,6 +1246,9 @@ def _run(args, prepared):
             if state == "RETIRED" and pool_id in slots:
                 remove_slot(pool_id)
                 migration_sources[:] = [m for m in migration_sources if m[0] != pool_id]
+                evacuation_sources[:] = [
+                    m for m in evacuation_sources if m[0] != pool_id
+                ]
         # A deferred retirement re-reads the same file on the next tick.
         layout_state.update(
             signature=None if deferred else signature,
@@ -1511,7 +1536,9 @@ def _run(args, prepared):
             candidates_by_source, runtimes, rates_by_source = {}, {}, {}
             # Published (next tick) with each request's planner row.
             layout_state["candidates"] = {}
-            for source_id, inventory_path, source_predictor in migration_sources:
+            for source_id, inventory_path, source_predictor in (
+                migration_sources + evacuation_sources
+            ):
                 if t is None or source_id not in index_of:
                     continue
                 n = index_of[source_id]
@@ -1583,6 +1610,7 @@ def _run(args, prepared):
                                 session.record
                                 and session.record.request_id == row["request_id"]
                             ),
+                            source_tp=tp_of[source_id],
                             target_health_after_supported=(
                                 health_module.supported_after(
                                     health_tracker.reference,
@@ -1696,12 +1724,16 @@ def _run(args, prepared):
                     {target_pool_id: pools[t]}
                     | {
                         source: pools[index_of[source]]
-                        for source in candidates_by_source
+                        for source in policy_sources(
+                            candidates_by_source, evacuation_sources
+                        )
                     },
                     tp_of,
                     {
                         (source, target_pool_id): cs
-                        for source, cs in candidates_by_source.items()
+                        for source, cs in policy_sources(
+                            candidates_by_source, evacuation_sources
+                        ).items()
                     },
                     actions,
                 )

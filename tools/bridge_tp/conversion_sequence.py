@@ -65,12 +65,37 @@ def prepare_plan(plan):
     )
 
 
+# Opening a channel between two running engines (warmup included). Past this
+# the group waits for its long requests as it does without migration.
+EVACUATION_CHANNEL_S = 30.0
+
+
+def evacuation_rows(status, instance_ids):
+    """Long requests of the group, least generated first.
+
+    Remaining output is unknown (user 11-04: never assume the cap), so every
+    long request moves; the least generated is the cheapest to move and the
+    one least likely to end by itself soon.
+    """
+    from tools.bridge_tp.conversion_decider import LONG_TOKENS
+
+    rows = [
+        dict(q, instance=i)
+        for i in instance_ids
+        for q in status["instances"][i]["requests"]
+        if q["prompt_tokens"] + q["generated"] >= LONG_TOKENS
+    ]
+    return sorted(rows, key=lambda q: (q["generated"], q["request_id"]))
+
+
 class SequenceBackend(pc.ControllerConversionBackend):
     """Per-plan transient state over one run's registry and owned resources."""
 
     def __init__(self, *args, sequence_context, **kwargs):
         super().__init__(*args, **kwargs)
         self.context = sequence_context
+        self.evacuate_enabled = False
+        self.evacuation_run = None
         self.next_service_port = self.base_port
         channels = list(pc.read_json(self.channel_plan) or [])
         self.next_channel_generation = (
@@ -131,6 +156,11 @@ class SequenceBackend(pc.ControllerConversionBackend):
         )
         self.target_tp_ranks = 2 if target_id else 0
         self.join = None
+        self.evacuation_run = (
+            dict(state="IDLE", target=target_id, channels={}, last_reason=None)
+            if step.get("evacuate") and target_id and (bundle, target) == ("A", 1)
+            else None
+        )
         if bundle == "B" and target == 2:
             channels, files = {}, {}
             for source, r in sorted(active.items()):
@@ -185,6 +215,22 @@ class SequenceBackend(pc.ControllerConversionBackend):
                 extra["inventory_path"] = str(
                     self.run_dir / f"inventory_{instance_id}.jsonl"
                 )
+            elif (
+                self.evacuate_enabled
+                and plan["bundle_id"] == "A"
+                and plan["target_bundle_mode"] == "TP2"
+            ):
+                # A future same-TP source. Its channel opens only when the group
+                # is being retired; until then nothing is connected.
+                channel = dict(
+                    self.channel_for_new(instance_id),
+                    target=self.evacuation_target(),
+                    target_tp=2,
+                )
+                joined = dict(migration_channel=channel)
+                path = Path(self.context["folder"]) / f"gpu_targets_{instance_id}.json"
+                pc.atomic_json(path, [])
+                extra.update(joined, targets_file=str(path))
             elif "migration_channel" in joined:
                 # Channel generations do not reuse an old target's counters.
                 c = self.channel_for_new(instance_id)
@@ -193,6 +239,163 @@ class SequenceBackend(pc.ControllerConversionBackend):
             self.next_service_port = max(self.next_service_port, extra["port"] + 1)
             self._specs.append((instance_id, generation, extra, joined))
         return self._specs
+
+    def evacuation_target(self):
+        return next(
+            i
+            for i, r in self.active().items()
+            if r.bundle_id == "B" and r.tp_degree == 2
+        )
+
+    def gate(self, plan):
+        """Long requests leave first; only then does the group stop accepting.
+
+        The start gate is the last point before routing closes, so the group
+        keeps serving short requests the whole time, and the plan can still be
+        cancelled here.
+        """
+        run = self.evacuation_run
+        if run is not None and run["state"] != "DONE":
+            self.evacuate_tick(plan, run)
+            if run["state"] != "DONE":
+                return False
+        return super().gate(plan)
+
+    def evacuate_note(self, run, reason):
+        if reason != run["last_reason"]:
+            run["last_reason"] = reason
+            self.decision("EVACUATE", state=run["state"], reason=reason)
+
+    def evacuate_tick(self, plan, run):
+        if self.clock() - self.assist_at < self.safety["decision_interval_s"]:
+            return
+        self.assist_at = self.clock()
+        status = self.status()
+        if not self.fresh(status):
+            return
+        ids = [r.instance_id for r in self.refs(plan)]
+        rows = evacuation_rows(status, ids)
+        moving = any(status["instances"][i]["sessions"] for i in ids)
+        if not rows and not moving:
+            run["state"] = "DONE"
+            self.ops.event(
+                "EVACUATION_DONE",
+                moved=run.get("moved", 0),
+                reason=run["last_reason"],
+            )
+            return
+        if run["state"] == "NATURAL":
+            return
+        if run["state"] == "IDLE":
+            self.evacuate_open(plan, run, ids)
+        if run["state"] == "CHANNEL":
+            self.evacuate_channel_ready(run)
+        if run["state"] == "MIGRATING":
+            self.evacuate_step(run, status, rows, moving)
+
+    def evacuate_open(self, plan, run, ids):
+        """Connect the group to the retained TP2, for this conversion only."""
+        channels = {source: self.channel(source) for source in ids}
+        rows = list(pc.read_json(self.channel_plan) or [])
+        rows += [
+            dict(source=s, base_port=c["base_port"], generation=c["generation"])
+            for s, c in channels.items()
+        ]
+        pc.atomic_json(self.channel_plan, sorted(rows, key=lambda r: r["source"]))
+        for source, channel in channels.items():
+            pc.atomic_json(
+                self.rows[source]["targets_file"],
+                [
+                    dict(
+                        target=run["target"],
+                        host=self.context["target_host"],
+                        base_port=channel["base_port"],
+                        tp=2,
+                        generation=channel["generation"],
+                    )
+                ],
+            )
+        run.update(state="CHANNEL", channels=channels, opened_at=self.clock())
+        # New long requests stop coming here; short ones still do.
+        self.write_layout({}, tilt=ids)
+        self.ops.event("EVACUATION_OPEN", target=run["target"], sources=sorted(ids))
+
+    def evacuate_channel_ready(self, run):
+        receipts = pc.preconnect_receipts(self.run_dir)
+        for source, channel in run["channels"].items():
+            label = f"source-{channel['pool']}-{run['target']}"
+            names = [f"tp_rank_{rank}-{source}.json" for rank in range(2)] + [
+                f"{label}.json",
+                f"{label}_rank_1.json",
+            ]
+            if any(
+                (receipts.get(name) or {}).get("status") != "WARMUP_COMPLETE"
+                or receipts[name].get("channel_generation") != channel["generation"]
+                for name in names
+            ):
+                if self.clock() - run["opened_at"] > EVACUATION_CHANNEL_S:
+                    self.evacuation_close(run)
+                    run["state"] = "NATURAL"
+                    self.evacuate_note(run, "channel not ready in time")
+                    self.ops.event("EVACUATION_CHANNEL_TIMEOUT", waited=names)
+                return
+        run["state"] = "MIGRATING"
+        self.ops.event(
+            "EVACUATION_CHANNEL_READY",
+            ready_s=round(self.clock() - run["opened_at"], 3),
+        )
+
+    def evacuate_step(self, run, status, rows, moving):
+        result = status.get("assist_result")
+        if self.assist_seq > self.assist_step_start_seq and (
+            result is None or result["seq"] != self.assist_seq
+        ):
+            return
+        if result is not None and result["seq"] == self.assist_seq:
+            if result["state"] == "STARTED" and run.get("counted") != result["seq"]:
+                run["counted"] = result["seq"]
+                run["moved"] = run.get("moved", 0) + 1
+            self.evacuate_note(run, result.get("reason"))
+        target = status["instances"].get(run["target"], {})
+        if moving or target.get("sessions"):
+            return
+        startable = [q for q in rows if q["action_available"]]
+        if not startable:
+            return
+        row = startable[0]
+        self.assist_seq += 1
+        self.write_layout(
+            {},
+            assist=dict(
+                seq=self.assist_seq,
+                request_id=row["request_id"],
+                source=row["instance"],
+                before_quiesce=True,
+            ),
+        )
+        self.ops.event(
+            "ASSIST_REQUESTED",
+            seq=self.assist_seq,
+            request_id=row["request_id"],
+            instance=row["instance"],
+            generated=row["generated"],
+        )
+
+    def evacuation_close(self, run):
+        """Disconnect after a cancelled or impossible evacuation."""
+        channels = run["channels"]
+        if channels:
+            pc.atomic_json(
+                self.channel_plan,
+                [
+                    r
+                    for r in pc.read_json(self.channel_plan) or []
+                    if r["source"] not in channels
+                ],
+            )
+            for source in channels:
+                pc.atomic_json(self.rows[source]["targets_file"], [])
+            run["channels"] = {}
 
     def channel_for_new(self, instance_id):
         self.rows.setdefault(instance_id, {})
@@ -494,6 +697,7 @@ class DecidedSequenceDriver(ConversionSequenceDriver):
         self.cancel_since = None
         self.cancel_checked = -float("inf")
         backend.assist_requires_spare = False
+        backend.evacuate_enabled = bool(request.get("evacuate"))
 
     def _loop(self):
         try:
@@ -590,6 +794,8 @@ class DecidedSequenceDriver(ConversionSequenceDriver):
             else "DRAIN",
             held_s=proposal["held_s"],
         )
+        if self.sequence_request.get("evacuate") and (bundle, mode) == ("A", "TP1"):
+            step["evacuate"] = True
         self.tilt_before_step = list(self.backend.layout_tilt)
         self.step_edge = (proposal.get("layout"), (bundle, mode))
         self.cancel_since = None
@@ -598,6 +804,9 @@ class DecidedSequenceDriver(ConversionSequenceDriver):
         # The prepare stage reads its options (pre_tilt) from the request.
         self.request = self.sequence_request
         if after == "ABORTED":
+            run = getattr(self.backend, "evacuation_run", None)
+            if run is not None:
+                self.backend.evacuation_close(run)
             self.decider.cancelled()
         else:
             self.decider.converted(time.time())
