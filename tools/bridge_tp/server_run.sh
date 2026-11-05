@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 当前任务：重跑同TP迁移冒烟第一场，TP1→TP1（GPU2→GPU3），无背景负载，手动触发。
-# 上次卡在stager拒绝TP1目标（已修）。通过后才跑TP2→TP2。只验证机制，不是负载收益。
+# 当前任务：同TP迁移冒烟第二场，TP2→TP2（GPU2,3→GPU0,1），无背景负载，手动触发。
+# TP1→TP1已通过（qwen3_same_tp1_20261105_131218_26158）。只验证机制，不是负载收益。
 set -uo pipefail
-same_tp=1
+same_tp=2
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
 py=$venv/bin/python
