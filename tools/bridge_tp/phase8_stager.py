@@ -181,9 +181,13 @@ def _build_direct_gpu_rank_record(
     *, manifest: dict[str, Any], cutover: dict[str, Any], run_dir: Path,
     rank: int
 ) -> dict[str, Any]:
-    receipts = sorted(
-        (run_dir / "gpu_direct_delta_sender_receipts").glob("delta_*.json")
-    )
+    # One TP1 sender covers every rank. On the same TP each rank has its own
+    # sender, whose batches need not line up with the other ranks'.
+    paired = int(manifest.get("source_tp_size", 1)) > 1
+    directory = run_dir / "gpu_direct_delta_sender_receipts"
+    if paired:
+        directory = directory / f"rank_{rank}"
+    receipts = sorted(directory.glob("delta_*.json"))
     rows = [_load_json(path) for path in receipts]
     coverage = [[int(row["start_token"]), int(row["end_token"])] for row in rows]
     expected = int(manifest["num_computed_tokens"])
@@ -194,13 +198,14 @@ def _build_direct_gpu_rank_record(
     if expected != int(cutover["num_computed_tokens"]):
         raise ValueError("GPU-direct delta sender coverage is incomplete")
     delta_bytes = sum(int(row["payload_bytes"]) for row in rows)
+    if not paired:
+        delta_bytes //= int(manifest["target_tp_size"])
     return {
         "target_tp_rank": rank,
         "host": "persistent-nccl-session",
         "port": 0,
         "payload_bytes": (
-            int(manifest["ranks"][rank]["raw_tensor_bytes"])
-            + delta_bytes // int(manifest["target_tp_size"])
+            int(manifest["ranks"][rank]["raw_tensor_bytes"]) + delta_bytes
         ),
         "payload_sha256": "GPU_EXACT_READBACK",
         "num_frames": 1 + len(coverage),

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 当前任务：同TP迁移冒烟第二场，TP2→TP2（GPU2,3→GPU0,1），无背景负载，手动触发。
+# 当前任务：重跑同TP迁移冒烟第二场，TP2→TP2（GPU2,3→GPU0,1），无背景负载，手动触发。上次stager读错回执目录（已修）。
 # TP1→TP1已通过（qwen3_same_tp1_20261105_131218_26158）。只验证机制，不是负载收益。
 set -uo pipefail
 same_tp=2

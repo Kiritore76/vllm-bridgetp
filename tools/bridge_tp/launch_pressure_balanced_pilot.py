@@ -804,8 +804,11 @@ def verify_full_speed(run_dir):
     for path in controls:
         if read(path).get("rate_gib_s") not in (None, 0):
             raise RuntimeError("full-speed runtime control contains a rate limit")
-    senders = list(run_dir.glob("sessions/*/gpu_direct_sender.json"))
-    senders += list(run_dir.glob("gpu_direct_sender.json"))
+    # One receipt per source rank (gpu_direct_sender_rank_N.json on the same TP).
+    senders = []
+    for name in ("gpu_direct_sender.json", "gpu_direct_sender_rank_*.json"):
+        senders += list(run_dir.glob(f"sessions/*/{name}"))
+        senders += list(run_dir.glob(name))
     ranks = 0
     for path in senders:
         for rank in read(path)["ranks"]:

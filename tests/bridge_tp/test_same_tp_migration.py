@@ -298,6 +298,134 @@ class ChannelDescriptionTests(unittest.TestCase):
             gpu_direct_targets.parse_targets(json.dumps(rows), 8)
 
 
+def stager_record_builder():
+    """The real function, without importing the stager's GPU dependencies."""
+    source = (ROOT / "tools/bridge_tp/phase8_stager.py").read_text("utf-8")
+    function = next(
+        n
+        for n in ast.parse(source).body
+        if isinstance(n, ast.FunctionDef) and n.name == "_build_direct_gpu_rank_record"
+    )
+    function.returns = None
+    for argument in function.args.kwonlyargs:
+        argument.annotation = None
+    namespace = dict(_load_json=lambda path: json.loads(path.read_text("utf-8")))
+    exec(compile(ast.Module([function], []), "stager", "exec"), namespace)
+    return namespace["_build_direct_gpu_rank_record"]
+
+
+class StagerCoverageTests(unittest.TestCase):
+    """GPU 11-05: the stager only read one sender's receipts and exited."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.run_dir = Path(temporary.name)
+        self.receipts = self.run_dir / "gpu_direct_delta_sender_receipts"
+        self.build = stager_record_builder()
+
+    def receipt(self, directory, start, end, payload_bytes=100):
+        receipt(directory, start, end)
+        path = directory / f"delta_{start:012d}_{end:012d}.json"
+        row = json.loads(path.read_text("utf-8"))
+        path.write_text(json.dumps(dict(row, payload_bytes=payload_bytes)))
+
+    def record(self, manifest, rank, end=30):
+        ranks = [dict(raw_tensor_bytes=1000)] * manifest["target_tp_size"]
+        return self.build(
+            manifest=dict(manifest, num_computed_tokens=10, ranks=ranks),
+            cutover=dict(num_computed_tokens=end),
+            run_dir=self.run_dir,
+            rank=rank,
+        )
+
+    def test_one_sender_shares_its_bytes_between_ranks(self):
+        self.receipt(self.receipts, 10, 30, payload_bytes=200)
+        manifest = dict(target_tp_size=2)
+        self.assertEqual(self.record(manifest, 1)["payload_bytes"], 1100)
+
+    def test_each_rank_has_its_own_batches_and_bytes(self):
+        manifest = dict(source_tp_size=2, target_tp_size=2)
+        self.receipt(self.receipts / "rank_0", 10, 30, payload_bytes=100)
+        self.receipt(self.receipts / "rank_1", 10, 16, payload_bytes=30)
+        self.receipt(self.receipts / "rank_1", 16, 30, payload_bytes=70)
+        first, second = self.record(manifest, 0), self.record(manifest, 1)
+        self.assertEqual(first["delta_coverage"], [[10, 30]])
+        self.assertEqual(second["delta_coverage"], [[10, 16], [16, 30]])
+        self.assertEqual(first["payload_bytes"], 1100)
+        self.assertEqual(second["payload_bytes"], 1100)
+        self.assertEqual(second["target_tp_rank"], 1)
+
+    def test_a_rank_that_is_short_fails_closed(self):
+        manifest = dict(source_tp_size=2, target_tp_size=2)
+        self.receipt(self.receipts / "rank_0", 10, 30)
+        self.receipt(self.receipts / "rank_1", 10, 16)
+        self.record(manifest, 0)
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            self.record(manifest, 1)
+
+    def test_tp1_to_tp1_is_the_single_sender_case(self):
+        self.receipt(self.receipts, 10, 30, payload_bytes=100)
+        manifest = dict(source_tp_size=1, target_tp_size=1)
+        self.assertEqual(self.record(manifest, 0)["payload_bytes"], 1100)
+
+
+class EveryRankReceiptTests(unittest.TestCase):
+    """After the takeover, the checks must see every source rank's sender."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.run_dir = Path(temporary.name)
+        self.write("session_manifest.json", source_tp_size=2, target_tp_size=2)
+        for rank in range(2):
+            self.write(
+                f"persistent_channel_receipts/tp_rank_{rank}.json",
+                status="PERSISTENT_CHANNEL_IDLE",
+                migration_id="m",
+                session_request_id="r",
+                tp_rank=rank,
+                channel_create_count=1,
+                channel_destroy_count=0,
+                channel_session_count=1,
+            )
+
+    def write(self, name, **fields):
+        path = self.run_dir / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(fields))
+
+    def sender(self, name, lifecycle="PERSISTENT_CHANNEL_IDLE"):
+        self.write(
+            name,
+            communicator_lifecycle=lifecycle,
+            migration_id="m",
+            source_request_id="r",
+            channel_create_count=1,
+            channel_destroy_count=0,
+            channel_session_count=1,
+        )
+
+    def idle(self):
+        from tools.bridge_tp.pressure_session import channel_idle
+
+        return channel_idle(self.run_dir, "m", "r")
+
+    def test_channel_is_idle_only_when_every_rank_is(self):
+        self.sender("gpu_direct_sender.json")
+        self.assertFalse(self.idle())
+        self.sender("gpu_direct_sender_rank_1.json", lifecycle="ACTIVE")
+        self.assertFalse(self.idle())
+        self.sender("gpu_direct_sender_rank_1.json")
+        self.assertTrue(self.idle())
+
+    def test_full_speed_check_reads_every_rank(self):
+        source = (ROOT / "tools/bridge_tp/launch_pressure_balanced_pilot.py").read_text(
+            "utf-8"
+        )
+        self.assertIn("gpu_direct_sender_rank_*.json", source)
+
+
 class ControllerContractTests(unittest.TestCase):
     """No GPU here: pin the file-level contract between ranks and controller."""
 
