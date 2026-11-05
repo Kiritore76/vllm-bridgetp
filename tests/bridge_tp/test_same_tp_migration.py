@@ -304,6 +304,13 @@ class ControllerContractTests(unittest.TestCase):
     def test_controller_reads_the_file_the_ranks_write(self):
         self.assertIn(f'"{RANK_FAILURE}"', PRESSURE_SESSION.read_text("utf-8"))
 
+    def test_session_tools_accept_a_tp1_target(self):
+        # GPU 11-05: the stager still refused TP1 and the takeover waited forever.
+        for name in ("phase8_stager.py", "run_pressure_balanced_pilot.py"):
+            source = (ROOT / "tools/bridge_tp" / name).read_text("utf-8")
+            self.assertNotIn("validate_target_tp", source)
+            self.assertIn("validate_session_tp", source)
+
     def test_only_rank_zero_freezes(self):
         source = PHASE8.read_text("utf-8")
         branch = source.index("if not state.role.leader:\n        # Rank 0 asks")

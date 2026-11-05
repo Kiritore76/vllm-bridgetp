@@ -20,7 +20,7 @@ from typing import Any
 
 import torch
 
-from vllm.bridge_tp.controller.tp_geometry import validate_target_tp
+from vllm.bridge_tp.controller.tp_geometry import validate_session_tp
 from vllm.bridge_tp.runtime_control import RuntimeControl
 from vllm.bridge_tp.stream_protocol import (
     PROTOCOL_VERSION,
@@ -228,7 +228,7 @@ class _DeltaReceivers:
         self.stop = threading.Event()
         self.lock = threading.Lock()
         self.by_rank: list[dict[int, dict[str, Any]]] = [
-            {} for _ in range(validate_target_tp(self.manifest["target_tp_size"]))
+            {} for _ in range(validate_session_tp(self.manifest["target_tp_size"]))
         ]
         # GPU-resident Shadow needs a digest of history followed by every
         # delta at cutover. Retain only the much smaller delta wire images;
@@ -236,14 +236,14 @@ class _DeltaReceivers:
         # soon as it arrives. This avoids rereading thousands of queue files
         # while the source request is frozen.
         self.wire_by_rank: list[dict[int, bytes]] = [
-            {} for _ in range(validate_target_tp(self.manifest["target_tp_size"]))
+            {} for _ in range(validate_session_tp(self.manifest["target_tp_size"]))
         ]
         self.errors: list[str] = []
         self.listeners: list[socket.socket] = []
         self.threads: list[threading.Thread] = []
 
     def start(self) -> None:
-        for rank in range(validate_target_tp(self.manifest["target_tp_size"])):
+        for rank in range(validate_session_tp(self.manifest["target_tp_size"])):
             listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind((self.host, self.base_port + rank))
@@ -649,7 +649,7 @@ def main(argv=None) -> None:
         _cleanup(args.run_dir, str(request.get("reason")), 0, 0)
         return
     manifest = _load_json(manifest_path)
-    target_tp = validate_target_tp(manifest["target_tp_size"])
+    target_tp = validate_session_tp(manifest["target_tp_size"])
     if manifest.get("phase") != "BridgeTP D3 Phase 8":
         raise ValueError("CPU stager requires a Phase 8 source manifest")
 

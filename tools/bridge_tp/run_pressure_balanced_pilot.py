@@ -201,7 +201,7 @@ def preflight(args):
         },
         rate=SimpleNamespace(**raw["rate"]),
         transfer_mode=raw.get("transfer_mode", "ADAPTIVE"),
-        target_tp_size=load("tp_geometry").validate_target_tp(
+        target_tp_size=load("tp_geometry").validate_session_tp(
             raw.get("target_tp_size", 4)
         ),
         policy=SimpleNamespace(kv_bytes_per_token=raw["policy"]["kv_bytes_per_token"]),
