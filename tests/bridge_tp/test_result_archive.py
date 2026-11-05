@@ -95,6 +95,75 @@ class ResultArchiveTests(unittest.TestCase):
                 self.assertEqual((root / name).read_bytes(), data)
             self.assertFalse((base / "restored/batch/.__bridgetp_compact__").exists())
 
+    def test_compact_members_keep_path_order_when_workers_finish_out_of_order(self):
+        import time
+
+        from tools.bridge_tp import compact_archive
+
+        prepare = compact_archive.prepare_file
+
+        def first_is_slowest(path, compressed):
+            if path.name == "a.jsonl":
+                time.sleep(0.3)
+            return prepare(path, compressed)
+
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "batch"
+            root.mkdir()
+            files = {
+                f"{name}.jsonl": f'{{"file":"{name}"}}\n'.encode() * 100_000
+                for name in "abc"
+            }
+            files["d.log"] = b"small"
+            for name, data in files.items():
+                (root / name).write_bytes(data)
+            archive = base / "result.tar.gz"
+            with (
+                patch.object(compact_archive, "pack_workers", return_value=4),
+                patch.object(compact_archive, "prepare_file", first_is_slowest),
+            ):
+                receipt = pack(root, archive, compact=True)
+            self.assertEqual(receipt["transformed_files"], 3)
+            with tarfile.open(archive) as tar:
+                names = [m.name.removeprefix("batch/") for m in tar.getmembers()]
+            prefix = compact_archive.PREFIX
+            self.assertEqual(
+                names,
+                [
+                    f"{prefix}/a.jsonl.xz",
+                    f"{prefix}/b.jsonl.xz",
+                    f"{prefix}/c.jsonl.xz",
+                    "d.log",
+                    "archive_contents_manifest.json",
+                ],
+            )
+            compact_archive.restore(archive, base / "restored")
+            for name, data in files.items():
+                self.assertEqual((base / "restored/batch" / name).read_bytes(), data)
+            self.assertEqual(
+                [p.name for p in base.glob("compact-*")], [], "temporary files left"
+            )
+
+    def test_compact_failure_in_a_worker_fails_the_pack(self):
+        from tools.bridge_tp import compact_archive
+
+        def broken(path, compressed):
+            raise ValueError("evidence changed during packing")
+
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "batch"
+            root.mkdir()
+            (root / "a.log").write_bytes(b"x")
+            archive = base / "result.tar.gz"
+            with (
+                patch.object(compact_archive, "prepare_file", broken),
+                self.assertRaisesRegex(ValueError, "evidence changed"),
+            ):
+                pack(root, archive, compact=True)
+            self.assertFalse(archive.exists())
+
     def test_unique_or_torn_durable_journal_is_not_deduplicated(self):
         from tools.bridge_tp.compact_archive import restore
 

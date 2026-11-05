@@ -68,22 +68,35 @@ def prepare_plan(plan):
 # Opening a channel between two running engines (warmup included). Past this
 # the group waits for its long requests as it does without migration.
 EVACUATION_CHANNEL_S = 30.0
+# A request whose output cap is this close does not move: it ends by itself
+# during the drain. Chosen by the user 11-05; about 25s at a busy TP2's rate.
+EVACUATION_FINISH_TOKENS = 512
 
 
-def evacuation_rows(status, instance_ids):
-    """Long requests of the group, least generated first.
-
-    Remaining output is unknown (user 11-04: never assume the cap), so every
-    long request moves; the least generated is the cheapest to move and the
-    one least likely to end by itself soon.
-    """
+def evacuation_long_rows(status, instance_ids):
     from tools.bridge_tp.conversion_decider import LONG_TOKENS
 
-    rows = [
+    return [
         dict(q, instance=i)
         for i in instance_ids
         for q in status["instances"][i]["requests"]
         if q["prompt_tokens"] + q["generated"] >= LONG_TOKENS
+    ]
+
+
+def evacuation_rows(status, instance_ids):
+    """Long requests of the group to move, least generated first.
+
+    Remaining output is unknown (user 11-04: never assume the cap), so a long
+    request moves unless the cap itself says it ends within
+    EVACUATION_FINISH_TOKENS (user 11-05); that one finishes during the drain.
+    The cap is only an upper bound here, never a predicted length. The least
+    generated is the cheapest to move and the least likely to end by itself.
+    """
+    rows = [
+        q
+        for q in evacuation_long_rows(status, instance_ids)
+        if q["max_output_tokens"] - q["generated"] > EVACUATION_FINISH_TOKENS
     ]
     return sorted(rows, key=lambda q: (q["generated"], q["request_id"]))
 
@@ -281,6 +294,7 @@ class SequenceBackend(pc.ControllerConversionBackend):
             self.ops.event(
                 "EVACUATION_DONE",
                 moved=run.get("moved", 0),
+                finishing=len(evacuation_long_rows(status, ids)),
                 reason=run["last_reason"],
             )
             return

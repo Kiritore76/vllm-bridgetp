@@ -195,6 +195,49 @@ class StaticLayoutTests(unittest.TestCase):
             )
             self.assertEqual((code, value["runs"], value["arms"]), (0, 1, ["stay"]))
 
+    def test_the_rotation_load_is_seeded_and_near_its_nominal_rates(self):
+        from tools.bridge_tp import qwen3_phase_shift as phase
+
+        inputs = json.loads(Path(INPUTS).read_text(encoding="utf-8"))
+        jobs = phase.jobs(inputs, "mixed_rotation")
+        self.assertEqual(jobs, phase.jobs(inputs, "mixed_rotation"))
+        long = [j for j in jobs if j["workload_role"] == "long_input_output"]
+
+        def count(name):
+            return sum(j["workload_phase"] == name for j in long)
+
+        self.assertTrue(41 <= count("l1_long") <= 49)
+        self.assertTrue(5 <= count("b_blip") <= 7)
+        self.assertTrue(21 <= count("l2_long") <= 27)
+        self.assertEqual(count("s2_short") + count("s4_short"), 0)
+        self.assertLess(max(j["at_s"] for j in jobs), 3180)
+        self.assertEqual(jobs, sorted(jobs, key=lambda j: j["at_s"]))
+        gaps = {
+            b["at_s"] - a["at_s"] for a, b in zip(long, long[1:], strict=False)
+        }
+        self.assertGreater(len(gaps), 10)  # Poisson, not evenly spaced.
+        code, value = plan(
+            "--phase-shift",
+            "--phase-scenario",
+            "mixed_rotation",
+            "--static-layout",
+            "L1A",
+            "--hold-queue",
+            "--expanded-context",
+            "--kv-short-exempt",
+            "--overload-migrate",
+        )
+        self.assertEqual((code, value["runs"]), (0, 1))
+
+    def test_a_seeded_arrival_never_runs_past_its_phase(self):
+        from tools.bridge_tp import qwen3_phase_shift as phase
+
+        times = phase.arrival_times(100, 200, 2.0, 7, "short_probe")
+        self.assertTrue(all(100 <= t < 200 for t in times))
+        self.assertEqual(times, phase.arrival_times(100, 200, 2.0, 7, "short_probe"))
+        self.assertNotEqual(times, phase.arrival_times(100, 200, 2.0, 8, "short_probe"))
+        self.assertEqual(phase.arrival_times(0, 2, 2.0, None, "x"), [0, 0.5, 1.0, 1.5])
+
     def test_the_long_p2_load(self):
         from tools.bridge_tp import qwen3_phase_shift as phase
 

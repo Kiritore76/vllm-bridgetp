@@ -887,7 +887,10 @@ def main(argv=None):
             health_reference=str(observation.ASSETS / "health_reference.json"),
             # Phase shift: arrivals end at 840s, then 2048-token outputs drain.
             # Mixed: arrivals end at 1980s; the slowest layout drains long after.
-            run_timeout_s=3600
+            # Rotation: arrivals end at 3180s, and packing follows the run.
+            run_timeout_s=5400
+            if args.phase_shift and args.phase_scenario == "mixed_rotation"
+            else 3600
             if args.phase_shift and args.phase_scenario.startswith("mixed")
             else 2400
             if args.conversion_cycle

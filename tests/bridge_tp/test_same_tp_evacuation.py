@@ -204,6 +204,30 @@ class EvacuationTests(unittest.TestCase):
         self.assertEqual(json.loads(self.backend.channel_plan.read_text()), [])
         self.assertEqual(self.run["channels"], {})
 
+    def test_a_request_at_its_cap_stays_and_the_rest_still_move(self):
+        cap = 8192 - seq.EVACUATION_FINISH_TOKENS
+        self.requests = [request("finishing", cap), request("long", cap - 1)]
+        self.tick()
+        self.ready()
+        self.tick()
+        self.assertEqual([a["request_id"] for a in self.assists()], ["long"])
+
+    def test_only_finishing_requests_need_no_channel(self):
+        self.requests = [request("finishing", 8192 - seq.EVACUATION_FINISH_TOKENS)]
+        self.tick()
+        self.assertEqual(self.run["state"], "DONE")
+        self.assertFalse((self.root / "targets.json").exists())
+        self.assertEqual(self.assists(), [])
+
+    def test_a_request_reaching_its_cap_while_waiting_is_dropped(self):
+        self.requests = [request("long", 8000)]
+        self.tick()
+        self.ready()
+        self.requests = [request("long", 8192 - seq.EVACUATION_FINISH_TOKENS)]
+        self.tick()
+        self.assertEqual(self.assists(), [])
+        self.assertEqual(self.run["state"], "DONE")
+
     def test_it_counts_what_moved(self):
         self.requests = [request("long", 10)]
         self.tick()

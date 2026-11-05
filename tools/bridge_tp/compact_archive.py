@@ -10,10 +10,13 @@ import os
 import shutil
 import tarfile
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 
 PREFIX = ".__bridgetp_compact__"
 POLICY = "SINGLE_EVIDENCE_ARCHIVE_LOSSLESS_COMPACT_V2"
+# xz at preset 6 needs about 94 MiB per worker. Nothing else runs while packing.
+MAX_PACK_WORKERS = 16
 
 
 def digest(path):
@@ -60,6 +63,29 @@ def audit_subset(full, durable):
         return None  # Torn/unique failure journals are retained in full.
 
 
+def pack_workers():
+    if hasattr(os, "sched_getaffinity"):
+        available = len(os.sched_getaffinity(0))
+    else:
+        available = os.cpu_count() or 1
+    return min(MAX_PACK_WORKERS, available)
+
+
+def prepare_file(path, compressed):
+    """Hash one file and, when asked, xz it to ``compressed``.
+
+    Threads, not processes: hashlib and lzma release the GIL for this work, and
+    the packer's parent may hold threads that a fork would leave inconsistent.
+    """
+    sha256 = digest(path)
+    if compressed is not None:
+        with path.open("rb") as src, lzma.open(compressed, "wb", preset=6) as dst:
+            shutil.copyfileobj(src, dst, length=1024 * 1024)
+        if digest(path) != sha256:
+            raise ValueError("evidence changed during packing")
+    return sha256
+
+
 def pack_compact(root, output):
     from tools.bridge_tp.result_archive import exclusion_reason
 
@@ -71,79 +97,93 @@ def pack_compact(root, output):
     with tempfile.TemporaryDirectory(dir=output.parent, prefix="compact-") as temp:
         temporary_root = Path(temp)
         archive_path = temporary_root / "evidence.tar.gz"
-        with tarfile.open(archive_path, "w:gz", compresslevel=1) as archive:
-            for path in sorted(root.rglob("*")):
-                if path.is_symlink():
-                    raise ValueError("evidence symlink must be resolved explicitly")
-                if path.is_dir():
-                    continue
-                if not path.is_file():
-                    raise ValueError("special evidence file")
-                relative = path.relative_to(root)
-                row = dict(path=relative.as_posix(), bytes=path.stat().st_size)
-                reason = exclusion_reason(relative, root)
-                if reason:
-                    omitted.append(dict(row, reason=reason))
-                    continue
-                row["sha256"] = digest(path)
-                included.append(row)
-                transform = None
-                if path.name == "pressure_audit_durable.jsonl":
-                    full = path.with_name("pressure_audit.jsonl")
-                    selected = audit_subset(full, path) if full.is_file() else None
+        plan = []
+        for path in sorted(root.rglob("*")):
+            if path.is_symlink():
+                raise ValueError("evidence symlink must be resolved explicitly")
+            if path.is_dir():
+                continue
+            if not path.is_file():
+                raise ValueError("special evidence file")
+            relative = path.relative_to(root)
+            row = dict(path=relative.as_posix(), bytes=path.stat().st_size)
+            reason = exclusion_reason(relative, root)
+            if reason:
+                omitted.append(dict(row, reason=reason))
+                continue
+            selected = None
+            if path.name == "pressure_audit_durable.jsonl":
+                full = path.with_name("pressure_audit.jsonl")
+                selected = audit_subset(full, path) if full.is_file() else None
+            compressed = None
+            if (
+                selected is None
+                and row["bytes"] >= 1_000_000
+                and path.suffix in {".json", ".jsonl"}
+            ):
+                compressed = temporary_root / f"payload_{len(plan)}.xz"
+            plan.append((path, relative, row, selected, compressed))
+        pool = ThreadPoolExecutor(pack_workers(), thread_name_prefix="compact")
+        try:
+            futures = [
+                pool.submit(prepare_file, item[0], item[4]) for item in plan
+            ]
+            with tarfile.open(archive_path, "w:gz", compresslevel=1) as archive:
+                # Workers finish in any order; members are written in path order.
+                for future, item in zip(futures, plan, strict=True):
+                    path, relative, row, selected, compressed = item
+                    row["sha256"] = future.result()
+                    included.append(row)
+                    transform = None
                     if selected is not None:
                         payload = json.dumps(selected).encode()
                         member = f"{PREFIX}/{relative.as_posix()}.index.json"
                         info = tarfile.TarInfo(f"{root.name}/{member}")
                         info.size = len(payload)
                         archive.addfile(info, io.BytesIO(payload))
+                        full = path.with_name("pressure_audit.jsonl")
                         transform = dict(
                             encoding="SORTED_JSON_AUDIT_SUBSET_V1",
                             source=full.relative_to(root).as_posix(),
                             member=member,
                         )
-                if (
-                    transform is None
-                    and row["bytes"] >= 1_000_000
-                    and (path.suffix in {".json", ".jsonl"})
-                ):
-                    compressed = temporary_root / "payload.xz"
-                    with (
-                        path.open("rb") as src,
-                        lzma.open(compressed, "wb", preset=6) as dst,
-                    ):
-                        shutil.copyfileobj(src, dst, length=1024 * 1024)
-                    member = f"{PREFIX}/{relative.as_posix()}.xz"
-                    archive.add(
-                        compressed, arcname=f"{root.name}/{member}", recursive=False
-                    )
-                    transform = dict(encoding="XZ_V1", member=member)
-                if transform is None:
-                    archive.add(
-                        path,
-                        arcname=f"{root.name}/{relative.as_posix()}",
-                        recursive=False,
-                    )
-                else:
-                    stored.append(dict(path=relative.as_posix(), **transform))
-                if digest(path) != row["sha256"]:
-                    raise ValueError("evidence changed during packing")
-            manifest = dict(
-                policy=POLICY,
-                root=root.name,
-                included=included,
-                omitted=omitted,
-                included_bytes=sum(r["bytes"] for r in included),
-                omitted_bytes=sum(r["bytes"] for r in omitted),
-                transforms=stored,
-                predictor_features_preserved=True,
-                restore_command="python -m tools.bridge_tp.compact_archive "
-                "--archive ARCHIVE --output EMPTY_DIRECTORY",
-            )
-            payload = json.dumps(manifest, indent=2).encode()
-            info = tarfile.TarInfo(f"{root.name}/archive_contents_manifest.json")
-            info.size = len(payload)
-            archive.addfile(info, io.BytesIO(payload))
+                    if compressed is not None:
+                        member = f"{PREFIX}/{relative.as_posix()}.xz"
+                        archive.add(
+                            compressed,
+                            arcname=f"{root.name}/{member}",
+                            recursive=False,
+                        )
+                        compressed.unlink()
+                        transform = dict(encoding="XZ_V1", member=member)
+                    if transform is None:
+                        archive.add(
+                            path,
+                            arcname=f"{root.name}/{relative.as_posix()}",
+                            recursive=False,
+                        )
+                    else:
+                        stored.append(dict(path=relative.as_posix(), **transform))
+                    if digest(path) != row["sha256"]:
+                        raise ValueError("evidence changed during packing")
+                manifest = dict(
+                    policy=POLICY,
+                    root=root.name,
+                    included=included,
+                    omitted=omitted,
+                    included_bytes=sum(r["bytes"] for r in included),
+                    omitted_bytes=sum(r["bytes"] for r in omitted),
+                    transforms=stored,
+                    predictor_features_preserved=True,
+                    restore_command="python -m tools.bridge_tp.compact_archive "
+                    "--archive ARCHIVE --output EMPTY_DIRECTORY",
+                )
+                payload = json.dumps(manifest, indent=2).encode()
+                info = tarfile.TarInfo(f"{root.name}/archive_contents_manifest.json")
+                info.size = len(payload)
+                archive.addfile(info, io.BytesIO(payload))
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
         archive_sha = digest(archive_path)
         size = archive_path.stat().st_size
         os.replace(archive_path, output)

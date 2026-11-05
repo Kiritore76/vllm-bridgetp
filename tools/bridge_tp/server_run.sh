@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# 当前任务：长p2负载mixed_long_p2上跑一场自动转换，转回L1A时先把长请求迁到另一个TP2再停接入。
-# 对照是已有的两轮自动转换和静态L1A。负载相同，到达序列相同。
+# 当前任务：轮换负载mixed_rotation（带种子的泊松到达）先跑一场自动转换，转回时开迁移。
+# 没问题再跑同种子的静态L1A作对照。
 # cd /root/autodl-tmp/bridgetp/vllm_bridge && git pull --ff-only && bash tools/bridge_tp/server_run.sh
 set -uo pipefail
-scenes='mixed_long_p2:auto'
+scenes='mixed_rotation:auto'
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
 py=$venv/bin/python
@@ -34,7 +34,7 @@ revision=$(git rev-parse HEAD)
     echo 'GPU上有计算进程，停止，未清理任何进程。'; exit 1;
 }
 mkdir -p /root/autodl-tmp/bridgetp/results || exit 1
-run=/root/autodl-tmp/bridgetp/results/qwen3_evacuate_$(date +%Y%m%d_%H%M%S)_${RANDOM}
+run=/root/autodl-tmp/bridgetp/results/qwen3_rotation_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 printf '%s\n' "$revision" > "$run/revision.txt"
 echo "本批目录：$run"
@@ -42,8 +42,8 @@ echo 'A={GPU2,GPU3}，B={GPU0,GPU1}；双32768/.88，四卡。'
 echo "场次：$scenes"
 echo '请求留在控制器：每引擎未开始8条；只看prompt是否放得下，不看输出长度，也不为增长预留。'
 echo '运行：自动转换（从L1A开始），开迁移、短请求分流、过载迁移和转回迁移；通道只在转回时建立。'
-echo '负载：短10+少量长300秒→短1+长0.05/s共900秒→短8+两次6条突发600秒，到达共1920秒；长请求16384输入/8192输出。'
-echo '约45分钟，控制器上限60分钟；不自动重试，不删除原始目录。'
+echo '负载：长段900秒→短段→120秒脉冲（不该切）→短段→长段480秒（边界）→短段，到达共3180秒；泊松到达，种子6；长请求16384输入/8192输出。'
+echo '约70分钟加打包，控制器上限90分钟；不自动重试，不删除原始目录。'
 export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 export VLLM_USE_V2_MODEL_RUNNER=0 OMP_NUM_THREADS=1
 "$py" -m compileall -q -j 0 "$repo/vllm" "$repo/tools" > "$run/compileall.log" 2>&1 || exit 1

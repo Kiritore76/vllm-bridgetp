@@ -14,6 +14,8 @@ Arrivals stop at 840s; the 2048-token outputs then drain. With the decider's
 120s window and 180s hold, the two proposals fall inside their phases.
 """
 
+import random
+
 from tools.bridge_tp import qwen3_long_burst_pair as long_burst
 from tools.bridge_tp import qwen3_pressure_four_mode as pressure
 from tools.bridge_tp import qwen3_rate_sweep as rate_sweep
@@ -227,8 +229,42 @@ SCENARIOS["long_output"] = dict(
     ),
     long=(512, 8192),
 )
+# Rotation with long segments of three lengths (design 11-05): one clearly worth
+# converting for (900s), one that must not trigger it (120s, under the 167s the
+# decider took on the first long phase), one at the edge (480s). Short to long
+# took about 242s and long to short about 178s, so one run shows where it pays.
+# Seed: the first from 1 whose long arrivals are near nominal (L1 41-49, blip 5-7,
+# L2 21-27, S1 2-5), fixed before any GPU run and not chosen by any result.
+SCENARIOS["mixed_rotation"] = dict(
+    phases=(
+        (0, 60, 4.0, 0.0, "warm"),
+        (60, 420, 10.0, 0.01, "s1_short"),
+        (420, 1320, 1.0, 0.05, "l1_long"),
+        (1320, 1800, 8.0, 0.0, "s2_short"),
+        (1800, 1920, 4.0, 0.05, "b_blip"),
+        (1920, 2220, 8.0, 0.0, "s3_short"),
+        (2220, 2700, 1.0, 0.05, "l2_long"),
+        (2700, 3120, 8.0, 0.0, "s4_short"),
+        (3120, 3180, 1.0, 0.0, "tail"),
+    ),
+    long=(16384, 8192),
+    arrival_seed=6,
+)
 PHASES = SCENARIOS["phase_shift"]["phases"]
 LONG_PROMPT, LONG_OUTPUT = SCENARIOS["phase_shift"]["long"]
+
+
+def arrival_times(start, end, rate, seed, role):
+    """Evenly spaced without a seed; a seeded Poisson process with one."""
+    if seed is None:
+        return [start + n / rate for n in range(int((end - start) * rate))]
+    stream = random.Random(f"{seed}:{start}:{role}")
+    times = []
+    at = start + stream.expovariate(rate)
+    while at < end:
+        times.append(at)
+        at += stream.expovariate(rate)
+    return times
 
 
 def jobs(inputs, scenario="phase_shift"):
@@ -243,10 +279,11 @@ def jobs(inputs, scenario="phase_shift"):
         ):
             if not rate:
                 continue
-            for n in range(int((end - start) * rate)):
+            seed = value.get("arrival_seed")
+            for at in arrival_times(start, end, rate, seed, role):
                 rows.append(
                     dict(
-                        at_s=round(start + n / rate, 6),
+                        at_s=round(at, 6),
                         route=None,
                         request=dict(body),
                         workload_role=role,
@@ -276,6 +313,7 @@ def config(inputs, scenario="phase_shift"):
                 planned_output_tokens=sum(j["request"]["max_tokens"] for j in values),
                 routing_scope="all arrivals use the layout's router; no forced pool",
                 phases=[list(p) for p in SCENARIOS[scenario]["phases"]],
+                arrival_seed=SCENARIOS[scenario].get("arrival_seed"),
             )
         ],
         note="phases for the conversion decider; one run per scenario, a "
