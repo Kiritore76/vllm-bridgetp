@@ -925,6 +925,22 @@ class PressureCoordinator:
                         r for r in rows if r["request"]["request_id"] == c.request_id
                     )
                     blocks = evidence["target_required_blocks"]
+                    # The target's free blocks already promised to prompts
+                    # waiting for prefill are not room: count them, and keep
+                    # the admission guard, as routing does (GPU 11-06: two KV
+                    # moves into B overcommitted it and B preempted 10 times).
+                    room = unified.prompt_room(
+                        target_reading, self.ledger.pending(best_target)[0]
+                    )
+                    if room is None or room < blocks:
+                        entry["rejected"].append(
+                            dict(
+                                request_id=c.request_id,
+                                reasons=["target room promised to pending prompts"],
+                            )
+                        )
+                        pool = [x for x in pool if x.request_id != c.request_id]
+                        continue
                     if trigger == "PRESSURE":
                         after = self.unified_fullness(
                             target_reading,

@@ -157,7 +157,9 @@ def fullness(
 
 
 def prompt_room(reading, pending_blocks, guard_blocks=GUARD_BLOCKS):
-    """Free blocks a new prompt may take, after commitments and the guard."""
+    """Free blocks a new prompt or a migrated request may take, after
+    commitments (prompts not yet allocated, reserved moves) and the guard.
+    """
     if reading.free_blocks is None or reading.block_size <= 0:
         return None
     unallocated = reading.unallocated_prompt_blocks

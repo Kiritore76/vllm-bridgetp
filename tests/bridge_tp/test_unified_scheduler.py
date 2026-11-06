@@ -442,6 +442,35 @@ class MigrationTests(unittest.TestCase):
         self.tick(co, 10.0, source, inst("b"), stale, started)
         self.assertEqual(started.calls, [])
 
+    def test_a_kv_move_does_not_take_room_promised_to_pending_prompts(self):
+        # GPU 11-06: B had 948 free after pending prompts and took a 1037-block
+        # move, then preempted. Physically 1500 free fits 1030 blocks, but 1024
+        # of them belong to a prompt awaiting prefill.
+        co, records = coordinator()
+        started = Started()
+        source = inst("a1", total=2325, free=150, requests=3)
+        rows = source_candidates(16384, 4096)
+        target = inst("b", free=1500, unallocated=1024)
+        self.tick(co, 10.0, source, target, rows, started)
+        self.assertEqual(started.calls, ["q1"])
+        reasons = [
+            rejected
+            for x in records
+            if x["kind"] == "pressure_decision_unified"
+            for e in x["evaluations"]
+            for rejected in e["rejected"]
+        ]
+        self.assertIn(
+            dict(request_id="q0", reasons=["target room promised to pending prompts"]),
+            reasons,
+        )
+        # Nothing fits: no move at all, and the source is left to its engine.
+        co, _ = coordinator()
+        started = Started()
+        target = inst("b", free=1200, unallocated=1024)
+        self.tick(co, 10.0, source, target, rows, started)
+        self.assertEqual(started.calls, [])
+
     def test_short_or_nearly_finished_requests_are_never_moved(self):
         # Unified L2C:16 GPU 11-06: only short requests left on a TP1 at KV
         # trigger; one had finished, START failed and stopped the controller.
