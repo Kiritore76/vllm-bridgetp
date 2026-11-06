@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 当前任务：用户授权L0、L2C、L3三场静态冒烟串行执行。
+# 当前任务：六卡容量测量首场，L3短请求12req/s，60秒。
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
@@ -25,24 +25,23 @@ revision=$(git rev-parse HEAD)
 [ "$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)" = 6 ] || { echo '需要六张GPU。'; exit 1; }
 [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || { echo 'GPU有计算进程，停止；未清理任何进程。'; exit 1; }
 mkdir -p /root/autodl-tmp/bridgetp/results || exit 1
-run=/root/autodl-tmp/bridgetp/results/qwen3_six_static_$(date +%Y%m%d_%H%M%S)_${RANDOM}
+run=/root/autodl-tmp/bridgetp/results/qwen3_six_rate12_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 avail=$(df --output=avail -k "$run" | tail -1)
-[ "$avail" -ge 16777216 ] || { echo '磁盘可用不足16GB。'; exit 1; }
+[ "$avail" -ge 8388608 ] || { echo '磁盘可用不足8GB。'; exit 1; }
 printf '%s\n' "$revision" > "$run/revision.txt"
 echo "本批目录：$run"
-echo '串行三场：L0=6TP1；L2C=2TP1+2TP2；L3=3TP2。'
-echo 'A={2,3}、B={0,1}、C={4,5}；双32768/.88、guard125。'
-echo '每场300秒150条512/128短请求；90秒起每2秒一条16384/8192长请求，共6条。'
-echo 'L2C沿用原策略、只迁向B；不强制迁移，不运行转换或决策器。'
-echo '零迁移覆盖不足会保留并继续；请求不完整、实例缺失或技术失败立即停止。'
-echo '预计约25–40分钟含启动/打包；不自动重试，不删除结果。'
+echo '容量测量首场：L3=3TP2，A={2,3}、B={0,1}、C={4,5}；双32768/.88。'
+echo '仅一场：512输入/128输出，12req/s持续60秒，共720请求/92160输出，之后收尾。'
+echo '复用原分流；无长请求、不迁移、不转换、不训练；不改策略阈值。'
+echo '按计划到达分析派发、排队、TTFT/E2E、输出间隔和CPU；单点不能标定完整容量。'
+echo '预计约5–10分钟含启动和打包，排队会延长；失败不自动重试，不删除结果。'
 printf 'layout\trunner_exit\tbatch_exit\n' > "$run/scenes.tsv"
 pack_result() {
     local status=$1
     printf '%s\n' "$status" > "$run/exit_code.txt"
     local excludes=()
-    for layout in L0 L2C L3; do
+    for layout in L3; do
         if (cd "$run" && sha256sum -c "$layout.tar.gz.sha256" >/dev/null 2>&1) \
             && tar -tzf "$run/$layout.tar.gz" >/dev/null 2>&1; then
             excludes+=(--exclude="$(basename "$run")/$layout")
@@ -77,7 +76,7 @@ if [ "$status" != 0 ]; then
     pack_result "$status" || exit 1
     exit "$status"
 fi
-echo '[CPU前置] 通过；准备三场串行GPU冒烟。'
+echo '[CPU前置] 通过；准备单场GPU容量测量。'
 echo '[预编译] 数据盘短临时路径；最多4个编译进程。'
 "$py" -m compileall -q -j 4 "$repo/vllm" "$repo/tools" > "$run/compileall.log" 2>&1 || {
     echo '[预编译] 失败，尚未启动GPU服务；请拿回诊断包。'
@@ -94,7 +93,7 @@ nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,pcie.link.gen
 smi=$!
 trap 'kill "$smi" 2>/dev/null || true' EXIT
 batch_status=0
-for layout in L0 L2C L3; do
+for layout in L3; do
     avail=$(df --output=avail -k "$run" | tail -1)
     if [ "$avail" -lt 8388608 ] || [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]; then
         echo "[停止] $layout 前磁盘不足8GB或GPU有计算进程；未清理任何进程。"
@@ -102,12 +101,9 @@ for layout in L0 L2C L3; do
         break
     fi
     options=(--hold-queue)
-    if [ "$layout" = L2C ]; then
-        options+=(--kv-short-exempt --overload-migrate --migrate-current-length)
-    fi
     echo "[场次] $layout 开始"
     "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
-        --cards 6 --static-layout "$layout" --long-burst-pair \
+        --cards 6 --static-layout "$layout" --rate-sweep --sweep-rates 12 \
         "${options[@]}" --expanded-context --current-machine --repetitions 1 \
         --model "$model" \
         --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
@@ -128,7 +124,7 @@ for layout in L0 L2C L3; do
     fi
     if [ "$status" = 2 ]; then
         batch_status=2
-        echo "[场次] $layout 覆盖不足，保留结果并继续；不修改触发规则。"
+        echo "[场次] $layout 覆盖不足，保留结果；不修改参数或自动重试。"
     fi
 done
 status=$batch_status
