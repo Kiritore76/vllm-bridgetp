@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # 当前任务：长请求容量（用户11-06）。负载mixed_long_ramp：短8/s，深长请求每240秒升一档（0.02→0.08/s）。
 # 比较L2C、L3在TP2 max-num-seqs 16与32下的抢占、长请求TPOT/中断和短请求能力；TP1保持16。
-# 按惯例先下发一场（L3、TP2=32）；没问题再放其余三场：L3:16 L2C:16 L2C:32。
-scenes='L3:32'
+# 首场L3:32已回收（qwen3_six_longcap_20261106_145204_12086）；用户同意放其余三场，串行执行。
+scenes='L3:16 L2C:16 L2C:32'
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
@@ -39,7 +39,7 @@ echo '负载：预热60秒短4/s；60–1020秒短8/s，深长16384/8192每240�
 echo '双32768/.88、guard125、hold-queue；L2C沿用kv-short-exempt/overload-migrate/migrate-current-length，仍只迁向B。'
 echo 'TP2健康参考只测到16条并发：TP2=32时B正在生成超过15条会挡住非紧急迁移；规则不改，分析里单独统计。'
 echo '不转换、不训练、不改阈值；性能负结果和零迁移保留；技术故障/请求或清理不完整即停，不自动重试。'
-echo '每场约25–35分钟含启动/收尾/打包；不删除服务器结果。'
+echo '共三场，每场约25–35分钟，合计约1.5–2小时含启动/收尾/打包；不删除服务器结果。'
 printf 'scene\trunner_exit\tbatch_exit\n' > "$run/scenes.tsv"
 pack_result() {
     local status=$1
