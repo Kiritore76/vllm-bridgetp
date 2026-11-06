@@ -36,6 +36,7 @@ from tools.bridge_tp.qwen3_calibration_contract import (  # noqa: E402
     migration_spec,
     require_revision,
     runtime_versions,
+    set_max_num_seqs,
     verified_inputs,
 )
 from tools.bridge_tp.qwen3_online_validation import (  # noqa: E402
@@ -308,6 +309,12 @@ def main(argv=None):
     )
     parser.add_argument("--cards", type=int, choices=(4, 6), default=4)
     parser.add_argument(
+        "--tp2-max-num-seqs",
+        type=int,
+        default=16,
+        help="running slots of every TP2 engine; TP1 keeps 16 (user 11-06)",
+    )
+    parser.add_argument(
         "--static-layout",
         choices=("L0", "L1A", "L2", "L1AC", "L2C", "L3"),
         help="static layout: four cards L0/L1A/L2; --cards 6 selects "
@@ -392,6 +399,10 @@ def main(argv=None):
         or args.layout_l1a_channels
     ):
         parser.error("six cards currently support static native-32K layouts only")
+    if not 1 <= args.tp2_max_num_seqs <= 256:
+        parser.error("--tp2-max-num-seqs must be in [1, 256]")
+    if args.tp2_max_num_seqs != 16 and args.cards != 6:
+        parser.error("--tp2-max-num-seqs is for six-card static layouts")
     mixed_layout = args.static_layout in (six.MIXED if args.cards == 6 else ("L1A",))
     if args.layout_l1a_channels and not args.long_burst_memory_verify:
         parser.error("layout-l1a-channels runs with long-burst-memory-verify only")
@@ -741,6 +752,9 @@ def main(argv=None):
         cfg["service_context_limits"] = dict(tp1=32768, tp2=32768)
         cfg["context_profile"] = "QWEN3_NATIVE_32K_BOTH_V1"
         cfg["note"] += "; native context limits raised; boundary GPU validation pending"
+    if args.tp2_max_num_seqs != 16:
+        cfg["note"] += f"; TP2 max-num-seqs {args.tp2_max_num_seqs}, TP1 16"
+    cfg["tp2_max_num_seqs"] = args.tp2_max_num_seqs
     run_count = len(missing) if missing is not None else len(values) * len(cfg["arms"])
     if args.validate_only:
         print(
@@ -748,6 +762,7 @@ def main(argv=None):
                 dict(
                     status="CPU_MATCHED_PLAN_ONLY",
                     cards=args.cards,
+                    tp2_max_num_seqs=args.tp2_max_num_seqs,
                     runs=run_count,
                     inherited_runs=len(inherited),
                     missing_cells=sorted(missing) if missing is not None else None,
@@ -979,6 +994,10 @@ def main(argv=None):
             plans = [p for p in plans if p[2]["name"] in missing]
         for _, arm, _, plan in plans:
             adapt_plan(plan, arm, args.checkpoint, args.model)
+            if args.tp2_max_num_seqs != 16:
+                # Every TP2 engine starts from target_argv, extra ones included.
+                set_max_num_seqs(plan["target_argv"], args.tp2_max_num_seqs)
+            plan["tp2_max_num_seqs"] = args.tp2_max_num_seqs
             if args.cards == 6:
                 six.configure(plan)
             if args.thread_profile:

@@ -250,6 +250,23 @@ SCENARIOS["mixed_rotation"] = dict(
     long=(16384, 8192),
     arrival_seed=6,
 )
+# Long-request capacity (user 11-06): short 8/s, deep long requests stepping up
+# every 240s, so each layout and TP2 slot count shows when long requests stop
+# fitting. Lives of about 200-300s put about 5, 10, 15 and 20 in flight.
+# Seed: the first from 1 whose long arrivals fall in r1 3-7, r2 7-12, r3 11-18,
+# r4 15-23 (3/10/18/17), fixed before any GPU run, not chosen by results.
+SCENARIOS["mixed_long_ramp"] = dict(
+    phases=(
+        (0, 60, 4.0, 0.0, "warm"),
+        (60, 300, 8.0, 0.02, "r1"),
+        (300, 540, 8.0, 0.04, "r2"),
+        (540, 780, 8.0, 0.06, "r3"),
+        (780, 1020, 8.0, 0.08, "r4"),
+        (1020, 1080, 1.0, 0.0, "tail"),
+    ),
+    long=(16384, 8192),
+    arrival_seed=6,
+)
 PHASES = SCENARIOS["phase_shift"]["phases"]
 LONG_PROMPT, LONG_OUTPUT = SCENARIOS["phase_shift"]["long"]
 

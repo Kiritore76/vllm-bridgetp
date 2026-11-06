@@ -334,7 +334,7 @@
     "vllm/bridge_tp/README.md": "f8eeb11400496c30779100c13b7c2bd14b8b813c80c2699a0a3a619709eff6a0",
     "vllm/entrypoints/openai/api_server.py": "0cbf2af64daa695e12d0ba3f76f7315a4d22f242baa17c9f71cea68bbc4b93fc",
     "tools/bridge_tp/run_qwen3_parameter_batch.py": "7c569e98bd239ec565d3b9f4f01e5c5784b7d71a212eddad84a1931d6fbf31f8",
-    "tools/bridge_tp/qwen3_calibration_contract.py": "c8a45749f3322b97010f834512529f380c5081be56b8719a3c0519a525f34bb6",
+    "tools/bridge_tp/qwen3_calibration_contract.py": "8c81aa9ed99a21d920fe7b012483ea268dd699a3b54b114d893ef824aa3c8115",
     "tests/bridge_tp/test_qwen3_parameter_batch.py": "d9d7ef911ea5f60793320556c56dff7a185c44d1a08cf4480842336021f95c0f",
     "tools/bridge_tp/run_qwen3_scheduler_supplement.py": "78044e014a097707b22032903f9a48f2e64bb0225c2c2682070beed31bbc44ac",
     "tests/bridge_tp/test_qwen3_scheduler_supplement.py": "40fd9afa64c988a4a8e6a5fa09e9ac89a45ff02a4489aa1b9a8198acc6331dab",
@@ -358,7 +358,7 @@
     "experiments/platforms/qwen3_pressure_observation/scope.json": "7cf1845a67e01054df5011088174b4c30e4ba0b36f3c01d08d151e7e3c24dca8",
     "experiments/platforms/qwen3_pressure_observation/service_evidence.json": "513028147a78f7342556584396ff6e2ec574c8c9caf906e86efabfcfc0a4cdba",
     "tools/bridge_tp/qwen3_stay_migrate.py": "a18219546bc8492c89943905b600ced54f99f06e49eb13712932871e7232fee1",
-    "tools/bridge_tp/run_qwen3_stay_migrate.py": "5751d5d0fe802a8c29578bf76aaa2574a1fffe869cf2f221648a27407966f104",
+    "tools/bridge_tp/run_qwen3_stay_migrate.py": "8fd288971b7a756913effb05a31dcd6945e3d2ab9b69e4cf93d2a0b8df31f970",
     "tests/bridge_tp/test_qwen3_stay_migrate.py": "725ef0959b991c7c1001fb2d3277c009289b19be758e3b4ea0a9fff1f8a5026f",
     "tests/bridge_tp/test_pressure_launcher.py": "b7741fdd429116ac1b01f771c2db5b0ab05a75487a542fea21c078a187ac5876",
     "tools/bridge_tp/qwen3_four_mode.py": "062ad57c85d2bc7b89926318f7a1522fc9414fd9f4f82b2a978dd7ed467813a7",
@@ -406,7 +406,7 @@
     "tests/bridge_tp/test_conversion_sequence.py": "a3835b39ec1fd6dd5fb98cba4a7e8905911fac9b2168524679b4c441137d8b4b",
     "vllm/bridge_tp/controller/pressure_hold.py": "2ea44d8ddbae7a99949be8e7a6cf835f9c1e5a4f474908575ad605641f26fead",
     "tools/bridge_tp/qwen3_six_card.py": "eda1f05eb7129cf2a42e428b1007375d4f398e4779dcbc06fc405247308ed64e",
-    "tests/bridge_tp/test_qwen3_six_card.py": "ae339c127a549e2fc79a274c1aa4104c7423ba4ac7d04878f130532b8d534727"
+    "tests/bridge_tp/test_qwen3_six_card.py": "2a9522a512dfa48a1fa5311c9c943b54a118ae704fcdc622e71444d27e083dc8"
   },
   "server_settings": {
     "dtype": "bfloat16",

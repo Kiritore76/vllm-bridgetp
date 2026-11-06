@@ -91,6 +91,52 @@ def build(root, name):
     return plan
 
 
+class TwoSlotCountTests(unittest.TestCase):
+    def test_tp2_slots_change_only_the_tp2_command(self):
+        from tools.bridge_tp.qwen3_calibration_contract import (
+            engine_arguments,
+            set_max_num_seqs,
+        )
+
+        argv = ["serve", *engine_arguments()]
+        set_max_num_seqs(argv, 32)
+        self.assertEqual(argv[argv.index("--max-num-seqs") + 1], "32")
+        base = engine_arguments()
+        self.assertEqual(base[base.index("--max-num-seqs") + 1], "16")
+        for bad in (0, 257, "32"):
+            with self.assertRaises(ValueError):
+                set_max_num_seqs(list(argv), bad)
+        with self.assertRaises(ValueError):
+            set_max_num_seqs(["serve"], 32)
+
+    def test_every_tp2_engine_starts_from_the_target_command(self):
+        from tools.bridge_tp.qwen3_calibration_contract import set_max_num_seqs
+
+        with tempfile.TemporaryDirectory() as folder:
+            plan = build(Path(folder), "L3")
+            plan["target_argv"] += ["--max-num-seqs", "16"]
+            plan["source_argv"] += ["--max-num-seqs", "16"]
+            set_max_num_seqs(plan["target_argv"], 32)
+            self.assertTrue(plan["extra_engines"])
+            for extra in plan["extra_engines"]:
+                argv, _ = launch.extra_engine(plan, extra)
+                value = argv[argv.index("--max-num-seqs") + 1]
+                self.assertEqual(value, "32" if extra["tp"] == 2 else "16")
+
+    def test_the_long_ramp_load_is_seeded_and_steps_up(self):
+        from tools.bridge_tp import qwen3_phase_shift as phase
+
+        path = "experiments/platforms/qwen3_pressure_observation/inputs.json"
+        inputs = json.loads(Path(path).read_text(encoding="utf-8"))
+        jobs = phase.jobs(inputs, "mixed_long_ramp")
+        self.assertEqual(jobs, phase.jobs(inputs, "mixed_long_ramp"))
+        long = [j for j in jobs if j["workload_role"] == "long_input_output"]
+        phases = ("r1", "r2", "r3", "r4")
+        counts = [sum(j["workload_phase"] == p for j in long) for p in phases]
+        self.assertEqual(counts, [3, 10, 18, 17])
+        self.assertLess(max(j["at_s"] for j in jobs), 1080)
+
+
 class SixCardTests(unittest.TestCase):
     def test_all_layouts_cover_six_gpus_once_and_ports_are_unique(self):
         for name, degrees in (

@@ -62,6 +62,20 @@ def engine_arguments():
     ]
 
 
+def set_max_num_seqs(argv, value):
+    """Replace the one ``--max-num-seqs`` of an engine command (user 11-06).
+
+    TP2 may get more running slots than TP1: with 16 each, a TP2 has half the
+    slots per GPU and left most of its KV unused in the six-card short sweep.
+    """
+    if type(value) is not int or not 1 <= value <= 256:
+        raise ValueError("max-num-seqs must be an integer in [1, 256]")
+    positions = [i for i, v in enumerate(argv) if v == "--max-num-seqs"]
+    if len(positions) != 1 or positions[0] + 1 >= len(argv):
+        raise ValueError("engine command needs exactly one --max-num-seqs")
+    argv[positions[0] + 1] = str(value)
+
+
 def expanded_context_spec(spec, model_config):
     """Opt in to native 32K limits in both pools; preserve frozen profiles."""
     validate_config(model_config, read(PROFILE))
