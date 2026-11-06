@@ -52,8 +52,12 @@ pack_result() {
 }
 export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 export VLLM_USE_V2_MODEL_RUNNER=0 OMP_NUM_THREADS=1
-mkdir "$run/cpu_tmp" || exit 1
-export TMPDIR="$run/cpu_tmp" TEMP="$run/cpu_tmp" TMP="$run/cpu_tmp"
+# multiprocessing/forkserver binds AF_UNIX sockets below the temp directory.
+# The timestamped result path is too long for Linux's 108-byte socket path.
+# Keep temporary files on the data disk, using a short path for all children.
+task_tmp=$(mktemp -d /root/autodl-tmp/bt-tmp.XXXXXX) || { pack_result 1; exit 1; }
+printf '%s\n' "$task_tmp" > "$run/temporary_directory.txt"
+export TMPDIR="$task_tmp" TEMP="$task_tmp" TMP="$task_tmp"
 echo '[CPU前置] 运行本次相关的115项回归检查；不执行GPU计算。'
 # 与本地CPU检查相同，导入源码控制逻辑，避免执行vLLM顶层的GPU平台探测。
 "$py" -B -c 'import sys,types,unittest; from pathlib import Path; p=types.ModuleType("vllm"); p.__path__=[str(Path.cwd()/"vllm")]; sys.modules["vllm"]=p; s=unittest.defaultTestLoader.loadTestsFromNames(sys.argv[1:]); r=unittest.TextTestRunner(verbosity=2).run(s); raise SystemExit(not r.wasSuccessful())' \
@@ -65,11 +69,18 @@ echo '[CPU前置] 运行本次相关的115项回归检查；不执行GPU计算�
 status=$?
 if [ "$status" != 0 ]; then
     echo '[CPU前置] 未通过，不启动GPU实验；请拿回诊断包。'
+    tail -n 30 "$run/cpu_checks.log"
     pack_result "$status" || exit 1
     exit "$status"
 fi
 echo '[CPU前置] 通过；准备单场GPU冒烟。'
-"$py" -m compileall -q -j 0 "$repo/vllm" "$repo/tools" > "$run/compileall.log" 2>&1 || { pack_result 1; exit 1; }
+echo '[预编译] 数据盘短临时路径；最多4个编译进程。'
+"$py" -m compileall -q -j 4 "$repo/vllm" "$repo/tools" > "$run/compileall.log" 2>&1 || {
+    echo '[预编译] 失败，尚未启动GPU服务；请拿回诊断包。'
+    tail -n 30 "$run/compileall.log"
+    pack_result 1
+    exit 1
+}
 [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || { pack_result 1; exit 1; }
 # 先确认本机支持查询字段；失败时在GPU实验之前停止。
 nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,pcie.link.gen.current,pcie.link.width.current \
