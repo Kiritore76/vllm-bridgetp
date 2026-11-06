@@ -57,6 +57,22 @@ def migration_request(inputs, max_tokens, request_id):
 SAME_TP_GPUS = {None: ("2", "0,1"), 1: ("2", "3"), 2: ("2,3", "0,1")}
 
 
+def smoke_gpus(cards, same_tp, source=None, target=None):
+    """Resolve explicit device placement without changing four-card defaults."""
+    defaults = SAME_TP_GPUS[same_tp]
+    groups = [source or defaults[0], target or defaults[1]]
+    parsed = [group.split(",") for group in groups]
+    sizes = (same_tp or 1, same_tp or 2)
+    if any(len(group) != size for group, size in zip(parsed, sizes)):
+        raise ValueError("GPU group size differs from TP degree")
+    flat = [gpu for group in parsed for gpu in group]
+    if len(set(flat)) != len(flat) or any(
+        gpu not in {str(i) for i in range(cards)} for gpu in flat
+    ):
+        raise ValueError("GPU IDs must be distinct and within physical card count")
+    return tuple(groups)
+
+
 def compare_tokens(unified, reference):
     """Where a migrated output first differs from the unmigrated one, if at all."""
     first = next(
@@ -87,7 +103,20 @@ def main(argv=None):
     parser.add_argument("--diagnostic-probe", action="store_true")
     parser.add_argument("--channel-ablation", action="store_true")
     parser.add_argument("--same-tp", type=int, choices=(1, 2))
+    parser.add_argument("--cards", type=int, choices=(4, 6), default=4)
+    parser.add_argument("--source-gpus")
+    parser.add_argument("--target-gpus")
+    parser.add_argument("--expanded-context", action="store_true")
     args = parser.parse_args(argv)
+    if args.platform != "qwen3" and (
+        args.cards != 4 or args.source_gpus or args.target_gpus or args.expanded_context
+    ):
+        raise ValueError("device/context overrides require Qwen3")
+    if args.expanded_context and args.same_tp == 1:
+        raise ValueError("expanded context requires a TP2 target")
+    source_gpus, target_gpus = smoke_gpus(
+        args.cards, args.same_tp, args.source_gpus, args.target_gpus
+    )
     if args.same_tp and args.platform != "qwen3":
         raise ValueError("same-TP smoke runs on Qwen3")
     if args.channel_ablation and (
@@ -111,8 +140,10 @@ def main(argv=None):
                 dict(
                     target_tp=args.same_tp or 2,
                     source_tp=args.same_tp or 1,
-                    source_gpu=SAME_TP_GPUS[args.same_tp][0],
-                    target_gpus=SAME_TP_GPUS[args.same_tp][1],
+                    source_gpu=source_gpus,
+                    target_gpus=target_gpus,
+                    cards=args.cards,
+                    expanded_context=args.expanded_context,
                     trigger="explicit mechanism smoke",
                     history_tokens=args.history_tokens,
                     rate=0,
@@ -145,7 +176,7 @@ def main(argv=None):
         )
 
         require_revision(args.expected_revision)
-        runtime_inventory(read(PROFILE))
+        runtime_inventory(dict(read(PROFILE), gpu_count=args.cards))
         inputs = verified_inputs(args.model_path, args.inputs)
         spec = migration_spec(args.model_path)
     else:
@@ -154,14 +185,17 @@ def main(argv=None):
             raise ValueError("frozen model config differs")
         if pilot.sha(spec["checkpoint"]) != spec["checkpoint_sha256"]:
             raise ValueError("frozen predictor differs")
-    if args.same_tp:
-        source_gpus, target_gpus = SAME_TP_GPUS[args.same_tp]
+    if args.platform == "qwen3":
         spec["server_settings"].update(
-            source_tp_size=args.same_tp,
-            target_tp_size=args.same_tp,
+            source_tp_size=args.same_tp or 1,
+            target_tp_size=args.same_tp or 2,
             tp1_gpu=source_gpus,
             tp4_gpus=target_gpus,
         )
+        if args.expanded_context:
+            from tools.bridge_tp.qwen3_calibration_contract import expanded_context_spec
+
+            expanded_context_spec(spec, read(args.model_path / "config.json"))
     common, settings = pilot.arguments(spec)
     args.out_root.mkdir(parents=True, exist_ok=False)
     freeze(args.out_root / "source_identity")
@@ -540,6 +574,10 @@ def main(argv=None):
             natural_policy_trigger=False,
             target_tp=args.same_tp or 2,
             source_tp=args.same_tp or 1,
+            physical_cards=args.cards,
+            source_gpus=source_gpus,
+            target_gpus=target_gpus,
+            isolated_mechanism_smoke=True,
             reference_tokens=reference_match,
             target_background_requests=args.target_background,
             predictor_loaded=bool(args.predictor_checkpoint) or args.platform == "a100",

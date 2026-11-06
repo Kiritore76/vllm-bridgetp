@@ -292,7 +292,7 @@
     "tools/bridge_tp/freeze_pressure_baseline.py": "c53b3a70502f65c76ce3fcaf97fbd439508651472a2b1065eeea69d0e8322194",
     "tools/bridge_tp/run_tp2_calibration.py": "d35f9077cfb7a9abaae9e39d6a0aec0bf5142efcaa86cea87ef8a5ae03114244",
     "tools/bridge_tp/run_tp2_cpu_checks.py": "54e6aa6605ab96fd4f889ae5403f43a87a95867b992c3f61277ff63510c2fbaa",
-    "tools/bridge_tp/run_tp2_migration_smoke.py": "99e6a65ee345bc629c70e32d6da7a9c0c0a657b4cb7f2172059f71e21e31ef97",
+    "tools/bridge_tp/run_tp2_migration_smoke.py": "abc30dc37ef6e0c91eade24ad73b4883b1e2a27bfd201876b978d3975106dcd9",
     "tools/bridge_tp/run_tp_bundle_drain.py": "f2bbdb994b5b4d887bae1996ba623dfa4a9e54731c4724a3ba7454971c0d2d21",
     "tools/bridge_tp/summarize_tp2_calibration.py": "d263fdcc02ff80f857d3378cdb95dc519192d3b1dbee90385b6f0596ad6dcb76",
     "vllm/bridge_tp/controller/instance_pool.py": "8a830498f9f47f0278866de3b041561eadc493710e7d19989a8f6ccaabc49a69",
