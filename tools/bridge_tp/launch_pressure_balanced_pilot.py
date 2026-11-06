@@ -1237,6 +1237,8 @@ def run_scene(
             common.write_json(Path(path), [])
         for path, targets in plan.get("sequence_target_files", {}).items():
             common.write_json(Path(path), targets)
+        for path, targets in plan.get("runtime_target_files", {}).items():
+            common.write_json(Path(path), targets)
         target_label = f"TP{plan['config'].get('target_tp_size', 4)}"
         if "target" not in absent:
             announce(scene["name"], f"启动{target_label}服务，等待就绪")

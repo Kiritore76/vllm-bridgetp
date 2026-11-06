@@ -84,7 +84,7 @@ def inspect_model(model, profile):
 
 def validate_gpus(rows, profile):
     if len(rows) != profile["gpu_count"]:
-        raise ValueError("requires four physical GPUs")
+        raise ValueError(f"requires {profile['gpu_count']} physical GPUs")
     for row in rows:
         family = re.sub(r"[^A-Z0-9]", "", row["name"].upper())
         if (

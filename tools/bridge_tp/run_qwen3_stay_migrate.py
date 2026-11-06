@@ -22,6 +22,7 @@ from tools.bridge_tp import qwen3_pressure_observation as observation  # noqa: E
 from tools.bridge_tp import qwen3_rate_sweep as rate_sweep  # noqa: E402
 from tools.bridge_tp import qwen3_resident_pressure as resident  # noqa: E402
 from tools.bridge_tp import qwen3_routine_four_mode as routine  # noqa: E402
+from tools.bridge_tp import qwen3_six_card as six  # noqa: E402
 from tools.bridge_tp import qwen3_stay_migrate as matched  # noqa: E402
 from tools.bridge_tp import run_pressure_comparison as comparison  # noqa: E402
 from tools.bridge_tp.prepare_4090d_qwen3 import (  # noqa: E402
@@ -305,11 +306,13 @@ def main(argv=None):
         default=None,
         help="comma-separated req/s for --rate-sweep (default 4,8,12,16)",
     )
+    parser.add_argument("--cards", type=int, choices=(4, 6), default=4)
     parser.add_argument(
         "--static-layout",
-        choices=("L0", "L1A", "L2"),
-        help="four-card layout screen: start directly in this layout on "
-        "A={2,3}, B={0,1}; L1A migrates (per-source channels), L0/L2 cannot",
+        choices=("L0", "L1A", "L2", "L1AC", "L2C", "L3"),
+        help="static layout: four cards L0/L1A/L2; --cards 6 selects "
+        "L0/L1AC/L2C/L3 on A={2,3}, B={0,1}, C={4,5}; "
+        "mixed layouts migrate to B only",
     )
     parser.add_argument(
         "--static-no-migrate",
@@ -376,6 +379,20 @@ def main(argv=None):
         args.phase_shift, args.static_layout = True, "L1A"
         args.phase_scenario = "conversion_cycle"
         args.expanded_context = True
+    allowed_layouts = six.LAYOUTS if args.cards == 6 else ("L0", "L1A", "L2")
+    if args.static_layout and args.static_layout not in allowed_layouts:
+        parser.error("static layout does not match --cards")
+    if args.cards == 6 and (
+        not args.static_layout
+        or not args.current_machine
+        or not args.expanded_context
+        or args.conversion
+        or args.conversion_cycle
+        or args.conversion_decider
+        or args.layout_l1a_channels
+    ):
+        parser.error("six cards currently support static native-32K layouts only")
+    mixed_layout = args.static_layout in (six.MIXED if args.cards == 6 else ("L1A",))
     if args.layout_l1a_channels and not args.long_burst_memory_verify:
         parser.error("layout-l1a-channels runs with long-burst-memory-verify only")
     joined = bool(
@@ -405,17 +422,15 @@ def main(argv=None):
             "static-layout screens the routine or long-burst workloads on the "
             "current machine, without conversion or other layout options"
         )
-    if args.static_no_migrate and (
-        args.static_layout != "L1A" or args.conversion_decider
-    ):
+    if args.static_no_migrate and (not mixed_layout or args.conversion_decider):
         parser.error("--static-no-migrate is a static L1A control without a decider")
-    if args.kv_short_exempt and args.static_layout != "L1A":
+    if args.kv_short_exempt and not mixed_layout:
         parser.error("--kv-short-exempt is a static L1A routing option")
     if args.hold_queue and not args.static_layout:
         parser.error("--hold-queue is a static layout option")
     if args.overload_migrate and not args.kv_short_exempt:
         parser.error("--overload-migrate needs --kv-short-exempt")
-    if args.migrate_current_length and args.static_layout != "L1A":
+    if args.migrate_current_length and not mixed_layout:
         parser.error("--migrate-current-length is a static L1A option")
     if args.conversion_assist and args.conversion != "L1A-L2":
         parser.error("drain assist merges TP1s into a TP2 (L1A-L2) only")
@@ -535,8 +550,8 @@ def main(argv=None):
                 else "; one failed-workload memory verification, not a new pair"
             )
         if args.static_layout:
-            # One arm: the layout as it would run. Only L1A has a pair.
-            migrate = args.static_layout == "L1A" and not args.static_no_migrate
+            # One arm; mixed layouts retain B as the single migration target.
+            migrate = mixed_layout and not args.static_no_migrate
             cfg["arms"] = ["migrate" if migrate else "stay"]
             if args.kv_short_exempt:
                 cfg["policy_overrides"] = dict(
@@ -560,7 +575,8 @@ def main(argv=None):
             for recipe in cfg["recipes"]:
                 recipe["arm_order_offset"] = 0
             cfg["note"] += (
-                f"; four-card static layout screen {args.static_layout}, one arm, "
+                f"; {args.cards}-card static layout screen {args.static_layout}, "
+                "one arm, "
                 "one run per workload; not a formal layout comparison"
             )
         if args.conversion_cycle:
@@ -731,6 +747,7 @@ def main(argv=None):
             json.dumps(
                 dict(
                     status="CPU_MATCHED_PLAN_ONLY",
+                    cards=args.cards,
                     runs=run_count,
                     inherited_runs=len(inherited),
                     missing_cells=sorted(missing) if missing is not None else None,
@@ -782,7 +799,8 @@ def main(argv=None):
     args.output.mkdir(parents=True, exist_ok=False)
     result, code, ledger, pairs = dict(status="TECHNICAL_FAILURE"), 1, [], []
     try:
-        hardware, versions = runtime_inventory(read(PROFILE)), runtime_versions()
+        platform_profile = dict(read(PROFILE), gpu_count=args.cards)
+        hardware, versions = runtime_inventory(platform_profile), runtime_versions()
         prior_identity = (
             args.prior_comparison
             if matrix_mode or args.pressure_four_mode or args.kv_priority_verify
@@ -796,6 +814,7 @@ def main(argv=None):
                 gpu=hardware,
                 versions=versions,
                 checkpoint_sha256=CHECKPOINT_SHA,
+                cards=args.cards,
                 prior_environment_comparison=not args.current_machine,
             ),
         )
@@ -809,11 +828,17 @@ def main(argv=None):
         if args.expanded_context:
             expanded_context_spec(spec, read(args.model / "config.json"))
         if args.static_layout:
+            if args.cards == 6:
+                # L2C keeps only C at TP1; the old pair source on GPU2
+                # belongs to A's TP2 and must not also be started.
+                spec["server_settings"]["tp1_gpu"] = (
+                    "4" if args.static_layout == "L2C" else "2"
+                )
             spec["layout"] = dict(
                 name=args.static_layout,
-                bundle_gpus=["2", "3", "0", "1"],
+                bundle_gpus=list(six.GPUS) if args.cards == 6 else ["2", "3", "0", "1"],
                 base_port=8300,
-                migration_sources=args.static_layout == "L1A",
+                migration_sources=mixed_layout,
             )
         if args.layout_l1a_channels:
             spec["layout"] = dict(
@@ -954,6 +979,8 @@ def main(argv=None):
             plans = [p for p in plans if p[2]["name"] in missing]
         for _, arm, _, plan in plans:
             adapt_plan(plan, arm, args.checkpoint, args.model)
+            if args.cards == 6:
+                six.configure(plan)
             if args.thread_profile:
                 plan["controller_argv"].append("--thread-profile")
             if args.hold_queue:
@@ -991,7 +1018,9 @@ def main(argv=None):
             ledger.append(row)
             write(args.output / "attempt_ledger.json", ledger)
             finalizer = comparison.finalize
-            if args.conversion_cycle or args.decider_multi:
+            if args.cards == 6:
+                finalizer = six.finalize
+            elif args.conversion_cycle or args.decider_multi:
                 from tools.bridge_tp.conversion_sequence import finalize
 
                 finalizer = finalize
@@ -1002,7 +1031,9 @@ def main(argv=None):
                 common,
                 settings,
                 before_workload=lambda current: (
-                    long_burst.prepare_native(current, common, inputs)
+                    six.prepare(current, common)
+                    if args.cards == 6
+                    else long_burst.prepare_native(current, common, inputs)
                     if args.long_burst_pair
                     else prepare_native(current, common)
                 ),
@@ -1021,6 +1052,11 @@ def main(argv=None):
                 horizon=cfg["horizon_s"] if args.conversion_cycle else 300.0,
             )
             write(plan["run_dir"].parent / "closed_loop_acceptance.json", proof)
+            if args.cards == 6:
+                row["six_card"] = six.assess(plan, proof, len(recipe["jobs"]))
+                write(
+                    plan["run_dir"].parent / "six_card_acceptance.json", row["six_card"]
+                )
             write(
                 plan["run_dir"].parent / "comparison_metrics.json",
                 dict(summary=summary, requests=requests),
@@ -1313,6 +1349,8 @@ def main(argv=None):
             done = len(ledger) == run_count and all(
                 r["status"] == "COMPLETED" for r in ledger
             )
+            if args.cards == 6:
+                done = done and all(r["six_card"]["passed"] for r in ledger)
             result, code = (
                 (dict(status="COMPLETED_STATIC_LAYOUT", layout=args.static_layout), 0)
                 if done
