@@ -301,8 +301,8 @@ class PressureCoordinator:
         with self._lock:
             for pool_id in pool_ids:
                 last = self.itl.snapshot().get(pool_id, {}).get("updated_at", -math.inf)
-                intervals, active = service.intervals_since(pool_id, last, now)
-                self.itl.update(pool_id, now, intervals, active)
+                seconds, tokens, active = service.decode_progress(pool_id, last, now)
+                self.itl.update(pool_id, now, seconds, tokens, active)
 
     def unified_fullness(self, reading, kind, *, extra_requests=0, extra_blocks=0):
         """Fullness of a routing-adjusted reading; ``kind`` picks the smoothing."""

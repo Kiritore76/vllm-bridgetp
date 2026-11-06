@@ -211,20 +211,30 @@ class NativeServiceWindow:
             if self.health_observer is not None:
                 self.health_observer.finish(request_id)
 
-    def intervals_since(self, pool_id, since, now):
-        """Token intervals captured in (since, now], and the active stream count.
+    def decode_progress(self, pool_id, since, now):
+        """Stream-seconds of decoding and tokens in (since, now], and stream count.
 
-        For the unified scheduler's smoothing; it reads the retained window and
-        never prunes it, so it must be called more often than ``window_s``.
+        For the unified scheduler's speed term: their ratio is the mean
+        inter-token interval, the same quantity TPOT averages, so prefill stalls
+        count. A gap still open at ``now`` counts its time already, so a stall
+        shows while it lasts. It reads the retained window and never prunes it,
+        so it must be called more often than ``window_s``.
         """
         with self._lock:
-            values = [
-                interval
-                for captured, interval, _ in self._intervals.get(pool_id, ())
-                if since < captured <= now
-            ]
-            active = sum(pool == pool_id for pool, _, _ in self._active.values())
-            return values, active
+            seconds = 0.0
+            tokens = 0
+            for captured, interval, _ in self._intervals.get(pool_id, ()):
+                if since < captured <= now:
+                    seconds += captured - max(captured - interval, since)
+                    tokens += 1
+            active = 0
+            for pool, _, last in self._active.values():
+                if pool != pool_id:
+                    continue
+                active += 1
+                if last is not None and last < now:
+                    seconds += now - max(last, since)
+            return seconds, tokens, active
 
     def snapshot(self, pool_id, now):
         with self._lock:

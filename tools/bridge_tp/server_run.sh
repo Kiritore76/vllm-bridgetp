@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# 当前任务：统一调度速度基准由35ms改为28ms（用户11-06，TP1与TP2统一），L2C:16一场。
+# 当前任务：统一调度速度项改为token间隔均值（与TPOT同口径，用户11-06），基准32ms，L2C:16一场。
 # 负载只跑长请求递增的前三档（mixed_long_ramp_r3）：各档起点与种子不变，到达与此前L2C-16两场逐条相同，可直接对比r1–r3。
-# 对照：旧调度qwen3_six_longcap_20261106_153723_9226的L2C-s16，统一调度35ms qwen3_unified_20261106_205522_4987。
+# 对照：旧调度qwen3_six_longcap_20261106_153723_9226的L2C-s16，统一调度中位数35ms qwen3_unified_20261106_205522_4987、28ms qwen3_unified_20261106_215240_27223。
 scenes='L2C:16:unified'
 scenario=mixed_long_ramp_r3
 set -uo pipefail
@@ -36,7 +36,7 @@ avail=$(df --output=avail -k "$run" | tail -1)
 printf '%s\n' "$revision" > "$run/revision.txt"
 echo "本批目录：$run"
 echo "统一调度：场次 $scenes（布局:TP2槽位:调度方式）；A={2,3}、B={0,1}、C={4,5}；TP1槽位16。"
-echo '统一调度：准入=引擎排队≤8且提示放得下（保护125块）；选实例=满度最低（槽位、KV、平滑ITL÷28ms取最大）；迁移=KV≥90%或约8秒耗尽立即迁，满度≥0.9持续10秒且高出目标0.3才按压力迁；挑请求沿用旧调度评估，目标仍只有B。'
+echo '统一调度：准入=引擎排队≤8且提示放得下（保护125块）；选实例=满度最低（槽位、KV、平滑后token间隔均值÷32ms取最大）；迁移=KV≥90%或约8秒耗尽立即迁，满度≥0.9持续10秒且高出目标0.3才按压力迁；挑请求沿用旧调度评估，目标仍只有B。'
 echo '负载：预热60秒短4/s；60–780秒短8/s，深长16384/8192每240秒一档0.02/0.04/0.06/s（3/10/18条）；收尾60秒短1/s；种子6。'
 echo '双32768/.88、guard125、hold-queue；L2C沿用kv-short-exempt/overload-migrate/migrate-current-length，仍只迁向B。'
 echo '不转换、不训练；旧调度代码保留在开关后面；性能负结果和零迁移保留；技术故障/请求或清理不完整即停，不自动重试。'
@@ -68,7 +68,7 @@ export VLLM_USE_V2_MODEL_RUNNER=0 OMP_NUM_THREADS=1
 task_tmp=$(mktemp -d /root/autodl-tmp/bt-tmp.XXXXXX) || { pack_result 1; exit 1; }
 printf '%s\n' "$task_tmp" > "$run/temporary_directory.txt"
 export TMPDIR="$task_tmp" TEMP="$task_tmp" TMP="$task_tmp"
-echo '[CPU前置] 运行本次相关的回归检查（含统一调度20项）；不执行GPU计算。'
+echo '[CPU前置] 运行本次相关的回归检查（含统一调度各项）；不执行GPU计算。'
 # 与本地CPU检查相同，导入源码控制逻辑，避免执行vLLM顶层的GPU平台探测。
 "$py" -B -c 'import sys,types,unittest; from pathlib import Path; p=types.ModuleType("vllm"); p.__path__=[str(Path.cwd()/"vllm")]; sys.modules["vllm"]=p; s=unittest.defaultTestLoader.loadTestsFromNames(sys.argv[1:]); r=unittest.TextTestRunner(verbosity=2).run(s); raise SystemExit(not r.wasSuccessful())' \
     tests.bridge_tp.test_qwen3_six_card tests.bridge_tp.test_static_layout \

@@ -12,6 +12,7 @@ from tools.bridge_tp.pressure_cpu import load
 
 u = load("unified_scheduler")
 hold_module = load("pressure_hold")
+observation = load("pressure_observation")
 
 TP = dict(a1=1, a2=1, b=2, c=2)
 # The routing configuration of the six-card runs (L2C-s16, 11-06).
@@ -87,35 +88,85 @@ def coordinator(slots=None, cfg=None):
     return co, records
 
 
+def busy(s, pool_id, times, interval, streams=10):
+    """Updates at ``times`` with every stream emitting at ``interval``."""
+    for t0, t1 in zip(times, times[1:]):
+        dt = t1 - t0
+        s.update(pool_id, t1, dt * streams, dt / interval * streams, streams)
+
+
 class SmoothingTests(unittest.TestCase):
-    def test_first_value_then_exponential_weighting_by_elapsed_time(self):
+    def test_the_first_update_starts_the_clock_then_rates_set_the_value(self):
         s = u.SmoothedItl(route_tau_s=5.0, migrate_tau_s=10.0)
-        s.update("b", 0.0, [0.020, 0.030, 0.025], active=3)
+        s.update("b", 0.0, 0.0, 0, 0)
+        self.assertIsNone(s.value("b"))
+        s.update("b", 0.2, 0.0, 0, 0)
+        self.assertEqual(s.value("b"), 0.0)
+        s = u.SmoothedItl()
+        s.update("b", 0.0, 9.0, 300, 10)
+        self.assertIsNone(s.value("b"))
+        busy(s, "b", [0.0, 0.2], 0.025)
         self.assertAlmostEqual(s.value("b"), 0.025)
-        s.update("b", 5.0, [0.045], active=3)
+        self.assertAlmostEqual(s.value("b", "migrate"), 0.025)
+
+    def test_exponential_weighting_by_elapsed_time(self):
+        s = u.SmoothedItl(route_tau_s=5.0, migrate_tau_s=10.0)
+        s.update("b", 0.0, 0.0, 0, 10)
+        busy(s, "b", [0.0, 0.2], 0.025)
+        busy(s, "b", [0.2, 5.2], 0.045)
         a = 1 - math.exp(-1)
-        self.assertAlmostEqual(s.value("b"), a * 0.045 + (1 - a) * 0.025)
-        a = 1 - math.exp(-0.5)
-        self.assertAlmostEqual(s.value("b", "migrate"), a * 0.045 + (1 - a) * 0.025)
+        # The ratio of smoothed rates: time per second over tokens per second.
+        seconds = 10
+        tokens = a * 10 / 0.045 + (1 - a) * 10 / 0.025
+        self.assertAlmostEqual(s.value("b"), seconds / tokens)
 
-    def test_one_prefill_stall_moves_the_route_value_little(self):
+    def test_a_prefill_stall_counts_as_the_mean_does(self):
         s = u.SmoothedItl()
-        s.update("b", 0.0, [0.025] * 10, active=10)
-        # A long prefill makes a few intervals slow; the median ignores them.
-        s.update("b", 0.2, [0.025] * 8 + [0.4, 0.4], active=10)
-        self.assertAlmostEqual(s.value("b"), 0.025)
-        # Even a whole slow update moves it by only a few percent.
-        s.update("b", 0.4, [0.4] * 10, active=10)
-        self.assertLess(s.value("b"), 0.045)
+        s.update("b", 0.0, 0.0, 0, 10)
+        busy(s, "b", [i * 0.2 for i in range(51)], 0.025)
+        # 0.4s with no token at all: the value rises while the stall lasts.
+        s.update("b", 10.2, 2.0, 0, 10)
+        during = s.value("b")
+        self.assertGreater(during, 0.025)
+        s.update("b", 10.4, 2.0, 10, 10)
+        self.assertGreater(s.value("b"), during)
+        # A median would have stayed at 25ms; the mean of the last 10s is higher.
+        self.assertGreater(s.value("b"), 0.026)
 
-    def test_idle_decays_and_a_stall_keeps_its_value(self):
+    def test_idle_decays_and_prefill_only_keeps_the_value(self):
         s = u.SmoothedItl()
-        s.update("b", 0.0, [0.030], active=1)
-        s.update("b", 30.0, [], active=1)
+        s.update("b", 0.0, 0.0, 0, 10)
+        busy(s, "b", [0.0, 0.2], 0.030)
+        s.update("b", 30.0, 0.0, 0, 3)
         self.assertAlmostEqual(s.value("b"), 0.030)
-        s.update("b", 60.0, [], active=0)
-        self.assertLess(s.value("b"), 0.030 * math.exp(-5) * 1.01)
+        s.update("b", 60.0, 0.0, 0, 0)
+        self.assertLess(s.value("b"), 0.030 * math.exp(-6) * 1.01)
         self.assertIsNone(s.value("unknown"))
+        with self.assertRaises(ValueError):
+            s.update("b", 61.0, -1.0, 0, 0)
+
+
+class DecodeProgressTests(unittest.TestCase):
+    def test_closed_and_open_gaps_split_at_the_update_time(self):
+        w = observation.NativeServiceWindow()
+        w.add_pool("b")
+        w.arrive("x", "b", 0.0)
+        w.token("x", 1.0)  # first token: no interval yet
+        w.token("x", 1.1)
+        w.token("x", 1.3)
+        # (1.0, 1.4]: closed 0.1 + 0.2, open 0.1 since the last token.
+        seconds, tokens, active = w.decode_progress("b", 1.0, 1.4)
+        self.assertEqual((tokens, active), (2, 1))
+        self.assertAlmostEqual(seconds, 0.4)
+        # Next window: the open gap closes at 1.6; only its new part counts.
+        w.token("x", 1.6)
+        seconds, tokens, _ = w.decode_progress("b", 1.4, 1.6)
+        self.assertEqual(tokens, 1)
+        self.assertAlmostEqual(seconds, 0.2)
+        w.arrive("y", "b", 1.5)  # waiting for its first token: no decode time
+        seconds, tokens, active = w.decode_progress("b", 1.6, 1.8)
+        self.assertEqual((tokens, active), (0, 2))
+        self.assertAlmostEqual(seconds, 0.2)
 
 
 class FullnessTests(unittest.TestCase):
@@ -154,8 +205,9 @@ class AdmissionTests(unittest.TestCase):
 
     def test_slots_and_speed_also_count(self):
         co, _ = coordinator()
-        co.itl.update("b", 9.0, [0.050] * 5, active=5)
-        co.itl.update("c", 9.0, [0.020] * 5, active=5)
+        for pool_id, interval in (("b", 0.050), ("c", 0.020)):
+            co.itl.update(pool_id, 8.8, 0.0, 0, 5)
+            busy(co.itl, pool_id, [8.8, 9.0], interval, streams=5)
         readings = [inst("b"), inst("c")]
         self.assertEqual(
             co.admission_multi("q", 512, 128, readings, TP, 10.0, "k").pool_id, "c"

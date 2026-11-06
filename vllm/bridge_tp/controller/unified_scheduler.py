@@ -8,7 +8,8 @@ its own limit, whatever its TP degree:
 - running slots: requests in the engine plus routed ones it has not reported,
   over that instance's ``max_num_seqs``;
 - KV: used plus unallocated prompt blocks (with this request), over its blocks;
-- speed: the exponentially smoothed inter-token interval over ``ITL_REFERENCE_S``.
+- speed: the exponentially smoothed mean inter-token interval over
+  ``ITL_REFERENCE_S``.
 
 No output cap is read as a final length and no cost model is fitted: a request
 that grows too large for where it was placed is migration's job. Migration has
@@ -22,12 +23,12 @@ All values here are initial values, not tuned (plan 11-06).
 from __future__ import annotations
 
 import math
-import statistics
 from dataclasses import dataclass, field
 
-# Below the strict 35ms TPOT line so routing backs off before an instance
-# crosses it (unified L2C:16 GPU 11-06: TP1 short TPOT sat at 33-34ms).
-ITL_REFERENCE_S = 0.028
+# Mean inter-token interval, as TPOT measures it, kept below the strict 35ms
+# line so routing backs off before an instance crosses it (user 11-06). The
+# earlier 28ms was against the median interval, which hid prefill stalls.
+ITL_REFERENCE_S = 0.032
 ROUTE_TAU_S = 5.0
 MIGRATE_TAU_S = 10.0
 GUARD_BLOCKS = 125
@@ -40,21 +41,28 @@ TARGET_AFTER_MAX = 0.7
 COOLDOWN_S = 15.0
 
 
+# Token rate standing in for an instance first seen idle, so its value is zero.
+_IDLE_TOKENS = 1e-9
+
+
 @dataclass
 class _Smoothed:
     updated_at: float
-    route: float
-    migrate: float
+    # Per kind: smoothed stream-seconds per second and tokens per second.
+    seconds: list
+    tokens: list
 
 
 class SmoothedItl:
-    """Two exponentially weighted inter-token intervals per instance.
+    """Exponentially smoothed mean inter-token interval per instance.
 
-    new = a * latest + (1 - a) * previous, with a = 1 - exp(-dt / tau) from the
-    real time since the last update. The latest value is the median of the
-    intervals that arrived since then. An idle instance decays towards zero; one
-    with running requests but no new token keeps its value (a stall is handled
-    by migration and gap metrics, not by calling it idle).
+    Each update brings the decoding stream-seconds and the tokens since the
+    previous one; their ratio is the mean interval, the quantity TPOT averages,
+    so prefill stalls count instead of being filtered out. Both are smoothed as
+    rates, new = a * latest + (1 - a) * previous with a = 1 - exp(-dt / tau)
+    from the real elapsed time, and the value is their ratio. A stall with no
+    new token raises it while it lasts; an instance with no stream at all
+    decays towards zero.
     """
 
     def __init__(self, route_tau_s=ROUTE_TAU_S, migrate_tau_s=MIGRATE_TAU_S):
@@ -63,38 +71,46 @@ class SmoothedItl:
         self.taus = (route_tau_s, migrate_tau_s)
         self._values: dict[str, _Smoothed] = {}
 
-    def update(self, pool_id, now, intervals, active):
-        intervals = [v for v in intervals if math.isfinite(v) and v >= 0]
-        if intervals:
-            latest = statistics.median(intervals)
-        elif active == 0:
-            latest = 0.0
-        else:
-            latest = None
+    def update(self, pool_id, now, seconds, tokens, active):
+        if not (math.isfinite(seconds) and seconds >= 0) or tokens < 0:
+            raise ValueError("invalid decode progress")
         current = self._values.get(pool_id)
         if current is None:
-            if latest is not None:
-                self._values[pool_id] = _Smoothed(now, latest, latest)
+            # The first call only starts the clock: rates need an elapsed time.
+            self._values[pool_id] = _Smoothed(now, [None] * 2, [None] * 2)
             return
         dt = now - current.updated_at
         if dt <= 0:
             return
         current.updated_at = now
-        if latest is None:
+        rate = (seconds / dt, tokens / dt)
+        if current.tokens[0] is None:
+            if tokens > 0:
+                current.seconds, current.tokens = [rate[0]] * 2, [rate[1]] * 2
+            elif active == 0:
+                current.seconds, current.tokens = [0.0] * 2, [_IDLE_TOKENS] * 2
             return
-        route_a, migrate_a = (1 - math.exp(-dt / tau) for tau in self.taus)
-        current.route = route_a * latest + (1 - route_a) * current.route
-        current.migrate = migrate_a * latest + (1 - migrate_a) * current.migrate
+        for i, tau in enumerate(self.taus):
+            a = 1 - math.exp(-dt / tau)
+            current.seconds[i] = a * rate[0] + (1 - a) * current.seconds[i]
+            if active or tokens:
+                current.tokens[i] = a * rate[1] + (1 - a) * current.tokens[i]
 
     def value(self, pool_id, kind="route"):
         current = self._values.get(pool_id)
         if current is None:
             return None
-        return current.route if kind == "route" else current.migrate
+        i = 0 if kind == "route" else 1
+        tokens = current.tokens[i]
+        return current.seconds[i] / tokens if tokens else None
 
     def snapshot(self):
         return {
-            k: dict(updated_at=v.updated_at, route_s=v.route, migrate_s=v.migrate)
+            k: dict(
+                updated_at=v.updated_at,
+                route_s=self.value(k, "route"),
+                migrate_s=self.value(k, "migrate"),
+            )
             for k, v in self._values.items()
         }
 

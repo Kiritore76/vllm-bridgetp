@@ -205,9 +205,9 @@
     "vllm/bridge_tp/controller/policy.py": "a3ed7f8f9cf24ff94fa13e84c72f906ddd300e03c1f5dab0867be688f841c9d0",
     "vllm/bridge_tp/controller/predictor.py": "f134fdf282bceee20a007768cabb3d5ee1ce9d68c4201027c5b2f5f64197f29f",
     "vllm/bridge_tp/controller/pressure_ingress.py": "a73b01f1c1c557be3a655069cabf056c9b2b85e263704db72bc27e31ec3ffd11",
-    "vllm/bridge_tp/controller/pressure_observation.py": "ceaec729e7a7aa8dc2e5d11be1ea44f6ec27f60a43e4db094a71562758d4c44f",
+    "vllm/bridge_tp/controller/pressure_observation.py": "d99c36a8dda6c363e8f72ccbe73327f8197c92f625faffcd859f48ad189776fa",
     "vllm/bridge_tp/controller/pressure_policy.py": "2df8df4a518419fc8a08517aa9d70cef5dc638840b59644e605140a2a4c2e666",
-    "vllm/bridge_tp/controller/pressure_runtime.py": "b34807f438ebd7d490fe5fe5694a2b1132368f28d6fc935c1b2e559ecd48da35",
+    "vllm/bridge_tp/controller/pressure_runtime.py": "f57ea29677d6bb20cc2f72e4736cdf56af02f669810b7869e3c6dd15179fec4b",
     "vllm/bridge_tp/controller/pressure_service.py": "e2d537e473026842ee1f8bf6d5b43e860d3f25dab44d66d7be61a4ff9508f143",
     "vllm/bridge_tp/controller/rate_controller.py": "01f9efbbc2065f8f3d1e0202fe2eae303d2d45c3f9cdcd185209d675055471f1",
     "vllm/bridge_tp/controller/residency_policy.py": "afebde8915666ae1fba63d5a1b98fb5ac79d140f9a060a468a40b6b954780b37",
@@ -407,8 +407,8 @@
     "vllm/bridge_tp/controller/pressure_hold.py": "f1490049e0f7f244a3b19f338285221188a96d9252ec567b4c713fa93bd60676",
     "tools/bridge_tp/qwen3_six_card.py": "eda1f05eb7129cf2a42e428b1007375d4f398e4779dcbc06fc405247308ed64e",
     "tests/bridge_tp/test_qwen3_six_card.py": "ee1c3ab62f93b301fbccf5bfc9594a954ff3c0d1dc7ef176ce6cc4cee576b906",
-    "vllm/bridge_tp/controller/unified_scheduler.py": "221cadcb4c5f70fc3075bb77989e9035b4acbbc7a0fe307a8b504eeef213d59a",
-    "tests/bridge_tp/test_unified_scheduler.py": "dbdfb5e15bacac0946c53778a4a02c19e1f30acb24f2727e185e4db5f014f687"
+    "vllm/bridge_tp/controller/unified_scheduler.py": "1e170283050e2e0a5aa5df02e1d670dc59056800590d637fa4883a8eba23521b",
+    "tests/bridge_tp/test_unified_scheduler.py": "329badc9b76c4243819de5589f7755f13e89a121345e1351f4da2dc0aab030c3"
   },
   "server_settings": {
     "dtype": "bfloat16",
