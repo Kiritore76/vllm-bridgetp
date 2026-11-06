@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# 当前任务：长请求容量（用户11-06）。负载mixed_long_ramp：短8/s，深长请求每240秒升一档（0.02→0.08/s）。
-# 比较L2C、L3在TP2 max-num-seqs 16与32下的抢占、长请求TPOT/中断和短请求能力；TP1保持16。
-# 首场L3:32已回收（qwen3_six_longcap_20261106_145204_12086）；用户同意放其余三场，串行执行。
-scenes='L3:16 L2C:16 L2C:32'
+# 当前任务：统一调度首场GPU验证（用户11-06）。分支bridgetp/unified-scheduler，开关--scheduler unified。
+# 负载与长请求容量四场相同（mixed_long_ramp，种子6）；先L2C:16（同时检验新路由与新迁移），没问题再放L3:16。
+# 场次格式：布局:TP2槽位:调度方式。旧调度对照为qwen3_six_longcap_20261106_153723_9226的L2C-s16。
+scenes='L2C:16:unified'
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
 py=$venv/bin/python
 model=/root/autodl-tmp/models/Qwen3-8B
-branch=bridgetp/tp2-4090d-qwen3-8b
+branch=bridgetp/unified-scheduler
 cd "$repo" || exit 1
 [ -x "$py" ] && [ -f "$model/config.json" ] || { echo '虚拟环境或模型不存在，请先核对部署路径。'; exit 1; }
 source "$venv/bin/activate" || exit 1
@@ -28,17 +28,17 @@ revision=$(git rev-parse HEAD)
 [ "$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)" = 6 ] || { echo '需要六张GPU。'; exit 1; }
 [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || { echo 'GPU有计算进程，停止；未清理任何进程。'; exit 1; }
 mkdir -p /root/autodl-tmp/bridgetp/results || exit 1
-run=/root/autodl-tmp/bridgetp/results/qwen3_six_longcap_$(date +%Y%m%d_%H%M%S)_${RANDOM}
+run=/root/autodl-tmp/bridgetp/results/qwen3_unified_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 avail=$(df --output=avail -k "$run" | tail -1)
 [ "$avail" -ge 16777216 ] || { echo '磁盘可用不足16GB。'; exit 1; }
 printf '%s\n' "$revision" > "$run/revision.txt"
 echo "本批目录：$run"
-echo "长请求容量：场次 $scenes（布局:TP2槽位）；A={2,3}、B={0,1}、C={4,5}；TP1槽位16。"
+echo "统一调度：场次 $scenes（布局:TP2槽位:调度方式）；A={2,3}、B={0,1}、C={4,5}；TP1槽位16。"
+echo '统一调度：准入=引擎排队≤8且提示放得下（保护125块）；选实例=满度最低（槽位、KV、平滑ITL÷35ms取最大）；迁移=KV≥90%或约8秒耗尽立即迁，满度≥0.9持续10秒且高出目标0.3才按压力迁；迁当前上下文最长的请求，目标仍只有B。'
 echo '负载：预热60秒短4/s；60–1020秒短8/s，深长16384/8192每240秒一档0.02/0.04/0.06/0.08/s（3/10/18/17条）；收尾60秒短1/s；种子6。'
 echo '双32768/.88、guard125、hold-queue；L2C沿用kv-short-exempt/overload-migrate/migrate-current-length，仍只迁向B。'
-echo 'TP2健康参考只测到16条并发：TP2=32时B正在生成超过15条会挡住非紧急迁移；规则不改，分析里单独统计。'
-echo '不转换、不训练、不改阈值；性能负结果和零迁移保留；技术故障/请求或清理不完整即停，不自动重试。'
+echo '不转换、不训练；旧调度代码保留在开关后面；性能负结果和零迁移保留；技术故障/请求或清理不完整即停，不自动重试。'
 echo '共三场，每场约25–35分钟，合计约1.5–2小时含启动/收尾/打包；不删除服务器结果。'
 printf 'scene\trunner_exit\tbatch_exit\n' > "$run/scenes.tsv"
 pack_result() {
@@ -46,7 +46,8 @@ pack_result() {
     printf '%s\n' "$status" > "$run/exit_code.txt"
     local excludes=()
     for scene in $scenes; do
-        local name=${scene%%:*}-s${scene##*:}
+        local rest=${scene#*:}
+        local name=${scene%%:*}-s${rest%%:*}-${rest#*:}
         if (cd "$run" && sha256sum -c "$name.tar.gz.sha256" >/dev/null 2>&1) \
             && tar -tzf "$run/$name.tar.gz" >/dev/null 2>&1; then
             excludes+=(--exclude="$(basename "$run")/$name")
@@ -66,13 +67,15 @@ export VLLM_USE_V2_MODEL_RUNNER=0 OMP_NUM_THREADS=1
 task_tmp=$(mktemp -d /root/autodl-tmp/bt-tmp.XXXXXX) || { pack_result 1; exit 1; }
 printf '%s\n' "$task_tmp" > "$run/temporary_directory.txt"
 export TMPDIR="$task_tmp" TEMP="$task_tmp" TMP="$task_tmp"
-echo '[CPU前置] 运行本次相关的回归检查（含TP2槽位与长请求负载新增3项）；不执行GPU计算。'
+echo '[CPU前置] 运行本次相关的回归检查（含统一调度20项）；不执行GPU计算。'
 # 与本地CPU检查相同，导入源码控制逻辑，避免执行vLLM顶层的GPU平台探测。
 "$py" -B -c 'import sys,types,unittest; from pathlib import Path; p=types.ModuleType("vllm"); p.__path__=[str(Path.cwd()/"vllm")]; sys.modules["vllm"]=p; s=unittest.defaultTestLoader.loadTestsFromNames(sys.argv[1:]); r=unittest.TextTestRunner(verbosity=2).run(s); raise SystemExit(not r.wasSuccessful())' \
     tests.bridge_tp.test_qwen3_six_card tests.bridge_tp.test_static_layout \
     tests.bridge_tp.test_pressure_launcher tests.bridge_tp.test_pressure_multi \
     tests.bridge_tp.test_gpu_direct_targets tests.bridge_tp.test_source_channels \
     tests.bridge_tp.test_4090d_qwen3 tests.bridge_tp.test_qwen3_stay_migrate \
+    tests.bridge_tp.test_unified_scheduler tests.bridge_tp.test_pressure_multi \
+    tests.bridge_tp.test_pressure_policy tests.bridge_tp.test_pressure_dispatch \
     > "$run/cpu_checks.log" 2>&1
 status=$?
 if [ "$status" != 0 ]; then
@@ -100,8 +103,10 @@ trap 'kill "$smi" 2>/dev/null || true' EXIT
 batch_status=0
 for scene in $scenes; do
     layout=${scene%%:*}
-    slots=${scene##*:}
-    name=$layout-s$slots
+    rest=${scene#*:}
+    slots=${rest%%:*}
+    scheduler=${rest#*:}
+    name=$layout-s$slots-$scheduler
     avail=$(df --output=avail -k "$run" | tail -1)
     if [ "$avail" -lt 8388608 ] || [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]; then
         echo "[停止] $name 前磁盘不足8GB或GPU有计算进程；未清理任何进程。"
@@ -114,7 +119,7 @@ for scene in $scenes; do
     fi
     echo "[场次] $name 开始"
     "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
-        --cards 6 --static-layout "$layout" --tp2-max-num-seqs "$slots" \
+        --cards 6 --static-layout "$layout" --tp2-max-num-seqs "$slots" --scheduler "$scheduler" \
         --phase-shift --phase-scenario mixed_long_ramp \
         "${options[@]}" --expanded-context --current-machine --repetitions 1 \
         --model "$model" \

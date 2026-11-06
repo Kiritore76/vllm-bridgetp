@@ -315,6 +315,12 @@ def main(argv=None):
         help="running slots of every TP2 engine; TP1 keeps 16 (user 11-06)",
     )
     parser.add_argument(
+        "--scheduler",
+        choices=("pressure", "unified"),
+        default="pressure",
+        help="controller scheduling; unified is the 11-06 rule set, static only",
+    )
+    parser.add_argument(
         "--static-layout",
         choices=("L0", "L1A", "L2", "L1AC", "L2C", "L3"),
         help="static layout: four cards L0/L1A/L2; --cards 6 selects "
@@ -403,6 +409,14 @@ def main(argv=None):
         parser.error("--tp2-max-num-seqs must be in [1, 256]")
     if args.tp2_max_num_seqs != 16 and args.cards != 6:
         parser.error("--tp2-max-num-seqs is for six-card static layouts")
+    if args.scheduler == "unified" and (
+        not args.static_layout
+        or not args.hold_queue
+        or args.conversion
+        or args.conversion_cycle
+        or args.conversion_decider
+    ):
+        parser.error("the unified scheduler runs static layouts with --hold-queue")
     mixed_layout = args.static_layout in (six.MIXED if args.cards == 6 else ("L1A",))
     if args.layout_l1a_channels and not args.long_burst_memory_verify:
         parser.error("layout-l1a-channels runs with long-burst-memory-verify only")
@@ -755,6 +769,10 @@ def main(argv=None):
     if args.tp2_max_num_seqs != 16:
         cfg["note"] += f"; TP2 max-num-seqs {args.tp2_max_num_seqs}, TP1 16"
     cfg["tp2_max_num_seqs"] = args.tp2_max_num_seqs
+    cfg["scheduler"] = args.scheduler
+    if args.scheduler == "unified":
+        cfg["note"] += "; unified scheduler (11-06): queue limit, prompt fit, "
+        cfg["note"] += "one fullness, KV/pressure migration"
     run_count = len(missing) if missing is not None else len(values) * len(cfg["arms"])
     if args.validate_only:
         print(
@@ -763,6 +781,7 @@ def main(argv=None):
                     status="CPU_MATCHED_PLAN_ONLY",
                     cards=args.cards,
                     tp2_max_num_seqs=args.tp2_max_num_seqs,
+                    scheduler=args.scheduler,
                     runs=run_count,
                     inherited_runs=len(inherited),
                     missing_cells=sorted(missing) if missing is not None else None,
@@ -1010,9 +1029,19 @@ def main(argv=None):
                     "8",
                     "--hold-long-wait-s",
                     "300",
-                    "--hold-tp1-long-kv",
-                    "0.7",
                 ]
+                if args.scheduler == "pressure":
+                    plan["controller_argv"] += ["--hold-tp1-long-kv", "0.7"]
+            if args.scheduler == "unified":
+                plan["controller_argv"] += [
+                    "--scheduler",
+                    "unified",
+                    "--tp1-max-num-seqs",
+                    "16",
+                    "--tp2-max-num-seqs",
+                    str(args.tp2_max_num_seqs),
+                ]
+            plan["scheduler"] = args.scheduler
             if args.expanded_context:
                 plan["expected_context_limits"] = (32768, 32768)
                 plan["source_env"].update(

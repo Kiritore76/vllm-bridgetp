@@ -8,11 +8,13 @@ The experimental real pilot ingress calls this coordinator. Replay is CPU-only.
 
 from __future__ import annotations
 
+import math
 import threading
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 
 from . import pressure_multi as multi
+from . import unified_scheduler as unified
 from .bounded_length import from_advisory
 from .pressure_policy import (
     Admission,
@@ -24,6 +26,7 @@ from .pressure_policy import (
     ReservationLedger,
     RoutingError,
     admit,
+    classify,
 )
 
 
@@ -44,7 +47,19 @@ class PressureCoordinator:
         *,
         routing_strategy="pressure",
         routing_weights=(1.0, 1.0),
+        scheduler="pressure",
+        slots=None,
     ) -> None:
+        if scheduler not in {"pressure", "unified"}:
+            raise ValueError("unknown scheduler")
+        if scheduler == "unified" and not slots:
+            raise ValueError("the unified scheduler needs every instance's slots")
+        # Unified (user 11-06): one fullness for admission and migration; the
+        # pressure scheduler below stays unchanged behind this switch.
+        self.scheduler = scheduler
+        self.slots = dict(slots or {})
+        self.itl = unified.SmoothedItl()
+        self.migration_state = unified.MigrationState()
         self.ledger = ReservationLedger()
         self.policy = PressurePolicy(cfg, self.ledger)
         self.audit = audit
@@ -220,6 +235,18 @@ class PressureCoordinator:
                 and allowed_pool_id not in {r.pool_id for r in readings}
             ):
                 raise RoutingError({"admission": dict(reasons=["no ACTIVE instance"])})
+            if self.scheduler == "unified":
+                result, record = self._admit_unified(
+                    request_id,
+                    prompt_tokens,
+                    requested_output,
+                    readings,
+                    key,
+                    now,
+                    allowed_pool_id,
+                )
+                self.audit(record)
+                return result
             classes = (
                 [r for r in readings if tp_of[r.pool_id] == 1],
                 [r for r in readings if tp_of[r.pool_id] > 1],
@@ -267,6 +294,103 @@ class PressureCoordinator:
             )
         self.audit(record)
         return result
+
+    def observe_itl(self, service, pool_ids, now):
+        """Advance every instance's smoothed inter-token interval once."""
+        with self._lock:
+            for pool_id in pool_ids:
+                last = self.itl.snapshot().get(pool_id, {}).get("updated_at", -math.inf)
+                intervals, active = service.intervals_since(pool_id, last, now)
+                self.itl.update(pool_id, now, intervals, active)
+
+    def unified_fullness(self, reading, kind, *, extra_requests=0, extra_blocks=0):
+        """Fullness of a routing-adjusted reading; ``kind`` picks the smoothing."""
+        unobserved, _ = self.ledger.unobserved_ingress(reading.pool_id)
+        return unified.fullness(
+            reading,
+            self.slots[reading.pool_id],
+            self.itl.value(reading.pool_id, kind),
+            extra_requests=unobserved + extra_requests,
+            extra_blocks=extra_blocks,
+        )
+
+    def _admit_unified(
+        self, request_id, prompt_tokens, requested_output, readings, key, now, allowed
+    ):
+        """Least full instance that holds the prompt; one rule for every TP."""
+        if (
+            type(prompt_tokens) is not int
+            or prompt_tokens < 0
+            or type(requested_output) is not int
+            or requested_output <= 0
+        ):
+            raise ValueError("invalid request lengths")
+        output_cap = min(8192, requested_output)
+        rows = []
+        for raw in readings:
+            reading = self.ledger.routing_reading(raw)
+            prompt_blocks = (
+                math.ceil(prompt_tokens / reading.block_size)
+                if reading.block_size > 0
+                else None
+            )
+            room = unified.prompt_room(reading, self.ledger.pending(raw.pool_id)[0])
+            rows.append(
+                dict(
+                    pool_id=raw.pool_id,
+                    allowed=allowed in (None, raw.pool_id),
+                    context_feasible=reading.context_limit > 0
+                    and prompt_tokens + output_cap <= reading.context_limit,
+                    fits=room is not None
+                    and prompt_blocks is not None
+                    and room >= prompt_blocks,
+                    room_blocks=room,
+                    waiting=reading.waiting,
+                    fullness=self.unified_fullness(
+                        reading,
+                        "route",
+                        extra_requests=1,
+                        extra_blocks=prompt_blocks or 0,
+                    ),
+                )
+            )
+        feasible = [r for r in rows if r["allowed"] and r["context_feasible"]]
+        if not feasible:
+            reason = dict(reasons=["context/stop budget exhausted"])
+            raise RoutingError({r["pool_id"]: reason for r in rows})
+        # The hold queue sends a request only where its prompt fits; without
+        # one (fixed routes, stale evidence) the least full feasible one gets it.
+        fitting = [r for r in feasible if r["fits"]]
+        chosen = unified.rank_admission(fitting or feasible)[0]
+        before, known = self.ledger.live_snapshot(), self.ledger.mark()
+        self.ledger.track_ingress(key, request_id, chosen["pool_id"], prompt_tokens)
+        result = Admission(
+            request_id,
+            chosen["pool_id"],
+            output_cap,
+            key,
+            "fixed pilot route"
+            if allowed
+            else "unified: least full instance holding the prompt"
+            if fitting
+            else "unified: least full feasible instance; prompt fit unknown/none",
+            routing_capacity={r["pool_id"]: r["fits"] for r in rows},
+            routing_pressure={r["pool_id"]: r["fullness"] for r in rows},
+        )
+        self._owners[request_id] = result.pool_id
+        record = {
+            "kind": "pressure_admission",
+            "scheduler": "unified",
+            "admission": asdict(result),
+            "unified_rows": rows,
+            "smoothed_itl": self.itl.snapshot(),
+            "routing_strategy": self.routing_strategy,
+            "decision_unix_s": now,
+            "reservation_scope": "live",
+            "reservation_before": before,
+            "reservation_added": self.ledger.added_since(known),
+        }
+        return result, record
 
     def _admit_class_only(
         self, request_id, prompt_tokens, requested_output, ranking, key, now, allowed
@@ -495,6 +619,8 @@ class PressureCoordinator:
         are evaluated on copies and the chosen target's outcome is kept.
         Returns the executed (source, target, decision) or None.
         """
+        if self.scheduler == "unified":
+            return self._tick_unified(now, readings, tp_of, candidates, actions)
         chosen = action = None
         with self._lock:
             for rows in candidates.values():
@@ -687,6 +813,195 @@ class PressureCoordinator:
             }
         )
         return s, t, decision
+
+    def _tick_unified(self, now, readings, tp_of, candidates, actions):
+        """KV or pressure trigger; longest context to the least full target.
+
+        Pairs are the (TP1 source, TP-k target) ones with a migration channel,
+        as before; only the rules that start a move are replaced.
+        """
+        action = chosen = None
+        with self._lock:
+            for rows in candidates.values():
+                for c in rows:
+                    owner = self._owners.get(c.request_id)
+                    if owner is not None and owner != c.owner:
+                        raise ValueError("inventory contradicts confirmed ownership")
+            before = self.ledger.live_snapshot()
+            sources = sorted(
+                i
+                for i in readings
+                if tp_of[i] == 1 and self.lifecycle(i) in {"ACTIVE", "QUIESCING"}
+            )
+            targets = sorted(
+                i for i in readings if tp_of[i] > 1 and self.lifecycle(i) == "ACTIVE"
+            )
+            session_active = any(
+                r.kind == "migration" and r.state == "ACTIVE"
+                for r in self.ledger.live_rows()
+            )
+            adjusted = {i: self.ledger.routing_reading(r) for i, r in readings.items()}
+            full = {i: self.unified_fullness(adjusted[i], "migrate") for i in readings}
+            fresh = {
+                i: 0 <= now - r.sampled_at <= self.policy.cfg.max_age_s
+                for i, r in readings.items()
+            }
+            evaluations = []
+            open_targets = [
+                t for t in targets if fresh[t] and self.ledger.channel_available(t)
+            ]
+
+            def least_full(names):
+                return min(names, key=lambda t: (full[t]["value"], t), default=None)
+
+            # KV is safety and ignores cooldowns; pressure respects them.
+            kv_target = least_full(open_targets)
+            pressure_target = least_full(
+                [t for t in open_targets if not self.migration_state.cooling(t, now)]
+            )
+            for s in sources:
+                capacity = classify(adjusted[s], self.policy.cfg, now).capacity
+                exhausting = fresh[s] and (capacity or 0) >= 1
+                trigger, reason = unified.migration_trigger(
+                    full[s],
+                    exhausting,
+                    full[pressure_target] if pressure_target else None,
+                    self.migration_state,
+                    s,
+                    now,
+                )
+                if trigger == "KV" and kv_target is None:
+                    trigger, reason = None, "no fresh target with a free channel"
+                best_target = kv_target if trigger == "KV" else pressure_target
+                entry = dict(
+                    source=s,
+                    fullness=full[s],
+                    exhausting=exhausting,
+                    trigger=trigger,
+                    reason=reason,
+                    target=None,
+                    request_id=None,
+                    rejected=[],
+                )
+                evaluations.append(entry)
+                if trigger is None or not fresh[s]:
+                    continue
+                retry = self.policy_for(s)._retry_after
+                ranked = sorted(
+                    candidates.get((s, best_target), []) if best_target else [],
+                    key=lambda c: (-(c.prompt_tokens + c.generated), c.request_id),
+                )
+                for c in ranked:
+                    target = readings[best_target]
+                    pending = self.ledger.pending(best_target)[0]
+                    problems, required = unified.candidate_problems(
+                        c,
+                        adjusted[s],
+                        adjusted[best_target],
+                        pending,
+                        now,
+                        self.policy.cfg.max_age_s,
+                        retry,
+                    )
+                    if not problems and trigger == "PRESSURE":
+                        after = self.unified_fullness(
+                            adjusted[best_target],
+                            "migrate",
+                            extra_requests=1,
+                            extra_blocks=required,
+                        )
+                        if after["value"] >= unified.TARGET_AFTER_MAX:
+                            problems.append("target would not stay below hysteresis")
+                    if problems:
+                        entry["rejected"].append(
+                            dict(request_id=c.request_id, reasons=problems)
+                        )
+                        continue
+                    entry.update(
+                        target=best_target,
+                        request_id=c.request_id,
+                        required_blocks=required,
+                    )
+                    key = (trigger != "KV", -full[s]["value"], s)
+                    if chosen is None or key < chosen["key"]:
+                        chosen = dict(
+                            key=key, source=s, target=best_target, candidate=c,
+                            required=required, target_reading=target, entry=entry,
+                        )
+                    break
+            record = {
+                "kind": "pressure_decision_unified",
+                "unix_s": now,
+                "readings": {i: asdict(r) for i, r in adjusted.items()},
+                "smoothed_itl": self.itl.snapshot(),
+                "evaluations": evaluations,
+                "chosen": [
+                    chosen["source"],
+                    chosen["target"],
+                    chosen["candidate"].request_id,
+                ]
+                if chosen
+                else None,
+                "global_session_active": session_active,
+                "reservation_scope": "live",
+                "reservation_before": before,
+                "execution": "ADVISORY",
+            }
+            if chosen is not None and actions is not None and not session_active:
+                selected = chosen["candidate"]
+                action = actions.get(selected.request_id)
+                if action is None or action.request_id != selected.request_id:
+                    record["execution_blocked"] = "chosen request has no action binding"
+                    action = None
+                elif action.session_id in self._sessions:
+                    raise ValueError("session already used")
+                else:
+                    s, t = chosen["source"], chosen["target"]
+                    self.ledger.reserve(
+                        Reservation(
+                            action.session_id,
+                            selected.request_id,
+                            t,
+                            chosen["required"],
+                            selected.target_decode_cost,
+                            0,
+                            "migration",
+                        ),
+                        chosen["target_reading"],
+                    )
+                    self._sessions[action.session_id] = (selected.request_id, t)
+                    self._session_source[action.session_id] = s
+                    self._owners.setdefault(selected.request_id, s)
+                    record.update(session_id=action.session_id, execution="RESERVED")
+            record["reservation_after"] = self.ledger.live_snapshot()
+        self.audit(record)
+        if action is None:
+            return None
+        try:
+            action.start()
+        except BaseException:
+            self.audit(
+                {
+                    "kind": "pressure_start_uncertain",
+                    "session_id": action.session_id,
+                    "request_id": action.request_id,
+                }
+            )
+            raise
+        with self._lock:
+            self.policy_for(s).note_started(now)
+            self.migration_state.started(s, t, now)
+        self.audit(
+            {
+                "kind": "pressure_start_published",
+                "unix_s": now,
+                "session_id": action.session_id,
+                "request_id": action.request_id,
+                "scheduler": "unified",
+                "trigger": chosen["entry"]["trigger"],
+            }
+        )
+        return s, t, chosen["entry"]
 
     def assist_start(
         self,

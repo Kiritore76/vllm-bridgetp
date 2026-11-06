@@ -206,6 +206,8 @@ class PoolReading:
     service_evidence: dict | None = None
     prefill_generation: int | None = None
     total_blocks: int | None = None
+    # Requests the scheduler reports (running and waiting); unified slots.
+    engine_requests: int | None = None
 
 
 @dataclass(frozen=True)

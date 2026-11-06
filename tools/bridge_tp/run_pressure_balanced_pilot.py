@@ -118,7 +118,26 @@ def parse_args(argv=None):
         "or engine room; measured too little KV for it keeps it waiting",
     )
     parser.add_argument("--test-only-cancel-first-shadow", action="store_true")
+    parser.add_argument(
+        "--scheduler",
+        choices=("pressure", "unified"),
+        default="pressure",
+        help="unified (user 11-06): engine queue limit and prompt fit, one "
+        "fullness for routing, KV/pressure triggered migration",
+    )
+    parser.add_argument("--tp1-max-num-seqs", type=int, default=16)
+    parser.add_argument("--tp2-max-num-seqs", type=int, default=16)
     args = parser.parse_args(argv)
+    if args.scheduler == "unified" and (
+        args.hold_unstarted <= 0
+        or args.hold_tp1_long_kv
+        or args.tp1_max_num_seqs <= 0
+        or args.tp2_max_num_seqs <= 0
+    ):
+        parser.error(
+            "the unified scheduler needs the hold queue, positive slot counts "
+            "and no TP1 long-prompt rule"
+        )
     if args.maximum_migrations < 0:
         parser.error("maximum migrations must be nonnegative")
     if args.hold_unstarted < 0 or args.hold_long_wait_s < 0:
@@ -719,6 +738,25 @@ def _run(args, prepared):
     tp_of.update({row["instance_id"]: row["tp_degree"] for row in extras})
     # Workload/health references exist per TP class, not per instance.
     profile_key = {pool: ("tp1" if tp == 1 else "tp4") for pool, tp in tp_of.items()}
+    if getattr(args, "scheduler", "pressure") == "unified":
+        # Conversions add instances at run time; unified runs are static.
+        co.scheduler = "unified"
+        co.slots = {
+            pool: args.tp1_max_num_seqs if tp == 1 else args.tp2_max_num_seqs
+            for pool, tp in tp_of.items()
+        }
+        audit.write(
+            dict(
+                kind="pressure_scheduler",
+                scheduler="unified",
+                slots=co.slots,
+                parameters={
+                    k: getattr(r.unified, k)
+                    for k in dir(r.unified)
+                    if k.isupper() and not k.startswith("_")
+                },
+            )
+        )
     context_of = {
         **{
             pool: limit
@@ -1348,6 +1386,9 @@ def _run(args, prepared):
                 lambda pool_id: co.lifecycle(pool_id) == "ACTIVE",
                 degree=tp_of.get,
                 tp1_long_kv=getattr(args, "hold_tp1_long_kv", 0.0),
+                unified_guard_blocks=r.unified.GUARD_BLOCKS
+                if getattr(args, "scheduler", "pressure") == "unified"
+                else None,
             )
             if getattr(args, "hold_unstarted", 0)
             else None,
@@ -1507,6 +1548,8 @@ def _run(args, prepared):
                 if 0 <= now - pool.sampled_at <= cfg.max_age_s:
                     ingress.reconcile(raw | {"sampled_at": pool.sampled_at}, now)
             now = time.time()
+            if co.scheduler == "unified":
+                co.observe_itl(service, [pool.pool_id for pool in pools], now)
             # Request rates of every migration source (client ids are unique).
             source_rates = {}
             for source_id, _, _ in migration_sources:

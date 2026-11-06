@@ -211,6 +211,21 @@ class NativeServiceWindow:
             if self.health_observer is not None:
                 self.health_observer.finish(request_id)
 
+    def intervals_since(self, pool_id, since, now):
+        """Token intervals captured in (since, now], and the active stream count.
+
+        For the unified scheduler's smoothing; it reads the retained window and
+        never prunes it, so it must be called more often than ``window_s``.
+        """
+        with self._lock:
+            values = [
+                interval
+                for captured, interval, _ in self._intervals.get(pool_id, ())
+                if since < captured <= now
+            ]
+            active = sum(pool == pool_id for pool, _, _ in self._active.values())
+            return values, active
+
     def snapshot(self, pool_id, now):
         with self._lock:
             intervals = deque(
@@ -350,4 +365,5 @@ def pool_reading(
         native_itl_p95_s=service["p95_s"],
         slow_interval_fraction=service["slow_fraction"],
         prefill_batch_tokens=step,
+        engine_requests=len(inventory["requests"]),
     )

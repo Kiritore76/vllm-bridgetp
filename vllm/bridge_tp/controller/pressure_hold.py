@@ -40,9 +40,16 @@ class HoldQueue:
         active,
         degree=None,
         tp1_long_kv=0.0,
+        unified_guard_blocks=None,
     ):
         if unstarted_limit <= 0 or long_wait_s < 0 or long_tokens <= 0:
             raise ValueError("invalid hold settings")
+        # Unified (user 11-06): one queue and two rules, the engine queue limit
+        # and a prompt that fits after the guard; no long/short distinction.
+        self.unified = unified_guard_blocks is not None
+        if self.unified and (unified_guard_blocks < 0 or tp1_long_kv):
+            raise ValueError("unified hold takes a guard and no TP1 long rule")
+        self.guard_blocks = unified_guard_blocks
         self.limit, self.long_wait_s = unstarted_limit, long_wait_s
         self.long_tokens, self.max_age_s = long_tokens, max_age_s
         self.active = active
@@ -58,6 +65,10 @@ class HoldQueue:
         return len(job["request"]["prompt"]) >= self.long_tokens
 
     def add(self, job, arrived):
+        if self.unified:
+            self.short.append((job, arrived))
+            self.arrived_at.append(arrived)
+            return
         (self.long if self.is_long(job) else self.short).append((job, arrived))
         self.arrived_at.append(arrived)
         if self.is_long(job):
@@ -113,6 +124,33 @@ class HoldQueue:
             and 1 - pool.free_blocks / total >= self.tp1_long_kv
         )
 
+    # Arrivals scanned per call; one that fits nowhere does not stop later ones.
+    unified_scan = 256
+
+    def _unified_fits(self, pool, job):
+        """Prompt blocks fit after unallocated, sent-but-unstarted and the guard."""
+        size = pool.block_size
+        need = math.ceil(len(job["request"]["prompt"]) / size)
+        sent = sum(
+            math.ceil(len(v.payload["prompt"]) / size)
+            for v in self.unstarted.get(pool.pool_id, ())
+        )
+        return (
+            pool.free_blocks - pool.unallocated_prompt_blocks - sent - self.guard_blocks
+            >= need
+        )
+
+    def _next_unified(self, room, now, wall):
+        fresh = [p for p in room if self._fresh(p, wall)]
+        for index, (job, arrived) in enumerate(self.short):
+            if index >= self.unified_scan:
+                break
+            fits = [p for p in fresh if self._unified_fits(p, job)]
+            if fits:
+                del self.short[index]
+                return dict(job, held_s=now - arrived), tuple(fits)
+        return None
+
     def _release(self, queue, now, pools):
         job, arrived = queue.popleft()
         if queue is self.long:
@@ -124,6 +162,8 @@ class HoldQueue:
         self._refresh()
         pools = [p for p in pools if self.active(p.pool_id)]
         room = [p for p in pools if len(self.unstarted.get(p.pool_id, ())) < self.limit]
+        if self.unified:
+            return self._next_unified(room, now, wall)
         if self.long and pools:
             job, arrived = self.long[0]
             fits = [
