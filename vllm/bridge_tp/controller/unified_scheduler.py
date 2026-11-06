@@ -161,57 +161,9 @@ class MigrationState:
         self.pressure_since.pop(source, None)
 
 
-def candidate_problems(c, source, target, pending_blocks, now, max_age_s, retry_after):
-    """Physical and protocol safety only; the migration rules are separate."""
-    reasons = []
-    if now < retry_after.get(c.request_id, -math.inf):
-        reasons.append("cancelled request cooling down")
-    if not c.action_available:
-        reasons.append("no bound source stream/action adapter")
-    if c.finished or c.migrating or c.owner != source.pool_id:
-        reasons.append("not active local owner")
-    if (
-        any(
-            type(v) is not int or v < 0
-            for v in (c.generated, c.prompt_tokens, c.max_output_tokens)
-        )
-        or min(8192, c.max_output_tokens) - c.generated <= 0
-    ):
-        reasons.append("stop contract exhausted/invalid")
-    if not all(
-        math.isfinite(v) and 0 <= now - v <= max_age_s
-        for v in (c.sampled_at, c.published_at)
-    ):
-        reasons.append("inventory stale/future")
-    final = c.prompt_tokens + min(8192, c.max_output_tokens)
-    if final > target.context_limit:
-        reasons.append("target context infeasible")
-    if final > source.context_limit:
-        reasons.append("source stop contract was not context feasible")
-    required = math.ceil((c.prompt_tokens + c.generated) / target.block_size)
-    if (
-        target.free_blocks is None
-        or pending_blocks + required + GUARD_BLOCKS > target.free_blocks
-    ):
-        reasons.append("target physical blocks insufficient")
-    if (
-        c.owned_blocks is None
-        or c.releasable_blocks is None
-        or c.owned_blocks <= 0
-        or not 0 < c.releasable_blocks <= c.owned_blocks
-    ):
-        reasons.append("physical release unknown/empty")
-    if (
-        c.transfer_bytes is None
-        or not math.isfinite(c.transfer_bytes)
-        or c.transfer_bytes < 0
-    ):
-        reasons.append("transfer size unknown")
-    return reasons, required
-
-
-def migration_trigger(source_full, source_kv_exhausting, best_target_full, state,
-                      source_id, now):
+def migration_trigger(
+    source_full, source_kv_exhausting, best_target_full, state, source_id, now
+):
     """("KV" | "PRESSURE" | None, reason). Advances the pressure timer."""
     kv = source_full["kv"]
     if (kv is not None and kv >= KV_TRIGGER) or source_kv_exhausting:

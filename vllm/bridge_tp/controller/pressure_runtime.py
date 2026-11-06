@@ -886,47 +886,75 @@ class PressureCoordinator:
                 evaluations.append(entry)
                 if trigger is None or not fresh[s]:
                     continue
-                retry = self.policy_for(s)._retry_after
-                ranked = sorted(
-                    candidates.get((s, best_target), []) if best_target else [],
-                    key=lambda c: (-(c.prompt_tokens + c.generated), c.request_id),
-                )
-                for c in ranked:
-                    target = readings[best_target]
-                    pending = self.ledger.pending(best_target)[0]
-                    problems, required = unified.candidate_problems(
-                        c,
-                        adjusted[s],
-                        adjusted[best_target],
-                        pending,
+                # Request selection is the old scheduler's (user 11-06): stop and
+                # survival from the predictor, release before exhaustion, enough
+                # relief, then joint KV block-seconds. KV maps to its capacity
+                # path, pressure to its overload path; only the trigger is new.
+                policy = self.policy_for(s)
+                source_reading = adjusted[s]
+                target_reading = adjusted[best_target]
+                guard = self.policy.cfg.capacity_guard_blocks
+                required = max(1, guard - source_reading.free_blocks)
+                pool = list(candidates.get((s, best_target), []))
+                while pool:
+                    rows, selected, basis = policy.evaluate_candidates(
                         now,
-                        self.policy.cfg.max_age_s,
-                        retry,
+                        source_reading,
+                        target_reading,
+                        classify(source_reading, self.policy.cfg, now),
+                        classify(target_reading, self.policy.cfg, now),
+                        pool,
+                        True,
+                        trigger == "PRESSURE",
+                        required,
                     )
-                    if not problems and trigger == "PRESSURE":
+                    entry["rejected"].extend(
+                        dict(
+                            request_id=r["request"]["request_id"],
+                            reasons=r["rejections"],
+                        )
+                        for r in rows
+                        if r["rejections"]
+                    )
+                    if selected is None:
+                        break
+                    c = next(x for x in pool if x.request_id == selected.request_id)
+                    evidence = next(
+                        r for r in rows if r["request"]["request_id"] == c.request_id
+                    )
+                    blocks = evidence["target_required_blocks"]
+                    if trigger == "PRESSURE":
                         after = self.unified_fullness(
-                            adjusted[best_target],
+                            target_reading,
                             "migrate",
                             extra_requests=1,
-                            extra_blocks=required,
+                            extra_blocks=blocks,
                         )
                         if after["value"] >= unified.TARGET_AFTER_MAX:
-                            problems.append("target would not stay below hysteresis")
-                    if problems:
-                        entry["rejected"].append(
-                            dict(request_id=c.request_id, reasons=problems)
-                        )
-                        continue
+                            entry["rejected"].append(
+                                dict(
+                                    request_id=c.request_id,
+                                    reasons=["target would not stay below hysteresis"],
+                                )
+                            )
+                            pool = [x for x in pool if x.request_id != c.request_id]
+                            continue
                     entry.update(
                         target=best_target,
                         request_id=c.request_id,
-                        required_blocks=required,
+                        required_blocks=blocks,
+                        selection_policy=basis,
                     )
                     key = (trigger != "KV", -full[s]["value"], s)
                     if chosen is None or key < chosen["key"]:
                         chosen = dict(
-                            key=key, source=s, target=best_target, candidate=c,
-                            required=required, target_reading=target, entry=entry,
+                            key=key,
+                            source=s,
+                            target=best_target,
+                            candidate=c,
+                            required=blocks,
+                            target_reading=readings[best_target],
+                            entry=entry,
                         )
                     break
             record = {
@@ -979,7 +1007,28 @@ class PressureCoordinator:
             return None
         try:
             action.start()
-        except BaseException:
+        except BaseException as error:
+            if getattr(error, "migration_not_started", False):
+                # Refused before anything was published: undo the reservation,
+                # cool the request down and keep serving (user 11-06).
+                with self._lock:
+                    self.ledger.discard_unstarted(action.session_id)
+                    self._sessions.pop(action.session_id, None)
+                    self._session_source.pop(action.session_id, None)
+                    policy = self.policy_for(s)
+                    policy._retry_after[action.request_id] = (
+                        now + policy.cfg.cooldown_s
+                    )
+                self.audit(
+                    {
+                        "kind": "pressure_start_refused",
+                        "unix_s": now,
+                        "session_id": action.session_id,
+                        "request_id": action.request_id,
+                        "reason": str(error),
+                    }
+                )
+                return None
             self.audit(
                 {
                     "kind": "pressure_start_uncertain",

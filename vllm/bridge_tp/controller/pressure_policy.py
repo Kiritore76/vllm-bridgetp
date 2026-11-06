@@ -581,6 +581,18 @@ class ReservationLedger:
             )
         row.state = "COMPLETED"
 
+    def discard_unstarted(self, key: str) -> None:
+        """Remove a migration reservation whose START was refused unpublished.
+
+        Only an ACTIVE migration row may go; its session id can then be reused.
+        """
+        row = self.entries[key]
+        if row.kind != "migration" or row.state != "ACTIVE":
+            raise ValueError("only an unstarted migration reservation can be discarded")
+        dict.pop(self.entries, key)
+        self.entries._live.pop(key, None)
+        self.entries._order.remove(key)
+
     def settle(self, key: str, outcome: str, *, evidence: bool) -> None:
         row = self.entries[key]
         if outcome not in {"COMMITTED", "CANCELLED", "FAILED"} or not evidence:
@@ -995,9 +1007,35 @@ class PressurePolicy:
             if now - self._last_start < cfg.cooldown_s:
                 return decision("migration cooldown")
         # Capacity bypasses persistence/cooldown, never physical feasibility.
-        kv_priority = emergency and cfg.kv_emergency_priority
         if t.capacity is None or "pool timestamp" in t.missing:
             return decision("target physical capacity evidence absent")
+        rows, selected, policy = self.evaluate_candidates(
+            now, source, target, s, t, candidates, emergency, overload, required
+        )
+        if selected is None:
+            return decision("no feasible candidate", rows=rows)
+        return decision(
+            "overload relief"
+            if overload
+            else "capacity relief"
+            if emergency
+            else "sustained pressure; " + policy,
+            selected.request_id,
+            rows,
+        )
+
+
+    def evaluate_candidates(
+        self, now, source, target, s, t, candidates, emergency, overload, required
+    ):
+        """Per-candidate safety, survival and benefit; then the ranked choice.
+
+        Shared by ``decide`` and the unified scheduler (user 11-06: keep the
+        old scheduler's request selection). Returns (rows, selected, policy);
+        selected is None when no candidate is feasible.
+        """
+        cfg = self.cfg
+        kv_priority = emergency and cfg.kv_emergency_priority
         pending_blocks, pending_decode, _ = self.ledger.pending(target.pool_id)
         feasible, rows = [], []
         joint_benefits = {}
@@ -1224,7 +1262,7 @@ class PressurePolicy:
             if not reasons:
                 feasible.append((c, summary))
         if not feasible:
-            return decision("no feasible candidate", rows=rows)
+            return rows, None, None
         predicted = [(c, summary) for c, summary in feasible if summary]
         if emergency:
             # Urgent KV requires valid adequate survival. Legacy emergency
@@ -1287,16 +1325,7 @@ class PressurePolicy:
                 list(rank(c)) if c.request_id in eligible_ids else None
             )
             row["selected"] = c.request_id == selected.request_id
-        return decision(
-            "overload relief"
-            if overload
-            else "capacity relief"
-            if emergency
-            else "sustained pressure; " + policy,
-            selected.request_id,
-            rows,
-        )
-
+        return rows, selected, policy
 
 def overload_pressed(source, cfg):
     """The source queues or is filling up, beyond merely running a lot."""

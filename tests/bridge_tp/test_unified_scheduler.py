@@ -7,13 +7,57 @@ import math
 import types
 import unittest
 
-from tests.bridge_tp.test_pressure_policy import candidate, config, p, pool, r
+from tests.bridge_tp.test_pressure_policy import b, candidate, config, p, pool, r
 from tools.bridge_tp.pressure_cpu import load
 
 u = load("unified_scheduler")
 hold_module = load("pressure_hold")
 
 TP = dict(a1=1, a2=1, b=2, c=2)
+# The routing configuration of the six-card runs (L2C-s16, 11-06).
+PRODUCTION = dict(
+    max_age_s=2.0,
+    min_decode_samples=20,
+    spare_ratio=0.8,
+    enter_ratio=1.2,
+    leave_ratio=1.0,
+    imbalance_enter=0.4,
+    imbalance_leave=0.2,
+    sustain_s=3,
+    max_tick_gap_s=0.5,
+    cooldown_s=2.0,
+    prompt_boundary=2048,
+    very_long_prompt_tokens=4096,
+    prefill_pending_budget=2048,
+    prefill_backlog_budget=8192,
+    prefill_waiting_budget=4,
+    capacity_guard_blocks=125,
+    capacity_lookahead_s=8.0,
+    capacity_only=False,
+    kv_emergency_priority=True,
+    kv_routing_priority=True,
+    queue_routing=True,
+    kv_short_exempt_blocks=64,
+    overload_migrates=True,
+    overload_sustain_s=10.0,
+    overload_min_waiting=4,
+    overload_kv_fraction=0.7,
+    migration_current_length=True,
+    migration_target_reserve_blocks=1171,
+    migration_target_running_max=15,
+    health_service=True,
+    pressure_routing=True,
+    workload_pressure=True,
+    routing_relief=True,
+    health_min_efficiency=0.9,
+    health_target_load=0.8,
+    survival_horizon=256,
+    min_survival_lower=0.5,
+    length_resolution=512,
+    shadow_cancel=True,
+    cancel_sustain_s=3.0,
+    cancel_recover_eta=1.0,
+)
 
 
 def inst(name, total=11712, free=10000, requests=0, unallocated=0, **kwargs):
@@ -35,7 +79,7 @@ def inst(name, total=11712, free=10000, requests=0, unallocated=0, **kwargs):
 def coordinator(slots=None, cfg=None):
     records = []
     co = r.PressureCoordinator(
-        cfg or config(capacity_lookahead_s=8.0),
+        cfg or p.PressureConfig(**PRODUCTION),
         records.append,
         scheduler="unified",
         slots=slots or dict(a1=16, a2=16, b=16, c=16),
@@ -52,9 +96,7 @@ class SmoothingTests(unittest.TestCase):
         a = 1 - math.exp(-1)
         self.assertAlmostEqual(s.value("b"), a * 0.045 + (1 - a) * 0.025)
         a = 1 - math.exp(-0.5)
-        self.assertAlmostEqual(
-            s.value("b", "migrate"), a * 0.045 + (1 - a) * 0.025
-        )
+        self.assertAlmostEqual(s.value("b", "migrate"), a * 0.045 + (1 - a) * 0.025)
 
     def test_one_prefill_stall_moves_the_route_value_little(self):
         s = u.SmoothedItl()
@@ -115,12 +157,14 @@ class AdmissionTests(unittest.TestCase):
         co.itl.update("b", 9.0, [0.050] * 5, active=5)
         co.itl.update("c", 9.0, [0.020] * 5, active=5)
         readings = [inst("b"), inst("c")]
-        self.assertEqual(co.admission_multi("q", 512, 128, readings, TP, 10.0, "k")
-                         .pool_id, "c")
+        self.assertEqual(
+            co.admission_multi("q", 512, 128, readings, TP, 10.0, "k").pool_id, "c"
+        )
         co, _ = coordinator()
         readings = [inst("b", requests=15), inst("c", requests=2)]
-        self.assertEqual(co.admission_multi("q", 512, 128, readings, TP, 10.0, "k")
-                         .pool_id, "c")
+        self.assertEqual(
+            co.admission_multi("q", 512, 128, readings, TP, 10.0, "k").pool_id, "c"
+        )
 
     def test_routed_but_unreported_requests_count_at_once(self):
         co, _ = coordinator()
@@ -141,7 +185,13 @@ class AdmissionTests(unittest.TestCase):
         result = co.admission_multi("q", 16384, 8192, short, TP, 10.0, "k")
         self.assertEqual(result.pool_id, "c")
         result = co.admission_multi(
-            "q2", 512, 128, [inst("b"), inst("c")], TP, 10.0, "k2",
+            "q2",
+            512,
+            128,
+            [inst("b"), inst("c")],
+            TP,
+            10.0,
+            "k2",
             allowed_pool_id="b",
         )
         self.assertEqual(result.pool_id, "b")
@@ -195,13 +245,33 @@ class HoldTests(unittest.TestCase):
         q.unstarted["b"] = [stream] * 8
         self.assertIsNone(q.next([inst("b", free=11000)], 1.0, 10.0))
 
+    def test_a_prompt_that_can_never_fit_fails_at_once(self):
+        q = self.queue()
+        q.add(self.job(40000), 0.0)
+        with self.assertRaisesRegex(ValueError, "can never fit"):
+            q.next([inst("a1", total=2325, free=2325)], 1.0, 10.0)
+
+    def test_without_fresh_readings_the_wait_is_bounded(self):
+        q = self.queue()
+        q.add(self.job(512), 0.0)
+        stale = [inst("b", sampled_at=1.0, published_at=1.0)]
+        self.assertIsNone(q.next(stale, 100.0, 10.0))
+        job, allowed = q.next(stale, 301.0, 10.0)
+        self.assertEqual([x.pool_id for x in allowed], ["b"])
+        self.assertGreaterEqual(job["held_s"], 300)
+
     def test_no_long_queue_and_no_tp1_rule(self):
         q = self.queue()
         q.add(self.job(16384), 0.0)
         self.assertEqual((len(q.short), len(q.long), q.held_long), (1, 0, ()))
         with self.assertRaises(ValueError):
             hold_module.HoldQueue(
-                8, 300, 8192, 2.0, lambda pool_id: True, tp1_long_kv=0.7,
+                8,
+                300,
+                8192,
+                2.0,
+                lambda pool_id: True,
+                tp1_long_kv=0.7,
                 unified_guard_blocks=125,
             )
 
@@ -216,16 +286,26 @@ class Started:
         )
 
 
-def source_candidates(*sizes, owner="a1"):
+def source_candidates(*sizes, owner="a1", generated=100, cap=8192):
+    """Fixed-output requests: the predictor's remaining length is exact."""
     return [
         candidate(
             f"q{i}",
             owner=owner,
             prompt_tokens=size,
-            generated=100,
-            max_output_tokens=8192,
-            releasable_blocks=(size + 100) // 16,
-            owned_blocks=(size + 100) // 16,
+            generated=generated,
+            max_output_tokens=cap,
+            releasable_blocks=(size + generated) // 16,
+            owned_blocks=(size + generated) // 16,
+            remaining=b.bounded_length(
+                (0.0, 0.0, 1.0, 0.0),
+                (0, 1, 2),
+                generated=generated,
+                predicted_at=generated,
+                max_output_tokens=cap,
+                ignore_eos=True,
+            ),
+            source_tokens_s=30.0,
         )
         for i, size in enumerate(sizes)
     ]
@@ -253,12 +333,13 @@ class MigrationTests(unittest.TestCase):
             now, {"a1": source, "b": target}, TP, {("a1", "b"): rows}, actions
         )
 
-    def test_kv_trigger_moves_the_longest_context_at_once(self):
+    def test_kv_trigger_moves_the_largest_block_seconds_at_once(self):
         co, records = coordinator()
         started = Started()
         source = inst("a1", total=2325, free=150, requests=3)
         rows = source_candidates(512, 16384, 4096)
         result = self.tick(co, 10.0, source, inst("b", free=9000), rows, started)
+        # Same remaining output: the most releasable blocks win.
         self.assertEqual(started.calls, ["q1"])
         self.assertEqual(result[2]["trigger"], "KV")
         decision = next(x for x in records if x["kind"] == "pressure_decision_unified")
@@ -308,6 +389,80 @@ class MigrationTests(unittest.TestCase):
         stale = [candidate("q", owner="a1", sampled_at=1.0, published_at=1.0)]
         self.tick(co, 10.0, source, inst("b"), stale, started)
         self.assertEqual(started.calls, [])
+
+    def test_short_or_nearly_finished_requests_are_never_moved(self):
+        # Unified L2C:16 GPU 11-06: only short requests left on a TP1 at KV
+        # trigger; one had finished, START failed and stopped the controller.
+        co, records = coordinator()
+        started = Started()
+        source = inst("a1", total=2325, free=150, requests=20)
+        rows = source_candidates(512, 512, generated=111, cap=128)
+        rows += source_candidates(16384, generated=8100)
+        rows = [dataclasses.replace(c, request_id=f"x{i}") for i, c in enumerate(rows)]
+        self.tick(co, 10.0, source, inst("b", free=9000), rows, started)
+        self.assertEqual(started.calls, [])
+        reasons = {
+            reason
+            for e in records[-1]["evaluations"]
+            for rejected in e["rejected"]
+            for reason in rejected["reasons"]
+        }
+        self.assertIn("insufficient sustained work probability", reasons)
+
+    def test_a_refused_start_releases_the_session_and_cools_the_request(self):
+        co, records = coordinator()
+        source = inst("a1", total=2325, free=150, requests=3)
+        rows = source_candidates(16384)
+
+        def refuse():
+            error = ValueError("source ended or has no safe output budget")
+            error.migration_not_started = True
+            raise error
+
+        actions = {"q0": r.BoundAction("q0", "s1", refuse)}
+        now = 10.0
+        fresh = [dataclasses.replace(c, sampled_at=now, published_at=now) for c in rows]
+        readings = {
+            "a1": dataclasses.replace(source, sampled_at=now, published_at=now),
+            "b": dataclasses.replace(inst("b"), sampled_at=now, published_at=now),
+        }
+        self.assertIsNone(
+            co.tick_multi(now, readings, TP, {("a1", "b"): fresh}, actions)
+        )
+        self.assertEqual(records[-1]["kind"], "pressure_start_refused")
+        self.assertNotIn("s1", co._sessions)
+        self.assertNotIn("s1", co.ledger.entries)
+        # The same session id can be used again after the cooldown.
+        started = Started()
+        actions = {"q0": started.bind("q0", "s1")}
+        later = 13.0
+        fresh = [
+            dataclasses.replace(c, sampled_at=later, published_at=later) for c in rows
+        ]
+        readings = {
+            k: dataclasses.replace(v, sampled_at=later, published_at=later)
+            for k, v in readings.items()
+        }
+        co.tick_multi(later, readings, TP, {("a1", "b"): fresh}, actions)
+        self.assertEqual(started.calls, ["q0"])
+
+    def test_any_other_start_error_still_stops(self):
+        co, _ = coordinator()
+        source = inst("a1", total=2325, free=150, requests=3)
+        rows = source_candidates(16384)
+
+        def broken():
+            raise RuntimeError("published, then failed")
+
+        with self.assertRaises(RuntimeError):
+            self.tick(co, 10.0, source, inst("b"), rows)
+            co.tick_multi(
+                10.0,
+                {"a1": dataclasses.replace(source, sampled_at=10.0), "b": inst("b")},
+                TP,
+                {("a1", "b"): rows},
+                {"q0": r.BoundAction("q0", "s9", broken)},
+            )
 
     def test_advisory_without_actions_and_one_session_at_a_time(self):
         co, records = coordinator()

@@ -140,15 +140,43 @@ class HoldQueue:
             >= need
         )
 
-    def _next_unified(self, room, now, wall):
+    def _never_fits(self, pools, job):
+        """No active instance could hold the prompt even when empty."""
+        known = [p for p in pools if p.total_blocks and p.block_size > 0]
+        if not known or len(known) != len(pools):
+            return False
+        return all(
+            p.total_blocks - self.guard_blocks
+            < math.ceil(len(job["request"]["prompt"]) / p.block_size)
+            for p in known
+        )
+
+    def _next_unified(self, pools, room, now, wall):
+        """First arrival that fits somewhere; safety for the two dead ends.
+
+        A prompt no instance could ever hold fails the run at once instead of
+        waiting forever. Without any fresh reading for ``long_wait_s`` the first
+        arrival goes to an instance with engine room, where admission picks the
+        least full one (the old hold's bounded wait, user 11-06).
+        """
         fresh = [p for p in room if self._fresh(p, wall)]
         for index, (job, arrived) in enumerate(self.short):
             if index >= self.unified_scan:
                 break
+            if self._never_fits(pools, job):
+                size = len(job["request"]["prompt"])
+                raise ValueError(
+                    f"prompt of {size} tokens can never fit any active instance"
+                )
             fits = [p for p in fresh if self._unified_fits(p, job)]
             if fits:
                 del self.short[index]
                 return dict(job, held_s=now - arrived), tuple(fits)
+        if self.short and room and not any(self._fresh(p, wall) for p in pools):
+            job, arrived = self.short[0]
+            if now - arrived >= self.long_wait_s:
+                self.short.popleft()
+                return dict(job, held_s=now - arrived), tuple(room)
         return None
 
     def _release(self, queue, now, pools):
@@ -163,7 +191,7 @@ class HoldQueue:
         pools = [p for p in pools if self.active(p.pool_id)]
         room = [p for p in pools if len(self.unstarted.get(p.pool_id, ())) < self.limit]
         if self.unified:
-            return self._next_unified(room, now, wall)
+            return self._next_unified(pools, room, now, wall)
         if self.long and pools:
             job, arrived = self.long[0]
             fits = [

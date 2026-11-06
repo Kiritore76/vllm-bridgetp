@@ -16,6 +16,13 @@ from pathlib import Path
 
 from tools.bridge_tp.pressure_cpu import load
 
+
+def not_started(message):
+    """A START refused before anything was published; the caller may go on."""
+    error = ValueError(message)
+    error.migration_not_started = True
+    return error
+
 # Several source ranks start at one exact token, named in advance. The ranks
 # must see the control block before it; 32 tokens is about a second of decoding.
 SAME_TP_TRIGGER_LEAD_TOKENS = 32
@@ -247,10 +254,9 @@ class RollingPressureSession:
         if self.record is not None:
             raise ValueError("one session per migration driver")
         stream = self.ingress.for_server_id(candidate.request_id)
-        stream.recorder.target_pool = self.target_instance
         cap = stream.payload["max_tokens"]
         if candidate.max_output_tokens != cap or cap > 8192:
-            raise ValueError("selected request stop contract differs from live stream")
+            raise not_started("selected request stop contract differs from live stream")
         # Several source ranks start at one exact token, named in advance.
         source_tp = getattr(candidate, "source_tp", None) or getattr(
             self.config, "source_tp_size", 1
@@ -259,7 +265,8 @@ class RollingPressureSession:
             SAME_TP_TRIGGER_LEAD_TOKENS if source_tp > 1 else 1
         )
         if trigger >= cap - 1 or stream.future.done():
-            raise ValueError("source ended or has no safe output budget")
+            raise not_started("source ended or has no safe output budget")
+        stream.recorder.target_pool = self.target_instance
         now = time.time()
         self.stream = stream
         self.source_instance = self._bind_source(candidate)
