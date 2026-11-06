@@ -123,6 +123,18 @@ class TwoSlotCountTests(unittest.TestCase):
                 value = argv[argv.index("--max-num-seqs") + 1]
                 self.assertEqual(value, "32" if extra["tp"] == 2 else "16")
 
+    def test_the_short_ramp_repeats_the_first_three_steps_exactly(self):
+        from tools.bridge_tp import qwen3_phase_shift as phase
+
+        path = "experiments/platforms/qwen3_pressure_observation/inputs.json"
+        inputs = json.loads(Path(path).read_text(encoding="utf-8"))
+        full = phase.jobs(inputs, "mixed_long_ramp")
+        short = phase.jobs(inputs, "mixed_long_ramp_r3")
+        head = [j for j in full if j["at_s"] < 780]
+        self.assertEqual(short[: len(head)], head)
+        self.assertTrue(all(j["workload_phase"] == "tail" for j in short[len(head) :]))
+        self.assertLess(max(j["at_s"] for j in short), 840)
+
     def test_the_long_ramp_load_is_seeded_and_steps_up(self):
         from tools.bridge_tp import qwen3_phase_shift as phase
 

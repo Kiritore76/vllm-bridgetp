@@ -25,7 +25,9 @@ import math
 import statistics
 from dataclasses import dataclass, field
 
-ITL_REFERENCE_S = 0.035
+# Below the strict 35ms TPOT line so routing backs off before an instance
+# crosses it (unified L2C:16 GPU 11-06: TP1 short TPOT sat at 33-34ms).
+ITL_REFERENCE_S = 0.028
 ROUTE_TAU_S = 5.0
 MIGRATE_TAU_S = 10.0
 GUARD_BLOCKS = 125
@@ -111,7 +113,15 @@ def used_blocks(reading):
     return reading.total_blocks - reading.free_blocks + unallocated
 
 
-def fullness(reading, slots_max, itl_s, *, extra_requests=0, extra_blocks=0):
+def fullness(
+    reading,
+    slots_max,
+    itl_s,
+    *,
+    extra_requests=0,
+    extra_blocks=0,
+    itl_reference_s=ITL_REFERENCE_S,
+):
     """The three shares and their maximum; None components count as zero."""
     if type(slots_max) is not int or slots_max <= 0:
         raise ValueError("instance slot limit must be a positive integer")
@@ -119,7 +129,9 @@ def fullness(reading, slots_max, itl_s, *, extra_requests=0, extra_blocks=0):
     slots = (requests + extra_requests) / slots_max
     used = used_blocks(reading)
     kv = None if used is None else (used + extra_blocks) / reading.total_blocks
-    speed = None if itl_s is None else itl_s / ITL_REFERENCE_S
+    if not itl_reference_s > 0:
+        raise ValueError("ITL reference must be positive")
+    speed = None if itl_s is None else itl_s / itl_reference_s
     return dict(
         slots=slots,
         kv=kv,

@@ -137,7 +137,7 @@
     "tools/bridge_tp/run_predictor_regularization_a100.py": "efdf52117542a0438437782eb029ff7403d5aa57e30b5e2b784cd81baa1b0d93",
     "tools/bridge_tp/run_predictor_tail_pilot.py": "1f22c18994ed77e01f42636760794dd1fea58d6b4b9f1f4ee21c40dc2f5d517d",
     "tools/bridge_tp/run_predictor_targeted4_pilot.py": "1e975e6750d24298af771ab9f94e76ae64b4f95993fdd4bf5f157ecbb6408019",
-    "tools/bridge_tp/run_pressure_balanced_pilot.py": "aa57ae44cdb8b27a03b4161246f6a1166f920a573d82b742cbc4c5af33347e48",
+    "tools/bridge_tp/run_pressure_balanced_pilot.py": "fd4cb3bf8205833218573b28914b95e324fbc2d2be5788744ae6a8bf758b60a4",
     "tools/bridge_tp/run_randomized_goodoutput_pilot_a100.py": "6595b0f923c3fd601d01cb60c49fc5ef58054ae4bb52cc070aa70bae8cc67994",
     "tools/bridge_tp/run_remote_attention_validation.py": "3bc15acc9e45323f5084c5f9aaabef37336852af1470541beed55c4c4a8e19a3",
     "tools/bridge_tp/run_shadow_rate_load_matrix.py": "ad901d156ea287d9167547018c72445bcc4ce4a6c1b8a7bd1e751554c2f876fe",
@@ -207,7 +207,7 @@
     "vllm/bridge_tp/controller/pressure_ingress.py": "a73b01f1c1c557be3a655069cabf056c9b2b85e263704db72bc27e31ec3ffd11",
     "vllm/bridge_tp/controller/pressure_observation.py": "ceaec729e7a7aa8dc2e5d11be1ea44f6ec27f60a43e4db094a71562758d4c44f",
     "vllm/bridge_tp/controller/pressure_policy.py": "2df8df4a518419fc8a08517aa9d70cef5dc638840b59644e605140a2a4c2e666",
-    "vllm/bridge_tp/controller/pressure_runtime.py": "d5c3e33f4e11086e5d11a5138cf7994f008d925b1cf4feac3d2d9e20619c29fc",
+    "vllm/bridge_tp/controller/pressure_runtime.py": "b34807f438ebd7d490fe5fe5694a2b1132368f28d6fc935c1b2e559ecd48da35",
     "vllm/bridge_tp/controller/pressure_service.py": "e2d537e473026842ee1f8bf6d5b43e860d3f25dab44d66d7be61a4ff9508f143",
     "vllm/bridge_tp/controller/rate_controller.py": "01f9efbbc2065f8f3d1e0202fe2eae303d2d45c3f9cdcd185209d675055471f1",
     "vllm/bridge_tp/controller/residency_policy.py": "afebde8915666ae1fba63d5a1b98fb5ac79d140f9a060a468a40b6b954780b37",
@@ -406,9 +406,9 @@
     "tests/bridge_tp/test_conversion_sequence.py": "a3835b39ec1fd6dd5fb98cba4a7e8905911fac9b2168524679b4c441137d8b4b",
     "vllm/bridge_tp/controller/pressure_hold.py": "f1490049e0f7f244a3b19f338285221188a96d9252ec567b4c713fa93bd60676",
     "tools/bridge_tp/qwen3_six_card.py": "eda1f05eb7129cf2a42e428b1007375d4f398e4779dcbc06fc405247308ed64e",
-    "tests/bridge_tp/test_qwen3_six_card.py": "2a9522a512dfa48a1fa5311c9c943b54a118ae704fcdc622e71444d27e083dc8",
-    "vllm/bridge_tp/controller/unified_scheduler.py": "6c6939976c2e810b8126ef16495e2c1bc5fe9dd4f1745a6c483f872b7ddf46b0",
-    "tests/bridge_tp/test_unified_scheduler.py": "a97c2e78d2bf9600e273f834377169ed88d13528dc75449c6cac9d89ced45dcc"
+    "tests/bridge_tp/test_qwen3_six_card.py": "ee1c3ab62f93b301fbccf5bfc9594a954ff3c0d1dc7ef176ce6cc4cee576b906",
+    "vllm/bridge_tp/controller/unified_scheduler.py": "221cadcb4c5f70fc3075bb77989e9035b4acbbc7a0fe307a8b504eeef213d59a",
+    "tests/bridge_tp/test_unified_scheduler.py": "dbdfb5e15bacac0946c53778a4a02c19e1f30acb24f2727e185e4db5f014f687"
   },
   "server_settings": {
     "dtype": "bfloat16",

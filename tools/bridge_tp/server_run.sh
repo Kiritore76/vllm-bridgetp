@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# 当前任务：统一调度首场GPU验证（用户11-06）。分支bridgetp/unified-scheduler，开关--scheduler unified。
-# 负载与长请求容量四场相同（mixed_long_ramp，种子6）；先L2C:16（同时检验新路由与新迁移），没问题再放L3:16。
-# 场次格式：布局:TP2槽位:调度方式。旧调度对照为qwen3_six_longcap_20261106_153723_9226的L2C-s16。
+# 当前任务：统一调度速度基准由35ms改为28ms（用户11-06，TP1与TP2统一），L2C:16一场。
+# 负载只跑长请求递增的前三档（mixed_long_ramp_r3）：各档起点与种子不变，到达与此前L2C-16两场逐条相同，可直接对比r1–r3。
+# 对照：旧调度qwen3_six_longcap_20261106_153723_9226的L2C-s16，统一调度35ms qwen3_unified_20261106_205522_4987。
 scenes='L2C:16:unified'
+scenario=mixed_long_ramp_r3
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
@@ -35,11 +36,11 @@ avail=$(df --output=avail -k "$run" | tail -1)
 printf '%s\n' "$revision" > "$run/revision.txt"
 echo "本批目录：$run"
 echo "统一调度：场次 $scenes（布局:TP2槽位:调度方式）；A={2,3}、B={0,1}、C={4,5}；TP1槽位16。"
-echo '统一调度：准入=引擎排队≤8且提示放得下（保护125块）；选实例=满度最低（槽位、KV、平滑ITL÷35ms取最大）；迁移=KV≥90%或约8秒耗尽立即迁，满度≥0.9持续10秒且高出目标0.3才按压力迁；迁当前上下文最长的请求，目标仍只有B。'
-echo '负载：预热60秒短4/s；60–1020秒短8/s，深长16384/8192每240秒一档0.02/0.04/0.06/0.08/s（3/10/18/17条）；收尾60秒短1/s；种子6。'
+echo '统一调度：准入=引擎排队≤8且提示放得下（保护125块）；选实例=满度最低（槽位、KV、平滑ITL÷28ms取最大）；迁移=KV≥90%或约8秒耗尽立即迁，满度≥0.9持续10秒且高出目标0.3才按压力迁；挑请求沿用旧调度评估，目标仍只有B。'
+echo '负载：预热60秒短4/s；60–780秒短8/s，深长16384/8192每240秒一档0.02/0.04/0.06/s（3/10/18条）；收尾60秒短1/s；种子6。'
 echo '双32768/.88、guard125、hold-queue；L2C沿用kv-short-exempt/overload-migrate/migrate-current-length，仍只迁向B。'
 echo '不转换、不训练；旧调度代码保留在开关后面；性能负结果和零迁移保留；技术故障/请求或清理不完整即停，不自动重试。'
-echo '共三场，每场约25–35分钟，合计约1.5–2小时含启动/收尾/打包；不删除服务器结果。'
+echo '约18–25分钟含启动/收尾/打包；不删除服务器结果。'
 printf 'scene\trunner_exit\tbatch_exit\n' > "$run/scenes.tsv"
 pack_result() {
     local status=$1
@@ -120,7 +121,7 @@ for scene in $scenes; do
     echo "[场次] $name 开始"
     "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
         --cards 6 --static-layout "$layout" --tp2-max-num-seqs "$slots" --scheduler "$scheduler" \
-        --phase-shift --phase-scenario mixed_long_ramp \
+        --phase-shift --phase-scenario "$scenario" \
         "${options[@]}" --expanded-context --current-machine --repetitions 1 \
         --model "$model" \
         --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \

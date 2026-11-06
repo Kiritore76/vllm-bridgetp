@@ -123,7 +123,7 @@ class FullnessTests(unittest.TestCase):
         value = u.fullness(inst("b", free=2000, requests=4), 16, 0.020)
         self.assertAlmostEqual(value["kv"], (11712 - 2000) / 11712)
         self.assertAlmostEqual(value["slots"], 4 / 16)
-        self.assertAlmostEqual(value["speed"], 0.020 / 0.035)
+        self.assertAlmostEqual(value["speed"], 0.020 / u.ITL_REFERENCE_S)
         self.assertEqual(value["value"], value["kv"])
 
     def test_tp1_and_tp2_are_compared_as_shares(self):

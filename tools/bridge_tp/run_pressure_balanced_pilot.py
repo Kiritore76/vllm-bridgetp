@@ -127,6 +127,12 @@ def parse_args(argv=None):
     )
     parser.add_argument("--tp1-max-num-seqs", type=int, default=16)
     parser.add_argument("--tp2-max-num-seqs", type=int, default=16)
+    parser.add_argument(
+        "--unified-itl-reference-ms",
+        type=float,
+        default=None,
+        help="speed share denominator; default the scheduler module's value",
+    )
     args = parser.parse_args(argv)
     if args.scheduler == "unified" and (
         args.hold_unstarted <= 0
@@ -741,6 +747,8 @@ def _run(args, prepared):
     if getattr(args, "scheduler", "pressure") == "unified":
         # Conversions add instances at run time; unified runs are static.
         co.scheduler = "unified"
+        if getattr(args, "unified_itl_reference_ms", None):
+            co.itl_reference_s = args.unified_itl_reference_ms / 1000
         co.slots = {
             pool: args.tp1_max_num_seqs if tp == 1 else args.tp2_max_num_seqs
             for pool, tp in tp_of.items()
@@ -750,6 +758,7 @@ def _run(args, prepared):
                 kind="pressure_scheduler",
                 scheduler="unified",
                 slots=co.slots,
+                itl_reference_s=co.itl_reference_s,
                 parameters={
                     k: getattr(r.unified, k)
                     for k in dir(r.unified)

@@ -267,6 +267,12 @@ SCENARIOS["mixed_long_ramp"] = dict(
     long=(16384, 8192),
     arrival_seed=6,
 )
+# Its first three steps only (user 11-06: shorter runs for quicker answers). Each
+# phase keeps its start and the seed, so these arrivals equal the full ramp's.
+SCENARIOS["mixed_long_ramp_r3"] = dict(
+    SCENARIOS["mixed_long_ramp"],
+    phases=SCENARIOS["mixed_long_ramp"]["phases"][:4] + ((780, 840, 1.0, 0.0, "tail"),),
+)
 PHASES = SCENARIOS["phase_shift"]["phases"]
 LONG_PROMPT, LONG_OUTPUT = SCENARIOS["phase_shift"]["long"]
 

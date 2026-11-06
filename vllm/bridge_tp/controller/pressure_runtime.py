@@ -59,6 +59,7 @@ class PressureCoordinator:
         self.scheduler = scheduler
         self.slots = dict(slots or {})
         self.itl = unified.SmoothedItl()
+        self.itl_reference_s = unified.ITL_REFERENCE_S
         self.migration_state = unified.MigrationState()
         self.ledger = ReservationLedger()
         self.policy = PressurePolicy(cfg, self.ledger)
@@ -312,6 +313,7 @@ class PressureCoordinator:
             self.itl.value(reading.pool_id, kind),
             extra_requests=unobserved + extra_requests,
             extra_blocks=extra_blocks,
+            itl_reference_s=self.itl_reference_s,
         )
 
     def _admit_unified(
