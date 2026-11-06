@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 当前任务：六卡容量测量首场，L3短请求12req/s，60秒。
+# 当前任务：用户授权扩大扫描；四布局×四速率，共16场短请求容量初筛。
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
@@ -25,23 +25,25 @@ revision=$(git rev-parse HEAD)
 [ "$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)" = 6 ] || { echo '需要六张GPU。'; exit 1; }
 [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || { echo 'GPU有计算进程，停止；未清理任何进程。'; exit 1; }
 mkdir -p /root/autodl-tmp/bridgetp/results || exit 1
-run=/root/autodl-tmp/bridgetp/results/qwen3_six_rate12_$(date +%Y%m%d_%H%M%S)_${RANDOM}
+run=/root/autodl-tmp/bridgetp/results/qwen3_six_sweep_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 avail=$(df --output=avail -k "$run" | tail -1)
-[ "$avail" -ge 8388608 ] || { echo '磁盘可用不足8GB。'; exit 1; }
+[ "$avail" -ge 33554432 ] || { echo '磁盘可用不足32GB。'; exit 1; }
 printf '%s\n' "$revision" > "$run/revision.txt"
 echo "本批目录：$run"
-echo '容量测量首场：L3=3TP2，A={2,3}、B={0,1}、C={4,5}；双32768/.88。'
-echo '仅一场：512输入/128输出，12req/s持续60秒，共720请求/92160输出，之后收尾。'
-echo '复用原分流；无长请求、不迁移、不转换、不训练；不改策略阈值。'
-echo '按计划到达分析派发、排队、TTFT/E2E、输出间隔和CPU；单点不能标定完整容量。'
-echo '预计约5–10分钟含启动和打包，排队会延长；失败不自动重试，不删除结果。'
+echo '广泛容量初筛：L3、L2C、L1AC、L0，每布局8/16/24/32req/s各一场，共16场。'
+echo '统一512输入/128输出，每场60秒到达再收尾，相同种子；A={2,3}、B={0,1}、C={4,5}。'
+echo '双32768/.88、guard125、hold-queue，混合布局沿用原KV保护和迁移规则、仍只迁向B。'
+echo '共19200请求/2457600输出token；不训练、不转换，不改策略阈值，不重跑已完成L3 12req/s。'
+echo '性能负结果及零迁移保留并继续；技术故障/请求或清理不完整即停，不自动重试。'
+echo '每点一次，为短容量初筛；按真实60秒窗口和计划到达分析，不使用默认300秒容量数字。'
+echo '预计约2–3小时含启动/收尾/打包，过载可延长；不删除服务器结果。'
 printf 'layout\trunner_exit\tbatch_exit\n' > "$run/scenes.tsv"
 pack_result() {
     local status=$1
     printf '%s\n' "$status" > "$run/exit_code.txt"
     local excludes=()
-    for layout in L3; do
+    for layout in L3 L2C L1AC L0; do
         if (cd "$run" && sha256sum -c "$layout.tar.gz.sha256" >/dev/null 2>&1) \
             && tar -tzf "$run/$layout.tar.gz" >/dev/null 2>&1; then
             excludes+=(--exclude="$(basename "$run")/$layout")
@@ -76,7 +78,7 @@ if [ "$status" != 0 ]; then
     pack_result "$status" || exit 1
     exit "$status"
 fi
-echo '[CPU前置] 通过；准备单场GPU容量测量。'
+echo '[CPU前置] 通过；准备16场串行GPU容量初筛。'
 echo '[预编译] 数据盘短临时路径；最多4个编译进程。'
 "$py" -m compileall -q -j 4 "$repo/vllm" "$repo/tools" > "$run/compileall.log" 2>&1 || {
     echo '[预编译] 失败，尚未启动GPU服务；请拿回诊断包。'
@@ -93,7 +95,7 @@ nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,pcie.link.gen
 smi=$!
 trap 'kill "$smi" 2>/dev/null || true' EXIT
 batch_status=0
-for layout in L3; do
+for layout in L3 L2C L1AC L0; do
     avail=$(df --output=avail -k "$run" | tail -1)
     if [ "$avail" -lt 8388608 ] || [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]; then
         echo "[停止] $layout 前磁盘不足8GB或GPU有计算进程；未清理任何进程。"
@@ -101,9 +103,12 @@ for layout in L3; do
         break
     fi
     options=(--hold-queue)
+    if [ "$layout" = L2C ] || [ "$layout" = L1AC ]; then
+        options+=(--kv-short-exempt --overload-migrate --migrate-current-length)
+    fi
     echo "[场次] $layout 开始"
     "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
-        --cards 6 --static-layout "$layout" --rate-sweep --sweep-rates 12 \
+        --cards 6 --static-layout "$layout" --rate-sweep --sweep-rates 8,16,24,32 \
         "${options[@]}" --expanded-context --current-machine --repetitions 1 \
         --model "$model" \
         --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
@@ -113,7 +118,7 @@ for layout in L3; do
     runner_status=$status
     if [ "$status" = 0 ] || [ "$status" = 2 ]; then
         # Coverage-only gaps can continue; incomplete service/cleanup cannot.
-        "$py" -B -c 'import json,sys; from pathlib import Path; p=Path(sys.argv[1]); a=list(p.rglob("six_card_acceptance.json")); c=list(p.rglob("owned_shutdown_receipt.json")); assert len(a)==len(c)==1, "missing scene receipts"; d=json.loads(a[0].read_text()); assert d["all_instances_active"] and d["requests_complete"], "incomplete static service"; assert json.loads(c[0].read_text())["all_owned_groups_ended"], "process cleanup incomplete"' "$run/$layout" \
+        "$py" -B -c 'import json,sys; from pathlib import Path; p=Path(sys.argv[1]); a=list(p.rglob("six_card_acceptance.json")); c=list(p.rglob("owned_shutdown_receipt.json")); assert len(a)==len(c)==4, "missing scene receipts"; assert all(json.loads(f.read_text())["all_instances_active"] and json.loads(f.read_text())["requests_complete"] for f in a), "incomplete static service"; assert all(json.loads(f.read_text())["all_owned_groups_ended"] for f in c), "process cleanup incomplete"' "$run/$layout" \
             > "$run/$layout.receipt_check.log" 2>&1 || status=1
     fi
     printf '%s\t%s\t%s\n' "$layout" "$runner_status" "$status" >> "$run/scenes.tsv"
