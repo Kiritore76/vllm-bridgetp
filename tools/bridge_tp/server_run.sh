@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 当前任务：六卡阶段4转换阈值的容量重测（用户11-07同意）：统一调度下短请求细扫，
-# 先只跑L1AC（12–22 req/s每2一档，每档60秒512/128）；L2C、L0、L3与L1AC长请求容量随后逐场下发。
-scenes='L1AC:12,14,16,18,20,22'
+# 本场L2C（12–22 req/s每2一档，每档60秒512/128）；L1AC已测得18 req/s；L0、L3与L1AC长请求容量随后逐场下发。
+scenes='L2C:12,14,16,18,20,22'
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
@@ -86,7 +86,7 @@ if [ "$status" != 0 ]; then
     pack_result "$status" || exit 1
     exit "$status"
 fi
-echo '[CPU前置] 通过（含本地权限受限的链接测试，Linux不允许跳过）；准备统一调度短请求细扫（先L1AC）。'
+echo '[CPU前置] 通过（含本地权限受限的链接测试，Linux不允许跳过）；准备统一调度短请求细扫（L2C）。'
 echo '[预编译] 数据盘短临时路径；最多4个编译进程。'
 "$py" -m compileall -q -j 4 "$repo/vllm" "$repo/tools" > "$run/compileall.log" 2>&1 || {
     echo '[预编译] 失败，尚未启动GPU服务；请拿回诊断包。'
@@ -106,7 +106,7 @@ batch_status=0
 for scene in $scenes; do
     layout=${scene%%:*}
     rates=${scene#*:}
-    count=$(printf '%s' "$rates" | tr ',' '\n' | wc -l)
+    count=$(printf '%s\n' "$rates" | tr ',' '\n' | grep -c .)
     avail=$(df --output=avail -k "$run" | tail -1)
     if [ "$avail" -lt 8388608 ] || [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]; then
         echo "[停止] $layout 前磁盘不足8GB或GPU有计算进程；未清理任何进程。"
