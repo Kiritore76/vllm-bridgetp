@@ -56,6 +56,8 @@ from __future__ import annotations
 
 import math
 
+from tools.bridge_tp.pressure_cpu import load
+
 WINDOW_S = 60.0
 # The short rate alone reads a shorter window. At 60s a short rate back at 8/s
 # still read 5.6/s, and a 120s long blip converted to L2 (rotation GPU 11-05).
@@ -131,7 +133,6 @@ SIX_CARD_RULES = dict(
 
 def layout_name(bundles):
     """Use the registry's naming for both two- and three-bundle layouts."""
-    from tools.bridge_tp.pressure_cpu import load
 
     ids = sorted(bundles)
     return load("instance_pool").layout_label([bundles[b] > 1 for b in ids], ids)
@@ -367,13 +368,21 @@ class ConversionDecider:
             tpk_capacity_max=tpk_max,
             tpk_waiting=waiting,
             quiet={
-                b: all(pressure(i).get("zone") == "SPARE" for i in ids)
+                b: all(
+                    load("unified_scheduler").route_gate_ready(
+                        instances.get(i, {}).get("unified_fullness"), now
+                    )
+                    if self.profile == "six_card"
+                    else pressure(i).get("zone") == "SPARE"
+                    for i in ids
+                )
                 for b, ids in members.items()
             },
             kv_room={
                 b: all(
                     pressure(i).get("capacity") is not None
-                    and pressure(i)["capacity"] < r["prepare_capacity_max"]
+                    and pressure(i)["capacity"]
+                    < (1.0 if self.profile == "six_card" else r["prepare_capacity_max"])
                     for i in ids
                 )
                 for b, ids in members.items()
@@ -600,7 +609,9 @@ class ConversionDecider:
             key, edge, waiting = approaching
             others = [b for b in bundles if b != edge[0]]
             if others and all(
-                s["kv_room"].get(b) and (waiting or s["quiet"].get(b)) for b in others
+                s["kv_room"].get(b)
+                and ((waiting and self.profile != "six_card") or s["quiet"].get(b))
+                for b in others
             ):
                 self.prepared = dict(
                     key=key, bundle=edge[0], target_mode=edge[1], at=now

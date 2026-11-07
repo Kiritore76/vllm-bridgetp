@@ -1255,6 +1255,10 @@ def _run(args, prepared):
                     block_size=raw["block_size"],
                 ),
             )
+            if co.scheduler == "unified":
+                instances[instance_of.get(pool, pool)]["unified_fullness"] = (
+                    layout_state.get("unified_fullness", {}).get(pool)
+                )
         # Conversion decision signals (record-only decider): arrivals and
         # migration starts of the last window.
         window = decision.WINDOW_S
@@ -1705,6 +1709,9 @@ def _run(args, prepared):
             now = time.time()
             if co.scheduler == "unified":
                 co.observe_itl(service, [pool.pool_id for pool in pools], now)
+                layout_state["unified_fullness"] = co.route_fullness_snapshot(
+                    pools, now
+                )
             # Request rates of every migration source (client ids are unique).
             source_rates = {}
             for source_id, _, _ in migration_sources:

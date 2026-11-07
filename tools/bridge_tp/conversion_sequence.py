@@ -718,9 +718,7 @@ class DecidedSequenceDriver(ConversionSequenceDriver):
             if not self.wait_for_clock():
                 self.sequence_state = "COMPLETED"
                 return
-            while (
-                not self.stop_event.is_set() and self.sequence_state == "RUNNING"
-            ):
+            while not self.stop_event.is_set() and self.sequence_state == "RUNNING":
                 self.decide()
                 self.stop_event.wait(self.interval_s)
             if self.sequence_state == "RUNNING":
@@ -737,11 +735,15 @@ class DecidedSequenceDriver(ConversionSequenceDriver):
 
     def after_begin(self, step):
         # Only L1A -> L0 is optional enough for the strict gate (user 11-03, 11-04).
-        self.backend.gate_mode = {
-            ("A", "TP2"): "NONE",
-            ("A", "TP1"): "PHYSICAL",
-            ("B", "TP2"): "PHYSICAL",
-        }.get((step["bundle"], step["target_mode"]), "STRICT")
+        self.backend.gate_mode = (
+            "UNIFIED"
+            if getattr(self.decider, "profile", "four_card") == "six_card"
+            else {
+                ("A", "TP2"): "NONE",
+                ("A", "TP1"): "PHYSICAL",
+                ("B", "TP2"): "PHYSICAL",
+            }.get((step["bundle"], step["target_mode"]), "STRICT")
+        )
         # Beginning clears the tilt, but routing keeps it until the bundle closes;
         # the start gate's service check ran before the load the tilt added.
         tilt = self.tilt_before_step
@@ -769,8 +771,13 @@ class DecidedSequenceDriver(ConversionSequenceDriver):
         bundles, members = registry_layout(self.backend.registry)
         layout, edge = self.step_edge
         s = self.decider.signals(status, bundles, members, wall)
+        extra = (
+            dict(long_arrivals=s["long_arrivals"], trend_blocks=s["trend_blocks"])
+            if getattr(self.decider, "profile", "four_card") == "six_card"
+            else {}
+        )
         reason = self.decider.cancel_reason(
-            edge, layout, s["short_rate"], s["long_blocks"]
+            edge, layout, s["short_rate"], s["long_blocks"], **extra
         )
         if reason is None:
             self.cancel_since = None

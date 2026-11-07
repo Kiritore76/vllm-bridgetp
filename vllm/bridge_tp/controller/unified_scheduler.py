@@ -41,6 +41,29 @@ TARGET_AFTER_MAX = 0.7
 COOLDOWN_S = 15.0
 
 
+CONVERSION_FULLNESS_MAX = 0.9
+
+
+def route_gate_ready(snapshot, now, max_age_s=2.0):
+    """Require complete, fresh route evidence before removing serving capacity."""
+    if not snapshot or snapshot.get("kind") != "route":
+        return False
+    if snapshot.get("complete") is not True:
+        return False
+    for key in ("observed_at", "sampled_at", "published_at", "itl_sampled_at"):
+        value = snapshot.get(key)
+        if type(value) not in (int, float) or not math.isfinite(value):
+            return False
+        if not 0 <= now - value <= max_age_s:
+            return False
+    values = [snapshot.get(k) for k in ("slots", "kv", "speed", "value")]
+    if any(
+        type(v) not in (int, float) or not math.isfinite(v) or v < 0 for v in values
+    ):
+        return False
+    return values[-1] == max(values[:-1]) and values[-1] < CONVERSION_FULLNESS_MAX
+
+
 # Token rate standing in for an instance first seen idle, so its value is zero.
 _IDLE_TOKENS = 1e-9
 

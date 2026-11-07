@@ -299,6 +299,19 @@ class TimingTests(unittest.TestCase):
         decider = d.ConversionDecider(profile="six_card", execute=True)
         value, modes, members = native_status("L3", short=8, blocks=1024, busy="C")
         for t in range(1000, 1050):
+            for instance in value["instances"].values():
+                instance["unified_fullness"] = dict(
+                    kind="route",
+                    complete=True,
+                    observed_at=t,
+                    sampled_at=t,
+                    published_at=t,
+                    itl_sampled_at=t,
+                    slots=0.1,
+                    kv=0.1,
+                    speed=0.1,
+                    value=0.1,
+                )
             row = decider.observe(value, modes, members, t)
             self.assertIsNone(row["proposal"])
         self.assertEqual(row["tilt"], ["C"])

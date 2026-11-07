@@ -289,6 +289,8 @@ class ControllerConversionBackend:
 
     def gate(self, plan):
         """Start gate: the retained instances must carry the load meanwhile."""
+        if self.gate_mode == "UNIFIED":
+            return self.unified_gate(plan)
         now = self.clock()
         if self.gate_since is None:
             self.gate_since = now
@@ -342,6 +344,59 @@ class ControllerConversionBackend:
                 plan_id=plan["plan_id"],
                 waited_s=round(waited, 3),
                 relaxed=waited >= self.safety["relax_after_s"],
+            )
+        return opened
+
+    def unified_gate(self, plan):
+        """Six-card gate; tilt and waiting never waive fresh route fullness."""
+        now = self.clock()
+        if self.gate_since is None:
+            self.gate_since = now
+        waited = now - self.gate_since
+        status = self.status()
+        retained = {}
+        reason = None
+        if not self.fresh(status):
+            reason = "status stale"
+        else:
+            refs = {r.instance_id for r in self.refs(plan)}
+            expected = {
+                i
+                for i, row in self.registry.instances.items()
+                if row.lifecycle == "ACTIVE" and i not in refs
+            }
+            retained = self.retained(plan, status)
+            if not expected or set(retained) != expected:
+                reason = "retained registry/status mismatch"
+            elif not all(
+                self.hard_ok(v, self.safety["valve_capacity"])
+                for v in retained.values()
+            ):
+                reason = "retained KV headroom (hard)"
+            elif not all(
+                load("unified_scheduler").route_gate_ready(
+                    v.get("unified_fullness"), now
+                )
+                for v in retained.values()
+            ):
+                reason = "retained route fullness missing, stale or >=0.9"
+        opened = reason is None
+        self.decision(
+            "GATE",
+            open=opened,
+            waited_s=waited,
+            relaxed=False,
+            mode="UNIFIED",
+            reason=reason,
+            retained={i: v.get("unified_fullness") for i, v in retained.items()},
+        )
+        if opened:
+            self.ops.event(
+                "GATE_OPEN",
+                plan_id=plan["plan_id"],
+                waited_s=round(waited, 3),
+                relaxed=False,
+                mode="UNIFIED",
             )
         return opened
 
@@ -1165,6 +1220,7 @@ class ConversionDriver:
                 request["edges"],
                 request.get("rules"),
                 execute=request["decider"] == "EXECUTE",
+                profile=request.get("profile", "four_card"),
             )
         self.decided_at = -float("inf")
         self.decisions = 0
@@ -1283,9 +1339,7 @@ class ConversionDriver:
                 backend.ops.event("PRE_TILT", instances=tilt)
                 self.tilt_since = time.monotonic() if tilt else None
         if not (
-            self.prepare_prestart
-            and self.decider.execute
-            and backend.prestart_enabled
+            self.prepare_prestart and self.decider.execute and backend.prestart_enabled
         ):
             return
         prepared = record["prepared"]

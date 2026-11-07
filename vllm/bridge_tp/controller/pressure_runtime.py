@@ -316,6 +316,38 @@ class PressureCoordinator:
             itl_reference_s=self.itl_reference_s,
         )
 
+    def route_fullness_snapshot(self, readings, now):
+        """Export current load for conversion, without a hypothetical new prompt.
+
+        Routing tolerates missing components while ranking. Conversion must
+        instead wait for all three components and their original timestamps.
+        """
+        with self._lock:
+            itl = self.itl.snapshot()
+            result = {}
+            for reading in readings:
+                pool_id = reading.pool_id
+                value = self.unified_fullness(
+                    self.ledger.routing_reading(reading), "route"
+                )
+                result[pool_id] = dict(
+                    value,
+                    kind="route",
+                    observed_at=now,
+                    sampled_at=reading.sampled_at,
+                    published_at=reading.published_at,
+                    itl_sampled_at=itl.get(pool_id, {}).get("updated_at"),
+                    complete=(
+                        type(reading.engine_requests) is int
+                        and reading.engine_requests >= 0
+                        and reading.free_blocks is not None
+                        and reading.total_blocks is not None
+                        and 0 <= reading.free_blocks <= reading.total_blocks
+                        and all(v is not None for v in value.values())
+                    ),
+                )
+            return result
+
     def _admit_unified(
         self, request_id, prompt_tokens, requested_output, readings, key, now, allowed
     ):
