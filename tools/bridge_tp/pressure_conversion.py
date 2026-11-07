@@ -151,11 +151,13 @@ class ControllerConversionBackend:
         speed_margin=0.8,
         join=None,
         prestart=False,
+        channel_graph=None,
     ):
         self.registry, self.ops, self.clock = registry, ops, clock
         self.run_dir = Path(run_dir)
         self.base_port, self.context_limits = base_port, context_limits
         self.channel_plan, self.target_tp_ranks = channel_plan, target_tp_ranks
+        self.channel_graph = channel_graph
         self.rows = {row["instance_id"]: dict(row) for row in manifest["instances"]}
         self.revision = 0
         self.layout = {}
@@ -405,7 +407,10 @@ class ControllerConversionBackend:
             self.registry.get(ref).lifecycle == "ACTIVE" for ref in self.refs(plan)
         ):
             return False
-        if self.channel_plan is not None:
+        if self.channel_graph is not None:
+            if not self.channel_graph.acknowledged():
+                return False
+        elif self.channel_plan is not None:
             # Every target rank must follow the plan file before anything is
             # quiesced; otherwise a retired source's channel could never close
             # (S3b-3 GPU, 10-31: the connector had rejected the file).
@@ -738,6 +743,8 @@ class ControllerConversionBackend:
             s is None or s["lifecycle"] != "RETIRED" for s in states.values()
         ):
             return False
+        if self.channel_graph is not None:
+            return self.channel_graph.retire(plan["plan_id"], ids)
         if self.channel_plan is None:
             self.ops.event("CHANNEL_RETIRE", plan_id=plan["plan_id"], closed=[])
             return True

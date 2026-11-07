@@ -291,36 +291,128 @@ class TargetSessions:
     the controller reads for "the" session go to the target that started last.
     """
 
-    def __init__(self, groups, source_links, audit):
-        if not groups:
+    def __init__(self, groups, source_links, audit, *, dynamic=False):
+        if not groups and not dynamic:
             raise ValueError("at least one migration target")
         self.groups = dict(groups)
+        self.dynamic = dynamic
+        self.retired_groups = {}
+        self.retired_sources = set()
+        self.last_group = next(iter(self.groups.values()), None)
         self.source_links = {k: Path(v) for k, v in source_links.items()}
         self.audit_log = audit
-        self.current = next(iter(self.groups))
+        self.current = next(iter(self.groups), None)
 
     def __getattr__(self, key):
-        if key in {"groups", "current", "source_links", "audit_log"}:
+        if key in {
+            "groups",
+            "current",
+            "source_links",
+            "audit_log",
+            "last_group",
+            "retired_groups",
+            "retired_sources",
+            "dynamic",
+        }:
             raise AttributeError(key)
-        return getattr(self.groups[self.current], key)
+        group = self.groups.get(self.current) or self.last_group
+        if group is None:
+            raise AttributeError(key)
+        return getattr(group, key)
 
     def items(self):
-        return list(self.groups.items())
+        # Retired targets remain in stream accounting, never in target selection.
+        return list(self.groups.items()) + list(self.retired_groups.items())
+
+    @property
+    def record(self):
+        group = self.groups.get(self.current) or self.last_group
+        return None if group is None else group.record
 
     @property
     def sessions(self):
-        return [s for group in self.groups.values() for s in group.sessions]
+        return [s for _, group in self.items() for s in group.sessions]
 
     @property
     def ready_for_start(self):
-        return all(
+        return bool(self.groups) and all(
             group.record is None and not group.cleanup_requires_shutdown
             for group in self.groups.values()
         )
 
     @property
     def cleanup_requires_shutdown(self):
-        return any(g.cleanup_requires_shutdown for g in self.groups.values())
+        return any(g.cleanup_requires_shutdown for _, g in self.items())
+
+    def reconcile(self, groups, source_links):
+        """Publish a dynamic target set only at a verified rotation boundary.
+
+        The caller builds new groups and owned source links first. Retired
+        session directories and source links stay on disk, so late APIs and
+        committed streams keep their immutable identities. An unused retired
+        target is a disarmed parking place until start_on moves the source.
+        """
+        if not self.dynamic:
+            raise ValueError("dynamic target reconciliation is not enabled")
+        groups = dict(groups)
+        links = {k: Path(v) for k, v in source_links.items()}
+        if set(groups) & set(self.retired_groups):
+            raise ValueError("retired target identity cannot be reused")
+        if set(links) & self.retired_sources:
+            raise ValueError("retired source identity cannot be reused")
+        for name in self.groups.keys() & groups.keys():
+            if groups[name] is not self.groups[name]:
+                raise ValueError("live target session group cannot be replaced")
+        for name in self.source_links.keys() & links.keys():
+            if links[name] != self.source_links[name]:
+                raise ValueError("live source entry cannot be replaced")
+        roots = {Path(g.root).resolve().parent.parent for g in groups.values()}
+        roots.update(Path(g.root).resolve().parent.parent for g in self.groups.values())
+        roots.update(
+            Path(g.root).resolve().parent.parent for g in self.retired_groups.values()
+        )
+        if len(roots) > 1 or any(
+            Path(g.root).name != name or Path(g.root).parent.name != "migration"
+            for name, g in groups.items()
+        ):
+            raise ValueError("target session escaped owned run")
+        if roots and any(
+            p.parent.resolve() != next(iter(roots)) / "source_active" or p.name != name
+            for name, p in links.items()
+        ):
+            raise ValueError("source entry escaped owned run")
+        if groups == self.groups and links == self.source_links:
+            return True
+        # A settled migration has not necessarily proved IDLE/cleanup yet;
+        # only record=None, established by rotate(), admits a topology change.
+        if any(
+            g.record is not None or g.cleanup_requires_shutdown
+            for g in [*self.groups.values(), *groups.values()]
+        ):
+            return False
+        removed = self.groups.keys() - groups.keys()
+        added = groups.keys() - self.groups.keys()
+        for name in sorted(removed):
+            group = self.groups[name]
+            group.close()
+            self.retired_groups[name] = group
+        self.retired_sources.update(self.source_links.keys() - links.keys())
+        if self.current not in groups:
+            self.current = next(iter(groups), None)
+        if self.current is not None:
+            self.last_group = groups[self.current]
+        self.groups, self.source_links = groups, links
+        if added or removed:
+            self.audit_log.write(
+                dict(
+                    kind="migration_targets_reconciled",
+                    added=sorted(added),
+                    retired=sorted(removed),
+                    active=sorted(groups),
+                    sources=sorted(links),
+                )
+            )
+        return True
 
     def target_ready(self, target):
         return target in self.groups and self.ready_for_start
@@ -344,6 +436,7 @@ class TargetSessions:
             target=target,
         )
         self.current = target
+        self.last_group = group
         return group.start(candidate, snapshot)
 
     def rotate(self):
@@ -351,6 +444,7 @@ class TargetSessions:
         return any(rotated)
 
     def close(self):
+        # Archived groups were closed when retired; their futures are retained.
         for group in self.groups.values():
             group.close()
 

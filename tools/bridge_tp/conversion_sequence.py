@@ -110,7 +110,17 @@ class SequenceBackend(pc.ControllerConversionBackend):
         self.evacuate_enabled = False
         self.evacuation_run = None
         self.next_service_port = self.base_port
-        channels = list(pc.read_json(self.channel_plan) or [])
+        channels = (
+            [
+                c
+                for target in self.channel_graph.targets
+                for c in self.channel_graph.rows(target)
+            ]
+            if self.channel_graph is not None
+            else list(pc.read_json(self.channel_plan) or [])
+            if self.channel_plan is not None
+            else []
+        )
         self.next_channel_generation = (
             max((c["generation"] for c in channels), default=0) + 1
         )
@@ -433,6 +443,8 @@ class SequenceBackend(pc.ControllerConversionBackend):
         )
 
     def retire_channels(self, plan):
+        if self.channel_graph is not None:
+            return super().retire_channels(plan)
         # Closing a receiver closes every source edge; closing a source only
         # removes that source. Graph edges, not instance generations, select it.
         retiring = {r.instance_id for r in self.refs(plan)}
