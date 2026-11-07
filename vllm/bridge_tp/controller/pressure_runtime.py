@@ -819,10 +819,11 @@ class PressureCoordinator:
         return s, t, decision
 
     def _tick_unified(self, now, readings, tp_of, candidates, actions):
-        """KV or pressure trigger; longest context to the least full target.
+        """KV or pressure trigger; the least full target that takes a request.
 
-        Pairs are the (TP1 source, TP-k target) ones with a migration channel,
-        as before; only the rules that start a move are replaced.
+        Pairs are the (TP1 source, TP-k target) ones passed in ``candidates``
+        (warm channels); targets are tried from the least full, the next one
+        only when none of its requests fits or passes (design 11-06 section 3).
         """
         action = chosen = None
         with self._lock:
@@ -856,54 +857,42 @@ class PressureCoordinator:
                 t for t in targets if fresh[t] and self.ledger.channel_available(t)
             ]
 
-            def least_full(names):
-                return min(
-                    names, key=lambda t: (full[t]["value"], sort_ids.get(t, t)),
-                    default=None,
+            def by_fullness(names):
+                # Least full first (design 11-06 section 3); ties by prompt
+                # blocks promised to pending prefill, then the instance order.
+                def promised(t):
+                    value = adjusted[t].unallocated_prompt_blocks
+                    return value if type(value) is int and value > 0 else 0
+
+                return sorted(
+                    names,
+                    key=lambda t: (full[t]["value"], promised(t), sort_ids.get(t, t)),
                 )
 
             # KV is safety and ignores cooldowns; pressure respects them.
-            kv_target = least_full(open_targets)
-            pressure_target = least_full(
+            kv_order = by_fullness(open_targets)
+            pressure_order = by_fullness(
                 [t for t in open_targets if not self.migration_state.cooling(t, now)]
             )
-            for s in sources:
-                capacity = classify(adjusted[s], self.policy.cfg, now).capacity
-                exhausting = fresh[s] and (capacity or 0) >= 1
-                trigger, reason = unified.migration_trigger(
-                    full[s],
-                    exhausting,
-                    full[pressure_target] if pressure_target else None,
-                    self.migration_state,
-                    s,
-                    now,
-                )
-                if trigger == "KV" and kv_target is None:
-                    trigger, reason = None, "no fresh target with a free channel"
-                best_target = kv_target if trigger == "KV" else pressure_target
-                entry = dict(
-                    source=s,
-                    fullness=full[s],
-                    exhausting=exhausting,
-                    trigger=trigger,
-                    reason=reason,
-                    target=None,
-                    request_id=None,
-                    rejected=[],
-                )
-                evaluations.append(entry)
-                if trigger is None or not fresh[s]:
-                    continue
-                # Request selection is the old scheduler's (user 11-06): stop and
-                # survival from the predictor, release before exhaustion, enough
-                # relief, then joint KV block-seconds. KV maps to its capacity
-                # path, pressure to its overload path; only the trigger is new.
+
+            def pick(s, target, trigger, entry):
+                """The old evaluation's choice for one target that has room."""
+                # Request selection is the old scheduler's (user 11-06): stop
+                # and survival from the predictor, release before exhaustion,
+                # enough relief, then joint KV block-seconds. KV maps to its
+                # capacity path, pressure to its overload path.
                 policy = self.policy_for(s)
                 source_reading = adjusted[s]
-                target_reading = adjusted[best_target]
+                target_reading = adjusted[target]
                 guard = self.policy.cfg.capacity_guard_blocks
                 required = max(1, guard - source_reading.free_blocks)
-                pool = list(candidates.get((s, best_target), []))
+                pool = list(candidates.get((s, target), []))
+
+                def reject(request_id, reasons):
+                    entry["rejected"].append(
+                        dict(request_id=request_id, reasons=reasons, target=target)
+                    )
+
                 while pool:
                     rows, selected, basis = policy.evaluate_candidates(
                         now,
@@ -916,16 +905,11 @@ class PressureCoordinator:
                         trigger == "PRESSURE",
                         required,
                     )
-                    entry["rejected"].extend(
-                        dict(
-                            request_id=r["request"]["request_id"],
-                            reasons=r["rejections"],
-                        )
-                        for r in rows
-                        if r["rejections"]
-                    )
+                    for r in rows:
+                        if r["rejections"]:
+                            reject(r["request"]["request_id"], r["rejections"])
                     if selected is None:
-                        break
+                        return None
                     c = next(x for x in pool if x.request_id == selected.request_id)
                     evidence = next(
                         r for r in rows if r["request"]["request_id"] == c.request_id
@@ -936,14 +920,11 @@ class PressureCoordinator:
                     # the admission guard, as routing does (GPU 11-06: two KV
                     # moves into B overcommitted it and B preempted 10 times).
                     room = unified.prompt_room(
-                        target_reading, self.ledger.pending(best_target)[0]
+                        target_reading, self.ledger.pending(target)[0]
                     )
                     if room is None or room < blocks:
-                        entry["rejected"].append(
-                            dict(
-                                request_id=c.request_id,
-                                reasons=["target room promised to pending prompts"],
-                            )
+                        reject(
+                            c.request_id, ["target room promised to pending prompts"]
                         )
                         pool = [x for x in pool if x.request_id != c.request_id]
                         continue
@@ -955,16 +936,60 @@ class PressureCoordinator:
                             extra_blocks=blocks,
                         )
                         if after["value"] >= unified.TARGET_AFTER_MAX:
-                            entry["rejected"].append(
-                                dict(
-                                    request_id=c.request_id,
-                                    reasons=["target would not stay below hysteresis"],
-                                )
+                            reject(
+                                c.request_id,
+                                ["target would not stay below hysteresis"],
                             )
                             pool = [x for x in pool if x.request_id != c.request_id]
                             continue
+                    return c, blocks, basis
+                return None
+
+            for s in sources:
+                capacity = classify(adjusted[s], self.policy.cfg, now).capacity
+                exhausting = fresh[s] and (capacity or 0) >= 1
+                trigger, reason = unified.migration_trigger(
+                    full[s],
+                    exhausting,
+                    full[pressure_order[0]] if pressure_order else None,
+                    self.migration_state,
+                    s,
+                    now,
+                )
+                if trigger == "KV" and not kv_order:
+                    trigger, reason = None, "no fresh target with a free channel"
+                order = kv_order if trigger == "KV" else pressure_order
+                entry = dict(
+                    source=s,
+                    fullness=full[s],
+                    exhausting=exhausting,
+                    trigger=trigger,
+                    reason=reason,
+                    target=None,
+                    request_id=None,
+                    rejected=[],
+                    targets=[],
+                )
+                evaluations.append(entry)
+                if trigger is None or not fresh[s]:
+                    continue
+                # Least full target first; the next one only when no request
+                # fits or passes there. No fit anywhere: no move this tick.
+                for target in order:
+                    found = pick(s, target, trigger, entry)
+                    entry["targets"].append(
+                        dict(
+                            target=target,
+                            fullness=full[target]["value"],
+                            candidates=len(candidates.get((s, target), [])),
+                            request_id=found[0].request_id if found else None,
+                        )
+                    )
+                    if found is None:
+                        continue
+                    c, blocks, basis = found
                     entry.update(
-                        target=best_target,
+                        target=target,
                         request_id=c.request_id,
                         required_blocks=blocks,
                         selection_policy=basis,
@@ -974,10 +999,10 @@ class PressureCoordinator:
                         chosen = dict(
                             key=key,
                             source=s,
-                            target=best_target,
+                            target=target,
                             candidate=c,
                             required=blocks,
-                            target_reading=readings[best_target],
+                            target_reading=readings[target],
                             entry=entry,
                         )
                     break
@@ -1001,7 +1026,11 @@ class PressureCoordinator:
             }
             if chosen is not None and actions is not None and not session_active:
                 selected = chosen["candidate"]
-                action = actions.get(selected.request_id)
+                # Several targets: one binding per (request, target), so START
+                # runs on the session of the chosen target.
+                action = actions.get((selected.request_id, chosen["target"]))
+                if action is None:
+                    action = actions.get(selected.request_id)
                 if action is None or action.request_id != selected.request_id:
                     record["execution_blocked"] = "chosen request has no action binding"
                     action = None

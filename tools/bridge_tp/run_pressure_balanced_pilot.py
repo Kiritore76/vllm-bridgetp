@@ -62,7 +62,18 @@ def parse_args(argv=None):
     parser.add_argument("--arrivals", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--mechanism-root", type=Path)
-    parser.add_argument("--migration-targets", choices=("B",))
+    parser.add_argument("--migration-targets", choices=("B", "all"))
+    parser.add_argument(
+        "--migration-target",
+        action="append",
+        default=[],
+        metavar="INSTANCE,READY_PORT",
+        help="all: one receiver below run-dir/migration with its ready port",
+    )
+    parser.add_argument(
+        "--force-migration-target",
+        help="diagnostic: only this receiver may be chosen; checks unchanged",
+    )
     parser.add_argument("--source-inventory", type=Path, required=True)
     parser.add_argument("--target-inventory", type=Path, required=True)
     parser.add_argument("--source-context-limit", type=int, default=8192)
@@ -281,8 +292,33 @@ def preflight(args):
             ).resolve()
         ):
             raise ValueError("mechanism root must be the owned B receiver")
+    elif getattr(args, "migration_targets", None) == "all":
+        receivers = migration_receivers(args)
+        tp2 = {
+            row["instance_id"]
+            for row in (manifest or {}).get("instances", ())
+            if row.get("tp_degree", 1) > 1
+        }
+        if not (
+            manifest
+            and manifest.get("runtime_pool_ids")
+            and controller.target_scoped_receivers
+            and len(receivers) >= 2
+            and set(receivers) <= tp2
+        ):
+            raise ValueError("all targets need owned six-card unified receivers")
     elif getattr(args, "migration_targets", None):
         raise ValueError("receiver selection requires its owned mechanism root")
+    force = getattr(args, "force_migration_target", None)
+    if force is not None and (
+        getattr(args, "migration_targets", None) != "all"
+        or force not in migration_receivers(args)
+    ):
+        raise ValueError("a forced target must be one of all receivers")
+    if getattr(args, "migration_target", None) and (
+        getattr(args, "migration_targets", None) != "all"
+    ):
+        raise ValueError("--migration-target belongs to --migration-targets all")
     pair = pair_pools(manifest)
     pool_names = {"tp1": "tp1", "tp4": "tp4"} | (
         manifest.get("runtime_pool_ids", {}) if manifest else {}
@@ -598,6 +634,19 @@ def channel_sources(manifest):
     return [r for r in extra_instances(manifest) if r.get("migration_channel")]
 
 
+def migration_receivers(args):
+    """{instance: ready port} of ``--migration-target`` (multi-target only)."""
+    receivers = {}
+    for value in getattr(args, "migration_target", None) or ():
+        name, _, port = value.partition(",")
+        if not name or name in receivers or not port.isdigit():
+            raise ValueError(f"invalid --migration-target {value!r}")
+        receivers[name] = int(port)
+    if len(set(receivers.values())) != len(receivers):
+        raise ValueError("receivers need distinct ready ports")
+    return receivers
+
+
 def policy_sources(candidates_by_source, evacuation_sources):
     """What the migration policy may choose from: never a same-TP source."""
     excluded = {row[0] for row in evacuation_sources}
@@ -838,17 +887,48 @@ def _run(args, prepared):
     ingress.urls.update({row["instance_id"]: row["endpoint"] for row in extras})
     for pool in {source_pool, target_pool} - set(pair):
         ingress.urls.pop(pool, None)
-    session = PressureSessions(
-        persistent_cleanup=cfg.shadow_cancel,
-        maximum_migrations=args.maximum_migrations,
-        run_dir=getattr(args, "mechanism_root", None) or args.run_dir,
-        migration_id=args.migration_id,
-        config=controller,
-        coordinator=co,
-        ingress=ingress,
-        executor=executor,
-        audit=audit,
-    )
+    if getattr(args, "migration_targets", None) == "all":
+        # One session group per receiver (design 11-06 section 2.4); each has
+        # its own root, ready port and endpoint. A forced target narrows only
+        # the choice; every group exists so the channels stay accounted.
+        from tools.bridge_tp.pressure_sessions import TargetSessions
+
+        groups = {}
+        for name, port in migration_receivers(args).items():
+            groups[name] = PressureSessions(
+                persistent_cleanup=cfg.shadow_cancel,
+                maximum_migrations=args.maximum_migrations,
+                run_dir=args.run_dir / "migration" / name,
+                migration_id=f"{args.migration_id}-{name}",
+                config=SimpleNamespace(
+                    **dict(
+                        vars(controller),
+                        target_url=ingress.urls[name],
+                        ready_notification_port=port,
+                        target_pool_id=name,
+                    )
+                ),
+                coordinator=co,
+                ingress=ingress,
+                executor=executor,
+                audit=audit,
+            )
+        links = args.run_dir / "source_active"
+        session = TargetSessions(
+            groups, {link.name: link for link in links.iterdir()}, audit
+        )
+    else:
+        session = PressureSessions(
+            persistent_cleanup=cfg.shadow_cancel,
+            maximum_migrations=args.maximum_migrations,
+            run_dir=getattr(args, "mechanism_root", None) or args.run_dir,
+            migration_id=args.migration_id,
+            config=controller,
+            coordinator=co,
+            ingress=ingress,
+            executor=executor,
+            audit=audit,
+        )
 
     def scraper_for(url, tp):
         return load("telemetry").MetricsScraper(
@@ -1653,24 +1733,72 @@ def _run(args, prepared):
             # Migration needs the pair target and a live source; retired or
             # not-yet-observed instances simply drop out (S3b-1).
             target_pool_id = layout_state["migration_target"]
-            t = index_of.get(target_pool_id)
-            if (
-                t is not None
-                and session.ready_for_start
-                and hasattr(session, "bind_target")
+            multi = hasattr(session, "groups")
+            if multi:
+                forced = getattr(args, "force_migration_target", None)
+                target_ids = [
+                    tid
+                    for tid in session.groups
+                    if tid in index_of and forced in (None, tid)
+                ]
+                t = index_of.get(session.current)
+            else:
+                target_ids = [target_pool_id] if target_pool_id in index_of else []
+                t = index_of.get(target_pool_id)
+            if target_ids and session.ready_for_start and hasattr(
+                session, "bind_target"
             ):
-                session.bind_target(
-                    target_pool_id,
-                    ingress.urls[target_pool_id],
-                    instance_of.get(target_pool_id, target_pool_id),
-                )
+                for tid in target_ids:
+                    session.bind_target(
+                        tid, ingress.urls[tid], instance_of.get(tid, tid)
+                    )
+            t0 = index_of[target_ids[0]] if target_ids else None
             candidates_by_source, runtimes, rates_by_source = {}, {}, {}
+            pairs, pair_runtimes = {}, {}
             # Published (next tick) with each request's planner row.
             layout_state["candidates"] = {}
+            def target_fields(row, n, tx, pools=pools, shapes=shapes, now=now):
+                """Target-side candidate fields toward receiver index ``tx``."""
+                if workload_module is not None:
+                    relief, cost = (
+                        tuple(
+                            workload_module.slot_cost(
+                                workload_profiles[name],
+                                max(row["prompt_tokens"], row["computed_tokens"]),
+                            )[0]
+                            for name in ("tp1", "tp4")
+                        )
+                        if all(
+                            workload_module.valid(pool, co.policy.cfg, now)
+                            for pool in (pools[n], pools[tx])
+                        )
+                        else (None, None)
+                    )
+                else:
+                    relief, cost = (
+                        lookup.deltas(shapes[n], shapes[tx], row["request_id"])
+                        if shapes[n] and shapes[tx]
+                        else (None, None)
+                    )
+                return dict(
+                    source_decode_relief=relief,
+                    target_decode_cost=cost,
+                    target_health_after_supported=(
+                        health_module.supported_after(
+                            health_tracker.reference,
+                            shapes[tx]["decode_requests"] + 1,
+                            (shapes[tx]["decode_context_sum"] + row["computed_tokens"])
+                            / (shapes[tx]["decode_requests"] + 1),
+                        )
+                        if health_tracker is not None and shapes[tx]
+                        else False
+                    ),
+                )
+
             for source_id, inventory_path, source_predictor in (
                 migration_sources + evacuation_sources
             ):
-                if t is None or source_id not in index_of:
+                if t0 is None or source_id not in index_of:
                     continue
                 n = index_of[source_id]
                 rates = service.snapshot(source_id, now)["request_rates"]
@@ -1692,14 +1820,14 @@ def _run(args, prepared):
                             )
                             if all(
                                 workload_module.valid(pool, co.policy.cfg, now)
-                                for pool in (pools[n], pools[t])
+                                for pool in (pools[n], pools[t0])
                             )
                             else (None, None)
                         )
                     else:
                         relief, cost = (
-                            lookup.deltas(shapes[n], shapes[t], row["request_id"])
-                            if shapes[n] and shapes[t]
+                            lookup.deltas(shapes[n], shapes[t0], row["request_id"])
+                            if shapes[n] and shapes[t0]
                             else (None, None)
                         )
                     release_budget = lookup.release_budget
@@ -1745,14 +1873,14 @@ def _run(args, prepared):
                             target_health_after_supported=(
                                 health_module.supported_after(
                                     health_tracker.reference,
-                                    shapes[t]["decode_requests"] + 1,
+                                    shapes[t0]["decode_requests"] + 1,
                                     (
-                                        shapes[t]["decode_context_sum"]
+                                        shapes[t0]["decode_context_sum"]
                                         + row["computed_tokens"]
                                     )
-                                    / (shapes[t]["decode_requests"] + 1),
+                                    / (shapes[t0]["decode_requests"] + 1),
                                 )
-                                if health_tracker is not None and shapes[t]
+                                if health_tracker is not None and shapes[t0]
                                 else False
                             ),
                         )
@@ -1791,7 +1919,7 @@ def _run(args, prepared):
                     state="LOCAL",
                     generated_tokens=None,
                     source_sampled_unix_s=pools[n].sampled_at,
-                    target_sampled_unix_s=pools[t].sampled_at,
+                    target_sampled_unix_s=pools[t0].sampled_at,
                     source_free_kv_tokens=pools[n].free_blocks * pools[n].block_size,
                     source_guard_free_kv_tokens=cfg.capacity_guard_blocks
                     * pools[n].block_size,
@@ -1799,11 +1927,36 @@ def _run(args, prepared):
                     * pools[n].block_size
                     if pools[n].growth_blocks_s is not None
                     else None,
-                    target_running=inventories[t]["running"],
-                    target_waiting=co.ledger.routing_reading(pools[t]).waiting,
+                    target_running=inventories[t0]["running"],
+                    target_waiting=co.ledger.routing_reading(pools[t0]).waiting,
                     target_kv_usage_frac=1
-                    - pools[t].free_blocks / inventories[t]["total_blocks"],
+                    - pools[t0].free_blocks / inventories[t0]["total_blocks"],
                 )
+                # The same requests toward every other receiver: only the
+                # target-side fields differ; one predictor read per source.
+                rows_by_id = {
+                    row["request_id"]: row for row in inventories[n]["requests"]
+                }
+                pairs[(source_id, target_ids[0])] = candidates_by_source[source_id]
+                pair_runtimes[(source_id, target_ids[0])] = runtimes[source_id]
+                for tid in target_ids[1:]:
+                    tx = index_of[tid]
+                    pairs[(source_id, tid)] = [
+                        replace(
+                            c,
+                            **target_fields(rows_by_id[c.request_id], n, tx),
+                        )
+                        for c in candidates_by_source[source_id]
+                        if c.request_id in rows_by_id
+                    ]
+                    pair_runtimes[(source_id, tid)] = replace(
+                        runtimes[source_id],
+                        target_sampled_unix_s=pools[tx].sampled_at,
+                        target_running=inventories[tx]["running"],
+                        target_waiting=co.ledger.routing_reading(pools[tx]).waiting,
+                        target_kv_usage_frac=1
+                        - pools[tx].free_blocks / inventories[tx]["total_blocks"],
+                    )
             candidates = [c for cs in candidates_by_source.values() for c in cs]
             # A source without observed request rates may not start a migration;
             # with one source this is the historical "no rates, advisory" rule.
@@ -1812,6 +1965,23 @@ def _run(args, prepared):
                 if args.no_migration
                 or not session.ready_for_start
                 or not any(rates_by_source.values())
+                else {
+                    # Several receivers: bind (request, target) to its group.
+                    (c.request_id, tid): r.BoundAction(
+                        c.request_id,
+                        session.groups[tid].migration_id,
+                        lambda c=c, tid=tid, runtime=pair_runtimes[(source, tid)],
+                        source=source: (
+                            note_migration_start(
+                                source, session.start_on(tid, c, runtime)
+                            )
+                        ),
+                    )
+                    for (source, tid), cs in pairs.items()
+                    if rates_by_source[source]
+                    for c in cs
+                }
+                if multi
                 else {
                     c.request_id: r.BoundAction(
                         c.request_id,
@@ -1847,29 +2017,40 @@ def _run(args, prepared):
                 audit.write(
                     dict(kind="pressure_assist_result", **layout_state["assist_result"])
                 )
-            if t is not None and not assist_started:
+            if target_ids and not assist_started:
+                chosen_sources = policy_sources(
+                    candidates_by_source, evacuation_sources
+                )
                 load("pause_diagnostics").call(
                     "policy.tick",
                     co.tick_multi,
                     now,
-                    {target_pool_id: pools[t]}
-                    | {
-                        source: pools[index_of[source]]
-                        for source in policy_sources(
-                            candidates_by_source, evacuation_sources
-                        )
-                    },
+                    {tid: pools[index_of[tid]] for tid in target_ids}
+                    | {source: pools[index_of[source]] for source in chosen_sources},
                     tp_of,
                     {
-                        (source, target_pool_id): cs
-                        for source, cs in policy_sources(
-                            candidates_by_source, evacuation_sources
-                        ).items()
+                        (source, tid): pairs[(source, tid)]
+                        for source in chosen_sources
+                        for tid in target_ids
+                        if (source, tid) in pairs
                     },
                     actions,
                 )
+            if multi:
+                # A START in this tick may have moved the session to another
+                # receiver: follow it with that receiver's readings.
+                t = index_of.get(session.current)
             session_source = co._session_source.get(session.migration_id, source_pool)
-            runtime = runtimes.get(session_source)
+            session_candidates = (
+                pairs.get((session_source, session.current), candidates)
+                if multi
+                else candidates
+            )
+            runtime = (
+                pair_runtimes.get((session_source, session.current))
+                if multi
+                else None
+            ) or runtimes.get(session_source)
             if t is not None and session.record is not None and not session.settled:
                 session.poll_cancel(inventories[t], now, cfg.max_age_s)
                 if args.test_only_cancel_first_shadow:
@@ -1889,7 +2070,7 @@ def _run(args, prepared):
                         next(
                             (
                                 c
-                                for c in candidates
+                                for c in session_candidates
                                 if c.request_id == session.record.request_id
                             ),
                             None,
@@ -1913,8 +2094,17 @@ def _run(args, prepared):
                     session.cancel(
                         "source ended before selected progress was published"
                     )
-            for previous_session in session.sessions if t is not None else ():
+            for group_target, previous_session in (
+                [(tid, x) for tid, group in session.items() for x in group.sessions]
+                if multi
+                else [(target_pool_id, x) for x in session.sessions]
+                if t is not None
+                else []
+            ):
                 if previous_session.record is None:
+                    continue
+                tt = index_of.get(group_target)
+                if tt is None:
                     continue
                 entry = co.ledger.entries[previous_session.migration_id]
                 if previous_session.target_future is not None and (
@@ -1930,7 +2120,7 @@ def _run(args, prepared):
                 )
                 targets = [
                     row
-                    for row in inventories[t]["requests"]
+                    for row in inventories[tt]["requests"]
                     if row["request_id"].startswith(prefix)
                 ]
                 if len(targets) > 1:
@@ -1938,12 +2128,12 @@ def _run(args, prepared):
                 if (
                     targets
                     and entry.state in {"ACTIVE", "COMMITTED"}
-                    and 0 <= now - pools[t].sampled_at <= cfg.max_age_s
+                    and 0 <= now - pools[tt].sampled_at <= cfg.max_age_s
                     and targets[0]["owned_blocks"] is not None
                 ):
                     co.observe_migration(
                         entry.key,
-                        inventories[t]["pool_id"],
+                        inventories[tt]["pool_id"],
                         allocated_blocks=acknowledged_blocks(
                             entry, targets[0]["owned_blocks"]
                         ),
@@ -1957,7 +2147,7 @@ def _run(args, prepared):
                     and previous_session.target_future is not None
                     and previous_session.target_future.done()
                     and not previous_session.target_future.exception()
-                    and pools[t].sampled_at
+                    and pools[tt].sampled_at
                     > previous_session.target_future.result()["completed_unix_s"]
                     and entry.state in {"COMMITTED", "ACCOUNTED"}
                 ):

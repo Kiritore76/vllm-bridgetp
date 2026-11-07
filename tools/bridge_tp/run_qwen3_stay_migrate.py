@@ -138,7 +138,7 @@ def serving_preflight(plans):
         if not started:
             stagers = (
                 [t["stager_argv"] for t in plan["migration_targets"]]
-                if plan.get("receiver_stage") == 2 else [plan["stager_argv"]]
+                if plan.get("receiver_stage") in (2, 3) else [plan["stager_argv"]]
             )
             for stager in stagers:
                 phase8_stager.parse_args(stager[2:])
@@ -178,11 +178,15 @@ def closed_loop_proof(plan, arm):
             state=state.get("state"),
             settled=session["settled"],
         )
-        if plan.get("receiver_stage") == 2:
+        if plan.get("receiver_stage") in (2, 3):
             targets = [t for t in plan["migration_targets"]
                        if run_dir.parent == Path(t["mechanism_root"]) / "sessions"]
             if len(targets) != 1 or not targets[0]["execution_allowed"]:
-                raise ValueError("stage 2 session is not in the B receiver root")
+                raise ValueError(
+                    "stage 2 session is not in the B receiver root"
+                    if plan["receiver_stage"] == 2
+                    else "session is not in an executing receiver root"
+                )
             row["target_instance"] = targets[0]["instance_id"]
         if state.get("state") == "COMMITTED":
             release = read(run_dir / "source_kv_release_receipt.json")
@@ -336,8 +340,18 @@ def main(argv=None):
         default="pressure",
         help="controller scheduling; unified is the 11-06 rule set, static only",
     )
-    parser.add_argument("--migration-targets", choices=("B",),
-                        help="stage 2: warm A/B receivers, execute only to B")
+    parser.add_argument(
+        "--migration-targets",
+        choices=("B", "all"),
+        help="warm A/B receivers; B executes only to B, all lets the controller "
+        "choose either",
+    )
+    parser.add_argument(
+        "--force-migration-target",
+        choices=("A", "B"),
+        help="diagnostic with --migration-targets all: only this bundle's "
+        "receiver may be chosen; triggers and checks are unchanged",
+    )
     parser.add_argument(
         "--static-layout",
         choices=("L0", "L1A", "L2", "L1AC", "L2C", "L3"),
@@ -439,7 +453,9 @@ def main(argv=None):
     if args.migration_targets and not (
         args.cards == 6 and args.scheduler == "unified" and args.static_layout == "L2C"
     ):
-        parser.error("--migration-targets B requires six-card unified L2C")
+        parser.error("--migration-targets requires six-card unified L2C")
+    if args.force_migration_target and args.migration_targets != "all":
+        parser.error("--force-migration-target needs --migration-targets all")
     if args.layout_l1a_channels and not args.long_burst_memory_verify:
         parser.error("layout-l1a-channels runs with long-burst-memory-verify only")
     joined = bool(
@@ -1079,7 +1095,17 @@ def main(argv=None):
             if args.migration_targets:
                 from tools.bridge_tp.migration_receivers import configure
 
-                configure(plan)
+                force = next(
+                    (
+                        row["instance_id"]
+                        for row in plan["instances"]["instances"]
+                        if row["bundle_id"] == args.force_migration_target
+                    ),
+                    None,
+                )
+                if args.force_migration_target and force is None:
+                    raise ValueError("forced bundle has no receiver")
+                configure(plan, args.migration_targets, force)
         serving_preflight(plans)
         for recipe, arm, scene, plan in plans:
             if not gpu_idle():

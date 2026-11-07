@@ -236,6 +236,125 @@ class PressureSessions:
             session.adapter.close()
 
 
+def switch_source_entry(link, active, audit=None, *, source=None, target=None):
+    """Point a TP1's stable entry at one target's ``migration_active``.
+
+    The source's stream, freeze gate and takeover API all follow this link, so
+    it moves only while no session anywhere is in flight (the caller checks).
+    Both ends must stay inside the run's owned directories.
+    """
+    link, active = Path(link), Path(active)
+    run_dir = link.parent.parent
+    if (
+        link.parent.name != "source_active"
+        or active.name != "migration_active"
+        or active.parent.parent != run_dir / "migration"
+    ):
+        raise ValueError("source entry or target escaped owned directories")
+    if not link.is_symlink():
+        raise ValueError("source entry is not an owned link")
+    previous = Path(os.readlink(link))
+    if previous == active:
+        return False
+    # A missing control would read as the default (armed); the entry may only
+    # move onto an unused session that says explicitly it is not armed.
+    control = active.resolve(strict=True) / "runtime_control.json"
+    armed = json.loads(control.read_text()).get("armed") if control.is_file() else None
+    if armed is not False:
+        raise ValueError("target session is not explicitly disarmed")
+    pending = link.with_name(link.name + ".next")
+    if pending.exists() or pending.is_symlink():
+        raise ValueError("unexpected pending source entry link")
+    pending.symlink_to(active, target_is_directory=True)
+    os.replace(pending, link)
+    if audit is not None:
+        audit.write(
+            dict(
+                kind="source_entry_switched",
+                unix_s=time.time(),
+                source_instance=source,
+                target_instance=target,
+                previous=str(previous),
+                current=str(active),
+            )
+        )
+    return True
+
+
+class TargetSessions:
+    """One ``PressureSessions`` per migration target, one migration at a time.
+
+    Each target keeps its own sessions, adapter (ready port), receipts and
+    rotation (design 11-06 section 2.4). A new migration may start only when no
+    target has a session that has not rotated, so no source is mid-session:
+    only then may a source's stable entry move to another target. Attributes
+    the controller reads for "the" session go to the target that started last.
+    """
+
+    def __init__(self, groups, source_links, audit):
+        if not groups:
+            raise ValueError("at least one migration target")
+        self.groups = dict(groups)
+        self.source_links = {k: Path(v) for k, v in source_links.items()}
+        self.audit_log = audit
+        self.current = next(iter(self.groups))
+
+    def __getattr__(self, key):
+        if key in {"groups", "current", "source_links", "audit_log"}:
+            raise AttributeError(key)
+        return getattr(self.groups[self.current], key)
+
+    def items(self):
+        return list(self.groups.items())
+
+    @property
+    def sessions(self):
+        return [s for group in self.groups.values() for s in group.sessions]
+
+    @property
+    def ready_for_start(self):
+        return all(
+            group.record is None and not group.cleanup_requires_shutdown
+            for group in self.groups.values()
+        )
+
+    @property
+    def cleanup_requires_shutdown(self):
+        return any(g.cleanup_requires_shutdown for g in self.groups.values())
+
+    def target_ready(self, target):
+        return target in self.groups and self.ready_for_start
+
+    def bind_target(self, pool_id, endpoint, epoch):
+        self.groups[pool_id].bind_target(pool_id, endpoint, epoch)
+
+    def start_on(self, target, candidate, snapshot):
+        """Move the owner's entry to ``target`` if needed, then start there."""
+        if not self.ready_for_start:
+            raise ValueError("a migration session has not rotated yet")
+        group = self.groups[target]
+        source = getattr(candidate, "owner", None)
+        if source not in self.source_links:
+            raise ValueError(f"source {source!r} has no owned entry link")
+        switch_source_entry(
+            self.source_links[source],
+            Path(group.root) / "migration_active",
+            self.audit_log,
+            source=source,
+            target=target,
+        )
+        self.current = target
+        return group.start(candidate, snapshot)
+
+    def rotate(self):
+        rotated = [group.rotate() for group in self.groups.values()]
+        return any(rotated)
+
+    def close(self):
+        for group in self.groups.values():
+            group.close()
+
+
 def verified_idle(root, migration_id, request_id):
     """An IDLE boundary certified by rotate, before a later channel retirement."""
     path = Path(root) / "channel_idle_verified.json"

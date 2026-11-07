@@ -348,8 +348,17 @@ class PolicyStaysOutTests(unittest.TestCase):
         source = (ROOT / "tools/bridge_tp/run_pressure_balanced_pilot.py").read_text(
             "utf-8"
         )
-        call = source[source.index('"policy.tick"') :][:700]
-        self.assertEqual(call.count("policy_sources("), 2)
+        start = source.index('"policy.tick"')
+        # Multi-target (11-07): the filtered sources are computed once just
+        # before the call and give both the readings and the candidate pairs.
+        before = source[start - 300 : start]
+        call = source[start:][:700]
+        self.assertIn(
+            "chosen_sources = policy_sources(\n"
+            "                    candidates_by_source, evacuation_sources\n",
+            before,
+        )
+        self.assertEqual(call.count("in chosen_sources"), 2)
         self.assertNotIn("candidates_by_source.items()\n                    }", call)
 
 

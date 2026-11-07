@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Stage 2: isolated A/B receivers and warm channels; execution stays on B."""
+"""Isolated A/B receivers and warm channels.
+
+Stage 2 (``execute='B'``) executes only to B; stage 3 (``'all'``) lets the
+controller choose either receiver, optionally narrowed by a diagnostic
+forced target that changes no check.
+"""
 
 import copy
 import json
@@ -37,8 +42,10 @@ def normalized_receiver_command(command, target):
     return command
 
 
-def configure(plan):
-    """Install receive capability for A and B, without selecting A."""
+def configure(plan, execute="B", force=None):
+    """Install receive capability for A and B; execute to B or to both."""
+    if execute not in {"B", "all"} or (force is not None and execute != "all"):
+        raise ValueError("receivers execute to B, or to all with a forced id")
     if (
         not plan.get("canonical_instance_ids")
         or plan.get("scheduler") != "unified"
@@ -135,7 +142,7 @@ def configure(plan):
             delta_base_port=allocated["delta_base_port"],
             delivery_base_port=allocated["delivery_base_port"],
             ready_notification_port=allocated["ready_notification_port"],
-            execution_allowed=row["bundle_id"] == "B",
+            execution_allowed=execute == "all" or row["bundle_id"] == "B",
         )
         descriptions.append(description)
         row["migration_receiver"] = True
@@ -185,21 +192,37 @@ def configure(plan):
     plan["source_env"]["BRIDGETP_GPU_DIRECT_MECHANISM_ROOT"] = str(roots)
     selected = descriptions[0]
     plan["config"]["target_scoped_receivers"] = True
-    plan["controller_argv"] += [
-        "--mechanism-root",
-        selected["mechanism_root"],
-        "--migration-targets",
-        "B",
-    ]
-    plan["receiver_stage"] = 2
+    if execute == "B":
+        plan["controller_argv"] += [
+            "--mechanism-root",
+            selected["mechanism_root"],
+            "--migration-targets",
+            "B",
+        ]
+        execution = [selected["instance_id"]]
+    else:
+        names = [t["instance_id"] for t in descriptions]
+        if force is not None and force not in names:
+            raise ValueError(f"forced target {force!r} is not a receiver")
+        plan["controller_argv"] += ["--migration-targets", "all"]
+        for target in descriptions:
+            plan["controller_argv"] += [
+                "--migration-target",
+                f"{target['instance_id']},{target['ready_notification_port']}",
+            ]
+        if force is not None:
+            plan["controller_argv"] += ["--force-migration-target", force]
+        execution = [force] if force is not None else names
+    plan["receiver_stage"] = 2 if execute == "B" else 3
     plan["migration_targets"] = descriptions
     plan["migration_plan"].update(
-        stage="AB_RECEIVERS_B_ONLY",
+        stage="AB_RECEIVERS_B_ONLY" if execute == "B" else "AB_RECEIVERS_ALL",
         migration_targets=copy.deepcopy(descriptions),
         migration_sources=copy.deepcopy(plan["migration_sources"]),
         port_blocks=blocks,
-        execution_targets=[selected["instance_id"]],
-        multi_target_execution=False,
+        execution_targets=execution,
+        forced_target=force,
+        multi_target_execution=execute == "all",
     )
 
 
@@ -221,7 +244,9 @@ def initialize(plan):
         RuntimeControl(armed=False, target_instance=target["instance_id"]).write(
             session
         )
-        if target["execution_allowed"]:
+        # Source entries start at the first executing receiver (B); a stage 3
+        # controller moves an entry only between sessions.
+        if target["execution_allowed"] and selected is None:
             selected = session
     if selected is None:
         raise ValueError("no selected B receiver")

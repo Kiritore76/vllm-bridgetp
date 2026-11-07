@@ -1178,7 +1178,7 @@ def run_scene(
     plan["run_dir"].mkdir(parents=True, exist_ok=False)
     mechanism_dir = plan["run_dir"]
     multiple = "--maximum-migrations" in plan["controller_argv"]
-    if plan.get("receiver_stage") == 2:
+    if plan.get("receiver_stage") in (2, 3):
         from tools.bridge_tp.migration_receivers import initialize
 
         mechanism_dir = initialize(plan)
@@ -1324,7 +1324,7 @@ def run_scene(
         # S5b: an L2 that will split sources needs the pair target's stager
         # from the start; an L0 merging a TP2 starts it with that TP2.
         receiver_stagers = []
-        if plan.get("receiver_stage") == 2:
+        if plan.get("receiver_stage") in (2, 3):
             for target in plan["migration_targets"]:
                 process = common.start_process(
                     "stager " + target["instance_id"], target["stager_argv"],
@@ -1476,7 +1476,7 @@ def run_scene(
                 verify_full_speed(
                     plan["run_dir"],
                     [Path(t["mechanism_root"]) for t in plan["migration_targets"]]
-                    if plan.get("receiver_stage") == 2 else None,
+                    if plan.get("receiver_stage") in (2, 3) else None,
                 ),
             )
             announce(scene["name"], "全速检查通过：历史pacing关闭，运行时限速为0")
@@ -1520,7 +1520,7 @@ def run_scene(
             raise RuntimeError(
                 "owned server groups did not terminate; commitments unresolved"
             )
-        if plan.get("receiver_stage") == 2:
+        if plan.get("receiver_stage") in (2, 3):
             from tools.bridge_tp.migration_receivers import cleanup_links
 
             cleanup_links(plan, common.write_json)

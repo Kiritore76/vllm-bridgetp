@@ -461,7 +461,11 @@ class MigrationTests(unittest.TestCase):
             for rejected in e["rejected"]
         ]
         self.assertIn(
-            dict(request_id="q0", reasons=["target room promised to pending prompts"]),
+            dict(
+                request_id="q0",
+                reasons=["target room promised to pending prompts"],
+                target="b",
+            ),
             reasons,
         )
         # Nothing fits: no move at all, and the source is left to its engine.

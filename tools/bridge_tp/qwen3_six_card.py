@@ -131,7 +131,7 @@ def prepare(plan, common):
 
 def warm_channels(plan, timeout_s=30):
     """The target-file followers warm asynchronously after engine startup."""
-    if plan.get("receiver_stage") == 2:
+    if plan.get("receiver_stage") in (2, 3):
         from tools.bridge_tp.migration_receivers import warm_channels as warm
 
         return warm(plan, pc.preconnect_receipts, timeout_s)
@@ -216,19 +216,30 @@ def assess(plan, proof, expected_requests):
         s["state"] == "COMMITTED" and s.get("source_release") for s in proof["sessions"]
     )
     required = (set(plan["instances"]["legacy_pool_aliases"]) == {"tp1", "tp4"}
-                and plan.get("receiver_stage") != 2)
+                and plan.get("receiver_stage") not in (2, 3))
     receiver_targets = {row.get("target_instance") for row in proof["sessions"]}
     if plan.get("receiver_stage") == 2:
         allowed = plan["instances"]["legacy_pool_aliases"]["tp4"]
         if receiver_targets - {allowed}:
             raise ValueError("stage 2 executed migration outside B")
+    elif plan.get("receiver_stage") == 3:
+        allowed = set(plan["migration_plan"]["execution_targets"])
+        if receiver_targets - allowed:
+            raise ValueError("migration executed outside the allowed receivers")
     return dict(
         passed=complete and observed and (migrated or not required),
         all_instances_active=observed,
         requests_complete=complete,
         migration_required=required,
         committed_migration_observed=migrated,
-        migration_target="B only; A/B preconnected" if plan.get("receiver_stage") == 2
-        else "B only; multi-target stage not implemented",
+        migration_target=(
+            "B only; A/B preconnected"
+            if plan.get("receiver_stage") == 2
+            else "chosen per migration among "
+            + ",".join(plan["migration_plan"]["execution_targets"])
+            if plan.get("receiver_stage") == 3
+            else "B only; multi-target stage not implemented"
+        ),
+        migration_targets_used=sorted(receiver_targets - {None}),
         performance_validated=False,
     )
