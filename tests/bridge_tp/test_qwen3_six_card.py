@@ -148,6 +148,27 @@ class TwoSlotCountTests(unittest.TestCase):
         self.assertEqual(counts, [3, 10, 18, 17])
         self.assertLess(max(j["at_s"] for j in jobs), 1080)
 
+    def test_the_two_step_load_drops_r4_and_keeps_the_ramp_prefix(self):
+        from tools.bridge_tp import qwen3_phase_shift as phase
+
+        path = "experiments/platforms/qwen3_pressure_observation/inputs.json"
+        inputs = json.loads(Path(path).read_text(encoding="utf-8"))
+        jobs = phase.jobs(inputs, "mixed_long_steps")
+        self.assertEqual(jobs, phase.jobs(inputs, "mixed_long_steps"))
+        ramp = phase.jobs(inputs, "mixed_long_ramp")
+
+        def window(rows, end):
+            return [(j["at_s"], j["workload_role"]) for j in rows if j["at_s"] < end]
+
+        # Same arrivals as the ramp up to 540s: warm, r1 and r2's 240s.
+        self.assertEqual(window(jobs, 540), window(ramp, 540))
+        long = [j for j in jobs if j["workload_role"] == "long_input_output"]
+        phases = ("r1", "s2", "s3")
+        counts = [sum(j["workload_phase"] == p for j in long) for p in phases]
+        self.assertEqual(counts, [3, 14, 19])
+        self.assertFalse(any(j["workload_phase"] == "r4" for j in jobs))
+        self.assertLess(max(j["at_s"] for j in jobs), 1080)
+
 
 class SixCardTests(unittest.TestCase):
     def test_all_layouts_cover_six_gpus_once_and_ports_are_unique(self):

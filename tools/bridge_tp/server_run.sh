@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# 当前任务：多目标阶段3第4批，单场限制迁往A（--force-migration-target A，只缩小可选目标，
-# 不改触发与安全检查、不强制START）；负载完整mixed_long_ramp（用户11-07改选：long_output太轻、零迁移）。先验证功能，不作性能结论。
-# 11-07重跑：上一场141246在首次START迁A时源引擎崩溃（arm_shadow丢失target_instance），本次为修复后同场重跑。
+# 当前任务：多目标阶段4第1场，--migration-targets all（A/B按现有满度规则自由选择；用户11-07定排序保持(a)），
+# 负载mixed_long_steps（去掉r4过载段的两档长请求）。只迁入单一目标记覆盖不足；handoff只记录不卡门槛。先验证功能，不作性能结论。
 scenes='L2C:16:unified'
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
@@ -36,11 +35,10 @@ printf '%s\n' "$revision" > "$run/revision.txt"
 echo "本批目录：$run"
 echo "统一调度：场次 $scenes（布局:TP2槽位:调度方式）；A={2,3}、B={0,1}、C={4,5}；TP1槽位16。"
 echo '统一调度：准入=引擎排队≤8且提示放得下（保护125块）；选实例=满度最低（槽位、KV、平滑后token间隔均值÷32ms取最大）；迁移=KV≥90%或约8秒耗尽立即迁，满度≥0.9持续10秒且高出目标0.3才按压力迁；挑请求沿用旧调度评估，目标空间扣除待预填充提示与125块保护。'
-echo '本场是修复后重跑：上一场首次迁A时arm_shadow覆盖control丢失target_instance致源引擎崩溃，已修复并补CPU回归。'
-echo '阶段3：A/B各自会话组、机制目录和stager；两个TP1均预连A/B；本场只允许迁往A；源入口在会话轮换后才改指。'
-echo '负载mixed_long_ramp（种子6）：0–60秒短4/s；60–1020秒短8/s，16384/8192深长每240秒一档0.02/0.04/0.06/0.08/s（3/10/18/17条）；1020–1080秒短1/s；8045请求、1416832输出token。'
+echo '阶段4：A/B各自会话组、机制目录和stager；两个TP1均预连A/B；每次迁移按满度最低选A或B（选不出请求再试另一个）；源入口在会话结算后才改指。'
+echo '负载mixed_long_steps（种子6）：0–60秒短4/s；60–1020秒短8/s，16384/8192深长60–300秒0.02/s、300–660秒0.04/s、660–1020秒0.05/s（3/14/19条）；1020–1080秒短1/s；7936请求、1306112输出token。无r4；前540秒到达与mixed_long_ramp相同。'
 echo '双32768/.88、guard125、hold-queue；L2C沿用kv-short-exempt/overload-migrate/migrate-current-length。'
-echo '不降阈值、不强制START、不转换、不训练；零迁往A记覆盖不足（退出码2）；技术故障/请求或清理不完整即停，不自动重试。'
+echo '不降阈值、不强制START、不转换、不训练；A、B没有都提交过迁移记覆盖不足（退出码2）；handoff只记录；技术故障/请求或清理不完整即停，不自动重试。'
 echo '约25–30分钟含启动/收尾/打包；不删除服务器结果。'
 printf 'scene\trunner_exit\tbatch_exit\n' > "$run/scenes.tsv"
 pack_result() {
@@ -90,7 +88,7 @@ if [ "$status" != 0 ]; then
     pack_result "$status" || exit 1
     exit "$status"
 fi
-echo '[CPU前置] 通过（含本地权限受限的链接测试，Linux不允许跳过）；准备单场限制迁A冒烟。'
+echo '[CPU前置] 通过（含本地权限受限的链接测试，Linux不允许跳过）；准备阶段4单场all。'
 echo '[预编译] 数据盘短临时路径；最多4个编译进程。'
 "$py" -m compileall -q -j 4 "$repo/vllm" "$repo/tools" > "$run/compileall.log" 2>&1 || {
     echo '[预编译] 失败，尚未启动GPU服务；请拿回诊断包。'
@@ -126,8 +124,8 @@ for scene in $scenes; do
     echo "[场次] $name 开始"
     "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
         --cards 6 --static-layout "$layout" --tp2-max-num-seqs "$slots" --scheduler "$scheduler" \
-        --phase-shift --phase-scenario mixed_long_ramp \
-        --migration-targets all --force-migration-target A \
+        --phase-shift --phase-scenario mixed_long_steps \
+        --migration-targets all \
         "${options[@]}" --expanded-context --current-machine --repetitions 1 \
         --model "$model" \
         --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
@@ -171,46 +169,59 @@ assert plan["stage"] == "AB_RECEIVERS_ALL"
 targets = {r["bundle"]: r for r in plan["migration_targets"]}
 assert set(targets) == {"A", "B"}
 a_id, b_id = targets["A"]["instance_id"], targets["B"]["instance_id"]
-assert plan["forced_target"] == a_id and plan["execution_targets"] == [a_id]
+assert plan["forced_target"] is None
+assert set(plan["execution_targets"]) == {a_id, b_id}
 _, initial = unique("six_card_initial_receipt.json")
 assert len(initial["channels"]) == 12, "four-pair warmup proof missing"
 _, startup = unique("receiver_startup.json")
 assert startup["source_target_pairs"] == 4
 _, acceptance = unique("six_card_acceptance.json")
 assert acceptance["passed"], "acceptance failed"
-assert set(acceptance["migration_targets_used"]) <= {a_id}, "migrated outside A"
+assert set(acceptance["migration_targets_used"]) <= {a_id, b_id}
 controller = next(root.rglob("pressure_request_results.json")).parent
 requests = json.loads((controller / "pressure_request_results.json").read_text())
-assert len(requests) == 8045
-assert sum(len(r["response"]["emitted"]) for r in requests) == 1416832
+from tools.bridge_tp import qwen3_phase_shift as phase
+
+inputs = json.loads(Path(
+    "experiments/platforms/qwen3_pressure_observation/inputs.json").read_text())
+planned = phase.jobs(inputs, "mixed_long_steps")
+assert len(requests) == len(planned) == 7936
+tokens = sum(len(r["response"]["emitted"]) for r in requests)
+assert tokens == sum(j["request"]["max_tokens"] for j in planned) == 1306112
 for target in targets.values():
     target_root = Path(target["mechanism_root"])
     assert (target_root / "migration_active_final.json").is_file()
     assert not (target_root / "migration_active").is_symlink()
-assert not list(
-    (Path(targets["B"]["mechanism_root"]) / "sessions").glob("*/session_manifest.json")
-), "B started a migration although only A was allowed"
 assert not list((controller / "source_active").glob("*")), "source links retained"
 audit = [json.loads(line) for line in (controller / "pressure_audit.jsonl").open()]
 switches = [r for r in audit if r.get("kind") == "source_entry_switched"]
-assert all(r["target_instance"] == a_id for r in switches)
-a_sessions = sorted((Path(targets["A"]["mechanism_root"]) / "sessions").iterdir())
-states = {}
-for session in a_sessions:
-    state = session / "takeover_state.json"
-    states[session.name] = json.loads(state.read_text()).get("state") if state.is_file() else None
-committed = [k for k, v in states.items() if v == "COMMITTED"]
-released = [
-    k for k in committed
-    if json.loads((Path(targets["A"]["mechanism_root"]) / "sessions" / k
-                   / "source_kv_release_receipt.json").read_text()).get("status")
-    == "SOURCE_KV_RELEASED"
-]
-idle = [
-    k for k in committed
-    if (Path(targets["A"]["mechanism_root"]) / "sessions" / k
-        / "channel_idle_verified.json").is_file()
-]
+assert all(r["target_instance"] in (a_id, b_id) for r in switches)
+by_server = {r["server_id"]: r for r in requests if r["server_id"]}
+per_target, handoffs = {}, []
+for bundle, target in sorted(targets.items()):
+    sessions = Path(target["mechanism_root"]) / "sessions"
+    states, committed, released, idle = {}, [], [], []
+    for session in sorted(p for p in sessions.iterdir() if p.is_dir()):
+        state = session / "takeover_state.json"
+        value = json.loads(state.read_text()) if state.is_file() else {}
+        states[session.name] = value.get("state")
+        if value.get("state") != "COMMITTED":
+            continue
+        committed.append(session.name)
+        receipt = session / "source_kv_release_receipt.json"
+        if receipt.is_file() and json.loads(receipt.read_text()).get(
+                "status") == "SOURCE_KV_RELEASED":
+            released.append(session.name)
+        if (session / "channel_idle_verified.json").is_file():
+            idle.append(session.name)
+        row = by_server.get(value.get("source_request_id"))
+        if row is not None:
+            handoffs.append(dict(target=bundle, session=session.name,
+                                 handoff_s=row["response"].get("handoff_stall_s")))
+    per_target[bundle] = dict(
+        instance=target["instance_id"], session_states=states,
+        committed=len(committed), source_released=len(released),
+        channel_idle_verified=len(idle))
 
 # Serving flags must match. Identity paths and channel/notification ports differ.
 from tools.bridge_tp.migration_receivers import normalized_receiver_command as normalized
@@ -218,22 +229,28 @@ from tools.bridge_tp.migration_receivers import normalized_receiver_command as n
 assert normalized(argv["target_argv"], targets["B"]) == normalized(
     argv["extra_argv"][a_id], targets["A"]
 ), "A/B effective serving arguments differ beyond identities/ports"
+complete = all(v["committed"] == v["source_released"] == v["channel_idle_verified"]
+               for v in per_target.values())
+both = all(v["committed"] for v in per_target.values())
 summary = dict(
-    four_pairs_warm=True, requests=8045, output_tokens=1416832,
-    receiver_flags_match=True, entry_switches=len(switches),
-    a_session_states=states, a_committed=len(committed),
-    a_source_released=len(released), a_channel_idle_verified=len(idle),
-    reuse_observed=len(committed) >= 2,
+    four_pairs_warm=True, requests=len(requests), output_tokens=tokens,
+    receiver_flags_match=True, per_target=per_target,
+    entry_switches=[(r["source_instance"], r["target_instance"]) for r in switches],
+    both_targets_committed=both, release_and_idle_complete=complete,
+    handoffs=handoffs,
+    handoff_over_1s=sum((h["handoff_s"] or 0) > 1 for h in handoffs),
     startup_span_s=startup["all_stagers_ready_unix_s"] - startup["started_unix_s"],
 )
-(root / "force_a_check.json").write_text(json.dumps(summary, indent=2))
+(root / "multi_target_all_check.json").write_text(json.dumps(summary, indent=2))
 print(json.dumps(summary))
-# Zero committed migrations to A is coverage, not a technical failure.
-sys.exit(0 if committed and len(released) == len(committed) else 3)
+# A commit without its release/idle proof is a failure; one target only is coverage.
+if not complete:
+    sys.exit(1)
+sys.exit(0 if both else 3)
 PY
         check=$?
         if [ "$check" = 3 ]; then
-            echo "[核对] 没有提交到A的迁移或源释放不全：记覆盖不足。"
+            echo "[核对] A、B未都提交过迁移：记覆盖不足。"
             [ "$status" = 0 ] && status=2
         elif [ "$check" != 0 ]; then
             status=1

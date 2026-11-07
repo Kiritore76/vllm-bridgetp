@@ -273,6 +273,21 @@ SCENARIOS["mixed_long_ramp_r3"] = dict(
     SCENARIOS["mixed_long_ramp"],
     phases=SCENARIOS["mixed_long_ramp"]["phases"][:4] + ((780, 840, 1.0, 0.0, "tail"),),
 )
+# Multi-target stage 4 (user 11-07): the ramp without its overloaded 0.08/s step,
+# two longer steps instead so TP1 sources trigger KV moves while TP2 targets can
+# still serve. Seed 6 is kept (chosen before any run of this load): r1 equals the
+# ramp's r1 and the first 240s of s2 equal its r2; long counts are 3/14/19.
+SCENARIOS["mixed_long_steps"] = dict(
+    phases=(
+        (0, 60, 4.0, 0.0, "warm"),
+        (60, 300, 8.0, 0.02, "r1"),
+        (300, 660, 8.0, 0.04, "s2"),
+        (660, 1020, 8.0, 0.05, "s3"),
+        (1020, 1080, 1.0, 0.0, "tail"),
+    ),
+    long=(16384, 8192),
+    arrival_seed=6,
+)
 PHASES = SCENARIOS["phase_shift"]["phases"]
 LONG_PROMPT, LONG_OUTPUT = SCENARIOS["phase_shift"]["long"]
 
