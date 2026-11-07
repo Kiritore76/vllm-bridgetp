@@ -682,7 +682,11 @@ class ConversionTests(unittest.TestCase):
         """L1A -> L0: bundle B TP2(0,1) -> TP1@0 + TP1@1 while serving."""
         with tempfile.TemporaryDirectory() as directory:
             harness = Harness(Path(directory), "B", "TP1", slow={"target"})
-            outcome = harness.run(jobs(16, 0.3, busy="tp4"))
+            # Arrivals must outlast the drain (slow target) plus the new
+            # instances' inventory join: with 16 (last at 4.5s) the join was
+            # sometimes later and nothing could reach them (1 of 24 runs at
+            # 5aa292e7a, 4 of 24 at 3fa7018a7; Linux gate 11-07).
+            outcome = harness.run(jobs(30, 0.3, busy="tp4"))
             self.check_common(harness, outcome, ["B-g2-tp2"], ["B-g4-tp1", "B-g5-tp1"])
             # No channel plan: retiring the target closes nothing on a target.
             retire = next(e for e in harness.events if e["kind"] == "CHANNEL_RETIRE")
