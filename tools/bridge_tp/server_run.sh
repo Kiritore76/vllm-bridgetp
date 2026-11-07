@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# 当前任务：统一调度KV迁移的目标检查扣除待预填充提示并保留125块（用户11-06），其余同均值口径32ms，L2C:16一场。
-# 负载只跑长请求递增的前三档（mixed_long_ramp_r3）：各档起点与种子不变，到达与此前L2C-16两场逐条相同，可直接对比r1–r3。
-# 对照：旧调度qwen3_six_longcap_20261106_153723_9226的L2C-s16，统一调度中位数35ms qwen3_unified_20261106_205522_4987、28ms qwen3_unified_20261106_215240_27223、均值32ms qwen3_unified_20261106_225746_28385。
+# 当前任务：多目标阶段2，A/B接收端、四对预连，控制器仍只迁往B。
+# 仅一场L2C短背景/六条深长请求；先验证能力与隔离，不作性能收益结论。
 scenes='L2C:16:unified'
-scenario=mixed_long_ramp_r3
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
@@ -29,7 +27,7 @@ revision=$(git rev-parse HEAD)
 [ "$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)" = 6 ] || { echo '需要六张GPU。'; exit 1; }
 [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || { echo 'GPU有计算进程，停止；未清理任何进程。'; exit 1; }
 mkdir -p /root/autodl-tmp/bridgetp/results || exit 1
-run=/root/autodl-tmp/bridgetp/results/qwen3_unified_$(date +%Y%m%d_%H%M%S)_${RANDOM}
+run=/root/autodl-tmp/bridgetp/results/qwen3_receiver_ab_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 avail=$(df --output=avail -k "$run" | tail -1)
 [ "$avail" -ge 16777216 ] || { echo '磁盘可用不足16GB。'; exit 1; }
@@ -37,10 +35,11 @@ printf '%s\n' "$revision" > "$run/revision.txt"
 echo "本批目录：$run"
 echo "统一调度：场次 $scenes（布局:TP2槽位:调度方式）；A={2,3}、B={0,1}、C={4,5}；TP1槽位16。"
 echo '统一调度：准入=引擎排队≤8且提示放得下（保护125块）；选实例=满度最低（槽位、KV、平滑后token间隔均值÷32ms取最大）；迁移=KV≥90%或约8秒耗尽立即迁，满度≥0.9持续10秒且高出目标0.3才按压力迁；挑请求沿用旧调度评估，目标空间扣除待预填充提示与125块保护，目标仍只有B。'
-echo '负载：预热60秒短4/s；60–780秒短8/s，深长16384/8192每240秒一档0.02/0.04/0.06/s（3/10/18条）；收尾60秒短1/s；种子6。'
+echo '阶段2：A/B各自机制目录和stager；两个TP1均预连A/B，4对通道共12份预热回执；只允许迁往B。'
+echo '负载：300秒内150条512/128短请求，90秒起每2秒一条16384/8192长请求，共6条；156请求、68352输出token。'
 echo '双32768/.88、guard125、hold-queue；L2C沿用kv-short-exempt/overload-migrate/migrate-current-length，仍只迁向B。'
-echo '不转换、不训练；旧调度代码保留在开关后面；性能负结果和零迁移保留；技术故障/请求或清理不完整即停，不自动重试。'
-echo '约18–25分钟含启动/收尾/打包；不删除服务器结果。'
+echo '不强制迁移、不转换、不训练；阶段2允许零迁移（不算传输验证）；技术故障/请求或清理不完整即停，不自动重试。'
+echo '约10–15分钟含启动/收尾/打包；记录启动跨度，单场不能直接声称启动时间增量；不删除服务器结果。'
 printf 'scene\trunner_exit\tbatch_exit\n' > "$run/scenes.tsv"
 pack_result() {
     local status=$1
@@ -70,7 +69,9 @@ printf '%s\n' "$task_tmp" > "$run/temporary_directory.txt"
 export TMPDIR="$task_tmp" TEMP="$task_tmp" TMP="$task_tmp"
 echo '[CPU前置] 运行本次相关的回归检查（含统一调度各项）；不执行GPU计算。'
 # 与本地CPU检查相同，导入源码控制逻辑，避免执行vLLM顶层的GPU平台探测。
-"$py" -B -c 'import sys,types,unittest; from pathlib import Path; p=types.ModuleType("vllm"); p.__path__=[str(Path.cwd()/"vllm")]; sys.modules["vllm"]=p; s=unittest.defaultTestLoader.loadTestsFromNames(sys.argv[1:]); r=unittest.TextTestRunner(verbosity=2).run(s); raise SystemExit(not r.wasSuccessful())' \
+"$py" -B -c 'import sys,types,unittest; from pathlib import Path; p=types.ModuleType("vllm"); p.__path__=[str(Path.cwd()/"vllm")]; sys.modules["vllm"]=p; s=unittest.defaultTestLoader.loadTestsFromNames(sys.argv[1:]); r=unittest.TextTestRunner(verbosity=2).run(s); raise SystemExit(not r.wasSuccessful() or bool(r.skipped))' \
+    tests.bridge_tp.test_migration_receivers tests.bridge_tp.test_migration_plan \
+    tests.bridge_tp.test_runtime_instance_ids tests.bridge_tp.test_pressure_conversion \
     tests.bridge_tp.test_qwen3_six_card tests.bridge_tp.test_static_layout \
     tests.bridge_tp.test_pressure_launcher tests.bridge_tp.test_pressure_multi \
     tests.bridge_tp.test_gpu_direct_targets tests.bridge_tp.test_source_channels \
@@ -85,7 +86,7 @@ if [ "$status" != 0 ]; then
     pack_result "$status" || exit 1
     exit "$status"
 fi
-echo '[CPU前置] 通过；准备长请求容量场次。'
+echo '[CPU前置] 通过（含本地权限受限的链接测试，Linux不允许跳过）；准备单场接收端冒烟。'
 echo '[预编译] 数据盘短临时路径；最多4个编译进程。'
 "$py" -m compileall -q -j 4 "$repo/vllm" "$repo/tools" > "$run/compileall.log" 2>&1 || {
     echo '[预编译] 失败，尚未启动GPU服务；请拿回诊断包。'
@@ -121,7 +122,7 @@ for scene in $scenes; do
     echo "[场次] $name 开始"
     "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
         --cards 6 --static-layout "$layout" --tp2-max-num-seqs "$slots" --scheduler "$scheduler" \
-        --phase-shift --phase-scenario "$scenario" \
+        --long-burst-pair --migration-targets B \
         "${options[@]}" --expanded-context --current-machine --repetitions 1 \
         --model "$model" \
         --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
@@ -154,6 +155,52 @@ tp1 = {k: v for k, v in slots.items() if k == "source" or "tp1" in k}
 print(json.dumps(dict(tp2=tp2, tp1=tp1)))
 assert tp2 and set(tp2.values()) == {wanted}, "TP2 slots differ from the request"
 assert set(tp1.values()) <= {"16"}, "TP1 slots changed"
+
+def unique(name):
+    paths = list(root.rglob(name))
+    assert len(paths) == 1, (name, paths)
+    return paths[0], json.loads(paths[0].read_text())
+
+_, plan = unique("migration_plan.json")
+assert plan["stage"] == "AB_RECEIVERS_B_ONLY"
+targets = {r["bundle"]: r for r in plan["migration_targets"]}
+assert set(targets) == {"A", "B"}
+assert plan["execution_targets"] == [targets["B"]["instance_id"]]
+_, initial = unique("six_card_initial_receipt.json")
+assert len(initial["channels"]) == 12, "four-pair warmup proof missing"
+_, startup = unique("receiver_startup.json")
+assert startup["source_target_pairs"] == 4
+_, acceptance = unique("six_card_acceptance.json")
+assert acceptance["passed"] and not acceptance["migration_required"]
+assert acceptance["migration_target"] == "B only; A/B preconnected"
+controller = next(root.rglob("pressure_request_results.json")).parent
+requests = json.loads((controller / "pressure_request_results.json").read_text())
+assert len(requests) == 156
+assert sum(len(r["response"]["emitted"]) for r in requests) == 68352
+for target in targets.values():
+    target_root = Path(target["mechanism_root"])
+    assert (target_root / "migration_active_final.json").is_file()
+    assert not (target_root / "migration_active").is_symlink()
+    if target["bundle"] == "A":
+        assert not list((target_root / "sessions").glob("*/session_manifest.json")), \
+            "A unexpectedly started a migration"
+assert not list((controller / "source_active").glob("*")), "source links retained"
+
+# Serving flags must match. Identity paths and channel/notification ports differ.
+from tools.bridge_tp.migration_receivers import normalized_receiver_command as normalized
+
+assert normalized(argv["target_argv"], targets["B"]) == normalized(
+    argv["extra_argv"][targets["A"]["instance_id"]], targets["A"]
+), "A/B effective serving arguments differ beyond identities/ports"
+summary = dict(
+    four_pairs_warm=True, zero_migration_to_A=True, requests=156,
+    output_tokens=68352, receiver_flags_match=True,
+    startup_span_s=startup["all_stagers_ready_unix_s"] - startup["started_unix_s"],
+    startup_increment_s=None,
+    note="startup increment needs a comparable baseline; zero B migration is allowed",
+)
+(root / "receiver_stage2_check.json").write_text(json.dumps(summary, indent=2))
+print(json.dumps(summary))
 PY
         cat "$run/$name.slots_check.log"
     fi

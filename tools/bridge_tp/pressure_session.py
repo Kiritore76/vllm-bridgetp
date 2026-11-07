@@ -290,6 +290,8 @@ class RollingPressureSession:
             migration_id=self.migration_id,
             source_request_id_prefix=candidate.request_id,
             target_request_admitted=False,
+            **({"target_instance": self.target_instance}
+               if getattr(self.config, "target_scoped_receivers", False) else {}),
             note="pressure selected existing request",
         ).write(self.run_dir)
         rate = self._rate_decision(snapshot, before_start=True)

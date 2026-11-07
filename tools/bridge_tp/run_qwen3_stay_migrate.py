@@ -136,7 +136,12 @@ def serving_preflight(plans):
             parsed = make_arg_parser(FlexibleArgumentParser()).parse_args(argv[3:])
             validate_parsed_serve_args(parsed)
         if not started:
-            phase8_stager.parse_args(plan["stager_argv"][2:])
+            stagers = (
+                [t["stager_argv"] for t in plan["migration_targets"]]
+                if plan.get("receiver_stage") == 2 else [plan["stager_argv"]]
+            )
+            for stager in stagers:
+                phase8_stager.parse_args(stager[2:])
         parsed = pilot.controller.parse_args(
             plan["controller_argv"][2:] + ["--validate-only"]
         )
@@ -173,6 +178,12 @@ def closed_loop_proof(plan, arm):
             state=state.get("state"),
             settled=session["settled"],
         )
+        if plan.get("receiver_stage") == 2:
+            targets = [t for t in plan["migration_targets"]
+                       if run_dir.parent == Path(t["mechanism_root"]) / "sessions"]
+            if len(targets) != 1 or not targets[0]["execution_allowed"]:
+                raise ValueError("stage 2 session is not in the B receiver root")
+            row["target_instance"] = targets[0]["instance_id"]
         if state.get("state") == "COMMITTED":
             release = read(run_dir / "source_kv_release_receipt.json")
             if (
@@ -325,6 +336,8 @@ def main(argv=None):
         default="pressure",
         help="controller scheduling; unified is the 11-06 rule set, static only",
     )
+    parser.add_argument("--migration-targets", choices=("B",),
+                        help="stage 2: warm A/B receivers, execute only to B")
     parser.add_argument(
         "--static-layout",
         choices=("L0", "L1A", "L2", "L1AC", "L2C", "L3"),
@@ -423,6 +436,10 @@ def main(argv=None):
     ):
         parser.error("the unified scheduler runs static layouts with --hold-queue")
     mixed_layout = args.static_layout in (six.MIXED if args.cards == 6 else ("L1A",))
+    if args.migration_targets and not (
+        args.cards == 6 and args.scheduler == "unified" and args.static_layout == "L2C"
+    ):
+        parser.error("--migration-targets B requires six-card unified L2C")
     if args.layout_l1a_channels and not args.long_burst_memory_verify:
         parser.error("layout-l1a-channels runs with long-burst-memory-verify only")
     joined = bool(
@@ -1059,6 +1076,10 @@ def main(argv=None):
 
             install(plan)
             activate_instance_ids(plan)
+            if args.migration_targets:
+                from tools.bridge_tp.migration_receivers import configure
+
+                configure(plan)
         serving_preflight(plans)
         for recipe, arm, scene, plan in plans:
             if not gpu_idle():

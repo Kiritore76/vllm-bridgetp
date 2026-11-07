@@ -61,6 +61,8 @@ def parse_args(argv=None):
     parser.add_argument("--health-reference", type=Path)
     parser.add_argument("--arrivals", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--mechanism-root", type=Path)
+    parser.add_argument("--migration-targets", choices=("B",))
     parser.add_argument("--source-inventory", type=Path, required=True)
     parser.add_argument("--target-inventory", type=Path, required=True)
     parser.add_argument("--source-context-limit", type=int, default=8192)
@@ -234,6 +236,7 @@ def preflight(args):
         ready_notification_port=raw.get("ready_notification_port", 0),
         source_pool_id=raw.get("source_pool_id", "tp1"),
         target_pool_id=raw.get("target_pool_id", "tp4"),
+        target_scoped_receivers=raw.get("target_scoped_receivers", False),
     )
     validate_guard_geometry(cfg, controller, getattr(args, "platform", "a100"))
     if controller.transfer_mode not in {"FULL_SPEED", "ADAPTIVE"}:
@@ -267,6 +270,19 @@ def preflight(args):
     if not isinstance(jobs, list) or not jobs:
         raise ValueError("arrivals must be a nonempty list")
     manifest = instance_manifest(args, controller)
+    mechanism_root = getattr(args, "mechanism_root", None)
+    if mechanism_root is not None:
+        if not (
+            manifest and manifest.get("runtime_pool_ids")
+            and getattr(args, "migration_targets", None) == "B"
+            and controller.target_scoped_receivers
+            and mechanism_root.resolve() == (
+                args.run_dir / "migration" / manifest["legacy_pool_aliases"]["tp4"]
+            ).resolve()
+        ):
+            raise ValueError("mechanism root must be the owned B receiver")
+    elif getattr(args, "migration_targets", None):
+        raise ValueError("receiver selection requires its owned mechanism root")
     pair = pair_pools(manifest)
     pool_names = {"tp1": "tp1", "tp4": "tp4"} | (
         manifest.get("runtime_pool_ids", {}) if manifest else {}
@@ -825,7 +841,7 @@ def _run(args, prepared):
     session = PressureSessions(
         persistent_cleanup=cfg.shadow_cancel,
         maximum_migrations=args.maximum_migrations,
-        run_dir=args.run_dir,
+        run_dir=getattr(args, "mechanism_root", None) or args.run_dir,
         migration_id=args.migration_id,
         config=controller,
         coordinator=co,

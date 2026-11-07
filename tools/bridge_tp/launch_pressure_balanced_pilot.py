@@ -724,6 +724,8 @@ def extra_engine(plan, extra):
     Same serving flags as the pair engine of its TP class (whatever the runner
     appended), without the migration connector or any source publisher.
     """
+    if "receiver_argv" in extra:
+        return list(extra["receiver_argv"]), dict(extra["receiver_env"])
     template = plan["source_argv"] if extra["tp"] == 1 else plan["target_argv"]
     argv = list(template)
     if "--kv-transfer-config" in argv:
@@ -735,6 +737,9 @@ def extra_engine(plan, extra):
         # A second migration source: the pair source's publisher environment
         # with its own channel, predictor journal, inventory and trace.
         env = dict(plan["source_env"])
+        if extra.get("source_active"):
+            env.update(BRIDGETP_STREAM_RUN_DIR=extra["source_active"],
+                       BRIDGETP_TAKEOVER_RUN_DIR=extra["source_active"])
         env.update(
             BRIDGETP_GPU_DIRECT_BASE_PORT=str(channel["base_port"]),
             BRIDGETP_CHANNEL_GENERATION=str(channel["generation"]),
@@ -791,7 +796,7 @@ def write_instances(plan):
         path.write_text(json.dumps(plan["instances"], indent=2) + "\n", "utf-8")
 
 
-def verify_full_speed(run_dir):
+def verify_full_speed(run_dir, session_roots=None):
     """Validate actual controls and history receipts, not only launch intent."""
     starts = 0
     with (run_dir / "pressure_audit.jsonl").open(encoding="utf-8") as stream:
@@ -806,16 +811,19 @@ def verify_full_speed(run_dir):
                 continue
             if rate["profile"] != "FULL_SPEED" or rate["rate_bytes_s"] != 0:
                 raise RuntimeError("full-speed run published a rate limit")
-    controls = list(run_dir.glob("sessions/*/runtime_control.json"))
-    controls += list(run_dir.glob("runtime_control.json"))
+    roots = session_roots or [run_dir]
+    controls = [path for root in roots for pattern in (
+        "sessions/*/runtime_control.json", "runtime_control.json"
+    ) for path in root.glob(pattern)]
     for path in controls:
         if read(path).get("rate_gib_s") not in (None, 0):
             raise RuntimeError("full-speed runtime control contains a rate limit")
     # One receipt per source rank (gpu_direct_sender_rank_N.json on the same TP).
     senders = []
     for name in ("gpu_direct_sender.json", "gpu_direct_sender_rank_*.json"):
-        senders += list(run_dir.glob(f"sessions/*/{name}"))
-        senders += list(run_dir.glob(name))
+        for root in roots:
+            senders += list(root.glob(f"sessions/*/{name}"))
+            senders += list(root.glob(name))
     ranks = 0
     for path in senders:
         for rank in read(path)["ranks"]:
@@ -1153,6 +1161,7 @@ def run_scene(
     from tools.bridge_tp.run_phase9_controller import RuntimeControl
 
     root, processes = plan["run_dir"].parent, []
+    startup_started = time.time()
     monitor = driver = None
 
     def publish_processes():
@@ -1169,7 +1178,11 @@ def run_scene(
     plan["run_dir"].mkdir(parents=True, exist_ok=False)
     mechanism_dir = plan["run_dir"]
     multiple = "--maximum-migrations" in plan["controller_argv"]
-    if multiple:
+    if plan.get("receiver_stage") == 2:
+        from tools.bridge_tp.migration_receivers import initialize
+
+        mechanism_dir = initialize(plan)
+    elif multiple:
         from tools.bridge_tp.pressure_sessions import initialize
 
         mechanism_dir = initialize(plan["run_dir"])
@@ -1269,7 +1282,8 @@ def run_scene(
         extras = []
         for extra in plan.get("extra_engines", ()):
             argv, env = engines[extra["instance_id"]]
-            announce(scene["name"], "启动只路由实例", instance=extra["instance_id"])
+            announce(scene["name"], "启动接收实例" if "receiver_argv" in extra
+                     else "启动只路由实例", instance=extra["instance_id"])
             extras.append(
                 (
                     extra,
@@ -1309,7 +1323,18 @@ def run_scene(
             before_workload(plan)
         # S5b: an L2 that will split sources needs the pair target's stager
         # from the start; an L0 merging a TP2 starts it with that TP2.
-        if absent and not (plan.get("join") and "target" not in absent):
+        receiver_stagers = []
+        if plan.get("receiver_stage") == 2:
+            for target in plan["migration_targets"]:
+                process = common.start_process(
+                    "stager " + target["instance_id"], target["stager_argv"],
+                    os.environ.copy(), root / f"stager_{target['instance_id']}.log",
+                )
+                receiver_stagers.append((target, process))
+                processes.append(process)
+            stager = next(p for t, p in receiver_stagers if t["execution_allowed"])
+            publish_processes()
+        elif absent and not (plan.get("join") and "target" not in absent):
             # Single-class layout: no pair to migrate between, so no stager.
             announce(scene["name"], "warmup完成；单类布局不启动stager；启动正式调度器")
             stager = None
@@ -1323,7 +1348,18 @@ def run_scene(
         if spec.get("require_stager_process_ready") and stager is not None:
             from tools.bridge_tp.qwen3_migration_diagnostics import wait_stager_ready
 
-            wait_stager_ready(mechanism_dir, stager)
+            if receiver_stagers:
+                for target, process in receiver_stagers:
+                    wait_stager_ready(Path(target["mechanism_dir"]), process)
+                common.write_json(root / "receiver_startup.json", dict(
+                    started_unix_s=startup_started,
+                    all_stagers_ready_unix_s=time.time(),
+                    source_target_pairs=sum(
+                        len(t["connector_sources"]) for t, _ in receiver_stagers
+                    ),
+                ))
+            else:
+                wait_stager_ready(mechanism_dir, stager)
         checked = controller.parse_args(
             plan["controller_argv"][2:] + ["--validate-only"]
         )
@@ -1437,7 +1473,11 @@ def run_scene(
         if plan["config"].get("transfer_mode") == "FULL_SPEED":
             common.write_json(
                 plan["run_dir"] / "full_speed_receipt.json",
-                verify_full_speed(plan["run_dir"]),
+                verify_full_speed(
+                    plan["run_dir"],
+                    [Path(t["mechanism_root"]) for t in plan["migration_targets"]]
+                    if plan.get("receiver_stage") == 2 else None,
+                ),
             )
             announce(scene["name"], "全速检查通过：历史pacing关闭，运行时限速为0")
         if before_shutdown is not None:
@@ -1480,7 +1520,11 @@ def run_scene(
             raise RuntimeError(
                 "owned server groups did not terminate; commitments unresolved"
             )
-        if multiple:
+        if plan.get("receiver_stage") == 2:
+            from tools.bridge_tp.migration_receivers import cleanup_links
+
+            cleanup_links(plan, common.write_json)
+        elif multiple:
             active = plan["run_dir"] / "migration_active"
             if active.is_symlink():
                 common.write_json(

@@ -211,7 +211,8 @@ def _start_target_file_follower(base, device, path: Path) -> None:
         _preconnect_one(apply_target(base, target), device, label(target))
 
     def drop(target) -> bool:
-        key = _persistent_sender_key(apply_target(base, target), device)
+        selected = apply_target(base, target)
+        key = _persistent_sender_key(selected, device)
         with _persistent_gpu_senders_lock:
             if key in _active_persistent_gpu_senders:
                 return False
@@ -225,7 +226,7 @@ def _start_target_file_follower(base, device, path: Path) -> None:
                 "channel_generation": target.generation,
                 "completed_unix_s": time.time(),
             },
-            base.run_dir
+            selected.run_dir
             / "gpu_channel_preconnect_receipts"
             / local_role().own_file(f"{label(target)}-retired.json"),
         )
@@ -364,6 +365,7 @@ class BridgeTPStreamConfig:
     # current session uses (from the runtime control block).
     gpu_direct_targets: tuple = ()
     target_instance: str | None = None
+    gpu_direct_mechanism_root: Path | None = None
 
     @classmethod
     def from_env(cls) -> BridgeTPStreamConfig:
@@ -381,6 +383,10 @@ class BridgeTPStreamConfig:
             phase8_enabled=_env_bool("BRIDGETP_PHASE8_ENABLED", False),
             migration_id=migration_id,
             run_dir=Path(run_dir or "/tmp/bridgetp_phase6_disabled").expanduser(),
+            gpu_direct_mechanism_root=(
+                Path(os.environ["BRIDGETP_GPU_DIRECT_MECHANISM_ROOT"])
+                if os.getenv("BRIDGETP_GPU_DIRECT_MECHANISM_ROOT") else None
+            ),
             host=os.getenv("BRIDGETP_STREAM_HOST", "127.0.0.1"),
             base_port=int(os.getenv("BRIDGETP_STREAM_BASE_PORT", "29600")),
             target_tp_size=int(os.getenv("BRIDGETP_STREAM_TARGET_TP", "4")),

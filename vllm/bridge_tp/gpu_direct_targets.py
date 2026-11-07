@@ -2,8 +2,9 @@
 """Several preconnected TP-k targets for one TP1 source (S1-d2a).
 
 ``BRIDGETP_GPU_DIRECT_TARGETS`` lists every target this source keeps a
-persistent channel to, as a JSON list of objects with exactly the keys
+persistent channel to, as a JSON list of objects with required keys
 ``target`` (instance id), ``host``, ``base_port``, ``tp`` and ``generation``.
+An optional ``mechanism_dir`` selects a session below the configured owned root.
 
 Target rank r listens on ``base_port + r``; the sender control socket uses
 ``base_port + tp``, so blocks ``[base_port, base_port + tp]`` must not overlap.
@@ -19,6 +20,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 ENV = "BRIDGETP_GPU_DIRECT_TARGETS"
 _TARGET_ID = re.compile(r"tp[14]|[A-Z]-g[0-9]+-tp[0-9]+")
@@ -31,6 +33,7 @@ class GpuDirectTarget:
     base_port: int
     tp: int
     generation: int
+    mechanism_dir: str | None = None
 
     @property
     def ports(self) -> range:
@@ -45,13 +48,17 @@ def parse_targets(text: str, expected_kv_heads: int) -> tuple[GpuDirectTarget, .
         raise ValueError(f"{ENV} must be a non-empty JSON list")
     targets = []
     for row in rows:
-        if not isinstance(row, dict) or set(row) != {
+        required = {
             "target",
             "host",
             "base_port",
             "tp",
             "generation",
-        }:
+        }
+        if (
+            not isinstance(row, dict)
+            or not required <= set(row) <= required | {"mechanism_dir"}
+        ):
             raise ValueError(f"{ENV} entries need target/host/base_port/tp/generation")
         target = GpuDirectTarget(
             str(row["target"]),
@@ -59,6 +66,7 @@ def parse_targets(text: str, expected_kv_heads: int) -> tuple[GpuDirectTarget, .
             int(row["base_port"]),
             int(row["tp"]),
             int(row["generation"]),
+            row.get("mechanism_dir"),
         )
         if (
             not _TARGET_ID.fullmatch(target.target)
@@ -67,6 +75,10 @@ def parse_targets(text: str, expected_kv_heads: int) -> tuple[GpuDirectTarget, .
             or target.generation < 0
             or not 1024 <= target.base_port <= 65535 - target.tp
             or not target.host
+            or target.mechanism_dir is not None and (
+                not isinstance(target.mechanism_dir, str)
+                or not Path(target.mechanism_dir).is_absolute()
+            )
         ):
             raise ValueError(f"invalid {ENV} entry {row!r}")
         targets.append(target)
@@ -80,6 +92,15 @@ def parse_targets(text: str, expected_kv_heads: int) -> tuple[GpuDirectTarget, .
 
 def apply_target(config, target: GpuDirectTarget):
     """The single-target view of ``config`` for one preconnected target."""
+    directory = {}
+    if target.mechanism_dir is not None:
+        root = getattr(config, "gpu_direct_mechanism_root", None)
+        if root is None:
+            raise ValueError("target directories require an owned mechanism root")
+        selected = Path(target.mechanism_dir).resolve(strict=True)
+        if not selected.is_relative_to(Path(root).resolve(strict=True)):
+            raise ValueError("target mechanism directory escaped its owned root")
+        directory["run_dir"] = selected
     return replace(
         config,
         gpu_direct_host=target.host,
@@ -87,6 +108,7 @@ def apply_target(config, target: GpuDirectTarget):
         target_tp_size=target.tp,
         channel_generation=target.generation,
         target_instance=target.target,
+        **directory,
     )
 
 
