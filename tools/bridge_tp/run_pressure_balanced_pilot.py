@@ -232,6 +232,8 @@ def preflight(args):
         policy=SimpleNamespace(kv_bytes_per_token=raw["policy"]["kv_bytes_per_token"]),
         ready_notification_mode=raw.get("ready_notification_mode", "FILE_POLL"),
         ready_notification_port=raw.get("ready_notification_port", 0),
+        source_pool_id=raw.get("source_pool_id", "tp1"),
+        target_pool_id=raw.get("target_pool_id", "tp4"),
     )
     validate_guard_geometry(cfg, controller, getattr(args, "platform", "a100"))
     if controller.transfer_mode not in {"FULL_SPEED", "ADAPTIVE"}:
@@ -266,6 +268,9 @@ def preflight(args):
         raise ValueError("arrivals must be a nonempty list")
     manifest = instance_manifest(args, controller)
     pair = pair_pools(manifest)
+    pool_names = {"tp1": "tp1", "tp4": "tp4"} | (
+        manifest.get("runtime_pool_ids", {}) if manifest else {}
+    )
     ids = set()
     for job in jobs:
         req = job["request"]
@@ -284,8 +289,8 @@ def preflight(args):
         limits = {
             name: limit
             for name, limit in (
-                ("tp1", args.source_context_limit),
-                ("tp4", args.target_context_limit),
+                (pool_names["tp1"], args.source_context_limit),
+                (pool_names["tp4"], args.target_context_limit),
             )
             if name in pair
         }
@@ -354,11 +359,7 @@ def batch(inventory, now, cfg, reading):
 
 
 def instance_manifest(args, controller):
-    """Fixed migration pair (tp1/tp4 aliases) plus optional routing-only instances.
-
-    Only the aliased pair has a migration channel and session; other instances
-    serve routed requests and never migrate (multi-source channels: S1-d2).
-    """
+    """Validate the pair, extra sources and the opt-in canonical runtime IDs."""
     if args.instances is None:
         return None
     manifest = read(args.instances)
@@ -380,6 +381,22 @@ def instance_manifest(args, controller):
         )
     ):
         raise ValueError("controller needs one TP1 source and one TP-k target pair")
+    runtime_ids = manifest.get("runtime_pool_ids")
+    if runtime_ids is not None and (
+        runtime_ids != aliases
+        or getattr(args, "scheduler", "pressure") != "unified"
+        or len({gpu for row in rows.values() for gpu in row["physical_gpu_ids"]}) != 6
+        or any(
+            getattr(
+                controller, {"tp1": "source_pool_id", "tp4": "target_pool_id"}[k], v
+            )
+            != v
+            for k, v in aliases.items()
+        )
+    ):
+        raise ValueError(
+            "canonical runtime IDs require a matching six-card unified plan"
+        )
     deferred = getattr(args, "deferred_migration", False)
     if len(aliases) == 1 and (
         not (args.no_migration or deferred)
@@ -427,10 +444,14 @@ def acknowledged_blocks(entry, owned_blocks):
 
 
 def pair_pools(manifest):
-    """Historical pool ids of the pair sides this run starts with."""
+    """Pool IDs of present pair sides; canonical when explicitly configured."""
     if manifest is None:
         return ("tp1", "tp4")
-    return tuple(p for p in ("tp1", "tp4") if p in manifest["legacy_pool_aliases"])
+    return tuple(
+        manifest.get("runtime_pool_ids", {}).get(p, p)
+        for p in ("tp1", "tp4")
+        if p in manifest["legacy_pool_aliases"]
+    )
 
 
 # Remaining-output quantiles published per request for the conversion planner.
@@ -575,8 +596,11 @@ def extra_instances(manifest):
     return [r for r in manifest["instances"] if r["instance_id"] not in paired]
 
 
-def unknown_routing_pools(args, block_size, extras=(), pair=("tp1", "tp4")):
+def unknown_routing_pools(
+    args, block_size, extras=(), pair=("tp1", "tp4"), pool_names=None
+):
     """Use configured context contracts while pressure telemetry is absent."""
+    pool_names = pool_names or {"tp1": "tp1", "tp4": "tp4"}
     return tuple(
         p.PoolReading(
             pool_id=name,
@@ -597,8 +621,8 @@ def unknown_routing_pools(args, block_size, extras=(), pair=("tp1", "tp4")):
             *(
                 (name, limit)
                 for name, limit in (
-                    ("tp1", args.source_context_limit),
-                    ("tp4", args.target_context_limit),
+                    (pool_names["tp1"], args.source_context_limit),
+                    (pool_names["tp4"], args.target_context_limit),
                 )
                 if name in pair
             ),
@@ -736,7 +760,13 @@ def _run(args, prepared):
     executor = ThreadPoolExecutor(max_workers=max(4, len(jobs) + 1))
     # Fixed pair through the multi-instance entry points; identical behaviour
     # and records for one instance per TP class.
-    tp_of = {"tp1": 1, "tp4": getattr(controller, "target_tp_size", 4)}
+    manifest = receipt.get("instance_manifest")
+    canonical_ids = bool(manifest and manifest.get("runtime_pool_ids"))
+    pool_names = {"tp1": "tp1", "tp4": "tp4"} | (
+        manifest.get("runtime_pool_ids", {}) if manifest else {}
+    )
+    source_pool, target_pool = pool_names["tp1"], pool_names["tp4"]
+    tp_of = {source_pool: 1, target_pool: getattr(controller, "target_tp_size", 4)}
     # A single-class layout starts with one side of the pair (S3b-2).
     pair = pair_pools(receipt.get("instance_manifest"))
     tp_of = {pool: tp for pool, tp in tp_of.items() if pool in pair}
@@ -770,15 +800,15 @@ def _run(args, prepared):
         **{
             pool: limit
             for pool, limit in (
-                ("tp1", args.source_context_limit),
-                ("tp4", args.target_context_limit),
+                (source_pool, args.source_context_limit),
+                (target_pool, args.target_context_limit),
             )
             if pool in pair
         },
         **{row["instance_id"]: row["context_limit"] for row in extras},
     }
-    for row in extras:
-        service.add_pool(row["instance_id"])
+    for pool in tp_of:
+        service.add_pool(pool)
     ingress = i.PressureIngress(
         co,
         service,
@@ -787,9 +817,10 @@ def _run(args, prepared):
         controller.target_url,
         reconcile_log_interval_s=1.0 if cfg.health_service else 0,
         tp_of=tp_of,
+        **({"pair_ids": pool_names} if canonical_ids else {}),
     )
     ingress.urls.update({row["instance_id"]: row["endpoint"] for row in extras})
-    for pool in {"tp1", "tp4"} - set(pair):
+    for pool in {source_pool, target_pool} - set(pair):
         ingress.urls.pop(pool, None)
     session = PressureSessions(
         persistent_cleanup=cfg.shadow_cancel,
@@ -828,8 +859,8 @@ def _run(args, prepared):
 
     evacuation_sources = []
     # Migration sources: the pair source, then every TP1 with its own channel.
-    migration_sources = [("tp1", args.source_inventory, predictor)] * (
-        "tp1" in pair
+    migration_sources = [(source_pool, args.source_inventory, predictor)] * (
+        source_pool in pair
     ) + [
         (
             row["instance_id"],
@@ -839,9 +870,14 @@ def _run(args, prepared):
         for row in channel_sources(receipt.get("instance_manifest"))
     ]
     manifest = receipt.get("instance_manifest")
-    # Layout instance id of the fixed pair -> historical pool id.
+    # Compatibility boundary: canonical runs keep actual IDs on both sides.
     alias_of = (
-        {v: k for k, v in manifest["legacy_pool_aliases"].items()} if manifest else {}
+        {
+            v: (v if canonical_ids else k)
+            for k, v in manifest["legacy_pool_aliases"].items()
+        }
+        if manifest
+        else {}
     )
     dispatched, previous = {}, {}
     growth_readers = {pool: health.NativeDecodeGrowth() for pool in tp_of}
@@ -858,7 +894,7 @@ def _run(args, prepared):
         else None
     )
     if health_tracker is not None:
-        for row in extras:
+        for row in (manifest["instances"] if canonical_ids else extras):
             health_tracker.add_pool(
                 row["instance_id"], "source" if row["tp_degree"] == 1 else "target"
             )
@@ -930,7 +966,7 @@ def _run(args, prepared):
 
     layout_state = dict(
         signature=None,
-        migration_target="tp4" if "tp4" in pair else None,
+        migration_target=target_pool if target_pool in pair else None,
         revision=None,
         status_at=-math.inf,
         candidates={},
@@ -950,7 +986,17 @@ def _run(args, prepared):
         layout_state["migration_starts"].append((time.time(), source))
         return value
 
-    instance_of = dict(manifest["legacy_pool_aliases"]) if manifest else {}
+    instance_of = (
+        {pool_names[k]: v for k, v in manifest["legacy_pool_aliases"].items()}
+        if manifest
+        else {}
+    )
+    if canonical_ids:
+        co.pool_sort_ids = {v: k for k, v in manifest["legacy_pool_aliases"].items()}
+        audit.write(
+            dict(kind="pressure_runtime_identities", pool_ids=pool_names,
+                 compatibility_sort_ids=co.pool_sort_ids)
+        )
 
     def request_rows(raw):
         rows = []
@@ -1331,8 +1377,8 @@ def _run(args, prepared):
             *(
                 row
                 for row in (
-                    (args.source_inventory, "tp1", controller.source_url, 1),
-                    (args.target_inventory, "tp4", controller.target_url, 2),
+                    (args.source_inventory, source_pool, controller.source_url, 1),
+                    (args.target_inventory, target_pool, controller.target_url, 2),
                 )
                 if row[1] in pair
             ),
@@ -1384,7 +1430,9 @@ def _run(args, prepared):
         dispatcher = load("pressure_dispatch").ScheduledDispatch(
             jobs,
             submit_arrival,
-            unknown_routing_pools(args, controller.block_size, extras, pair),
+            unknown_routing_pools(
+                args, controller.block_size, extras, pair, pool_names
+            ),
             started,
             args.max_seconds,
             hold=load("pressure_hold").HoldQueue(
@@ -1433,7 +1481,9 @@ def _run(args, prepared):
                     )
             if any(polled[p] is None for p, s in slots.items() if s["initial"]):
                 dispatcher.publish(
-                    unknown_routing_pools(args, controller.block_size, extras, pair)
+                    unknown_routing_pools(
+                        args, controller.block_size, extras, pair, pool_names
+                    )
                 )
                 save_progress(
                     progress_path,
@@ -1802,7 +1852,7 @@ def _run(args, prepared):
                     },
                     actions,
                 )
-            session_source = co._session_source.get(session.migration_id, "tp1")
+            session_source = co._session_source.get(session.migration_id, source_pool)
             runtime = runtimes.get(session_source)
             if t is not None and session.record is not None and not session.settled:
                 session.poll_cancel(inventories[t], now, cfg.max_age_s)
@@ -1918,7 +1968,7 @@ def _run(args, prepared):
             layout_state["pressure"] = {
                 pool: asdict(value) for pool, value in by_pool.items()
             }
-            source_p, target_p = by_pool.get("tp1"), by_pool.get(target_pool_id)
+            source_p, target_p = by_pool.get(source_pool), by_pool.get(target_pool_id)
             if time.monotonic() - last_status_at >= 5:
                 last_status_at = time.monotonic()
                 status = dict(

@@ -107,7 +107,7 @@ class RollingPressureSession:
 
         self.old, self.run_dir, self.config = old, run_dir, config
         self.target_url = config.target_url
-        self.target_instance = "tp4"
+        self.target_instance = getattr(config, "target_pool_id", "tp4")
         self.target_epoch = None
         self.coordinator, self.ingress, self.executor = coordinator, ingress, executor
         self.audit, self.request_timeout_s = audit, request_timeout_s

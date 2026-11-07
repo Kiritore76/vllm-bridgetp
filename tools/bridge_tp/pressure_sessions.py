@@ -75,7 +75,9 @@ class PressureSessions:
     @staticmethod
     def _source(session):
         """Source instance of a session; the fixed pair's source when unbound."""
-        return getattr(session, "source_instance", None) or "tp1"
+        return getattr(session, "source_instance", None) or getattr(
+            getattr(session, "config", None), "source_pool_id", "tp1"
+        )
 
     @property
     def ready_for_start(self):

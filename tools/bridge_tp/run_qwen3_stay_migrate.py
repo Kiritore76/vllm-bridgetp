@@ -88,7 +88,12 @@ def prepare_native(plan, common):
     # A single-class layout starts one side of the pair; the absent side keeps
     # the template geometry (no inventory, never routed).
     pools = [p for p in ("source", "target") if p not in pilot.absent_pair(plan)]
-    rows = wait_empty(plan["run_dir"], pools=pools)
+    if plan.get("canonical_instance_ids"):
+        native = six.wait_empty(plan)
+        aliases = plan["instances"]["legacy_pool_aliases"]
+        rows = [native[aliases[{"source": "tp1", "target": "tp4"}[p]]] for p in pools]
+    else:
+        rows = wait_empty(plan["run_dir"], pools=pools)
     by_pool = dict(zip(pools, rows))
     limits = dict(zip(("source", "target"), plan.get("expected_context_limits", ())))
     for pool, row in by_pool.items():
@@ -1050,9 +1055,10 @@ def main(argv=None):
                 )
             if args.kv_priority_verify or args.updated_pressure_four_mode:
                 priority.enable_urgent_target(plan)
-            from tools.bridge_tp.migration_plan import install
+            from tools.bridge_tp.migration_plan import activate_instance_ids, install
 
             install(plan)
+            activate_instance_ids(plan)
         serving_preflight(plans)
         for recipe, arm, scene, plan in plans:
             if not gpu_idle():

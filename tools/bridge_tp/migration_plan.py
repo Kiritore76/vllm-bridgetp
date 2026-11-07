@@ -81,10 +81,13 @@ def describe(plan):
     aliases = plan["instances"]["legacy_pool_aliases"]
     rows = plan["instances"]["instances"]
     inverse = {instance: pool for pool, instance in aliases.items()}
+    canonical_ids = bool(plan["instances"].get("runtime_pool_ids"))
     canonical = [
         dict(
             instance_id=row["instance_id"],
-            runtime_pool_id=inverse.get(row["instance_id"], row["instance_id"]),
+            runtime_pool_id=row["instance_id"]
+            if canonical_ids
+            else inverse.get(row["instance_id"], row["instance_id"]),
             bundle=row["bundle_id"],
             gpus=list(row["physical_gpu_ids"]),
             tp=row["tp_degree"],
@@ -94,18 +97,19 @@ def describe(plan):
         for row in rows
     ]
     for original, row in zip(rows, canonical):
-        pool = row["runtime_pool_id"]
-        side = {"tp1": "source", "tp4": "target"}.get(pool)
+        side = {"tp1": "source", "tp4": "target"}.get(inverse.get(row["instance_id"]))
         row["inventory_path"] = (
-            str(Path(plan["run_dir"]) / f"{side}_inventory.jsonl")
-            if side
-            else original["inventory_path"]
+            original["inventory_path"]
+            if canonical_ids or not side
+            else str(Path(plan["run_dir"]) / f"{side}_inventory.jsonl")
         )
         row["trace_name"] = row["instance_id"]
-        row["runtime_trace_name"] = side or row["instance_id"]
+        row["runtime_trace_name"] = (
+            row["instance_id"] if canonical_ids else side or row["instance_id"]
+        )
     result = dict(
         schema="BRIDGETP_MIGRATION_PLAN_V1",
-        stage="SINGLE_B_COMPATIBILITY",
+        stage="SINGLE_B_INSTANCE_IDS" if canonical_ids else "SINGLE_B_COMPATIBILITY",
         scheduler=plan.get("scheduler", "pressure"),
         instances=canonical,
         migration_sources=[],
@@ -207,3 +211,38 @@ def install(plan):
     plan["migration_plan"] = description
     plan["migration_targets"] = copy.deepcopy(description["migration_targets"])
     plan["migration_sources"] = copy.deepcopy(description["migration_sources"])
+
+
+def activate_instance_ids(plan):
+    """Use actual IDs on the static six-card unified runtime boundary only."""
+    if (
+        plan.get("static_cards") != 6
+        or plan.get("scheduler") != "unified"
+        or "migration_plan" not in plan
+    ):
+        return
+    if plan["instances"].get("runtime_pool_ids"):
+        raise ValueError("instance IDs already activated")
+    aliases = plan["instances"]["legacy_pool_aliases"]
+    plan["instances"]["runtime_pool_ids"] = dict(aliases)
+    plan["canonical_instance_ids"] = True
+    by_id = {row["instance_id"]: row for row in plan["instances"]["instances"]}
+    for side, alias in (("source", "tp1"), ("target", "tp4")):
+        if alias not in aliases:
+            continue
+        instance = aliases[alias]
+        path = str(plan["run_dir"] / f"inventory_{instance}.jsonl")
+        by_id[instance]["inventory_path"] = path
+        env = plan[side + "_env"]
+        env.update(
+            BRIDGETP_PRESSURE_POOL=instance, BRIDGETP_PRESSURE_INVENTORY_PATH=path
+        )
+        if "BRIDGETP_PERFORMANCE_TRACE_DIR" in env:
+            env["BRIDGETP_PERFORMANCE_TRACE_DIR"] = str(
+                plan["run_dir"] / "performance_trace" / instance
+            )
+        argv = plan["controller_argv"]
+        argv[argv.index("--" + side + "-inventory") + 1] = path
+        plan["config"][side + "_pool_id"] = instance
+    # Rebuild the description with the actual filenames and identities.
+    install(plan)

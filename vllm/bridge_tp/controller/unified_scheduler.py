@@ -167,11 +167,15 @@ def prompt_room(reading, pending_blocks, guard_blocks=GUARD_BLOCKS):
     return reading.free_blocks - unallocated - pending_blocks - guard_blocks
 
 
-def rank_admission(rows):
+def rank_admission(rows, pool_sort_ids=None):
     """Least full first; ties by engine queue, then instance id."""
+    pool_sort_ids = pool_sort_ids or {}
     return sorted(
         rows,
-        key=lambda r: (r["fullness"]["value"], r["waiting"] or 0, r["pool_id"]),
+        key=lambda r: (
+            r["fullness"]["value"], r["waiting"] or 0,
+            pool_sort_ids.get(r["pool_id"], r["pool_id"]),
+        ),
     )
 
 

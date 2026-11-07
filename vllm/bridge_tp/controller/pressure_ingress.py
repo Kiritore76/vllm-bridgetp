@@ -82,9 +82,11 @@ class PressureIngress:
         clock=time.time,
         reconcile_log_interval_s=0,
         tp_of=None,
+        pair_ids=None,
     ):
         self.coordinator, self.service, self.executor = coordinator, service, executor
-        self.urls = {"tp1": source_url, "tp4": target_url}
+        pair_ids = pair_ids or {"tp1": "tp1", "tp4": "tp4"}
+        self.urls = {pair_ids["tp1"]: source_url, pair_ids["tp4"]: target_url}
         # With TP degrees per pool id, route through the multi-instance entry.
         self.tp_of = tp_of
         self.timeout_s, self.clock = timeout_s, clock

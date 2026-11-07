@@ -363,7 +363,9 @@ class PressureCoordinator:
         # The hold queue sends a request only where its prompt fits; without
         # one (fixed routes, stale evidence) the least full feasible one gets it.
         fitting = [r for r in feasible if r["fits"]]
-        chosen = unified.rank_admission(fitting or feasible)[0]
+        chosen = unified.rank_admission(
+            fitting or feasible, getattr(self, "pool_sort_ids", None)
+        )[0]
         before, known = self.ledger.live_snapshot(), self.ledger.mark()
         self.ledger.track_ingress(key, request_id, chosen["pool_id"], prompt_tokens)
         result = Admission(
@@ -830,10 +832,11 @@ class PressureCoordinator:
                     if owner is not None and owner != c.owner:
                         raise ValueError("inventory contradicts confirmed ownership")
             before = self.ledger.live_snapshot()
+            sort_ids = getattr(self, "pool_sort_ids", {})
             sources = sorted(
-                i
-                for i in readings
-                if tp_of[i] == 1 and self.lifecycle(i) in {"ACTIVE", "QUIESCING"}
+                (i for i in readings
+                 if tp_of[i] == 1 and self.lifecycle(i) in {"ACTIVE", "QUIESCING"}),
+                key=lambda i: sort_ids.get(i, i),
             )
             targets = sorted(
                 i for i in readings if tp_of[i] > 1 and self.lifecycle(i) == "ACTIVE"
@@ -854,7 +857,10 @@ class PressureCoordinator:
             ]
 
             def least_full(names):
-                return min(names, key=lambda t: (full[t]["value"], t), default=None)
+                return min(
+                    names, key=lambda t: (full[t]["value"], sort_ids.get(t, t)),
+                    default=None,
+                )
 
             # KV is safety and ignores cooldowns; pressure respects them.
             kv_target = least_full(open_targets)
@@ -963,7 +969,7 @@ class PressureCoordinator:
                         required_blocks=blocks,
                         selection_policy=basis,
                     )
-                    key = (trigger != "KV", -full[s]["value"], s)
+                    key = (trigger != "KV", -full[s]["value"], sort_ids.get(s, s))
                     if chosen is None or key < chosen["key"]:
                         chosen = dict(
                             key=key,

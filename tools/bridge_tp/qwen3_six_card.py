@@ -66,15 +66,16 @@ def instances(plan):
         environment = plan[
             (side or ("source" if row.get("migration_channel") else "target")) + "_env"
         ]
+        inventory_path = (
+            row["inventory_path"]
+            if plan.get("canonical_instance_ids") or not side
+            else str(plan["run_dir"] / f"{side}_inventory.jsonl")
+        )
         result.append(
             dict(
                 row,
-                inventory_path=(
-                    str(plan["run_dir"] / f"{side}_inventory.jsonl")
-                    if side
-                    else row["inventory_path"]
-                ),
-                trace_name=side or name,
+                inventory_path=inventory_path,
+                trace_name=name if plan.get("canonical_instance_ids") else side or name,
                 finalize_token=environment["BRIDGETP_PERFORMANCE_FINALIZE_TOKEN"],
             )
         )
@@ -138,7 +139,9 @@ def warm_channels(plan, timeout_s=30):
         receipts, missing = pc.preconnect_receipts(plan["run_dir"]), []
         for channel in plan["channel_sources"]:
             source = channel["source"]
-            pool = "tp1" if source == aliases["tp1"] else source
+            pool = source if plan.get("canonical_instance_ids") else (
+                "tp1" if source == aliases["tp1"] else source
+            )
             names = [f"source-{pool}-{aliases['tp4']}.json"] + [
                 f"tp_rank_{rank}-{source}.json" for rank in range(2)
             ]
