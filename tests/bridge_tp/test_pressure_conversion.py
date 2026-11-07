@@ -686,7 +686,22 @@ class ConversionTests(unittest.TestCase):
             # instances' inventory join: with 16 (last at 4.5s) the join was
             # sometimes later and nothing could reach them (1 of 24 runs at
             # 5aa292e7a, 4 of 24 at 3fa7018a7; Linux gate 11-07).
-            outcome = harness.run(jobs(30, 0.3, busy="tp4"))
+            # Every fake engine reports the same empty inventory and serves in
+            # 0.25s, so arrivals 0.3s apart that never overlap all tie and go
+            # to an existing TP1; the new ones got traffic only from timing
+            # jitter (Linux gate failed again at 77cbf43b9). Simultaneous
+            # arrivals after the join are spread over all TP1s by the
+            # in-flight reservations, so routing to them is deterministic.
+            bursts = [
+                dict(
+                    id=f"burst-{at}-{n}",
+                    at_s=at,
+                    request=dict(model="qwen", prompt=[1], max_tokens=8),
+                )
+                for at in (6.0, 8.0)
+                for n in range(4)
+            ]
+            outcome = harness.run(jobs(30, 0.3, busy="tp4") + bursts)
             self.check_common(harness, outcome, ["B-g2-tp2"], ["B-g4-tp1", "B-g5-tp1"])
             # No channel plan: retiring the target closes nothing on a target.
             retire = next(e for e in harness.events if e["kind"] == "CHANNEL_RETIRE")

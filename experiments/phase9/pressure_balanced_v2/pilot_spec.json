@@ -398,7 +398,7 @@
     "vllm/bridge_tp/source_channels.py": "c8f6cd5d737854dfecf79356a392ba466848efbe49bbb9fcc1ace5750cefba22",
     "tests/bridge_tp/test_source_channels.py": "18fcb141701d25c927ad74aee11744398f7334bf43d26153a4eb4caedce84b2c",
     "tools/bridge_tp/pressure_conversion.py": "a27fbe1b01d12e5a330f062f924d52b269e7c944f2ccd51b84f7fcf288a22312",
-    "tests/bridge_tp/test_pressure_conversion.py": "d0e8cb8098eeb2f1680bcc58715753d81f2b59161aa17c002fea5207a25f5c40",
+    "tests/bridge_tp/test_pressure_conversion.py": "55e8f153a4ece6050dac9270594f49db275320ffd8d424aa794de28a700a0c86",
     "tools/bridge_tp/conversion_acceptance.py": "1a22369c18c78c3645c3d1b6e57fa3831477c1f7d4e2b91ada4097e2a5abe9b3",
     "tools/bridge_tp/conversion_planner.py": "33d7c53d0c02b68db9f28e5b7b7ed2c1c1d353b8fa62358ccd1f908b4aaa244c",
     "experiments/platforms/qwen3_pressure_observation/conversion_profile.json": "503c4cf2f82a627c4f7420dc48a5d6fbd6ef3966cb7726f4b3948130f54f0cb8",
