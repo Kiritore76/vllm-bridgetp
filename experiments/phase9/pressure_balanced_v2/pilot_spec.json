@@ -416,8 +416,9 @@
     "tools/bridge_tp/migration_receivers.py": "c005aa9e041f218b109816c57b53b7a125ec89e63ed39974ab53492ce39cf6db",
     "tests/bridge_tp/test_migration_receivers.py": "105d20450c6002a8096f0c0ee99a96cd70f2d21c7577dccd18275fc69662c317",
     "tests/bridge_tp/test_multi_target.py": "e6eae04bc46876aafe8a6b243afd4c2f2cf66efc79f1cdddfe46405c3cdf876c",
-    "tools/bridge_tp/conversion_decider.py": "334b416bf4e981298ef69d6fd8d96e2f41f868672e8a3d5e3804c945576320c6",
-    "tests/bridge_tp/test_conversion_decider.py": "c9fc2149536a45639b9efef0483e20ecf142b43f0577310f89b3ad5a3801eb2f"
+    "tools/bridge_tp/conversion_decider.py": "b68213f71289e9ef1899f5c2ae78c31a23a817606880a6945f6f402c79449cfa",
+    "tests/bridge_tp/test_conversion_decider.py": "c9fc2149536a45639b9efef0483e20ecf142b43f0577310f89b3ad5a3801eb2f",
+    "tests/bridge_tp/test_six_card_decider.py": "c5591357cc07f8274fbbb1f8a1e92c550b7cc85231ddbce29950c9d765c49366"
   },
   "server_settings": {
     "dtype": "bfloat16",

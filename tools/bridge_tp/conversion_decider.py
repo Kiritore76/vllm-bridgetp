@@ -54,6 +54,8 @@ once a plan's start gate is waiting.
 
 from __future__ import annotations
 
+import math
+
 WINDOW_S = 60.0
 # The short rate alone reads a shorter window. At 60s a short rate back at 8/s
 # still read 5.6/s, and a 120s long blip converted to L2 (rotation GPU 11-05).
@@ -105,15 +107,81 @@ RULES = dict(
     cancel_hold_s=15.0,
 )
 
+# Six-card policy is explicit: existing four-card callers keep RULES unchanged.
+SIX_CARD_RULES = dict(
+    RULES,
+    l2_max_short=15.0,
+    l2_min_long_blocks=12600,
+    l2_leave_short=17.0,
+    l0_min_short=19.0,
+    l0_max_long_blocks=1536,
+    l0_leave_long_blocks=3072,
+    l0_leave_short=17.0,
+    l3_max_short=6.0,
+    l3_min_long_blocks=16800,
+    l3_leave_short=8.0,
+    l3_leave_long_blocks=14500,
+    l3_hold_s=120.0,
+    extreme_exit_hold_s=30.0,
+    current_length=True,
+    trend_lookahead_s=60.0,
+    evacuate_busy=False,
+)
+
 
 def layout_name(bundles):
-    """L0 / L1A / L2 from {bundle: tp}; four-card names (A, B)."""
-    degrees = set(bundles.values())
-    if degrees == {1}:
-        return "L0"
-    if 1 not in degrees:
-        return "L2"
-    return "L1A"
+    """Use the registry's naming for both two- and three-bundle layouts."""
+    from tools.bridge_tp.pressure_cpu import load
+
+    ids = sorted(bundles)
+    return load("instance_pool").layout_label([bundles[b] > 1 for b in ids], ids)
+
+
+def _layout_path(bundle_ids, merge_order):
+    ids = tuple(bundle_ids)
+    order = tuple(merge_order)
+    if (
+        len(ids) not in (2, 3)
+        or len(set(ids)) != len(ids)
+        or len(order) != len(ids)
+        or set(order) != set(ids)
+    ):
+        raise ValueError("conversion needs two or three distinct ordered bundles")
+    modes = dict.fromkeys(ids, 1)
+    path = [dict(modes)]
+    for bundle in order:
+        modes[bundle] = 2
+        path.append(dict(modes))
+    return path
+
+
+def adjacent_edges(bundle_ids=("A", "B"), merge_order=None):
+    """Generate only the neighbouring edges along one selected layout path."""
+    ids = tuple(bundle_ids)
+    order = tuple(merge_order) if merge_order is not None else ids[1::-1] + ids[2:]
+    path = _layout_path(ids, order)
+    edges = {layout_name(modes): [] for modes in path}
+    for bundle, before, after in zip(order, path, path[1:]):
+        edges[layout_name(before)].append([bundle, "TP2"])
+        edges[layout_name(after)].append([bundle, "TP1"])
+    # Preserve the historical preference for merging over splitting at L1A.
+    for values in edges.values():
+        values.sort(key=lambda e: e[1] != "TP2")
+    return {k: v for k, v in edges.items() if v}
+
+
+def profile_rules(profile):
+    """Return a separate policy copy; unknown profile names fail closed."""
+    if profile == "four_card":
+        return dict(RULES)
+    if profile == "six_card":
+        return dict(SIX_CARD_RULES)
+    raise ValueError(f"unknown conversion profile: {profile}")
+
+
+def profile_edges(profile):
+    profile_rules(profile)
+    return adjacent_edges(("A", "B", "C") if profile == "six_card" else ("A", "B"))
 
 
 def registry_layout(registry):
@@ -135,9 +203,39 @@ class ConversionDecider:
     edge is not proposed again within the cooldown; the layout never changes.
     """
 
-    def __init__(self, edges, rules=None, execute=False):
+    def __init__(self, edges=None, rules=None, execute=False, *, profile="four_card"):
+        defaults = profile_rules(profile)
+        if profile == "six_card":
+            if not set(rules or {}) <= defaults.keys():
+                raise ValueError("unknown six-card conversion rule")
+            allowed = profile_edges(profile)
+            if edges is not None and (
+                not set(edges) <= allowed.keys()
+                or any(
+                    tuple(edge) not in map(tuple, allowed.get(layout, ()))
+                    for layout, values in edges.items()
+                    for edge in values
+                )
+            ):
+                raise ValueError("six-card conversion edge is outside its path")
+        if edges is None:
+            edges = profile_edges(profile)
         self.edges = {k: [tuple(e) for e in v] for k, v in edges.items()}
-        self.rules = dict(RULES, **(rules or {}))
+        self.rules = dict(defaults, **(rules or {}))
+        self.profile = profile
+        if profile == "six_card" and (
+            self.rules["current_length"] is not True
+            or self.rules["evacuate_busy"] is not False
+        ):
+            raise ValueError(
+                "six-card conversion uses current length and natural drain"
+            )
+        if profile == "six_card" and any(
+            type(value) not in (int, float) or not math.isfinite(value) or value < 0
+            for name, value in self.rules.items()
+            if name not in {"current_length", "evacuate_busy"}
+        ):
+            raise ValueError("six-card numeric rules must be finite and nonnegative")
         self.execute = execute
         self.since = {}
         self.proposed_at = {}
@@ -290,6 +388,10 @@ class ConversionDecider:
         r = self.rules
         bundle, mode = edge
         after = layout_name(dict(bundles, **{bundle: 1 if mode == "TP1" else 2}))
+        if self.profile == "six_card":
+            if self._six_after(s["layout"], edge) != after:
+                return ["not a neighbouring six-card layout"], [], False
+            return self._check_six(edge, s, after)
         short, blocks = s["short_rate"], s["long_blocks"]
         failed, waiting, urgent = [], [], False
         bundle_busy = bool(s["bundle_long_blocks"].get(bundle))
@@ -328,10 +430,99 @@ class ConversionDecider:
             failed.append("not a neighbouring layout")
         return failed, waiting, urgent
 
+    def _six_after(self, layout, edge):
+        for before, values in profile_edges("six_card").items():
+            if before != layout or list(edge) not in values:
+                continue
+            path = _layout_path(("A", "B", "C"), ("B", "A", "C"))
+            modes = next(m for m in path if layout_name(m) == layout)
+            modes[edge[0]] = 1 if edge[1] == "TP1" else 2
+            return layout_name(modes)
+        return None
+
+    def _check_six(self, edge, s, after):
+        r = self.rules
+        short, blocks, new = s["short_rate"], s["long_blocks"], s["long_arrivals"]
+        transition = s["layout"], after
+        failed, waiting, urgent = [], [], False
+        if transition == ("L1AC", "L0"):
+            if short < r["l0_min_short"]:
+                failed.append("short rate within what L1AC carries")
+            if blocks > r["l0_max_long_blocks"]:
+                failed.append("too many long-request blocks for L0")
+            if new:
+                failed.append("new or held long request prevents entering L0")
+        elif transition == ("L0", "L1AC"):
+            if not (
+                short <= r["l0_leave_short"]
+                or blocks >= r["l0_leave_long_blocks"]
+                or new
+            ):
+                failed.append("L0 still suits the load")
+        elif transition == ("L1AC", "L2C"):
+            if short > r["l2_max_short"]:
+                failed.append("short rate too high for L2C")
+            if s.get("trend_blocks", blocks) < r["l2_min_long_blocks"]:
+                failed.append("too few long-request blocks")
+            if not new:
+                failed.append("no new long request: a burst is left to migration")
+            urgent = any(
+                s.get(k) is not None and s[k] >= r["urgent_capacity"]
+                for k in ("tp1_capacity_max", "tpk_capacity_max")
+            )
+        elif transition == ("L2C", "L1AC"):
+            if short < r["l2_leave_short"]:
+                failed.append("short rate within what L2C carries")
+            urgent = s.get("tpk_waiting", False)
+        elif transition == ("L2C", "L3"):
+            if short > r["l3_max_short"]:
+                failed.append("short rate too high for L3")
+            if blocks < r["l3_min_long_blocks"]:
+                failed.append("too few current long-request blocks for L3")
+            if not new:
+                failed.append("no new or held long request for L3")
+        elif transition == ("L3", "L2C"):
+            if not (
+                short >= r["l3_leave_short"] or blocks <= r["l3_leave_long_blocks"]
+            ):
+                failed.append("L3 still suits the load")
+        else:
+            failed.append("not a neighbouring six-card layout")
+        if edge[1] == "TP1" and s["bundle_long_blocks"].get(edge[0]):
+            waiting.append("bundle serves a long request")
+        return failed, waiting, urgent
+
+    def _hold_seconds(self, edge, s, urgent):
+        r = self.rules
+        if self.profile == "six_card":
+            after = self._six_after(s["layout"], edge)
+            if after == "L0":
+                return r["l0_hold_s"]
+            if after == "L3":
+                return r["l3_hold_s"]
+            if s["layout"] in ("L0", "L3"):
+                return r["extreme_exit_hold_s"]
+        return (
+            r["urgent_hold_s"]
+            if urgent
+            else r["l0_hold_s"]
+            if edge[1] == "TP1" and s["layout"] == "L1A"
+            else r["trend_hold_s"]
+            if r["trend_lookahead_s"] and tuple(edge) == ("A", "TP2")
+            else r["hold_s"]
+        )
+
     def observe(self, status, bundles, members, now):
         """One decision record; ``proposal`` is the edge to convert, if any."""
         r = self.rules
         s = self.signals(status, bundles, members, now)
+        if self.profile == "six_card" and (
+            set(bundles) != {"A", "B", "C"} or s["layout"] not in self.edges
+        ):
+            self.since.clear()
+            self.prepared = None
+            # A partial ACTIVE registry during conversion is not a new layout.
+            s["layout"] = None
         candidates, proposal, approaching = {}, None, None
         cooling = (
             self.execute
@@ -346,15 +537,7 @@ class ConversionDecider:
             else:
                 self.since.setdefault(key, now)
             held = now - self.since[key] if key in self.since else 0.0
-            need = (
-                r["urgent_hold_s"]
-                if urgent
-                else r["l0_hold_s"]
-                if edge[1] == "TP1" and s["layout"] == "L1A"
-                else r["trend_hold_s"]
-                if r["trend_lookahead_s"] and tuple(edge) == ("A", "TP2")
-                else r["hold_s"]
-            )
+            need = self._hold_seconds(edge, s, urgent)
             repeated = (
                 not self.execute
                 and now - self.proposed_at.get(key, -float("inf")) < r["cooldown_s"]
@@ -423,9 +606,41 @@ class ConversionDecider:
                     key=key, bundle=edge[0], target_mode=edge[1], at=now
                 )
 
-    def cancel_reason(self, edge, layout, short, blocks):
+    def cancel_reason(
+        self, edge, layout, short, blocks, *, long_arrivals=None, trend_blocks=None
+    ):
         """Why a conversion in progress no longer fits the load, or None."""
         r = self.rules
+        if self.profile == "six_card":
+            after = self._six_after(layout, edge)
+            if after is None:
+                return "not a neighbouring six-card layout"
+            # Preserve the middle edge's existing cancellation semantics.
+            if (layout, after) == ("L1AC", "L2C"):
+                return (
+                    "short rate too high for L2C" if short > r["l2_max_short"] else None
+                )
+            if (layout, after) == ("L2C", "L1AC"):
+                return (
+                    "short rate within what L2C carries"
+                    if short < r["l2_leave_short"]
+                    else None
+                )
+            if long_arrivals is None and (layout, after) != ("L3", "L2C"):
+                return "new-long signal unavailable"
+            failed, _, _ = self._check_six(
+                edge,
+                dict(
+                    layout=layout,
+                    short_rate=short,
+                    long_blocks=blocks,
+                    long_arrivals=long_arrivals,
+                    trend_blocks=trend_blocks,
+                    bundle_long_blocks={},
+                ),
+                after,
+            )
+            return "; ".join(failed) if failed else None
         bundle, mode = edge
         after = {
             ("L1A", "A", "TP2"): "L2",
