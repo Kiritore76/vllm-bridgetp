@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 当前任务：六卡阶段4转换阈值的容量重测（用户11-07同意）：统一调度下短请求细扫，
-# 本场L0（14–24 req/s每2一档，用户11-07由12–22改为14–24以框住上限；每档60秒512/128）；已测L1AC 18、L2C 16 req/s；L3与L1AC长请求容量随后逐场下发。
-scenes='L0:14,16,18,20,22,24'
+# 本场L3（预注册8–16 req/s每2一档，每档60秒512/128）；已测L0 20、L1AC 18、L2C 16 req/s；L1AC长请求容量随后下发。
+scenes='L3:8,10,12,14,16'
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
@@ -35,7 +35,7 @@ printf '%s\n' "$revision" > "$run/revision.txt"
 echo "本批目录：$run"
 echo "场次 $scenes（布局:速率列表）；A={2,3}、B={0,1}、C={4,5}；TP1与TP2槽位均16。"
 echo '统一调度：准入=引擎排队≤8且提示放得下（保护125块）；选实例=满度最低（槽位、KV、平滑后token间隔均值÷32ms取最大）；迁移规则同阶段4第1场，纯短请求通常不触发。'
-echo '负载：每档固定512输入/128输出短请求，均匀到达60秒后停止并排空；种子20261101；每档单独启动一遍布局。双32768/.88、guard125、hold-queue；L1AC/L2C沿用kv-short-exempt/overload-migrate/migrate-current-length；L0没有TP2，不加这三项。'
+echo '负载：每档固定512输入/128输出短请求，均匀到达60秒后停止并排空；种子20261101；每档单独启动一遍布局。双32768/.88、guard125、hold-queue；L1AC/L2C沿用kv-short-exempt/overload-migrate/migrate-current-length；L0、L3不是混合布局，不加这三项。'
 echo '用途：量各布局短请求能力（严格≥95%且TTFT不持续上升的最高速率），定转换决策器短请求阈值；不改调度、不转换、不训练。'
 echo '纯短请求零迁移不算覆盖不足；请求/token不全、槽位或调度器不符、清理不完整即停，不自动重试。'
 echo '约30–40分钟含每档启动/收尾/打包；不删除服务器结果。'
@@ -86,7 +86,7 @@ if [ "$status" != 0 ]; then
     pack_result "$status" || exit 1
     exit "$status"
 fi
-echo '[CPU前置] 通过（含本地权限受限的链接测试，Linux不允许跳过）；准备统一调度短请求细扫（L0）。'
+echo '[CPU前置] 通过（含本地权限受限的链接测试，Linux不允许跳过）；准备统一调度短请求细扫（L3）。'
 echo '[预编译] 数据盘短临时路径；最多4个编译进程。'
 "$py" -m compileall -q -j 4 "$repo/vllm" "$repo/tools" > "$run/compileall.log" 2>&1 || {
     echo '[预编译] 失败，尚未启动GPU服务；请拿回诊断包。'
