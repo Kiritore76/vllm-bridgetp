@@ -32,7 +32,7 @@ import socket
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -215,9 +215,9 @@ class ActionAdapter:
         without it the server keeps the env-frozen boundary and this call has no
         observable effect.
         """
-        current = RuntimeControl.load(self.run_dir) or RuntimeControl()
-        return RuntimeControl(
-            generation=current.generation,
+        current = self._current_control()
+        return replace(
+            current,
             armed=True,
             trigger_output_tokens=int(trigger_output_tokens),
             cutover_output_tokens=(
@@ -226,28 +226,24 @@ class ActionAdapter:
                 else current.cutover_output_tokens
             ),
             rate_gib_s=float(rate_gib_s),
-            target_request_admitted=current.target_request_admitted,
-            migration_id=current.migration_id,
-            source_request_id_prefix=current.source_request_id_prefix,
             note=note or "shadow armed by Phase 9 controller",
         ).write(self.run_dir)
 
+    def _current_control(self) -> RuntimeControl:
+        # Every update starts from the published block and changes only its own
+        # fields: rebuilding from a field list dropped target_instance on
+        # multi-target sources, and the source engine refused the armed block.
+        return RuntimeControl.load(self.run_dir) or RuntimeControl()
+
     def set_rate(self, rate_gib_s: float, note: str = "") -> RuntimeControl:
-        current = RuntimeControl.load(self.run_dir) or RuntimeControl()
-        return RuntimeControl(
-            generation=current.generation,
-            armed=current.armed,
-            trigger_output_tokens=current.trigger_output_tokens,
-            cutover_output_tokens=current.cutover_output_tokens,
+        return replace(
+            self._current_control(),
             rate_gib_s=float(rate_gib_s),
-            target_request_admitted=current.target_request_admitted,
-            migration_id=current.migration_id,
-            source_request_id_prefix=current.source_request_id_prefix,
             note=note or "rate update",
         ).write(self.run_dir)
 
     def set_cutover(self, cutover_output_tokens: int, note: str = "") -> RuntimeControl:
-        current = RuntimeControl.load(self.run_dir) or RuntimeControl()
+        current = self._current_control()
         if (
             current.trigger_output_tokens is not None
             and cutover_output_tokens <= current.trigger_output_tokens
@@ -256,43 +252,23 @@ class ActionAdapter:
                 f"cutover {cutover_output_tokens} must be after trigger "
                 f"{current.trigger_output_tokens}"
             )
-        return RuntimeControl(
-            generation=current.generation,
-            armed=current.armed,
-            trigger_output_tokens=current.trigger_output_tokens,
+        return replace(
+            current,
             cutover_output_tokens=int(cutover_output_tokens),
-            rate_gib_s=current.rate_gib_s,
-            target_request_admitted=current.target_request_admitted,
-            migration_id=current.migration_id,
-            source_request_id_prefix=current.source_request_id_prefix,
             note=note or "cutover boundary set",
         ).write(self.run_dir)
 
     def mark_target_request_admitted(self, note: str = "") -> RuntimeControl:
-        current = RuntimeControl.load(self.run_dir) or RuntimeControl()
-        return RuntimeControl(
-            generation=current.generation,
-            armed=current.armed,
-            trigger_output_tokens=current.trigger_output_tokens,
-            cutover_output_tokens=current.cutover_output_tokens,
-            rate_gib_s=current.rate_gib_s,
+        return replace(
+            self._current_control(),
             target_request_admitted=True,
-            migration_id=current.migration_id,
-            source_request_id_prefix=current.source_request_id_prefix,
             note=note or "target request admitted",
         ).write(self.run_dir)
 
     def disarm(self, note: str = "") -> RuntimeControl:
-        current = RuntimeControl.load(self.run_dir) or RuntimeControl()
-        return RuntimeControl(
-            generation=current.generation,
+        return replace(
+            self._current_control(),
             armed=False,
-            trigger_output_tokens=current.trigger_output_tokens,
-            cutover_output_tokens=current.cutover_output_tokens,
-            rate_gib_s=current.rate_gib_s,
-            target_request_admitted=current.target_request_admitted,
-            migration_id=current.migration_id,
-            source_request_id_prefix=current.source_request_id_prefix,
             note=note or "migration disarmed",
         ).write(self.run_dir)
 

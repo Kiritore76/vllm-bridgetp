@@ -5,7 +5,7 @@ import ast
 import json
 import tempfile
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from vllm.bridge_tp.gpu_direct_targets import (
@@ -199,6 +199,48 @@ class WiringTests(unittest.TestCase):
             self.assertEqual(RuntimeControl.load(folder).target_instance, "B-g5-tp2")
             RuntimeControl(armed=False).write(folder)
             self.assertIsNone(RuntimeControl.load(folder).target_instance)
+
+    def test_adapter_updates_keep_the_session_target(self):
+        # 11-07 GPU: arm_shadow rebuilt the block from a field list, dropped
+        # target_instance, and the armed multi-target source engine died.
+        from vllm.bridge_tp.controller.action_adapter import ActionAdapter
+
+        config = Config(gpu_direct_targets=parse_targets(TWO, 8))
+        with tempfile.TemporaryDirectory() as folder:
+            RuntimeControl(armed=False, target_instance="B-g5-tp2").write(folder)
+            current = RuntimeControl.load(folder)
+            replace(current, migration_id="m-1", source_request_id_prefix="r").write(
+                folder
+            )
+            adapter = ActionAdapter("http://source", folder)
+            steps = [
+                lambda: adapter.arm_shadow(100, 0.0, cutover_output_tokens=200),
+                lambda: adapter.set_rate(1.5),
+                lambda: adapter.set_cutover(300),
+                lambda: adapter.mark_target_request_admitted(),
+                lambda: adapter.disarm(),
+            ]
+            for step in steps:
+                written = step()
+                loaded = RuntimeControl.load(folder)
+                self.assertEqual(loaded, written)
+                self.assertEqual(loaded.target_instance, "B-g5-tp2")
+                self.assertEqual(
+                    (loaded.migration_id, loaded.source_request_id_prefix),
+                    ("m-1", "r"),
+                )
+                chosen = select_target(config, loaded.target_instance, loaded.armed)
+                self.assertEqual(chosen.gpu_direct_base_port, 30410)
+            self.assertEqual(
+                (
+                    loaded.armed,
+                    loaded.trigger_output_tokens,
+                    loaded.cutover_output_tokens,
+                    loaded.rate_gib_s,
+                    loaded.target_request_admitted,
+                ),
+                (False, 100, 300, 1.5, True),
+            )
 
     def test_dataclass_target_is_hashable_and_frozen(self):
         target = GpuDirectTarget("B-g2-tp2", "127.0.0.1", 30400, 2, 1)
