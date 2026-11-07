@@ -412,10 +412,12 @@
     "tools/bridge_tp/migration_plan.py": "f7aba17e2038ce3d6385aabcfa5687aed253cd5b3570b76c3ee849a024f67cd1",
     "tests/bridge_tp/test_migration_plan.py": "7413085058c1f3f480f57f9ac505f47c367f7a89284e7d56ca32e42e0c5b76f2",
     "tests/bridge_tp/test_runtime_instance_ids.py": "f73f1777c8048b3a6618a670ad3e20a3a010e654a04c45dfd13cced4bfae6c6a",
-    "tools/bridge_tp/server_run.sh": "f7b60fe1e032225dc564e3f9b307c65752537065e646bed7d3091257b0f01ec8",
+    "tools/bridge_tp/server_run.sh": "eb61cb7657ca2feaa5a5611269f519dc32ae4b2320202f09694893ce71d54783",
     "tools/bridge_tp/migration_receivers.py": "c005aa9e041f218b109816c57b53b7a125ec89e63ed39974ab53492ce39cf6db",
     "tests/bridge_tp/test_migration_receivers.py": "105d20450c6002a8096f0c0ee99a96cd70f2d21c7577dccd18275fc69662c317",
-    "tests/bridge_tp/test_multi_target.py": "e6eae04bc46876aafe8a6b243afd4c2f2cf66efc79f1cdddfe46405c3cdf876c"
+    "tests/bridge_tp/test_multi_target.py": "e6eae04bc46876aafe8a6b243afd4c2f2cf66efc79f1cdddfe46405c3cdf876c",
+    "tools/bridge_tp/conversion_decider.py": "334b416bf4e981298ef69d6fd8d96e2f41f868672e8a3d5e3804c945576320c6",
+    "tests/bridge_tp/test_conversion_decider.py": "c9fc2149536a45639b9efef0483e20ecf142b43f0577310f89b3ad5a3801eb2f"
   },
   "server_settings": {
     "dtype": "bfloat16",

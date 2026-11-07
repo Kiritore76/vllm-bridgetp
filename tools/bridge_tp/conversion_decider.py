@@ -146,6 +146,7 @@ class ConversionDecider:
         self.history = []  # (now, tp1 cap, tp-k cap, tp-k waiting)
         self.no_room_at = -float("inf")
         self.long_seen = {}  # request id -> when first seen long
+        self.long_last_seen = {}  # retain first-seen time while present/recent
         self.block_history = []  # (now, demand blocks)
 
     def smooth(self, now, tp1_cap, tpk_cap, waiting):
@@ -218,10 +219,20 @@ class ConversionDecider:
                 for q in instances[i].get("requests", ()):
                     if q["prompt_tokens"] + q["generated"] >= LONG_TOKENS:
                         self.long_seen.setdefault(q["request_id"], now)
-            self.long_seen = {
-                k: v for k, v in self.long_seen.items() if now - v <= window
+                    if q["request_id"] in self.long_seen:
+                        self.long_last_seen[q["request_id"]] = now
+            # A request can outlive the arrival window. Keep its birth time
+            # until it has been absent for a full window, including temporary
+            # missing inventory or a generated-count reset during recompute.
+            self.long_last_seen = {
+                k: v for k, v in self.long_last_seen.items() if now - v <= window
             }
-            long_arrivals = len(self.long_seen) + len(held)
+            self.long_seen = {
+                k: v for k, v in self.long_seen.items() if k in self.long_last_seen
+            }
+            long_arrivals = sum(
+                now - seen <= window for seen in self.long_seen.values()
+            ) + len(held)
             total_blocks += sum(-(-n // BLOCK_TOKENS) for n in held)
         trend_blocks = total_blocks
         if r["trend_lookahead_s"]:

@@ -304,7 +304,74 @@ class CurrentLengthTests(unittest.TestCase):
         self.assertEqual(self.signals(decider, value, 1059.0)["long_arrivals"], 1)
         self.assertEqual(self.signals(decider, value, 1061.0)["long_arrivals"], 0)
         # Still in flight and first seen long-ago: it does not count again.
-        self.assertEqual(self.signals(decider, value, 1062.0)["long_arrivals"], 1)
+        for now in (1062.0, 1124.0, 1300.0):
+            self.assertEqual(self.signals(decider, value, now)["long_arrivals"], 0)
+        self.assertEqual(set(decider.long_seen.values()), {1000.0})
+
+    def test_growing_old_request_does_not_reopen_the_trend_gate(self):
+        decider = d.ConversionDecider(
+            d.EDGES, dict(current_length=True, trend_lookahead_s=60.0)
+        )
+        value = status(deep={"B-g2-tp2": 1})
+        request = value["instances"]["B-g2-tp2"]["requests"][0]
+        for second in range(190):
+            request["generated"] = second * 16
+            s = self.signals(decider, value, 1000.0 + second)
+            if second > 60:
+                self.assertEqual(s["long_arrivals"], 0)
+                self.assertEqual(s["trend_blocks"], s["long_blocks"])
+
+    def test_recent_departed_request_counts_until_its_birth_window_ends(self):
+        decider = self.decider()
+        value = status(deep={"B-g2-tp2": 1})
+        self.signals(decider, value, 1000.0)
+        value["instances"]["B-g2-tp2"]["requests"] = []
+        self.assertEqual(self.signals(decider, value, 1059.0)["long_arrivals"], 1)
+        self.assertEqual(self.signals(decider, value, 1061.0)["long_arrivals"], 0)
+        self.assertEqual(decider.long_seen, {})
+        self.assertEqual(decider.long_last_seen, {})
+
+    def test_temporary_inventory_gap_does_not_rebirth_an_old_request(self):
+        decider = self.decider()
+        value = status(deep={"B-g2-tp2": 1})
+        self.signals(decider, value, 1000.0)
+        self.signals(decider, value, 1120.0)
+        self.signals(decider, status(), 1121.0)
+        s = self.signals(decider, value, 1122.0)
+        self.assertEqual(s["long_arrivals"], 0)
+        self.assertEqual(set(decider.long_seen.values()), {1000.0})
+
+    def test_new_request_counts_once_alongside_an_old_one(self):
+        decider = self.decider()
+        value = status(deep={"B-g2-tp2": 1})
+        self.signals(decider, value, 1000.0)
+        value = status(deep={"B-g2-tp2": 2})
+        self.assertEqual(self.signals(decider, value, 1070.0)["long_arrivals"], 1)
+        self.assertEqual(self.signals(decider, value, 1131.0)["long_arrivals"], 0)
+
+    def test_recompute_count_reset_does_not_rebirth_a_resident_request(self):
+        decider = self.decider()
+        value = status()
+        request = dict(
+            request_id="growing", prompt_tokens=512,
+            max_output_tokens=8192, generated=7680,
+        )
+        value["instances"]["B-g2-tp2"]["requests"] = [request]
+        self.signals(decider, value, 1000.0)
+        for second in range(1, 131):
+            request["generated"] = 0 if second < 130 else 7680
+            s = self.signals(decider, value, 1000.0 + second)
+        self.assertEqual(s["long_arrivals"], 0)
+        self.assertEqual(decider.long_seen["growing"], 1000.0)
+
+    def test_same_id_moving_between_instances_keeps_its_birth_time(self):
+        decider = self.decider()
+        value = status(deep={"A-g1-tp1": 1})
+        self.signals(decider, value, 1000.0)
+        request = value["instances"]["A-g1-tp1"]["requests"].pop()
+        value["instances"]["B-g2-tp2"]["requests"] = [request]
+        self.assertEqual(self.signals(decider, value, 1070.0)["long_arrivals"], 0)
+        self.assertEqual(decider.long_seen[request["request_id"]], 1000.0)
 
     def test_held_long_prompts_count_as_demand_and_as_new(self):
         value = status()
