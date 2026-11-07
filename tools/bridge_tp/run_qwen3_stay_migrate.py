@@ -1050,6 +1050,9 @@ def main(argv=None):
                 )
             if args.kv_priority_verify or args.updated_pressure_four_mode:
                 priority.enable_urgent_target(plan)
+            from tools.bridge_tp.migration_plan import install
+
+            install(plan)
         serving_preflight(plans)
         for recipe, arm, scene, plan in plans:
             if not gpu_idle():

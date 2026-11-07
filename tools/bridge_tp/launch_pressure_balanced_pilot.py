@@ -1175,6 +1175,8 @@ def run_scene(
         mechanism_dir = initialize(plan["run_dir"])
     common.write_json(plan["config_path"], plan["config"])
     write_instances(plan)
+    if "migration_plan" in plan:
+        common.write_json(root / "migration_plan.json", plan["migration_plan"])
     if plan["config"].get("transfer_mode") == "FULL_SPEED":
         announce(scene["name"], "迁移全速：历史pacing关闭，M2动态限速关闭")
     RuntimeControl(
