@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 当前任务：多目标阶段3第4批，单场限制迁往A（--force-migration-target A，只缩小可选目标，
-# 不改触发与安全检查、不强制START）；负载long_output（用户11-07选定）。先验证功能，不作性能结论。
+# 不改触发与安全检查、不强制START）；负载完整mixed_long_ramp（用户11-07改选：long_output太轻、零迁移）。先验证功能，不作性能结论。
 scenes='L2C:16:unified'
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
@@ -36,10 +36,10 @@ echo "本批目录：$run"
 echo "统一调度：场次 $scenes（布局:TP2槽位:调度方式）；A={2,3}、B={0,1}、C={4,5}；TP1槽位16。"
 echo '统一调度：准入=引擎排队≤8且提示放得下（保护125块）；选实例=满度最低（槽位、KV、平滑后token间隔均值÷32ms取最大）；迁移=KV≥90%或约8秒耗尽立即迁，满度≥0.9持续10秒且高出目标0.3才按压力迁；挑请求沿用旧调度评估，目标空间扣除待预填充提示与125块保护。'
 echo '阶段3：A/B各自会话组、机制目录和stager；两个TP1均预连A/B；本场只允许迁往A；源入口在会话轮换后才改指。'
-echo '负载long_output：0–60秒短4/s；60–420秒短4/s加512/8192长请求0.1/s（每10秒一条，共36条）；420–480秒短1/s；1776请求、517632输出token。'
+echo '负载mixed_long_ramp（种子6）：0–60秒短4/s；60–1020秒短8/s，16384/8192深长每240秒一档0.02/0.04/0.06/0.08/s（3/10/18/17条）；1020–1080秒短1/s；8045请求、1416832输出token。'
 echo '双32768/.88、guard125、hold-queue；L2C沿用kv-short-exempt/overload-migrate/migrate-current-length。'
 echo '不降阈值、不强制START、不转换、不训练；零迁往A记覆盖不足（退出码2）；技术故障/请求或清理不完整即停，不自动重试。'
-echo '约15–20分钟含启动/收尾/打包；不删除服务器结果。'
+echo '约25–30分钟含启动/收尾/打包；不删除服务器结果。'
 printf 'scene\trunner_exit\tbatch_exit\n' > "$run/scenes.tsv"
 pack_result() {
     local status=$1
@@ -124,7 +124,7 @@ for scene in $scenes; do
     echo "[场次] $name 开始"
     "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
         --cards 6 --static-layout "$layout" --tp2-max-num-seqs "$slots" --scheduler "$scheduler" \
-        --phase-shift --phase-scenario long_output \
+        --phase-shift --phase-scenario mixed_long_ramp \
         --migration-targets all --force-migration-target A \
         "${options[@]}" --expanded-context --current-machine --repetitions 1 \
         --model "$model" \
@@ -179,8 +179,8 @@ assert acceptance["passed"], "acceptance failed"
 assert set(acceptance["migration_targets_used"]) <= {a_id}, "migrated outside A"
 controller = next(root.rglob("pressure_request_results.json")).parent
 requests = json.loads((controller / "pressure_request_results.json").read_text())
-assert len(requests) == 1776
-assert sum(len(r["response"]["emitted"]) for r in requests) == 517632
+assert len(requests) == 8045
+assert sum(len(r["response"]["emitted"]) for r in requests) == 1416832
 for target in targets.values():
     target_root = Path(target["mechanism_root"])
     assert (target_root / "migration_active_final.json").is_file()
@@ -217,7 +217,7 @@ assert normalized(argv["target_argv"], targets["B"]) == normalized(
     argv["extra_argv"][a_id], targets["A"]
 ), "A/B effective serving arguments differ beyond identities/ports"
 summary = dict(
-    four_pairs_warm=True, requests=1776, output_tokens=517632,
+    four_pairs_warm=True, requests=8045, output_tokens=1416832,
     receiver_flags_match=True, entry_switches=len(switches),
     a_session_states=states, a_committed=len(committed),
     a_source_released=len(released), a_channel_idle_verified=len(idle),
