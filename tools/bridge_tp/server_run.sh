@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 当前任务：多目标阶段2，A/B接收端、四对预连，控制器仍只迁往B。
-# 仅一场L2C短背景/六条深长请求；先验证能力与隔离，不作性能收益结论。
+# 当前任务：多目标阶段3第4批，单场限制迁往A（--force-migration-target A，只缩小可选目标，
+# 不改触发与安全检查、不强制START）；负载long_output（用户11-07选定）。先验证功能，不作性能结论。
 scenes='L2C:16:unified'
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
@@ -27,19 +27,19 @@ revision=$(git rev-parse HEAD)
 [ "$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)" = 6 ] || { echo '需要六张GPU。'; exit 1; }
 [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || { echo 'GPU有计算进程，停止；未清理任何进程。'; exit 1; }
 mkdir -p /root/autodl-tmp/bridgetp/results || exit 1
-run=/root/autodl-tmp/bridgetp/results/qwen3_receiver_ab_$(date +%Y%m%d_%H%M%S)_${RANDOM}
+run=/root/autodl-tmp/bridgetp/results/qwen3_force_a_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 avail=$(df --output=avail -k "$run" | tail -1)
 [ "$avail" -ge 16777216 ] || { echo '磁盘可用不足16GB。'; exit 1; }
 printf '%s\n' "$revision" > "$run/revision.txt"
 echo "本批目录：$run"
 echo "统一调度：场次 $scenes（布局:TP2槽位:调度方式）；A={2,3}、B={0,1}、C={4,5}；TP1槽位16。"
-echo '统一调度：准入=引擎排队≤8且提示放得下（保护125块）；选实例=满度最低（槽位、KV、平滑后token间隔均值÷32ms取最大）；迁移=KV≥90%或约8秒耗尽立即迁，满度≥0.9持续10秒且高出目标0.3才按压力迁；挑请求沿用旧调度评估，目标空间扣除待预填充提示与125块保护，目标仍只有B。'
-echo '阶段2：A/B各自机制目录和stager；两个TP1均预连A/B，4对通道共12份预热回执；只允许迁往B。'
-echo '负载：300秒内150条512/128短请求，90秒起每2秒一条16384/8192长请求，共6条；156请求、68352输出token。'
-echo '双32768/.88、guard125、hold-queue；L2C沿用kv-short-exempt/overload-migrate/migrate-current-length，仍只迁向B。'
-echo '不强制迁移、不转换、不训练；阶段2允许零迁移（不算传输验证）；技术故障/请求或清理不完整即停，不自动重试。'
-echo '约10–15分钟含启动/收尾/打包；记录启动跨度，单场不能直接声称启动时间增量；不删除服务器结果。'
+echo '统一调度：准入=引擎排队≤8且提示放得下（保护125块）；选实例=满度最低（槽位、KV、平滑后token间隔均值÷32ms取最大）；迁移=KV≥90%或约8秒耗尽立即迁，满度≥0.9持续10秒且高出目标0.3才按压力迁；挑请求沿用旧调度评估，目标空间扣除待预填充提示与125块保护。'
+echo '阶段3：A/B各自会话组、机制目录和stager；两个TP1均预连A/B；本场只允许迁往A；源入口在会话轮换后才改指。'
+echo '负载long_output：0–60秒短4/s；60–420秒短4/s加512/8192长请求0.1/s（每10秒一条，共36条）；420–480秒短1/s；1776请求、517632输出token。'
+echo '双32768/.88、guard125、hold-queue；L2C沿用kv-short-exempt/overload-migrate/migrate-current-length。'
+echo '不降阈值、不强制START、不转换、不训练；零迁往A记覆盖不足（退出码2）；技术故障/请求或清理不完整即停，不自动重试。'
+echo '约15–20分钟含启动/收尾/打包；不删除服务器结果。'
 printf 'scene\trunner_exit\tbatch_exit\n' > "$run/scenes.tsv"
 pack_result() {
     local status=$1
@@ -78,6 +78,8 @@ echo '[CPU前置] 运行本次相关的回归检查（含统一调度各项）�
     tests.bridge_tp.test_4090d_qwen3 tests.bridge_tp.test_qwen3_stay_migrate \
     tests.bridge_tp.test_unified_scheduler tests.bridge_tp.test_pressure_multi \
     tests.bridge_tp.test_pressure_policy tests.bridge_tp.test_pressure_dispatch \
+    tests.bridge_tp.test_multi_target tests.bridge_tp.test_pressure_sessions \
+    tests.bridge_tp.test_same_tp_evacuation \
     > "$run/cpu_checks.log" 2>&1
 status=$?
 if [ "$status" != 0 ]; then
@@ -86,7 +88,7 @@ if [ "$status" != 0 ]; then
     pack_result "$status" || exit 1
     exit "$status"
 fi
-echo '[CPU前置] 通过（含本地权限受限的链接测试，Linux不允许跳过）；准备单场接收端冒烟。'
+echo '[CPU前置] 通过（含本地权限受限的链接测试，Linux不允许跳过）；准备单场限制迁A冒烟。'
 echo '[预编译] 数据盘短临时路径；最多4个编译进程。'
 "$py" -m compileall -q -j 4 "$repo/vllm" "$repo/tools" > "$run/compileall.log" 2>&1 || {
     echo '[预编译] 失败，尚未启动GPU服务；请拿回诊断包。'
@@ -122,7 +124,8 @@ for scene in $scenes; do
     echo "[场次] $name 开始"
     "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
         --cards 6 --static-layout "$layout" --tp2-max-num-seqs "$slots" --scheduler "$scheduler" \
-        --long-burst-pair --migration-targets B \
+        --phase-shift --phase-scenario long_output \
+        --migration-targets all --force-migration-target A \
         "${options[@]}" --expanded-context --current-machine --repetitions 1 \
         --model "$model" \
         --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
@@ -135,7 +138,7 @@ for scene in $scenes; do
         "$py" -B -c 'import json,sys; from pathlib import Path; p=Path(sys.argv[1]); a=list(p.rglob("six_card_acceptance.json")); c=list(p.rglob("owned_shutdown_receipt.json")); assert len(a)==len(c)==1, "missing scene receipts"; assert all(json.loads(f.read_text())["all_instances_active"] and json.loads(f.read_text())["requests_complete"] for f in a), "incomplete static service"; assert all(json.loads(f.read_text())["all_owned_groups_ended"] for f in c), "process cleanup incomplete"' "$run/$name" \
             > "$run/$name.receipt_check.log" 2>&1 || status=1
         # Every TP2 engine must really have run with the requested slot count.
-        "$py" -B - "$run/$name" "$slots" > "$run/$name.slots_check.log" 2>&1 <<'PY' || status=1
+        "$py" -B - "$run/$name" "$slots" > "$run/$name.slots_check.log" 2>&1 <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -162,46 +165,77 @@ def unique(name):
     return paths[0], json.loads(paths[0].read_text())
 
 _, plan = unique("migration_plan.json")
-assert plan["stage"] == "AB_RECEIVERS_B_ONLY"
+assert plan["stage"] == "AB_RECEIVERS_ALL"
 targets = {r["bundle"]: r for r in plan["migration_targets"]}
 assert set(targets) == {"A", "B"}
-assert plan["execution_targets"] == [targets["B"]["instance_id"]]
+a_id, b_id = targets["A"]["instance_id"], targets["B"]["instance_id"]
+assert plan["forced_target"] == a_id and plan["execution_targets"] == [a_id]
 _, initial = unique("six_card_initial_receipt.json")
 assert len(initial["channels"]) == 12, "four-pair warmup proof missing"
 _, startup = unique("receiver_startup.json")
 assert startup["source_target_pairs"] == 4
 _, acceptance = unique("six_card_acceptance.json")
-assert acceptance["passed"] and not acceptance["migration_required"]
-assert acceptance["migration_target"] == "B only; A/B preconnected"
+assert acceptance["passed"], "acceptance failed"
+assert set(acceptance["migration_targets_used"]) <= {a_id}, "migrated outside A"
 controller = next(root.rglob("pressure_request_results.json")).parent
 requests = json.loads((controller / "pressure_request_results.json").read_text())
-assert len(requests) == 156
-assert sum(len(r["response"]["emitted"]) for r in requests) == 68352
+assert len(requests) == 1776
+assert sum(len(r["response"]["emitted"]) for r in requests) == 517632
 for target in targets.values():
     target_root = Path(target["mechanism_root"])
     assert (target_root / "migration_active_final.json").is_file()
     assert not (target_root / "migration_active").is_symlink()
-    if target["bundle"] == "A":
-        assert not list((target_root / "sessions").glob("*/session_manifest.json")), \
-            "A unexpectedly started a migration"
+assert not list(
+    (Path(targets["B"]["mechanism_root"]) / "sessions").glob("*/session_manifest.json")
+), "B started a migration although only A was allowed"
 assert not list((controller / "source_active").glob("*")), "source links retained"
+audit = [json.loads(line) for line in (controller / "pressure_audit.jsonl").open()]
+switches = [r for r in audit if r.get("kind") == "source_entry_switched"]
+assert all(r["target_instance"] == a_id for r in switches)
+a_sessions = sorted((Path(targets["A"]["mechanism_root"]) / "sessions").iterdir())
+states = {}
+for session in a_sessions:
+    state = session / "takeover_state.json"
+    states[session.name] = json.loads(state.read_text()).get("state") if state.is_file() else None
+committed = [k for k, v in states.items() if v == "COMMITTED"]
+released = [
+    k for k in committed
+    if json.loads((Path(targets["A"]["mechanism_root"]) / "sessions" / k
+                   / "source_kv_release_receipt.json").read_text()).get("status")
+    == "SOURCE_KV_RELEASED"
+]
+idle = [
+    k for k in committed
+    if (Path(targets["A"]["mechanism_root"]) / "sessions" / k
+        / "channel_idle_verified.json").is_file()
+]
 
 # Serving flags must match. Identity paths and channel/notification ports differ.
 from tools.bridge_tp.migration_receivers import normalized_receiver_command as normalized
 
 assert normalized(argv["target_argv"], targets["B"]) == normalized(
-    argv["extra_argv"][targets["A"]["instance_id"]], targets["A"]
+    argv["extra_argv"][a_id], targets["A"]
 ), "A/B effective serving arguments differ beyond identities/ports"
 summary = dict(
-    four_pairs_warm=True, zero_migration_to_A=True, requests=156,
-    output_tokens=68352, receiver_flags_match=True,
+    four_pairs_warm=True, requests=1776, output_tokens=517632,
+    receiver_flags_match=True, entry_switches=len(switches),
+    a_session_states=states, a_committed=len(committed),
+    a_source_released=len(released), a_channel_idle_verified=len(idle),
+    reuse_observed=len(committed) >= 2,
     startup_span_s=startup["all_stagers_ready_unix_s"] - startup["started_unix_s"],
-    startup_increment_s=None,
-    note="startup increment needs a comparable baseline; zero B migration is allowed",
 )
-(root / "receiver_stage2_check.json").write_text(json.dumps(summary, indent=2))
+(root / "force_a_check.json").write_text(json.dumps(summary, indent=2))
 print(json.dumps(summary))
+# Zero committed migrations to A is coverage, not a technical failure.
+sys.exit(0 if committed and len(released) == len(committed) else 3)
 PY
+        check=$?
+        if [ "$check" = 3 ]; then
+            echo "[核对] 没有提交到A的迁移或源释放不全：记覆盖不足。"
+            [ "$status" = 0 ] && status=2
+        elif [ "$check" != 0 ]; then
+            status=1
+        fi
         cat "$run/$name.slots_check.log"
     fi
     printf '%s\t%s\t%s\n' "$name" "$runner_status" "$status" >> "$run/scenes.tsv"
