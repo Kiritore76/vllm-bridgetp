@@ -64,6 +64,7 @@ CONVERSIONS = {
     "L2-L1A": dict(bundle="A", target_mode="TP1", join_migration=True),
 }
 from tools.bridge_tp.six_conversion import EDGES as SIX_EDGES  # noqa: E402
+from tools.bridge_tp.six_conversion import PATH as SIX_PATH  # noqa: E402
 
 # Layout a conversion edge starts from.
 START_LAYOUT = {name: name.split("-")[0] for name in CONVERSIONS}
@@ -238,6 +239,46 @@ def closed_loop_proof(plan, arm):
         sessions=sessions,
         final_controller_outcome=final["outcome"],
     )
+
+
+def six_conversion_result(args, ledger, run_count, scene_dir):
+    """Verdict of a six-card conversion run (explicit edge or decider).
+
+    These runs write ``conversion_sequence``, never the four-card ``conversion``
+    or the static ``six_card`` receipt; the four-card and static summaries read
+    those and raised KeyError after a passing L1AC-L2C GPU run (11-08). Missing
+    evidence fails here; nothing defaults to passed.
+    """
+    gaps = dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2
+    done = len(ledger) == run_count and all(r["status"] == "COMPLETED" for r in ledger)
+    if args.conversion_decider == "record":
+        # Record only: the layout never changes and no sequence is assessed.
+        return (dict(status="COMPLETED_CONVERSION_DECIDER_RECORD"), 0) if done else gaps
+    sequences = [r.get("conversion_sequence") for r in ledger]
+    passed = done and all(
+        isinstance(s, dict) and s.get("passed") is True for s in sequences
+    )
+    if not args.conversion:
+        return (dict(status="COMPLETED_CONVERSION_SEQUENCE"), 0) if passed else gaps
+    after = SIX_EDGES[args.conversion][1]
+    phases = sequences[0].get("phases") if passed and len(ledger) == 1 else None
+    final = phases[-1].get("layout") if phases else None
+    if (
+        passed
+        and len(ledger) == 1
+        and sequences[0].get("all_steps_completed") is True
+        and final == SIX_PATH[after]
+    ):
+        edge = args.conversion
+        return dict(status="COMPLETED_CONVERSION", edge=edge, layout=after), 0
+    outcome = scene_dir / "conversion_result.json" if scene_dir else None
+    if (
+        outcome is not None
+        and outcome.is_file()
+        and json.loads(outcome.read_text(encoding="utf-8")).get("state") == "ABORTED"
+    ):
+        return dict(status="CONVERSION_ABORTED_SAFELY"), 2
+    return gaps
 
 
 def main(argv=None):
@@ -1426,7 +1467,7 @@ def main(argv=None):
                     if accepted
                     else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
                 )
-            if args.conversion:
+            if args.conversion and not six_conversion:
                 # The scene already failed unless the plan COMPLETED; the memory
                 # check needs every session COMMITTED, which retiring a source
                 # early does not provide, so it is kept as a record only.
@@ -1534,7 +1575,9 @@ def main(argv=None):
                     if accepted
                     else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
                 )
-        if args.static_layout:
+        # A six-card conversion starts from a static layout but is not a static
+        # run: it has no six_card receipt (its own verdict follows below).
+        if args.static_layout and not six_conversion:
             done = len(ledger) == run_count and all(
                 r["status"] == "COMPLETED" for r in ledger
             )
@@ -1545,12 +1588,19 @@ def main(argv=None):
                 if done
                 else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
             )
-        if args.conversion_cycle or args.decider_multi:
+        if (args.conversion_cycle or args.decider_multi) and not six_conversion:
             accepted = len(ledger) == 1 and ledger[0]["conversion_sequence"]["passed"]
             result, code = (
                 (dict(status="COMPLETED_CONVERSION_SEQUENCE"), 0)
                 if accepted
                 else (dict(status="COMPLETED_WITH_COVERAGE_GAPS"), 2)
+            )
+        if six_conversion:
+            result, code = six_conversion_result(
+                args,
+                ledger,
+                run_count,
+                plans[0][3]["run_dir"].parent if plans else None,
             )
     except KeyboardInterrupt:
         result, code = dict(status="INTERRUPTED"), 130
@@ -1573,6 +1623,10 @@ def main(argv=None):
             maximum_live_runs=run_count,
             experiment_mode="conversion-cycle"
             if args.conversion_cycle
+            else "six-card-conversion-" + args.conversion
+            if six_conversion and args.conversion
+            else "six-card-decider-" + args.conversion_decider
+            if six_conversion
             else "static-layout-" + args.static_layout
             if args.static_layout
             else "conversion-" + args.conversion

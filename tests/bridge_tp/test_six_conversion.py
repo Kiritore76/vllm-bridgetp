@@ -242,6 +242,93 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(result, 0)
 
 
+class RunnerVerdictTests(unittest.TestCase):
+    """GPU 11-08: a passing L1AC-L2C run ended runner=2 on KeyError('conversion')
+    because the four-card and static summaries read receipts it never writes."""
+
+    def args(self, conversion="L1AC-L2C", decider=None):
+        return NS(conversion=conversion, conversion_decider=decider)
+
+    def row(self, layout, passed=True, steps=True, status="COMPLETED"):
+        return dict(
+            status=status,
+            conversion_sequence=dict(
+                passed=passed,
+                all_steps_completed=steps,
+                phases=[dict(state="COMPLETED", layout=dict(layout))],
+            ),
+        )
+
+    def verdict(self, args, ledger, scene=None):
+        return runner.six_conversion_result(args, ledger, 1, scene)
+
+    def test_explicit_edge_passes_only_at_its_target_layout(self):
+        for edge, (_, after, _, _) in six.EDGES.items():
+            result, code = self.verdict(self.args(edge), [self.row(six.PATH[after])])
+            self.assertEqual(
+                (result, code),
+                (dict(status="COMPLETED_CONVERSION", edge=edge, layout=after), 0),
+            )
+        wrong = self.row(six.PATH["L1AC"])
+        self.assertEqual(self.verdict(self.args(), [wrong])[1], 2)
+
+    def test_missing_or_failed_evidence_never_passes(self):
+        target = six.PATH["L2C"]
+        cases = [
+            [dict(status="COMPLETED")],  # no conversion_sequence at all
+            [self.row(target, passed=False)],
+            [self.row(target, steps=False)],
+            [self.row(target, status="FAILED")],
+            [],
+        ]
+        for ledger in cases:
+            with self.subTest(ledger=ledger):
+                result, code = self.verdict(self.args(), ledger)
+                self.assertEqual(
+                    (result["status"], code), ("COMPLETED_WITH_COVERAGE_GAPS", 2)
+                )
+
+    def test_aborted_conversion_is_reported_as_aborted(self):
+        with tempfile.TemporaryDirectory() as folder:
+            scene = Path(folder)
+            (scene / "conversion_result.json").write_text(
+                json.dumps(dict(state="ABORTED"))
+            )
+            result, code = self.verdict(self.args(), [dict(status="COMPLETED")], scene)
+        self.assertEqual((result["status"], code), ("CONVERSION_ABORTED_SAFELY", 2))
+
+    def test_decider_runs(self):
+        execute = self.args(conversion=None, decider="execute")
+        self.assertEqual(
+            self.verdict(execute, [self.row(six.PATH["L2C"])]),
+            (dict(status="COMPLETED_CONVERSION_SEQUENCE"), 0),
+        )
+        self.assertEqual(self.verdict(execute, [dict(status="COMPLETED")])[1], 2)
+        record = self.args(conversion=None, decider="record")
+        self.assertEqual(
+            self.verdict(record, [dict(status="COMPLETED")]),
+            (dict(status="COMPLETED_CONVERSION_DECIDER_RECORD"), 0),
+        )
+
+    def test_four_card_and_static_summaries_skip_six_card_conversions(self):
+        """Their receipts do not exist for these runs; reading them raised."""
+        import inspect
+
+        source = inspect.getsource(runner.main)
+        for guard in (
+            "if args.conversion and not six_conversion:",
+            "if args.static_layout and not six_conversion:",
+            "if (args.conversion_cycle or args.decider_multi) and not six_conversion:",
+            "result, code = six_conversion_result(",
+        ):
+            self.assertIn(guard, source)
+        # The six-card verdict is the last one written.
+        self.assertGreater(
+            source.index("result, code = six_conversion_result("),
+            source.index("if args.static_layout and not six_conversion:"),
+        )
+
+
 def plan_at(root, layout):
     plan = canonical_plan(root, layout)
     plan["controller_argv"] += ["--maximum-migrations", "0"]
