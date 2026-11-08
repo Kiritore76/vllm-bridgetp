@@ -16,6 +16,27 @@ from unittest.mock import Mock, patch
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "requires torch")
 class TestGpuDirectHistoryLifecycle(unittest.TestCase):
+    def test_failed_listener_bind_closes_its_socket(self):
+        import errno
+
+        import torch
+
+        from vllm.bridge_tp.gpu_direct_history import GpuDirectHistoryReceiver
+
+        listener = Mock()
+        listener.bind.side_effect = OSError(errno.EADDRINUSE, "occupied")
+        with (
+            patch(
+                "vllm.bridge_tp.gpu_direct_history.socket.socket", return_value=listener
+            ),
+            self.assertRaises(OSError),
+        ):
+            GpuDirectHistoryReceiver(
+                device=torch.device("cuda:0"), host="127.0.0.1", port=34090
+            )
+        listener.close.assert_called_once()
+
+
     def test_preconnect_opens_channel_without_starting_session(self) -> None:
         import torch
 

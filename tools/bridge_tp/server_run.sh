@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 当前任务：修复新源监听重试后，CPU前置通过再重跑L2C到L1AC一场；保留rank级通道进度/错误回执，不绕过预热。
+# 当前任务：避开系统临时/占用端口、补启动绑定重试后，CPU前置通过再重跑L2C到L1AC一场；不绕过预热。
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
@@ -19,7 +19,7 @@ run=/root/autodl-tmp/bridgetp/results/qwen3_six_conversion_$(date +%Y%m%d_%H%M%S
 mkdir "$run" || exit 1
 printf '%s\n' "$revision" > "$run/revision.txt"
 printf 'six-card unified; explicit L2C to L1AC (split A) at 60s; DRAIN natural; gate<0.9; no TP2 migration.\n' > "$run/scope.txt"
-printf 'retry after pending-listener fix; per-rank connection receipts; warmup proof remains mandatory.\n' >> "$run/scope.txt"
+printf 'retry after OS-aware port allocation and startup bind retry; warmup proof remains mandatory.\n' >> "$run/scope.txt"
 echo "本批目录：$run"
 echo 'Linux CPU前置失败/错误/跳过即停止；通过后仅运行L2C到L1AC一场GPU冒烟。'
 echo '失败即打包，不自动重试、不删除结果；不清理其他进程。'
@@ -54,6 +54,7 @@ export TMPDIR="$task_tmp" TEMP="$task_tmp" TMP="$task_tmp"
     tests.bridge_tp.test_migration_plan tests.bridge_tp.test_qwen3_six_card \
     tests.bridge_tp.test_pressure_launcher \
     tests.bridge_tp.test_source_channels tests.bridge_tp.test_channel_runtime \
+    tests.bridge_tp.test_tcp_ports tests.bridge_tp.test_gpu_direct_history_lifecycle \
     > "$run/cpu_checks.log" 2>&1
 status=$?
 tail -n 12 "$run/cpu_checks.log"
@@ -61,6 +62,7 @@ if [ -f "$run/cpu_summary.json" ]; then
     cat "$run/cpu_summary.json"
 fi
 [ "$status" = 0 ] || { pack_result "$status"; exit "$status"; }
+"$py" -B -c 'import json,sys; from pathlib import Path; from tools.bridge_tp.pressure_cpu import load; Path(sys.argv[1]).write_text(json.dumps(load("tcp_ports").environment_snapshot(),indent=2)+"\n")' "$run/port_environment.json" || { pack_result 1; exit 1; }
 [ -f "$model/config.json" ] || { echo '找不到Qwen3-8B模型。'; pack_result 1; exit 1; }
 [ "$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)" = 6 ] || { echo '需要六卡。'; pack_result 1; exit 1; }
 [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || { echo 'GPU忙，未清理其他进程。'; pack_result 1; exit 1; }

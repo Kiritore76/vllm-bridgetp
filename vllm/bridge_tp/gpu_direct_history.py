@@ -180,10 +180,14 @@ class GpuDirectHistoryReceiver:
         self.device = _cuda_device(device)
         self.defer_communicator_destroy = defer_communicator_destroy
         self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.listener.bind((host, port))
-        self.listener.listen(1)
-        self.listener.settimeout(_TIMEOUT_S)
+        try:
+            self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.listener.bind((host, port))
+            self.listener.listen(1)
+            self.listener.settimeout(_TIMEOUT_S)
+        except BaseException:
+            self.listener.close()
+            raise
         self.nccl: NCCLLibrary | None = None
         self.connection: socket.socket | None = None
         self.comm: Any | None = None

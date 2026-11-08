@@ -1462,6 +1462,12 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             value.update(
                 last_error=failure, error_stage=error_stage, failed_unix_s=time.time()
             )
+            if stage == "bind":
+                from vllm.bridge_tp.controller.tcp_ports import bind_snapshot
+
+                value["bind_snapshot"] = bind_snapshot(
+                    channel.base_port + value["target_tp_rank"]
+                )
         states[channel.generation] = value
         _atomic_json_dump(
             value,
@@ -1551,6 +1557,70 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             )
             self._channel_plan_acknowledged = True
 
+    def _initialize_source_channels(self, timeout_s=15.0) -> bool:
+        """Keep the multi-source set alive across retryable startup failures.
+
+        The budget covers retries after socket errors, not a hard timeout for
+        an already blocking TCP/NCCL call. Formal warmup receipts still gate
+        startup; setting the receiver-ready event never substitutes for them.
+        """
+        import errno
+
+        rank = get_tp_group().rank_in_group
+        device = next(iter(self._registered_kv_caches.values())).device
+        channels = SourceChannelSet(
+            lambda channel: self._bind_source_receiver(channel, rank, device),
+            lambda receiver, channel: self._open_source_receiver(
+                receiver, channel, rank
+            ),
+            lambda receiver, channel: self._retire_source_receiver(
+                receiver, channel, rank
+            ),
+            report=self._source_channel_progress,
+        )
+        self._source_channels = channels
+        complete = False
+        deadline = time.monotonic() + timeout_s
+        try:
+            while not self._prebind_receiver_stop.is_set():
+                try:
+                    if (
+                        self._source_plan_path is not None
+                        and self._source_plan_path.is_file()
+                    ):
+                        self._reconcile_source_channels()
+                    else:
+                        channels.reconcile(self._source_plan or ())
+                    complete = True
+                    return True
+                except OSError as error:
+                    if error.errno not in (
+                        errno.EADDRINUSE,
+                        errno.ECONNRESET,
+                        errno.ECONNABORTED,
+                        errno.ECONNREFUSED,
+                        errno.ETIMEDOUT,
+                        errno.EINTR,
+                        10048,
+                        10054,
+                        10061,
+                    ):
+                        raise
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"initial source channels could not open: {error!r}"
+                        ) from error
+                    self._prebind_receiver_stop.wait(min(0.1, remaining))
+            return False
+        finally:
+            if not complete:
+                try:
+                    channels.close_all()
+                finally:
+                    self._source_channels = None
+
+
     def _start_gpu_direct_receiver_prebind(self) -> None:
         """Bind the GPU-direct listener before dynamic cutover is known.
 
@@ -1572,23 +1642,9 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 self._source_plan is not None or self._source_plan_path is not None
             ):
                 try:
-                    tp_rank = get_tp_group().rank_in_group
-                    device = next(iter(self._registered_kv_caches.values())).device
-                    channels = SourceChannelSet(
-                        lambda channel: self._bind_source_receiver(
-                            channel, tp_rank, device
-                        ),
-                        lambda receiver, channel: self._open_source_receiver(
-                            receiver, channel, tp_rank
-                        ),
-                        lambda receiver, channel: self._retire_source_receiver(
-                            receiver, channel, tp_rank
-                        ),
-                        report=self._source_channel_progress,
-                    )
-                    channels.reconcile(self._source_plan or ())
-                    self._source_channels = channels
-                    self._reconcile_source_channels()
+                    if not self._initialize_source_channels():
+                        self._prebind_receiver_ready.set()
+                        return
                 except BaseException:
                     logger.exception("GPU-direct per-source preconnect failed")
                     self._prebind_receiver_ready.set()
@@ -1615,18 +1671,14 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     receiver.allow_idle_wait = True
                     receiver.connection.settimeout(None)
                     warmup_started = time.perf_counter()
-                    warmup_bytes = receiver.warmup_preconnected_channel(
-                        rank=tp_rank
-                    )
+                    warmup_bytes = receiver.warmup_preconnected_channel(rank=tp_rank)
                     _atomic_json_dump(
                         {
                             "status": "WARMUP_COMPLETE",
                             "target_tp_rank": tp_rank,
                             "channel_generation": self.channel_generation,
                             "warmup_payload_bytes": warmup_bytes,
-                            "warmup_ms": (
-                                time.perf_counter() - warmup_started
-                            ) * 1000,
+                            "warmup_ms": (time.perf_counter() - warmup_started) * 1000,
                             "completed_unix_s": receiver.warmup_completed_unix_s,
                         },
                         self.manifest_path.parent
@@ -1681,9 +1733,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     with self._prebound_gpu_receiver_lock:
                         receiver = self._prebound_gpu_receiver
                     if receiver is None:
-                        device = next(
-                            iter(self._registered_kv_caches.values())
-                        ).device
+                        device = next(iter(self._registered_kv_caches.values())).device
                         receiver = GpuDirectHistoryReceiver(
                             device=device,
                             host=str(record["host"]),

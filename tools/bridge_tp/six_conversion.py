@@ -9,6 +9,8 @@ from tools.bridge_tp import pressure_conversion as pc
 from tools.bridge_tp.conversion_channels import TargetChannelGraph
 from tools.bridge_tp.conversion_sequence import SequenceBackend
 
+ports = pc.load("tcp_ports")
+
 PATH = {
     "L0": {"A": 1, "B": 1, "C": 1},
     "L1AC": {"A": 1, "B": 2, "C": 1},
@@ -31,14 +33,7 @@ EDGES = {
 
 
 def take(state, width=10):
-    port = state["next_port"]
-    if port + width >= 64000:
-        raise ValueError("six-card conversion port budget exhausted")
-    state["next_port"] += width
-    state.setdefault("port_blocks", []).append(
-        dict(owner=f"six_conversion_{port}", first=port, last=port + width - 1)
-    )
-    return port
+    return ports.take(state, width)
 
 
 def receiver(state, row, run):
@@ -186,7 +181,7 @@ def configure(plan):
     if plan.get("scheduler") != "unified" or plan.get("static_cards") != 6:
         raise ValueError("six-card conversion requires six-card unified scheduler")
     rows = plan["instances"]["instances"]
-    state = dict(next_port=34000, generation=1000)
+    state = dict(ports.state(), generation=1000)
     targets = {
         r["instance_id"]: receiver(state, r, plan["run_dir"])
         for r in sorted(rows, key=lambda r: (r["bundle_id"] != "B", r["instance_id"]))
@@ -263,6 +258,8 @@ def configure(plan):
             for n in sources
         ],
         port_blocks=copy.deepcopy(state.get("port_blocks", [])),
+        port_policy=copy.deepcopy(state["port_policy"]),
+        port_probe_failures=copy.deepcopy(state.get("port_probe_failures", [])),
     )
 
 

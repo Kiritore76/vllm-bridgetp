@@ -46,6 +46,144 @@ def methods(*names):
     return namespace
 
 
+class StartupRetryTests(unittest.TestCase):
+    """Run the actual multi-source worker branch with CPU receiver fakes."""
+
+    def run_worker(self, mode):
+        import errno
+
+        from tests.bridge_tp.test_source_channels import ConnectorWiringTests
+        from vllm.bridge_tp.source_channels import SourceChannelSet, parse_plan
+
+        ns = methods(
+            "_start_gpu_direct_receiver_prebind",
+            "_initialize_source_channels",
+            "_reconcile_source_channels",
+        )
+        clock = NS(now=0.0)
+        ns.update(
+            SourceChannelSet=SourceChannelSet,
+            parse_plan=parse_plan,
+            _load_json_list=ConnectorWiringTests().module_function("_load_json_list"),
+            time=NS(
+                monotonic=lambda: clock.now,
+                time=lambda: clock.now,
+                sleep=lambda delay: None,
+            ),
+            threading=NS(Thread=lambda **kwargs: NS(start=kwargs["target"])),
+        )
+
+        class Stop:
+            stopped = False
+
+            def is_set(self):
+                return self.stopped
+
+            def wait(self, delay):
+                clock.now += 20 if mode == "persistent" else delay
+                if mode == "stop":
+                    self.stopped = True
+                return self.stopped
+
+            def set(self):
+                self.stopped = True
+
+        stop = Stop()
+        bound, closed, opened = [], [], []
+        attempts = []
+        rows = [
+            dict(source="C-g1-tp1", base_port=34080, generation=1003),
+            dict(source="C-g4-tp1", base_port=34090, generation=1004),
+        ]
+
+        class Receiver:
+            def __init__(self, channel):
+                self.channel = channel
+                bound.append(self)
+
+            def close(self):
+                closed.append(self.channel.generation)
+
+        def bind(channel, *args):
+            attempts.append(channel.generation)
+            if channel.generation == 1004 and (
+                mode in ("persistent", "stop") or attempts.count(1004) == 1
+            ):
+                raise OSError(errno.EADDRINUSE, "address in use")
+            return Receiver(channel)
+
+        def opened_receiver(receiver, channel, rank):
+            opened.append(channel.generation)
+            if channel.generation == 1004:
+                stop.set()
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "plan.json"
+            path.write_text(
+                json.dumps(dict(sources=rows) if mode == "invalid" else rows)
+            )
+            c = NS(
+                preconnect_gpu_direct=True,
+                _source_plan=parse_plan(rows, 2),
+                _source_plan_path=path,
+                _source_channels=None,
+                _registered_kv_caches={"layer": NS(device="cuda")},
+                _bind_source_receiver=bind,
+                _open_source_receiver=opened_receiver,
+                _retire_source_receiver=lambda r, c, rank: r.close(),
+                _source_channel_progress=lambda *args: None,
+                _channel_plan_cache=ManifestPollCache(),
+                _channel_plan_acknowledged=False,
+                _target_tp_size=2,
+                manifest_path=Path(folder) / "session/manifest.json",
+                _prebind_receiver_thread=None,
+                _prebind_receiver_stop=stop,
+                _prebind_receiver_ready=threading.Event(),
+            )
+            c._initialize_source_channels = lambda: ns["_initialize_source_channels"](c)
+            c._reconcile_source_channels = lambda: ns["_reconcile_source_channels"](c)
+            fake = types.ModuleType("vllm.bridge_tp.gpu_direct_history")
+            fake.GpuDirectHistoryReceiver = Mock(
+                side_effect=AssertionError("use per-source factory")
+            )
+            with patch.dict(sys.modules, {fake.__name__: fake}):
+                ns["_start_gpu_direct_receiver_prebind"](c)
+            return c, attempts, closed, opened
+
+    def test_first_bind_failure_retries_in_the_actual_worker_without_resetting_peer(
+        self,
+    ):
+        c, attempts, closed, opened = self.run_worker("once")
+        self.assertEqual(attempts, [1003, 1004, 1004])
+        self.assertEqual(closed, [])
+        self.assertEqual(opened, [1003, 1004])
+        self.assertEqual(set(c._source_channels.channels), {1003, 1004})
+        self.assertTrue(c._channel_plan_acknowledged)
+        self.assertFalse(c._prebind_receiver_ready.is_set())  # no migrated history yet
+
+    def test_persistent_bind_conflict_cleans_pending_listener_and_does_not_ack(self):
+        c, attempts, closed, opened = self.run_worker("persistent")
+        self.assertEqual(attempts, [1003, 1004, 1004])
+        self.assertEqual(closed, [1003])
+        self.assertEqual(opened, [])
+        self.assertIsNone(c._source_channels)
+        self.assertFalse(c._channel_plan_acknowledged)
+        self.assertTrue(c._prebind_receiver_ready.is_set())
+
+    def test_invalid_initial_plan_error_is_not_retried(self):
+        c, attempts, closed, opened = self.run_worker("invalid")
+        self.assertEqual(attempts, [])
+        self.assertEqual(closed, [])
+        self.assertIsNone(c._source_channels)
+
+    def test_stop_during_initial_retry_closes_pending_listener(self):
+        c, attempts, closed, opened = self.run_worker("stop")
+        self.assertEqual(attempts, [1003, 1004])
+        self.assertEqual(closed, [1003])
+        self.assertIsNone(c._source_channels)
+
+
+
 class RuntimeTests(unittest.TestCase):
     def test_gpu_identity_allows_replacement_cards_and_changed_indices(self):
         from tools.bridge_tp import run_qwen3_online_loaded_validation as runner

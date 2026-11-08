@@ -418,6 +418,44 @@ class ChannelDiagnosticTests(unittest.TestCase):
 
 
 class PlansTests(unittest.TestCase):
+    def test_initial_peer_plans_share_the_reallocated_port_blocks(self):
+        with tempfile.TemporaryDirectory() as folder:
+            original = six.ports.probe_block
+
+            def occupied(first, width):
+                if first == 18000:
+                    return False, dict(port=first, error="occupied")
+                return original(first, width)
+
+            with (
+                patch.object(
+                    six.ports,
+                    "state",
+                    return_value=dict(
+                        next_port=18000,
+                        port_policy=dict(
+                            ephemeral_range=[32768, 60999], reserved_ports=""
+                        ),
+                    ),
+                ),
+                patch.object(six.ports, "probe_block", side_effect=occupied),
+            ):
+                plan = plan_at(Path(folder), "L2C")
+            blocks = plan["migration_plan"]["port_blocks"]
+            self.assertNotIn(18000, [b["first"] for b in blocks])
+            self.assertEqual(plan["six_state"]["port_probe_failures"][0]["port"], 18000)
+            for source in plan["source_links"]:
+                entries = six.source_entries(source, plan["six_targets"])
+                for entry in entries:
+                    target = plan["six_targets"][entry["target"]]
+                    expected = next(
+                        c for c in target["connector_sources"] if c["source"] == source
+                    )
+                    self.assertEqual(
+                        (entry["base_port"], entry["generation"]),
+                        (expected["base_port"], expected["generation"]),
+                    )
+
     def test_all_layouts_have_owned_full_mesh_and_distinct_ports(self):
         for layout in six.PATH:
             with self.subTest(layout=layout), tempfile.TemporaryDirectory() as folder:

@@ -343,6 +343,35 @@ class ConnectorWiringTests(unittest.TestCase):
                 (path.parent.parent / "gpu_channel_preconnect_receipts").exists()
             )
 
+    def test_bind_failure_snapshot_uses_the_actual_rank_port(self):
+        import os
+        import time
+        from pathlib import Path
+        from unittest.mock import Mock, patch
+
+        progress = self.method("_source_channel_progress")
+        dump = Mock()
+        progress.__globals__.update(
+            os=os,
+            time=time,
+            get_tp_group=lambda: NS(rank_in_group=1),
+            logger=NS(warning=lambda *args: None),
+            _atomic_json_dump=dump,
+        )
+        with patch(
+            "vllm.bridge_tp.controller.tcp_ports.bind_snapshot",
+            return_value={"port": 30401},
+        ) as snapshot:
+            progress(
+                NS(manifest_path=Path("unused/session.json")),
+                parse_plan([A], 2)[0],
+                "bind",
+                "FAILED",
+                OSError("occupied"),
+            )
+        snapshot.assert_called_once_with(30401)
+        self.assertEqual(dump.call_args.args[0]["bind_snapshot"], {"port": 30401})
+
     def test_retired_receiver_leaves_the_set_before_its_teardown(self):
         """S3b-3 GPU (10-31): teardown runs through ``retire`` (background
         in the connector), never as a blocking close inside reconcile."""
@@ -553,13 +582,16 @@ class ConnectorWiringTests(unittest.TestCase):
         self.assertIn("parse_plan", called(methods["__init__"]))
         self.assertIn("_check_source_generation", called(methods["_load_manifest"]))
         prebind = called(methods["_start_gpu_direct_receiver_prebind"])
+        startup = called(methods["_initialize_source_channels"])
+        self.assertIn("_initialize_source_channels", prebind)
         for name in (
-            "SourceChannelSet",
             "_reconcile_source_channels",
             "_activate_source_channel",
             "discard",
         ):
             self.assertIn(name, prebind)
+        self.assertIn("SourceChannelSet", startup)
+        self.assertIn("_reconcile_source_channels", startup)
         text = ast.unparse(methods["__init__"])
         for key in ("bridgetp_gpu_direct_sources", "bridgetp_gpu_direct_channel_plan"):
             self.assertIn(key, text)
