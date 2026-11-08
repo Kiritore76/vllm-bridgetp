@@ -337,6 +337,86 @@ def plan_at(root, layout):
     return plan
 
 
+class ChannelDiagnosticTests(unittest.TestCase):
+    def backend(self, root, now):
+        backend = object.__new__(six.SixBackend)
+        backend.targets = {
+            "B-g2-tp2": dict(
+                mechanism_root=str(root),
+                connector_sources=[
+                    dict(
+                        source="A-g5-tp1",
+                        base_port=34100,
+                        generation=1005,
+                    )
+                ],
+            )
+        }
+        backend.joined_at = 0
+        backend.clock = lambda: now
+        backend.channel_graph = NS(acknowledged=lambda: True)
+        return backend
+
+    def test_warmup_timeout_includes_the_target_rank_connection_failure(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            path = (
+                root / "sessions/s1/gpu_channel_connection_receipts/tp_rank_1-1005.json"
+            )
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                json.dumps(
+                    dict(
+                        target_tp_rank=1,
+                        source_instance="A-g5-tp1",
+                        base_port=34100,
+                        channel_generation=1005,
+                        status="FAILED",
+                        stage="bind",
+                        last_error="OSError('bind unavailable')",
+                        updated_unix_s=30,
+                    )
+                )
+            )
+            with (
+                patch.object(six.SequenceBackend, "warm_and_verify", return_value=True),
+                self.assertRaisesRegex(TimeoutError, "bind unavailable") as raised,
+            ):
+                six.SixBackend.warm_and_verify(self.backend(root, 781), {})
+            self.assertIn('"generation": 1005', str(raised.exception))
+            self.assertIn('"target_tp_rank": 1', str(raised.exception))
+
+    def test_diagnostic_complete_never_substitutes_for_warmup_proof(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            path = (
+                root / "sessions/s1/gpu_channel_connection_receipts/tp_rank_1-1005.json"
+            )
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps(dict(status="COMPLETE", updated_unix_s=20)))
+            backend = self.backend(root, 30)
+            with patch.object(
+                six.SequenceBackend, "warm_and_verify", return_value=True
+            ):
+                self.assertFalse(six.SixBackend.warm_and_verify(backend, {}))
+                receipts = root / "sessions/s1/gpu_channel_preconnect_receipts"
+                receipts.mkdir()
+                for name in (
+                    "source-A-g5-tp1-B-g2-tp2.json",
+                    "tp_rank_0-A-g5-tp1.json",
+                    "tp_rank_1-A-g5-tp1.json",
+                ):
+                    (receipts / name).write_text(
+                        json.dumps(
+                            dict(
+                                status="WARMUP_COMPLETE",
+                                channel_generation=1005,
+                            )
+                        )
+                    )
+                self.assertTrue(six.SixBackend.warm_and_verify(backend, {}))
+
+
 class PlansTests(unittest.TestCase):
     def test_all_layouts_have_owned_full_mesh_and_distinct_ports(self):
         for layout in six.PATH:

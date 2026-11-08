@@ -1385,13 +1385,17 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
 
     def _open_source_receiver(self, receiver, channel, tp_rank: int) -> None:
         """Handshake and warm one bound source channel on this rank."""
+        stage = "accept_handshake"
         try:
+            self._source_channel_progress(channel, stage, "STARTED", None)
             receiver._open(migration_id="", rank=tp_rank)
             if receiver.channel_generation != channel.generation:
                 raise RuntimeError("source channel generation differs")
             assert receiver.connection is not None
             receiver.allow_idle_wait = True
             receiver.connection.settimeout(None)
+            stage = "warmup"
+            self._source_channel_progress(channel, stage, "STARTED", None)
             started = time.perf_counter()
             payload = receiver.warmup_preconnected_channel(rank=tp_rank)
             _atomic_json_dump(
@@ -1408,9 +1412,63 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 / "gpu_channel_preconnect_receipts"
                 / f"tp_rank_{tp_rank}-{channel.source}.json",
             )
-        except BaseException:
+        except BaseException as error:
+            self._source_channel_progress(channel, stage, "FAILED", error)
             receiver.close()
             raise
+
+    def _source_channel_progress(self, channel, stage, status, error) -> None:
+        """Receipt dynamic listener failures that the idle poller can retry.
+
+        This diagnostic never counts as a channel ACK or a warmup receipt.
+        Keep the last failure even after a retry starts, so a stuck accept or
+        NCCL handshake does not erase the preceding bind/handshake evidence.
+        """
+        states = getattr(self, "_source_channel_progress_states", None)
+        if states is None:
+            states = self._source_channel_progress_states = {}
+        previous = states.get(channel.generation, {})
+        value = dict(
+            previous,
+            target_instance=os.getenv("BRIDGETP_PRESSURE_POOL", "target"),
+            target_tp_rank=get_tp_group().rank_in_group,
+            source_instance=channel.source,
+            channel_generation=channel.generation,
+            base_port=channel.base_port,
+            stage=stage,
+            status=status,
+            updated_unix_s=time.time(),
+        )
+        if error is not None:
+            failure = repr(error)
+            error_stage = (
+                previous["error_stage"]
+                if stage == "handshake"
+                and previous.get("last_error") == failure
+                and previous.get("status") == "FAILED"
+                else stage
+            )
+            if previous.get("last_error") != failure:
+                logger.warning(
+                    "BridgeTP source channel failed: source=%s generation=%d "
+                    "port=%d rank=%d stage=%s error=%s",
+                    channel.source,
+                    channel.generation,
+                    channel.base_port,
+                    value["target_tp_rank"],
+                    stage,
+                    failure,
+                )
+            value.update(
+                last_error=failure, error_stage=error_stage, failed_unix_s=time.time()
+            )
+        states[channel.generation] = value
+        _atomic_json_dump(
+            value,
+            self.manifest_path.parent
+            / "gpu_channel_connection_receipts"
+            / f"tp_rank_{value['target_tp_rank']}-{channel.generation}.json",
+        )
 
     def _retire_source_receiver(self, receiver, channel, tp_rank: int) -> None:
         """Tear down a retired source's channel without blocking plan polling.
@@ -1526,6 +1584,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                         lambda receiver, channel: self._retire_source_receiver(
                             receiver, channel, tp_rank
                         ),
+                        report=self._source_channel_progress,
                     )
                     channels.reconcile(self._source_plan or ())
                     self._source_channels = channels

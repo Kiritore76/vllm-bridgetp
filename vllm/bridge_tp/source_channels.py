@@ -93,21 +93,38 @@ class SourceChannelSet:
         bind: Callable[[SourceChannel], Any],
         open: Callable[[Any, SourceChannel], None],
         retire: Callable[[Any, SourceChannel], None] | None = None,
+        *,
+        report: Callable[..., None] | None = None,
     ) -> None:
         self._bind, self._open = bind, open
         self._retire = retire or (lambda receiver, channel: receiver.close())
+        self._report = report or (lambda *args: None)
         self._lock = threading.RLock()
+        self._reconcile_lock = threading.Lock()
         self.channels: dict[int, tuple[SourceChannel, Any]] = {}
+        self.pending: dict[int, tuple[SourceChannel, Any]] = {}
+        self._closed = False
         self.active_generation: int | None = None
         self.deferred_close: set[int] = set()
 
     def reconcile(self, plan: tuple[SourceChannel, ...]) -> dict[str, list[int]]:
         """Open new sources (sorted by source id), close departed idle ones."""
+        # Serialize plan changes, but never hold the selection lock across a
+        # TCP/NCCL handshake. Retained channels must remain usable meanwhile.
+        with self._reconcile_lock:
+            return self._reconcile(plan)
+
+    def _reconcile(self, plan):
         with self._lock:
+            if self._closed:
+                raise RuntimeError("source channel set is closed")
             wanted = {c.generation: c for c in plan}
-            for generation, (channel, _) in self.channels.items():
+            for generation, (channel, _) in (self.channels | self.pending).items():
                 if generation in wanted and wanted[generation] != channel:
                     raise ValueError("a generation cannot change source or port")
+            for generation in set(self.pending) - set(wanted):
+                _, receiver = self.pending.pop(generation)
+                receiver.close()
             closed, deferred = [], []
             for generation in sorted(set(self.channels) - set(wanted)):
                 channel, receiver = self.channels[generation]
@@ -125,22 +142,53 @@ class SourceChannelSet:
                 (c for g, c in wanted.items() if g not in self.channels),
                 key=lambda c: c.source,
             )
-            bound = []
+        # Retain successfully bound listeners across a later bind failure.
+        # Early senders can already be queued there; closing/resetting them on
+        # each retry prevents any progress towards the full new source set.
+        for channel in new:
+            with self._lock:
+                if self._closed:
+                    raise RuntimeError("source channel set is closed")
+                if channel.generation in self.pending:
+                    continue
+            self._report(channel, "bind", "STARTED", None)
             try:
-                for channel in new:
-                    bound.append((channel, self._bind(channel)))
-                for channel, receiver in bound:
-                    self._open(receiver, channel)
-                    self.channels[channel.generation] = (channel, receiver)
-            except BaseException:
-                for channel, receiver in bound:
-                    held = self.channels.get(channel.generation)
-                    if held is None or held[1] is not receiver:
-                        receiver.close()
+                receiver = self._bind(channel)
+            except BaseException as error:
+                self._report(channel, "bind", "FAILED", error)
                 raise
-            return dict(
-                opened=[c.generation for c in new], closed=closed, deferred=deferred
-            )
+            with self._lock:
+                if self._closed:
+                    receiver.close()
+                    raise RuntimeError("source channel set is closed")
+                self.pending[channel.generation] = (channel, receiver)
+            self._report(channel, "bind", "COMPLETE", None)
+        for channel in new:
+            with self._lock:
+                if self._closed:
+                    raise RuntimeError("source channel set is closed")
+                _, receiver = self.pending[channel.generation]
+            self._report(channel, "handshake", "STARTED", None)
+            try:
+                self._open(receiver, channel)
+            except BaseException as error:
+                self._report(channel, "handshake", "FAILED", error)
+                # A partially handshaken channel cannot safely be reused.
+                # Already warmed channels stay; only pending ones are closed.
+                with self._lock:
+                    pending, self.pending = self.pending, {}
+                for _, held in pending.values():
+                    held.close()
+                raise
+            with self._lock:
+                if self._closed:
+                    raise RuntimeError("source channel set is closed")
+                self.pending.pop(channel.generation)
+                self.channels[channel.generation] = (channel, receiver)
+            self._report(channel, "warmup", "COMPLETE", None)
+        return dict(
+            opened=[c.generation for c in new], closed=closed, deferred=deferred
+        )
 
     def select(self, generation: int) -> Any:
         """Make ``generation`` the active receiver for the next session."""
@@ -168,7 +216,9 @@ class SourceChannelSet:
 
     def close_all(self) -> None:
         with self._lock:
-            for _, receiver in self.channels.values():
+            self._closed = True
+            for _, receiver in (self.channels | self.pending).values():
                 receiver.close()
             self.channels.clear()
+            self.pending.clear()
             self.active_generation = None

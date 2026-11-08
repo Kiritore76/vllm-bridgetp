@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 当前任务：Linux CPU前置通过后，仅六卡统一调度L2C到L1AC一场GPU转换核验（首次拆分：A的TP2自然排空后退役为两个TP1；L1AC→L2C已于11-08通过）。
+# 当前任务：修复新源监听重试后，CPU前置通过再重跑L2C到L1AC一场；保留rank级通道进度/错误回执，不绕过预热。
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
@@ -19,6 +19,7 @@ run=/root/autodl-tmp/bridgetp/results/qwen3_six_conversion_$(date +%Y%m%d_%H%M%S
 mkdir "$run" || exit 1
 printf '%s\n' "$revision" > "$run/revision.txt"
 printf 'six-card unified; explicit L2C to L1AC (split A) at 60s; DRAIN natural; gate<0.9; no TP2 migration.\n' > "$run/scope.txt"
+printf 'retry after pending-listener fix; per-rank connection receipts; warmup proof remains mandatory.\n' >> "$run/scope.txt"
 echo "本批目录：$run"
 echo 'Linux CPU前置失败/错误/跳过即停止；通过后仅运行L2C到L1AC一场GPU冒烟。'
 echo '失败即打包，不自动重试、不删除结果；不清理其他进程。'
@@ -52,6 +53,7 @@ export TMPDIR="$task_tmp" TEMP="$task_tmp" TMP="$task_tmp"
     tests.bridge_tp.test_pressure_conversion tests.bridge_tp.test_runtime_instance_ids \
     tests.bridge_tp.test_migration_plan tests.bridge_tp.test_qwen3_six_card \
     tests.bridge_tp.test_pressure_launcher \
+    tests.bridge_tp.test_source_channels tests.bridge_tp.test_channel_runtime \
     > "$run/cpu_checks.log" 2>&1
 status=$?
 tail -n 12 "$run/cpu_checks.log"

@@ -132,6 +132,112 @@ class ChannelSetTests(unittest.TestCase):
         self.assertEqual(self.channels.channels, {})
         self.assertEqual(sum(1 for op, _ in self.log if op == "close"), 2)
 
+    def test_later_bind_failure_keeps_the_first_new_listener_for_retry(self):
+        """An early new sender must not be reset by its sibling's bind retry."""
+        attempts = []
+        fail = True
+
+        def bind(channel):
+            attempts.append(channel.generation)
+            if channel.generation == 3 and fail:
+                raise OSError("second listener temporarily unavailable")
+            return Receiver(channel, self.log)
+
+        channels = SourceChannelSet(bind, lambda receiver, channel: receiver.open())
+        with self.assertRaises(OSError):
+            channels.reconcile(parse_plan([A, A3], 2))
+        self.assertNotIn(("close", A["source"]), self.log)
+        with self.assertRaises(ValueError):
+            channels.select(1)  # bound is not the same as warmed/selectable
+        fail = False
+        channels.reconcile(parse_plan([A, A3], 2))
+        self.assertEqual(attempts, [1, 3, 3])
+        self.assertEqual(set(channels.channels), {1, 3})
+
+    def test_a_removed_pending_listener_is_closed_without_retiring_old_sources(self):
+        def bind(channel):
+            if channel.generation == 3:
+                raise OSError("bind failed")
+            return Receiver(channel, self.log)
+
+        channels = SourceChannelSet(bind, lambda receiver, channel: receiver.open())
+        with self.assertRaises(OSError):
+            channels.reconcile(parse_plan([A, A3], 2))
+        # Keep the pending listener until the plan actually withdraws it.
+        self.assertNotIn(("close", A["source"]), self.log)
+        channels.reconcile(())
+        self.assertIn(("close", A["source"]), self.log)
+
+    def test_old_channel_remains_selectable_while_a_new_handshake_waits(self):
+        import threading
+
+        entering, release, selected = (
+            threading.Event(),
+            threading.Event(),
+            threading.Event(),
+        )
+
+        def open(receiver, channel):
+            if channel.generation == 3:
+                entering.set()
+                if not release.wait(5):
+                    raise TimeoutError("test handshake did not finish")
+            receiver.open()
+
+        channels = SourceChannelSet(lambda c: Receiver(c, self.log), open)
+        channels.reconcile(parse_plan([A], 2))
+        worker = threading.Thread(
+            target=lambda: channels.reconcile(parse_plan([A, A3], 2))
+        )
+        reader = threading.Thread(target=lambda: (channels.select(1), selected.set()))
+        worker.start()
+        try:
+            self.assertTrue(entering.wait(2))
+            reader.start()
+            self.assertTrue(selected.wait(0.5), "new handshake blocked an old source")
+        finally:
+            release.set()
+            worker.join(3)
+            if reader.ident is not None:
+                reader.join(3)
+
+    def test_pending_identity_cannot_change_and_shutdown_releases_it(self):
+        def bind(channel):
+            if channel.generation == 3:
+                raise OSError("bind failed")
+            return Receiver(channel, self.log)
+
+        channels = SourceChannelSet(bind, lambda r, c: r.open())
+        with self.assertRaises(OSError):
+            channels.reconcile(parse_plan([A, A3], 2))
+        with self.assertRaises(ValueError):
+            channels.reconcile(parse_plan([dict(A, base_port=30500)], 2))
+        channels.close_all()
+        self.assertIn(("close", A["source"]), self.log)
+        self.assertFalse(channels.pending)
+        with self.assertRaises(RuntimeError):
+            channels.reconcile(parse_plan([A], 2))
+
+    def test_progress_receipts_do_not_ack_a_failed_handshake(self):
+        progress = []
+
+        def fail(receiver, channel):
+            raise ConnectionResetError("handshake reset")
+
+        channels = SourceChannelSet(
+            lambda c: Receiver(c, self.log),
+            fail,
+            report=lambda c, stage, status, error: progress.append(
+                (c.generation, stage, status, repr(error))
+            ),
+        )
+        with self.assertRaises(ConnectionResetError):
+            channels.reconcile(parse_plan([A], 2))
+        self.assertIn((1, "bind", "COMPLETE", "None"), progress)
+        self.assertEqual(progress[-1][:3], (1, "handshake", "FAILED"))
+        self.assertFalse(channels.channels)
+        self.assertFalse(channels.pending)
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -191,6 +297,51 @@ class ConnectorWiringTests(unittest.TestCase):
             ns,
         )
         return ns[name]
+
+    def test_connection_failure_receipt_keeps_rank_identity_and_precise_stage(self):
+        import json
+        import os
+        import tempfile
+        import time
+        from pathlib import Path
+
+        progress = self.method("_source_channel_progress")
+        progress.__globals__.update(
+            os=os,
+            time=time,
+            get_tp_group=lambda: NS(rank_in_group=1),
+            logger=NS(warning=lambda *args: None),
+        )
+
+        def atomic(value, path):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(value))
+
+        progress.__globals__["_atomic_json_dump"] = atomic
+        with tempfile.TemporaryDirectory() as folder:
+            connector = NS(manifest_path=Path(folder) / "session/manifest.json")
+            channel = parse_plan([A], 2)[0]
+            error = ConnectionResetError("peer reset")
+            progress(connector, channel, "accept_handshake", "FAILED", error)
+            progress(connector, channel, "handshake", "FAILED", error)
+            progress(connector, channel, "bind", "STARTED", None)
+            path = (
+                Path(folder)
+                / "session/gpu_channel_connection_receipts/tp_rank_1-1.json"
+            )
+            value = json.loads(path.read_text())
+            self.assertEqual(value["source_instance"], A["source"])
+            self.assertEqual(value["base_port"], A["base_port"])
+            self.assertEqual(value["target_tp_rank"], 1)
+            self.assertEqual(value["error_stage"], "accept_handshake")
+            self.assertIn("peer reset", value["last_error"])
+            self.assertEqual(value["status"], "STARTED")
+            self.assertFalse(
+                (path.parent.parent / "gpu_channel_plan_receipts").exists()
+            )
+            self.assertFalse(
+                (path.parent.parent / "gpu_channel_preconnect_receipts").exists()
+            )
 
     def test_retired_receiver_leaves_the_set_before_its_teardown(self):
         """S3b-3 GPU (10-31): teardown runs through ``retire`` (background

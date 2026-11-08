@@ -493,6 +493,7 @@ class SixBackend(SequenceBackend):
     def warm_and_verify(self, plan):
         if not super().warm_and_verify(plan):
             return False
+        missing = []
         for name, target in self.targets.items():
             receipts = pc.preconnect_receipts(Path(target["mechanism_root"]))
             for channel in target["connector_sources"]:
@@ -505,9 +506,41 @@ class SixBackend(SequenceBackend):
                     or receipts[k].get("channel_generation") != channel["generation"]
                     for k in names
                 ):
-                    if self.clock() - self.joined_at > 780:
-                        raise TimeoutError("six-card new channel warmup incomplete")
-                    return False
+                    diagnostics = {}
+                    for path in Path(target["mechanism_root"]).glob(
+                        "sessions/*/gpu_channel_connection_receipts/"
+                        f"tp_rank_*-{channel['generation']}.json"
+                    ):
+                        value = pc.read_json(path) or {}
+                        rank = value.get("target_tp_rank")
+                        if value.get("updated_unix_s", 0) >= diagnostics.get(
+                            rank, {}
+                        ).get("updated_unix_s", 0):
+                            diagnostics[rank] = value
+                    missing.append(
+                        dict(
+                            target=name,
+                            source=source,
+                            generation=channel["generation"],
+                            base_port=channel["base_port"],
+                            missing_receipts=[
+                                k
+                                for k in names
+                                if receipts.get(k, {}).get("status")
+                                != "WARMUP_COMPLETE"
+                                or receipts[k].get("channel_generation")
+                                != channel["generation"]
+                            ],
+                            connection_progress=list(diagnostics.values()),
+                        )
+                    )
+        if missing:
+            if self.clock() - self.joined_at > 780:
+                raise TimeoutError(
+                    "six-card new channel warmup incomplete: "
+                    + json.dumps(missing, sort_keys=True)
+                )
+            return False
         return self.channel_graph.acknowledged()
 
     def write_layout(self, changes, **kwargs):
