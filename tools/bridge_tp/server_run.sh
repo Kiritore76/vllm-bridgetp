@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 当前任务：Linux CPU前置通过后，仅六卡统一调度L1AC到L2C一场GPU转换核验。
+# 当前任务：Linux CPU前置通过后，仅六卡统一调度L2C到L1AC一场GPU转换核验（首次拆分：A的TP2自然排空后退役为两个TP1；L1AC→L2C已于11-08通过）。
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
@@ -18,9 +18,9 @@ mkdir -p /root/autodl-tmp/bridgetp/results || exit 1
 run=/root/autodl-tmp/bridgetp/results/qwen3_six_conversion_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 printf '%s\n' "$revision" > "$run/revision.txt"
-printf 'six-card unified; explicit L1AC to L2C at 60s; DRAIN; gate<0.9; no TP2 migration.\n' > "$run/scope.txt"
+printf 'six-card unified; explicit L2C to L1AC (split A) at 60s; DRAIN natural; gate<0.9; no TP2 migration.\n' > "$run/scope.txt"
 echo "本批目录：$run"
-echo 'Linux CPU前置失败/错误/跳过即停止；通过后仅运行L1AC到L2C一场GPU冒烟。'
+echo 'Linux CPU前置失败/错误/跳过即停止；通过后仅运行L2C到L1AC一场GPU冒烟。'
 echo '失败即打包，不自动重试、不删除结果；不清理其他进程。'
 smi=
 pack_result() {
@@ -68,11 +68,11 @@ avail=$(df --output=avail -k "$run" | tail -1)
 nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,pcie.link.gen.current,pcie.link.width.current --format=csv,noheader > "$run/gpu_before.csv" || { pack_result 1; exit 1; }
 nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,pcie.link.gen.current,pcie.link.width.current --format=csv,noheader -lms 1000 > "$run/gpu_samples.csv" &
 smi=$!
-echo '唯一GPU场：L1AC起点，60秒提议A合并到TP2，保留B和C服务；新A预热后再加入路由和迁移。'
+echo '唯一GPU场：L2C起点，60秒提议A拆回两个TP1；A停止接新请求和新迁移，已有请求自然结束后退役，源入口改回B；B、C保留服务，新TP1加入路由后可作为源迁往B。'
 "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
-    --cards 6 --static-layout L1AC --long-burst-pair \
+    --cards 6 --static-layout L2C --long-burst-pair \
     --scheduler unified --hold-queue --kv-short-exempt --overload-migrate --migrate-current-length \
-    --conversion L1AC-L2C --conversion-trigger-s 60 \
+    --conversion L2C-L1AC --conversion-trigger-s 60 \
     --expanded-context --current-machine --repetitions 1 \
     --model "$model" \
     --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
@@ -88,16 +88,23 @@ paths=list(root.rglob("conversion_sequence_acceptance.json"))
 assert len(paths)==1, paths
 proof=json.loads(paths[0].read_text())
 assert proof["passed"] and proof["all_steps_completed"],proof
+assert proof.get("late_dispatches")==[],proof.get("late_dispatches")
 sequence=json.loads((paths[0].parent/"conversion_sequence_result.json").read_text())
 assert len(sequence["steps"])==1,sequence
 step=sequence["steps"][0]
-assert step["request"]["bundle"]=="A" and step["request"]["target_mode"]=="TP2",step
-assert step["layout"]==dict(A=2,B=2,C=1),step
-print(json.dumps(proof,indent=2))
+assert step["request"]["bundle"]=="A" and step["request"]["target_mode"]=="TP1",step
+assert step["layout"]==dict(A=1,B=2,C=1),step
+phase=proof["phases"][-1]
+# Report the split's own timings; the acceptance above is the gate.
+print(json.dumps(dict(passed=True,layout=step["layout"],
+    drain_s=phase.get("drain_s"),rebuild_s=phase.get("rebuild_s"),
+    admission_closed_s=phase.get("admission_closed_s"),
+    trigger_to_route_s=phase.get("trigger_to_route_s"),
+    migration_coverage=proof.get("migration_coverage")),indent=2))
 PY
     status=$?
     cat "$run/mechanism_check.log"
 fi
-echo '仅验机制，另报告转换耗时、期间服务和迁移；零迁移不代表已验迁入新A，不作收益结论。'
+echo '仅验机制，另报告排空/重建/转换耗时、期间服务和迁移；零迁移不算失败，不作收益结论。'
 pack_result "$status" || exit 1
 exit "$status"
