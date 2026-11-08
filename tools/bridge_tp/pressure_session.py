@@ -160,6 +160,7 @@ class RollingPressureSession:
         self.cancel_reason = None
         self.cancel_started_at = None
         self.cancel_policy = load("pressure_cancel").ShadowCancellation()
+        self._cancel_need_status = None
 
     def _rate_decision(self, snapshot, *, before_start=False):
         if self.transfer_mode == "FULL_SPEED":
@@ -194,8 +195,28 @@ class RollingPressureSession:
                 target_inventory,
                 f"cmpl-bridgetp-phase9-target-{self.run_dir.name}-0-",
             )
+        options = {}
+        if getattr(self.coordinator, "scheduler", "pressure") == "unified":
+            expected_source = getattr(self, "source_instance", None) or getattr(
+                self.config, "source_pool_id", "tp1"
+            )
+            need = self.coordinator.cancellation_source_need(
+                source, now, expected_source
+            )
+            options.update(scheduler="unified", source_need=need)
+            status = (need["state"], need["need"], need["reason"], need["pool_id"])
+            if status != getattr(self, "_cancel_need_status", None):
+                self.audit.write(
+                    dict(
+                        kind="pressure_cancel_source_need",
+                        migration_id=self.migration_id,
+                        request_id=self.record.request_id,
+                        source_need=need,
+                    )
+                )
+                self._cancel_need_status = status
         reason = self.cancel_policy.decide(
-            now, source, target, candidate, cfg, reversible=self.reversible()
+            now, source, target, candidate, cfg, reversible=self.reversible(), **options
         )
         if reason:
             self.audit.write(
@@ -210,6 +231,7 @@ class RollingPressureSession:
                     if candidate is not None and candidate.remaining is not None
                     else None,
                     config_sha256=cfg.sha256,
+                    **options,
                 )
             )
             self.cancel(reason)

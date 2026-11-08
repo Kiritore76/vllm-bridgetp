@@ -1,0 +1,4108 @@
+{
+  "scope": "CPU replay fixture of captured source observations, not GPU execution",
+  "batch": "qwen3_six_split_probe_20261108_173234_6413",
+  "revision": "5f910c9c973dad231d1be2df41262f472ea43aa8",
+  "outer_sha256": "10fcdadae6b5ad3bcac178e1013bad5ec90e29eec924e0470db2c0b367ae83e9",
+  "policy": {
+    "cancel_recover_eta": 1.0,
+    "cancel_sustain_s": 3.0,
+    "capacity_guard_blocks": 125,
+    "capacity_lookahead_s": 8.007738590240479,
+    "capacity_only": false,
+    "cooldown_s": 2.0,
+    "enter_ratio": 1.2,
+    "health_min_efficiency": 0.9,
+    "health_service": true,
+    "health_target_load": 0.8,
+    "imbalance_enter": 0.4,
+    "imbalance_leave": 0.2,
+    "kv_emergency_priority": true,
+    "kv_routing_priority": true,
+    "kv_short_exempt_blocks": 64,
+    "leave_ratio": 1.0,
+    "length_resolution": 512,
+    "max_age_s": 2.0,
+    "max_tick_gap_s": 0.5,
+    "migration_current_length": true,
+    "min_decode_samples": 20,
+    "min_survival_lower": 0.5,
+    "overload_kv_fraction": 0.7,
+    "overload_migrates": true,
+    "overload_min_waiting": 4,
+    "prefill_backlog_budget": 8192,
+    "prefill_pending_budget": 2048,
+    "prefill_waiting_budget": 4,
+    "pressure_routing": true,
+    "prompt_boundary": 2048,
+    "queue_routing": true,
+    "routing_relief": true,
+    "shadow_cancel": true,
+    "spare_ratio": 0.8,
+    "survival_horizon": 256,
+    "sustain_s": 3,
+    "very_long_prompt_tokens": 4096,
+    "workload_pressure": true
+  },
+  "cases": [
+    {
+      "session_suffix": "0001",
+      "source": "A-g5-tp1",
+      "cancel_requested_unix_s": 1794130941.5186944,
+      "observations": [
+        {
+          "now": 1794130938.3754015,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130938.2474344,
+            "published_at": 1794130938.3191218,
+            "free_blocks": 232,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.3138165473937988,
+            "decode_samples": 230,
+            "decode_sampled_at": 1794130938.3557084,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 4.784690707870212,
+            "guard_time_s": 22.362991995281643,
+            "urgency": 0.35807992919418064,
+            "native_itl_p95_s": 0.03138165473937988,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130934.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130938.2474344,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2100,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.02321919463553599
+        },
+        {
+          "now": 1794130938.6802108,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130938.4577732,
+            "published_at": 1794130938.5242517,
+            "free_blocks": 231,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.3193390369415282,
+            "decode_samples": 228,
+            "decode_sampled_at": 1794130938.6753771,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 4.7800835928488565,
+            "guard_time_s": 22.17534441418118,
+            "urgency": 0.36110999859463344,
+            "native_itl_p95_s": 0.031933903694152825,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130934.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130938.4577732,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2122,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.023388915911957072
+        },
+        {
+          "now": 1794130938.9193633,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130938.672523,
+            "published_at": 1794130938.7297165,
+            "free_blocks": 230,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.40757215023040766,
+            "decode_samples": 220,
+            "decode_sampled_at": 1794130938.9155202,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 4.69902954291177,
+            "guard_time_s": 22.345039340811716,
+            "urgency": 0.3583676210233777,
+            "native_itl_p95_s": 0.04075721502304077,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130934.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130938.672523,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2132,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.023812881358995903
+        },
+        {
+          "now": 1794130939.1562183,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130938.9123194,
+            "published_at": 1794130938.9850624,
+            "free_blocks": 229,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.4795502424240112,
+            "decode_samples": 214,
+            "decode_sampled_at": 1794130939.135185,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 4.429874291593305,
+            "guard_time_s": 23.47696416518267,
+            "urgency": 0.3410891857183261,
+            "native_itl_p95_s": 0.04795502424240112,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130934.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130938.9123194,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2144,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.024139794307670815
+        },
+        {
+          "now": 1794130939.4660041,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130939.3533173,
+            "published_at": 1794130939.4460976,
+            "free_blocks": 227,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.48007333278656,
+            "decode_samples": 210,
+            "decode_sampled_at": 1794130939.4575737,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 4.10823461096863,
+            "guard_time_s": 24.828182822779606,
+            "urgency": 0.3225261650197557,
+            "native_itl_p95_s": 0.048007333278656,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130934.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130939.3533173,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2164,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.024375846762142724
+        },
+        {
+          "now": 1794130939.691647,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130939.558141,
+            "published_at": 1794130939.6009934,
+            "free_blocks": 227,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.48085796833038325,
+            "decode_samples": 204,
+            "decode_sampled_at": 1794130939.6630394,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 4.061067467155353,
+            "guard_time_s": 25.116548992338636,
+            "urgency": 0.31882320268931447,
+            "native_itl_p95_s": 0.048085796833038326,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130934.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130939.558141,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2176,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.024651434910943733
+        },
+        {
+          "now": 1794130939.9175959,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130939.761172,
+            "published_at": 1794130939.8068411,
+            "free_blocks": 226,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.48111951351165766,
+            "decode_samples": 202,
+            "decode_sampled_at": 1794130939.8960438,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.944164322750016,
+            "guard_time_s": 25.607452361310113,
+            "urgency": 0.3127112559755941,
+            "native_itl_p95_s": 0.04811195135116577,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130934.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130939.761172,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2190,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.024836404488302277
+        },
+        {
+          "now": 1794130940.1426928,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130939.9658885,
+            "published_at": 1794130940.0121922,
+            "free_blocks": 225,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.4816254377365112,
+            "decode_samples": 198,
+            "decode_sampled_at": 1794130940.1305141,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.825211779127691,
+            "guard_time_s": 26.142343424134335,
+            "urgency": 0.3063129597956325,
+            "native_itl_p95_s": 0.04816254377365112,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130934.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130939.9658885,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2204,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.025013590880309994
+        },
+        {
+          "now": 1794130940.3646195,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130940.199336,
+            "published_at": 1794130940.2680435,
+            "free_blocks": 224,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.4823757410049438,
+            "decode_samples": 192,
+            "decode_sampled_at": 1794130940.3323765,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.714326441524837,
+            "guard_time_s": 26.653553896936877,
+            "urgency": 0.3004379311368589,
+            "native_itl_p95_s": 0.04823757410049438,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130934.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130940.199336,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2216,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.025262356268723602
+        },
+        {
+          "now": 1794130940.5882993,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130940.4217322,
+            "published_at": 1794130940.5239618,
+            "free_blocks": 223,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.48262584209442133,
+            "decode_samples": 190,
+            "decode_sampled_at": 1794130940.5610454,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.62787618145004,
+            "guard_time_s": 27.01304981164765,
+            "urgency": 0.2964396336613444,
+            "native_itl_p95_s": 0.048262584209442135,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130934.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130940.4217322,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2230,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.02542419558460472
+        },
+        {
+          "now": 1794130940.8173604,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130940.6304271,
+            "published_at": 1794130940.729837,
+            "free_blocks": 223,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.48312604427337646,
+            "decode_samples": 186,
+            "decode_sampled_at": 1794130940.7925642,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.575251718664474,
+            "guard_time_s": 27.41065740585327,
+            "urgency": 0.2921396036466643,
+            "native_itl_p95_s": 0.048312604427337646,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130934.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130940.6304271,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2244,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.025600395711394285
+        },
+        {
+          "now": 1794130941.0409217,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130940.8564258,
+            "published_at": 1794130940.9352877,
+            "free_blocks": 222,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.48337614536285395,
+            "decode_samples": 184,
+            "decode_sampled_at": 1794130941.0291095,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.7292198730637676,
+            "guard_time_s": 26.010802071670007,
+            "urgency": 0.30786204009303536,
+            "native_itl_p95_s": 0.0483376145362854,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130934.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130940.8564258,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2258,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.02575310538789743
+        },
+        {
+          "now": 1794130941.2657657,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130941.05699,
+            "published_at": 1794130941.14053,
+            "free_blocks": 221,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.4837533235549927,
+            "decode_samples": 180,
+            "decode_sampled_at": 1794130941.2554238,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.741916036184452,
+            "guard_time_s": 25.65530575022978,
+            "urgency": 0.31212797337910336,
+            "native_itl_p95_s": 0.04837533235549927,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130934.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130941.05699,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2272,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.025906255664750036
+        },
+        {
+          "now": 1794130941.4914272,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130941.2843394,
+            "published_at": 1794130941.3457246,
+            "free_blocks": 220,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.48376142978668213,
+            "decode_samples": 176,
+            "decode_sampled_at": 1794130941.4559457,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.7544882307025773,
+            "guard_time_s": 25.303049087524414,
+            "urgency": 0.31647326622737604,
+            "native_itl_p95_s": 0.04837614297866821,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130934.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130941.2843394,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2284,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.026147945986223522
+        }
+      ]
+    },
+    {
+      "session_suffix": "0002",
+      "source": "A-g5-tp1",
+      "cancel_requested_unix_s": 1794130945.6344995,
+      "observations": [
+        {
+          "now": 1794130942.459627,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130942.3442695,
+            "published_at": 1794130942.4234731,
+            "free_blocks": 215,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.41069495677948,
+            "decode_samples": 194,
+            "decode_sampled_at": 1794130942.451585,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 4.161167582250642,
+            "guard_time_s": 21.628544926643375,
+            "urgency": 0.3702393580982904,
+            "native_itl_p95_s": 0.041069495677948,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130934.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130942.3442695,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2358,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.026149131455232285
+        },
+        {
+          "now": 1794130942.75982,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130942.571985,
+            "published_at": 1794130942.6289837,
+            "free_blocks": 215,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.4115620851516723,
+            "decode_samples": 198,
+            "decode_sampled_at": 1794130942.7461677,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 4.249165099360421,
+            "guard_time_s": 21.180631464177914,
+            "urgency": 0.3780689260272384,
+            "native_itl_p95_s": 0.041156208515167235,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130934.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130942.571985,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2378,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.02627743411380355
+        },
+        {
+          "now": 1794130942.9997804,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130942.7915466,
+            "published_at": 1794130942.885109,
+            "free_blocks": 213,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.5698323249816895,
+            "decode_samples": 194,
+            "decode_sampled_at": 1794130942.9418073,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 4.327895141800915,
+            "guard_time_s": 20.33320982064774,
+            "urgency": 0.39382560160810764,
+            "native_itl_p95_s": 0.043339467048645004,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130934.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130942.7915466,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2388,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.026641028999230744
+        },
+        {
+          "now": 1794130943.2395396,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130942.9980552,
+            "published_at": 1794130943.0886016,
+            "free_blocks": 213,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.49566221237182556,
+            "decode_samples": 192,
+            "decode_sampled_at": 1794130943.223957,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 4.1858457580731026,
+            "guard_time_s": 21.02323044996995,
+            "urgency": 0.3808995296558681,
+            "native_itl_p95_s": 0.04956622123718256,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130934.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130942.9980552,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2402,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.026819474771436574
+        },
+        {
+          "now": 1794130943.556967,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130943.439595,
+            "published_at": 1794130943.4989514,
+            "free_blocks": 211,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.4902396202087399,
+            "decode_samples": 194,
+            "decode_sampled_at": 1794130943.5435786,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 4.166376712796025,
+            "guard_time_s": 20.641436415452223,
+            "urgency": 0.3879448323783256,
+            "native_itl_p95_s": 0.049023962020873994,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130934.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130943.439595,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2422,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.02698340551658131
+        },
+        {
+          "now": 1794130943.7839391,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130943.642465,
+            "published_at": 1794130943.6539547,
+            "free_blocks": 211,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.49566221237182556,
+            "decode_samples": 192,
+            "decode_sampled_at": 1794130943.749585,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 4.068328905775795,
+            "guard_time_s": 21.138900514632937,
+            "urgency": 0.37881528344850757,
+            "native_itl_p95_s": 0.04956622123718256,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130934.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130943.642465,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2434,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.02720157114017445
+        },
+        {
+          "now": 1794130944.0073872,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130943.8474166,
+            "published_at": 1794130943.85974,
+            "free_blocks": 210,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.49566221237182556,
+            "decode_samples": 192,
+            "decode_sampled_at": 1794130944.0029974,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.9616661321528692,
+            "guard_time_s": 21.455619217919523,
+            "urgency": 0.37322337374222664,
+            "native_itl_p95_s": 0.04956622123718256,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130934.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130943.8474166,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2448,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.027312201559496357
+        },
+        {
+          "now": 1794130944.2343593,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130944.0616007,
+            "published_at": 1794130944.1658309,
+            "free_blocks": 209,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.49566221237182556,
+            "decode_samples": 192,
+            "decode_sampled_at": 1794130944.2304907,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.7121552950995897,
+            "guard_time_s": 22.628363665412454,
+            "urgency": 0.35388058582779186,
+            "native_itl_p95_s": 0.04956622123718256,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130934.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130944.0616007,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2462,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.027431899536783752
+        },
+        {
+          "now": 1794130944.4591334,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130944.2678614,
+            "published_at": 1794130944.3710077,
+            "free_blocks": 208,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.5010848045349111,
+            "decode_samples": 190,
+            "decode_sampled_at": 1794130944.4402893,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.7040082031410257,
+            "guard_time_s": 22.408157716717636,
+            "urgency": 0.35735818586577933,
+            "native_itl_p95_s": 0.05010848045349112,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130934.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130944.2678614,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2474,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.02763365344661102
+        },
+        {
+          "now": 1794130944.6937845,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130944.6713607,
+            "published_at": 1794130944.6805565,
+            "free_blocks": 207,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.4673913717269897,
+            "decode_samples": 188,
+            "decode_sampled_at": 1794130944.6749249,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.524284572082584,
+            "guard_time_s": 23.267133604805423,
+            "urgency": 0.34416523866896176,
+            "native_itl_p95_s": 0.04673913717269897,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130944.464885,
+            "health_mixed_window": false,
+            "health_reason": "outside repeated health support",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130944.6713607,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2488,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.027771718249366025
+        },
+        {
+          "now": 1794130944.9184728,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130944.8760684,
+            "published_at": 1794130944.8856022,
+            "free_blocks": 206,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.46749889850616455,
+            "decode_samples": 186,
+            "decode_sampled_at": 1794130944.9136744,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.660783769571959,
+            "guard_time_s": 22.126409287886187,
+            "urgency": 0.36190863533490597,
+            "native_itl_p95_s": 0.046749889850616455,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130944.464885,
+            "health_mixed_window": false,
+            "health_reason": "outside repeated health support",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130944.8760684,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2502,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.02787309639531828
+        },
+        {
+          "now": 1794130945.152277,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130945.0795398,
+            "published_at": 1794130945.0902135,
+            "free_blocks": 205,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.47150850296020497,
+            "decode_samples": 180,
+            "decode_sampled_at": 1794130945.1303065,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.6586597488059405,
+            "guard_time_s": 21.865930557250977,
+            "urgency": 0.36621988573841086,
+            "native_itl_p95_s": 0.0471508502960205,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130944.464885,
+            "health_mixed_window": false,
+            "health_reason": "outside repeated health support",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130945.0795398,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2514,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.028096490349754984
+        },
+        {
+          "now": 1794130945.3746707,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130945.0795398,
+            "published_at": 1794130945.0902135,
+            "free_blocks": 205,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.47200441360473633,
+            "decode_samples": 178,
+            "decode_sampled_at": 1794130945.3633425,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.6586597488059405,
+            "guard_time_s": 21.865930557250977,
+            "urgency": 0.36621988573841086,
+            "native_itl_p95_s": 0.04720044136047363,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130944.464885,
+            "health_mixed_window": false,
+            "health_reason": "outside repeated health support",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130945.0795398,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2528,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.028182719629462782
+        },
+        {
+          "now": 1794130945.609964,
+          "source": {
+            "pool_id": "A-g5-tp1",
+            "sampled_at": 1794130945.4993286,
+            "published_at": 1794130945.6002436,
+            "free_blocks": 204,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.47349214553832997,
+            "decode_samples": 172,
+            "decode_sampled_at": 1794130945.58201,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.635162199467146,
+            "guard_time_s": 21.73218020686397,
+            "urgency": 0.3684737800817281,
+            "native_itl_p95_s": 0.047349214553833,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794130944.464885,
+            "health_mixed_window": false,
+            "health_reason": "outside repeated health support",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794130945.4993286,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 2540,
+              "slow_interval_count": 8,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 37,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.02840522514874478
+        }
+      ]
+    },
+    {
+      "session_suffix": "0004",
+      "source": "A-g6-tp1",
+      "cancel_requested_unix_s": 1794131061.7263455,
+      "observations": [
+        {
+          "now": 1794131058.5472457,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131058.3138928,
+            "published_at": 1794131058.3858166,
+            "free_blocks": 232,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.30732452869415267,
+            "decode_samples": 230,
+            "decode_sampled_at": 1794131058.5271616,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 4.790415295324715,
+            "guard_time_s": 22.336268027623497,
+            "urgency": 0.3585083497537379,
+            "native_itl_p95_s": 0.03073245286941527,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131054.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131058.3138928,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 4646,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.024349860134463764
+        },
+        {
+          "now": 1794131058.8370144,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131058.7400167,
+            "published_at": 1794131058.7959824,
+            "free_blocks": 230,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.3372296094894407,
+            "decode_samples": 228,
+            "decode_sampled_at": 1794131058.8249226,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 4.692850374879393,
+            "guard_time_s": 22.37446149190267,
+            "urgency": 0.35789637185853534,
+            "native_itl_p95_s": 0.03372296094894407,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131054.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131058.7400167,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 4666,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.0245087038124067
+        },
+        {
+          "now": 1794131059.0822241,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131058.9572093,
+            "published_at": 1794131059.0515077,
+            "free_blocks": 229,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.3723285198211669,
+            "decode_samples": 218,
+            "decode_sampled_at": 1794131059.0724363,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 4.550785351642376,
+            "guard_time_s": 22.85319828641587,
+            "urgency": 0.35039903342545903,
+            "native_itl_p95_s": 0.03723285198211669,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131054.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131058.9572093,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 4676,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.024933731347582616
+        },
+        {
+          "now": 1794131059.3174086,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131059.1687694,
+            "published_at": 1794131059.2561436,
+            "free_blocks": 229,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.4442842006683349,
+            "decode_samples": 214,
+            "decode_sampled_at": 1794131059.3076274,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 4.280315961480733,
+            "guard_time_s": 24.29727172851563,
+            "urgency": 0.3295735702228033,
+            "native_itl_p95_s": 0.04442842006683349,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131054.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131059.1687694,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 4690,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.025143762619450474
+        },
+        {
+          "now": 1794131059.6336143,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131059.3832633,
+            "published_at": 1794131059.46095,
+            "free_blocks": 228,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.44450259208679194,
+            "decode_samples": 210,
+            "decode_sampled_at": 1794131059.6086483,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 4.263986727092097,
+            "guard_time_s": 24.155797518216648,
+            "urgency": 0.3315037967262969,
+            "native_itl_p95_s": 0.0444502592086792,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131054.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131059.3832633,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 4710,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.025366409154281754
+        },
+        {
+          "now": 1794131059.8631225,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131059.602265,
+            "published_at": 1794131059.6665015,
+            "free_blocks": 227,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.44450259208679194,
+            "decode_samples": 210,
+            "decode_sampled_at": 1794131059.8524024,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 4.177164051605251,
+            "guard_time_s": 24.418480753898617,
+            "urgency": 0.3279376252333788,
+            "native_itl_p95_s": 0.0444502592086792,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131054.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131059.602265,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 4726,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.025457714659009326
+        },
+        {
+          "now": 1794131060.0928407,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131060.016392,
+            "published_at": 1794131060.0767667,
+            "free_blocks": 225,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.4807811975479126,
+            "decode_samples": 206,
+            "decode_sampled_at": 1794131060.0892284,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.9893492839606335,
+            "guard_time_s": 25.066744694944287,
+            "urgency": 0.3194566621111979,
+            "native_itl_p95_s": 0.04807811975479126,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131054.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131060.016392,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 4740,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.025634454479744537
+        },
+        {
+          "now": 1794131060.3198893,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131060.219191,
+            "published_at": 1794131060.23117,
+            "free_blocks": 224,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.48384058475494357,
+            "decode_samples": 200,
+            "decode_sampled_at": 1794131060.2864454,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.8707850939760244,
+            "guard_time_s": 25.57620678917836,
+            "urgency": 0.31309328456120633,
+            "native_itl_p95_s": 0.04838405847549436,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131054.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131060.219191,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 4752,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.02588624174066793
+        },
+        {
+          "now": 1794131060.5480306,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131060.4460695,
+            "published_at": 1794131060.5369904,
+            "free_blocks": 223,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.4870492219924927,
+            "decode_samples": 196,
+            "decode_sampled_at": 1794131060.5184414,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.7366956486741207,
+            "guard_time_s": 26.226379992915135,
+            "urgency": 0.3053314484272595,
+            "native_itl_p95_s": 0.04870492219924927,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131054.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131060.4460695,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 4766,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.0260473498743438
+        },
+        {
+          "now": 1794131060.7755935,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131060.6501272,
+            "published_at": 1794131060.6920598,
+            "free_blocks": 223,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.49025785923004134,
+            "decode_samples": 192,
+            "decode_sampled_at": 1794131060.7585247,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.7301507417259807,
+            "guard_time_s": 26.272396689967106,
+            "urgency": 0.3047966534891151,
+            "native_itl_p95_s": 0.049025785923004134,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131054.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131060.6501272,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 4780,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.02620236939129219
+        },
+        {
+          "now": 1794131061.0095196,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131060.8902128,
+            "published_at": 1794131060.9497063,
+            "free_blocks": 222,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.4934664964675904,
+            "decode_samples": 188,
+            "decode_sampled_at": 1794131060.99214,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.750640016458623,
+            "guard_time_s": 25.862252728692418,
+            "urgency": 0.3096303587411948,
+            "native_itl_p95_s": 0.04934664964675904,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131054.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131060.8902128,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 4794,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.026375274088526444
+        },
+        {
+          "now": 1794131061.2449682,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131061.1094613,
+            "published_at": 1794131061.2050836,
+            "free_blocks": 221,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.49507081508636475,
+            "decode_samples": 186,
+            "decode_sampled_at": 1794131061.2368674,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.9290109943030904,
+            "guard_time_s": 24.433629770747952,
+            "urgency": 0.3277343016724997,
+            "native_itl_p95_s": 0.049507081508636475,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131054.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131061.1094613,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 4810,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.02645861017898998
+        },
+        {
+          "now": 1794131061.470815,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131061.3234656,
+            "published_at": 1794131061.410061,
+            "free_blocks": 220,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.49667513370513905,
+            "decode_samples": 184,
+            "decode_sampled_at": 1794131061.4465697,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.8655764126855936,
+            "guard_time_s": 24.575894991556805,
+            "urgency": 0.3258371096145872,
+            "native_itl_p95_s": 0.04966751337051391,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131054.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131061.3234656,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 4824,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.026596989987547087
+        },
+        {
+          "now": 1794131061.6996613,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131061.529849,
+            "published_at": 1794131061.615158,
+            "free_blocks": 219,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.49667513370513905,
+            "decode_samples": 184,
+            "decode_sampled_at": 1794131061.695284,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.8908806742071675,
+            "guard_time_s": 24.159054946899413,
+            "urgency": 0.33145909920074074,
+            "native_itl_p95_s": 0.04966751337051391,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131054.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131061.529849,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 4840,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.026651455171782804
+        }
+      ]
+    },
+    {
+      "session_suffix": "0005",
+      "source": "A-g6-tp1",
+      "cancel_requested_unix_s": 1794131065.935744,
+      "observations": [
+        {
+          "now": 1794131062.69081,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131062.569043,
+            "published_at": 1794131062.6381257,
+            "free_blocks": 215,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.40735602378845215,
+            "decode_samples": 198,
+            "decode_sampled_at": 1794131062.678349,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 4.234161925005802,
+            "guard_time_s": 21.255682138296276,
+            "urgency": 0.37673402049106525,
+            "native_itl_p95_s": 0.040735602378845215,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131054.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131062.569043,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 4912,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.026744887693770477
+        },
+        {
+          "now": 1794131062.9770088,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131062.796843,
+            "published_at": 1794131062.893012,
+            "free_blocks": 214,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.4075568914413451,
+            "decode_samples": 200,
+            "decode_sampled_at": 1794131062.9669135,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 4.327005658506135,
+            "guard_time_s": 20.56849632841168,
+            "urgency": 0.3893205639529044,
+            "native_itl_p95_s": 0.040755689144134515,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131054.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131062.796843,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 4932,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.026806506676053932
+        },
+        {
+          "now": 1794131063.2225332,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131063.006432,
+            "published_at": 1794131063.0978339,
+            "free_blocks": 213,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.49555063247680664,
+            "decode_samples": 196,
+            "decode_sampled_at": 1794131063.215063,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 4.349039121862051,
+            "guard_time_s": 20.234354654947918,
+            "urgency": 0.39574964098409443,
+            "native_itl_p95_s": 0.049555063247680664,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131054.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131063.006432,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 4942,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.027176532483793724
+        },
+        {
+          "now": 1794131063.4561021,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131063.2119427,
+            "published_at": 1794131063.3025444,
+            "free_blocks": 212,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.5077923536300658,
+            "decode_samples": 192,
+            "decode_sampled_at": 1794131063.430947,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 4.17002676607691,
+            "guard_time_s": 20.863175437563942,
+            "urgency": 0.38382165812700897,
+            "native_itl_p95_s": 0.05077923536300659,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131054.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131063.2119427,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 4954,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.027411426195768383
+        },
+        {
+          "now": 1794131063.7757142,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131063.630171,
+            "published_at": 1794131063.7125347,
+            "free_blocks": 211,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.5075162649154663,
+            "decode_samples": 196,
+            "decode_sampled_at": 1794131063.756762,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 4.1515976353970485,
+            "guard_time_s": 20.7149168953063,
+            "urgency": 0.38656870460604725,
+            "native_itl_p95_s": 0.05075162649154663,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131054.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131063.630171,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 4976,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.027471120535829736
+        },
+        {
+          "now": 1794131064.004576,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131063.8451078,
+            "published_at": 1794131063.917217,
+            "free_blocks": 210,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.5075162649154663,
+            "decode_samples": 196,
+            "decode_sampled_at": 1794131063.9792535,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 4.120628214041687,
+            "guard_time_s": 20.627922633337597,
+            "urgency": 0.3881989831248861,
+            "native_itl_p95_s": 0.05075162649154663,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131054.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131063.8451078,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 4990,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.027592276482985914
+        },
+        {
+          "now": 1794131064.231708,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131064.0819392,
+            "published_at": 1794131064.1720881,
+            "free_blocks": 209,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.5075162649154663,
+            "decode_samples": 196,
+            "decode_sampled_at": 1794131064.216186,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 4.011526432924429,
+            "guard_time_s": 20.939660103090347,
+            "urgency": 0.3824197026511748,
+            "native_itl_p95_s": 0.05075162649154663,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131054.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131064.0819392,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 5004,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.027704817216222172
+        },
+        {
+          "now": 1794131064.4573522,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131064.3180425,
+            "published_at": 1794131064.3747506,
+            "free_blocks": 208,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.5076543092727661,
+            "decode_samples": 194,
+            "decode_sampled_at": 1794131064.4492373,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.7878796636129817,
+            "guard_time_s": 21.91199493408203,
+            "urgency": 0.36545000189759996,
+            "native_itl_p95_s": 0.05076543092727661,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131054.464885,
+            "health_mixed_window": false,
+            "health_reason": "reference shape changed or below 80% sample purity",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131064.3180425,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 5018,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.0278097386252227
+        },
+        {
+          "now": 1794131064.6930563,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131064.532907,
+            "published_at": 1794131064.6297753,
+            "free_blocks": 207,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.5076543092727661,
+            "decode_samples": 194,
+            "decode_sampled_at": 1794131064.6671045,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.819001551891862,
+            "guard_time_s": 21.471580696105956,
+            "urgency": 0.372945928088692,
+            "native_itl_p95_s": 0.05076543092727661,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131064.464885,
+            "health_mixed_window": false,
+            "health_reason": "outside repeated health support",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131064.532907,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 5032,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.027945467779731333
+        },
+        {
+          "now": 1794131064.9211998,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131064.735818,
+            "published_at": 1794131064.784811,
+            "free_blocks": 206,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.49793291091918934,
+            "decode_samples": 192,
+            "decode_sampled_at": 1794131064.9013355,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.7390892267588054,
+            "guard_time_s": 21.663029440518084,
+            "urgency": 0.3696499888082582,
+            "native_itl_p95_s": 0.049793291091918934,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131064.464885,
+            "health_mixed_window": false,
+            "health_reason": "outside repeated health support",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131064.735818,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 5046,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.028053022209193243
+        },
+        {
+          "now": 1794131065.157998,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131064.9628203,
+            "published_at": 1794131065.0398324,
+            "free_blocks": 205,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.5059620141983031,
+            "decode_samples": 190,
+            "decode_sampled_at": 1794131065.152403,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.7058084228657515,
+            "guard_time_s": 21.587732249292834,
+            "urgency": 0.37093931394775354,
+            "native_itl_p95_s": 0.05059620141983032,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131064.464885,
+            "health_mixed_window": false,
+            "health_reason": "outside repeated health support",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131064.9628203,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 5060,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.028186684526272352
+        },
+        {
+          "now": 1794131065.4076772,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131065.1686947,
+            "published_at": 1794131065.2443995,
+            "free_blocks": 205,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.5067681074142455,
+            "decode_samples": 184,
+            "decode_sampled_at": 1794131065.3753543,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.8328821245409372,
+            "guard_time_s": 20.8720219930013,
+            "urgency": 0.3836589762566172,
+            "native_itl_p95_s": 0.050676810741424556,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131064.464885,
+            "health_mixed_window": false,
+            "health_reason": "outside repeated health support",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131065.1686947,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 5074,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.02835999469067234
+        },
+        {
+          "now": 1794131065.6355963,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131065.3718677,
+            "published_at": 1794131065.3987823,
+            "free_blocks": 204,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.5070368051528931,
+            "decode_samples": 182,
+            "decode_sampled_at": 1794131065.6242967,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.8037623858604928,
+            "guard_time_s": 20.768910354038454,
+            "urgency": 0.38556373221975015,
+            "native_itl_p95_s": 0.050703680515289305,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131064.464885,
+            "health_mixed_window": false,
+            "health_reason": "outside repeated health support",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131065.3718677,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 5090,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.028363423544180345
+        },
+        {
+          "now": 1794131065.9057753,
+          "source": {
+            "pool_id": "A-g6-tp1",
+            "sampled_at": 1794131065.7973752,
+            "published_at": 1794131065.8604186,
+            "free_blocks": 202,
+            "block_size": 16,
+            "context_limit": 32768,
+            "decode_ratio": 0.492561936378479,
+            "decode_samples": 182,
+            "decode_sampled_at": 1794131065.8957832,
+            "idle": false,
+            "pending_prompt_tokens": 0,
+            "waiting": 0,
+            "growth_blocks_s": 3.841686834416919,
+            "guard_time_s": 20.043278725941974,
+            "urgency": 0.3995223885140149,
+            "native_itl_p95_s": 0.0492561936378479,
+            "slow_interval_fraction": 0.0,
+            "actual_decode_requests": null,
+            "actual_decode_context": null,
+            "prefill_batch_tokens": 0,
+            "prefill_batch_s": null,
+            "unallocated_prompt_blocks": 0,
+            "health_status": "UNKNOWN",
+            "health_eta": null,
+            "health_load": null,
+            "health_sampled_at": 1794131064.464885,
+            "health_mixed_window": false,
+            "health_reason": "outside repeated health support",
+            "workload": {
+              "status": "OBSERVED",
+              "reason": "fresh passive native workload",
+              "sampled_at": 1794131065.7973752,
+              "load": 0.5,
+              "prefill_s": 0.0,
+              "requests": 2,
+              "fallback_requests": 2,
+              "profile": {
+                "capacities": [
+                  [
+                    1,
+                    4
+                  ],
+                  [
+                    2,
+                    4
+                  ],
+                  [
+                    3,
+                    4
+                  ]
+                ],
+                "prefill_s_per_token": 0.00013062966354482342,
+                "efficient_fraction": 0.9,
+                "basis": "smallest repeated Nd within selected fraction of measured peak G; prefill uses repeated local P95 per-token envelope",
+                "maximum_capacity_claim": false
+              }
+            },
+            "service_evidence": {
+              "interval_count": 5108,
+              "slow_interval_count": 9,
+              "window_s": 3.0,
+              "slow_budget": 0.01
+            },
+            "prefill_generation": 57,
+            "total_blocks": 2325,
+            "engine_requests": 2
+          },
+          "migrate_itl_s": 0.028412366864678143
+        }
+      ]
+    }
+  ]
+}

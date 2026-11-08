@@ -316,6 +316,85 @@ class PressureCoordinator:
             itl_reference_s=self.itl_reference_s,
         )
 
+    def cancellation_source_need(self, source, now, expected_pool_id):
+        """Evidence from the same adjusted source and migrate EMA as START.
+
+        ``source`` is already ledger.routing_reading-adjusted by the session
+        caller; applying that adjustment twice would double count promises.
+        Instance IDs include their generation and must match the bound owner.
+        """
+        with self._lock:
+            value = dict(slots=None, kv=None, speed=None, value=None)
+            if source.pool_id in self.slots:
+                value = self.unified_fullness(source, "migrate")
+            capacity = classify(source, self.policy.cfg, now).capacity
+            exhausting = (
+                capacity >= 1
+                if capacity is not None and math.isfinite(capacity)
+                else None
+            )
+            snapshot = dict(
+                value,
+                kind="migrate",
+                pool_id=source.pool_id,
+                expected_pool_id=expected_pool_id,
+                observed_at=now,
+                sampled_at=source.sampled_at,
+                published_at=source.published_at,
+                itl_sampled_at=self.itl.snapshot()
+                .get(source.pool_id, {})
+                .get("updated_at"),
+                legacy_capacity=capacity,
+                exhausting=exhausting,
+                complete=False,
+                state="UNKNOWN",
+                need=None,
+                reason="incomplete, stale or mismatched source evidence",
+            )
+            complete = (
+                self.scheduler == "unified"
+                and source.pool_id == expected_pool_id
+                and self.lifecycle(source.pool_id) in {"ACTIVE", "QUIESCING"}
+                and type(source.engine_requests) is int
+                and source.engine_requests >= 0
+                and type(source.unallocated_prompt_blocks) is int
+                and source.unallocated_prompt_blocks >= 0
+                and type(source.total_blocks) is int
+                and source.total_blocks > 0
+                and type(source.free_blocks) is int
+                and 0 <= source.free_blocks <= source.total_blocks
+                and exhausting is not None
+                and source.growth_blocks_s is not None
+                and math.isfinite(source.growth_blocks_s)
+                and source.growth_blocks_s >= 0
+                and all(
+                    type(v) in (int, float) and math.isfinite(v) and v >= 0
+                    for v in value.values()
+                )
+                and all(
+                    type(snapshot[k]) in (int, float)
+                    and math.isfinite(snapshot[k])
+                    and 0 <= now - snapshot[k] <= self.policy.cfg.max_age_s
+                    for k in (
+                        "observed_at",
+                        "sampled_at",
+                        "published_at",
+                        "itl_sampled_at",
+                    )
+                )
+            )
+            if complete:
+                need = unified.source_migration_need(value, exhausting)
+                snapshot.update(
+                    complete=True,
+                    need=need,
+                    state="NEEDED" if need else "CLEAR",
+                    reason="source migration demand remains"
+                    if need
+                    else "source below migration triggers",
+                )
+            return snapshot
+
     def route_fullness_snapshot(self, readings, now):
         """Export current load for conversion, without a hypothetical new prompt.
 

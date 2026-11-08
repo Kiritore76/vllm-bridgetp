@@ -218,15 +218,56 @@ class MigrationState:
         self.pressure_since.pop(source, None)
 
 
+def source_migration_need(source_full, source_kv_exhausting):
+    """Source demand, independent of target channels, cooldowns and timers."""
+    kv = source_full["kv"]
+    if (kv is not None and kv >= KV_TRIGGER) or source_kv_exhausting:
+        return "KV"
+    if source_full["value"] < PRESSURE_TRIGGER:
+        return None
+    return "PRESSURE"
+
+
+def source_recovery_ready(snapshot, source, now, max_age_s):
+    """Only complete, current evidence of absent demand can support recovery."""
+    if not isinstance(snapshot, dict) or not (
+        snapshot.get("kind") == "migrate"
+        and snapshot.get("state") == "CLEAR"
+        and snapshot.get("complete") is True
+        and snapshot.get("pool_id")
+        == snapshot.get("expected_pool_id")
+        == source.pool_id
+        and snapshot.get("sampled_at") == source.sampled_at
+        and snapshot.get("published_at") == source.published_at
+        and snapshot.get("exhausting") is False
+    ):
+        return False
+    for key in ("observed_at", "sampled_at", "published_at", "itl_sampled_at"):
+        value = snapshot.get(key)
+        if type(value) not in (int, float) or not math.isfinite(value):
+            return False
+        if not 0 <= now - value <= max_age_s:
+            return False
+    values = [snapshot.get(k) for k in ("slots", "kv", "speed", "value")]
+    if any(
+        type(v) not in (int, float) or not math.isfinite(v) or v < 0 for v in values
+    ):
+        return False
+    return (
+        values[-1] == max(values[:-1])
+        and source_migration_need(snapshot, False) is None
+    )
+
+
 def migration_trigger(
     source_full, source_kv_exhausting, best_target_full, state, source_id, now
 ):
     """("KV" | "PRESSURE" | None, reason). Advances the pressure timer."""
-    kv = source_full["kv"]
-    if (kv is not None and kv >= KV_TRIGGER) or source_kv_exhausting:
+    need = source_migration_need(source_full, source_kv_exhausting)
+    if need == "KV":
         state.pressure_since.pop(source_id, None)
         return "KV", "source KV at the trigger or about to run out"
-    if source_full["value"] < PRESSURE_TRIGGER:
+    if need is None:
         state.pressure_since.pop(source_id, None)
         return None, "source below the pressure trigger"
     since = state.pressure_since.setdefault(source_id, now)

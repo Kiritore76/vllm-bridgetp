@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 当前任务：L2C到L1AC带长自然排空及新A双源真实迁移一场诊断；正常触发/安全门。
+# 当前任务：统一调度恢复取消一致性修复，同一带长拆分/新A双源迁移配方核验。
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
@@ -20,6 +20,7 @@ mkdir "$run" || exit 1
 printf '%s\n' "$revision" > "$run/revision.txt"
 printf 'six-card unified diagnostic; split A at 110s; pinned long arrivals to old/new A; normal migration gates; no TP2 migration.\n' > "$run/scope.txt"
 printf '366 requests/95232 output tokens; 720s background; require loaded natural drain and commit/release from each new A to B; no performance comparison.\n' >> "$run/scope.txt"
+printf 'unified cancellation consistency repair; recovery requires fresh CLEAR source demand; true recovery cancellations remain allowed.\n' >> "$run/scope.txt"
 echo "本批目录：$run"
 echo 'Linux CPU前置失败/错误/跳过即停止；通过后仅运行L2C到L1AC一场GPU冒烟。'
 echo '失败即打包，不自动重试、不删除结果；不清理其他进程。'
@@ -56,6 +57,7 @@ export TMPDIR="$task_tmp" TEMP="$task_tmp" TMP="$task_tmp"
     tests.bridge_tp.test_source_channels tests.bridge_tp.test_channel_runtime \
     tests.bridge_tp.test_tcp_ports tests.bridge_tp.test_gpu_direct_history_lifecycle \
     tests.bridge_tp.test_six_split_probe \
+    tests.bridge_tp.test_pressure_cancel tests.bridge_tp.test_unified_cancel \
     > "$run/cpu_checks.log" 2>&1
 status=$?
 tail -n 12 "$run/cpu_checks.log"
@@ -100,6 +102,14 @@ step=sequence["steps"][0]
 assert step["request"]["bundle"]=="A" and step["request"]["target_mode"]=="TP1",step
 assert step["layout"]==dict(A=1,B=2,C=1),step
 phase=proof["phases"][-1]
+from tools.bridge_tp.pressure_cpu import load
+audit=[json.loads(line) for line in (paths[0].parent/"controller/pressure_audit.jsonl").read_text().splitlines()]
+cfg=json.loads((root/"comparison_policy.json").read_text())
+cancel_check=load("pressure_cancel").assess_unified_cancellations(audit,cfg["max_age_s"])
+(root.parent/"unified_cancellation_acceptance.json").write_text(json.dumps(cancel_check,indent=2)+"\n")
+assert cancel_check["passed"],cancel_check
+if proof["coverage_passed"]:
+    assert {"A-g5-tp1","A-g6-tp1"} <= set(cancel_check["observed_needed_sources"]),cancel_check
 # Report the split's own timings; the acceptance above is the gate.
 print(json.dumps(dict(passed=proof["passed"],mechanism_passed=proof["mechanism_passed"],layout=step["layout"],
     drain_s=phase.get("drain_s"),rebuild_s=phase.get("rebuild_s"),
@@ -108,6 +118,7 @@ print(json.dumps(dict(passed=proof["passed"],mechanism_passed=proof["mechanism_p
     migration_coverage=proof["migration_coverage"],coverage_passed=proof["coverage_passed"],
     loaded_drain_requests=proof["loaded_drain_requests"],joined_source_coverage=proof["joined_source_coverage"],
     actual_committed_transfers=proof["actual_committed_transfers"]),indent=2))
+print(json.dumps(cancel_check,indent=2))
 raise SystemExit(0 if proof["passed"] else 2)
 PY
     status=$?
