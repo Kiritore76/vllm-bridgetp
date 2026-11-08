@@ -53,7 +53,7 @@ class ControllerTests(unittest.TestCase):
                     tick_s=0.005,
                     max_seconds=4,
                     no_progress_s=3,
-                    no_migration=True,
+                    no_migration=False,
                     maximum_migrations=0,
                     routing_strategy="pressure",
                     routing_weights=[1, 1],
@@ -200,6 +200,15 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(set(status["migration_resource_targets"]), set(wanted))
                 self.assertEqual(set(status["migration_resource_sources"]), set(links))
                 results = pc.read_json(directory / "pressure_request_results.json")
+                audit = [
+                    json.loads(line)
+                    for line in (directory / "pressure_audit.jsonl")
+                    .read_text()
+                    .splitlines()
+                ]
+                self.assertFalse(
+                    any(e["kind"] == "pressure_actual_start" for e in audit)
+                )
                 self.assertEqual(len(results), len(jobs))
                 self.assertTrue(
                     all(r["source_done"] and not r["source_error"] for r in results)

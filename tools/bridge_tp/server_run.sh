@@ -20,6 +20,7 @@ mkdir "$run" || exit 1
 printf '%s\n' "$revision" > "$run/revision.txt"
 printf 'Four independent six-card directions: L0-L1AC L1AC-L0 L2C-L3 L3-L2C; serial, natural drain, prestart off.\n' > "$run/scope.txt"
 printf 'Each: 156 requests/68352 tokens, short background 300s, long arrivals 90..100s, explicit trigger 60s.\n' >> "$run/scope.txt"
+printf 'Single-class dynamic preflight repaired; explicit NOT_STARTED launch evidence; no workload or threshold changes.\n' >> "$run/scope.txt"
 printf 'Mechanism check; zero migration allowed and reported; no loaded-drain or performance acceptance.\n' >> "$run/scope.txt"
 echo "本批目录：$run"
 echo 'Linux CPU前置失败/错误/跳过即停止；通过后串行运行剩余四方向，各自从独立布局启动。'
@@ -62,7 +63,7 @@ export TMPDIR="$task_tmp" TEMP="$task_tmp" TMP="$task_tmp"
     tests.bridge_tp.test_tcp_ports tests.bridge_tp.test_gpu_direct_history_lifecycle \
     tests.bridge_tp.test_six_split_probe \
     tests.bridge_tp.test_pressure_cancel tests.bridge_tp.test_unified_cancel \
-    tests.bridge_tp.test_six_edge_batch \
+    tests.bridge_tp.test_six_edge_batch tests.bridge_tp.test_six_single_class \
     > "$run/cpu_checks.log" 2>&1
 status=$?
 tail -n 12 "$run/cpu_checks.log"
@@ -110,9 +111,9 @@ for edge in L0-L1AC L1AC-L0 L2C-L3 L3-L2C; do
     check_status=$?
     cat "$case_dir/mechanism_check.log"
     printf '%s\n' "$check_status" > "$case_dir/check_exit_code.txt"
-    # A failed workload may be followed only when its owned groups have ended.
-    "$py" -B -c 'import json,sys; from pathlib import Path; v=json.loads(Path(sys.argv[1]).read_text()); raise SystemExit(0 if v.get("cleanup_confirmed") is True else 1)' \
-        "$case_dir/case_acceptance.json" || { echo '受管进程退出未获确认，停止后续方向。'; break; }
+    # Continue only after confirmed cleanup or explicit pre-launch failure evidence.
+    "$py" -B -c 'import json,sys; from pathlib import Path; v=json.loads(Path(sys.argv[1]).read_text()); raise SystemExit(0 if v.get("continuation_safe") is True else 1)' \
+        "$case_dir/case_acceptance.json" || { echo '启动/退出安全状态未获确认，停止后续方向。'; break; }
 done
 "$py" -B -m tools.bridge_tp.six_edge_batch aggregate --directory "$run" > "$run/batch_check.log" 2>&1
 status=$?

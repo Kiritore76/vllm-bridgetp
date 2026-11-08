@@ -51,14 +51,44 @@ def assess_case(directory, edge, registered):
         )
     except (OSError, ValueError, TypeError, AttributeError):
         cleanup = False
-    value = dict(edge=edge, passed=False, cleanup_confirmed=cleanup, errors=[])
+    try:
+        result = read(directory / "trial/result.json")
+    except (OSError, ValueError):
+        result = {}
+    try:
+        launch = read(directory / "trial/owned_launch_receipt.json")
+    except (OSError, ValueError):
+        launch = {}
+    if not isinstance(result, dict):
+        result = {}
+    not_started = (
+        isinstance(launch, dict)
+        and launch.get("schema") == "BRIDGETP_OWNED_LAUNCH_V1"
+        and launch.get("state") == "NOT_STARTED"
+        and result.get("status") in {"TECHNICAL_FAILURE", "INTERRUPTED"}
+        and result.get("runs") == []
+        and result.get("total_profile_attempts") == 0
+        and not shutdowns
+        and not list((directory / "trial").rglob("owned_processes.json"))
+        and not list((directory / "trial").rglob("effective_argv.json"))
+    )
+    value = dict(
+        edge=edge,
+        passed=False,
+        cleanup_confirmed=cleanup,
+        launch_state=launch.get("state") if isinstance(launch, dict) else None,
+        launch_not_started=not_started,
+        continuation_safe=cleanup or not_started,
+        runner_error=result.get("error"),
+        errors=[],
+    )
     try:
         if edge not in EDGES:
             raise ValueError("unexpected edge")
+        if int((directory / "runner_exit_code.txt").read_text()) != 0:
+            raise ValueError(result.get("error") or "runner did not exit zero")
         if not cleanup:
             raise ValueError("owned cleanup not confirmed")
-        if int((directory / "runner_exit_code.txt").read_text()) != 0:
-            raise ValueError("runner did not exit zero")
         root = directory / "trial"
         result = read(root / "result.json")
         if result.get("status") != "COMPLETED_CONVERSION" or result.get("edge") != edge:

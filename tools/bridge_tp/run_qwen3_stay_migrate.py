@@ -114,6 +114,26 @@ def prepare_native(plan, common):
     common.write_json(plan["run_dir"].parent / "native_initial_receipt.json", rows)
 
 
+def controller_preflight(plan):
+    """Validate the actual configured controller plan without CUDA imports."""
+    plan["config_path"].parent.mkdir(parents=True, exist_ok=True)
+    write(plan["config_path"], plan["config"])
+    pilot.write_instances(plan)
+    parsed = pilot.controller.parse_args(
+        plan["controller_argv"][2:] + ["--validate-only"]
+    )
+    return pilot.controller.preflight(parsed)
+
+
+def launch_scene(output, *args, **kwargs):
+    """Mark the process-launch boundary before entering the owned launcher."""
+    write(
+        Path(output) / "owned_launch_receipt.json",
+        dict(schema="BRIDGETP_OWNED_LAUNCH_V1", state="LAUNCH_ATTEMPTED"),
+    )
+    return pilot.run_scene(*args, **kwargs)
+
+
 def serving_preflight(plans):
     from tools.bridge_tp import phase8_stager
     from vllm.entrypoints.openai.cli_args import (
@@ -123,9 +143,7 @@ def serving_preflight(plans):
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
     for _, _, _, plan in plans:
-        plan["config_path"].parent.mkdir(parents=True, exist_ok=True)
-        write(plan["config_path"], plan["config"])
-        pilot.write_instances(plan)
+        controller_preflight(plan)
         absent = pilot.absent_pair(plan)
         # S5b: a conversion that joins migration starts the planned side too.
         started = [] if plan.get("join") else absent
@@ -146,10 +164,6 @@ def serving_preflight(plans):
             )
             for stager in stagers:
                 phase8_stager.parse_args(stager[2:])
-        parsed = pilot.controller.parse_args(
-            plan["controller_argv"][2:] + ["--validate-only"]
-        )
-        pilot.controller.preflight(parsed)
 
 
 def closed_loop_proof(plan, arm):
@@ -969,6 +983,10 @@ def main(argv=None):
         raise ValueError("results must be outside checkout")
     args.output.mkdir(parents=True, exist_ok=False)
     result, code, ledger, pairs = dict(status="TECHNICAL_FAILURE"), 1, [], []
+    write(
+        args.output / "owned_launch_receipt.json",
+        dict(schema="BRIDGETP_OWNED_LAUNCH_V1", state="NOT_STARTED"),
+    )
     try:
         platform_profile = dict(read(PROFILE), gpu_count=args.cards)
         hardware, versions = runtime_inventory(platform_profile), runtime_versions()
@@ -1274,7 +1292,8 @@ def main(argv=None):
                 from tools.bridge_tp.conversion_sequence import finalize
 
                 finalizer = finalize
-            pilot.run_scene(
+            launch_scene(
+                args.output,
                 spec,
                 scene,
                 plan,

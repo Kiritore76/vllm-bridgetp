@@ -18,7 +18,7 @@ from tools.bridge_tp import qwen3_six_card as six
 from tools.bridge_tp import run_qwen3_stay_migrate as runner
 
 
-def build(root, name):
+def build(root, name, *, setup_only=False):
     context = dict(
         argparse=argparse,
         Path=Path,
@@ -79,6 +79,8 @@ def build(root, name):
             migration_sources=name in six.MIXED,
         ),
     )
+    if setup_only:
+        return spec, common, args
     plan = launch.build_scene(spec, dict(name=name, arrivals="a"), root, common, args)
     for side in ("source", "target"):
         plan[side + "_env"].update(

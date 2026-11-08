@@ -470,9 +470,20 @@ def instance_manifest(args, controller):
         raise ValueError(
             "canonical runtime IDs require a matching six-card unified plan"
         )
+    # Canonical six-card conversions can start with no sources or no targets.
+    # Their owned receiver set is reconciled as instances join/retire; legacy
+    # static and four-card deferred contracts still require their usual flags.
+    dynamic_single_class = (
+        runtime_ids is not None
+        and getattr(controller, "dynamic_conversion", False) is True
+        and getattr(controller, "target_scoped_receivers", False) is True
+        and controller.target_tp_size == 2
+        and getattr(args, "migration_targets", None) == "all"
+        and getattr(args, "scheduler", "pressure") == "unified"
+    )
     deferred = getattr(args, "deferred_migration", False)
     if len(aliases) == 1 and (
-        not (args.no_migration or deferred)
+        not (args.no_migration or deferred or dynamic_single_class)
         or args.no_migration
         and any(row.get("migration_channel") for row in rows.values())
         # S5b: only TP1s (an L0 that will merge the target) own channels.
