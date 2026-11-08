@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 当前任务：六卡剩余四方向，独立初始布局、串行核验、逐场验收与打包。
+# 当前任务：L0到L1AC首目标启动/通道预热时序修复，单场核验。
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
@@ -15,15 +15,16 @@ git fetch origin "refs/heads/$branch:refs/remotes/origin/$branch" || exit 1
 revision=$(git rev-parse HEAD)
 [ "$revision" = "$(git rev-parse "origin/$branch")" ] || { echo '请先git pull --ff-only。'; exit 1; }
 mkdir -p /root/autodl-tmp/bridgetp/results || exit 1
-run=/root/autodl-tmp/bridgetp/results/qwen3_six_remaining_edges_$(date +%Y%m%d_%H%M%S)_${RANDOM}
+run=/root/autodl-tmp/bridgetp/results/qwen3_six_l0_join_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 printf '%s\n' "$revision" > "$run/revision.txt"
-printf 'Four independent six-card directions: L0-L1AC L1AC-L0 L2C-L3 L3-L2C; serial, natural drain, prestart off.\n' > "$run/scope.txt"
-printf 'Each: 156 requests/68352 tokens, short background 300s, long arrivals 90..100s, explicit trigger 60s.\n' >> "$run/scope.txt"
-printf 'Single-class dynamic preflight repaired; explicit NOT_STARTED launch evidence; no workload or threshold changes.\n' >> "$run/scope.txt"
+printf 'Single L0-L1AC repair verification; cold first receiver starts without channels, model verifies before topology publication; natural drain, prestart off.\n' > "$run/scope.txt"
+printf '156 requests/68352 tokens, short background 300s, long arrivals 90..100s, explicit trigger 60s.\n' >> "$run/scope.txt"
+printf 'First-target ordering repair; require 12 formal warmups before route; sender substage diagnostics; no workload/threshold changes.\n' >> "$run/scope.txt"
+printf 'Controller budget 1200s covers trigger+900s conversion+180s ACK+60s margin; channel budget 780s unchanged.\n' >> "$run/scope.txt"
 printf 'Mechanism check; zero migration allowed and reported; no loaded-drain or performance acceptance.\n' >> "$run/scope.txt"
 echo "本批目录：$run"
-echo 'Linux CPU前置失败/错误/跳过即停止；通过后串行运行剩余四方向，各自从独立布局启动。'
+echo 'Linux CPU前置失败/错误/跳过即停止；通过后仅运行L0到L1AC一场GPU核验。'
 echo '逐场保留成功和失败；确认退出且GPU空闲才继续；不重试、不删除结果、不清理其他进程。'
 smi=
 pack_result() {
@@ -31,7 +32,7 @@ pack_result() {
     if [ -n "$smi" ]; then kill "$smi" 2>/dev/null || true; wait "$smi" 2>/dev/null || true; smi=; fi
     printf '%s\n' "$status" > "$run/exit_code.txt"
     local excludes=() edge
-    for edge in L0-L1AC L1AC-L0 L2C-L3 L3-L2C; do
+    for edge in L0-L1AC; do
         # Never omit unarchived failure data. Keep its raw trial if no inner pack.
         if [ -f "$run/$edge/trial.tar.gz" ] && [ -f "$run/$edge/trial.tar.gz.sha256" ] &&
            (cd "$run/$edge" && sha256sum -c trial.tar.gz.sha256 > /dev/null 2>&1); then
@@ -64,6 +65,7 @@ export TMPDIR="$task_tmp" TEMP="$task_tmp" TMP="$task_tmp"
     tests.bridge_tp.test_six_split_probe \
     tests.bridge_tp.test_pressure_cancel tests.bridge_tp.test_unified_cancel \
     tests.bridge_tp.test_six_edge_batch tests.bridge_tp.test_six_single_class \
+    tests.bridge_tp.test_first_target_startup tests.bridge_tp.test_gpu_direct_targets \
     > "$run/cpu_checks.log" 2>&1
 status=$?
 tail -n 12 "$run/cpu_checks.log"
@@ -81,9 +83,9 @@ avail=$(df --output=avail -k "$run" | tail -1)
 nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,pcie.link.gen.current,pcie.link.width.current --format=csv,noheader > "$run/gpu_before.csv" || { pack_result 1; exit 1; }
 nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,pcie.link.gen.current,pcie.link.width.current --format=csv,noheader -lms 1000 > "$run/gpu_samples.csv" &
 smi=$!
-"$py" -B -m tools.bridge_tp.six_edge_batch plan --directory "$run" \
+"$py" -B -m tools.bridge_tp.six_edge_batch plan --directory "$run" --edges L0-L1AC \
     --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json" > "$run/plan.log" 2>&1 || { pack_result 1; exit 1; }
-for edge in L0-L1AC L1AC-L0 L2C-L3 L3-L2C; do
+for edge in L0-L1AC; do
     case_dir="$run/$edge"
     mkdir "$case_dir" || { pack_result 1; exit 1; }
     # No overlapping GPU trials, including after a failed case.
@@ -106,7 +108,7 @@ for edge in L0-L1AC L1AC-L0 L2C-L3 L3-L2C; do
         --output "$case_dir/trial" --expected-revision "$revision" 2>&1 | tee "$case_dir/console.log"
     status=${PIPESTATUS[0]}
     printf '%s\n' "$status" > "$case_dir/runner_exit_code.txt"
-    "$py" -B -m tools.bridge_tp.six_edge_batch assess --directory "$case_dir" --edge "$edge" \
+    "$py" -B -m tools.bridge_tp.six_edge_batch assess --directory "$case_dir" --edge "$edge" --require-first-target-order \
         > "$case_dir/mechanism_check.log" 2>&1
     check_status=$?
     cat "$case_dir/mechanism_check.log"
@@ -115,9 +117,9 @@ for edge in L0-L1AC L1AC-L0 L2C-L3 L3-L2C; do
     "$py" -B -c 'import json,sys; from pathlib import Path; v=json.loads(Path(sys.argv[1]).read_text()); raise SystemExit(0 if v.get("continuation_safe") is True else 1)' \
         "$case_dir/case_acceptance.json" || { echo '启动/退出安全状态未获确认，停止后续方向。'; break; }
 done
-"$py" -B -m tools.bridge_tp.six_edge_batch aggregate --directory "$run" > "$run/batch_check.log" 2>&1
+"$py" -B -m tools.bridge_tp.six_edge_batch aggregate --directory "$run" --edges L0-L1AC > "$run/batch_check.log" 2>&1
 status=$?
 cat "$run/batch_check.log"
-echo '全部四方向均验收通过才整批通过；任何失败或未执行方向均保留并记为未通过。'
+echo '本场机制与首目标时序/12预热均通过才通过；失败保留，不重跑已通过三边。'
 pack_result "$status" || exit 1
 exit "$status"

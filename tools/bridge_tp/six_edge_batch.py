@@ -40,7 +40,67 @@ def plan(inputs):
     )
 
 
-def assess_case(directory, edge, registered):
+def first_target_order(scene):
+    """Require model validation before topology publication and formal warmup."""
+    scene = Path(scene)
+    events = [
+        json.loads(s)
+        for s in (scene / "conversion_events.jsonl").read_text().splitlines()
+        if s.strip()
+    ]
+    deferred = [e for e in events if e["kind"] == "CHANNEL_TOPOLOGY_DEFERRED"]
+    if len(deferred) != 1:
+        raise ValueError("first target needs one deferred topology event")
+    target = deferred[0]["instance"]
+    verified = [
+        e for e in events if e["kind"] == "VERIFIED" and e.get("instance") == target
+    ]
+    published = [
+        e
+        for e in events
+        if e["kind"] == "CHANNEL_TOPOLOGY_PUBLISHED" and e.get("instance") == target
+    ]
+    routes = [e for e in events if e["kind"] == "ROUTE_PUBLISHED"]
+    if not (
+        len(verified) == len(published) == len(routes) == 1
+        and deferred[0]["unix_s"]
+        <= verified[0]["unix_s"]
+        <= published[0]["unix_s"]
+        <= routes[0]["unix_s"]
+    ):
+        raise ValueError("first target model/topology/route ordering differs")
+    root = scene / "controller/migration" / target
+    channels = read(root / "gpu_channel_plan.json")
+    if len(channels) != 4 or len({c["generation"] for c in channels}) != 4:
+        raise ValueError("first target requires four distinct source channels")
+    receipts = six.pc.preconnect_receipts(root)
+    for c in channels:
+        names = [f"source-{c['source']}-{target}.json"] + [
+            f"tp_rank_{r}-{c['source']}.json" for r in range(2)
+        ]
+        for name in names:
+            v = receipts.get(name, {})
+            if not (
+                v.get("status") == "WARMUP_COMPLETE"
+                and v.get("channel_generation") == c["generation"]
+                and verified[0]["unix_s"]
+                <= v.get("completed_unix_s", 0)
+                <= routes[0]["unix_s"]
+            ):
+                raise ValueError(
+                    "first target formal warmup missing, stale or after route: " + name
+                )
+    return dict(
+        passed=True,
+        target=target,
+        formal_warmup_receipts=12,
+        model_verified_unix_s=verified[0]["unix_s"],
+        topology_published_unix_s=published[0]["unix_s"],
+        route_unix_s=routes[0]["unix_s"],
+    )
+
+
+def assess_case(directory, edge, registered, *, require_first_target_order=False):
     """Persist failure evidence and independently check cleanup for continuation."""
     directory = Path(directory)
     shutdowns = list((directory / "trial").rglob("owned_shutdown_receipt.json"))
@@ -102,6 +162,8 @@ def assess_case(directory, edge, registered):
             raise ValueError("offline mechanism acceptance differs")
         if not proof["passed"] or not proof["mechanism_passed"]:
             raise ValueError("conversion mechanism failed")
+        if require_first_target_order:
+            value["first_target_order"] = first_target_order(scene)
         sequence = read(scene / "conversion_sequence_result.json")
         steps = sequence["steps"]
         before, after, bundle, mode = six.EDGES[edge]
@@ -172,9 +234,11 @@ def assess_case(directory, edge, registered):
     return value
 
 
-def aggregate(directory):
+def aggregate(directory, edges=EDGES):
+    if not edges or len(set(edges)) != len(edges) or not set(edges) <= set(EDGES):
+        raise ValueError("invalid requested edge set")
     cases = {}
-    for edge in EDGES:
+    for edge in edges:
         path = Path(directory) / edge / "case_acceptance.json"
         try:
             cases[edge] = read(path)
@@ -192,7 +256,7 @@ def aggregate(directory):
             and v.get("edge") == k
             for k, v in cases.items()
         ),
-        expected_edges=list(EDGES),
+        expected_edges=list(edges),
         cases=cases,
         scope="independent serial mechanism checks; inspect actual migration "
         "coverage and service costs per edge; no all-edge performance claim",
@@ -205,16 +269,26 @@ def main():
     parser.add_argument("--directory", type=Path, required=True)
     parser.add_argument("--inputs", type=Path)
     parser.add_argument("--edge", choices=EDGES)
+    parser.add_argument("--edges", nargs="+", choices=EDGES, default=list(EDGES))
+    parser.add_argument("--require-first-target-order", action="store_true")
     args = parser.parse_args()
     if args.action == "plan":
         value, name = plan(read(args.inputs)), "batch_plan.json"
+        value["edges"] = list(args.edges)
+        if len(args.edges) != len(EDGES):
+            value["execution"] = (
+                f"{len(args.edges)} independent trial(s), serial; no automatic retries"
+            )
     elif args.action == "assess":
         value = assess_case(
-            args.directory, args.edge, read(args.directory.parent / "batch_plan.json")
+            args.directory,
+            args.edge,
+            read(args.directory.parent / "batch_plan.json"),
+            require_first_target_order=args.require_first_target_order,
         )
         name = "case_acceptance.json"
     else:
-        value, name = aggregate(args.directory), "batch_acceptance.json"
+        value, name = aggregate(args.directory, args.edges), "batch_acceptance.json"
     (args.directory / name).write_text(json.dumps(value, indent=2) + "\n")
     print(json.dumps(value, indent=2))
     return 0 if value.get("passed", True) else 2

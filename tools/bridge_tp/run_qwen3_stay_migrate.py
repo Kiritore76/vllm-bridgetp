@@ -1148,6 +1148,14 @@ def main(argv=None):
             no_progress_s=90,
             require_stager_process_ready=True,
         )
+        if six_conversion and args.conversion == "L0-L1AC":
+            # Do not let the controller deadline mask this conversion's own
+            # terminal state plus resource-ACK settlement.
+            from tools.bridge_tp.six_conversion import controller_timeout_s
+
+            spec["run_timeout_s"] = controller_timeout_s(
+                spec["conversion"], spec["run_timeout_s"]
+            )
         common, settings = pilot.arguments(spec)
         scope = read(observation.ASSETS / "scope.json")
         scope.update(

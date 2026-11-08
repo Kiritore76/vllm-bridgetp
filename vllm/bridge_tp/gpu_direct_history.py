@@ -94,6 +94,12 @@ def _cuda_device(device: torch.device) -> torch.device:
     return torch.device("cuda", index)
 
 
+def _channel_progress(owner, stage, rank=None):
+    callback = getattr(owner, "channel_progress", None)
+    if callback is not None:
+        callback(stage, rank)
+
+
 def _connect(address: str) -> socket.socket:
     host, port_text = address.rsplit(":", 1)
     deadline = time.monotonic() + _TIMEOUT_S
@@ -835,11 +841,14 @@ class GpuDirectHistorySender:
             or self.warmup_completed_unix_s is not None
         ):
             raise ProtocolViolation("warmup requires an idle preconnected channel")
+        _channel_progress(self, "sender.warmup.allocate")
         with torch.cuda.device(self.device):
             payloads = [
                 torch.full(
-                    (_WARMUP_ELEMENTS,), self.rank_base + rank + 1,
-                    dtype=torch.float16, device=self.device,
+                    (_WARMUP_ELEMENTS,),
+                    self.rank_base + rank + 1,
+                    dtype=torch.float16,
+                    device=self.device,
                 )
                 for rank in range(self.target_tp_size)
             ]
@@ -849,8 +858,10 @@ class GpuDirectHistorySender:
             ]
             # The test payload is created on the current stream, while NCCL
             # uses separate streams. Finish the fill before publishing it.
+            _channel_progress(self, "sender.warmup.fill_sync")
             torch.cuda.current_stream(self.device).synchronize()
         for rank, connection in enumerate(self.connections):
+            _channel_progress(self, "sender.warmup.header", self.rank_base + rank)
             send_json(
                 connection,
                 {
@@ -862,12 +873,15 @@ class GpuDirectHistorySender:
                 },
             )
         for rank, connection in enumerate(self.connections):
+            _channel_progress(self, "sender.warmup.ready", self.rank_base + rank)
             ready = recv_json(connection)
             wire_rank = self.rank_base + rank
             if ready != {"status": "WARMUP_READY", "target_tp_rank": wire_rank}:
                 raise ProtocolViolation(f"GPU-direct rank {rank} warmup not ready")
+        _channel_progress(self, "sender.warmup.nccl_send")
         _send_group(self.nccl, self.comms, payloads, streams)
         for rank, connection in enumerate(self.connections):
+            _channel_progress(self, "sender.warmup.complete_ack", self.rank_base + rank)
             complete = recv_json(connection)
             wire_rank = self.rank_base + rank
             if complete != {"status": "WARMUP_COMPLETE", "target_tp_rank": wire_rank}:
@@ -893,6 +907,7 @@ class GpuDirectHistorySender:
         comms: list[Any] = []
         try:
             for rank, address in enumerate(target_addresses):
+                _channel_progress(self, "sender.connect", self.rank_base + rank)
                 connection = _connect(address)
                 connections.append(connection)
                 unique_id = nccl.ncclGetUniqueId()
@@ -910,13 +925,14 @@ class GpuDirectHistorySender:
                     },
                 )
                 with torch.cuda.device(self.device):
+                    _channel_progress(self, "sender.comm_init", self.rank_base + rank)
                     comm = nccl.ncclCommInitRank(2, unique_id, 0)
                 comms.append(comm)
+                _channel_progress(self, "sender.channel_ready", self.rank_base + rank)
                 ready = recv_json(connection)
                 if (
                     ready.get("status") != "CHANNEL_READY"
-                    or int(ready.get("channel_generation", -1))
-                    != channel_generation
+                    or int(ready.get("channel_generation", -1)) != channel_generation
                     or int(ready.get("target_tp_rank", -1)) != self.rank_base + rank
                 ):
                     raise ProtocolViolation(

@@ -32,6 +32,12 @@ EDGES = {
 }
 
 
+def controller_timeout_s(request, current):
+    """Outwait the conversion deadline and its existing resource-ACK budget."""
+    latest = max(s["trigger_s"] + s["deadline_s"] for s in request["sequence"])
+    return max(current, latest + SixBackend.ack_timeout_s + 60)
+
+
 def take(state, width=10):
     return ports.take(state, width)
 
@@ -112,7 +118,11 @@ def receiver_engine(plan, extra, target):
     old = plan["target_env"]["BRIDGETP_TAKEOVER_RUN_DIR"]
     connector = _remap(json.loads(argv[index]), old, target["mechanism_dir"])
     connector["kv_connector_extra_config"].update(
-        bridgetp_gpu_direct_sources=target["connector_sources"],
+        bridgetp_gpu_direct_sources=(
+            []
+            if target.get("defer_channels_until_model_ready")
+            else target["connector_sources"]
+        ),
         bridgetp_gpu_direct_channel_plan=target["channel_plan"],
         bridgetp_ready_notification_port=target["ready_notification_port"],
         bridgetp_release_persistent_payload_buffer=False,
@@ -404,10 +414,14 @@ class SixBackend(SequenceBackend):
                 self.channel_graph.remove_target(target)
                 del self.targets[target]
         specs = self.replacement_specs(plan)
+        first_target = not self.targets and any(e["tp"] == 2 for _, _, e, _ in specs)
         for name, _, extra, _ in specs:
             if extra["tp"] == 2:
                 target = extra["migration_receiver"]
                 self.targets[name] = target
+                if first_target:
+                    target["defer_channels_until_model_ready"] = True
+                    self.ops.event("CHANNEL_TOPOLOGY_DEFERRED", instance=name)
                 initialize_target(target)
                 pc.atomic_json(target["channel_plan"], [])
                 self.channel_graph.add_target(
@@ -434,9 +448,19 @@ class SixBackend(SequenceBackend):
         for source, row in sources.items():
             self.resources["source_links"][source] = row["source_active"]
             self.channel_graph.source_files[source] = Path(row["targets_file"])
-            pc.atomic_json(row["targets_file"], source_entries(source, self.targets))
+            visible = {
+                n: t
+                for n, t in self.targets.items()
+                if not t.get("defer_channels_until_model_ready")
+            }
+            pc.atomic_json(row["targets_file"], source_entries(source, visible))
         for target in self.targets.values():
-            pc.atomic_json(target["channel_plan"], target["connector_sources"])
+            pc.atomic_json(
+                target["channel_plan"],
+                []
+                if target.get("defer_channels_until_model_ready")
+                else target["connector_sources"],
+            )
         for _, _, extra, _ in specs:
             if extra["tp"] == 2:
                 target = extra["migration_receiver"]
@@ -490,6 +514,25 @@ class SixBackend(SequenceBackend):
     def warm_and_verify(self, plan):
         if not super().warm_and_verify(plan):
             return False
+        # Only the first receiver starts with an empty topology. Its model/KV
+        # warmup must finish before live sources begin communicator creation.
+        for name, target in self.targets.items():
+            if target.get("defer_channels_until_model_ready"):
+                pc.atomic_json(target["channel_plan"], target["connector_sources"])
+                for source, row in self.rows.items():
+                    if (
+                        row.get("targets_file")
+                        and self.registry.instances[source].lifecycle == "ACTIVE"
+                    ):
+                        pc.atomic_json(
+                            row["targets_file"], source_entries(source, self.targets)
+                        )
+                target["defer_channels_until_model_ready"] = False
+                self.ops.event(
+                    "CHANNEL_TOPOLOGY_PUBLISHED",
+                    instance=name,
+                    sources=[c["source"] for c in target["connector_sources"]],
+                )
         missing = []
         for name, target in self.targets.items():
             receipts = pc.preconnect_receipts(Path(target["mechanism_root"]))
@@ -514,8 +557,15 @@ class SixBackend(SequenceBackend):
                             rank, {}
                         ).get("updated_unix_s", 0):
                             diagnostics[rank] = value
+                    sender_paths = list(
+                        Path(target["mechanism_root"]).glob(
+                            f"sessions/*/gpu_channel_connection_receipts/source-{source}-{name}*.json"
+                        )
+                    )
+                    sender_progress = [pc.read_json(p) for p in sender_paths]
                     missing.append(
                         dict(
+                            sender_progress=sender_progress,
                             target=name,
                             source=source,
                             generation=channel["generation"],

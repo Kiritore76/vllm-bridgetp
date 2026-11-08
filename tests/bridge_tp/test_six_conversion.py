@@ -609,6 +609,7 @@ class LifecycleTests(unittest.TestCase):
         cancel_after_retire=False,
         prestart=False,
         cancel_before_retire=False,
+        require_cold_order=False,
     ):
         before, after, bundle, mode = six.EDGES[edge]
         with tempfile.TemporaryDirectory() as folder:
@@ -618,7 +619,27 @@ class LifecycleTests(unittest.TestCase):
             calls, events = [], []
             alive = set()
 
+            def cold_check(extra):
+                if not require_cold_order:
+                    return
+                target = extra["migration_receiver"]
+                self.assertTrue(target.get("defer_channels_until_model_ready"))
+                self.assertEqual(pc.read_json(target["channel_plan"]), [])
+                for source in target["connector_sources"]:
+                    self.assertEqual(
+                        pc.read_json(run / f"gpu_targets_{source['source']}.json"), []
+                    )
+                argv, _ = six.receiver_engine(plan, extra, target)
+                connector = json.loads(argv[argv.index("--kv-transfer-config") + 1])
+                self.assertEqual(
+                    connector["kv_connector_extra_config"][
+                        "bridgetp_gpu_direct_sources"
+                    ],
+                    [],
+                )
+
             def start(extra):
+                cold_check(extra)
                 calls.append(("start", extra["instance_id"]))
                 alive.add(extra["instance_id"])
 
@@ -643,7 +664,7 @@ class LifecycleTests(unittest.TestCase):
                 ),
                 alive=lambda name: name in alive,
                 gpus_released=lambda ids: True,
-                warm=lambda extra: None,
+                warm=cold_check,
                 scrape=lambda endpoint, native: dict(
                     num_running=0,
                     num_waiting=0,
@@ -741,7 +762,7 @@ class LifecycleTests(unittest.TestCase):
                         / "sessions/cpu/gpu_channel_preconnect_receipts"
                     )
                     pre.mkdir(parents=True, exist_ok=True)
-                    for c in target["connector_sources"]:
+                    for c in pc.read_json(target["channel_plan"]):
                         for name in [
                             f"source-{c['source']}-{target['instance_id']}.json"
                         ] + [f"tp_rank_{r}-{c['source']}.json" for r in range(2)]:
@@ -816,6 +837,17 @@ class LifecycleTests(unittest.TestCase):
                 kinds.index("RESOURCES_RELEASED"), kinds.index("LOAD_START")
             )
             self.assertLess(kinds.index("VERIFIED"), kinds.index("ROUTE_PUBLISHED"))
+            if require_cold_order:
+                self.assertLess(
+                    kinds.index("CHANNEL_TOPOLOGY_DEFERRED"), kinds.index("LOAD_START")
+                )
+                self.assertLess(
+                    kinds.index("VERIFIED"), kinds.index("CHANNEL_TOPOLOGY_PUBLISHED")
+                )
+                self.assertLess(
+                    kinds.index("CHANNEL_TOPOLOGY_PUBLISHED"),
+                    kinds.index("ROUTE_PUBLISHED"),
+                )
 
     def test_gated_prestart_merge_and_split_follow_the_same_release_order(self):
         self.run_edge("L1AC-L2C", prestart=True)

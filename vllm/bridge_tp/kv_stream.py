@@ -271,7 +271,37 @@ def _file_targets(path: str, heads: int):
 
 def _preconnect_one(config: BridgeTPStreamConfig, device: torch.device, label: str):
     """Open and warm one target's channel; receipt per target label."""
+    pool = os.getenv("BRIDGETP_PRESSURE_POOL", "source")
+    path = (
+        config.run_dir
+        / "gpu_channel_connection_receipts"
+        / local_role().own_file(f"source-{pool}-{config.target_instance}.json")
+    )
+    last_stage = {}
+
+    def progress(stage, rank=None, error=None):
+        if stage is not None:
+            last_stage.update(stage=stage, rank=rank)
+        _atomic_json_dump(
+            dict(
+                source_instance=pool,
+                target_instance=config.target_instance,
+                channel_generation=config.channel_generation,
+                base_port=config.gpu_direct_base_port,
+                target_tp_rank=last_stage.get("rank"),
+                stage=last_stage.get("stage"),
+                status="FAILED"
+                if error
+                else ("COMPLETE" if stage == "sender.complete" else "STARTED"),
+                error=None if error is None else repr(error),
+                updated_unix_s=time.time(),
+            ),
+            path,
+        )
+
+    progress("sender.acquire")
     key, sender = _acquire_persistent_gpu_sender(config, device)
+    sender.channel_progress = progress
     try:
         if sender.nccl is None:
             sender.preconnect(
@@ -296,11 +326,15 @@ def _preconnect_one(config: BridgeTPStreamConfig, device: torch.device, label: s
                 / "gpu_channel_preconnect_receipts"
                 / local_role().own_file(f"{label}.json"),
             )
-    except BaseException:
+    except BaseException as error:
+        progress(None, error=error)
         _discard_persistent_gpu_sender(key, sender)
         raise
     else:
+        progress("sender.complete")
         _release_persistent_gpu_sender(key)
+    finally:
+        sender.channel_progress = None
 
 
 def _env_bool(name: str, default: bool) -> bool:
