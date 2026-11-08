@@ -560,8 +560,9 @@ class SixBackend(SequenceBackend):
         return revision
 
 
-def assess(scene, expected_requests, require_conversion=True):
+def assess(scene, expected_requests, require_conversion=True, *, split_probe=False):
     from tools.bridge_tp.conversion_sequence import assess as sequence_assess
+    from tools.bridge_tp.six_split_probe import PROFILE, coverage
 
     value = sequence_assess(scene, expected_requests, decided=True)
     sequence = pc.read_json(Path(scene) / "conversion_sequence_result.json") or {}
@@ -570,5 +571,27 @@ def assess(scene, expected_requests, require_conversion=True):
         s["plan"]["state"] == "COMPLETED" and s.get("layout") in PATH.values()
         for s in steps
     )
-    value["passed"] = value["passed"] and value["all_steps_completed"]
+    value["mechanism_passed"] = value["passed"] and value["all_steps_completed"]
+    scene = Path(scene)
+    manifest = pc.read_json(scene / "instances.json") or {}
+    split_probe = split_probe or manifest.get("diagnostic_arrival_profile") == PROFILE
+    audit = [
+        json.loads(line)
+        for line in (scene / "controller/pressure_audit.jsonl").read_text().splitlines()
+    ]
+    observed = coverage(
+        sequence,
+        [
+            json.loads(line)
+            for line in (scene / "conversion_events.jsonl").read_text().splitlines()
+        ],
+        pc.read_json(scene / "controller/pressure_request_results.json"),
+        [e for e in audit if e["kind"] == "pressure_actual_start"],
+        (pc.read_json(scene / "closed_loop_acceptance.json") or {}).get("sessions", []),
+    )
+    value.update(observed)
+    value["migration_coverage"] = observed["actual_migration_coverage"]
+    value["migration_coverage_required"] = split_probe
+    value["coverage_passed"] = not split_probe or observed["split_probe_coverage"]
+    value["passed"] = value["mechanism_passed"] and value["coverage_passed"]
     return value

@@ -324,38 +324,7 @@ def preflight(args):
         getattr(args, "migration_targets", None) != "all"
     ):
         raise ValueError("--migration-target belongs to --migration-targets all")
-    pair = pair_pools(manifest)
-    pool_names = {"tp1": "tp1", "tp4": "tp4"} | (
-        manifest.get("runtime_pool_ids", {}) if manifest else {}
-    )
-    ids = set()
-    for job in jobs:
-        req = job["request"]
-        if (
-            job["id"] in ids
-            or not math.isfinite(job["at_s"])
-            or job["at_s"] < 0
-            or not isinstance(req["prompt"], list)
-            or not req["prompt"]
-            or any(type(t) is not int or t < 0 for t in req["prompt"])
-            or not 0 < req["max_tokens"] <= 8192
-            or job.get("route") not in {None, *pair}
-        ):
-            raise ValueError("invalid/duplicate arrival or stop contract")
-        ids.add(job["id"])
-        limits = {
-            name: limit
-            for name, limit in (
-                (pool_names["tp1"], args.source_context_limit),
-                (pool_names["tp4"], args.target_context_limit),
-            )
-            if name in pair
-        }
-        routes = [job["route"]] if job.get("route") else limits
-        if not any(
-            len(req["prompt"]) + req["max_tokens"] <= limits[name] for name in routes
-        ):
-            raise ValueError("arrival has no context-feasible route")
+    validate_arrivals(jobs, args, controller, manifest)
     paths = (
         args.policy_config,
         args.controller_config,
@@ -394,6 +363,53 @@ def preflight(args):
     if manifest is not None:
         receipt["instance_manifest"] = manifest
     return cfg, controller, lookup, jobs, receipt
+
+
+def validate_arrivals(jobs, args, controller, manifest):
+    """Check pinned routes and token limits without activating future instances."""
+    pair = pair_pools(manifest)
+    pool_names = {"tp1": "tp1", "tp4": "tp4"} | (
+        manifest.get("runtime_pool_ids", {}) if manifest else {}
+    )
+    route_limits = {
+        name: limit
+        for name, limit in (
+            (pool_names["tp1"], args.source_context_limit),
+            (pool_names["tp4"], args.target_context_limit),
+        )
+        if name in pair
+    }
+    if manifest and manifest.get("diagnostic_arrival_profile") is not None:
+        from tools.bridge_tp.six_split_probe import PROFILE, arrival_limits
+
+        if not (
+            manifest["diagnostic_arrival_profile"] == PROFILE
+            and getattr(controller, "dynamic_conversion", False)
+            and getattr(args, "scheduler", "pressure") == "unified"
+        ):
+            raise ValueError("diagnostic arrival routes require the split probe")
+        route_limits.update(arrival_limits(manifest))
+    ids = set()
+    for job in jobs:
+        req = job["request"]
+        if (
+            job["id"] in ids
+            or not math.isfinite(job["at_s"])
+            or job["at_s"] < 0
+            or not isinstance(req["prompt"], list)
+            or not req["prompt"]
+            or any(type(t) is not int or t < 0 for t in req["prompt"])
+            or not 0 < req["max_tokens"] <= 8192
+            or job.get("route") not in {None, *route_limits}
+        ):
+            raise ValueError("invalid/duplicate arrival or stop contract")
+        ids.add(job["id"])
+        limits = route_limits
+        routes = [job["route"]] if job.get("route") else limits
+        if not any(
+            len(req["prompt"]) + req["max_tokens"] <= limits[name] for name in routes
+        ):
+            raise ValueError("arrival has no context-feasible route")
 
 
 def batch(inventory, now, cfg, reading):

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 当前任务：避开系统临时/占用端口、补启动绑定重试后，CPU前置通过再重跑L2C到L1AC一场；不绕过预热。
+# 当前任务：L2C到L1AC带长自然排空及新A双源真实迁移一场诊断；正常触发/安全门。
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
@@ -15,11 +15,11 @@ git fetch origin "refs/heads/$branch:refs/remotes/origin/$branch" || exit 1
 revision=$(git rev-parse HEAD)
 [ "$revision" = "$(git rev-parse "origin/$branch")" ] || { echo '请先git pull --ff-only。'; exit 1; }
 mkdir -p /root/autodl-tmp/bridgetp/results || exit 1
-run=/root/autodl-tmp/bridgetp/results/qwen3_six_conversion_$(date +%Y%m%d_%H%M%S)_${RANDOM}
+run=/root/autodl-tmp/bridgetp/results/qwen3_six_split_probe_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 printf '%s\n' "$revision" > "$run/revision.txt"
-printf 'six-card unified; explicit L2C to L1AC (split A) at 60s; DRAIN natural; gate<0.9; no TP2 migration.\n' > "$run/scope.txt"
-printf 'retry after OS-aware port allocation and startup bind retry; warmup proof remains mandatory.\n' >> "$run/scope.txt"
+printf 'six-card unified diagnostic; split A at 110s; pinned long arrivals to old/new A; normal migration gates; no TP2 migration.\n' > "$run/scope.txt"
+printf '366 requests/95232 output tokens; 720s background; require loaded natural drain and commit/release from each new A to B; no performance comparison.\n' >> "$run/scope.txt"
 echo "本批目录：$run"
 echo 'Linux CPU前置失败/错误/跳过即停止；通过后仅运行L2C到L1AC一场GPU冒烟。'
 echo '失败即打包，不自动重试、不删除结果；不清理其他进程。'
@@ -55,6 +55,7 @@ export TMPDIR="$task_tmp" TEMP="$task_tmp" TMP="$task_tmp"
     tests.bridge_tp.test_pressure_launcher \
     tests.bridge_tp.test_source_channels tests.bridge_tp.test_channel_runtime \
     tests.bridge_tp.test_tcp_ports tests.bridge_tp.test_gpu_direct_history_lifecycle \
+    tests.bridge_tp.test_six_split_probe \
     > "$run/cpu_checks.log" 2>&1
 status=$?
 tail -n 12 "$run/cpu_checks.log"
@@ -72,18 +73,18 @@ avail=$(df --output=avail -k "$run" | tail -1)
 nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,pcie.link.gen.current,pcie.link.width.current --format=csv,noheader > "$run/gpu_before.csv" || { pack_result 1; exit 1; }
 nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,pcie.link.gen.current,pcie.link.width.current --format=csv,noheader -lms 1000 > "$run/gpu_samples.csv" &
 smi=$!
-echo '唯一GPU场：L2C起点，60秒提议A拆回两个TP1；A停止接新请求和新迁移，已有请求自然结束后退役，源入口改回B；B、C保留服务，新TP1加入路由后可作为源迁往B。'
+echo '唯一GPU场：30/32秒长请求指定旧A，110秒提议自然排空拆分；330/332与450/452秒分别给新A两源长请求。背景统一调度，迁移仍走正常触发与安全检查，缺覆盖退出2。'
 "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
     --cards 6 --static-layout L2C --long-burst-pair \
     --scheduler unified --hold-queue --kv-short-exempt --overload-migrate --migrate-current-length \
-    --conversion L2C-L1AC --conversion-trigger-s 60 \
+    --conversion L2C-L1AC --conversion-trigger-s 110 --six-split-probe \
     --expanded-context --current-machine --repetitions 1 \
     --model "$model" \
     --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
     --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json" \
     --output "$run/trial" --expected-revision "$revision" 2>&1 | tee "$run/console.log"
 status=${PIPESTATUS[0]}
-if [ "$status" = 0 ]; then
+if [ "$status" = 0 ] || [ "$status" = 2 ]; then
     "$py" -B - "$run/trial" > "$run/mechanism_check.log" 2>&1 <<'PY'
 import json,sys
 from pathlib import Path
@@ -91,7 +92,7 @@ root=Path(sys.argv[1])
 paths=list(root.rglob("conversion_sequence_acceptance.json"))
 assert len(paths)==1, paths
 proof=json.loads(paths[0].read_text())
-assert proof["passed"] and proof["all_steps_completed"],proof
+assert proof["mechanism_passed"] and proof["all_steps_completed"],proof
 assert proof.get("late_dispatches")==[],proof.get("late_dispatches")
 sequence=json.loads((paths[0].parent/"conversion_sequence_result.json").read_text())
 assert len(sequence["steps"])==1,sequence
@@ -100,15 +101,18 @@ assert step["request"]["bundle"]=="A" and step["request"]["target_mode"]=="TP1",
 assert step["layout"]==dict(A=1,B=2,C=1),step
 phase=proof["phases"][-1]
 # Report the split's own timings; the acceptance above is the gate.
-print(json.dumps(dict(passed=True,layout=step["layout"],
+print(json.dumps(dict(passed=proof["passed"],mechanism_passed=proof["mechanism_passed"],layout=step["layout"],
     drain_s=phase.get("drain_s"),rebuild_s=phase.get("rebuild_s"),
     admission_closed_s=phase.get("admission_closed_s"),
     trigger_to_route_s=phase.get("trigger_to_route_s"),
-    migration_coverage=proof.get("migration_coverage")),indent=2))
+    migration_coverage=proof["migration_coverage"],coverage_passed=proof["coverage_passed"],
+    loaded_drain_requests=proof["loaded_drain_requests"],joined_source_coverage=proof["joined_source_coverage"],
+    actual_committed_transfers=proof["actual_committed_transfers"]),indent=2))
+raise SystemExit(0 if proof["passed"] else 2)
 PY
     status=$?
     cat "$run/mechanism_check.log"
 fi
-echo '仅验机制，另报告排空/重建/转换耗时、期间服务和迁移；零迁移不算失败，不作收益结论。'
+echo '本场须带长自然排空且新A两源各实际迁B提交/释放；机制通过但缺覆盖记2并保留全部数据，不强行START、不调整阈值。'
 pack_result "$status" || exit 1
 exit "$status"

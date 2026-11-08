@@ -442,6 +442,12 @@ def main(argv=None):
         help="S5a: SELECTIVE_ROLL drain assist (merging edge L1A-L2 only)",
     )
     parser.add_argument(
+        "--six-split-probe",
+        action="store_true",
+        help="diagnostic L2C-L1AC: pinned loaded drain, then both new A sources "
+        "under KV pressure; require real commit/release; not a performance trial",
+    )
+    parser.add_argument(
         "--conversion-trigger-s",
         type=float,
         default=30,
@@ -477,6 +483,19 @@ def main(argv=None):
     six_conversion = args.cards == 6 and bool(
         args.conversion or args.conversion_decider
     )
+    if args.six_split_probe and not (
+        six_conversion
+        and args.conversion == "L2C-L1AC"
+        and args.static_layout == "L2C"
+        and args.long_burst_pair
+        and args.conversion_trigger_s == 110.0
+        and not args.conversion_prestart
+        and not args.conversion_decider
+    ):
+        parser.error(
+            "six-split-probe needs L2C-L1AC, long-burst-pair, trigger 110, "
+            "and natural drain without prestart/decider"
+        )
     if args.conversion in SIX_EDGES and args.cards != 6:
         parser.error("six-card edge requires --cards 6")
     if six_conversion and (
@@ -714,6 +733,16 @@ def main(argv=None):
             cfg["note"] += (
                 "; explicit four-edge mechanism check; no performance comparison"
             )
+        if args.six_split_probe:
+            from tools.bridge_tp.six_split_probe import HORIZON_S
+            from tools.bridge_tp.six_split_probe import recipe as probe_recipe
+
+            cfg["recipes"] = [probe_recipe(read(args.inputs))]
+            cfg["horizon_s"] = HORIZON_S
+            cfg["note"] += "; diagnostic pinned arrivals; normal migration policy; "
+            cfg["note"] += (
+                "require loaded drain and commit/release from both joined A sources"
+            )
         values = cfg["recipes"]
     elif args.kv_priority_verify:
         if (
@@ -901,7 +930,10 @@ def main(argv=None):
                     routing_weights=cfg["routing_weights"],
                     migration_execution=True,
                     maximum_migrations_per_run=0,
-                    routing_policy="KV-first ingress during warning/recovery; "
+                    routing_policy="diagnostic pinned long arrivals; background "
+                    "unified; normal migration triggers and safety gates"
+                    if args.six_split_probe
+                    else "KV-first ingress during warning/recovery; "
                     "original service routing otherwise"
                     if args.kv_routing_verify or args.updated_pressure_four_mode
                     else "single pressure MIGRATE; urgent KV soft-gate fix"
@@ -1196,6 +1228,12 @@ def main(argv=None):
                 from tools.bridge_tp.six_conversion import configure
 
                 configure(plan)
+                if args.six_split_probe:
+                    from tools.bridge_tp.six_split_probe import (
+                        configure as probe_configure,
+                    )
+
+                    probe_configure(plan)
             elif args.migration_targets:
                 from tools.bridge_tp.migration_receivers import configure
 
@@ -1282,12 +1320,13 @@ def main(argv=None):
                     plan["run_dir"].parent,
                     len(recipe["jobs"]),
                     require_conversion=bool(args.conversion),
+                    split_probe=args.six_split_probe,
                 )
                 write(
                     plan["run_dir"].parent / "conversion_sequence_acceptance.json",
                     row["conversion_sequence"],
                 )
-                if not row["conversion_sequence"]["passed"]:
+                if not row["conversion_sequence"]["mechanism_passed"]:
                     raise RuntimeError(
                         "six-card conversion mechanism acceptance failed"
                     )
