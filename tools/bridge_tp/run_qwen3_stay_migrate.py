@@ -63,6 +63,8 @@ CONVERSIONS = {
     # L2 A: TP2(2,3) -> TP1@2 + TP1@3, new sources of the retained TP2(0,1).
     "L2-L1A": dict(bundle="A", target_mode="TP1", join_migration=True),
 }
+from tools.bridge_tp.six_conversion import EDGES as SIX_EDGES  # noqa: E402
+
 # Layout a conversion edge starts from.
 START_LAYOUT = {name: name.split("-")[0] for name in CONVERSIONS}
 
@@ -138,7 +140,8 @@ def serving_preflight(plans):
         if not started:
             stagers = (
                 [t["stager_argv"] for t in plan["migration_targets"]]
-                if plan.get("receiver_stage") in (2, 3) else [plan["stager_argv"]]
+                if plan.get("receiver_stage") in (2, 3)
+                else [plan["stager_argv"]]
             )
             for stager in stagers:
                 phase8_stager.parse_args(stager[2:])
@@ -179,8 +182,11 @@ def closed_loop_proof(plan, arm):
             settled=session["settled"],
         )
         if plan.get("receiver_stage") in (2, 3):
-            targets = [t for t in plan["migration_targets"]
-                       if run_dir.parent == Path(t["mechanism_root"]) / "sessions"]
+            targets = [
+                t
+                for t in plan["migration_targets"]
+                if run_dir.parent == Path(t["mechanism_root"]) / "sessions"
+            ]
             if len(targets) != 1 or not targets[0]["execution_allowed"]:
                 raise ValueError(
                     "stage 2 session is not in the B receiver root"
@@ -269,7 +275,7 @@ def main(argv=None):
     )
     parser.add_argument(
         "--conversion",
-        choices=sorted(CONVERSIONS),
+        choices=sorted(set(CONVERSIONS) | set(SIX_EDGES)),
         help="S3b-3: explicit DRAIN conversion of one L1A bundle while serving",
     )
     parser.add_argument(
@@ -427,13 +433,24 @@ def main(argv=None):
     allowed_layouts = six.LAYOUTS if args.cards == 6 else ("L0", "L1A", "L2")
     if args.static_layout and args.static_layout not in allowed_layouts:
         parser.error("static layout does not match --cards")
+    six_conversion = args.cards == 6 and bool(
+        args.conversion or args.conversion_decider
+    )
+    if args.conversion in SIX_EDGES and args.cards != 6:
+        parser.error("six-card edge requires --cards 6")
+    if six_conversion and (
+        args.scheduler != "unified"
+        or args.static_no_migrate
+        or args.decider_assist
+        or args.decider_evacuate
+    ):
+        parser.error("six-card conversions require unified migration and natural drain")
     if args.cards == 6 and (
         not args.static_layout
         or not args.current_machine
         or not args.expanded_context
-        or args.conversion
+        or (args.conversion and args.conversion not in SIX_EDGES)
         or args.conversion_cycle
-        or args.conversion_decider
         or args.layout_l1a_channels
     ):
         parser.error("six cards currently support static native-32K layouts only")
@@ -444,9 +461,9 @@ def main(argv=None):
     if args.scheduler == "unified" and (
         not args.static_layout
         or not args.hold_queue
-        or args.conversion
+        or (args.conversion and not six_conversion)
         or args.conversion_cycle
-        or args.conversion_decider
+        or (args.conversion_decider and not six_conversion)
     ):
         parser.error("the unified scheduler runs static layouts with --hold-queue")
     mixed_layout = args.static_layout in (six.MIXED if args.cards == 6 else ("L1A",))
@@ -459,9 +476,15 @@ def main(argv=None):
     if args.layout_l1a_channels and not args.long_burst_memory_verify:
         parser.error("layout-l1a-channels runs with long-burst-memory-verify only")
     joined = bool(
-        args.conversion and CONVERSIONS[args.conversion].get("join_migration")
+        args.conversion in CONVERSIONS
+        and CONVERSIONS[args.conversion].get("join_migration")
     )
-    if args.conversion and not joined and not args.layout_l1a_channels:
+    if (
+        args.conversion
+        and not six_conversion
+        and not joined
+        and not args.layout_l1a_channels
+    ):
         parser.error("conversion runs on the L1A channel layout only")
     if joined and (args.layout_l1a_channels or not args.long_burst_memory_verify):
         parser.error(
@@ -470,7 +493,7 @@ def main(argv=None):
         )
     if args.static_layout and (
         args.layout_l1a_channels
-        or args.conversion
+        or (args.conversion and not six_conversion)
         or args.long_burst_memory_verify
         or args.long_burst_deep_stay
         or not (
@@ -487,13 +510,13 @@ def main(argv=None):
         )
     if args.static_no_migrate and (not mixed_layout or args.conversion_decider):
         parser.error("--static-no-migrate is a static L1A control without a decider")
-    if args.kv_short_exempt and not mixed_layout:
+    if args.kv_short_exempt and not (mixed_layout or six_conversion):
         parser.error("--kv-short-exempt is a static L1A routing option")
     if args.hold_queue and not args.static_layout:
         parser.error("--hold-queue is a static layout option")
     if args.overload_migrate and not args.kv_short_exempt:
         parser.error("--overload-migrate needs --kv-short-exempt")
-    if args.migrate_current_length and not mixed_layout:
+    if args.migrate_current_length and not (mixed_layout or six_conversion):
         parser.error("--migrate-current-length is a static L1A option")
     if args.conversion_assist and args.conversion != "L1A-L2":
         parser.error("drain assist merges TP1s into a TP2 (L1A-L2) only")
@@ -525,7 +548,10 @@ def main(argv=None):
             or args.rate_sweep
             or args.updated_pressure_four_mode
             or not args.static_layout
-            or (args.conversion_decider and args.static_layout != "L1A")
+            or (
+                args.conversion_decider
+                and args.static_layout != ("L1AC" if args.cards == 6 else "L1A")
+            )
         ):
             parser.error(
                 "phase-shift is its own workload on a static layout; "
@@ -614,7 +640,7 @@ def main(argv=None):
             )
         if args.static_layout:
             # One arm; mixed layouts retain B as the single migration target.
-            migrate = mixed_layout and not args.static_no_migrate
+            migrate = (mixed_layout or six_conversion) and not args.static_no_migrate
             cfg["arms"] = ["migrate" if migrate else "stay"]
             if args.kv_short_exempt:
                 cfg["policy_overrides"] = dict(
@@ -939,7 +965,11 @@ def main(argv=None):
                 if args.decider_evacuate:
                     spec["conversion"]["evacuate"] = True
                     spec["conversion"]["rules"]["evacuate_busy"] = True
-        if args.conversion and START_LAYOUT[args.conversion] != "L1A":
+        if (
+            args.conversion
+            and not six_conversion
+            and START_LAYOUT[args.conversion] != "L1A"
+        ):
             spec["layout"] = dict(
                 name=START_LAYOUT[args.conversion],
                 bundle_gpus=["2", "3", "0", "1"],
@@ -948,7 +978,7 @@ def main(argv=None):
             )
         if args.conversion:
             spec["conversion"] = dict(
-                CONVERSIONS[args.conversion],
+                CONVERSIONS.get(args.conversion, {}),
                 trigger_s=args.conversion_trigger_s,
                 method="SELECTIVE_ROLL" if args.conversion_assist else "DRAIN",
                 # A drain behind 8192-token outputs can take minutes.
@@ -956,6 +986,33 @@ def main(argv=None):
                 base_port=8400,
                 prestart=args.conversion_prestart,
             )
+        if six_conversion:
+            if args.conversion:
+                edge = SIX_EDGES[args.conversion]
+                if args.static_layout != edge[0]:
+                    raise ValueError("six-card edge must start in its declared layout")
+                spec["conversion"] = dict(
+                    profile="six_card",
+                    base_port=8400,
+                    prestart=args.conversion_prestart,
+                    sequence=[
+                        dict(
+                            bundle=edge[2],
+                            target_mode=edge[3],
+                            trigger_s=args.conversion_trigger_s,
+                            deadline_s=900,
+                            method="DRAIN",
+                        )
+                    ],
+                )
+            else:
+                spec["conversion"].update(
+                    profile="six_card",
+                    multi=args.conversion_decider == "execute",
+                    assist=False,
+                    max_conversions=4,
+                    rules=dict(current_length=True, trend_lookahead_s=60.0),
+                )
         if args.conversion_cycle:
             spec["conversion"] = dict(
                 base_port=8400,
@@ -1050,6 +1107,8 @@ def main(argv=None):
         if missing is not None:
             plans = [p for p in plans if p[2]["name"] in missing]
         for _, arm, _, plan in plans:
+            if six_conversion and "--no-migration" in plan["controller_argv"]:
+                plan["controller_argv"].remove("--no-migration")
             adapt_plan(plan, arm, args.checkpoint, args.model)
             if args.tp2_max_num_seqs != 16:
                 # Every TP2 engine starts from target_argv, extra ones included.
@@ -1092,7 +1151,11 @@ def main(argv=None):
 
             install(plan)
             activate_instance_ids(plan)
-            if args.migration_targets:
+            if six_conversion:
+                from tools.bridge_tp.six_conversion import configure
+
+                configure(plan)
+            elif args.migration_targets:
                 from tools.bridge_tp.migration_receivers import configure
 
                 force = next(
@@ -1122,7 +1185,11 @@ def main(argv=None):
             ledger.append(row)
             write(args.output / "attempt_ledger.json", ledger)
             finalizer = comparison.finalize
-            if args.cards == 6:
+            if six_conversion:
+                from tools.bridge_tp.conversion_sequence import finalize
+
+                finalizer = finalize
+            elif args.cards == 6:
                 finalizer = six.finalize
             elif args.conversion_cycle or args.decider_multi:
                 from tools.bridge_tp.conversion_sequence import finalize
@@ -1153,10 +1220,12 @@ def main(argv=None):
                 plan["run_dir"],
                 recipe["jobs"],
                 natural_eos=not recipe["fixed_output"],
-                horizon=cfg["horizon_s"] if args.conversion_cycle else 300.0,
+                horizon=cfg["horizon_s"]
+                if args.conversion_cycle or six_conversion
+                else 300.0,
             )
             write(plan["run_dir"].parent / "closed_loop_acceptance.json", proof)
-            if args.cards == 6:
+            if args.cards == 6 and not six_conversion:
                 row["six_card"] = six.assess(plan, proof, len(recipe["jobs"]))
                 write(
                     plan["run_dir"].parent / "six_card_acceptance.json", row["six_card"]
@@ -1165,7 +1234,23 @@ def main(argv=None):
                 plan["run_dir"].parent / "comparison_metrics.json",
                 dict(summary=summary, requests=requests),
             )
-            if args.conversion:
+            if six_conversion and args.conversion_decider != "record":
+                from tools.bridge_tp.six_conversion import assess
+
+                row["conversion_sequence"] = assess(
+                    plan["run_dir"].parent,
+                    len(recipe["jobs"]),
+                    require_conversion=bool(args.conversion),
+                )
+                write(
+                    plan["run_dir"].parent / "conversion_sequence_acceptance.json",
+                    row["conversion_sequence"],
+                )
+                if not row["conversion_sequence"]["passed"]:
+                    raise RuntimeError(
+                        "six-card conversion mechanism acceptance failed"
+                    )
+            if args.conversion and not six_conversion:
                 from tools.bridge_tp.conversion_acceptance import assess
 
                 row["conversion"] = assess(plan["run_dir"].parent)
@@ -1183,7 +1268,7 @@ def main(argv=None):
                     plan["run_dir"].parent / "conversion_sequence_acceptance.json",
                     row["conversion_sequence"],
                 )
-            if args.decider_multi:
+            if args.decider_multi and not six_conversion:
                 from tools.bridge_tp.conversion_sequence import assess
 
                 row["conversion_sequence"] = assess(

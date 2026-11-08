@@ -317,6 +317,10 @@ class TargetSessions:
             raise AttributeError(key)
         group = self.groups.get(self.current) or self.last_group
         if group is None:
+            if key in {"migration_id", "cancel_future", "target_future", "stream"}:
+                return None
+            if key == "settled":
+                return True
             raise AttributeError(key)
         return getattr(group, key)
 
@@ -392,6 +396,33 @@ class TargetSessions:
             return False
         removed = self.groups.keys() - groups.keys()
         added = groups.keys() - self.groups.keys()
+        # Move idle retained senders before the backend removes retired targets
+        # from their files. A disarmed old control can still name that retired
+        # target, and select_target rejects an id absent from the new file.
+        for source, link in links.items():
+            if not link.is_symlink():
+                continue
+            previous = Path(os.readlink(link))
+            if not any(
+                previous == Path(self.groups[n].root) / "migration_active"
+                for n in removed
+            ):
+                continue
+            if groups:
+                target, group = next(iter(groups.items()))
+                active = Path(group.root) / "migration_active"
+            else:
+                target = None
+                root = link.parent.parent / "migration" / "parked"
+                active = root / "migration_active"
+                if not active.is_symlink():
+                    from tools.bridge_tp.run_phase9_controller import RuntimeControl
+
+                    directory = initialize(root)
+                    RuntimeControl(armed=False).write(directory)
+            switch_source_entry(
+                link, active, self.audit_log, source=source, target=target
+            )
         for name in sorted(removed):
             group = self.groups[name]
             group.close()

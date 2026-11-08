@@ -407,7 +407,11 @@ def build_scene(spec, scene, run_root, common, args):
         stager_argv=stager_argv,
         controller_argv=argv,
     )
-    if request is not None and ("sequence" in request or request.get("multi")):
+    if (
+        request is not None
+        and request.get("profile") != "six_card"
+        and ("sequence" in request or request.get("multi"))
+    ):
         from tools.bridge_tp.conversion_sequence import prepare_plan
 
         prepare_plan(plan)
@@ -516,7 +520,7 @@ def conversion_request(spec, registry):
     if "sequence" in request:
         from tools.bridge_tp.conversion_sequence import validate
 
-        if spec["layout"]["name"] != "L1A":
+        if request.get("profile") != "six_card" and spec["layout"]["name"] != "L1A":
             raise ValueError("the explicit cycle starts in four-card L1A")
         return validate(request)
     if "decider" in request:
@@ -555,14 +559,16 @@ def decider_request(request):
     proposal (one DRAIN conversion per run), or with ``multi`` keeps converting
     serially up to ``max_conversions``.
     """
-    from tools.bridge_tp.conversion_decider import EDGES, RULES
+    from tools.bridge_tp.conversion_decider import profile_edges, profile_rules
 
+    RULES = profile_rules(request.get("profile", "four_card"))
     required = {"decider", "deadline_s", "base_port"}
     if (
         not required
         <= set(request)
-        <= required | {"rules", "prestart", "pre_tilt", "assist", "multi"}
-        | {"max_conversions", "evacuate"}
+        <= required
+        | {"rules", "prestart", "pre_tilt", "assist", "multi"}
+        | {"max_conversions", "evacuate", "profile"}
         or request.get("evacuate", False) not in (True, False)
         or request.get("evacuate")
         and not request.get("multi")
@@ -580,7 +586,7 @@ def decider_request(request):
         or int(request["base_port"]) <= 0
     ):
         raise ValueError("invalid conversion decider request")
-    return dict(request, edges=EDGES)
+    return dict(request, edges=profile_edges(request.get("profile", "four_card")))
 
 
 def join_plan(request, spec, args, aliases, pair_bundles, extras, run_root, scene):
@@ -666,7 +672,7 @@ def source_launch(plan):
     settings stay; the runner may add sender settings after planning, so
     this is applied at launch.
     """
-    if "target" not in absent_pair(plan):
+    if plan.get("dynamic_conversion") or "target" not in absent_pair(plan):
         return plan["source_argv"], plan["source_env"]
     join = plan.get("join")
     if join:
@@ -738,8 +744,10 @@ def extra_engine(plan, extra):
         # with its own channel, predictor journal, inventory and trace.
         env = dict(plan["source_env"])
         if extra.get("source_active"):
-            env.update(BRIDGETP_STREAM_RUN_DIR=extra["source_active"],
-                       BRIDGETP_TAKEOVER_RUN_DIR=extra["source_active"])
+            env.update(
+                BRIDGETP_STREAM_RUN_DIR=extra["source_active"],
+                BRIDGETP_TAKEOVER_RUN_DIR=extra["source_active"],
+            )
         env.update(
             BRIDGETP_GPU_DIRECT_BASE_PORT=str(channel["base_port"]),
             BRIDGETP_CHANNEL_GENERATION=str(channel["generation"]),
@@ -812,9 +820,12 @@ def verify_full_speed(run_dir, session_roots=None):
             if rate["profile"] != "FULL_SPEED" or rate["rate_bytes_s"] != 0:
                 raise RuntimeError("full-speed run published a rate limit")
     roots = session_roots or [run_dir]
-    controls = [path for root in roots for pattern in (
-        "sessions/*/runtime_control.json", "runtime_control.json"
-    ) for path in root.glob(pattern)]
+    controls = [
+        path
+        for root in roots
+        for pattern in ("sessions/*/runtime_control.json", "runtime_control.json")
+        for path in root.glob(pattern)
+    ]
     for path in controls:
         if read(path).get("rate_gib_s") not in (None, 0):
             raise RuntimeError("full-speed runtime control contains a rate limit")
@@ -973,7 +984,7 @@ def start_conversion(spec, scene, plan, common, processes, publish, requests):
     manifest = json.loads(json.dumps(plan["instances"]))
     for row in manifest["instances"]:
         pool_id = row.get("legacy_pool")
-        if pool_id is not None:
+        if pool_id is not None and not plan.get("canonical_instance_ids"):
             row["inventory_path"] = (
                 str(run_dir / ("source" if pool_id == "tp1" else "target"))
                 + "_inventory.jsonl"
@@ -986,7 +997,11 @@ def start_conversion(spec, scene, plan, common, processes, publish, requests):
         announce(scene["name"], "转换", **{"event": kind, **values})
 
     def start(extra):
-        if extra.get("pair_slot") == "target":
+        if extra.get("migration_receiver"):
+            from tools.bridge_tp.six_conversion import receiver_engine
+
+            argv, env = receiver_engine(plan, extra, extra["migration_receiver"])
+        elif extra.get("pair_slot") == "target":
             # S5b MERGE_TARGET: the planned (absent) pair target, unchanged.
             argv, env = plan["target_argv"], dict(plan["target_env"])
             if plan.get("sequence_context"):
@@ -1045,9 +1060,22 @@ def start_conversion(spec, scene, plan, common, processes, publish, requests):
 
             wait_stager_ready(run_dir / "migration_active", stager)
 
+    def start_receiver(target):
+        process = common.start_process(
+            "stager " + target["instance_id"],
+            target["stager_argv"],
+            os.environ.copy(),
+            root / f"stager_{target['instance_id']}.log",
+        )
+        processes.append(process)
+        publish()
+        from tools.bridge_tp.qwen3_migration_diagnostics import wait_stager_ready
+        wait_stager_ready(Path(target["mechanism_dir"]), process)
+
     ops = SimpleNamespace(
         stop=lambda ids: common.stop_processes([owned[i] for i in ids]),
         start_stager=start_stager,
+        start_receiver=start_receiver,
         alive=lambda i: common.process_group_alive(owned[i]),
         gpus_released=pc.nvidia_gpus_released,
         scrape=pc.scrape_metrics,
@@ -1062,6 +1090,11 @@ def start_conversion(spec, scene, plan, common, processes, publish, requests):
 
         backend_type = SequenceBackend
         sequence_args = dict(sequence_context=plan["sequence_context"])
+    if plan.get("dynamic_conversion"):
+        from tools.bridge_tp.six_conversion import SixBackend
+
+        backend_type = SixBackend
+        sequence_args = dict(sequence_context=plan["sequence_context"], resources=plan)
     backend = backend_type(
         plan["registry"],
         manifest,
@@ -1083,7 +1116,7 @@ def start_conversion(spec, scene, plan, common, processes, publish, requests):
         from tools.bridge_tp.conversion_sequence import DecidedSequenceDriver
 
         driver_type = DecidedSequenceDriver
-    elif plan.get("sequence_context"):
+    elif plan.get("sequence_context") and "decider" not in plan["conversion"]:
         from tools.bridge_tp.conversion_sequence import ConversionSequenceDriver
 
         driver_type = ConversionSequenceDriver
@@ -1178,7 +1211,11 @@ def run_scene(
     plan["run_dir"].mkdir(parents=True, exist_ok=False)
     mechanism_dir = plan["run_dir"]
     multiple = "--maximum-migrations" in plan["controller_argv"]
-    if plan.get("receiver_stage") in (2, 3):
+    if plan.get("dynamic_conversion"):
+        from tools.bridge_tp.six_conversion import initialize
+
+        mechanism_dir = initialize(plan)
+    elif plan.get("receiver_stage") in (2, 3):
         from tools.bridge_tp.migration_receivers import initialize
 
         mechanism_dir = initialize(plan)
@@ -1282,8 +1319,11 @@ def run_scene(
         extras = []
         for extra in plan.get("extra_engines", ()):
             argv, env = engines[extra["instance_id"]]
-            announce(scene["name"], "启动接收实例" if "receiver_argv" in extra
-                     else "启动只路由实例", instance=extra["instance_id"])
+            announce(
+                scene["name"],
+                "启动接收实例" if "receiver_argv" in extra else "启动只路由实例",
+                instance=extra["instance_id"],
+            )
             extras.append(
                 (
                     extra,
@@ -1327,12 +1367,16 @@ def run_scene(
         if plan.get("receiver_stage") in (2, 3):
             for target in plan["migration_targets"]:
                 process = common.start_process(
-                    "stager " + target["instance_id"], target["stager_argv"],
-                    os.environ.copy(), root / f"stager_{target['instance_id']}.log",
+                    "stager " + target["instance_id"],
+                    target["stager_argv"],
+                    os.environ.copy(),
+                    root / f"stager_{target['instance_id']}.log",
                 )
                 receiver_stagers.append((target, process))
                 processes.append(process)
-            stager = next(p for t, p in receiver_stagers if t["execution_allowed"])
+            stager = next(
+                (p for t, p in receiver_stagers if t["execution_allowed"]), None
+            )
             publish_processes()
         elif absent and not (plan.get("join") and "target" not in absent):
             # Single-class layout: no pair to migrate between, so no stager.
@@ -1351,13 +1395,16 @@ def run_scene(
             if receiver_stagers:
                 for target, process in receiver_stagers:
                     wait_stager_ready(Path(target["mechanism_dir"]), process)
-                common.write_json(root / "receiver_startup.json", dict(
-                    started_unix_s=startup_started,
-                    all_stagers_ready_unix_s=time.time(),
-                    source_target_pairs=sum(
-                        len(t["connector_sources"]) for t, _ in receiver_stagers
+                common.write_json(
+                    root / "receiver_startup.json",
+                    dict(
+                        started_unix_s=startup_started,
+                        all_stagers_ready_unix_s=time.time(),
+                        source_target_pairs=sum(
+                            len(t["connector_sources"]) for t, _ in receiver_stagers
+                        ),
                     ),
-                ))
+                )
             else:
                 wait_stager_ready(mechanism_dir, stager)
         checked = controller.parse_args(
@@ -1476,7 +1523,8 @@ def run_scene(
                 verify_full_speed(
                     plan["run_dir"],
                     [Path(t["mechanism_root"]) for t in plan["migration_targets"]]
-                    if plan.get("receiver_stage") in (2, 3) else None,
+                    if plan.get("receiver_stage") in (2, 3)
+                    else None,
                 ),
             )
             announce(scene["name"], "全速检查通过：历史pacing关闭，运行时限速为0")
@@ -1520,7 +1568,10 @@ def run_scene(
             raise RuntimeError(
                 "owned server groups did not terminate; commitments unresolved"
             )
-        if plan.get("receiver_stage") in (2, 3):
+        if plan.get("dynamic_conversion"):
+            from tools.bridge_tp.six_conversion import cleanup
+            cleanup(plan, common.write_json)
+        elif plan.get("receiver_stage") in (2, 3):
             from tools.bridge_tp.migration_receivers import cleanup_links
 
             cleanup_links(plan, common.write_json)

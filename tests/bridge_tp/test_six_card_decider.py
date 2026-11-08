@@ -143,18 +143,14 @@ class ProfilesTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             d.ConversionDecider({"L4": []}, profile="six_card")
 
-    def test_launcher_does_not_yet_enable_six_card_execution(self):
+    def test_launcher_selects_the_six_card_policy_explicitly(self):
         from tools.bridge_tp import launch_pressure_balanced_pilot as launch
 
-        with self.assertRaises(ValueError):
-            launch.decider_request(
-                dict(
-                    decider="EXECUTE",
-                    deadline_s=600,
-                    base_port=8400,
-                    profile="six_card",
-                )
-            )
+        request = launch.decider_request(
+            dict(decider="EXECUTE", deadline_s=600, base_port=8400, profile="six_card")
+        )
+        self.assertEqual(request["edges"], d.profile_edges("six_card"))
+        self.assertEqual(request["profile"], "six_card")
 
 
 class BoundaryTests(unittest.TestCase):

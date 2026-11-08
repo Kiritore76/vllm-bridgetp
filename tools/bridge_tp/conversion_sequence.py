@@ -152,27 +152,7 @@ class SequenceBackend(pc.ControllerConversionBackend):
         after = dict(modes, **{bundle: target})
         if after == {"A": 2, "B": 1}:
             raise ValueError("L1B is outside this explicit sequence")
-        self.current_plan_id = plan_id
-        self.started, self.warm = {}, {}
-        self.base_port = self.next_service_port
-        self.channel_closing = self.joining = self.prestarted = None
-        if hasattr(self, "_close_generations"):
-            del self._close_generations
-        self.gate_since = self.valve_since = self.refused_since = None
-        self.planned = self.evacuation = self.last_shadow = None
-        self.last_assist_reason = None
-        self.assisted = []
-        self.assist_step_start_seq = self.assist_seq
-        self.assist_committed_baseline = sum(
-            state in {"COMMITTED", "ACCOUNTED", "COMPLETED"}
-            for state in (self.status().get("assist_sessions") or {}).values()
-        )
-        self.assist_at = self.shadow_at = -float("inf")
-        self.valve_continued = self.reported_unacknowledged = False
-        self.service_gate_passed = False
-        self.layout_assist = None
-        self.layout_tilt = []
-        self._specs = None
+        self.reset_step(plan_id)
         target_id = next(
             (i for i, r in active.items() if r.bundle_id == "B" and r.tp_degree == 2),
             None,
@@ -210,6 +190,29 @@ class SequenceBackend(pc.ControllerConversionBackend):
             )
         self.ops.event("STEP_BEGIN", plan_id=plan_id, before=modes, after=after)
         self.write_layout({}, assist=None, tilt=[])
+
+    def reset_step(self, plan_id):
+        self.current_plan_id = plan_id
+        self.started, self.warm = {}, {}
+        self.base_port = self.next_service_port
+        self.channel_closing = self.joining = self.prestarted = None
+        if hasattr(self, "_close_generations"):
+            del self._close_generations
+        self.gate_since = self.valve_since = self.refused_since = None
+        self.planned = self.evacuation = self.last_shadow = None
+        self.last_assist_reason = None
+        self.assisted = []
+        self.assist_step_start_seq = self.assist_seq
+        self.assist_committed_baseline = sum(
+            state in {"COMMITTED", "ACCOUNTED", "COMPLETED"}
+            for state in (self.status().get("assist_sessions") or {}).values()
+        )
+        self.assist_at = self.shadow_at = -float("inf")
+        self.valve_continued = self.reported_unacknowledged = False
+        self.service_gate_passed = False
+        self.layout_assist = None
+        self.layout_tilt = []
+        self._specs = None
 
     def channel(self, source):
         generation, port = self.next_channel_generation, self.next_channel_port
@@ -487,7 +490,7 @@ class SequenceBackend(pc.ControllerConversionBackend):
 
 def validate(request):
     """Validate the sequence without creating processes or mutating a registry."""
-    allowed = {"sequence", "base_port", "prestart", "safety"}
+    allowed = {"sequence", "base_port", "prestart", "safety", "profile"}
     if not set(request) <= allowed or not {"sequence", "base_port"} <= set(request):
         raise ValueError("invalid conversion sequence fields")
     if (
@@ -499,6 +502,8 @@ def validate(request):
         raise ValueError("invalid prestart flag")
     if not set(request.get("safety", {})) <= set(pc.SAFETY):
         raise ValueError("invalid sequence safety overrides")
+    if request.get("profile", "four_card") not in {"four_card", "six_card"}:
+        raise ValueError("invalid sequence profile")
     steps = request["sequence"]
     if not isinstance(steps, list) or not 1 <= len(steps) <= 32:
         raise ValueError("sequence requires 1..32 explicit steps")
@@ -507,7 +512,9 @@ def validate(request):
         required = {"bundle", "target_mode", "trigger_s", "deadline_s"}
         if not required <= set(step) <= required | {"method", "on_abort"}:
             raise ValueError("invalid sequence step fields")
-        if step["bundle"] not in {"A", "B"} or step["target_mode"] not in {
+        if step["bundle"] not in (
+            {"A", "B", "C"} if request.get("profile") == "six_card" else {"A", "B"}
+        ) or step["target_mode"] not in {
             "TP1",
             "TP2",
         }:
@@ -526,6 +533,11 @@ def validate(request):
                 "sequence triggers must be ordered; deadline is a duration"
             )
         previous = step["trigger_s"]
+        if (
+            request.get("profile") == "six_card"
+            and step.get("method", "DRAIN") != "DRAIN"
+        ):
+            raise ValueError("six-card conversions use natural drain")
         if step.get("method", "DRAIN") not in {"DRAIN", "SELECTIVE_ROLL"}:
             raise ValueError("unsupported sequence method")
         if step.get("method") == "SELECTIVE_ROLL" and step["target_mode"] != "TP2":
@@ -654,7 +666,7 @@ class ConversionSequenceDriver(pc.ConversionDriver):
         )
         self.save_sequence()
         if after != "RECOVERY_REQUIRED":
-            until = time.monotonic() + 30
+            until = time.monotonic() + getattr(self.backend, "ack_timeout_s", 30)
             while not self.backend.step_acknowledged():
                 if time.monotonic() >= until:
                     raise TimeoutError("controller did not acknowledge conversion")

@@ -3,7 +3,6 @@
 
 import copy
 import math
-import time
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace as NS
@@ -167,7 +166,7 @@ class DriverTests(Base):
                 cancel_since=1,
             )
             with patch.object(
-                self.backend, "status", return_value=dict(unix_s=time.time())
+                self.backend, "status", return_value=dict(unix_s=self.now[0])
             ):
                 seq.DecidedSequenceDriver.plan_tick(driver)
             extra = (

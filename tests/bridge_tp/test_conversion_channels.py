@@ -110,6 +110,26 @@ class DynamicSessionsTests(unittest.TestCase):
         self.assertEqual(seen, ["A"])
         self.assertEqual(self.a.started, ["q"])
 
+    def test_idle_source_is_rehomed_before_old_receiver_is_closed(self):
+        seen = []
+
+        def switch(link, active, audit, **kwargs):
+            self.assertFalse(self.b.closed)
+            self.assertEqual(active, self.a.root / "migration_active")
+            seen.append(kwargs["source"])
+
+        with (
+            patch.object(Path, "is_symlink", return_value=True),
+            patch(
+                "tools.bridge_tp.pressure_sessions.os.readlink",
+                return_value=str(self.b.root / "migration_active"),
+            ),
+            patch("tools.bridge_tp.pressure_sessions.switch_source_entry", switch),
+        ):
+            self.assertTrue(self.sessions.reconcile(dict(A=self.a), self.links))
+        self.assertEqual(seen, ["s"])
+        self.assertTrue(self.b.closed)
+
     def test_static_groups_cannot_silently_enable_dynamic_changes(self):
         fixed = TargetSessions(dict(B=self.b), self.links, self.audit)
         with self.assertRaisesRegex(ValueError, "not enabled"):

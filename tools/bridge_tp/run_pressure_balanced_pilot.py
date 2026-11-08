@@ -248,6 +248,7 @@ def preflight(args):
         source_pool_id=raw.get("source_pool_id", "tp1"),
         target_pool_id=raw.get("target_pool_id", "tp4"),
         target_scoped_receivers=raw.get("target_scoped_receivers", False),
+        dynamic_conversion=raw.get("dynamic_conversion", False),
     )
     validate_guard_geometry(cfg, controller, getattr(args, "platform", "a100"))
     if controller.transfer_mode not in {"FULL_SPEED", "ADAPTIVE"}:
@@ -284,10 +285,12 @@ def preflight(args):
     mechanism_root = getattr(args, "mechanism_root", None)
     if mechanism_root is not None:
         if not (
-            manifest and manifest.get("runtime_pool_ids")
+            manifest
+            and manifest.get("runtime_pool_ids")
             and getattr(args, "migration_targets", None) == "B"
             and controller.target_scoped_receivers
-            and mechanism_root.resolve() == (
+            and mechanism_root.resolve()
+            == (
                 args.run_dir / "migration" / manifest["legacy_pool_aliases"]["tp4"]
             ).resolve()
         ):
@@ -303,7 +306,9 @@ def preflight(args):
             manifest
             and manifest.get("runtime_pool_ids")
             and controller.target_scoped_receivers
-            and len(receivers) >= 2
+            and (
+                getattr(controller, "dynamic_conversion", False) or len(receivers) >= 2
+            )
             and set(receivers) <= tp2
         ):
             raise ValueError("all targets need owned six-card unified receivers")
@@ -893,9 +898,8 @@ def _run(args, prepared):
         # the choice; every group exists so the channels stay accounted.
         from tools.bridge_tp.pressure_sessions import TargetSessions
 
-        groups = {}
-        for name, port in migration_receivers(args).items():
-            groups[name] = PressureSessions(
+        def target_group(name, port, endpoint):
+            return PressureSessions(
                 persistent_cleanup=cfg.shadow_cancel,
                 maximum_migrations=args.maximum_migrations,
                 run_dir=args.run_dir / "migration" / name,
@@ -903,7 +907,7 @@ def _run(args, prepared):
                 config=SimpleNamespace(
                     **dict(
                         vars(controller),
-                        target_url=ingress.urls[name],
+                        target_url=endpoint,
                         ready_notification_port=port,
                         target_pool_id=name,
                     )
@@ -913,9 +917,17 @@ def _run(args, prepared):
                 executor=executor,
                 audit=audit,
             )
+
+        groups = {
+            name: target_group(name, port, ingress.urls[name])
+            for name, port in migration_receivers(args).items()
+        }
         links = args.run_dir / "source_active"
         session = TargetSessions(
-            groups, {link.name: link for link in links.iterdir()}, audit
+            groups,
+            {link.name: link for link in links.iterdir()},
+            audit,
+            dynamic=getattr(controller, "dynamic_conversion", False),
         )
     else:
         session = PressureSessions(
@@ -990,7 +1002,7 @@ def _run(args, prepared):
         else None
     )
     if health_tracker is not None:
-        for row in (manifest["instances"] if canonical_ids else extras):
+        for row in manifest["instances"] if canonical_ids else extras:
             health_tracker.add_pool(
                 row["instance_id"], "source" if row["tp_degree"] == 1 else "target"
             )
@@ -1090,8 +1102,11 @@ def _run(args, prepared):
     if canonical_ids:
         co.pool_sort_ids = {v: k for k, v in manifest["legacy_pool_aliases"].items()}
         audit.write(
-            dict(kind="pressure_runtime_identities", pool_ids=pool_names,
-                 compatibility_sort_ids=co.pool_sort_ids)
+            dict(
+                kind="pressure_runtime_identities",
+                pool_ids=pool_names,
+                compatibility_sort_ids=co.pool_sort_ids,
+            )
         )
 
     def request_rows(raw):
@@ -1226,9 +1241,9 @@ def _run(args, prepared):
                     co._owners.get(value.client_id, value.pool_id),
                 )
                 streams[owner] = streams.get(owner, 0) + 1
-        for session, (_, target) in tuple(co._sessions.items()):
-            if co.ledger.entries[session].state == "ACTIVE":
-                for pool in {target, co._session_source.get(session)} - {None}:
+        for migration_key, (_, target) in tuple(co._sessions.items()):
+            if co.ledger.entries[migration_key].state == "ACTIVE":
+                for pool in {target, co._session_source.get(migration_key)} - {None}:
                     sessions[pool] = sessions.get(pool, 0) + 1
         instances = {}
         for pool in tp_of:
@@ -1288,9 +1303,7 @@ def _run(args, prepared):
             short_window_arrivals=len(in_short_window)
             if hold is None
             else hold.arrivals_since(time.monotonic() - short_window),
-            short_window_long=sum(
-                n >= decision.LONG_TOKENS for n in in_short_window
-            ),
+            short_window_long=sum(n >= decision.LONG_TOKENS for n in in_short_window),
             migration_starts=[[round(now - t, 3), source] for t, source in starts],
             tilt=sorted(layout_state["tilt"]),
             tilted_long_requests=layout_state["tilted"],
@@ -1306,6 +1319,12 @@ def _run(args, prepared):
                     unix_s=time.time(),
                     workload_origin_unix_s=origin_unix_s,
                     layout_revision=layout_state["revision"],
+                    migration_resource_targets=list(session.groups)
+                    if hasattr(session, "groups")
+                    else None,
+                    migration_resource_sources=list(session.source_links)
+                    if hasattr(session, "groups")
+                    else None,
                     instances=instances,
                     # Measured START-to-source-release budget (S4 planner).
                     release_budget_s=lookup.release_budget,
@@ -1389,6 +1408,10 @@ def _run(args, prepared):
                     raise ValueError("invalid layout control instance " + pool_id)
                 tp = row["tp_degree"]
                 tp_of[pool_id] = tp
+                if co.scheduler == "unified":
+                    co.slots[pool_id] = (
+                        args.tp1_max_num_seqs if tp == 1 else args.tp2_max_num_seqs
+                    )
                 profile_key[pool_id] = "tp1" if tp == 1 else "tp4"
                 context_of[pool_id] = row["context_limit"]
                 service.add_pool(pool_id)
@@ -1455,6 +1478,29 @@ def _run(args, prepared):
                 evacuation_sources[:] = [
                     m for m in evacuation_sources if m[0] != pool_id
                 ]
+        if getattr(controller, "dynamic_conversion", False) and not deferred:
+            resources = control.get("migration_resources")
+            if resources is not None:
+                wanted = resources["targets"]
+                links = resources["source_links"]
+                changing = set(wanted) != set(session.groups) or set(links) != set(
+                    session.source_links
+                )
+                if changing and any(
+                    g.record is not None or g.cleanup_requires_shutdown
+                    for g in session.groups.values()
+                ):
+                    deferred.append("migration_resources")
+                else:
+                    groups = {
+                        name: session.groups.get(name)
+                        or target_group(
+                            name, target["ready_notification_port"], target["endpoint"]
+                        )
+                        for name, target in wanted.items()
+                    }
+                    if not session.reconcile(groups, links):
+                        deferred.append("migration_resources")
         # A deferred retirement re-reads the same file on the next tick.
         layout_state.update(
             signature=None if deferred else signature,
@@ -1752,8 +1798,10 @@ def _run(args, prepared):
             else:
                 target_ids = [target_pool_id] if target_pool_id in index_of else []
                 t = index_of.get(target_pool_id)
-            if target_ids and session.ready_for_start and hasattr(
-                session, "bind_target"
+            if (
+                target_ids
+                and session.ready_for_start
+                and hasattr(session, "bind_target")
             ):
                 for tid in target_ids:
                     session.bind_target(
@@ -1764,6 +1812,7 @@ def _run(args, prepared):
             pairs, pair_runtimes = {}, {}
             # Published (next tick) with each request's planner row.
             layout_state["candidates"] = {}
+
             def target_fields(row, n, tx, pools=pools, shapes=shapes, now=now):
                 """Target-side candidate fields toward receiver index ``tx``."""
                 if workload_module is not None:
@@ -2054,9 +2103,7 @@ def _run(args, prepared):
                 else candidates
             )
             runtime = (
-                pair_runtimes.get((session_source, session.current))
-                if multi
-                else None
+                pair_runtimes.get((session_source, session.current)) if multi else None
             ) or runtimes.get(session_source)
             if t is not None and session.record is not None and not session.settled:
                 session.poll_cancel(inventories[t], now, cfg.max_age_s)
