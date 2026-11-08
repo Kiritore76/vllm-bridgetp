@@ -250,6 +250,26 @@ SCENARIOS["mixed_rotation"] = dict(
     long=(16384, 8192),
     arrival_seed=6,
 )
+# Six-card comparison v2 (user 11-08): a moderate mixed plateau and a
+# low-short recovery isolate unnecessary merges and the long-demand exit.
+# Keep the four-card rotation and its seeded streams unchanged.
+SCENARIOS["mixed_rotation_six_v2"] = dict(
+    phases=(
+        (0, 60, 4.0, 0.0, "warm"),
+        (60, 420, 18.0, 0.01, "s1_short"),
+        (420, 900, 8.0, 0.02, "m_mixed"),
+        (900, 1800, 2.0, 0.06, "l1_long"),
+        (1800, 2040, 2.0, 0.0, "q_recovery"),
+        (2040, 2520, 18.0, 0.0, "s2_short"),
+        (2520, 2640, 8.0, 0.06, "b_blip"),
+        (2640, 2940, 18.0, 0.0, "s3_short"),
+        (2940, 3420, 2.0, 0.06, "l2_long"),
+        (3420, 3840, 18.0, 0.0, "s4_short"),
+        (3840, 3900, 1.0, 0.0, "tail"),
+    ),
+    long=(16384, 8192),
+    arrival_seed=6,
+)
 # Long-request capacity (user 11-06): short 8/s, deep long requests stepping up
 # every 240s, so each layout and TP2 slot count shows when long requests stop
 # fitting. Lives of about 200-300s put about 5, 10, 15 and 20 in flight.
@@ -357,4 +377,10 @@ def config(inputs, scenario="phase_shift"):
         note="phases for the conversion decider; one run per scenario, a "
         "functional check, not a comparison",
     )
+    if scenario == "mixed_rotation_six_v2":
+        cfg.update(
+            horizon_s=3900,
+            note="registered six-card dynamic/static comparison v2; identical "
+            "jobs across arms; performance and migration coverage reported separately",
+        )
     return cfg

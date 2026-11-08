@@ -215,8 +215,11 @@ def assess(plan, proof, expected_requests):
     migrated = any(
         s["state"] == "COMMITTED" and s.get("source_release") for s in proof["sessions"]
     )
-    required = (set(plan["instances"]["legacy_pool_aliases"]) == {"tp1", "tp4"}
-                and plan.get("receiver_stage") not in (2, 3))
+    required = (
+        set(plan["instances"]["legacy_pool_aliases"]) == {"tp1", "tp4"}
+        and plan.get("receiver_stage") not in (2, 3)
+        and plan.get("migration_coverage_required", True)
+    )
     receiver_targets = {row.get("target_instance") for row in proof["sessions"]}
     if plan.get("receiver_stage") == 2:
         allowed = plan["instances"]["legacy_pool_aliases"]["tp4"]
