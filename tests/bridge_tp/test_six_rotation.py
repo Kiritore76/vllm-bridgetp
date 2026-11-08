@@ -4,6 +4,7 @@
 import contextlib
 import copy
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -49,7 +50,7 @@ class RotationTests(unittest.TestCase):
         # Hardware, model geometry, predictor load and actual engine invocation
         # are CPU substitutes. Recipe, runner/build/configure and controller
         # preflight are real; the old validate-only early return is not used.
-        for layout in ("L1AC", "L2C"):
+        for layout in getattr(self, "layouts", ("L1AC", "L2C")):
             with self.subTest(layout=layout), tempfile.TemporaryDirectory() as folder:
                 root = Path(folder)
                 spec, common, settings = build(root, layout, setup_only=True)
@@ -58,7 +59,14 @@ class RotationTests(unittest.TestCase):
                     REPO
                     / "experiments/phase9/pressure_balanced_v2/controller_template.json"
                 )
-                common.write_json = runner.write
+
+                def compact_write(path, value):
+                    # Preserve exact logical inputs; avoid pretty-printing large
+                    # fixture files when checking planning rather than layout.
+                    Path(path).parent.mkdir(parents=True, exist_ok=True)
+                    Path(path).write_text(json.dumps(value), encoding="utf-8")
+
+                common.write_json = compact_write
                 model = root / "model"
                 model.mkdir()
                 (model / "config.json").write_text("{}")
@@ -69,7 +77,7 @@ class RotationTests(unittest.TestCase):
                     self.assertEqual(len(plans), 1)
                     _, _, _, current = plans[0]
                     _, _, _, jobs, receipt = runner.controller_preflight(current)
-                    self.assertEqual(len(jobs), 36371)
+                    self.assertEqual(len(jobs), len(self.config["recipes"][0]["jobs"]))
                     self.assertTrue(receipt["migration_execution_enabled"])
                     self.assertFalse(current["migration_coverage_required"])
                     self.assertEqual(current["expected_context_limits"], (32768, 32768))
@@ -88,7 +96,7 @@ class RotationTests(unittest.TestCase):
                     layout,
                     "--phase-shift",
                     "--phase-scenario",
-                    rotation.SCENARIO,
+                    self.config["recipes"][0]["scenario"],
                     "--scheduler",
                     "unified",
                     "--hold-queue",
@@ -111,6 +119,7 @@ class RotationTests(unittest.TestCase):
                 with (
                     contextlib.redirect_stdout(io.StringIO()),
                     patch.object(runner, "require_revision"),
+                    patch.object(runner, "write", side_effect=compact_write),
                     patch.object(runner, "runtime_inventory", return_value={}),
                     patch.object(runner, "runtime_versions", return_value={}),
                     patch.object(runner, "verified_inputs", return_value={}),
@@ -136,9 +145,10 @@ class RotationTests(unittest.TestCase):
                 )
                 gpu.assert_not_called()
                 config = rotation.read(output / "comparison_recipe.json")
-                self.assertEqual(config["horizon_s"], 3900)
+                self.assertEqual(config["horizon_s"], self.config["horizon_s"])
                 self.assertEqual(
-                    config["recipes"][0]["input_sha256"], rotation.INPUT_SHA256
+                    config["recipes"][0]["input_sha256"],
+                    self.config["recipes"][0]["input_sha256"],
                 )
                 current = captured[0]
                 argv = current["controller_argv"]

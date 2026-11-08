@@ -616,7 +616,7 @@ def main(argv=None):
     if args.decider_multi and args.conversion_decider != "execute":
         parser.error("--decider-multi needs --conversion-decider execute")
     if args.phase_shift:
-        if args.phase_scenario == "mixed_rotation_six_v2" and (
+        if args.phase_scenario in phase_shift.SIX_COMPARISON_SCENARIOS and (
             args.cards != 6 or args.scheduler != "unified"
         ):
             parser.error("six-card rotation v2 requires --cards 6 --scheduler unified")
@@ -705,7 +705,10 @@ def main(argv=None):
             if args.routine_four_mode
             else pressure_four.updated_config(read(args.inputs))
         )
-        if args.phase_shift and args.phase_scenario == "mixed_rotation_six_v2":
+        if (
+            args.phase_shift
+            and args.phase_scenario in phase_shift.SIX_COMPARISON_SCENARIOS
+        ):
             from tools.bridge_tp.six_rotation import validate_recipe
 
             validate_recipe(cfg)
@@ -1109,8 +1112,10 @@ def main(argv=None):
                     profile="six_card",
                     multi=args.conversion_decider == "execute",
                     assist=False,
-                    max_conversions=12
-                    if args.phase_scenario == "mixed_rotation_six_v2"
+                    max_conversions=(
+                        12 if args.phase_scenario == "mixed_rotation_six_v2" else 8
+                    )
+                    if args.phase_scenario in phase_shift.SIX_COMPARISON_SCENARIOS
                     else 4,
                     rules=dict(current_length=True, trend_lookahead_s=60.0),
                 )
@@ -1145,7 +1150,8 @@ def main(argv=None):
             # Rotation: arrivals end at 3180s, and packing follows the run.
             run_timeout_s=5400
             if args.phase_shift
-            and args.phase_scenario in {"mixed_rotation", "mixed_rotation_six_v2"}
+            and args.phase_scenario
+            in {"mixed_rotation", *phase_shift.SIX_COMPARISON_SCENARIOS}
             else 3600
             if args.phase_shift and args.phase_scenario.startswith("mixed")
             else 2400
@@ -1285,7 +1291,10 @@ def main(argv=None):
                 if args.force_migration_target and force is None:
                     raise ValueError("forced bundle has no receiver")
                 configure(plan, args.migration_targets, force)
-            if args.phase_shift and args.phase_scenario == "mixed_rotation_six_v2":
+            if (
+                args.phase_shift
+                and args.phase_scenario in phase_shift.SIX_COMPARISON_SCENARIOS
+            ):
                 from tools.bridge_tp.six_rotation import configure_plan
 
                 configure_plan(plan, recipe=cfg["recipes"][0])
@@ -1344,7 +1353,10 @@ def main(argv=None):
                 horizon=cfg["horizon_s"]
                 if args.conversion_cycle
                 or six_conversion
-                or (args.phase_shift and args.phase_scenario == "mixed_rotation_six_v2")
+                or (
+                    args.phase_shift
+                    and args.phase_scenario in phase_shift.SIX_COMPARISON_SCENARIOS
+                )
                 else 300.0,
             )
             write(plan["run_dir"].parent / "closed_loop_acceptance.json", proof)

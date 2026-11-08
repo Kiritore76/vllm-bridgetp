@@ -270,6 +270,20 @@ SCENARIOS["mixed_rotation_six_v2"] = dict(
     long=(16384, 8192),
     arrival_seed=6,
 )
+# Main performance comparison (user 11-09): two workload changes, with time
+# for the new layout to serve and the complete return cost still included.
+SCENARIOS["mixed_simple_six_v1"] = dict(
+    phases=(
+        (0, 60, 4.0, 0.0, "warm"),
+        (60, 660, 18.0, 0.01, "s1_short"),
+        (660, 2460, 2.0, 0.06, "l_long"),
+        (2460, 3360, 18.0, 0.0, "s2_recovery"),
+        (3360, 3420, 1.0, 0.0, "tail"),
+    ),
+    long=(16384, 8192),
+    arrival_seed=6,
+)
+SIX_COMPARISON_SCENARIOS = ("mixed_rotation_six_v2", "mixed_simple_six_v1")
 # Long-request capacity (user 11-06): short 8/s, deep long requests stepping up
 # every 240s, so each layout and TP2 slot count shows when long requests stop
 # fitting. Lives of about 200-300s put about 5, 10, 15 and 20 in flight.
@@ -377,10 +391,10 @@ def config(inputs, scenario="phase_shift"):
         note="phases for the conversion decider; one run per scenario, a "
         "functional check, not a comparison",
     )
-    if scenario == "mixed_rotation_six_v2":
+    if scenario in SIX_COMPARISON_SCENARIOS:
         cfg.update(
-            horizon_s=3900,
-            note="registered six-card dynamic/static comparison v2; identical "
+            horizon_s=SCENARIOS[scenario]["phases"][-1][1],
+            note="registered six-card dynamic/static comparison; identical "
             "jobs across arms; performance and migration coverage reported separately",
         )
     return cfg
