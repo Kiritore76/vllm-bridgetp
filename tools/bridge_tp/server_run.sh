@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 当前任务：统一调度恢复取消一致性修复，同一带长拆分/新A双源迁移配方核验。
+# 当前任务：六卡剩余四方向，独立初始布局、串行核验、逐场验收与打包。
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
@@ -15,25 +15,29 @@ git fetch origin "refs/heads/$branch:refs/remotes/origin/$branch" || exit 1
 revision=$(git rev-parse HEAD)
 [ "$revision" = "$(git rev-parse "origin/$branch")" ] || { echo '请先git pull --ff-only。'; exit 1; }
 mkdir -p /root/autodl-tmp/bridgetp/results || exit 1
-run=/root/autodl-tmp/bridgetp/results/qwen3_six_split_probe_$(date +%Y%m%d_%H%M%S)_${RANDOM}
+run=/root/autodl-tmp/bridgetp/results/qwen3_six_remaining_edges_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 printf '%s\n' "$revision" > "$run/revision.txt"
-printf 'six-card unified diagnostic; split A at 110s; pinned long arrivals to old/new A; normal migration gates; no TP2 migration.\n' > "$run/scope.txt"
-printf '366 requests/95232 output tokens; 720s background; require loaded natural drain and commit/release from each new A to B; no performance comparison.\n' >> "$run/scope.txt"
-printf 'unified cancellation consistency repair; recovery requires fresh CLEAR source demand; true recovery cancellations remain allowed.\n' >> "$run/scope.txt"
+printf 'Four independent six-card directions: L0-L1AC L1AC-L0 L2C-L3 L3-L2C; serial, natural drain, prestart off.\n' > "$run/scope.txt"
+printf 'Each: 156 requests/68352 tokens, short background 300s, long arrivals 90..100s, explicit trigger 60s.\n' >> "$run/scope.txt"
+printf 'Mechanism check; zero migration allowed and reported; no loaded-drain or performance acceptance.\n' >> "$run/scope.txt"
 echo "本批目录：$run"
-echo 'Linux CPU前置失败/错误/跳过即停止；通过后仅运行L2C到L1AC一场GPU冒烟。'
-echo '失败即打包，不自动重试、不删除结果；不清理其他进程。'
+echo 'Linux CPU前置失败/错误/跳过即停止；通过后串行运行剩余四方向，各自从独立布局启动。'
+echo '逐场保留成功和失败；确认退出且GPU空闲才继续；不重试、不删除结果、不清理其他进程。'
 smi=
 pack_result() {
     local status=$1
     if [ -n "$smi" ]; then kill "$smi" 2>/dev/null || true; wait "$smi" 2>/dev/null || true; smi=; fi
     printf '%s\n' "$status" > "$run/exit_code.txt"
-    if [ -f "$run/trial.tar.gz" ]; then
-        tar --exclude="$(basename "$run")/trial" -C "$(dirname "$run")" -czf "$run.tar.gz" "$(basename "$run")" || return 1
-    else
-        tar -C "$(dirname "$run")" -czf "$run.tar.gz" "$(basename "$run")" || return 1
-    fi
+    local excludes=() edge
+    for edge in L0-L1AC L1AC-L0 L2C-L3 L3-L2C; do
+        # Never omit unarchived failure data. Keep its raw trial if no inner pack.
+        if [ -f "$run/$edge/trial.tar.gz" ] && [ -f "$run/$edge/trial.tar.gz.sha256" ] &&
+           (cd "$run/$edge" && sha256sum -c trial.tar.gz.sha256 > /dev/null 2>&1); then
+            excludes+=(--exclude="$(basename "$run")/$edge/trial")
+        fi
+    done
+    tar "${excludes[@]}" -C "$(dirname "$run")" -czf "$run.tar.gz" "$(basename "$run")" || return 1
     sha256sum "$run.tar.gz" > "$run.tar.gz.sha256" || return 1
     echo "请拿回：$run.tar.gz"
     echo "以及：$run.tar.gz.sha256"
@@ -58,6 +62,7 @@ export TMPDIR="$task_tmp" TEMP="$task_tmp" TMP="$task_tmp"
     tests.bridge_tp.test_tcp_ports tests.bridge_tp.test_gpu_direct_history_lifecycle \
     tests.bridge_tp.test_six_split_probe \
     tests.bridge_tp.test_pressure_cancel tests.bridge_tp.test_unified_cancel \
+    tests.bridge_tp.test_six_edge_batch \
     > "$run/cpu_checks.log" 2>&1
 status=$?
 tail -n 12 "$run/cpu_checks.log"
@@ -75,55 +80,43 @@ avail=$(df --output=avail -k "$run" | tail -1)
 nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,pcie.link.gen.current,pcie.link.width.current --format=csv,noheader > "$run/gpu_before.csv" || { pack_result 1; exit 1; }
 nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,pcie.link.gen.current,pcie.link.width.current --format=csv,noheader -lms 1000 > "$run/gpu_samples.csv" &
 smi=$!
-echo '唯一GPU场：30/32秒长请求指定旧A，110秒提议自然排空拆分；330/332与450/452秒分别给新A两源长请求。背景统一调度，迁移仍走正常触发与安全检查，缺覆盖退出2。'
-"$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
-    --cards 6 --static-layout L2C --long-burst-pair \
-    --scheduler unified --hold-queue --kv-short-exempt --overload-migrate --migrate-current-length \
-    --conversion L2C-L1AC --conversion-trigger-s 110 --six-split-probe \
-    --expanded-context --current-machine --repetitions 1 \
-    --model "$model" \
-    --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
-    --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json" \
-    --output "$run/trial" --expected-revision "$revision" 2>&1 | tee "$run/console.log"
-status=${PIPESTATUS[0]}
-if [ "$status" = 0 ] || [ "$status" = 2 ]; then
-    "$py" -B - "$run/trial" > "$run/mechanism_check.log" 2>&1 <<'PY'
-import json,sys
-from pathlib import Path
-root=Path(sys.argv[1])
-paths=list(root.rglob("conversion_sequence_acceptance.json"))
-assert len(paths)==1, paths
-proof=json.loads(paths[0].read_text())
-assert proof["mechanism_passed"] and proof["all_steps_completed"],proof
-assert proof.get("late_dispatches")==[],proof.get("late_dispatches")
-sequence=json.loads((paths[0].parent/"conversion_sequence_result.json").read_text())
-assert len(sequence["steps"])==1,sequence
-step=sequence["steps"][0]
-assert step["request"]["bundle"]=="A" and step["request"]["target_mode"]=="TP1",step
-assert step["layout"]==dict(A=1,B=2,C=1),step
-phase=proof["phases"][-1]
-from tools.bridge_tp.pressure_cpu import load
-audit=[json.loads(line) for line in (paths[0].parent/"controller/pressure_audit.jsonl").read_text().splitlines()]
-cfg=json.loads((root/"comparison_policy.json").read_text())
-cancel_check=load("pressure_cancel").assess_unified_cancellations(audit,cfg["max_age_s"])
-(root.parent/"unified_cancellation_acceptance.json").write_text(json.dumps(cancel_check,indent=2)+"\n")
-assert cancel_check["passed"],cancel_check
-if proof["coverage_passed"]:
-    assert {"A-g5-tp1","A-g6-tp1"} <= set(cancel_check["observed_needed_sources"]),cancel_check
-# Report the split's own timings; the acceptance above is the gate.
-print(json.dumps(dict(passed=proof["passed"],mechanism_passed=proof["mechanism_passed"],layout=step["layout"],
-    drain_s=phase.get("drain_s"),rebuild_s=phase.get("rebuild_s"),
-    admission_closed_s=phase.get("admission_closed_s"),
-    trigger_to_route_s=phase.get("trigger_to_route_s"),
-    migration_coverage=proof["migration_coverage"],coverage_passed=proof["coverage_passed"],
-    loaded_drain_requests=proof["loaded_drain_requests"],joined_source_coverage=proof["joined_source_coverage"],
-    actual_committed_transfers=proof["actual_committed_transfers"]),indent=2))
-print(json.dumps(cancel_check,indent=2))
-raise SystemExit(0 if proof["passed"] else 2)
-PY
+"$py" -B -m tools.bridge_tp.six_edge_batch plan --directory "$run" \
+    --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json" > "$run/plan.log" 2>&1 || { pack_result 1; exit 1; }
+for edge in L0-L1AC L1AC-L0 L2C-L3 L3-L2C; do
+    case_dir="$run/$edge"
+    mkdir "$case_dir" || { pack_result 1; exit 1; }
+    # No overlapping GPU trials, including after a failed case.
+    nvidia-smi --query-compute-apps=pid --format=csv,noheader > "$case_dir/gpu_pids_before.txt"
     status=$?
-    cat "$run/mechanism_check.log"
-fi
-echo '本场须带长自然排空且新A两源各实际迁B提交/释放；机制通过但缺覆盖记2并保留全部数据，不强行START、不调整阈值。'
+    if [ "$status" != 0 ] || [ -s "$case_dir/gpu_pids_before.txt" ]; then
+        echo 'GPU未空闲或查询失败，停止后续场次，保留数据。'
+        break
+    fi
+    layout=${edge%%-*}
+    echo "开始 $edge：独立初始布局 $layout，60秒提议转换；每场156请求，零迁移允许但如实记录。"
+    "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
+        --cards 6 --static-layout "$layout" --long-burst-pair \
+        --scheduler unified --hold-queue --kv-short-exempt --overload-migrate --migrate-current-length \
+        --conversion "$edge" --conversion-trigger-s 60 \
+        --expanded-context --current-machine --repetitions 1 \
+        --model "$model" \
+        --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
+        --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json" \
+        --output "$case_dir/trial" --expected-revision "$revision" 2>&1 | tee "$case_dir/console.log"
+    status=${PIPESTATUS[0]}
+    printf '%s\n' "$status" > "$case_dir/runner_exit_code.txt"
+    "$py" -B -m tools.bridge_tp.six_edge_batch assess --directory "$case_dir" --edge "$edge" \
+        > "$case_dir/mechanism_check.log" 2>&1
+    check_status=$?
+    cat "$case_dir/mechanism_check.log"
+    printf '%s\n' "$check_status" > "$case_dir/check_exit_code.txt"
+    # A failed workload may be followed only when its owned groups have ended.
+    "$py" -B -c 'import json,sys; from pathlib import Path; v=json.loads(Path(sys.argv[1]).read_text()); raise SystemExit(0 if v.get("cleanup_confirmed") is True else 1)' \
+        "$case_dir/case_acceptance.json" || { echo '受管进程退出未获确认，停止后续方向。'; break; }
+done
+"$py" -B -m tools.bridge_tp.six_edge_batch aggregate --directory "$run" > "$run/batch_check.log" 2>&1
+status=$?
+cat "$run/batch_check.log"
+echo '全部四方向均验收通过才整批通过；任何失败或未执行方向均保留并记为未通过。'
 pack_result "$status" || exit 1
 exit "$status"

@@ -412,7 +412,7 @@
     "tools/bridge_tp/migration_plan.py": "f7aba17e2038ce3d6385aabcfa5687aed253cd5b3570b76c3ee849a024f67cd1",
     "tests/bridge_tp/test_migration_plan.py": "7413085058c1f3f480f57f9ac505f47c367f7a89284e7d56ca32e42e0c5b76f2",
     "tests/bridge_tp/test_runtime_instance_ids.py": "f73f1777c8048b3a6618a670ad3e20a3a010e654a04c45dfd13cced4bfae6c6a",
-    "tools/bridge_tp/server_run.sh": "47fb880763b084cbe5c450772da6abf1e472232210fffa235e6ca235ee3ae99b",
+    "tools/bridge_tp/server_run.sh": "ed73d2ce6c7accca6720b53bb288325d1a91d0b5b9d6186fcc3cd5d4d452274a",
     "tools/bridge_tp/migration_receivers.py": "c005aa9e041f218b109816c57b53b7a125ec89e63ed39974ab53492ce39cf6db",
     "tests/bridge_tp/test_migration_receivers.py": "105d20450c6002a8096f0c0ee99a96cd70f2d21c7577dccd18275fc69662c317",
     "tests/bridge_tp/test_multi_target.py": "e6eae04bc46876aafe8a6b243afd4c2f2cf66efc79f1cdddfe46405c3cdf876c",
@@ -430,7 +430,9 @@
     "tools/bridge_tp/six_split_probe.py": "aa40af9aac649f40929370d8ac972db66556d3f5657ae8e5b263b7e6dba485c7",
     "tests/bridge_tp/test_six_split_probe.py": "a261d8c560e0cea555e49b29616128f26da2cbe6d6ace70f150acea415719241",
     "tests/bridge_tp/test_unified_cancel.py": "6d7cf83c4ebe483f1409e47f75fe85c2acfb010d3ea2049c0a04611330f44585",
-    "tests/bridge_tp/fixtures/unified_cancel_20261108.json": "8c34c63b2bd0640e7e5cd32ea8a2a29be08fec530dce66d461614c833531e52d"
+    "tests/bridge_tp/fixtures/unified_cancel_20261108.json": "8c34c63b2bd0640e7e5cd32ea8a2a29be08fec530dce66d461614c833531e52d",
+    "tools/bridge_tp/six_edge_batch.py": "57f1203f08a309b1d2258dd7921f4818db59e138dd38bcfeb1a75c00364c518e",
+    "tests/bridge_tp/test_six_edge_batch.py": "ddfdd0d791726e1d559f4ff94c911a7defbeec048b64aed4e3f57493fcf66bc0"
   },
   "server_settings": {
     "dtype": "bfloat16",
