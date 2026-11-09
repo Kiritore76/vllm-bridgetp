@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from tests.bridge_tp import test_six_rotation as previous
 from tools.bridge_tp import qwen3_phase_shift as phase
@@ -36,8 +38,16 @@ class SmokeTests(unittest.TestCase):
     def test_real_runner_assisted_auto_preflight(self):
         self.layouts = ("L1AC",)
         self.automatic = self.assist = True
+        self.dynamic_all = True
         self.attempts = 1
         self.timeout = "1200"
         previous.RotationTests.test_real_runner_builds_and_preflights_static_arms_before_gpu(
             self
         )
+
+    def test_missing_runner_output_is_technical_failure_not_stopiteration(self):
+        with tempfile.TemporaryDirectory() as folder:
+            self.assertEqual(smoke.check(Path(folder) / "trial"), 1)
+            value = json.loads((Path(folder) / "smoke_check.json").read_text())
+            self.assertEqual(value["status"], "TECHNICAL_FAILURE")
+            self.assertFalse(value["passed"])

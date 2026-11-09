@@ -23,6 +23,28 @@ def completion_coverage(steps, events):
 
 
 def check(directory):
+    """Preserve an explicit technical failure if the runner produced no scene."""
+    try:
+        return check_complete(directory)
+    except (OSError, ValueError, StopIteration, KeyError) as error:
+        value = dict(
+            passed=False,
+            mechanism_passed=False,
+            automatic_completion_coverage=False,
+            performance_validated=False,
+            status="TECHNICAL_FAILURE",
+            error=f"{type(error).__name__}: {error}"
+            if str(error)
+            else "runner produced no conversion sequence result",
+        )
+        output = Path(directory).parent / "smoke_check.json"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(value, indent=2) + "\n")
+        print(json.dumps(value, indent=2))
+        return 1
+
+
+def check_complete(directory):
     root = Path(directory)
     scene = next(root.rglob("conversion_sequence_result.json")).parent
     # Frozen actual arrival list is the runner input, not a guessed count.

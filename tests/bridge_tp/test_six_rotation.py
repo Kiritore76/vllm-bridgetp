@@ -131,6 +131,8 @@ class RotationTests(unittest.TestCase):
                     ]
                     if getattr(self, "assist", False):
                         args += ["--decider-assist"]
+                    if getattr(self, "dynamic_all", False):
+                        args += ["--migration-targets", "all"]
                 if layout == "L2C":
                     args += ["--migration-targets", "all"]
                 with (

@@ -541,9 +541,16 @@ def main(argv=None):
         parser.error("the unified scheduler runs static layouts with --hold-queue")
     mixed_layout = args.static_layout in (six.MIXED if args.cards == 6 else ("L1A",))
     if args.migration_targets and not (
-        args.cards == 6 and args.scheduler == "unified" and args.static_layout == "L2C"
+        args.cards == 6
+        and args.scheduler == "unified"
+        and (
+            args.static_layout == "L2C"
+            or (six_conversion and args.migration_targets == "all")
+        )
     ):
-        parser.error("--migration-targets requires six-card unified L2C")
+        parser.error("--migration-targets requires six-card unified L2C or dynamic all")
+    if six_conversion and args.force_migration_target:
+        parser.error("dynamic conversion uses all current receivers; no forced target")
     if args.force_migration_target and args.migration_targets != "all":
         parser.error("--force-migration-target needs --migration-targets all")
     if args.layout_l1a_channels and not args.long_burst_memory_verify:
