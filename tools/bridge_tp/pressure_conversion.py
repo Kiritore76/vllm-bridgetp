@@ -265,7 +265,7 @@ class ControllerConversionBackend:
 
     def controller_states(self, ids):
         value = self.status()
-        if value is None:
+        if not self.status_applied(value):
             return None
         return {i: value["instances"].get(i) for i in ids}
 
@@ -288,6 +288,9 @@ class ControllerConversionBackend:
 
     def fresh(self, status):
         return status is not None and 0 <= self.clock() - status["unix_s"] <= 2
+
+    def status_applied(self, status):
+        return self.fresh(status) and status.get("layout_revision", -1) >= self.revision
 
     @staticmethod
     def hard_ok(value, limit):
@@ -728,22 +731,46 @@ class ControllerConversionBackend:
             stream.write(json.dumps(record) + "\n")
 
     def drain_evidence(self, plan):
+        started = time.monotonic()
         value = self.status()
         if value is None:
             return []
+        # Prediction can do expensive I/O. Never age captured drain evidence
+        # while computing it; acquire native/HTTP/controller proof afterwards.
         self.shadow(plan, value)
-        evidence = []
+        shadow_done = time.monotonic()
+        samples, timings = {}, {}
         for ref in self.refs(plan):
-            state = value["instances"].get(ref.instance_id)
             row = self.rows[ref.instance_id]
+            before = time.monotonic()
             native = (
                 read_latest(Path(row["inventory_path"]))
                 if row.get("inventory_path")
                 else None
             )
+            after_native = time.monotonic()
+            observed = (
+                (self.ops.scrape(row["endpoint"], native) or {}) if native else {}
+            )
+            timings[ref.instance_id] = dict(
+                native_read_s=after_native - before,
+                scrape_s=time.monotonic() - after_native,
+                native_sampled_at=native.get("sampled_at") if native else None,
+                http_sampled_at=observed.get("sampled_unix_s"),
+            )
+            samples[ref.instance_id] = native, observed
+        # The controller may publish during the engine reads. Re-read it last
+        # rather than pinning every proof to the pre-I/O status timestamp.
+        before_status = time.monotonic()
+        value = self.status()
+        status_read_s = time.monotonic() - before_status
+        evidence = []
+        for ref in self.refs(plan):
+            state = value["instances"].get(ref.instance_id) if value else None
+            native, observed = samples[ref.instance_id]
             if state is None or native is None:
-                return []
-            observed = self.ops.scrape(row["endpoint"], native) or {}
+                evidence = []
+                break
             stamp = min(value["unix_s"], native["sampled_at"])
             idle = (
                 not native["requests"]
@@ -756,7 +783,14 @@ class ControllerConversionBackend:
                 # a fresh scrape instead of rewriting the native sample's age.
                 stamp = min(value["unix_s"], observed["sampled_unix_s"])
             # The controller must have applied QUIESCING (routing closed).
-            closed = state["lifecycle"] == "QUIESCING"
+            closed = (
+                self.status_applied(value)
+                and state["lifecycle"] == "QUIESCING"
+                and native["sampled_at"] <= self.clock()
+                and 0
+                <= self.clock() - observed.get("sampled_unix_s", -float("inf"))
+                <= 2
+            )
             evidence.append(
                 conversion.DrainEvidence(
                     ref.instance_id,
@@ -784,7 +818,17 @@ class ControllerConversionBackend:
             stream.write(
                 json.dumps(
                     dict(
-                        collected_unix_s=self.clock(), rows=[vars(r) for r in evidence]
+                        collected_unix_s=self.clock(),
+                        rows=[vars(r) for r in evidence],
+                        shadow_s=shadow_done - started,
+                        status_read_s=status_read_s,
+                        controller_sampled_at=value["unix_s"] if value else None,
+                        controller_revision=value.get("layout_revision")
+                        if value
+                        else None,
+                        required_revision=self.revision,
+                        instances=timings,
+                        collection_s=time.monotonic() - shadow_done,
                     )
                 )
                 + "\n"
@@ -794,7 +838,11 @@ class ControllerConversionBackend:
     def fence(self, plan):
         states = self.controller_states([r.instance_id for r in self.refs(plan)])
         if states is None or any(
-            s is None or s["open_admissions"] or s["streams_pending"] or s["sessions"]
+            s is None
+            or s["lifecycle"] != "QUIESCING"
+            or s["open_admissions"]
+            or s["streams_pending"]
+            or s["sessions"]
             for s in states.values()
         ):
             return False

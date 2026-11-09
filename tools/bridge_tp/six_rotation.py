@@ -17,6 +17,7 @@ HORIZON_S = 3900
 TIMEOUT_S = 5400
 
 SIMPLE_SCENARIO = "mixed_simple_six_v1"
+RETURN_SCENARIO = "mixed_return_six_v1"
 
 
 def registration(scenario):
@@ -35,6 +36,15 @@ def registration(scenario):
             requests=30731,
             output_tokens=4748032,
             horizon_s=3420,
+            controller_timeout_s=5400,
+            max_conversions=8,
+        )
+    if scenario == RETURN_SCENARIO:
+        return dict(
+            input_sha256="e181e33bde6e3d63c328392cc2dfd6732d415da3f38d102198ac0b369535060c",
+            requests=11049,
+            output_tokens=1704576,
+            horizon_s=1860,
             controller_timeout_s=5400,
             max_conversions=8,
         )
@@ -82,6 +92,8 @@ def plan(inputs, scenario=SCENARIO, arm="static_L1AC"):
     return dict(
         schema="QWEN3_SIX_ROTATION_V2"
         if scenario == SCENARIO
+        else "QWEN3_SIX_RETURN_V1"
+        if scenario == RETURN_SCENARIO
         else "QWEN3_SIX_SIMPLE_V1",
         scenario=scenario,
         input_sha256=registered["input_sha256"],
@@ -162,6 +174,20 @@ def configure_plan(current, *, recipe, unlimited=False, assist=False):
             instances=rows,
         ),
     )
+
+
+def return_coverage(steps):
+    """A completed A merge must be followed by a completed A split."""
+    merged = False
+    for step in steps:
+        plan = step["plan"]
+        if plan["state"] != "COMPLETED" or plan.get("bundle_id") != "A":
+            continue
+        if plan["target_bundle_mode"] == "TP1" and merged:
+            return True
+        if plan["target_bundle_mode"] == "TP2":
+            merged = True
+    return False
 
 
 def assess(directory, scenario=SCENARIO, *, automatic=False):
@@ -283,6 +309,13 @@ def assess(directory, scenario=SCENARIO, *, automatic=False):
             fixed_arrivals_valid=summary["fixed_arrivals_valid"],
             scope="complete baseline and cleanup; SLO/CPU/dispatch review follows",
         )
+        if automatic and scenario == RETURN_SCENARIO:
+            value["mechanism_complete"] = True
+            covered = return_coverage(steps)
+            value["automatic_coverage"]["a_round_trip_completed"] = covered
+            if not covered:
+                value["passed"] = False
+                value["errors"].append("A merge/split round trip not covered")
     except (OSError, ValueError, KeyError, TypeError, IndexError) as error:
         value["errors"].append(repr(error))
     write(directory.parent / "rotation_acceptance.json", value)

@@ -1064,10 +1064,7 @@ def finalize(plan, common, *, timeout_s=30):
     deadline = time.monotonic() + timeout_s
     while True:
         inventories = {
-            r["instance_id"]: pc.load("native_journal").latest_inventory(
-                Path(r["inventory_path"])
-            )
-            for r in active
+            r["instance_id"]: pc.read_latest(Path(r["inventory_path"])) for r in active
         }
         if all(
             value

@@ -190,6 +190,32 @@ class AutoEvidenceTests(unittest.TestCase):
                 self.assertTrue(value["automatic_coverage"]["budget_limit_reached"])
                 self.assertFalse(value["automatic_coverage"]["conversion_observed"])
                 self.assertFalse(value["performance_validated"])
+                value = rotation.assess(root, rotation.RETURN_SCENARIO, automatic=True)
+                self.assertFalse(value["passed"])
+                self.assertTrue(value["mechanism_complete"])
+                self.assertFalse(value["automatic_coverage"]["a_round_trip_completed"])
+                rotation.write(
+                    scene / "conversion_sequence_result.json",
+                    dict(
+                        steps=[
+                            dict(
+                                plan=dict(
+                                    state="COMPLETED",
+                                    bundle_id="A",
+                                    target_bundle_mode=mode,
+                                )
+                            )
+                            for mode in ("TP2", "TP1")
+                        ]
+                    ),
+                )
+                self.assertTrue(
+                    rotation.assess(
+                        root,
+                        rotation.RETURN_SCENARIO,
+                        automatic=True,
+                    )["passed"]
+                )
                 (scene / "A-new_trace_finalization.json").unlink()
                 self.assertFalse(rotation.assess(root, automatic=True)["passed"])
 

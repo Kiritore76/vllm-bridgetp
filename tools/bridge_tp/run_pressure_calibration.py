@@ -24,6 +24,7 @@ from tools.bridge_tp.pressure_cpu import load  # noqa: E402
 from tools.bridge_tp.pressure_progress import save_progress  # noqa: E402
 
 io = load("online_io")
+native_journal = load("native_journal")
 
 
 def payload(config, prompt_tokens, max_tokens, request_id, *, context_limit=8192):
@@ -83,25 +84,15 @@ def validate_config(config):
 
 def latest_inventory(path):
     """Read the last complete native sample; incomplete append stays unread."""
-    if not path.exists():
+    row = native_journal.latest_inventory(path)
+    if row is None or row.get("schema") != "PRESSURE_INVENTORY_V1":
         return None
-    for line in reversed(path.read_bytes().splitlines(keepends=True)):
-        if not line.endswith(b"\n"):
-            continue
-        row = json.loads(line)
-        if row.get("schema") == "PRESSURE_INVENTORY_V1":
-            if any(
-                row.get(k)
-                for k in (
-                    "writer_error",
-                    "inventory_error",
-                    "dropped",
-                    "dropped_before",
-                )
-            ):
-                raise RuntimeError("native inventory integrity error")
-            return row
-    return None
+    if any(
+        row.get(k)
+        for k in ("writer_error", "inventory_error", "dropped", "dropped_before")
+    ):
+        raise RuntimeError("native inventory integrity error")
+    return row
 
 
 def wait_empty(

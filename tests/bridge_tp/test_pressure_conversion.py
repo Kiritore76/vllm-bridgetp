@@ -1243,8 +1243,9 @@ class ConversionTests(unittest.TestCase):
     def test_joined_channels_that_never_warm_fail_before_publishing(self):
         with tempfile.TemporaryDirectory() as directory:
             harness = JoinHarness(Path(directory), "L2", receipts_after_s=600)
-            harness.backend.clock = lambda: time.time() + (
-                pc.CHANNEL_READY_S + 700 if harness.backend.joining else 0
+            harness.backend.clock = lambda: (
+                time.time()
+                + (pc.CHANNEL_READY_S + 700 if harness.backend.joining else 0)
             )
             plan = dict(plan_id="p", bundle_id="A", target_bundle_mode="TP1", refs=[])
             harness.backend.started = {}
@@ -1337,6 +1338,12 @@ class ConversionTests(unittest.TestCase):
             )
             now = [time.time()]
             backend.clock = lambda: now[0]
+            # Simulate the live controller continuing to acknowledge RETIRED
+            # while the separate channel-close deadline advances.
+            status = backend.status
+            backend.status = lambda: dict(
+                status(), unix_s=now[0], layout_revision=backend.revision
+            )
             self.assertFalse(backend.retire_channels(plan))
             now[0] += 61
             with self.assertRaises(RuntimeError):
@@ -1369,6 +1376,12 @@ class ConversionTests(unittest.TestCase):
             )
             harness.event = lambda kind, **values: None  # no receipts at all
             backend.ops.event = harness.event
+            now = [time.time()]
+            backend.clock = lambda: now[0]
+            status = backend.status
+            backend.status = lambda: dict(
+                status(), unix_s=now[0], layout_revision=backend.revision
+            )
             self.assertFalse(backend.retire_channels(plan))
             receipts = root / "s" / "gpu_channel_plan_receipts"
             receipts.mkdir(parents=True)

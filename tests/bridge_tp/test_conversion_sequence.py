@@ -590,11 +590,19 @@ class SequenceEvidenceTests(unittest.TestCase):
                 BRIDGETP_PERFORMANCE_TRACE_DIR=str(root / "trace/old"),
             )
             post, verify = Mock(return_value=dict(status="FINALIZED")), Mock()
-            inventory = NS(
-                latest_inventory=lambda path: dict(
-                    sampled_at=time.time(), requests=[], running=0, waiting=0
+            for row in active:
+                Path(row["inventory_path"]).write_text(
+                    json.dumps(
+                        dict(
+                            schema="PRESSURE_INVENTORY_V1",
+                            sampled_at=time.time(),
+                            requests=[],
+                            running=0,
+                            waiting=0,
+                        )
+                    )
+                    + "\n"
                 )
-            )
             with (
                 patch.dict(
                     sys.modules,
@@ -605,12 +613,40 @@ class SequenceEvidenceTests(unittest.TestCase):
                         ),
                     },
                 ),
-                patch.object(seq.pc, "load", return_value=inventory),
             ):
                 seq.finalize(
                     dict(run_dir=root, source_env=environment, target_env=environment),
                     NS(write_json=Mock()),
                 )
+                for key in (
+                    "writer_error",
+                    "inventory_error",
+                    "dropped",
+                    "dropped_before",
+                ):
+                    with self.subTest(key=key):
+                        Path(active[0]["inventory_path"]).write_text(
+                            json.dumps(
+                                dict(
+                                    schema="PRESSURE_INVENTORY_V1",
+                                    sampled_at=time.time(),
+                                    requests=[],
+                                    running=0,
+                                    waiting=0,
+                                    **{key: 1},
+                                )
+                            )
+                            + "\n"
+                        )
+                        with self.assertRaises(RuntimeError):
+                            seq.finalize(
+                                dict(
+                                    run_dir=root,
+                                    source_env=environment,
+                                    target_env=environment,
+                                ),
+                                NS(write_json=Mock()),
+                            )
             self.assertEqual(
                 [c.args[0] for c in post.call_args_list],
                 [r["endpoint"] for r in active],

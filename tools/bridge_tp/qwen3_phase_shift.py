@@ -293,7 +293,24 @@ SCENARIOS["mixed_simple_six_v1"] = dict(
     long=(16384, 8192),
     arrival_seed=6,
 )
-SIX_COMPARISON_SCENARIOS = ("mixed_rotation_six_v2", "mixed_simple_six_v1")
+SCENARIOS["mixed_return_six_v1"] = dict(
+    phases=(
+        (0, 60, 4.0, 0.0, "warm"),
+        (60, 240, 12.0, 0.0, "s1_short"),
+        (240, 1080, 2.0, 0.04, "l_long"),
+        (1080, 1320, 2.0, 0.0, "l_retreat"),
+        (1320, 1560, 17.0, 0.0, "s2_return"),
+        (1560, 1800, 10.0, 0.0, "s3_recovery"),
+        (1800, 1860, 1.0, 0.0, "tail"),
+    ),
+    long=(16384, 8192),
+    arrival_seed=6,
+)
+SIX_COMPARISON_SCENARIOS = (
+    "mixed_rotation_six_v2",
+    "mixed_simple_six_v1",
+    "mixed_return_six_v1",
+)
 # Long-request capacity (user 11-06): short 8/s, deep long requests stepping up
 # every 240s, so each layout and TP2 slot count shows when long requests stop
 # fitting. Lives of about 200-300s put about 5, 10, 15 and 20 in flight.
