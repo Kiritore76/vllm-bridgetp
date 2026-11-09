@@ -86,6 +86,11 @@ class RotationTests(unittest.TestCase):
                         self.assertEqual(
                             len(current["migration_plan"]["execution_targets"]), 2
                         )
+                    if getattr(self, "automatic", False):
+                        self.assertEqual(current["conversion"]["profile"], "six_card")
+                        self.assertEqual(current["conversion"]["max_conversions"], 8)
+                        self.assertFalse(current["conversion"]["prestart"])
+                        self.assertTrue(current["config"]["dynamic_conversion"])
                     captured.append(current)
                     raise RuntimeError("CPU_STOP_AFTER_REAL_PREFLIGHT")
 
@@ -114,6 +119,13 @@ class RotationTests(unittest.TestCase):
                     "--expected-revision",
                     "cpu-fixture",
                 ]
+                if getattr(self, "automatic", False):
+                    args += [
+                        "--conversion-decider",
+                        "execute",
+                        "--decider-multi",
+                        "--decider-pre-tilt",
+                    ]
                 if layout == "L2C":
                     args += ["--migration-targets", "all"]
                 with (

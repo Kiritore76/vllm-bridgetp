@@ -72,8 +72,10 @@ def validate_recipe(config):
     return recipe
 
 
-def plan(inputs, scenario=SCENARIO):
+def plan(inputs, scenario=SCENARIO, arm="static_L1AC"):
     registered = registration(scenario)
+    if arm not in {"static_L1AC", "auto_from_L1AC"}:
+        raise ValueError("unregistered comparison arm")
     config = phase.config(inputs, scenario)
     recipe = validate_recipe(config)
     counts = Counter((j["workload_phase"], j["workload_role"]) for j in recipe["jobs"])
@@ -104,10 +106,10 @@ def plan(inputs, scenario=SCENARIO):
             for a, b, short_rate, long_rate, name in phase.SCENARIOS[scenario]["phases"]
         ],
         comparison_arms=["static_L1AC", "static_L2C", "static_L3", "auto_from_L1AC"],
-        dispatched_arms=["static_L1AC"],
+        dispatched_arms=[arm],
         prestart=False,
         migration_coverage_required=False,
-        scope="first static baseline; no GPU result or performance claim",
+        scope=arm + "; no GPU result or performance claim",
     )
 
 
@@ -159,7 +161,7 @@ def configure_plan(current, *, recipe):
     )
 
 
-def assess(directory, scenario=SCENARIO):
+def assess(directory, scenario=SCENARIO, *, automatic=False):
     """Audit the first static L1AC run without treating SLO failures as success."""
     registered = registration(scenario)
     directory = Path(directory)
@@ -172,11 +174,15 @@ def assess(directory, scenario=SCENARIO):
             and read(shutdowns[0]).get("all_owned_groups_ended") is True
         )
         result = read(directory / "result.json")
-        if (
-            result.get("status") != "COMPLETED_STATIC_LAYOUT"
-            or result.get("layout") != "L1AC"
+        expected_status = (
+            "COMPLETED_CONVERSION_SEQUENCE" if automatic else "COMPLETED_STATIC_LAYOUT"
+        )
+        if result.get("status") != expected_status or (
+            not automatic and result.get("layout") != "L1AC"
         ):
-            raise ValueError(result.get("error") or "first arm did not complete L1AC")
+            raise ValueError(
+                result.get("error") or "registered comparison did not complete"
+            )
         contracts = list(directory.rglob("rotation_contract.json"))
         if len(contracts) != 1 or not value["cleanup_confirmed"]:
             raise ValueError("missing unique contract or owned shutdown")
@@ -184,7 +190,7 @@ def assess(directory, scenario=SCENARIO):
         contract = read(contracts[0])
         if (
             contract["input_sha256"] != registered["input_sha256"]
-            or contract["automatic_conversion"]
+            or contract["automatic_conversion"] != automatic
         ):
             raise ValueError("input hash changed or first static arm converted")
         runs = result["runs"]
@@ -198,17 +204,77 @@ def assess(directory, scenario=SCENARIO):
             summary["requests"] != registered["requests"]
             or summary["output_tokens"] != registered["output_tokens"]
             or summary["window_s"] != registered["horizon_s"]
-            or not read(scene / "six_card_acceptance.json")["passed"]
         ):
             raise ValueError("request/output/window or six-card mechanism differs")
+        proof_name = (
+            "conversion_sequence_acceptance.json"
+            if automatic
+            else "six_card_acceptance.json"
+        )
+        proof = read(scene / proof_name)
+        if not proof.get("passed"):
+            raise ValueError("mechanism evidence failed")
         empty = read(scene / "native_empty_receipt.json")
-        if len(empty) != 5 or any(
-            r["running"] or r["waiting"] or r["requests"] for r in empty.values()
+        expected = {r["instance_id"]: r for r in contract["instances"]}
+        if automatic:
+            control = read(scene / "controller/layout_control.json")
+            expected = {
+                r["instance_id"]: r
+                for r in control["instances"]
+                if r["lifecycle"] == "ACTIVE"
+            }
+            status = read(scene / "controller/layout_status.json")["instances"]
+            if any(status.get(k, {}).get("lifecycle") != "ACTIVE" for k in expected):
+                raise ValueError("final layout lacks controller ACK")
+        if (
+            not expected
+            or set(empty) != set(expected)
+            or any(
+                r["running"] or r["waiting"] or r["requests"] for r in empty.values()
+            )
         ):
             raise ValueError("native inventories did not empty")
+        for name, row in expected.items():
+            if (
+                read(scene / (name + "_trace_finalization.json")).get("status")
+                != "FINALIZED"
+            ):
+                raise ValueError("missing finalized current engine trace")
+            trace = read(scene / (name + "_trace_acceptance.json"))
+            if trace.get("samples", 0) <= 0 or trace.get("ranks") != row["tp_degree"]:
+                raise ValueError("invalid current engine trace")
+        export = read(scene / "controller/pressure_result_export_receipt.json")
+        if (
+            export.get("status") != "WRITTEN"
+            or export.get("requests") != registered["requests"]
+        ):
+            raise ValueError("missing bounded result export proof")
+        from tools.bridge_tp.pressure_cpu import load
+
+        value["pause_timing"] = load("pause_diagnostics").verify(
+            scene / "controller/pressure_timing.jsonl"
+        )
+        if automatic:
+            sequence = read(scene / "conversion_sequence_result.json")
+            steps = sequence.get("steps", [])
+            limits = [
+                json.loads(line)
+                for line in (scene / "conversion_events.jsonl").read_text().splitlines()
+                if line.strip()
+            ]
+            value["automatic_coverage"] = dict(
+                attempts=len(steps),
+                completed=sum(s["plan"]["state"] == "COMPLETED" for s in steps),
+                safely_aborted=sum(s["plan"]["state"] == "ABORTED" for s in steps),
+                conversion_observed=any(
+                    s["plan"]["state"] == "COMPLETED" for s in steps
+                ),
+                budget_limit_reached=any(e["kind"] == "DECIDER_LIMIT" for e in limits),
+                actual_migration_coverage=proof.get("actual_migration_coverage", False),
+            )
         value.update(
             passed=True,
-            arm="static_L1AC",
+            arm="auto_from_L1AC" if automatic else "static_L1AC",
             input_sha256=registered["input_sha256"],
             summary=summary,
             fixed_arrivals_valid=summary["fixed_arrivals_valid"],
@@ -226,14 +292,19 @@ def main(argv=None):
     parser.add_argument("--directory", type=Path, required=True)
     parser.add_argument("--inputs", type=Path)
     parser.add_argument(
+        "--arm", choices=("static_L1AC", "auto_from_L1AC"), default="static_L1AC"
+    )
+    parser.add_argument(
         "--scenario", choices=phase.SIX_COMPARISON_SCENARIOS, default=SCENARIO
     )
     args = parser.parse_args(argv)
     if args.action == "plan":
-        value = plan(read(args.inputs), args.scenario)
+        value = plan(read(args.inputs), args.scenario, args.arm)
         write(args.directory / "rotation_plan.json", value)
     else:
-        value = assess(args.directory, args.scenario)
+        value = assess(
+            args.directory, args.scenario, automatic=args.arm == "auto_from_L1AC"
+        )
     print(json.dumps(value, indent=2))
     return 0 if args.action == "plan" or value["passed"] else 2
 

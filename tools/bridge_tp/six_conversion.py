@@ -621,7 +621,19 @@ def assess(scene, expected_requests, require_conversion=True, *, split_probe=Fal
         s["plan"]["state"] == "COMPLETED" and s.get("layout") in PATH.values()
         for s in steps
     )
-    value["mechanism_passed"] = value["passed"] and value["all_steps_completed"]
+    # The underlying decided-sequence audit verifies ownership, controller ACKs
+    # and safe ABORTED outcomes. Automatic runs may legitimately make no plan
+    # or abandon one; explicit edge probes still require a completed edge.
+    value["automatic_terminal_steps_valid"] = all(
+        s["plan"]["state"] in {"COMPLETED", "ABORTED"}
+        and s.get("layout") in PATH.values()
+        for s in steps
+    )
+    value["mechanism_passed"] = value["passed"] and (
+        value["all_steps_completed"]
+        if require_conversion
+        else value["automatic_terminal_steps_valid"]
+    )
     scene = Path(scene)
     manifest = pc.read_json(scene / "instances.json") or {}
     split_probe = split_probe or manifest.get("diagnostic_arrival_profile") == PROFILE

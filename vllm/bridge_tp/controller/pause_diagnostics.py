@@ -195,6 +195,12 @@ def tick():
         _observer.tick()
 
 
+def flush_gc():
+    """Consume GC evidence during result export without adding online ticks."""
+    if _gc_monitor is not None:
+        _gc_monitor.flush()
+
+
 def verify(path):
     rows = [json.loads(line) for line in path.read_text().splitlines()]
     if (

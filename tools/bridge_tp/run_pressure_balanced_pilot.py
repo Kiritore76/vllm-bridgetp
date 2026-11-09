@@ -2439,45 +2439,14 @@ def _run(args, prepared):
             total=len(jobs),
             elapsed_s=round(time.monotonic() - started, 1),
         )
-        results = []
-        for job_id, value in dispatched.items():
-            results.append(
-                dict(
-                    job_id=job_id,
-                    client_id=value.client_id,
-                    server_id=value.server_id,
-                    initial_pool=value.pool_id,
-                    request=value.payload,
-                    source_done=value.future.done(),
-                    source_error=str(value.future.exception())
-                    if value.future.done() and value.future.exception()
-                    else None,
-                    response=value.recorder.stats(),
-                    source_transport={
-                        key: value.future.result().get(key)
-                        for key in (
-                            "request_started_unix_s",
-                            "completed_unix_s",
-                            "ttft_ms",
-                            "e2e_ms",
-                            "finish_reason",
-                        )
-                    }
-                    if value.future.done() and value.future.exception() is None
-                    else None,
-                    dispatch_timing=dict(
-                        planned_unix_s=origin_unix_s
-                        + next(job["at_s"] for job in jobs if job["id"] == job_id),
-                        dispatch_entered_unix_s=value.dispatch_entered_at,
-                        admission_finished_unix_s=value.admission_finished_at,
-                        executor_submitted_unix_s=value.executor_submitted_at,
-                        http_thread_started_unix_s=value.http_thread_started_at,
-                        held_s=value.held_s,
-                    ),
-                )
-            )
-        (args.run_dir / "pressure_request_results.json").write_text(
-            json.dumps(results), encoding="utf-8"
+        from tools.bridge_tp.pressure_result_export import write_request_results
+
+        export = write_request_results(
+            args.run_dir / "pressure_request_results.json",
+            dispatched, jobs, origin_unix_s,
+        )
+        (args.run_dir / "pressure_result_export_receipt.json").write_text(
+            json.dumps(export), encoding="utf-8"
         )
         audit.write(
             dict(
