@@ -513,12 +513,11 @@ def main(argv=None):
     if args.conversion in SIX_EDGES and args.cards != 6:
         parser.error("six-card edge requires --cards 6")
     if six_conversion and (
-        args.scheduler != "unified"
-        or args.static_no_migrate
-        or args.decider_assist
-        or args.decider_evacuate
+        args.scheduler != "unified" or args.static_no_migrate or args.decider_evacuate
     ):
-        parser.error("six-card conversions require unified migration and natural drain")
+        parser.error(
+            "six-card conversions require unified migration; no TP2 evacuation"
+        )
     if args.cards == 6 and (
         not args.static_layout
         or not args.current_machine
@@ -620,6 +619,13 @@ def main(argv=None):
             args.cards != 6 or args.scheduler != "unified"
         ):
             parser.error("six-card rotation v2 requires --cards 6 --scheduler unified")
+        if args.phase_scenario == "auto_smoke_six_v1" and (
+            args.cards != 6
+            or args.scheduler != "unified"
+            or args.conversion_decider != "execute"
+            or not args.decider_multi
+        ):
+            parser.error("six-card auto smoke requires unified execute multi")
         if (
             args.routine_four_mode
             or args.long_burst_pair
@@ -1111,12 +1117,16 @@ def main(argv=None):
                 spec["conversion"].update(
                     profile="six_card",
                     multi=args.conversion_decider == "execute",
-                    assist=False,
+                    assist=args.decider_assist,
                     max_conversions=(
-                        12 if args.phase_scenario == "mixed_rotation_six_v2" else 8
-                    )
-                    if args.phase_scenario in phase_shift.SIX_COMPARISON_SCENARIOS
-                    else 4,
+                        1
+                        if args.phase_scenario == "auto_smoke_six_v1"
+                        else (
+                            12 if args.phase_scenario == "mixed_rotation_six_v2" else 8
+                        )
+                        if args.phase_scenario in phase_shift.SIX_COMPARISON_SCENARIOS
+                        else 4
+                    ),
                     rules=dict(current_length=True, trend_lookahead_s=60.0),
                 )
         if args.conversion_cycle:
@@ -1298,6 +1308,8 @@ def main(argv=None):
                 from tools.bridge_tp.six_rotation import configure_plan
 
                 configure_plan(plan, recipe=cfg["recipes"][0])
+            if args.phase_shift and args.phase_scenario == "auto_smoke_six_v1":
+                plan["migration_coverage_required"] = False
         serving_preflight(plans)
         for recipe, arm, scene, plan in plans:
             if not gpu_idle():

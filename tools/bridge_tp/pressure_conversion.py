@@ -436,6 +436,13 @@ class ControllerConversionBackend:
         self.write_layout(
             {r.instance_id: "QUIESCING" for r in self.refs(plan)}, tilt=[]
         )
+        if self.gate_mode == "UNIFIED":
+            self.ops.event(
+                "CONVERSION_COMMITTED",
+                plan_id=plan["plan_id"],
+                policy="finish_unless_hard_emergency_or_failure",
+                remaining_evidence=self.remaining_evidence(),
+            )
         self.prestart(plan)
 
     def remaining_s(self):
@@ -445,15 +452,30 @@ class ControllerConversionBackend:
         exists: stale, failed or UNKNOWN planner output never keeps the
         retained side under pressure.
         """
+        return self.remaining_evidence()["remaining_s"]
+
+    def remaining_evidence(self):
+        """Explain unavailable estimates without inventing a completion time."""
         record = self.last_shadow
+        evidence = dict(remaining_s=None, reason=None, missing_inputs=[])
         if record is None or "error" in record:
-            return None
-        if not 0 <= self.clock() - record["evaluated_unix_s"] <= 3:
-            return None
+            evidence.update(reason="planner_error" if record else "no_planner_record")
+            return evidence
+        evidence["age_s"] = self.clock() - record["evaluated_unix_s"]
+        if not 0 <= evidence["age_s"] <= 3:
+            evidence["reason"] = "planner_stale"
+            return evidence
         drain = record["drain_only"]
+        evidence.update(
+            support_status=drain["support_status"],
+            missing_inputs=drain.get("missing_inputs", []),
+            profile_mismatch=record.get("profile_mismatch"),
+        )
         if drain["support_status"] != "SUPPORTED":
-            return None
-        return drain["estimated_ready_s"]
+            evidence["reason"] = "drain_estimate_unsupported"
+            return evidence
+        evidence.update(remaining_s=drain["estimated_ready_s"], reason="supported")
+        return evidence
 
     def kv_emergency(self, plan):
         """Safety valve: retained KV about to hit its guard, sustained.
@@ -498,8 +520,21 @@ class ControllerConversionBackend:
                     remaining_s=round(remaining, 3),
                 )
             return False
-        self.decision("VALVE_ABORT", instances=unsafe, remaining_s=remaining)
-        self.ops.event("SAFETY_ABORT", plan_id=plan["plan_id"], instances=unsafe)
+        evidence = self.remaining_evidence()
+        evidence["continue_limit_s"] = self.safety["continue_if_remaining_s"]
+        self.decision(
+            "VALVE_ABORT",
+            instances=unsafe,
+            remaining_s=remaining,
+            remaining_evidence=evidence,
+        )
+        self.ops.event(
+            "SAFETY_ABORT",
+            plan_id=plan["plan_id"],
+            instances=unsafe,
+            remaining_s=remaining,
+            remaining_evidence=evidence,
+        )
         return True
 
     def assisted_step(self, plan, now):
@@ -533,6 +568,9 @@ class ControllerConversionBackend:
             request_id=choice["request_id"],
             source=choice["instance"],
         )
+        for key in ("target", "final_length"):
+            if key in choice:
+                assist[key] = choice[key]
         if "evacuate" in choice:
             assist["evacuate"] = choice["evacuate"]
             self.planned = dict(seq=self.assist_seq, requests=choice["evacuate"])

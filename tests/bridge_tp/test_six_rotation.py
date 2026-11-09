@@ -88,7 +88,10 @@ class RotationTests(unittest.TestCase):
                         )
                     if getattr(self, "automatic", False):
                         self.assertEqual(current["conversion"]["profile"], "six_card")
-                        self.assertEqual(current["conversion"]["max_conversions"], 8)
+                        self.assertEqual(
+                            current["conversion"]["max_conversions"],
+                            getattr(self, "attempts", 8),
+                        )
                         self.assertFalse(current["conversion"]["prestart"])
                         self.assertTrue(current["config"]["dynamic_conversion"])
                     captured.append(current)
@@ -126,6 +129,8 @@ class RotationTests(unittest.TestCase):
                         "--decider-multi",
                         "--decider-pre-tilt",
                     ]
+                    if getattr(self, "assist", False):
+                        args += ["--decider-assist"]
                 if layout == "L2C":
                     args += ["--migration-targets", "all"]
                 with (
@@ -164,7 +169,17 @@ class RotationTests(unittest.TestCase):
                 )
                 current = captured[0]
                 argv = current["controller_argv"]
-                self.assertEqual(argv[argv.index("--max-seconds") + 1], "5400")
+                self.assertEqual(
+                    argv[argv.index("--max-seconds") + 1],
+                    getattr(self, "timeout", "5400"),
+                )
+                if getattr(self, "assist", False):
+                    self.assertTrue(current["conversion"]["assist"])
+                if (
+                    self.config["recipes"][0]["scenario"]
+                    not in phase.SIX_COMPARISON_SCENARIOS
+                ):
+                    continue
                 with self.assertRaisesRegex(ValueError, "budget/options"):
                     rotation.configure_plan(
                         dict(current, conversion=dict(max_conversions=4)),

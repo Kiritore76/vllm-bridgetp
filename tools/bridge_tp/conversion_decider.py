@@ -112,6 +112,7 @@ RULES = dict(
 # Six-card policy is explicit: existing four-card callers keep RULES unchanged.
 SIX_CARD_RULES = dict(
     RULES,
+    prepare_long_ratio=0.8,
     l2_max_short=15.0,
     l2_min_long_blocks=12600,
     l2_leave_short=17.0,
@@ -560,7 +561,18 @@ class ConversionDecider:
                 held_s=round(held, 3),
                 ready=ready,
             )
-            if usable and held >= need - r["tilt_lead_s"] and approaching is None:
+            predicted_prepare = (
+                self.profile == "six_card"
+                and s["layout"] == "L1AC"
+                and tuple(edge) == ("A", "TP2")
+                and not cooling
+                and failed == ["too few long-request blocks"]
+                and s.get("trend_blocks", 0)
+                >= r["prepare_long_ratio"] * r["l2_min_long_blocks"]
+            )
+            if (
+                usable and held >= need - r["tilt_lead_s"] or predicted_prepare
+            ) and approaching is None:
                 approaching = (key, edge, bool(waiting))
             if ready and proposal is None:
                 proposal = dict(
@@ -593,6 +605,31 @@ class ConversionDecider:
             proposal=proposal,
             prepared=dict(prepared) if prepared else None,
             tilt=tilt,
+            preparation=dict(
+                phase="PREPARING" if prepared else "OBSERVING",
+                approaching=approaching[0] if approaching else None,
+                retained_no_room=[
+                    b
+                    for b in bundles
+                    if approaching
+                    and b != approaching[1][0]
+                    and not s["kv_room"].get(b)
+                ],
+                retained_not_quiet=[
+                    b
+                    for b in bundles
+                    if approaching and b != approaching[1][0] and not s["quiet"].get(b)
+                ],
+                tilt_active=bool(tilt),
+                tilt_expired=bool(
+                    prepared and now - prepared["at"] > r["split_tilt_max_s"]
+                ),
+                capacity_recovery_wait_s=max(
+                    0.0, r["smooth_capacity_s"] - (now - self.no_room_at)
+                )
+                if prepared
+                else None,
+            ),
         )
         if proposal is not None and not self.execute:
             self.prepared = None  # record only: this hold is over
@@ -610,7 +647,7 @@ class ConversionDecider:
             others = [b for b in bundles if b != edge[0]]
             if others and all(
                 s["kv_room"].get(b)
-                and ((waiting and self.profile != "six_card") or s["quiet"].get(b))
+                and (self.profile == "six_card" or waiting or s["quiet"].get(b))
                 for b in others
             ):
                 self.prepared = dict(

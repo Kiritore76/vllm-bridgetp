@@ -140,9 +140,7 @@ class TrendTests(unittest.TestCase):
                 )
                 for n in range(count)
             ]
-            records.append(
-                decider.observe(value, BUNDLES, MEMBERS, start + second)
-            )
+            records.append(decider.observe(value, BUNDLES, MEMBERS, start + second))
         return records
 
     def test_the_short_rate_reads_its_shorter_window(self):
@@ -167,9 +165,7 @@ class TrendTests(unittest.TestCase):
                 short_window_arrivals=240 if second >= 20 else 120,
                 short_window_long=0,
             )
-            records.append(
-                decider.observe(value, BUNDLES, MEMBERS, 1000.0 + second)
-            )
+            records.append(decider.observe(value, BUNDLES, MEMBERS, 1000.0 + second))
         self.assertFalse(any(r["proposal"] for r in records))
         self.assertIn(
             "short rate too high for L2",
@@ -353,8 +349,10 @@ class CurrentLengthTests(unittest.TestCase):
         decider = self.decider()
         value = status()
         request = dict(
-            request_id="growing", prompt_tokens=512,
-            max_output_tokens=8192, generated=7680,
+            request_id="growing",
+            prompt_tokens=512,
+            max_output_tokens=8192,
+            generated=7680,
         )
         value["instances"]["B-g2-tp2"]["requests"] = [request]
         self.signals(decider, value, 1000.0)
@@ -625,6 +623,9 @@ class PrepareStageTests(unittest.TestCase):
         full = status(short=12, deep={"B-g2-tp2": 1}, tp1_capacity=0.9)
         record = decider.observe(full, BUNDLES, MEMBERS, 1101)
         self.assertEqual(record["tilt"], [])
+        self.assertEqual(record["preparation"]["retained_no_room"], ["A"])
+        self.assertFalse(record["preparation"]["tilt_active"])
+        self.assertGreater(record["preparation"]["capacity_recovery_wait_s"], 0)
         # Room again, after the capacity smoothing.
         records = run(decider, value, 20, start=1102)
         tilted = [r["evaluated_unix_s"] - 1000 for r in records if r["tilt"]]

@@ -533,11 +533,6 @@ def validate(request):
                 "sequence triggers must be ordered; deadline is a duration"
             )
         previous = step["trigger_s"]
-        if (
-            request.get("profile") == "six_card"
-            and step.get("method", "DRAIN") != "DRAIN"
-        ):
-            raise ValueError("six-card conversions use natural drain")
         if step.get("method", "DRAIN") not in {"DRAIN", "SELECTIVE_ROLL"}:
             raise ValueError("unsupported sequence method")
         if step.get("method") == "SELECTIVE_ROLL" and step["target_mode"] != "TP2":
@@ -780,6 +775,14 @@ class DecidedSequenceDriver(ConversionSequenceDriver):
         """Cancel while waiting or draining once the proposal no longer fits."""
         now = time.monotonic()
         state = self.executor.plan["state"]
+        # The six-card commit point is successful admission closure. Ordinary
+        # demand changes may withdraw a CREATED plan, never undo paid drainage.
+        # The executor deadline, hard capacity valve and recovery remain active.
+        if (
+            state == "DRAINING"
+            and getattr(self.decider, "profile", "four_card") == "six_card"
+        ):
+            return
         if (
             state not in {"CREATED", "DRAINING"}
             or now - self.cancel_checked < self.decision_interval_s
@@ -835,7 +838,14 @@ class DecidedSequenceDriver(ConversionSequenceDriver):
             deadline_s=self.sequence_request["deadline_s"],
             # Only a merge towards L2 has a TP-k to move requests to.
             method="SELECTIVE_ROLL"
-            if self.sequence_request.get("assist") and (bundle, mode) == ("A", "TP2")
+            if self.sequence_request.get("assist")
+            and (
+                (bundle, mode) == ("A", "TP2")
+                or (
+                    getattr(self.decider, "profile", "four_card") == "six_card"
+                    and mode == "TP2"
+                )
+            )
             else "DRAIN",
             held_s=proposal["held_s"],
         )

@@ -23,6 +23,16 @@ from tools.bridge_tp import qwen3_stay_migrate as matched
 
 # (start, end, short req/s, long req/s, phase label) and the long request.
 SCENARIOS = {
+    # Short automatic-conversion mechanism check; not a performance comparison.
+    "auto_smoke_six_v1": dict(
+        phases=(
+            (0, 60, 1.0, 0.0, "warm"),
+            (60, 420, 1.0, 0.06, "long_pressure"),
+            (420, 600, 1.0, 0.0, "tail"),
+        ),
+        long=(16384, 8192),
+        arrival_seed=6,
+    ),
     # Explicit cycle mechanism check, not the later mixed performance trial.
     "conversion_cycle": dict(
         phases=(
@@ -391,6 +401,8 @@ def config(inputs, scenario="phase_shift"):
         note="phases for the conversion decider; one run per scenario, a "
         "functional check, not a comparison",
     )
+    if scenario == "auto_smoke_six_v1":
+        cfg["horizon_s"] = 600
     if scenario in SIX_COMPARISON_SCENARIOS:
         cfg.update(
             horizon_s=SCENARIOS[scenario]["phases"][-1][1],

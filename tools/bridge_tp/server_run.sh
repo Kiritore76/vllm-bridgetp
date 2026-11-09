@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 当前任务：六卡简化主对照，三业务阶段3420秒，自动转换单场。
+# 当前任务：六卡600秒自动转换机制小场。
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
@@ -15,18 +15,13 @@ git fetch origin "refs/heads/$branch:refs/remotes/origin/$branch" || exit 1
 revision=$(git rev-parse HEAD)
 [ "$revision" = "$(git rev-parse "origin/$branch")" ] || { echo '请先git pull --ff-only。'; exit 1; }
 mkdir -p /root/autodl-tmp/bridgetp/results || exit 1
-run=/root/autodl-tmp/bridgetp/results/qwen3_six_simple_auto_$(date +%Y%m%d_%H%M%S)_${RANDOM}
+run=/root/autodl-tmp/bridgetp/results/qwen3_six_auto_smoke_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 printf '%s\n' "$revision" > "$run/revision.txt"
-printf 'Six-card simple comparison: auto from L1AC only; identical baseline input, natural drain, no retries.\n' > "$run/scope.txt"
-printf '3420s, seed6, warm60/short600/long1800/recovery900/tail60; 30731 requests (30630 short/101 long), 4748032 output tokens.\n' >> "$run/scope.txt"
-printf 'INPUT_SHA256=db268e9bba9c906a67e96fce644786550020d6568fd819a01425e537abae3387\n' >> "$run/scope.txt"
-printf '5400s controller budget; 32K/.88/slots16/guard125/unified mean32ms; original policy thresholds.\n' >> "$run/scope.txt"
-printf 'Automatic six-card decider, pre-tilt on, prestart/assist/TP2 evacuation off; 8 proposal attempts including aborts.\n' >> "$run/scope.txt"
-printf 'Zero conversion/migration is allowed and reported; safe aborts, budget limits, SLO failures and drain remain visible.\n' >> "$run/scope.txt"
+printf 'Six-card automatic smoke; 600s arrivals, seed6, unchanged thresholds, one proposal attempt; TP1 assist enabled.\n' > "$run/scope.txt"
 echo "本批目录：$run"
-echo 'Linux完整CPU前置失败/错误/跳过即停止；通过后仅运行自动转换一场。'
-echo '57分钟到达，另有启动、排空和打包；不自动重试、不删结果、不清理其他进程。'
+echo '先Linux CPU检查；通过后只跑自动转换小场，无固定时刻强制转换。'
+echo '10分钟到达；加启动/预热/drain/打包，预计约15–25分钟，慢机器可能更久。'
 smi=
 pack_result() {
     local status=$1
@@ -69,6 +64,7 @@ export TMPDIR="$task_tmp" TEMP="$task_tmp" TMP="$task_tmp"
     tests.bridge_tp.test_first_target_startup tests.bridge_tp.test_gpu_direct_targets \
     tests.bridge_tp.test_six_rotation tests.bridge_tp.test_six_simple \
     tests.bridge_tp.test_pressure_result_export tests.bridge_tp.test_six_auto \
+    tests.bridge_tp.test_six_assist tests.bridge_tp.test_six_auto_smoke \
     tests.bridge_tp.test_pressure_pause_diagnostics \
     tests.bridge_tp.test_pressure_inventory_process.InventoryProcessTests.test_gc_callback_records_outside_collection_and_restores_callbacks \
     > "$run/cpu_checks.log" 2>&1
@@ -86,17 +82,13 @@ fi
 nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,pcie.link.gen.current,pcie.link.width.current --format=csv,noheader > "$run/gpu_before.csv" || { pack_result 1; exit 1; }
 nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,pcie.link.gen.current,pcie.link.width.current --format=csv,noheader -lms 1000 > "$run/gpu_samples.csv" &
 smi=$!
-"$py" -B -m tools.bridge_tp.six_rotation plan --arm auto_from_L1AC --scenario mixed_simple_six_v1 --directory "$run" \
-    --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json" \
-    > "$run/plan.log" 2>&1 || { cat "$run/plan.log"; pack_result 1; exit 1; }
-cat "$run/plan.log"
 case_dir="$run/auto_from_L1AC"
 mkdir "$case_dir" || { pack_result 1; exit 1; }
-echo '开始自动转换：同一3420秒输入，从L1AC起步，8次提议预算含取消；阈值/0.9门保持。'
+echo '开始600秒自动转换小场；一次提议预算，零转换/全部中止均不算覆盖通过。'
 "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
-    --cards 6 --static-layout L1AC --phase-shift --phase-scenario mixed_simple_six_v1 \
-    --scheduler unified --hold-queue --kv-short-exempt --overload-migrate --migrate-current-length \
-    --conversion-decider execute --decider-multi --decider-pre-tilt \
+    --cards 6 --static-layout L1AC --phase-shift --phase-scenario auto_smoke_six_v1 \
+    --scheduler unified --migration-targets all --hold-queue --kv-short-exempt --overload-migrate --migrate-current-length \
+    --conversion-decider execute --decider-multi --decider-pre-tilt --decider-assist \
     --expanded-context --current-machine --repetitions 1 \
     --model "$model" \
     --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
@@ -104,13 +96,12 @@ echo '开始自动转换：同一3420秒输入，从L1AC起步，8次提议预�
     --output "$case_dir/trial" --expected-revision "$revision" 2>&1 | tee "$case_dir/console.log"
 runner_status=${PIPESTATUS[0]}
 printf '%s\n' "$runner_status" > "$case_dir/runner_exit_code.txt"
-"$py" -B -m tools.bridge_tp.six_rotation assess --arm auto_from_L1AC --scenario mixed_simple_six_v1 --directory "$case_dir/trial" \
-    > "$case_dir/auto_check.log" 2>&1
+"$py" -B -m tools.bridge_tp.six_auto_smoke "$case_dir/trial" > "$case_dir/auto_check.log" 2>&1
 check_status=$?
 cat "$case_dir/auto_check.log"
 printf '%s\n' "$check_status" > "$case_dir/check_exit_code.txt"
 status=$runner_status
 if [ "$status" = 0 ]; then status=$check_status; fi
-echo '自动决策可零转换或安全取消，如实记录；完整请求/通道/资源ACK/当前实例trace/收尾必须通过，性能回收后对比。'
+echo '必须实际完成一次自动L1AC→L2C，完整输出/ACK/trace/收尾须通过；辅助覆盖另记，不冒称性能收益。'
 pack_result "$status" || exit 1
 exit "$status"

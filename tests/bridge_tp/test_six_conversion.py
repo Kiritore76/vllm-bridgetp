@@ -564,7 +564,7 @@ class PlansTests(unittest.TestCase):
                     any(p.is_symlink() for p in plan["run_dir"].rglob("*"))
                 )
 
-    def test_profile_validation_accepts_c_and_rejects_assistance(self):
+    def test_profile_validation_accepts_c_and_only_merge_assistance(self):
         step = dict(bundle="C", target_mode="TP1", trigger_s=1, deadline_s=30)
         self.assertEqual(
             validate(dict(profile="six_card", base_port=8400, sequence=[step]))[
@@ -574,12 +574,19 @@ class PlansTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             validate(dict(base_port=8400, sequence=[step]))
+        validate(
+            dict(
+                profile="six_card",
+                base_port=8400,
+                sequence=[dict(step, target_mode="TP2", method="SELECTIVE_ROLL")],
+            )
+        )
         with self.assertRaises(ValueError):
             validate(
                 dict(
                     profile="six_card",
                     base_port=8400,
-                    sequence=[dict(step, target_mode="TP2", method="SELECTIVE_ROLL")],
+                    sequence=[dict(step, method="SELECTIVE_ROLL")],
                 )
             )
 

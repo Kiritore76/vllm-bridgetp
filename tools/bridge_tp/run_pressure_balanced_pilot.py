@@ -728,6 +728,18 @@ def unknown_routing_pools(
     )
 
 
+def try_ranked_assist_targets(order, start):
+    """Try the next target after a refusal, stop at the first accepted START."""
+    attempts = []
+    reason = "no fresh target with a free channel"
+    for target in order:
+        reason = start(target)
+        attempts.append(dict(target=target, reason=reason))
+        if reason is None:
+            return reason, target, attempts
+    return reason, None, attempts
+
+
 def dispatch_due(
     jobs, dispatched, elapsed, ingress, pools, tokens, audit, *, origin_unix_s=None
 ):
@@ -844,7 +856,7 @@ def _run(args, prepared):
         if cfg.health_service
         else load("audit").AuditLog(audit_path, receipt)
     )
-    tokens = AsyncJournal(args.run_dir / "native_tokens.jsonl")
+    tokens = AsyncJournal(args.run_dir / "native_tokens.jsonl", enqueue_timeout_s=5.0)
     co = r.PressureCoordinator(
         cfg,
         audit.write,
@@ -1169,6 +1181,12 @@ def _run(args, prepared):
         decode must be a measured supported one. Then the coordinator's
         single-session reservation path starts it.
         """
+        requested_target = assist.get("target")
+        if (
+            requested_target is not None
+            and alias_of.get(requested_target, requested_target) != target_pool.pool_id
+        ):
+            return "assist target changed; retry with fresh target"
         source = alias_of.get(assist["source"], assist["source"])
         candidate = next(
             (
@@ -1205,7 +1223,9 @@ def _run(args, prepared):
             )
             if refusal:
                 return refusal
-        current = co.policy.cfg.migration_current_length
+        current = co.policy.cfg.migration_current_length and not assist.get(
+            "final_length"
+        )
         required = math.ceil(
             (
                 candidate.prompt_tokens
@@ -1242,7 +1262,9 @@ def _run(args, prepared):
             source,
             target_pool.pool_id,
             candidate,
-            actions.get(candidate.request_id),
+            actions.get((candidate.request_id, target_pool.pool_id))
+            if hasattr(session, "groups")
+            else actions.get(candidate.request_id),
             target_pool,
             required,
             before_quiesce=bool(assist.get("before_quiesce")),
@@ -2053,8 +2075,7 @@ def _run(args, prepared):
                     (c.request_id, tid): r.BoundAction(
                         c.request_id,
                         session.groups[tid].migration_id,
-                        lambda c=c, tid=tid, runtime=pair_runtimes[(source, tid)],
-                        source=source: (
+                        lambda c=c, tid=tid, runtime=pair_runtimes[(source, tid)], source=source: (  # noqa: E501
                             note_migration_start(
                                 source, session.start_on(tid, c, runtime)
                             )
@@ -2081,20 +2102,75 @@ def _run(args, prepared):
             assist = layout_state["assist"]
             assist_started = False
             if (
-                t is not None
+                (
+                    t is not None
+                    or (
+                        multi
+                        and target_ids
+                        and assist is not None
+                        and assist.get("final_length")
+                    )
+                )
                 and assist is not None
                 and assist["seq"] != layout_state["assist_seen"]
             ):
                 layout_state["assist_seen"] = assist["seq"]
-                reason = start_assist(
-                    assist, now, pools[t], candidates_by_source, actions
-                )
+                attempts = []
+                selected_target = None
+                if multi and assist.get("final_length"):
+                    readings = {
+                        tid: co.ledger.routing_reading(pools[index_of[tid]])
+                        for tid in target_ids
+                        if co.lifecycle(tid) == "ACTIVE"
+                        and 0 <= now - pools[index_of[tid]].sampled_at <= cfg.max_age_s
+                        and co.ledger.channel_available(tid)
+                    }
+                    full = {
+                        tid: co.unified_fullness(v, "migrate")
+                        for tid, v in readings.items()
+                    }
+                    order = r.rank_migration_targets(
+                        list(readings),
+                        full,
+                        readings,
+                        getattr(co, "pool_sort_ids", {}),
+                    )
+                    source = alias_of.get(assist["source"], assist["source"])
+
+                    def start_target(
+                        tid,
+                        assist=assist,
+                        now=now,
+                        pools=pools,
+                        index_of=index_of,
+                        source=source,
+                        pairs=pairs,
+                        actions=actions,
+                    ):
+                        target_assist = dict(assist, target=instance_of.get(tid, tid))
+                        return start_assist(
+                            target_assist,
+                            now,
+                            pools[index_of[tid]],
+                            {source: pairs.get((source, tid), [])},
+                            actions,
+                        )
+
+                    reason, selected_target, attempts = try_ranked_assist_targets(
+                        order, start_target
+                    )
+                else:
+                    reason = start_assist(
+                        assist, now, pools[t], candidates_by_source, actions
+                    )
                 assist_started = reason is None
                 layout_state["assist_result"] = dict(
                     seq=assist["seq"],
                     request_id=assist["request_id"],
                     state="STARTED" if assist_started else "REFUSED",
                     reason=reason,
+                    target=selected_target,
+                    target_attempts=attempts,
                     unix_s=now,
                 )
                 audit.write(
@@ -2443,7 +2519,9 @@ def _run(args, prepared):
 
         export = write_request_results(
             args.run_dir / "pressure_request_results.json",
-            dispatched, jobs, origin_unix_s,
+            dispatched,
+            jobs,
+            origin_unix_s,
         )
         (args.run_dir / "pressure_result_export_receipt.json").write_text(
             json.dumps(export), encoding="utf-8"

@@ -91,9 +91,7 @@ class DecidedDriverTests(unittest.TestCase):
     def test_it_runs_plans_in_turn_and_frees_the_controller_between_them(self):
         driver, _ = self.run_driver(["COMPLETED", "COMPLETED"])
         self.propose(driver, ("A", "TP2"), ("A", "TP1"))
-        self.assertEqual(
-            [s["target_mode"] for _, s in self.begun], ["TP2", "TP1"]
-        )
+        self.assertEqual([s["target_mode"] for _, s in self.begun], ["TP2", "TP1"])
         self.assertEqual(
             [p for p, _ in self.begun], ["decided-0001-A", "decided-0002-A"]
         )
@@ -127,6 +125,14 @@ class DecidedDriverTests(unittest.TestCase):
         driver, cancels = self.ticking("DRAINING", remaining=120.0)
         driver.plan_tick()
         self.assertEqual(cancels, [True])
+
+    def test_six_committed_drain_does_not_cancel_on_changed_demand(self):
+        for remaining in (None, 120.0):
+            driver, cancels = self.ticking("DRAINING", remaining=remaining)
+            driver.decider.profile = "six_card"
+            driver.backend.status = lambda: self.fail("must not reconsider demand")
+            driver.plan_tick()
+            self.assertEqual(cancels, [])
 
     def test_it_finishes_a_drain_nearly_done(self):
         driver, cancels = self.ticking("DRAINING", remaining=30.0)

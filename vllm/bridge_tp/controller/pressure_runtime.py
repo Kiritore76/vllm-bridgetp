@@ -30,6 +30,18 @@ from .pressure_policy import (
 )
 
 
+def rank_migration_targets(names, fullness, readings, sort_ids):
+    """Shared normal/assist ordering: fullness, pending prompts, stable ID."""
+
+    def promised(target):
+        value = readings[target].unallocated_prompt_blocks
+        return value if type(value) is int and value > 0 else 0
+
+    return sorted(
+        names, key=lambda t: (fullness[t]["value"], promised(t), sort_ids.get(t, t))
+    )
+
+
 @dataclass(frozen=True)
 class BoundAction:
     request_id: str
@@ -946,8 +958,11 @@ class PressureCoordinator:
             before = self.ledger.live_snapshot()
             sort_ids = getattr(self, "pool_sort_ids", {})
             sources = sorted(
-                (i for i in readings
-                 if tp_of[i] == 1 and self.lifecycle(i) in {"ACTIVE", "QUIESCING"}),
+                (
+                    i
+                    for i in readings
+                    if tp_of[i] == 1 and self.lifecycle(i) in {"ACTIVE", "QUIESCING"}
+                ),
                 key=lambda i: sort_ids.get(i, i),
             )
             targets = sorted(
@@ -971,14 +986,7 @@ class PressureCoordinator:
             def by_fullness(names):
                 # Least full first (design 11-06 section 3); ties by prompt
                 # blocks promised to pending prefill, then the instance order.
-                def promised(t):
-                    value = adjusted[t].unallocated_prompt_blocks
-                    return value if type(value) is int and value > 0 else 0
-
-                return sorted(
-                    names,
-                    key=lambda t: (full[t]["value"], promised(t), sort_ids.get(t, t)),
-                )
+                return rank_migration_targets(names, full, adjusted, sort_ids)
 
             # KV is safety and ignores cooldowns; pressure respects them.
             kv_order = by_fullness(open_targets)
@@ -1180,9 +1188,7 @@ class PressureCoordinator:
                     self._sessions.pop(action.session_id, None)
                     self._session_source.pop(action.session_id, None)
                     policy = self.policy_for(s)
-                    policy._retry_after[action.request_id] = (
-                        now + policy.cfg.cooldown_s
-                    )
+                    policy._retry_after[action.request_id] = now + policy.cfg.cooldown_s
                 self.audit(
                     {
                         "kind": "pressure_start_refused",

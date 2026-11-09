@@ -32,10 +32,16 @@ class BackgroundScheduleTests(unittest.TestCase):
         probe.gc_events, probe.gc_dropped = deque(), 0
         records = []
         probe.journal = SimpleNamespace(submit=records.append)
-        with (patch("tools.bridge_tp.collector_resources.time.monotonic",
-                    side_effect=[10, 10.2]),
-              patch("tools.bridge_tp.collector_resources.time.thread_time",
-                    side_effect=[1, 1.01])):
+        with (
+            patch(
+                "tools.bridge_tp.collector_resources.time.monotonic",
+                side_effect=[10, 10.2],
+            ),
+            patch(
+                "tools.bridge_tp.collector_resources.time.thread_time",
+                side_effect=[1, 1.01],
+            ),
+        ):
             probe._gc_event("start", {"generation": 2})
             probe._gc_event("stop", {"generation": 2, "collected": 20})
         self.assertEqual(records, [])
@@ -46,8 +52,9 @@ class BackgroundScheduleTests(unittest.TestCase):
         self.assertEqual(probe.gc_started, {})
 
     def test_probe_unregisters_gc_callback_at_close(self):
-        probe = ResourceSampler(SimpleNamespace(submit=lambda row: None),
-                                diagnostics=True)
+        probe = ResourceSampler(
+            SimpleNamespace(submit=lambda row: None), diagnostics=True
+        )
         self.assertIn(probe.gc_observer, gc.callbacks)
         probe.close()
         self.assertNotIn(probe.gc_observer, gc.callbacks)
@@ -56,8 +63,9 @@ class BackgroundScheduleTests(unittest.TestCase):
         records = []
         mono, unix = time.monotonic(), time.time()
         jobs = [{"job_id": "x", "start_after_s": 0}]
-        results = execute_schedule(jobs, lambda job: job, None, mono, unix,
-                                   diagnostic_event=records.append)
+        results = execute_schedule(
+            jobs, lambda job: job, None, mono, unix, diagnostic_event=records.append
+        )
         self.assertEqual(results[0].scheduled_unix_s, unix)
         self.assertEqual(records[0]["job_id"], "x")
         self.assertGreaterEqual(records[0]["submit_wall_s"], 0)
@@ -173,6 +181,67 @@ class BackgroundScheduleTests(unittest.TestCase):
 
 
 class BufferedEvidenceTests(unittest.TestCase):
+    def test_lossless_writer_failure_is_reported_at_next_submission(self):
+        writer = journal.AsyncJournal(self.path, enqueue_timeout_s=1)
+        failure = OSError("disk unavailable")
+        writer.error = failure
+        try:
+            with self.assertRaisesRegex(RuntimeError, "writer failed") as caught:
+                writer.submit({"token": 1})
+            self.assertIs(caught.exception.__cause__, failure)
+        finally:
+            with self.assertRaisesRegex(RuntimeError, "evidence incomplete"):
+                writer.close()
+
+    def test_lossless_mode_waits_for_stalled_consumer_without_losing_tokens(self):
+        release = threading.Event()
+        entered = threading.Event()
+        original = journal.AsyncJournal._run
+
+        def delayed(writer):
+            entered.set()
+            release.wait(2)
+            original(writer)
+
+        with patch.object(journal.AsyncJournal, "_run", delayed):
+            writer = journal.AsyncJournal(self.path, capacity=1, enqueue_timeout_s=1)
+            self.assertTrue(entered.wait(1))
+            writer.submit({"token": 1})
+            timer = threading.Timer(0.05, release.set)
+            timer.start()
+            try:
+                self.assertTrue(writer.submit_batch([{"token": 2}, {"token": 3}]))
+            finally:
+                release.set()
+                timer.join()
+                writer.close()
+        rows = [json.loads(line) for line in self.path.read_text().splitlines()]
+        self.assertEqual([v["token"] for v in rows[:-1]], [1, 2, 3])
+        self.assertEqual(rows[-1]["dropped"], 0)
+        self.assertEqual(rows[-1]["backpressure_count"], 1)
+        self.assertGreater(rows[-1]["backpressure_s"], 0)
+
+    def test_lossless_timeout_fails_at_producer_and_at_close(self):
+        release = threading.Event()
+        original = journal.AsyncJournal._run
+
+        def delayed(writer):
+            release.wait(2)
+            original(writer)
+
+        with patch.object(journal.AsyncJournal, "_run", delayed):
+            writer = journal.AsyncJournal(self.path, capacity=1, enqueue_timeout_s=0.02)
+            writer.submit({"token": 1})
+            try:
+                with self.assertRaisesRegex(RuntimeError, "enqueue failed"):
+                    writer.submit({"token": 2})
+            finally:
+                release.set()
+                with self.assertRaisesRegex(RuntimeError, "evidence incomplete"):
+                    writer.close()
+        footer = json.loads(self.path.read_text().splitlines()[-1])
+        self.assertEqual(footer["dropped"], 1)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -281,8 +350,7 @@ class BackgroundDriverTests(unittest.TestCase):
         jobs[0]["start_after_event"] = "ANCHOR_FIRST_OUTPUT"
         args = self.args(jobs)
         loaded = self.driver.load_manifest(args.manifest)
-        self.assertEqual(loaded["jobs"][0]["start_after_event"],
-                         "ANCHOR_FIRST_OUTPUT")
+        self.assertEqual(loaded["jobs"][0]["start_after_event"], "ANCHOR_FIRST_OUTPUT")
 
     def test_m2_initial_rate_remains_source_only(self):
         jobs = self.jobs(1)
@@ -328,10 +396,10 @@ class BackgroundDriverTests(unittest.TestCase):
             self.assertGreaterEqual(row["dispatch_thread_cpu_s"], 0)
             self.assertGreaterEqual(row["since_previous_dispatch_cpu_s"], 0)
             self.assertGreaterEqual(row["since_previous_dispatch_wall_s"], 0)
-            self.assertLessEqual(row["dispatch_unix_s"],
-                                 row["worker_started_unix_s"])
-            self.assertLessEqual(row["worker_started_unix_s"],
-                                 row["http_call_started_unix_s"])
+            self.assertLessEqual(row["dispatch_unix_s"], row["worker_started_unix_s"])
+            self.assertLessEqual(
+                row["worker_started_unix_s"], row["http_call_started_unix_s"]
+            )
             self.assertGreaterEqual(row["due_to_dispatch_s"], 0)
             self.assertGreaterEqual(row["dispatch_to_worker_s"], 0)
         self.assertTrue(summary["native_evidence_integrity"]["complete"])

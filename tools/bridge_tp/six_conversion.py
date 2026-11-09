@@ -343,9 +343,13 @@ class SixBackend(SequenceBackend):
             modes == PATH[b] and after == PATH[a] for b, a, _, _ in EDGES.values()
         ):
             raise ValueError("not an adjacent canonical six-card conversion")
-        if step.get("method", "DRAIN") != "DRAIN" or step.get("evacuate"):
+        if (
+            step.get("method", "DRAIN") not in {"DRAIN", "SELECTIVE_ROLL"}
+            or step.get("evacuate")
+            or (step.get("method") == "SELECTIVE_ROLL" and step["target_mode"] != "TP2")
+        ):
             raise ValueError(
-                "six-card conversions use natural drain and normal TP1 migration"
+                "six-card conversions support drain or TP1-to-TP2 assistance only"
             )
         self.reset_step(plan_id)
         self.join = None
@@ -353,6 +357,54 @@ class SixBackend(SequenceBackend):
         self.gate_mode = "UNIFIED"
         self.ops.event("STEP_BEGIN", before=modes, after=after)
         self.write_layout({}, tilt=[])
+
+    def assist_choice(self, plan, status):
+        """Optional TP1-to-TP2 help; refusal never gates natural drainage."""
+        if not self.fresh(status):
+            return "status stale", None
+        result = status.get("assist_result")
+        if self.assist_seq > self.assist_step_start_seq:
+            if result is None or result["seq"] != self.assist_seq:
+                return "previous assist not answered yet", None
+            if (
+                result["state"] == "STARTED"
+                and result["request_id"] not in self.assisted
+            ):
+                self.assisted.append(result["request_id"])
+        instances = status["instances"]
+        refs = [r.instance_id for r in self.refs(plan)]
+        if any(instances[i].get("tp_degree") != 1 for i in refs):
+            return "assist only supports TP1 sources", None
+        targets = [
+            i
+            for i, row in instances.items()
+            if i not in refs
+            and row.get("tp_degree") == 2
+            and row.get("lifecycle") == "ACTIVE"
+        ]
+        if not targets:
+            return "no active retained TP2 target", None
+        if any(v.get("sessions") for v in instances.values()):
+            return "migration session in progress", None
+        states = list((status.get("assist_sessions") or {}).values())
+        committed = max(
+            0,
+            sum(s in {"COMMITTED", "ACCOUNTED", "COMPLETED"} for s in states)
+            - self.assist_committed_baseline,
+        )
+        if (
+            committed >= self.safety["assist_max_committed"]
+            or len(self.assisted) >= self.safety["assist_max_attempts"]
+        ):
+            return "assist budget reached; natural drain continues", None
+        if status.get("release_budget_s") is None:
+            return "no measured transfer budget", None
+        candidates, _ = self.long_requests(plan, status)
+        candidates = [c for c in candidates if c["request_id"] not in self.assisted]
+        if not candidates:
+            return "no startable long remaining request", None
+        # The controller ranks all live target-specific candidates at START.
+        return None, dict(candidates[0], final_length=True)
 
     def replacement_specs(self, plan):
         if self._specs is not None:

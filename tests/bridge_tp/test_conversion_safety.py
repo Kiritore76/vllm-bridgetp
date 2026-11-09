@@ -183,6 +183,20 @@ class ValveRemainingTests(Base):
         self.shadow(150.0)
         self.assertTrue(self.backend.kv_emergency(PLAN))
         self.assertEqual(self.decisions("VALVE_ABORT")[-1]["remaining_s"], 150.0)
+        evidence = self.decisions("VALVE_ABORT")[-1]["remaining_evidence"]
+        self.assertEqual(evidence["reason"], "supported")
+        self.assertEqual(evidence["continue_limit_s"], 60.0)
+        event = next(e for e in self.harness.events if e["kind"] == "SAFETY_ABORT")
+        self.assertEqual(event["remaining_s"], 150.0)
+
+    def test_missing_request_identity_is_preserved_in_abort_evidence(self):
+        self.trip()
+        self.shadow(None, status="UNKNOWN")
+        self.backend.last_shadow["drain_only"]["missing_inputs"] = ["queued-long"]
+        self.assertTrue(self.backend.kv_emergency(PLAN))
+        evidence = self.decisions("VALVE_ABORT")[-1]["remaining_evidence"]
+        self.assertEqual(evidence["reason"], "drain_estimate_unsupported")
+        self.assertEqual(evidence["missing_inputs"], ["queued-long"])
 
     def test_no_usable_estimate_cancels_as_before(self):
         for kwargs in (

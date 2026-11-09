@@ -215,6 +215,23 @@ class DriverTests(Base):
 
 
 class PreparationTests(unittest.TestCase):
+    def test_forecast_prepares_before_confirmation_without_proposing(self):
+        from tests.bridge_tp.test_six_card_decider import signal
+
+        decider = d.ConversionDecider(profile="six_card", execute=True)
+        s = signal("L1AC", short=2, blocks=9000, trend=11000)
+        s.update(kv_room=dict.fromkeys("ABC", True), quiet=dict.fromkeys("ABC", False))
+        decider.signals = lambda *args: s
+        modes = dict(A=1, B=2, C=1)
+        record = decider.observe({}, modes, {}, 1000)
+        self.assertEqual(record["tilt"], ["A"])
+        self.assertEqual(record["preparation"]["phase"], "PREPARING")
+        self.assertIsNone(record["proposal"])
+        s["trend_blocks"] = 5000
+        record = decider.observe({}, modes, {}, 1001)
+        self.assertEqual(record["tilt"], [])
+        self.assertIsNone(record["prepared"])
+
     def test_six_preparation_reads_route_evidence_instead_of_spare(self):
         value, modes, members = native_status("L1AC", short=14, blocks=13000)
         decider = d.ConversionDecider(profile="six_card")
@@ -226,12 +243,18 @@ class PreparationTests(unittest.TestCase):
         signals = decider.signals(value, modes, members, 10)
         self.assertTrue(all(signals["quiet"].values()))
 
-    def test_waiting_for_long_drain_cannot_bypass_route_evidence(self):
+    def test_preparation_can_start_while_busy_but_needs_capacity(self):
         decider = d.ConversionDecider(profile="six_card")
         signals = dict(
             kv_room=dict(A=True, B=True, C=True), quiet=dict(A=False, B=True, C=True)
         )
         decider.update_prepared(
             ("B->TP1", ("B", "TP1"), True), signals, dict(A=1, B=2, C=1), 10
+        )
+        self.assertIsNotNone(decider.prepared)
+        decider.prepared = None
+        signals["kv_room"]["A"] = False
+        decider.update_prepared(
+            ("B->TP1", ("B", "TP1"), True), signals, dict(A=1, B=2, C=1), 11
         )
         self.assertIsNone(decider.prepared)

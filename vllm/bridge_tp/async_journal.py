@@ -11,7 +11,15 @@ import time
 class AsyncJournal:
     """Drain immutable event records and expose losses instead of hiding them."""
 
-    def __init__(self, path, capacity=65536, batch_size=512, flush_interval_s=0.05):
+    def __init__(
+        self,
+        path,
+        capacity=65536,
+        batch_size=512,
+        flush_interval_s=0.05,
+        *,
+        enqueue_timeout_s=0,
+    ):
         if capacity < 1 or batch_size < 1 or flush_interval_s <= 0:
             raise ValueError("invalid journal buffering parameters")
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -23,19 +31,53 @@ class AsyncJournal:
         self.batch_size = batch_size
         self.flush_interval_s = flush_interval_s
         self.closed = False
+        if enqueue_timeout_s < 0:
+            raise ValueError("invalid journal enqueue timeout")
+        self.enqueue_timeout_s = enqueue_timeout_s
+        self.backpressure_count = 0
+        self.backpressure_s = 0.0
         self.handle = path.open("x", encoding="utf-8", buffering=65536)
         self.worker = threading.Thread(target=self._run, daemon=True)
         self.worker.start()
 
     def submit(self, value):
-        """Return False on overflow; the footer makes evidence loss auditable."""
+        """Enqueue, optionally applying bounded backpressure instead of dropping.
+
+        A positive timeout fails immediately on writer error and raises if the
+        consumer cannot make room in time. Default diagnostic users retain the
+        nonblocking policy. Producers must finish before close is called.
+        """
         if self.closed:
             raise RuntimeError("evidence journal is closed")
+        return self._enqueue(value, 1)
+
+    def _enqueue(self, value, count):
+        if self.enqueue_timeout_s and self.error is not None:
+            raise RuntimeError("evidence writer failed") from self.error
         try:
             self.queue.put_nowait(value)
             return True
         except queue.Full:
-            self.dropped += 1
+            if self.enqueue_timeout_s:
+                started = time.monotonic()
+                self.backpressure_count += 1
+                try:
+                    while self.error is None and self.worker.is_alive():
+                        remaining = self.enqueue_timeout_s - (
+                            time.monotonic() - started
+                        )
+                        if remaining <= 0:
+                            break
+                        try:
+                            self.queue.put(value, timeout=min(0.05, remaining))
+                            return True
+                        except queue.Full:
+                            continue
+                    self.dropped += count
+                    raise RuntimeError("evidence enqueue failed") from self.error
+                finally:
+                    self.backpressure_s += time.monotonic() - started
+            self.dropped += count
             return False
 
     def submit_batch(self, records):
@@ -44,12 +86,7 @@ class AsyncJournal:
             raise RuntimeError("evidence journal is closed")
         if not 1 <= len(records) <= 64:
             raise ValueError("journal batches must contain 1..64 records")
-        try:
-            self.queue.put_nowait(("records", tuple(records)))
-            return True
-        except queue.Full:
-            self.dropped += len(records)
-            return False
+        return self._enqueue(("records", tuple(records)), len(records))
 
     def _run(self):
         last_flush = time.monotonic()
@@ -81,15 +118,13 @@ class AsyncJournal:
             try:
                 if records and self.error is None:
                     payload = "".join(
-                        json.dumps(record, allow_nan=False) + "\n"
-                        for record in records
+                        json.dumps(record, allow_nan=False) + "\n" for record in records
                     )
                     self.handle.write(payload)
                     self.saved += len(records)
                     self.write_batches += 1
                 if self.error is None and (
-                    stopping
-                    or time.monotonic() - last_flush >= self.flush_interval_s
+                    stopping or time.monotonic() - last_flush >= self.flush_interval_s
                 ):
                     self.handle.flush()
                     last_flush = time.monotonic()
@@ -121,6 +156,9 @@ class AsyncJournal:
                         "write_batches": self.write_batches,
                         "queue_capacity": self.queue.maxsize,
                         "flush_interval_s": self.flush_interval_s,
+                        "enqueue_timeout_s": self.enqueue_timeout_s,
+                        "backpressure_count": self.backpressure_count,
+                        "backpressure_s": self.backpressure_s,
                     }
                 )
                 + "\n"
