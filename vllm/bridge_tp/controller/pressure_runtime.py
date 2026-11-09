@@ -43,6 +43,33 @@ def rank_migration_targets(names, fullness, readings, sort_ids):
     )
 
 
+def excluded_migration_targets(readings, cfg, now):
+    """Targets that no longer accept new normal or assist moves.
+
+    ``readings`` are the ledger-adjusted readings. The capacity ratio is the
+    valve's own metric (``classify(...).capacity``); a target at or above 1.0,
+    or one whose capacity is unmeasured, is excluded. This only steers new
+    admissions: a migration that already started keeps committing and
+    releasing its source. Returns ``(excluded, capacities)`` so callers can
+    both filter and record the refusal reason per target.
+    """
+    capacities = {t: classify(r, cfg, now).capacity for t, r in readings.items()}
+    excluded = [
+        dict(
+            target=t,
+            capacity=capacities[t],
+            reason=(
+                "capacity ratio >= 1.0"
+                if capacities[t] is not None
+                else "capacity evidence missing"
+            ),
+        )
+        for t in readings
+        if capacities[t] is None or capacities[t] >= 1.0
+    ]
+    return excluded, capacities
+
+
 @dataclass(frozen=True)
 class BoundAction:
     request_id: str
@@ -1014,9 +1041,21 @@ class PressureCoordinator:
                 i: 0 <= now - r.sampled_at <= self.policy.cfg.max_age_s
                 for i, r in readings.items()
             }
+            # A target whose capacity ratio (the valve's own metric) has hit
+            # or passed 1.0, or is unmeasured, no longer accepts new moves.
+            # Pressure only steers new admissions here; it never cancels a
+            # migration that already started. Excluded targets are recorded.
+            excluded_targets, target_capacity = excluded_migration_targets(
+                {t: adjusted[t] for t in targets}, self.policy.cfg, now
+            )
             evaluations = []
             open_targets = [
-                t for t in targets if fresh[t] and self.ledger.channel_available(t)
+                t
+                for t in targets
+                if fresh[t]
+                and self.ledger.channel_available(t)
+                and target_capacity[t] is not None
+                and target_capacity[t] < 1.0
             ]
 
             def by_fullness(names):
@@ -1167,6 +1206,7 @@ class PressureCoordinator:
                 "readings": {i: asdict(r) for i, r in adjusted.items()},
                 "smoothed_itl": self.itl.snapshot(),
                 "evaluations": evaluations,
+                "excluded_targets": excluded_targets,
                 "chosen": [
                     chosen["source"],
                     chosen["target"],

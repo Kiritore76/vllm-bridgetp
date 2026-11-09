@@ -629,6 +629,41 @@ class MigrationTests(unittest.TestCase):
         self.tick(co, 12.0, source, inst("b"), source_candidates(8192), started)
         self.assertEqual(started.calls, ["q0"])
 
+    def test_a_pressured_target_is_excluded_and_recorded(self):
+        co, records = coordinator()
+        started = Started()
+        source = inst("a1", total=2325, free=150, requests=3)
+        rows = source_candidates(16384, 4096)
+        # free 100 -> (125 + 8*1)/100 = 1.33, the valve's own ratio.
+        self.tick(co, 10.0, source, inst("b", free=100), rows, started)
+        self.assertEqual(started.calls, [])
+        decision = next(x for x in records if x["kind"] == "pressure_decision_unified")
+        self.assertEqual(len(decision["excluded_targets"]), 1)
+        self.assertEqual(decision["excluded_targets"][0]["target"], "b")
+        self.assertEqual(
+            decision["excluded_targets"][0]["reason"], "capacity ratio >= 1.0"
+        )
+        self.assertGreaterEqual(decision["excluded_targets"][0]["capacity"], 1.0)
+
+
+class ExclusionTests(unittest.TestCase):
+    def test_capacity_ratio_excludes_at_or_above_one_and_missing(self):
+        co, _ = coordinator()
+        readings = {
+            "ok": inst("ok", free=10000),
+            "busy": inst("busy", free=100),
+            "missing": inst("missing", free=None),
+        }
+        excluded, capacities = r.excluded_migration_targets(
+            readings, co.policy.cfg, 10.0
+        )
+        self.assertEqual([e["target"] for e in excluded], ["busy", "missing"])
+        self.assertEqual(excluded[0]["reason"], "capacity ratio >= 1.0")
+        self.assertEqual(excluded[1]["reason"], "capacity evidence missing")
+        self.assertLess(capacities["ok"], 1.0)
+        self.assertGreaterEqual(capacities["busy"], 1.0)
+        self.assertIsNone(capacities["missing"])
+
 
 if __name__ == "__main__":
     unittest.main()

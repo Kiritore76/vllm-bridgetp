@@ -2101,6 +2101,7 @@ def _run(args, prepared):
             )
             assist = layout_state["assist"]
             assist_started = False
+            assist_excluded = []
             if (
                 (
                     t is not None
@@ -2124,6 +2125,15 @@ def _run(args, prepared):
                         if co.lifecycle(tid) == "ACTIVE"
                         and 0 <= now - pools[index_of[tid]].sampled_at <= cfg.max_age_s
                         and co.ledger.channel_available(tid)
+                    }
+                    assist_excluded, assist_capacity = r.excluded_migration_targets(
+                        readings, co.policy.cfg, now
+                    )
+                    readings = {
+                        tid: reading
+                        for tid, reading in readings.items()
+                        if assist_capacity[tid] is not None
+                        and assist_capacity[tid] < 1.0
                     }
                     full = {
                         tid: co.unified_fullness(v, "migrate")
@@ -2171,6 +2181,7 @@ def _run(args, prepared):
                     reason=reason,
                     target=selected_target,
                     target_attempts=attempts,
+                    excluded_targets=assist_excluded,
                     unix_s=now,
                 )
                 audit.write(

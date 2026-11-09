@@ -171,6 +171,28 @@ class ScoreTests(unittest.TestCase):
         self.assertEqual(score["output_10s_bins"], 30)
         self.assertEqual(score["load_coverage"], "COVERED")
 
+    def test_fractional_weights_keep_the_pool_and_request_sums_equal(self):
+        # The 11-09 unlimited field (31k requests) drifted 7.031e-6 between the
+        # per-pool and per-request sums on a naive sum and aborted a complete
+        # batch. Stable summation keeps the two equal.
+        rows = []
+        for index in range(200):
+            # 99 fast intervals and one 1.05s seam: weight 1/1.05, not 1.
+            times = [101 + i * 0.01 for i in range(100)]
+            times.append(times[-1] + 1.05)
+            row = self.row(times)
+            row["job_id"] = f"r{index}"
+            rows.append(row)
+        score = s.score(rows, self.config)
+        self.assertAlmostEqual(
+            sum(score["actual_pool_G"].values()),
+            score["goodoutput_tokens_s"],
+        )
+        self.assertAlmostEqual(
+            score["good_tokens"],
+            sum(score["actual_pool_G"].values()) * score["horizon_s"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

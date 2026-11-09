@@ -53,7 +53,8 @@ export TMPDIR="$task_tmp" TEMP="$task_tmp" TMP="$task_tmp"
     tests.bridge_tp.test_six_card_decider tests.bridge_tp.test_conversion_decider \
     tests.bridge_tp.test_conversion_sequence tests.bridge_tp.test_conversion_safety \
     tests.bridge_tp.test_conversion_planner tests.bridge_tp.test_unified_scheduler \
-    tests.bridge_tp.test_pressure_conversion tests.bridge_tp.test_runtime_instance_ids \
+    tests.bridge_tp.test_pressure_conversion tests.bridge_tp.test_pressure_sustained \
+    tests.bridge_tp.test_runtime_instance_ids \
     tests.bridge_tp.test_migration_plan tests.bridge_tp.test_qwen3_six_card \
     tests.bridge_tp.test_pressure_launcher \
     tests.bridge_tp.test_source_channels tests.bridge_tp.test_channel_runtime \

@@ -258,3 +258,54 @@ class PreparationTests(unittest.TestCase):
             ("B->TP1", ("B", "TP1"), True), signals, dict(A=1, B=2, C=1), 11
         )
         self.assertIsNone(decider.prepared)
+
+
+class SixValveTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.backend.gate_mode = "UNIFIED"
+
+    def test_sustained_hard_pressure_never_cancels_a_six_card_conversion(self):
+        for _ in range(4):
+            self.write(status(target_capacity=1.1))
+            self.assertFalse(self.backend.kv_emergency(PLAN))
+            self.now[0] += 2
+        # The warning is recorded once; neither a continuation nor an abort
+        # decision follows for the six-card gate.
+        self.assertEqual(len(self.decisions("VALVE_WARNING")), 1)
+        self.assertFalse(self.decisions("VALVE_ABORT"))
+        self.assertFalse(self.decisions("VALVE_CONTINUE"))
+
+
+class SplitGateTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.backend.gate_mode = "UNIFIED"
+        self.split_plan = dict(PLAN, target_bundle_mode="TP1")
+
+    def publish(self, full=0.95, capacity=0.1):
+        value = status(target_capacity=capacity)
+        value["instances"]["B-g2-tp2"]["unified_fullness"] = snapshot(
+            self.now[0], full
+        )
+        self.write(value)
+
+    def test_split_skips_the_route_fullness_item(self):
+        self.publish(full=0.95)
+        self.assertTrue(self.backend.gate(self.split_plan))
+        self.assertTrue(self.decisions("GATE")[-1]["split"])
+
+    def test_split_still_requires_hard_capacity(self):
+        self.publish(full=0.5, capacity=1.0)
+        self.assertFalse(self.backend.gate(self.split_plan))
+        self.assertIn("hard", self.decisions("GATE")[-1]["reason"])
+
+    def test_split_still_requires_matching_identities(self):
+        value = status()
+        value["instances"]["B-g2-tp2"]["unified_fullness"] = snapshot(
+            self.now[0], 0.5
+        )
+        del value["instances"]["B-g2-tp2"]
+        self.write(value)
+        self.assertFalse(self.backend.gate(self.split_plan))
+        self.assertIn("mismatch", self.decisions("GATE")[-1]["reason"])

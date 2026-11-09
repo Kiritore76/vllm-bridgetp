@@ -102,7 +102,7 @@ def score(rows, config):
     if origin is None:
         origin = min(r["source_transport"]["request_started_unix_s"] for r in rows)
     records, bins, active = [], set(), []
-    pools = dict(tp1=0.0, tp4=0.0)
+    pool_weights = dict(tp1=[], tp4=[])
     for row in rows:
         emitted = row["response"]["emitted"]
         if not valid_output(row, row["request"], config.get("natural_eos", False)):
@@ -134,7 +134,7 @@ def score(rows, config):
                 else row["initial_pool"]
             )
             # Layout instances beyond the fixed pair get their own entry.
-            pools[pool] = pools.get(pool, 0.0) + weight
+            pool_weights.setdefault(pool, []).append(weight)
         active.append((max(origin, start), min(origin + horizon, times[-1])))
         records.append(
             dict(
@@ -166,8 +166,11 @@ def score(rows, config):
     for a, b in sorted(active):
         busy += max(0, b - max(a, end))
         end = max(end, b)
+    # Stable per-pool totals: the same weight multiset summed in a fixed
+    # floating order avoids the ~7e-6 drift seen at 31k requests (11-09).
+    pools = {p: math.fsum(weights) for p, weights in pool_weights.items()}
     raw = sum(r["window_tokens"] for r in records)
-    good = sum(r["good_tokens"] for r in records)
+    good = math.fsum(r["good_tokens"] for r in records)
     cohort = [r for r in records if r["in_arrival_cohort"]]
 
     def attainment(group):
@@ -194,7 +197,11 @@ def score(rows, config):
         },
         excluded_late_requests=len(records) - len(cohort),
     )
-    if abs(sum(pools.values()) - good) > 1e-6:
+    # Real accounting check: both sides count the same weight multiset, so only
+    # floating rounding may differ; a missing or double token is far larger.
+    if not math.isclose(
+        math.fsum(pools.values()), good, rel_tol=1e-9, abs_tol=1e-9
+    ):
         raise ValueError("pool goodoutput accounting mismatch")
     return dict(
         metric=config["metric"],

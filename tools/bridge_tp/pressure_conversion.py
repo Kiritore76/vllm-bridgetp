@@ -350,7 +350,13 @@ class ControllerConversionBackend:
         return opened
 
     def unified_gate(self, plan):
-        """Six-card gate; tilt and waiting never waive fresh route fullness."""
+        """Six-card gate; tilt and waiting never waive fresh route fullness.
+
+        Splits (``target_bundle_mode == "TP1"``) skip only the retained route
+        fullness (<0.9) item: they still require fresh, matching retained
+        identities and hard KV capacity, but are not held behind service
+        congestion on the retained side (user 11-09).
+        """
         now = self.clock()
         if self.gate_since is None:
             self.gate_since = now
@@ -358,6 +364,7 @@ class ControllerConversionBackend:
         status = self.status()
         retained = {}
         reason = None
+        split = plan.get("target_bundle_mode") == "TP1"
         if not self.fresh(status):
             reason = "status stale"
         else:
@@ -375,7 +382,7 @@ class ControllerConversionBackend:
                 for v in retained.values()
             ):
                 reason = "retained KV headroom (hard)"
-            elif not all(
+            elif not split and not all(
                 load("unified_scheduler").route_gate_ready(
                     v.get("unified_fullness"), now
                 )
@@ -389,6 +396,7 @@ class ControllerConversionBackend:
             waited_s=waited,
             relaxed=False,
             mode="UNIFIED",
+            split=split,
             reason=reason,
             retained={i: v.get("unified_fullness") for i, v in retained.items()},
         )
@@ -485,6 +493,11 @@ class ControllerConversionBackend:
         or a conversion under load would cancel and retry forever. When the
         conservative remaining time is short the conversion finishes instead:
         cancelling then would throw away the drain for a few seconds' relief.
+
+        Six-card (UNIFIED gate) is observation-only: a sustained hard-capacity
+        crossing is recorded but never cancels the conversion, and the 60s
+        continuation line never decides. Pressure only steers new admissions
+        there (see the controller's capacity-ratio target exclusion).
         """
         if self.gate_mode == "NONE":
             return False
@@ -504,6 +517,11 @@ class ControllerConversionBackend:
         if self.valve_since is None:
             self.valve_since = now
             self.decision("VALVE_WARNING", instances=unsafe)
+        # Six-card: pressure never cancels a conversion. The capacity ratio,
+        # slots and speed keep being recorded in the status/audit; the 60s
+        # continuation line below is only reached by the four-card gate modes.
+        if self.gate_mode == "UNIFIED":
+            return False
         if now - self.valve_since < self.safety["valve_sustain_s"]:
             return False
         remaining = self.remaining_s()
