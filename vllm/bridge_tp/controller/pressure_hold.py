@@ -215,9 +215,7 @@ class HoldQueue:
         if self.short:
             job = self.short[0][0]
             allowed = [
-                p
-                for p in room
-                if not self._fresh(p, wall) or self._prompt_fits(p, job)
+                p for p in room if not self._fresh(p, wall) or self._prompt_fits(p, job)
             ]
             if allowed:
                 return self._release(self.short, now, allowed)
@@ -226,3 +224,12 @@ class HoldQueue:
     def sent(self, job, value):
         self.unstarted.setdefault(value.pool_id, []).append(value)
         self.running.append(value)
+
+    def retry(self, job, released_at):
+        """Restore a final-admission refusal without inventing a new arrival."""
+        if not self.unified:
+            raise ValueError("capacity retry is for unified hold only")
+        job = dict(job)
+        arrived = released_at - job.pop("held_s")
+        index = bisect.bisect_right([at for _, at in self.short], arrived)
+        self.short.insert(index, (job, arrived))

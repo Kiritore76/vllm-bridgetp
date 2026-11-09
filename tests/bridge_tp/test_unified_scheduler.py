@@ -191,6 +191,73 @@ class FullnessTests(unittest.TestCase):
 
 
 class AdmissionTests(unittest.TestCase):
+    def test_growth_guard_prefers_alternative_before_two_short_prompts_fill_C4(self):
+        co, records = coordinator()
+        # Observed C4 room98 then66, C5 room488; fullness slightly favors C4.
+        co.unified_fullness = lambda reading, *args, **kwargs: dict(
+            value=0.918 if reading.pool_id == "b" else 0.942
+        )
+        readings = [
+            inst("b", total=2325, free=223, growth_blocks_s=4.6),
+            inst("c", total=2325, free=613, growth_blocks_s=4.6),
+        ]
+        self.assertEqual(
+            co.admission_multi("one", 512, 128, readings, TP, 10, "one").pool_id, "b"
+        )
+        self.assertEqual(
+            co.admission_multi("two", 512, 128, readings, TP, 10, "two").pool_id, "c"
+        )
+        rows = records[-1]["unified_rows"]
+        self.assertTrue(rows[0]["fits"])
+        self.assertFalse(rows[0]["growth_guard_fits"])
+        self.assertTrue(rows[1]["growth_guard_fits"])
+
+    def test_growth_preference_is_not_an_additional_all_pool_gate(self):
+        co, _ = coordinator()
+        result = co.admission_multi(
+            "one", 512, 128, [inst("b", free=180, growth_blocks_s=4.6)], TP, 10, "one"
+        )
+        self.assertEqual(result.pool_id, "b")
+
+    def test_assist_reservation_blocks_no_fit_fallback_until_room_recovers(self):
+        co, records = coordinator()
+        target = inst("b", free=2455)
+        co.ledger.reserve(
+            p.Reservation("assist", "moving", "b", 1536, 0, 0, "migration"), target
+        )
+        with self.assertRaises(p.AdmissionDeferred) as caught:
+            co.admission_multi("long", 16384, 8192, [target], TP, 10, "ingress")
+        self.assertEqual(caught.exception.diagnostics["b"]["room_blocks"], 794)
+        self.assertNotIn("ingress", co.ledger.entries)
+        self.assertNotIn("long", co._owners)
+        self.assertEqual(records, [])
+        # A commit and partial native allocation do not discard remaining growth.
+        co.ledger.settle("assist", "COMMITTED", evidence=True)
+        co.ledger.observe("assist", allocated_blocks=1024, service_observed=True)
+        self.assertEqual(co.ledger.pending("b")[0], 512)
+        reduced = dataclasses.replace(target, free_blocks=1431)
+        with self.assertRaises(p.AdmissionDeferred):
+            co.admission_multi("long", 16384, 8192, [reduced], TP, 10, "ingress")
+        # Different available target remains eligible; no all-pool blocking gate.
+        result = co.admission_multi(
+            "long", 16384, 8192, [reduced, inst("c")], TP, 10, "ingress"
+        )
+        self.assertEqual(result.pool_id, "c")
+
+    def test_short_fallback_is_unchanged_during_assist(self):
+        co, _ = coordinator()
+        result = co.admission_multi(
+            "short", 512, 128, [inst("b", free=125)], TP, 10, "ingress"
+        )
+        self.assertEqual(result.pool_id, "b")
+
+    def test_stale_only_long_fallback_keeps_the_existing_bounded_wait_contract(self):
+        co, _ = coordinator()
+        result = co.admission_multi(
+            "stale", 16384, 8192, [inst("b", free=125)], TP, 100, "ingress"
+        )
+        self.assertEqual(result.pool_id, "b")
+
     def test_a_long_prompt_goes_where_kv_is_free_not_where_requests_are_few(self):
         # Long-capacity L3:32 at 704s: C at 79% got the long request.
         co, records = coordinator(slots=dict(b=32, c=32))

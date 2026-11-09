@@ -315,6 +315,63 @@ class HoldQueueTests(unittest.TestCase):
 
 
 class DispatchTests(unittest.TestCase):
+    def test_final_capacity_refusal_returns_to_hold_without_losing_arrival(self):
+        from tests.bridge_tp.test_pressure_policy import p
+        from tests.bridge_tp.test_unified_scheduler import TP, coordinator, inst
+
+        co, _ = coordinator()
+        target = inst("b", free=2455, sampled_at=time.time())
+        co.ledger.reserve(
+            p.Reservation("assist", "moving", "b", 1536, 0, 0, "migration"), target
+        )
+        refused = threading.Event()
+        queue = h.HoldQueue(8, 120, 4096, 2, lambda _: True, unified_guard_blocks=125)
+        queue.poll_s = 0.005
+
+        def submit(job, pools):
+            try:
+                value = co.admission_multi(
+                    job["id"],
+                    len(job["request"]["prompt"]),
+                    job["request"]["max_tokens"],
+                    pools,
+                    TP,
+                    time.time(),
+                    job["id"],
+                )
+            except p.AdmissionDeferred:
+                refused.set()
+                raise
+            stream_value = stream(value.pool_id, tokens=1, prompt=16384)
+            return stream_value
+
+        job = hold_job("long", prompt=16384, output=8192)
+        dispatcher = d.ScheduledDispatch(
+            [job, hold_job("short", prompt=512)],
+            submit,
+            [target],
+            time.monotonic() - 0.1,
+            3,
+            hold=queue,
+        )
+        dispatcher.start()
+        try:
+            self.assertTrue(refused.wait(1))
+            self.assertIsNone(dispatcher.error)
+            deadline = time.monotonic() + 1
+            while "short" not in dispatcher.snapshot() and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertEqual(set(dispatcher.snapshot()), {"short"})
+            self.assertEqual(len(queue.arrived_at), 2)
+            dispatcher.publish([inst("b", free=6000, sampled_at=time.time())])
+            dispatcher.thread.join(1)
+            self.assertFalse(dispatcher.thread.is_alive())
+            self.assertEqual(set(dispatcher.snapshot()), {"long", "short"})
+            self.assertIsNone(dispatcher.error)
+            self.assertEqual(len(queue.arrived_at), 2)
+        finally:
+            dispatcher.close()
+
     def test_blocked_control_does_not_delay_arrivals(self):
         sent = threading.Event()
         rows, calls = [], []

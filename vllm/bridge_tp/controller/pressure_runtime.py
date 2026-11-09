@@ -18,6 +18,7 @@ from . import unified_scheduler as unified
 from .bounded_length import from_advisory
 from .pressure_policy import (
     Admission,
+    AdmissionDeferred,
     Candidate,
     PoolReading,
     PressureConfig,
@@ -460,6 +461,22 @@ class PressureCoordinator:
                 else None
             )
             room = unified.prompt_room(reading, self.ledger.pending(raw.pool_id)[0])
+            growth = reading.growth_blocks_s
+            growth_fits = None
+            if (
+                room is not None
+                and prompt_blocks is not None
+                and 0 <= now - raw.sampled_at <= self.policy.cfg.max_age_s
+                and growth is not None
+                and math.isfinite(growth)
+                and growth >= 0
+                and self.policy.cfg.capacity_lookahead_s > 0
+            ):
+                forecast = math.ceil(
+                    growth
+                    * (self.policy.cfg.capacity_lookahead_s + now - raw.sampled_at)
+                )
+                growth_fits = room >= prompt_blocks + forecast
             rows.append(
                 dict(
                     pool_id=raw.pool_id,
@@ -470,6 +487,10 @@ class PressureCoordinator:
                     and prompt_blocks is not None
                     and room >= prompt_blocks,
                     room_blocks=room,
+                    growth_guard_fits=growth_fits,
+                    capacity_fresh=0
+                    <= now - raw.sampled_at
+                    <= self.policy.cfg.max_age_s,
                     waiting=reading.waiting,
                     fullness=self.unified_fullness(
                         reading,
@@ -486,8 +507,23 @@ class PressureCoordinator:
         # The hold queue sends a request only where its prompt fits; without
         # one (fixed routes, stale evidence) the least full feasible one gets it.
         fitting = [r for r in feasible if r["fits"]]
+        # Hold's cached readings may predate a migration reservation. Recheck
+        # under the coordinator lock before tracking ingress or sending HTTP.
+        # Small/stale-only fallback semantics remain unchanged.
+        if (
+            not fitting
+            and all(prompt_tokens > 64 * r.block_size for r in readings)
+            and any(
+                r["room_blocks"] is not None and r["capacity_fresh"] for r in feasible
+            )
+        ):
+            raise AdmissionDeferred({r["pool_id"]: r for r in feasible})
+        # Align routing with the conversion valve's existing growth horizon.
+        # This is a preference among fitting targets, never a new conversion
+        # gate: when none has forecast headroom, retain the existing fit path.
+        protected = [r for r in fitting if r["growth_guard_fits"] is True]
         chosen = unified.rank_admission(
-            fitting or feasible, getattr(self, "pool_sort_ids", None)
+            protected or fitting or feasible, getattr(self, "pool_sort_ids", None)
         )[0]
         before, known = self.ledger.live_snapshot(), self.ledger.mark()
         self.ledger.track_ingress(key, request_id, chosen["pool_id"], prompt_tokens)

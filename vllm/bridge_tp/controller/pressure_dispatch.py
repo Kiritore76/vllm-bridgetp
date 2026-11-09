@@ -4,6 +4,8 @@
 import threading
 import time
 
+from .pressure_policy import AdmissionDeferred
+
 
 class ScheduledDispatch:
     """One arrival producer; publish only completed submissions to readers.
@@ -90,12 +92,23 @@ class ScheduledDispatch:
                     hold.add(job, due)
             with self.lock:
                 pools = self.pools
+            deferred = []
             while not self.stop.is_set():
-                released = hold.next(pools, time.monotonic(), time.time())
+                released_at = time.monotonic()
+                released = hold.next(pools, released_at, time.time())
                 if released is None:
                     break
                 job, allowed = released
-                hold.sent(job, self._send(job, allowed))
+                try:
+                    value = self._send(job, allowed)
+                except AdmissionDeferred:
+                    # Do not let one stale-fit long request starve later shorts.
+                    # Restore after this scan so it is retried only next poll.
+                    deferred.append((job, released_at))
+                    continue
+                hold.sent(job, value)
+            for job, released_at in deferred:
+                hold.retry(job, released_at)
             if index == len(self.jobs) and not hold.waiting():
                 return
             wait = hold.poll_s

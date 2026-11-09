@@ -115,9 +115,10 @@ class PressureConfig:
             and self.overload_sustain_s >= 0
             and self.overload_min_waiting >= 0
             and 0 <= self.overload_kv_fraction <= 1
-            and (not self.kv_routing_priority or (
-                self.workload_pressure and self.capacity_lookahead_s > 0
-            ))
+            and (
+                not self.kv_routing_priority
+                or (self.workload_pressure and self.capacity_lookahead_s > 0)
+            )
             and type(self.health_service) is bool
             and type(self.pressure_routing) is bool
             and (not self.pressure_routing or self.health_service)
@@ -888,11 +889,7 @@ class PressurePolicy:
         )
         overload = False
         if cfg.overload_migrates and not emergency:
-            if (
-                s.zone == "OVERLOAD"
-                and not s.missing
-                and overload_pressed(source, cfg)
-            ):
+            if s.zone == "OVERLOAD" and not s.missing and overload_pressed(source, cfg):
                 if self._overload_since is None:
                     self._overload_since = now
                 overload = now - self._overload_since >= cfg.overload_sustain_s
@@ -1023,7 +1020,6 @@ class PressurePolicy:
             selected.request_id,
             rows,
         )
-
 
     def evaluate_candidates(
         self, now, source, target, s, t, candidates, emergency, overload, required
@@ -1268,9 +1264,7 @@ class PressurePolicy:
             # Urgent KV requires valid adequate survival. Legacy emergency
             # mode retains its explicit missing-prediction fallback. Candidates
             # also passed candidate-specific release size/deadline checks.
-            tier = (
-                [c for c, _ in predicted] if predicted else [c for c, _ in feasible]
-            )
+            tier = [c for c, _ in predicted] if predicted else [c for c, _ in feasible]
 
             def rank(c):
                 key = (
@@ -1326,6 +1320,7 @@ class PressurePolicy:
             )
             row["selected"] = c.request_id == selected.request_id
         return rows, selected, policy
+
 
 def overload_pressed(source, cfg):
     """The source queues or is filling up, beyond merely running a lot."""
@@ -1455,6 +1450,10 @@ class RoutingError(ValueError):
     def __init__(self, diagnostics):
         self.diagnostics = diagnostics
         super().__init__("no route with a feasible context/stop contract")
+
+
+class AdmissionDeferred(RoutingError):
+    """Transient long-prompt capacity refusal; keep the original arrival held."""
 
 
 def admit(
