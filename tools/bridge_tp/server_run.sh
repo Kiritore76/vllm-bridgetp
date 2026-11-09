@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 当前任务：六卡600秒自动转换机制小场（当前长度辅助与新实例接流核验）。
+# 当前任务：六卡原输入3420秒自动长场（当前长度辅助/接流修复，次数不限）。
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
@@ -15,13 +15,13 @@ git fetch origin "refs/heads/$branch:refs/remotes/origin/$branch" || exit 1
 revision=$(git rev-parse HEAD)
 [ "$revision" = "$(git rev-parse "origin/$branch")" ] || { echo '请先git pull --ff-only。'; exit 1; }
 mkdir -p /root/autodl-tmp/bridgetp/results || exit 1
-run=/root/autodl-tmp/bridgetp/results/qwen3_six_current_assist_smoke_$(date +%Y%m%d_%H%M%S)_${RANDOM}
+run=/root/autodl-tmp/bridgetp/results/qwen3_six_simple_auto_current_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 printf '%s\n' "$revision" > "$run/revision.txt"
-printf 'Six-card automatic smoke (current-length assist and joined routing); 600s arrivals, seed6, unchanged thresholds; TP1 assist enabled.\n' > "$run/scope.txt"
+printf 'Six-card original automatic field; 3420s arrivals, seed6; current-length assist; joined routing fix; unlimited proposals.\n' > "$run/scope.txt"
 echo "本批目录：$run"
-echo '先Linux CPU检查；通过后只跑600秒自动转换小场，无固定时刻强制转换。'
-echo '10分钟到达；加启动/预热/drain/打包，预计约15–25分钟，慢机器可能更久。'
+echo '先Linux CPU检查；通过后只跑原3420秒自动长场，转换次数不限。'
+echo '57分钟到达；含CPU/启动/预热/drain/打包，预计65–90分钟，慢机器可能更久。'
 smi=
 pack_result() {
     local status=$1
@@ -86,11 +86,11 @@ nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,pcie.link.gen
 smi=$!
 case_dir="$run/auto_from_L1AC"
 mkdir "$case_dir" || { pack_result 1; exit 1; }
-echo '开始600秒自动小场：当前长度辅助优先；必须转换完成且新TP2接到业务。'
+echo '开始3420秒正常自动长场；当前长度辅助优先、次数不限，记录全部转换和中止。'
 "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
-    --cards 6 --static-layout L1AC --phase-shift --phase-scenario auto_smoke_six_v1 \
+    --cards 6 --static-layout L1AC --phase-shift --phase-scenario mixed_simple_six_v1 \
     --scheduler unified --migration-targets all --hold-queue --kv-short-exempt --overload-migrate --migrate-current-length \
-    --conversion-decider execute --decider-multi --decider-pre-tilt --decider-assist \
+    --conversion-decider execute --decider-multi --decider-pre-tilt --decider-assist --decider-max-conversions 0 \
     --expanded-context --current-machine --repetitions 1 \
     --model "$model" \
     --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
@@ -98,12 +98,12 @@ echo '开始600秒自动小场：当前长度辅助优先；必须转换完成�
     --output "$case_dir/trial" --expected-revision "$revision" 2>&1 | tee "$case_dir/console.log"
 runner_status=${PIPESTATUS[0]}
 printf '%s\n' "$runner_status" > "$case_dir/runner_exit_code.txt"
-"$py" -B -m tools.bridge_tp.six_current_assist_smoke "$case_dir/trial" > "$case_dir/auto_check.log" 2>&1
+"$py" -B -m tools.bridge_tp.six_rotation assess --arm auto_from_L1AC --scenario mixed_simple_six_v1 --directory "$case_dir/trial" > "$case_dir/auto_check.log" 2>&1
 check_status=$?
 cat "$case_dir/auto_check.log"
 printf '%s\n' "$check_status" > "$case_dir/check_exit_code.txt"
 status=$runner_status
 if [ "$status" = 0 ]; then status=$check_status; fi
-echo '必须完成自动L1AC→L2C且新TP2接到普通业务，完整输出/ACK/trace/收尾须通过；零辅助如实记未覆盖，不冒称收益。'
+echo '完整输出/ACK/trace/空闲/受管收尾须通过；逐次记录完成/中止与新实例接流，零辅助如实记未覆盖，不冒称收益。'
 pack_result "$status" || exit 1
 exit "$status"
