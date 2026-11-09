@@ -93,6 +93,19 @@ def edge(record):
 
 
 class ManyConversionsRequestTests(unittest.TestCase):
+    def test_zero_is_unlimited_only_for_multi_and_negative_is_rejected(self):
+        from tools.bridge_tp import launch_pressure_balanced_pilot as launch
+
+        self.assertEqual(
+            launch.decider_request(dict(self.request(), max_conversions=0))[
+                "max_conversions"
+            ],
+            0,
+        )
+        for changes in (dict(max_conversions=-1), dict(max_conversions=0, multi=False)):
+            with self.assertRaises(ValueError):
+                launch.decider_request(dict(self.request(), **changes))
+
     def request(self, **changes):
         return dict(
             decider="EXECUTE",

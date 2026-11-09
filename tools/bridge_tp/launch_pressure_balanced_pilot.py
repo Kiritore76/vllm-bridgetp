@@ -576,7 +576,9 @@ def decider_request(request):
         or request.get("multi")
         and request["decider"] != "EXECUTE"
         or type(request.get("max_conversions", 1)) is not int
-        or request.get("max_conversions", 1) < 1
+        or request.get("max_conversions", 1) < 0
+        or request.get("max_conversions") == 0
+        and not request.get("multi")
         or request.get("prestart", False) not in (True, False)
         or request.get("pre_tilt", False) not in (True, False)
         or request.get("assist", False) not in (True, False)
@@ -1070,6 +1072,7 @@ def start_conversion(spec, scene, plan, common, processes, publish, requests):
         processes.append(process)
         publish()
         from tools.bridge_tp.qwen3_migration_diagnostics import wait_stager_ready
+
         wait_stager_ready(Path(target["mechanism_dir"]), process)
 
     ops = SimpleNamespace(
@@ -1570,6 +1573,7 @@ def run_scene(
             )
         if plan.get("dynamic_conversion"):
             from tools.bridge_tp.six_conversion import cleanup
+
             cleanup(plan, common.write_json)
         elif plan.get("receiver_stage") in (2, 3):
             from tools.bridge_tp.migration_receivers import cleanup_links

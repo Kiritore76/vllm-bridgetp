@@ -827,7 +827,7 @@ class DecidedSequenceDriver(ConversionSequenceDriver):
 
     def start_proposal(self, proposal):
         limit = self.sequence_request.get("max_conversions", 4)
-        if self.number >= limit:
+        if limit > 0 and self.number >= limit:
             self.backend.ops.event("DECIDER_LIMIT", limit=limit, **proposal)
             return
         self.number += 1

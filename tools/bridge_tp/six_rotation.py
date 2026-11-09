@@ -113,7 +113,7 @@ def plan(inputs, scenario=SCENARIO, arm="static_L1AC"):
     )
 
 
-def configure_plan(current, *, recipe):
+def configure_plan(current, *, recipe, unlimited=False, assist=False):
     """Fail closed on unfair service settings; allow honest zero migration."""
     scenario = recipe["scenario"]
     registered = registration(scenario)
@@ -132,9 +132,10 @@ def configure_plan(current, *, recipe):
     conversion = current.get("conversion")
     if conversion and (
         conversion.get("prestart")
-        or conversion.get("assist")
+        or bool(conversion.get("assist")) != (assist if unlimited else False)
         or conversion.get("evacuate")
-        or conversion.get("max_conversions") != registered["max_conversions"]
+        or conversion.get("max_conversions")
+        != (0 if unlimited else registered["max_conversions"])
     ):
         raise ValueError("six-card comparison conversion budget/options differ")
     rows = current["instances"]["instances"]
@@ -156,6 +157,8 @@ def configure_plan(current, *, recipe):
             controller_timeout_s=registered["controller_timeout_s"],
             migration_coverage_required=False,
             automatic_conversion=bool(conversion),
+            max_conversions=conversion.get("max_conversions") if conversion else None,
+            assist=bool(conversion and conversion.get("assist")),
             instances=rows,
         ),
     )

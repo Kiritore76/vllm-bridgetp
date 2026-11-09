@@ -383,6 +383,12 @@ def main(argv=None):
         help="keep new long requests off a bundle the decider expects to convert",
     )
     parser.add_argument(
+        "--decider-max-conversions",
+        type=int,
+        default=None,
+        help="override multi-decider attempt limit; 0 means unlimited",
+    )
+    parser.add_argument(
         "--sweep-rates",
         type=lambda text: tuple(int(v) for v in text.split(",")),
         default=None,
@@ -621,6 +627,12 @@ def main(argv=None):
         parser.error("--decider-evacuate needs --decider-multi")
     if args.decider_multi and args.conversion_decider != "execute":
         parser.error("--decider-multi needs --conversion-decider execute")
+    if args.decider_max_conversions is not None and (
+        args.decider_max_conversions < 0 or not args.decider_multi
+    ):
+        parser.error(
+            "--decider-max-conversions needs multi execute and a nonnegative limit"
+        )
     if args.phase_shift:
         if args.phase_scenario in phase_shift.SIX_COMPARISON_SCENARIOS and (
             args.cards != 6 or args.scheduler != "unified"
@@ -1136,6 +1148,8 @@ def main(argv=None):
                     ),
                     rules=dict(current_length=True, trend_lookahead_s=60.0),
                 )
+        if args.decider_max_conversions is not None:
+            spec["conversion"]["max_conversions"] = args.decider_max_conversions
         if args.conversion_cycle:
             spec["conversion"] = dict(
                 base_port=8400,
@@ -1314,7 +1328,12 @@ def main(argv=None):
             ):
                 from tools.bridge_tp.six_rotation import configure_plan
 
-                configure_plan(plan, recipe=cfg["recipes"][0])
+                configure_plan(
+                    plan,
+                    recipe=cfg["recipes"][0],
+                    unlimited=args.decider_max_conversions == 0,
+                    assist=args.decider_assist,
+                )
             if args.phase_shift and args.phase_scenario == "auto_smoke_six_v1":
                 plan["migration_coverage_required"] = False
         serving_preflight(plans)

@@ -89,6 +89,14 @@ class AutoPreflightTests(unittest.TestCase):
             self
         )
 
+    def test_real_runner_unlimited_assisted_comparison_preflight(self):
+        self.automatic = self.assist = self.dynamic_all = self.unlimited = True
+        self.layouts = ("L1AC",)
+        self.attempts = 0
+        previous.RotationTests.test_real_runner_builds_and_preflights_static_arms_before_gpu(
+            self
+        )
+
 
 class AutoEvidenceTests(unittest.TestCase):
     def test_current_three_receivers_and_budget_limit_are_explicit(self):

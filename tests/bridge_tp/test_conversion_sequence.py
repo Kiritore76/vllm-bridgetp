@@ -199,6 +199,12 @@ class DecidedDriverTests(unittest.TestCase):
         self.assertEqual(len(self.begun), 1)
         self.assertIn("DECIDER_LIMIT", [e["kind"] for e in self.events])
 
+    def test_zero_limit_allows_all_proposals_without_budget_limit_events(self):
+        driver, _ = self.run_driver(["COMPLETED"] * 6, max_conversions=0)
+        self.propose(driver, *([("A", "TP2"), ("A", "TP1")] * 3))
+        self.assertEqual(len(self.begun), 6)
+        self.assertNotIn("DECIDER_LIMIT", [e["kind"] for e in self.events])
+
     def test_a_tilt_survives_the_step_and_passes_the_service_gate(self):
         driver, backend = self.run_driver(["COMPLETED"])
         self.propose(driver, ("A", "TP2"))

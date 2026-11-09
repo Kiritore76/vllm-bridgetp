@@ -133,6 +133,8 @@ class RotationTests(unittest.TestCase):
                         args += ["--decider-assist"]
                     if getattr(self, "dynamic_all", False):
                         args += ["--migration-targets", "all"]
+                    if getattr(self, "unlimited", False):
+                        args += ["--decider-max-conversions", "0"]
                 if layout == "L2C":
                     args += ["--migration-targets", "all"]
                 with (
@@ -177,6 +179,13 @@ class RotationTests(unittest.TestCase):
                 )
                 if getattr(self, "assist", False):
                     self.assertTrue(current["conversion"]["assist"])
+                if getattr(self, "unlimited", False):
+                    contract = rotation.read(
+                        current["run_dir"].parent / "rotation_contract.json"
+                    )
+                    self.assertEqual(contract["max_conversions"], 0)
+                    self.assertTrue(contract["assist"])
+                    continue
                 if (
                     self.config["recipes"][0]["scenario"]
                     not in phase.SIX_COMPARISON_SCENARIOS
