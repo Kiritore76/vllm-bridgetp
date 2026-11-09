@@ -89,6 +89,7 @@ class PressureCoordinator:
         routing_weights=(1.0, 1.0),
         scheduler="pressure",
         slots=None,
+        six_card=False,
     ) -> None:
         if scheduler not in {"pressure", "unified"}:
             raise ValueError("unknown scheduler")
@@ -97,6 +98,9 @@ class PressureCoordinator:
         # Unified (user 11-06): one fullness for admission and migration; the
         # pressure scheduler below stays unchanged behind this switch.
         self.scheduler = scheduler
+        # Six-card only (user 11-09): exclude pressured targets. Four-card
+        # unified runs keep their per-request target evaluation.
+        self.six_card = six_card
         self.slots = dict(slots or {})
         self.itl = unified.SmoothedItl()
         self.itl_reference_s = unified.ITL_REFERENCE_S
@@ -1041,21 +1045,30 @@ class PressureCoordinator:
                 i: 0 <= now - r.sampled_at <= self.policy.cfg.max_age_s
                 for i, r in readings.items()
             }
-            # A target whose capacity ratio (the valve's own metric) has hit
-            # or passed 1.0, or is unmeasured, no longer accepts new moves.
-            # Pressure only steers new admissions here; it never cancels a
-            # migration that already started. Excluded targets are recorded.
-            excluded_targets, target_capacity = excluded_migration_targets(
-                {t: adjusted[t] for t in targets}, self.policy.cfg, now
-            )
+            # Six-card: a target whose capacity ratio (the valve's own
+            # metric) has hit or passed 1.0, or is unmeasured, no longer
+            # accepts new moves. Pressure only steers new admissions here;
+            # it never cancels a migration that already started. Four-card
+            # unified runs keep their per-request target evaluation.
+            if self.six_card:
+                excluded_targets, target_capacity = excluded_migration_targets(
+                    {t: adjusted[t] for t in targets}, self.policy.cfg, now
+                )
+            else:
+                excluded_targets, target_capacity = [], {}
             evaluations = []
             open_targets = [
                 t
                 for t in targets
                 if fresh[t]
                 and self.ledger.channel_available(t)
-                and target_capacity[t] is not None
-                and target_capacity[t] < 1.0
+                and (
+                    not self.six_card
+                    or (
+                        target_capacity[t] is not None
+                        and target_capacity[t] < 1.0
+                    )
+                )
             ]
 
             def by_fullness(names):

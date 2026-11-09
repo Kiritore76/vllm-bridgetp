@@ -77,13 +77,14 @@ def inst(name, total=11712, free=10000, requests=0, unallocated=0, **kwargs):
     )
 
 
-def coordinator(slots=None, cfg=None):
+def coordinator(slots=None, cfg=None, six_card=False):
     records = []
     co = r.PressureCoordinator(
         cfg or p.PressureConfig(**PRODUCTION),
         records.append,
         scheduler="unified",
         slots=slots or dict(a1=16, a2=16, b=16, c=16),
+        six_card=six_card,
     )
     return co, records
 
@@ -630,7 +631,7 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(started.calls, ["q0"])
 
     def test_a_pressured_target_is_excluded_and_recorded(self):
-        co, records = coordinator()
+        co, records = coordinator(six_card=True)
         started = Started()
         source = inst("a1", total=2325, free=150, requests=3)
         rows = source_candidates(16384, 4096)

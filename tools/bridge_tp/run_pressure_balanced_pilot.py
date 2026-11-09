@@ -862,6 +862,7 @@ def _run(args, prepared):
         audit.write,
         routing_strategy=args.routing_strategy,
         routing_weights=tuple(args.routing_weights),
+        six_card=getattr(args, "cards", 0) == 6,
     )
     health_module = load("pressure_health") if cfg.health_service else None
     health_tokens = health_module.TokenWindows() if cfg.health_service else None
