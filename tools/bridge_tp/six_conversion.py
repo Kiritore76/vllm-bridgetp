@@ -355,6 +355,11 @@ class SixBackend(SequenceBackend):
         self.join = None
         self.evacuation_run = None
         self.gate_mode = "UNIFIED"
+        self.assist_priority_sources = (
+            [i for i, row in self.active().items() if row.bundle_id == step["bundle"]]
+            if step.get("method") == "SELECTIVE_ROLL"
+            else []
+        )
         self.ops.event("STEP_BEGIN", before=modes, after=after)
         self.write_layout({}, tilt=[])
 
@@ -404,7 +409,7 @@ class SixBackend(SequenceBackend):
         if not candidates:
             return "no startable long remaining request", None
         # The controller ranks all live target-specific candidates at START.
-        return None, dict(candidates[0], final_length=True)
+        return None, dict(candidates[0], current_length=True)
 
     def replacement_specs(self, plan):
         if self._specs is not None:

@@ -192,6 +192,46 @@ class FullnessTests(unittest.TestCase):
 
 
 class AdmissionTests(unittest.TestCase):
+    def test_fresh_empty_new_instance_receives_first_request(self):
+        co, records = coordinator()
+        readings = [
+            inst("b", free=5500, requests=6, growth_blocks_s=1),
+            inst("c", free=11711, idle=True, growth_blocks_s=None),
+        ]
+        result = co.admission_multi("first", 512, 128, readings, TP, 10, "first")
+        self.assertEqual(result.pool_id, "c")
+        row = records[-1]["unified_rows"][1]
+        self.assertTrue(row["growth_guard_fits"])
+        self.assertEqual(row["growth_basis"], "fresh idle inventory")
+        # Before that ingress appears in native inventory it is not idle again.
+        co.admission_multi("second", 512, 128, readings, TP, 10, "second")
+        self.assertIsNone(records[-1]["unified_rows"][1]["growth_guard_fits"])
+
+    def test_unknown_growth_only_zero_for_fresh_unencumbered_idle_inventory(self):
+        for changes in (
+            dict(idle=False),
+            dict(engine_requests=1),
+            dict(waiting=1),
+            dict(pending_prompt_tokens=512),
+            dict(unallocated_prompt_blocks=32),
+            dict(sampled_at=7),
+            dict(published_at=7),
+        ):
+            with self.subTest(changes=changes):
+                co, records = coordinator()
+                target = dataclasses.replace(
+                    inst("c", idle=True, growth_blocks_s=None), **changes
+                )
+                co.admission_multi("r", 512, 128, [target], TP, 10, "r")
+                self.assertIsNone(records[-1]["unified_rows"][0]["growth_guard_fits"])
+        co, records = coordinator()
+        target = inst("c", idle=True, growth_blocks_s=None)
+        co.ledger.reserve(
+            p.Reservation("move", "moving", "c", 100, 0, 0, "migration"), target
+        )
+        co.admission_multi("r", 512, 128, [target], TP, 10, "r")
+        self.assertIsNone(records[-1]["unified_rows"][0]["growth_guard_fits"])
+
     def test_growth_guard_prefers_alternative_before_two_short_prompts_fill_C4(self):
         co, records = coordinator()
         # Observed C4 room98 then66, C5 room488; fullness slightly favors C4.

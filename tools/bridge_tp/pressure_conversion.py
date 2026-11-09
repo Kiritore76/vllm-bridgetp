@@ -247,6 +247,12 @@ class ControllerConversionBackend:
                 instances=list(self.layout.values()),
                 conversion_pending=pending,
                 assist=assist or self.layout_assist,
+                assist_priority_sources=[
+                    i
+                    for i in getattr(self, "assist_priority_sources", ())
+                    if pending
+                    and self.layout.get(i, {}).get("lifecycle") == "QUIESCING"
+                ],
                 # Decider pre-tilt: instances that get no new long request.
                 tilt=self.layout_tilt,
             ),
@@ -575,6 +581,12 @@ class ControllerConversionBackend:
         self.assist_at = self.clock()
         status = self.status()
         reason, choice = self.assist_choice(plan, status)
+        if self.gate_mode == "UNIFIED":
+            priority = [r.instance_id for r in self.refs(plan)] if choice else []
+            if priority != getattr(self, "assist_priority_sources", []):
+                self.assist_priority_sources = priority
+                if choice is None:
+                    self.write_layout({})
         if reason != self.last_assist_reason or choice is not None:
             self.decision("ASSIST", choice=choice, reason=reason)
             self.last_assist_reason = reason
@@ -586,7 +598,7 @@ class ControllerConversionBackend:
             request_id=choice["request_id"],
             source=choice["instance"],
         )
-        for key in ("target", "final_length"):
+        for key in ("target", "final_length", "current_length"):
             if key in choice:
                 assist[key] = choice[key]
         if "evacuate" in choice:

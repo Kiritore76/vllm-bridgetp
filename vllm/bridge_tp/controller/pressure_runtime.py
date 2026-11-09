@@ -493,6 +493,29 @@ class PressureCoordinator:
             )
             room = unified.prompt_room(reading, self.ledger.pending(raw.pool_id)[0])
             growth = reading.growth_blocks_s
+            growth_basis = "observed" if growth is not None else "unknown"
+            # A fresh, empty scheduler has no existing decode growth. New
+            # instances must be able to receive their first request; unknown
+            # growth on a busy/stale instance is still unknown.
+            if (
+                growth is None
+                and reading.idle
+                and reading.engine_requests == 0
+                and reading.waiting == 0
+                and reading.pending_prompt_tokens == 0
+                and reading.unallocated_prompt_blocks == 0
+                and all(
+                    0 <= now - stamp <= self.policy.cfg.max_age_s
+                    for stamp in (raw.sampled_at, raw.published_at)
+                )
+                and not any(
+                    row.pool_id == raw.pool_id
+                    and row.kind == "migration"
+                    and row.state in {"ACTIVE", "COMMITTED"}
+                    for row in self.ledger.live_rows()
+                )
+            ):
+                growth, growth_basis = 0.0, "fresh idle inventory"
             growth_fits = None
             if (
                 room is not None
@@ -519,6 +542,7 @@ class PressureCoordinator:
                     and room >= prompt_blocks,
                     room_blocks=room,
                     growth_guard_fits=growth_fits,
+                    growth_basis=growth_basis,
                     capacity_fresh=0
                     <= now - raw.sampled_at
                     <= self.policy.cfg.max_age_s,
@@ -1064,10 +1088,7 @@ class PressureCoordinator:
                 and self.ledger.channel_available(t)
                 and (
                     not self.six_card
-                    or (
-                        target_capacity[t] is not None
-                        and target_capacity[t] < 1.0
-                    )
+                    or (target_capacity[t] is not None and target_capacity[t] < 1.0)
                 )
             ]
 

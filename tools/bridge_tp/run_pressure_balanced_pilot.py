@@ -685,6 +685,18 @@ def policy_sources(candidates_by_source, evacuation_sources):
     return {s: cs for s, cs in candidates_by_source.items() if s not in excluded}
 
 
+def ordinary_migration_ready(priority_sources, assist, result):
+    """Give a drain assist first refusal of an available migration slot."""
+    if not priority_sources:
+        return True
+    return bool(
+        assist is not None
+        and result is not None
+        and result["seq"] == assist["seq"]
+        and result["state"] == "REFUSED"
+    )
+
+
 def extra_instances(manifest):
     """Routing-only instances: every manifest row outside the migration pair."""
     if manifest is None:
@@ -1124,6 +1136,7 @@ def _run(args, prepared):
         assist=None,
         assist_seen=None,
         assist_result=None,
+        assist_priority_sources=(),
         # (unix_s, source) of migration starts, for the conversion decider.
         migration_starts=[],
         tilt=frozenset(),
@@ -1224,8 +1237,11 @@ def _run(args, prepared):
             )
             if refusal:
                 return refusal
-        current = co.policy.cfg.migration_current_length and not assist.get(
-            "final_length"
+        drain_current = bool(
+            getattr(co, "six_card", False) and assist.get("current_length")
+        )
+        current = drain_current or (
+            co.policy.cfg.migration_current_length and not assist.get("final_length")
         )
         required = math.ceil(
             (
@@ -1237,11 +1253,13 @@ def _run(args, prepared):
         pending, pending_decode, _ = co.ledger.pending(target_pool.pool_id)
         free = target_pool.free_blocks
         if current:
+            check = dict(check_service=False) if drain_current else {}
             refusal = p.target_refusal(
                 co.policy.cfg,
                 co.ledger.routing_reading(target_pool),
                 pending,
                 required,
+                **check,
             )
             if refusal:
                 return refusal
@@ -1385,6 +1403,7 @@ def _run(args, prepared):
                     if polled.get(layout_state["migration_target"]) is not None
                     else None,
                     assist_result=layout_state["assist_result"],
+                    assist_priority_sources=layout_state["assist_priority_sources"],
                     workload=workload,
                     # Ledger state of every drain-assist session (S5a cap).
                     assist_sessions={
@@ -1419,6 +1438,9 @@ def _run(args, prepared):
             return
         layout_state["pending"] = bool(control.get("conversion_pending"))
         layout_state["assist"] = control.get("assist")
+        layout_state["assist_priority_sources"] = tuple(
+            alias_of.get(i, i) for i in control.get("assist_priority_sources", ())
+        )
         # Decider pre-tilt: long requests avoid these pools (replaced whole,
         # read by the arrival thread).
         layout_state["tilt"] = frozenset(
@@ -2110,7 +2132,7 @@ def _run(args, prepared):
                         multi
                         and target_ids
                         and assist is not None
-                        and assist.get("final_length")
+                        and (assist.get("final_length") or assist.get("current_length"))
                     )
                 )
                 and assist is not None
@@ -2119,7 +2141,9 @@ def _run(args, prepared):
                 layout_state["assist_seen"] = assist["seq"]
                 attempts = []
                 selected_target = None
-                if multi and assist.get("final_length"):
+                if multi and (
+                    assist.get("final_length") or assist.get("current_length")
+                ):
                     readings = {
                         tid: co.ledger.routing_reading(pools[index_of[tid]])
                         for tid in target_ids
@@ -2183,12 +2207,22 @@ def _run(args, prepared):
                     target=selected_target,
                     target_attempts=attempts,
                     excluded_targets=assist_excluded,
+                    length_basis="current"
+                    if assist.get("current_length")
+                    else "policy",
                     unix_s=now,
                 )
                 audit.write(
                     dict(kind="pressure_assist_result", **layout_state["assist_result"])
                 )
-            if target_ids and not assist_started:
+            priority = layout_state["assist_priority_sources"] if co.six_card else ()
+            if (
+                target_ids
+                and not assist_started
+                and ordinary_migration_ready(
+                    priority, assist, layout_state["assist_result"]
+                )
+            ):
                 chosen_sources = policy_sources(
                     candidates_by_source, evacuation_sources
                 )

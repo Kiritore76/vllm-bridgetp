@@ -54,7 +54,8 @@ class AssistTests(unittest.TestCase):
         self.assertIsNone(reason)
         self.assertEqual(choice["request_id"], "long")
         self.assertNotIn("target", choice)
-        self.assertTrue(choice["final_length"])
+        self.assertTrue(choice["current_length"])
+        self.assertNotIn("final_length", choice)
         self.assertNotIn("evacuate", choice)
 
     def test_refusal_retries_but_started_request_is_not_reissued(self):
@@ -71,8 +72,179 @@ class AssistTests(unittest.TestCase):
         self.status["instances"]["target"]["sessions"] = 1
         self.assertIsNone(self.backend.assist_choice({}, self.status)[1])
 
+    def test_short_natural_finish_is_skipped_without_new_time_thresholds(self):
+        self.status["instances"]["source"]["requests"] = [
+            dict(
+                request_id="r",
+                tokens_s=20,
+                remaining_bins=[(240, 1)],
+                action_available=True,
+            )
+        ]  # 240/(20*.8) = 3*5: natural completion is not worth a move.
+        self.assertIsNone(self.backend.assist_choice({}, self.status)[1])
+
+    def test_control_publishes_current_length_and_releases_unused_priority(self):
+        b = self.backend
+        b.clock = lambda: 10
+        b.assist_at = 0
+        b.safety["decision_interval_s"] = 1
+        b.status = lambda: self.status
+        b.gate_mode = "UNIFIED"
+        b.assist_priority_sources = ["source"]
+        b.last_assist_reason = None
+        b.decision = lambda *args, **kwargs: None
+        b.ops = NS(event=lambda *args, **kwargs: None)
+        written = []
+        b.write_layout = lambda *args, **kwargs: written.append(kwargs)
+        b.assisted_step({}, 10)
+        self.assertTrue(written[-1]["assist"]["current_length"])
+        self.assertNotIn("final_length", written[-1]["assist"])
+        b.assist_at = 0
+        self.status["instances"]["source"]["requests"] = []
+        b.assisted_step({}, 10)
+        self.assertEqual(b.assist_priority_sources, [])
+
 
 class ControllerBindingTests(unittest.TestCase):
+    def test_auxiliary_gets_first_refusal_but_does_not_block_after_refusal(self):
+        ready = pilot.ordinary_migration_ready
+        self.assertTrue(ready([], None, None))
+        self.assertFalse(ready(["source"], None, None))
+        self.assertFalse(ready(["source"], dict(seq=2), dict(seq=1, state="REFUSED")))
+        self.assertTrue(ready(["source"], dict(seq=2), dict(seq=2, state="REFUSED")))
+        self.assertFalse(ready(["source"], dict(seq=2), dict(seq=2, state="STARTED")))
+
+    def test_current_length_start_keeps_kv_reserve_but_skips_comfort(self):
+        from tools.bridge_tp.pressure_cpu import load
+
+        policy = load("pressure_policy")
+        tree = ast.parse(Path(pilot.__file__).read_text(encoding="utf-8"))
+        node = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "start_assist"
+        )
+        calls = []
+        cfg = NS(
+            migration_current_length=True,
+            capacity_guard_blocks=125,
+            migration_target_reserve_blocks=1171,
+            migration_target_running_max=15,
+            health_service=True,
+        )
+        candidate = NS(
+            request_id="r",
+            migrating=False,
+            finished=False,
+            prompt_tokens=16384,
+            generated=1879,
+            max_output_tokens=8192,
+        )
+        target = NS(
+            pool_id="target",
+            free_blocks=2500,
+            unallocated_prompt_blocks=0,
+            waiting=3,
+            workload=dict(requests=18),
+        )
+        co = NS(
+            policy=NS(cfg=cfg),
+            six_card=True,
+            ledger=NS(pending=lambda _: (0, 0, 0), routing_reading=lambda v: v),
+            assist_start=lambda *args, **kwargs: calls.append(args),
+        )
+        scope = dict(
+            alias_of={},
+            co=co,
+            cfg=cfg,
+            math=math,
+            controller=NS(block_size=16),
+            session=NS(groups={}),
+            p=policy,
+            assist_service_refusal=lambda *args: self.fail("comfort check reached"),
+        )
+        exec(
+            compile(ast.Module(body=[node], type_ignores=[]), "start_assist", "exec"),
+            scope,
+        )
+        action = object()
+        assist = dict(source="source", request_id="r", current_length=True)
+        start = scope["start_assist"]
+        self.assertIsNone(
+            start(
+                assist, 10, target, {"source": [candidate]}, {("r", "target"): action}
+            )
+        )
+        self.assertEqual(calls[0][6], 1142)
+        self.assertIs(calls[0][4], action)
+        self.assertEqual(
+            policy.target_refusal(cfg, target, 0, 1142),
+            "target running slots full with a queue",
+        )
+        target.free_blocks = 2300
+        self.assertEqual(
+            start(assist, 10, target, {"source": [candidate]}, {}),
+            "target KV reserve too small",
+        )
+        self.assertEqual(len(calls), 1)
+
+    def test_current_length_reaches_the_real_atomic_ledger(self):
+        from tests.bridge_tp.test_unified_scheduler import coordinator, inst
+        from tools.bridge_tp.pressure_cpu import load
+
+        co, records = coordinator(six_card=True)
+        co.set_lifecycle("a1", "QUIESCING")
+        policy = load("pressure_policy")
+        runtime = load("pressure_runtime")
+        tree = ast.parse(Path(pilot.__file__).read_text(encoding="utf-8"))
+        node = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "start_assist"
+        )
+        started = []
+        action = runtime.BoundAction("r", "move", lambda: started.append(True))
+        candidate = NS(
+            request_id="r",
+            migrating=False,
+            finished=False,
+            prompt_tokens=16384,
+            generated=1879,
+            max_output_tokens=8192,
+            target_decode_cost=0.1,
+        )
+        scope = dict(
+            alias_of={},
+            co=co,
+            cfg=co.policy.cfg,
+            math=math,
+            controller=NS(block_size=16),
+            session=NS(groups={}),
+            p=policy,
+        )
+        exec(
+            compile(ast.Module(body=[node], type_ignores=[]), "start_assist", "exec"),
+            scope,
+        )
+        self.assertIsNone(
+            scope["start_assist"](
+                dict(source="a1", request_id="r", current_length=True),
+                10,
+                inst("b", free=5000),
+                {"a1": [candidate]},
+                {("r", "b"): action},
+            )
+        )
+        self.assertEqual(started, [True])
+        self.assertEqual(co.ledger.pending("b")[0], 1142)
+        self.assertIn("move", co._assist_sessions)
+        self.assertEqual(
+            next(r for r in records if r["kind"] == "pressure_conversion_assist")[
+                "required_blocks"
+            ],
+            1142,
+        )
+
     def test_shared_order_and_fallback_choose_a_safe_second_target(self):
         from tools.bridge_tp.pressure_cpu import load
 

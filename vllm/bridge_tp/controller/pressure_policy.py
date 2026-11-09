@@ -1335,7 +1335,7 @@ def overload_pressed(source, cfg):
     )
 
 
-def target_refusal(cfg, target, pending_blocks, required_blocks):
+def target_refusal(cfg, target, pending_blocks, required_blocks, *, check_service=True):
     """Why the target should not take this move now, from what it reports now."""
     native = target.unallocated_prompt_blocks
     unallocated = native if type(native) is int and native > 0 else 0
@@ -1347,7 +1347,8 @@ def target_refusal(cfg, target, pending_blocks, required_blocks):
         return "target KV reserve too small"
     requests = (target.workload or {}).get("requests")
     if (
-        target.waiting
+        check_service
+        and target.waiting
         and type(requests) is int
         and requests - target.waiting >= cfg.migration_target_running_max
     ):
