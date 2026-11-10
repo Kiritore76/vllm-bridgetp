@@ -385,7 +385,10 @@ class BackendGraphTests(Base):
         )
         self.assertEqual(self.backend.next_channel_generation, 28)
         self.assertEqual(self.backend.next_channel_port, 33100)
+        # The controller ACK must follow publication of this RETIRED revision.
+        self.backend.write_layout(dict.fromkeys(("A-g1-tp1", "A-g3-tp1"), "RETIRED"))
         value = status()
+        value["layout_revision"] = self.backend.revision
         for source in ("A-g1-tp1", "A-g3-tp1"):
             value["instances"][source]["lifecycle"] = "RETIRED"
         self.write(value)
@@ -401,8 +404,23 @@ class BackendGraphTests(Base):
             self.assertFalse(self.backend.retire_channels(PLAN))
             retire.assert_not_called()
             value = status()
+            value["layout_revision"] = self.backend.revision
             for source in ("A-g1-tp1", "A-g3-tp1"):
                 value["instances"][source]["lifecycle"] = "RETIRED"
+            missing_revision = dict(value)
+            missing_revision.pop("layout_revision")
+            for bad in (
+                missing_revision,
+                dict(value, layout_revision=self.backend.revision - 1),
+                dict(value, unix_s=self.now[0] - 3),
+                dict(value, unix_s=self.now[0] + 3),
+            ):
+                with (
+                    self.subTest(status=bad),
+                    patch.object(self.backend, "status", return_value=bad),
+                ):
+                    self.assertFalse(self.backend.retire_channels(PLAN))
+                    retire.assert_not_called()
             self.write(value)
             self.assertTrue(self.backend.retire_channels(PLAN))
             retire.assert_called_once_with("manual-A", ["A-g1-tp1", "A-g3-tp1"])
