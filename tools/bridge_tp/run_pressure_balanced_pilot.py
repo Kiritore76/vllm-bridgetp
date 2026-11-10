@@ -431,6 +431,18 @@ def batch(inventory, now, cfg, reading):
     return value
 
 
+def six_card_plan(manifest):
+    """True for the validated canonical six-card unified plan.
+
+    The controller has no ``--cards`` argument (only the outer runner does), so
+    reading ``args.cards`` left every six-card branch off in a real run (GPU
+    11-10: no service shape, no demand, 2393 decisions all KEEP). The manifest's
+    ``runtime_pool_ids`` exist only for that plan; ``instance_manifest`` has
+    already checked its six physical GPUs and the unified scheduler.
+    """
+    return bool(manifest and manifest.get("runtime_pool_ids"))
+
+
 def instance_manifest(args, controller):
     """Validate the pair, extra sources and the opt-in canonical runtime IDs."""
     if args.instances is None:
@@ -874,7 +886,7 @@ def _run(args, prepared):
         audit.write,
         routing_strategy=args.routing_strategy,
         routing_weights=tuple(args.routing_weights),
-        six_card=getattr(args, "cards", 0) == 6,
+        six_card=six_card_plan(receipt.get("instance_manifest")),
     )
     health_module = load("pressure_health") if cfg.health_service else None
     health_tokens = health_module.TokenWindows() if cfg.health_service else None
@@ -1386,9 +1398,18 @@ def _run(args, prepared):
             )
             if hold is not None:
                 held_short, held_long = dispatcher.held_demand
+                oldest_short, oldest_long, prompts = dispatcher.held_detail
+                mono = time.monotonic()
                 workload["conversion_demand"].update(
                     held_long_count=held_long,
                     held_short_count=held_short,
+                    held_short_wait_s=0.0
+                    if oldest_short is None
+                    else max(0.0, mono - oldest_short),
+                    held_long_wait_s=0.0
+                    if oldest_long is None
+                    else max(0.0, mono - oldest_long),
+                    held_long_prompt_tokens=list(prompts),
                 )
         path = args.run_dir / "layout_status.json"
         temporary = path.with_suffix(".tmp")

@@ -117,9 +117,25 @@ RULES = dict(
 )
 
 # Six-card policy is explicit: existing four-card callers keep RULES unchanged.
+# ``decision_budget``: 0 legacy thresholds, 1 the 300s service-budget estimate
+# (kept for replays), 2 gap rules (default, user 11-10). Gap rules propose a
+# middle move on an observed, sustained deficit instead of a predicted payback:
+# the estimate needed how long demand lasts and how long the drain takes, and
+# never passed in the 40-minute GPU run's long phase while L1AC failed 43 of
+# its 61 long requests.
 SIX_CARD_RULES = dict(
     RULES,
-    decision_budget=1,
+    decision_budget=2,
+    # L1AC -> L2C: long demand close to all of L1AC's 21012 blocks (0.95), or a
+    # long request held by the controller. 12600 also fired on a run where
+    # static L1AC passed 35 of 36 long requests (replay 11-10).
+    gap_merge_long_blocks=20000,
+    gap_merge_hold_s=30.0,
+    gap_merge_held_long_s=45.0,
+    # L2C -> L1AC: 16/s is the highest rate L2C passed. At 17 a 17.5/s load
+    # kept dipping below the line and the split came about 230s late.
+    gap_split_short=16.0,
+    gap_split_hold_s=30.0,
     prepare_long_ratio=0.8,
     l2_max_short=15.0,
     l2_min_long_blocks=12600,
@@ -236,7 +252,7 @@ class ConversionDecider:
         if profile == "six_card" and (
             self.rules["current_length"] is not True
             or self.rules["evacuate_busy"] is not False
-            or self.rules["decision_budget"] not in (0, 1)
+            or self.rules["decision_budget"] not in (0, 1, 2)
         ):
             raise ValueError(
                 "six-card conversion uses current length and natural drain"
@@ -537,6 +553,8 @@ class ConversionDecider:
         """One decision record; ``proposal`` is the edge to convert, if any."""
         r = self.rules
         s = self.signals(status, bundles, members, now)
+        if self.profile == "six_card" and r["decision_budget"] == 2:
+            return self.observe_gap(status, bundles, members, s, now)
         if self.profile == "six_card" and r["decision_budget"]:
             return self.observe_budget(status, bundles, members, s, now)
         if self.profile == "six_card" and (
@@ -647,6 +665,153 @@ class ConversionDecider:
         if proposal is not None and not self.execute:
             self.prepared = None  # record only: this hold is over
         return record
+
+    def _check_gap(self, edge, s, after, demand):
+        """(failed, waiting, immediate) of one edge under the gap rules.
+
+        Middle moves need a deficit the current layout already shows; the two
+        extreme layouts keep their strict entry and quick exit conditions.
+        """
+        r = self.rules
+        transition = s["layout"], after
+        if transition == ("L1AC", "L2C"):
+            failed = []
+            held_s = demand.get("held_long_wait_s", 0.0)
+            if s["short_rate"] > r["l2_max_short"]:
+                failed.append("short rate too high for L2C")
+            if not s["long_arrivals"]:
+                failed.append("no new long request: a burst is left to migration")
+            queued = held_s >= r["gap_merge_held_long_s"]
+            if s["long_blocks"] < r["gap_merge_long_blocks"] and not queued:
+                failed.append("long demand within what L1AC holds")
+            return failed, [], queued and not failed
+        if transition == ("L2C", "L1AC"):
+            failed, waiting = [], []
+            if s["short_rate"] < r["gap_split_short"]:
+                failed.append("short rate within what L2C carries")
+            # Shorts are also held when long requests fill the KV; that is a
+            # long deficit and must not read as a reason to split.
+            if demand.get("held_long_count", 0):
+                failed.append("a long request is held: not a short deficit")
+            if s["bundle_long_blocks"].get(edge[0]):
+                waiting.append("bundle serves a long request")
+            return failed, waiting, False
+        failed, waiting, _ = self._check_six(edge, s, after)
+        return failed, waiting, False
+
+    def observe_gap(self, status, bundles, members, signals, now):
+        """Propose on an observed, sustained deficit; commit at the proposal."""
+        r = self.rules
+        workload = status.get("workload") or {}
+        demand = workload.get("conversion_demand")
+        if status.get("workload_origin_unix_s") is not None and (
+            status.get("service_shape") is None or demand is None
+        ):
+            # GPU 11-10: these were silently absent for a whole 40-minute run.
+            raise RuntimeError(
+                "six-card decision signals missing: service_shape/conversion_demand"
+            )
+        demand = demand or {}
+        layout = signals["layout"]
+        complete = set(bundles) == {"A", "B", "C"} and layout in self.edges
+        cooling = (
+            self.execute
+            and self.converted_at is not None
+            and now - self.converted_at < r["cooldown_s"]
+        )
+        # Unified runs hold every request in one queue: its long prompts and
+        # count are published with the demand, not as held_long_prompt_tokens.
+        held = demand.get("held_long_prompt_tokens", ())
+        signals["long_blocks"] += sum(-(-n // BLOCK_TOKENS) for n in held)
+        signals["long_arrivals"] += demand.get("held_long_count", 0)
+        signals["held_long_wait_s"] = demand.get("held_long_wait_s", 0.0)
+        signals["held_short_wait_s"] = demand.get("held_short_wait_s", 0.0)
+        signals["held_short_count"] = demand.get("held_short_count", 0)
+        proposal, candidates = None, {}
+        if not complete:
+            # A partial ACTIVE registry during a conversion is not a layout.
+            self.since.clear()
+            signals["layout"] = None
+        for edge in self.edges.get(layout, ()) if complete else ():
+            key = f"{edge[0]}->{edge[1]}"
+            after = self._six_after(layout, edge)
+            failed, waiting, immediate = self._check_gap(edge, signals, after, demand)
+            if failed:
+                self.since.pop(key, None)
+            else:
+                self.since.setdefault(key, now)
+            held_s = now - self.since[key] if key in self.since else 0.0
+            hold_s = (
+                r["gap_merge_hold_s"]
+                if (layout, after) == ("L1AC", "L2C")
+                else r["gap_split_hold_s"]
+                if (layout, after) == ("L2C", "L1AC")
+                else self._hold_seconds(edge, signals, False)
+            )
+            repeated = (
+                not self.execute
+                and now - self.proposed_at.get(key, -float("inf")) < r["cooldown_s"]
+            )
+            ready = (
+                not failed
+                and not waiting
+                and (immediate or held_s >= hold_s)
+                and not cooling
+                and not repeated
+                and self.committed_edge is None
+            )
+            # Record only: the retired estimate, for comparison with this rule.
+            budget = six_budget.estimate(status, bundles, members, edge, now, signals)
+            candidates[key] = dict(
+                failed=failed,
+                waiting=waiting,
+                urgent=immediate,
+                held_s=held_s,
+                hold_s=hold_s,
+                ready=ready,
+                budget=budget,
+            )
+            if ready and proposal is None:
+                proposal = dict(
+                    bundle=edge[0],
+                    target_mode=edge[1],
+                    layout=layout,
+                    held_s=held_s,
+                    rule="held long request" if immediate else "sustained deficit",
+                )
+        if proposal is not None:
+            if self.execute:
+                self.committed_edge = (proposal["bundle"], proposal["target_mode"])
+            else:
+                key = f"{proposal['bundle']}->{proposal['target_mode']}"
+                self.proposed_at[key] = now
+            self.since.clear()
+        self.prepared = None
+        return dict(
+            evaluated_unix_s=now,
+            mode="EXECUTE" if self.execute else "RECORD_ONLY",
+            signals=signals,
+            candidates=candidates,
+            cooling=cooling,
+            proposal=proposal,
+            prepared=None,
+            tilt=[],
+            decision="SUBMIT"
+            if proposal
+            else "COMMITTED"
+            if self.committed_edge
+            else "KEEP",
+            policy="SIX_GAP_RULES_V1",
+            preparation=dict(
+                phase="COMMITTED" if self.committed_edge else "OBSERVING",
+                approaching=None,
+                retained_no_room=[],
+                retained_not_quiet=[],
+                tilt_active=False,
+                tilt_expired=False,
+                capacity_recovery_wait_s=None,
+            ),
+        )
 
     def observe_budget(self, status, bundles, members, signals, now):
         """Strict, common entry policy; no business-affecting half-prepared state."""

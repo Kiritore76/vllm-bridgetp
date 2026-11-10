@@ -77,6 +77,14 @@ class RotationTests(unittest.TestCase):
                     self.assertEqual(len(plans), 1)
                     _, _, _, current = plans[0]
                     _, _, _, jobs, receipt = runner.controller_preflight(current)
+                    # GPU 11-10: the real controller arguments carry no card
+                    # count; six-card branches key on the validated manifest.
+                    from tools.bridge_tp import run_pressure_balanced_pilot as pilot
+
+                    self.assertNotIn("--cards", current["controller_argv"])
+                    self.assertTrue(
+                        pilot.six_card_plan(receipt.get("instance_manifest"))
+                    )
                     self.assertEqual(len(jobs), len(self.config["recipes"][0]["jobs"]))
                     self.assertTrue(receipt["migration_execution_enabled"])
                     self.assertFalse(current["migration_coverage_required"])

@@ -207,7 +207,7 @@ def pulse_coverage(records, origin):
     rows = [r for r in records if 1500 <= r["evaluated_unix_s"] - origin < 1620]
     times = [r["evaluated_unix_s"] - origin for r in rows]
     observing = bool(rows) and all(
-        r.get("policy") == "SIX_SERVICE_BUDGET_V1"
+        r.get("policy") in ("SIX_SERVICE_BUDGET_V1", "SIX_GAP_RULES_V1")
         and r["signals"]["layout"] == "L2C"
         and r.get("decision") == "KEEP"
         and not r.get("proposal")

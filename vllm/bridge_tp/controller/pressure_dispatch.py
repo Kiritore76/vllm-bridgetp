@@ -33,6 +33,9 @@ class ScheduledDispatch:
         self.hold = hold
         self.observe_held = observe_held
         self.held_demand = (0, 0)
+        # (oldest held short arrival, oldest held long arrival, held long
+        # prompt tokens); arrivals are monotonic times, None when none is held.
+        self.held_detail = (None, None, ())
         self.held_demand_at = -float("inf")
         self.lock = threading.Lock()
         self.stop = threading.Event()
@@ -138,18 +141,27 @@ class ScheduledDispatch:
         now = time.monotonic()
         if not self.hold.short and not self.hold.long:
             self.held_demand, self.held_demand_at = (0, 0), now
+            self.held_detail = (None, None, ())
             return
         if now - self.held_demand_at < 0.5:
             return
         short, long = 0, 0
+        oldest_short = oldest_long = None
+        prompts = []
         for queue in (self.hold.short, self.hold.long):
-            for job, _ in queue:
+            for job, arrived in queue:
                 body = job["request"]
                 if len(body["prompt"]) + body["max_tokens"] >= 8192:
                     long += 1
+                    prompts.append(len(body["prompt"]))
+                    if oldest_long is None or arrived < oldest_long:
+                        oldest_long = arrived
                 else:
                     short += 1
+                    if oldest_short is None or arrived < oldest_short:
+                        oldest_short = arrived
         self.held_demand = (short, long)
+        self.held_detail = (oldest_short, oldest_long, tuple(prompts))
         self.held_demand_at = now
 
     def snapshot(self, *, check=True):

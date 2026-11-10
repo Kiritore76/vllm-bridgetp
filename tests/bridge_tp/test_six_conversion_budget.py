@@ -173,7 +173,9 @@ class BudgetTests(unittest.TestCase):
 
 class DecisionTests(unittest.TestCase):
     def run_case(self, layout, short, long_rate, edge, blocks=0, seconds=120):
-        decider = d.ConversionDecider(profile="six_card", execute=True)
+        decider = d.ConversionDecider(
+            profile="six_card", execute=True, rules=dict(decision_budget=1)
+        )
         proposals = []
         for second in range(seconds + 1):
             value, modes, members = status(
@@ -205,7 +207,9 @@ class DecisionTests(unittest.TestCase):
                 )
 
     def test_light_workload_remains_keep_without_half_preparation(self):
-        decider = d.ConversionDecider(profile="six_card", execute=True)
+        decider = d.ConversionDecider(
+            profile="six_card", execute=True, rules=dict(decision_budget=1)
+        )
         for second in range(180):
             value, modes, members = status(long_rate=0.04, now=1000 + second)
             record = decider.observe(value, modes, members, 1000 + second)
@@ -215,7 +219,9 @@ class DecisionTests(unittest.TestCase):
             self.assertFalse(record["tilt"])
 
     def test_jitter_does_not_restart_confirmation_and_submission_latches(self):
-        decider = d.ConversionDecider(profile="six_card", execute=True)
+        decider = d.ConversionDecider(
+            profile="six_card", execute=True, rules=dict(decision_budget=1)
+        )
         proposals = []
         for second in range(50):
             short = 17.1 if second % 2 else 16.9
@@ -230,7 +236,9 @@ class DecisionTests(unittest.TestCase):
         )
 
     def test_prior_need_can_submit_immediately_when_source_cost_falls(self):
-        decider = d.ConversionDecider(profile="six_card", execute=True)
+        decider = d.ConversionDecider(
+            profile="six_card", execute=True, rules=dict(decision_budget=1)
+        )
         for second in range(31):
             value, modes, members = status("L2C", short=18, now=1000 + second)
             value["instances"][members["A"][0]]["requests"] = [

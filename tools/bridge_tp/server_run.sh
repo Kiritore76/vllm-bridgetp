@@ -51,7 +51,7 @@ export TMPDIR="$task_tmp" TEMP="$task_tmp" TMP="$task_tmp"
     tests.bridge_tp.test_multi_target tests.bridge_tp.test_pressure_sessions \
     tests.bridge_tp.test_migration_receivers tests.bridge_tp.test_six_card_gate \
     tests.bridge_tp.test_six_card_decider tests.bridge_tp.test_conversion_decider \
-    tests.bridge_tp.test_six_conversion_budget \
+    tests.bridge_tp.test_six_conversion_budget tests.bridge_tp.test_six_gap_rules \
     tests.bridge_tp.test_conversion_sequence tests.bridge_tp.test_conversion_safety \
     tests.bridge_tp.test_conversion_planner tests.bridge_tp.test_unified_scheduler \
     tests.bridge_tp.test_pressure_conversion tests.bridge_tp.test_pressure_sustained \

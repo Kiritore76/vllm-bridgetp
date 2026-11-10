@@ -50,7 +50,7 @@ class GuardTests(unittest.TestCase):
             dict(
                 evaluated_unix_s=10000 + t,
                 signals=dict(layout="L2C"),
-                policy="SIX_SERVICE_BUDGET_V1",
+                policy="SIX_GAP_RULES_V1",
                 decision="KEEP",
                 proposal=None,
                 prepared=None,
