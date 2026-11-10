@@ -772,16 +772,19 @@ class DecidedSequenceDriver(ConversionSequenceDriver):
             self.tilt_since = time.monotonic()
 
     def plan_tick(self):
-        """Cancel while waiting or draining once the proposal no longer fits."""
+        """Apply legacy demand reconsideration before the policy's commit point."""
         now = time.monotonic()
         state = self.executor.plan["state"]
-        # The six-card commit point is successful admission closure. Ordinary
-        # demand changes may withdraw a CREATED plan, never undo paid drainage.
-        # The executor deadline, hard capacity valve and recovery remain active.
+        # The new six-card policy commits at proposal; legacy six-card commits
+        # at admission closure. Demand changes cannot undo either commitment.
+        # Executor deadlines, physical checks and fault recovery remain active.
         if (
             state == "DRAINING"
-            and getattr(self.decider, "profile", "four_card") == "six_card"
-        ):
+            or (
+                state == "CREATED"
+                and getattr(self.decider, "rules", {}).get("decision_budget")
+            )
+        ) and getattr(self.decider, "profile", "four_card") == "six_card":
             return
         if (
             state not in {"CREATED", "DRAINING"}

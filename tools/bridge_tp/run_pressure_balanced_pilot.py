@@ -1289,6 +1289,8 @@ def _run(args, prepared):
             before_quiesce=bool(assist.get("before_quiesce")),
         )
 
+    budget_arrivals = decision.six_budget.Arrivals()
+
     def publish_layout_status(now, polled, dispatched, *, force=False):
         """Controller-side drain evidence per instance for the conversion executor.
 
@@ -1378,6 +1380,16 @@ def _run(args, prepared):
         )
         if hold is not None:
             workload["held_long_prompt_tokens"] = list(hold.held_long)
+        if getattr(co, "six_card", False) and origin_unix_s is not None:
+            workload["conversion_demand"] = budget_arrivals.snapshot(
+                jobs, max(0, now - origin_unix_s), now
+            )
+            if hold is not None:
+                held_short, held_long = dispatcher.held_demand
+                workload["conversion_demand"].update(
+                    held_long_count=held_long,
+                    held_short_count=held_short,
+                )
         path = args.run_dir / "layout_status.json"
         temporary = path.with_suffix(".tmp")
         temporary.write_text(
@@ -1385,6 +1397,15 @@ def _run(args, prepared):
                 dict(
                     schema="PRESSURE_LAYOUT_STATUS_V1",
                     unix_s=time.time(),
+                    service_shape=dict(
+                        platform=getattr(args, "platform", "a100"),
+                        tp1_context=args.source_context_limit,
+                        tp2_context=args.target_context_limit,
+                        tp1_slots=args.tp1_max_num_seqs,
+                        tp2_slots=args.tp2_max_num_seqs,
+                    )
+                    if getattr(co, "six_card", False)
+                    else None,
                     workload_origin_unix_s=origin_unix_s,
                     layout_revision=layout_state["revision"],
                     migration_resource_targets=list(session.groups)
@@ -1667,6 +1688,7 @@ def _run(args, prepared):
             )
             if getattr(args, "hold_unstarted", 0)
             else None,
+            observe_held=getattr(co, "six_card", False),
         )
         dispatcher.start()
         tracker, due_jobs = StreamTracker(), DueJobs(jobs)

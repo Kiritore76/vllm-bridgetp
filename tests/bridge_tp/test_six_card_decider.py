@@ -239,9 +239,13 @@ class BoundaryTests(unittest.TestCase):
         self.assertTrue(self.d.check(("B", "TP1"), s, modes)[0])
 
 
-class TimingTests(unittest.TestCase):
+class LegacyTimingTests(unittest.TestCase):
+    """The explicit decision_budget=0 compatibility path remains reproducible."""
+
     def test_l0_needs_the_full_120_seconds(self):
-        decider = d.ConversionDecider(profile="six_card", execute=True)
+        decider = d.ConversionDecider(
+            profile="six_card", execute=True, rules=dict(decision_budget=0)
+        )
         value, modes, members = native_status(
             "L1AC", short=19, blocks=1536, capacity=99
         )
@@ -255,7 +259,9 @@ class TimingTests(unittest.TestCase):
         self.assertEqual(proposals[0][1]["target_mode"], "TP1")
 
     def test_l3_needs_120_seconds_of_sustained_conditions(self):
-        decider = d.ConversionDecider(profile="six_card", execute=True)
+        decider = d.ConversionDecider(
+            profile="six_card", execute=True, rules=dict(decision_budget=0)
+        )
         proposals = []
         for second in range(121):
             value, modes, members = native_status(
@@ -271,20 +277,26 @@ class TimingTests(unittest.TestCase):
         self.assertEqual(proposals, [1120])
 
     def test_a_stopped_burst_cannot_enter_l3_after_120_seconds(self):
-        decider = d.ConversionDecider(profile="six_card", execute=True)
+        decider = d.ConversionDecider(
+            profile="six_card", execute=True, rules=dict(decision_budget=0)
+        )
         value, modes, members = native_status("L2C", short=6, blocks=16800)
         for t in range(1000, 1201):
             self.assertIsNone(decider.observe(value, modes, members, t)["proposal"])
 
     def test_l0_returns_in_30_seconds_when_short_rate_falls(self):
-        decider = d.ConversionDecider(profile="six_card", execute=True)
+        decider = d.ConversionDecider(
+            profile="six_card", execute=True, rules=dict(decision_budget=0)
+        )
         value, modes, members = native_status("L0", short=17)
         rows = [decider.observe(value, modes, members, t) for t in range(1000, 1031)]
         self.assertFalse(any(r["proposal"] for r in rows[:-1]))
         self.assertEqual(rows[-1]["proposal"]["bundle"], "B")
 
     def test_long_demand_drop_can_exit_l3_and_cooldown_still_applies(self):
-        decider = d.ConversionDecider(profile="six_card", execute=True)
+        decider = d.ConversionDecider(
+            profile="six_card", execute=True, rules=dict(decision_budget=0)
+        )
         decider.converted(1000)
         value, modes, members = native_status("L3", short=1)
         rows = [decider.observe(value, modes, members, t) for t in range(1000, 1121)]
@@ -292,7 +304,9 @@ class TimingTests(unittest.TestCase):
         self.assertEqual(rows[-1]["proposal"]["bundle"], "C")
 
     def test_busy_tp2_tilts_but_waits_until_naturally_empty(self):
-        decider = d.ConversionDecider(profile="six_card", execute=True)
+        decider = d.ConversionDecider(
+            profile="six_card", execute=True, rules=dict(decision_budget=0)
+        )
         value, modes, members = native_status("L3", short=8, blocks=1024, busy="C")
         for t in range(1000, 1050):
             for instance in value["instances"].values():
@@ -317,7 +331,9 @@ class TimingTests(unittest.TestCase):
         )
 
     def test_incomplete_registry_clears_hold_instead_of_becoming_l0(self):
-        decider = d.ConversionDecider(profile="six_card", execute=True)
+        decider = d.ConversionDecider(
+            profile="six_card", execute=True, rules=dict(decision_budget=0)
+        )
         value, modes, members = native_status("L0", short=17)
         decider.observe(value, modes, members, 1000)
         partial = {b: tp for b, tp in modes.items() if b != "B"}

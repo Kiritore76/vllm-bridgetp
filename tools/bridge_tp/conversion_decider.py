@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Rule-based TP layout conversion decider (user 11-03; record-only first).
+"""Rule-based TP layout conversion decider.
+
+Six-card default (11-10): rolling evidence of joint short/long service need,
+then a current cost-aware payback check before submitting one fixed direction.
+No pre-proposal tilt or demand cancellation after submission. The budget is a
+fixed-output experimental proxy, not calibrated strict goodoutput. The rules
+below describe the four-card policy and explicit six-card legacy compatibility.
 
 Does the current mix of requests suit the current layout? Two inputs, the
 short-request rate and the final blocks of the long requests in flight, and
@@ -56,6 +62,7 @@ from __future__ import annotations
 
 import math
 
+from tools.bridge_tp import six_conversion_budget as six_budget
 from tools.bridge_tp.pressure_cpu import load
 
 WINDOW_S = 60.0
@@ -112,6 +119,7 @@ RULES = dict(
 # Six-card policy is explicit: existing four-card callers keep RULES unchanged.
 SIX_CARD_RULES = dict(
     RULES,
+    decision_budget=1,
     prepare_long_ratio=0.8,
     l2_max_short=15.0,
     l2_min_long_blocks=12600,
@@ -228,6 +236,7 @@ class ConversionDecider:
         if profile == "six_card" and (
             self.rules["current_length"] is not True
             or self.rules["evacuate_busy"] is not False
+            or self.rules["decision_budget"] not in (0, 1)
         ):
             raise ValueError(
                 "six-card conversion uses current length and natural drain"
@@ -248,6 +257,8 @@ class ConversionDecider:
         self.long_seen = {}  # request id -> when first seen long
         self.long_last_seen = {}  # retain first-seen time while present/recent
         self.block_history = []  # (now, demand blocks)
+        self.budget_evidence = six_budget.Evidence()
+        self.committed_edge = None
 
     def smooth(self, now, tp1_cap, tpk_cap, waiting):
         r = self.rules
@@ -526,6 +537,8 @@ class ConversionDecider:
         """One decision record; ``proposal`` is the edge to convert, if any."""
         r = self.rules
         s = self.signals(status, bundles, members, now)
+        if self.profile == "six_card" and r["decision_budget"]:
+            return self.observe_budget(status, bundles, members, s, now)
         if self.profile == "six_card" and (
             set(bundles) != {"A", "B", "C"} or s["layout"] not in self.edges
         ):
@@ -635,6 +648,122 @@ class ConversionDecider:
             self.prepared = None  # record only: this hold is over
         return record
 
+    def observe_budget(self, status, bundles, members, signals, now):
+        """Strict, common entry policy; no business-affecting half-prepared state."""
+        layout = signals["layout"]
+        complete = set(bundles) == {"A", "B", "C"} and layout in self.edges
+        cooling = (
+            self.execute
+            and self.converted_at is not None
+            and now - self.converted_at < self.rules["cooldown_s"]
+        )
+        proposal, candidates = None, {}
+        if not complete:
+            self.budget_evidence.rows.clear()
+            signals["layout"] = None
+        for edge in self.edges.get(layout, ()) if complete else ():
+            key = f"{edge[0]}->{edge[1]}"
+            after = self._six_after(layout, edge)
+            budget = six_budget.estimate(status, bundles, members, edge, now, signals)
+            if budget["supported"]:
+                demand = status["workload"]["conversion_demand"]
+                signals["short_rate"] = budget["short_rate"]
+                signals["long_arrivals"] = demand["long_recent_count"] + demand.get(
+                    "held_long_count", 0
+                )
+            failed, _, urgent = self._check_six(edge, signals, after)
+            extreme = after in {"L0", "L3"}
+            # Preserve strict extreme-layout eligibility. Middle moves use both
+            # traffic classes and payback, rather than a single rate/KV line.
+            hard = not failed if extreme else True
+            span = (
+                self.rules["l0_hold_s"]
+                if after == "L0"
+                else self.rules["l3_hold_s"]
+                if after == "L3"
+                else self.rules["urgent_hold_s"]
+            )
+            evidence = self.budget_evidence.observe(
+                (layout, key),
+                now,
+                budget["supported"],
+                budget.get("demand_supports_move", False),
+                hard,
+                span,
+            )
+            repeated = (
+                not self.execute
+                and now - self.proposed_at.get(key, -float("inf"))
+                < self.rules["cooldown_s"]
+            )
+            ready = (
+                evidence["ready"]
+                and budget["worthwhile"]
+                and not cooling
+                and not repeated
+                and self.committed_edge is None
+            )
+            # Extreme entries require uninterrupted eligibility, even though
+            # ordinary service-budget noise uses a rolling evidence fraction.
+            if extreme:
+                ready = ready and all(
+                    row[2] for row in self.budget_evidence.rows[(layout, key)]
+                )
+            candidates[key] = dict(
+                failed=failed if extreme else [],
+                waiting=[],
+                urgent=urgent,
+                held_s=evidence["coverage_s"],
+                ready=ready,
+                budget=budget,
+                evidence=evidence,
+            )
+            if ready and (
+                proposal is None
+                or budget["net_tokens"] > proposal["budget"]["net_tokens"]
+            ):
+                proposal = dict(
+                    bundle=edge[0],
+                    target_mode=edge[1],
+                    layout=layout,
+                    held_s=evidence["coverage_s"],
+                    budget=budget,
+                )
+        if proposal is not None:
+            if self.execute:
+                self.committed_edge = (proposal["bundle"], proposal["target_mode"])
+            else:
+                self.proposed_at[f"{proposal['bundle']}->{proposal['target_mode']}"] = (
+                    now
+                )
+        self.prepared = None
+        self.since.clear()
+        return dict(
+            evaluated_unix_s=now,
+            mode="EXECUTE" if self.execute else "RECORD_ONLY",
+            signals=signals,
+            candidates=candidates,
+            cooling=cooling,
+            proposal=proposal,
+            prepared=None,
+            tilt=[],
+            decision="SUBMIT"
+            if proposal
+            else "COMMITTED"
+            if self.committed_edge
+            else "KEEP",
+            policy="SIX_SERVICE_BUDGET_V1",
+            preparation=dict(
+                phase="COMMITTED" if self.committed_edge else "OBSERVING",
+                approaching=None,
+                retained_no_room=[],
+                retained_not_quiet=[],
+                tilt_active=False,
+                tilt_expired=False,
+                capacity_recovery_wait_s=None,
+            ),
+        )
+
     def update_prepared(self, approaching, s, bundles, now):
         """Enter once the others allow it (see the module doc); leave at once."""
         prepared = self.prepared
@@ -716,8 +845,12 @@ class ConversionDecider:
         """A cancelled conversion started nothing, so it needs no cooldown."""
         self.since.clear()
         self.prepared = None
+        self.committed_edge = None
+        self.budget_evidence.rows.clear()
 
     def converted(self, now):
         self.converted_at = now
         self.since.clear()
         self.prepared = None
+        self.committed_edge = None
+        self.budget_evidence.rows.clear()

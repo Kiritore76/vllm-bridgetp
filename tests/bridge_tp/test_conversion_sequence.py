@@ -41,6 +41,16 @@ class Executor:
 
 
 class DecidedDriverTests(unittest.TestCase):
+    def test_budget_commit_does_not_reconsider_demand_before_or_after_closure(self):
+        driver, backend = self.run_driver([], profile="six_card")
+        backend.status = Mock(side_effect=AssertionError("must not re-evaluate"))
+        for state in ("CREATED", "DRAINING"):
+            driver.executor.plan = dict(state=state)
+            driver.plan_tick()
+            self.assertEqual(driver.executor.plan["state"], state)
+        backend.status.assert_not_called()
+        self.assertFalse(any(e["kind"] == "DECIDER_CANCEL" for e in self.events))
+
     def run_driver(self, states, **request):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

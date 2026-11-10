@@ -18,9 +18,19 @@ TIMEOUT_S = 5400
 
 SIMPLE_SCENARIO = "mixed_simple_six_v1"
 RETURN_SCENARIO = "mixed_return_six_v1"
+GUARD_SCENARIO = "mixed_guard_six_v1"
 
 
 def registration(scenario):
+    if scenario == GUARD_SCENARIO:
+        return dict(
+            input_sha256="96a46bc77137643862dfde118c323b4adb6903821a34c4e26579c826c04cde16",
+            requests=16385,
+            output_tokens=2589184,
+            horizon_s=2400,
+            controller_timeout_s=5400,
+            max_conversions=8,
+        )
     if scenario == SCENARIO:
         return dict(
             input_sha256=INPUT_SHA256,
@@ -92,6 +102,8 @@ def plan(inputs, scenario=SCENARIO, arm="static_L1AC"):
     return dict(
         schema="QWEN3_SIX_ROTATION_V2"
         if scenario == SCENARIO
+        else "QWEN3_SIX_GUARD_V1"
+        if scenario == GUARD_SCENARIO
         else "QWEN3_SIX_RETURN_V1"
         if scenario == RETURN_SCENARIO
         else "QWEN3_SIX_SIMPLE_V1",
@@ -187,6 +199,62 @@ def return_coverage(steps):
             return True
         if plan["target_bundle_mode"] == "TP2":
             merged = True
+    return False
+
+
+def pulse_coverage(records, origin):
+    """Require a live L2C observer through the pulse and its recovery window."""
+    rows = [r for r in records if 1500 <= r["evaluated_unix_s"] - origin < 1620]
+    times = [r["evaluated_unix_s"] - origin for r in rows]
+    observing = bool(rows) and all(
+        r.get("policy") == "SIX_SERVICE_BUDGET_V1"
+        and r["signals"]["layout"] == "L2C"
+        and r.get("decision") == "KEEP"
+        and not r.get("proposal")
+        and not r.get("prepared")
+        and not r.get("tilt")
+        and r.get("candidates")
+        and all(c["budget"]["supported"] for c in r["candidates"].values())
+        for r in rows
+    )
+    continuous = bool(times) and (
+        times[0] <= 1505
+        and times[-1] >= 1615
+        and all(0 < b - a <= 5 for a, b in zip(times, times[1:]))
+    )
+    return dict(
+        passed=bool(observing and continuous),
+        samples=len(rows),
+        start_s=times[0] if times else None,
+        end_s=times[-1] if times else None,
+        live_supported_l2c_keep=bool(observing),
+        continuous_observation=bool(continuous),
+        window_s=[1500, 1620],
+    )
+
+
+def guard_round_trip(steps, origin):
+    """Cover the intended long merge and sustained return, not an earlier split."""
+    merged = False
+    for step in steps:
+        plan = step["plan"]
+        if plan["state"] != "COMPLETED" or plan.get("bundle_id") != "A":
+            continue
+        triggered = step["triggered_unix_s"] - origin
+        completed = step["completed_unix_s"] - origin
+        if (
+            plan["target_bundle_mode"] == "TP2"
+            and 240 <= triggered < 1200
+            and completed < 1500
+        ):
+            merged = True
+        if (
+            merged
+            and plan["target_bundle_mode"] == "TP1"
+            and 1620 <= triggered < 2220
+            and completed < 2400
+        ):
+            return True
     return False
 
 
@@ -309,13 +377,36 @@ def assess(directory, scenario=SCENARIO, *, automatic=False):
             fixed_arrivals_valid=summary["fixed_arrivals_valid"],
             scope="complete baseline and cleanup; SLO/CPU/dispatch review follows",
         )
-        if automatic and scenario == RETURN_SCENARIO:
+        if automatic and scenario in {RETURN_SCENARIO, GUARD_SCENARIO}:
             value["mechanism_complete"] = True
             covered = return_coverage(steps)
             value["automatic_coverage"]["a_round_trip_completed"] = covered
             if not covered:
                 value["passed"] = False
                 value["errors"].append("A merge/split round trip not covered")
+            if scenario == GUARD_SCENARIO:
+                origin = read(scene / "controller/layout_status.json")[
+                    "workload_origin_unix_s"
+                ]
+                timed = guard_round_trip(steps, origin)
+                value["automatic_coverage"]["timed_a_round_trip_completed"] = timed
+                if not timed:
+                    value["passed"] = False
+                    value["errors"].append("intended sustained round trip not covered")
+                records = [
+                    json.loads(line)
+                    for line in (scene / "controller/conversion_decider.jsonl")
+                    .read_text()
+                    .splitlines()
+                    if line.strip()
+                ]
+                value["pulse_coverage"] = pulse_coverage(records, origin)
+                if not value["pulse_coverage"]["passed"]:
+                    value["passed"] = False
+                    value["errors"].append("short pulse KEEP observation not covered")
+                if value["automatic_coverage"]["safely_aborted"]:
+                    value["passed"] = False
+                    value["errors"].append("guard scenario conversion aborted")
     except (OSError, ValueError, KeyError, TypeError, IndexError) as error:
         value["errors"].append(repr(error))
     write(directory.parent / "rotation_acceptance.json", value)

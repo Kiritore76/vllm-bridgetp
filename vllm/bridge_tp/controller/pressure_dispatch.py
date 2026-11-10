@@ -15,13 +15,25 @@ class ScheduledDispatch:
     This isolates control-loop waits, not whole-process/GIL or host stalls.
     """
 
-    def __init__(self, jobs, submit, pools, origin_monotonic, max_seconds, hold=None):
+    def __init__(
+        self,
+        jobs,
+        submit,
+        pools,
+        origin_monotonic,
+        max_seconds,
+        hold=None,
+        observe_held=False,
+    ):
         self.jobs = sorted(jobs, key=lambda job: job["at_s"])
         self.submit = submit
         self.pools = tuple(pools)
         self.origin = origin_monotonic
         self.deadline = origin_monotonic + max_seconds
         self.hold = hold
+        self.observe_held = observe_held
+        self.held_demand = (0, 0)
+        self.held_demand_at = -float("inf")
         self.lock = threading.Lock()
         self.stop = threading.Event()
         self.dispatched = {}
@@ -90,6 +102,7 @@ class ScheduledDispatch:
                     self._send(job, pools)
                 else:
                     hold.add(job, due)
+            self._publish_held_demand()
             with self.lock:
                 pools = self.pools
             deferred = []
@@ -109,6 +122,7 @@ class ScheduledDispatch:
                 hold.sent(job, value)
             for job, released_at in deferred:
                 hold.retry(job, released_at)
+            self._publish_held_demand()
             if index == len(self.jobs) and not hold.waiting():
                 return
             wait = hold.poll_s
@@ -116,6 +130,27 @@ class ScheduledDispatch:
                 due = self.origin + self.jobs[index]["at_s"]
                 wait = min(wait, max(0.0, due - time.monotonic()))
             self.stop.wait(wait)
+
+    def _publish_held_demand(self):
+        """Only the arrival writer iterates deques; readers get one atomic tuple."""
+        if not self.observe_held:
+            return
+        now = time.monotonic()
+        if not self.hold.short and not self.hold.long:
+            self.held_demand, self.held_demand_at = (0, 0), now
+            return
+        if now - self.held_demand_at < 0.5:
+            return
+        short, long = 0, 0
+        for queue in (self.hold.short, self.hold.long):
+            for job, _ in queue:
+                body = job["request"]
+                if len(body["prompt"]) + body["max_tokens"] >= 8192:
+                    long += 1
+                else:
+                    short += 1
+        self.held_demand = (short, long)
+        self.held_demand_at = now
 
     def snapshot(self, *, check=True):
         with self.lock:

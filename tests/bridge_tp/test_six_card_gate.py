@@ -218,7 +218,9 @@ class PreparationTests(unittest.TestCase):
     def test_forecast_prepares_before_confirmation_without_proposing(self):
         from tests.bridge_tp.test_six_card_decider import signal
 
-        decider = d.ConversionDecider(profile="six_card", execute=True)
+        decider = d.ConversionDecider(
+            profile="six_card", execute=True, rules=dict(decision_budget=0)
+        )
         s = signal("L1AC", short=2, blocks=9000, trend=11000)
         s.update(kv_room=dict.fromkeys("ABC", True), quiet=dict.fromkeys("ABC", False))
         decider.signals = lambda *args: s
@@ -285,9 +287,7 @@ class SplitGateTests(Base):
 
     def publish(self, full=0.95, capacity=0.1):
         value = status(target_capacity=capacity)
-        value["instances"]["B-g2-tp2"]["unified_fullness"] = snapshot(
-            self.now[0], full
-        )
+        value["instances"]["B-g2-tp2"]["unified_fullness"] = snapshot(self.now[0], full)
         self.write(value)
 
     def test_split_skips_the_route_fullness_item(self):
@@ -302,9 +302,7 @@ class SplitGateTests(Base):
 
     def test_split_still_requires_matching_identities(self):
         value = status()
-        value["instances"]["B-g2-tp2"]["unified_fullness"] = snapshot(
-            self.now[0], 0.5
-        )
+        value["instances"]["B-g2-tp2"]["unified_fullness"] = snapshot(self.now[0], 0.5)
         del value["instances"]["B-g2-tp2"]
         self.write(value)
         self.assertFalse(self.backend.gate(self.split_plan))

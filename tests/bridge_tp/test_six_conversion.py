@@ -42,6 +42,7 @@ class ControllerTests(unittest.TestCase):
                 manifest = plan["instances"]
                 argv = plan["controller_argv"]
                 args = NS(
+                    cards=6,
                     run_dir=directory,
                     source_inventory=root / "source",
                     target_inventory=root / "target",
@@ -200,6 +201,13 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(set(status["migration_resource_targets"]), set(wanted))
                 self.assertEqual(set(status["migration_resource_sources"]), set(links))
                 results = pc.read_json(directory / "pressure_request_results.json")
+                status = pc.read_json(directory / "layout_status.json")
+                self.assertIn("conversion_demand", status["workload"])
+                self.assertEqual(
+                    status["workload"]["conversion_demand"]["schema"],
+                    "SIX_CAUSAL_DEMAND_V1",
+                )
+                self.assertEqual(status["service_shape"]["tp1_slots"], 16)
                 audit = [
                     json.loads(line)
                     for line in (directory / "pressure_audit.jsonl")

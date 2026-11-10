@@ -306,10 +306,29 @@ SCENARIOS["mixed_return_six_v1"] = dict(
     long=(16384, 8192),
     arrival_seed=6,
 )
+# Sustained demand should justify a round trip; the isolated ten-second pulse
+# has the same peak as the real return, without enough sustained evidence.
+# Keep seed 6 before running; do not tune the seed to conversion outcomes.
+SCENARIOS["mixed_guard_six_v1"] = dict(
+    phases=(
+        (0, 60, 4.0, 0.0, "warm"),
+        (60, 240, 10.0, 0.0, "s1_short"),
+        (240, 1200, 2.0, 0.06, "l_long"),
+        (1200, 1500, 2.0, 0.0, "l_retreat"),
+        (1500, 1510, 17.5, 0.0, "short_pulse"),
+        (1510, 1620, 2.0, 0.0, "pulse_recovery"),
+        (1620, 2220, 17.5, 0.0, "s2_return"),
+        (2220, 2340, 8.0, 0.0, "s3_recovery"),
+        (2340, 2400, 1.0, 0.0, "tail"),
+    ),
+    long=(16384, 8192),
+    arrival_seed=6,
+)
 SIX_COMPARISON_SCENARIOS = (
     "mixed_rotation_six_v2",
     "mixed_simple_six_v1",
     "mixed_return_six_v1",
+    "mixed_guard_six_v1",
 )
 # Long-request capacity (user 11-06): short 8/s, deep long requests stepping up
 # every 240s, so each layout and TP2 slot count shows when long requests stop
