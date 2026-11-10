@@ -1174,6 +1174,28 @@ def _run(args, prepared):
             )
         )
 
+    def recompute_target(bundle, known):
+        """The bundle's new TP2 once ACTIVE: a merge's continuation target."""
+        for pool_id, tp in tuple(tp_of.items()):
+            name = instance_of.get(pool_id, pool_id)
+            if (
+                pool_id not in known
+                and tp > 1
+                and bundle is not None
+                and name.startswith(bundle + "-")
+                and co.lifecycle(pool_id) == "ACTIVE"
+            ):
+                return pool_id
+        return None
+
+    recompute = load("pressure_recompute").DrainRecompute(
+        ingress=ingress,
+        coordinator=co,
+        audit=audit.write,
+        tp_of=tp_of,
+        target_of=recompute_target,
+    )
+
     def request_rows(raw):
         rows = []
         for row in raw["requests"]:
@@ -1226,6 +1248,9 @@ def _run(args, prepared):
             return "request is not a current candidate of the source"
         if candidate.migrating or candidate.finished:
             return "request is migrating or finished"
+        # A recompute marks its source request's owner as parked at once.
+        if getattr(co, "_owners", {}).get(candidate.request_id) == "recompute-parked":
+            return "request is being recomputed"
         if actions is None:
             return "no start binding (session not ready or no observed rates)"
         if "evacuate" in assist:
@@ -1446,6 +1471,7 @@ def _run(args, prepared):
                     else None,
                     assist_result=layout_state["assist_result"],
                     assist_priority_sources=layout_state["assist_priority_sources"],
+                    recompute=recompute.snapshot(),
                     workload=workload,
                     # Ledger state of every drain-assist session (S5a cap).
                     assist_sessions={
@@ -1615,6 +1641,9 @@ def _run(args, prepared):
                     }
                     if not session.reconcile(groups, links):
                         deferred.append("migration_resources")
+        if control.get("recompute"):
+            # Idempotent by sequence number; owners are QUIESCING by now.
+            recompute.request(control["recompute"])
         # A deferred retirement re-reads the same file on the next tick.
         layout_state.update(
             signature=None if deferred else signature,
@@ -1895,6 +1924,11 @@ def _run(args, prepared):
                             "scope": "empirical budget plus configured recovery tokens",
                         }
                     )
+            # Before held arrivals see a new instance: a parked continuation
+            # takes it first (it was admitted long before them).
+            recompute.tick(
+                now, pools, {raw["pool_id"]: raw for raw in inventories}
+            )
             dispatcher.publish(pools)
             dispatched = dispatcher.snapshot()
             index_of = {pool.pool_id: n for n, pool in enumerate(pools)}

@@ -568,7 +568,7 @@ def decider_request(request):
         <= set(request)
         <= required
         | {"rules", "prestart", "pre_tilt", "assist", "multi"}
-        | {"max_conversions", "evacuate", "profile"}
+        | {"max_conversions", "evacuate", "profile", "recompute"}
         or request.get("evacuate", False) not in (True, False)
         or request.get("evacuate")
         and not request.get("multi")
@@ -580,6 +580,9 @@ def decider_request(request):
         or request.get("max_conversions") == 0
         and not request.get("multi")
         or request.get("prestart", False) not in (True, False)
+        or request.get("recompute", False) not in (True, False)
+        or request.get("recompute")
+        and request.get("profile") != "six_card"
         or request.get("pre_tilt", False) not in (True, False)
         or request.get("assist", False) not in (True, False)
         or request["decider"] not in {"RECORD_ONLY", "EXECUTE"}
@@ -1114,6 +1117,8 @@ def start_conversion(spec, scene, plan, common, processes, publish, requests):
         prestart=bool(plan["conversion"].get("prestart")),
         **sequence_args,
     )
+    # Six-card drain recompute (pressure_recompute) is an explicit run option.
+    backend.recompute_enabled = bool(plan["conversion"].get("recompute"))
     driver_type = pc.ConversionDriver
     if plan["conversion"].get("multi"):
         from tools.bridge_tp.conversion_sequence import DecidedSequenceDriver

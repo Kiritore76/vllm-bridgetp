@@ -128,6 +128,14 @@ SAFETY = dict(
     # TP2s). A merge starts when the retained side carries the short rate.
     carry_tp1_short=3.3,
     carry_tp2_short=4.0,
+    # Drain recompute (user 11-10, opt-in): once a TP1-to-TP2 merge has
+    # drained this long, at most this many requests (prompt + output so far
+    # within the token budget) still run on the group and no assist or
+    # migration is moving them, they continue on the new TP2 by recompute.
+    # Observable quantities only: no remaining length is predicted.
+    recompute_after_s=45.0,
+    recompute_max_requests=3,
+    recompute_max_tokens=65536,
 )
 
 
@@ -172,6 +180,12 @@ class ControllerConversionBackend:
         self.channel_closing = None
         self.layout_assist = None
         self.layout_tilt = []
+        # Drain recompute (pressure_recompute): off unless the run enables it.
+        self.recompute_enabled = False
+        self.layout_recompute = None
+        self.recompute_seq = 0
+        self.recompute_since = None
+        self.last_recompute_reason = None
         self.safety = dict(SAFETY, **(safety or {}))
         self.speed_margin = speed_margin
         self.gate_since = None
@@ -266,6 +280,7 @@ class ControllerConversionBackend:
                 ],
                 # Decider pre-tilt: instances that get no new long request.
                 tilt=self.layout_tilt,
+                recompute=self.layout_recompute,
             ),
         )
         self.ops.event("LAYOUT_CONTROL", revision=self.revision, changes=changes)

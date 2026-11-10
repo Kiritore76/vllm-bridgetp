@@ -305,6 +305,41 @@ def cleanup(plan, write):
         active.unlink()
 
 
+def recompute_choice(instances, refs, waited_s, safety):
+    """(reason, None) or (None, choice): which requests a merge recomputes.
+
+    Every request still on the group goes, or none: the drain ends with the
+    last one. Triggers only on what is observed now (drain time, request
+    count, context so far); it never predicts a remaining length.
+    """
+    if waited_s < safety["recompute_after_s"]:
+        return "drain younger than the recompute delay", None
+    if any(instances[i].get("sessions") for i in refs):
+        return "a migration session touches the group", None
+    rows = [
+        dict(
+            request_id=r["request_id"],
+            instance=i,
+            context_tokens=r["prompt_tokens"] + r["generated"],
+        )
+        for i in refs
+        for r in instances[i]["requests"]
+    ]
+    if not rows:
+        return "group already empty", None
+    if sum(instances[i].get("streams_pending", 0) for i in refs) != len(rows):
+        return "controller streams differ from native inventory", None
+    if len(rows) > safety["recompute_max_requests"]:
+        return (
+            f"{len(rows)} requests exceed the recompute cap "
+            f"{safety['recompute_max_requests']}: natural drain"
+        ), None
+    tokens = sum(r["context_tokens"] for r in rows)
+    if tokens > safety["recompute_max_tokens"]:
+        return f"{tokens} context tokens exceed the recompute budget", None
+    return None, dict(requests=rows, context_tokens=tokens)
+
+
 class SixBackend(SequenceBackend):
     ack_timeout_s = 180
 
@@ -363,10 +398,54 @@ class SixBackend(SequenceBackend):
         self.ops.event("STEP_BEGIN", before=modes, after=after)
         self.write_layout({}, tilt=[])
 
+    def recompute_step(self, plan, now):
+        """Request the group's recompute once (see ``recompute_choice``)."""
+        if not getattr(self, "recompute_enabled", False) or getattr(
+            self, "layout_recompute", None
+        ):
+            return
+        status = self.status()
+        if not self.fresh(status):
+            return
+        instances = status["instances"]
+        refs = [r.instance_id for r in self.refs(plan)]
+        if any(instances.get(i, {}).get("tp_degree") != 1 for i in refs):
+            return  # only a TP1-to-TP2 merge drains behind long requests
+        clock = self.clock()
+        if self.recompute_since is None:
+            self.recompute_since = clock
+        result = status.get("assist_result")
+        if self.assist_seq > self.assist_step_start_seq and (
+            result is None or result["seq"] != self.assist_seq
+        ):
+            reason, choice = "an assist START is unanswered", None
+        else:
+            reason, choice = recompute_choice(
+                instances, refs, clock - self.recompute_since, self.safety
+            )
+        if choice is None:
+            if reason != self.last_recompute_reason:
+                self.decision("RECOMPUTE", choice=None, reason=reason)
+                self.last_recompute_reason = reason
+            return
+        self.recompute_seq += 1
+        self.layout_recompute = dict(
+            seq=self.recompute_seq,
+            plan_id=plan["plan_id"],
+            bundle=plan["bundle_id"],
+            drained_s=round(clock - self.recompute_since, 3),
+            **choice,
+        )
+        self.decision("RECOMPUTE", choice=self.layout_recompute, reason=None)
+        self.write_layout({})
+        self.ops.event("RECOMPUTE_REQUESTED", **self.layout_recompute)
+
     def assist_choice(self, plan, status):
         """Optional TP1-to-TP2 help; refusal never gates natural drainage."""
         if not self.fresh(status):
             return "status stale", None
+        if getattr(self, "layout_recompute", None) is not None:
+            return "group requests are being recomputed", None
         result = status.get("assist_result")
         if self.assist_seq > self.assist_step_start_seq:
             if result is None or result["seq"] != self.assist_seq:

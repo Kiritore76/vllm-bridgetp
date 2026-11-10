@@ -212,6 +212,9 @@ class SequenceBackend(pc.ControllerConversionBackend):
         self.service_gate_passed = False
         self.layout_assist = None
         self.layout_tilt = []
+        self.layout_recompute = None
+        self.recompute_since = None
+        self.last_recompute_reason = None
         self._specs = None
 
     def channel(self, source):
@@ -490,7 +493,7 @@ class SequenceBackend(pc.ControllerConversionBackend):
 
 def validate(request):
     """Validate the sequence without creating processes or mutating a registry."""
-    allowed = {"sequence", "base_port", "prestart", "safety", "profile"}
+    allowed = {"sequence", "base_port", "prestart", "safety", "profile", "recompute"}
     if not set(request) <= allowed or not {"sequence", "base_port"} <= set(request):
         raise ValueError("invalid conversion sequence fields")
     if (
@@ -500,6 +503,10 @@ def validate(request):
         raise ValueError("invalid sequence service port")
     if type(request.get("prestart", False)) is not bool:
         raise ValueError("invalid prestart flag")
+    if type(request.get("recompute", False)) is not bool or (
+        request.get("recompute") and request.get("profile") != "six_card"
+    ):
+        raise ValueError("drain recompute is a six-card option")
     if not set(request.get("safety", {})) <= set(pc.SAFETY):
         raise ValueError("invalid sequence safety overrides")
     if request.get("profile", "four_card") not in {"four_card", "six_card"}:

@@ -208,6 +208,9 @@ class ConversionExecutor:
                     return self.plan_status()
                 if self.plan["method"] != "DRAIN":
                     self.backend.assisted_step(self.plan, now)
+                recompute = getattr(self.backend, "recompute_step", None)
+                if recompute is not None:
+                    recompute(self.plan, now)
                 evidence = self.backend.drain_evidence(self.plan)
                 # Freshness is judged when the evidence is in hand. A decision
                 # time taken before the scrape would reject every new sample as

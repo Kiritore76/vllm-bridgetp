@@ -53,8 +53,14 @@ def post_streaming_completion(
     *,
     retain_chunks: bool = True,
     encoded_body: bytes | None = None,
+    on_response: Callable[[Any], None] | None = None,
 ) -> dict[str, Any]:
-    """Consume one OpenAI-compatible SSE completion and expose each token."""
+    """Consume one OpenAI-compatible SSE completion and expose each token.
+
+    ``on_response`` receives the open HTTP response before the first read, so
+    another thread can end the stream (client disconnect aborts the request
+    in vLLM); the reader then raises because ``[DONE]`` never arrives.
+    """
     request_started_monotonic = time.monotonic()
     request_started_unix_s = time.time()
     request = urllib.request.Request(
@@ -91,6 +97,8 @@ def post_streaming_completion(
 
     try:
         with urllib.request.urlopen(request, timeout=timeout_s) as response:
+            if on_response is not None:
+                on_response(response)
             for raw_line in response:
                 line = raw_line.decode(errors="replace").strip()
                 if not line.startswith("data: "):

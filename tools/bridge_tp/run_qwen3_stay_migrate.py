@@ -373,6 +373,12 @@ def main(argv=None):
         help="start the replacement engines behind a start gate while draining",
     )
     parser.add_argument(
+        "--conversion-recompute",
+        action="store_true",
+        help="a six-card merge recomputes its last few long requests on the "
+        "new TP2 after a drain delay instead of waiting for them",
+    )
+    parser.add_argument(
         "--decider-multi",
         action="store_true",
         help="keep converting as the decider proposes, deciding on known lengths",
@@ -621,6 +627,10 @@ def main(argv=None):
         parser.error("the conversion decider runs on the phase-shift workload")
     if args.conversion_prestart and not (args.conversion or args.conversion_decider):
         parser.error("--conversion-prestart needs a conversion")
+    if args.conversion_recompute and not (
+        args.cards == 6 and (args.conversion or args.conversion_decider)
+    ):
+        parser.error("--conversion-recompute needs a six-card conversion")
     if (args.decider_pre_tilt or args.decider_assist) and not args.conversion_decider:
         parser.error("this option needs --conversion-decider")
     if args.decider_evacuate and not args.decider_multi:
@@ -1083,6 +1093,8 @@ def main(argv=None):
                 pre_tilt=args.decider_pre_tilt,
                 assist=args.decider_assist,
             )
+            if args.conversion_recompute:
+                spec["conversion"]["recompute"] = True
             if args.decider_multi:
                 spec["conversion"].update(
                     multi=True,
@@ -1122,6 +1134,7 @@ def main(argv=None):
                     profile="six_card",
                     base_port=8400,
                     prestart=args.conversion_prestart,
+                    **({"recompute": True} if args.conversion_recompute else {}),
                     sequence=[
                         dict(
                             bundle=edge[2],
@@ -1334,6 +1347,7 @@ def main(argv=None):
                     unlimited=args.decider_max_conversions == 0,
                     assist=args.decider_assist,
                     prestart=args.conversion_prestart,
+                    recompute=args.conversion_recompute,
                 )
             if args.phase_shift and args.phase_scenario == "auto_smoke_six_v1":
                 plan["migration_coverage_required"] = False

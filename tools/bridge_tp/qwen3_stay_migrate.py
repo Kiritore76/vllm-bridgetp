@@ -169,6 +169,10 @@ def metrics(run_dir, jobs, horizon=300.0, natural_eos=False):
         migration_starts=len(starts),
         source_releases=len(releases),
         committed_requests=sum(r["migrated"] for r in values),
+        recomputed_requests=sum(r.get("recomputed", False) for r in values),
+        maximum_recompute_stall_s=max(
+            (r.get("recompute_stall_s") or 0 for r in values), default=0.0
+        ),
         channel_reuses=sum(r.get("kind") == "pressure_channel_reused" for r in audit),
         cancellations_requested=sum(
             r.get("kind") == "pressure_cancel_requested" for r in audit

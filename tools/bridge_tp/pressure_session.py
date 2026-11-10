@@ -276,6 +276,9 @@ class RollingPressureSession:
         if self.record is not None:
             raise ValueError("one session per migration driver")
         stream = self.ingress.for_server_id(candidate.request_id)
+        if getattr(stream, "recompute", None) is not None:
+            # Its recorder already has a seam at the recompute boundary.
+            raise not_started("request continues by drain recompute")
         cap = stream.payload["max_tokens"]
         if candidate.max_output_tokens != cap or cap > 8192:
             raise not_started("selected request stop contract differs from live stream")

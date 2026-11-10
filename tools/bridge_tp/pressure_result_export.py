@@ -27,13 +27,20 @@ def write_request_results(path, dispatched, jobs, origin_unix_s):
                     job_id=job_id,
                     client_id=value.client_id,
                     server_id=value.server_id,
-                    initial_pool=value.pool_id,
-                    request=value.payload,
+                    # A drain recompute rebinds pool/payload to its
+                    # continuation; the client's request is the original.
+                    initial_pool=getattr(value, "initial_pool_id", None)
+                    or value.pool_id,
+                    request=getattr(value, "original_payload", None)
+                    or value.payload,
                     source_done=value.future.done(),
                     source_error=str(value.future.exception())
                     if value.future.done() and value.future.exception()
                     else None,
                     response=value.recorder.stats(),
+                    recompute=value.recompute.summary()
+                    if getattr(value, "recompute", None) is not None
+                    else None,
                     source_transport={
                         key: value.future.result().get(key)
                         for key in (

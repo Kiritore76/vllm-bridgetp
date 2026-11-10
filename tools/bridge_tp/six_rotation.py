@@ -137,7 +137,9 @@ def plan(inputs, scenario=SCENARIO, arm="static_L1AC"):
     )
 
 
-def configure_plan(current, *, recipe, unlimited=False, assist=False, prestart=False):
+def configure_plan(
+    current, *, recipe, unlimited=False, assist=False, prestart=False, recompute=False
+):
     """Fail closed on unfair service settings; allow honest zero migration."""
     scenario = recipe["scenario"]
     registered = registration(scenario)
@@ -158,6 +160,7 @@ def configure_plan(current, *, recipe, unlimited=False, assist=False, prestart=F
         # CPU-side pre-start of the replacements is an explicit choice of the
         # run (user 11-10) and is recorded with the contract below.
         bool(conversion.get("prestart")) != prestart
+        or bool(conversion.get("recompute")) != recompute
         or bool(conversion.get("assist")) != (assist if unlimited else False)
         or conversion.get("evacuate")
         or conversion.get("max_conversions")
@@ -186,6 +189,7 @@ def configure_plan(current, *, recipe, unlimited=False, assist=False, prestart=F
             max_conversions=conversion.get("max_conversions") if conversion else None,
             assist=bool(conversion and conversion.get("assist")),
             prestart=bool(conversion and conversion.get("prestart")),
+            recompute=bool(conversion and conversion.get("recompute")),
             instances=rows,
         ),
     )

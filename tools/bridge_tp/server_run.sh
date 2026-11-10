@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# 当前任务：六卡40分钟自动场；收紧L0/L3进入，保持预启动与不限转换次数。
+# 当前任务：六卡40分钟自动场+合并排空受限重算（排空满45秒且组内≤3条、上下文≤65536 token时在新TP2续算）；其余同7d2自动场。
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
 py=$venv/bin/python
 model=/root/autodl-tmp/models/Qwen3-8B
-branch=bridgetp/unified-scheduler
+branch=bridgetp/drain-recompute
 cd "$repo" || exit 1
 [ -x "$py" ] || { echo '找不到现有虚拟环境，请核对路径。'; exit 1; }
 source "$venv/bin/activate" || exit 1
@@ -15,13 +15,13 @@ git fetch origin "refs/heads/$branch:refs/remotes/origin/$branch" || exit 1
 revision=$(git rev-parse HEAD)
 [ "$revision" = "$(git rev-parse "origin/$branch")" ] || { echo '请先git pull --ff-only。'; exit 1; }
 mkdir -p /root/autodl-tmp/bridgetp/results || exit 1
-run=/root/autodl-tmp/bridgetp/results/qwen3_six_guard40_extreme_auto_$(date +%Y%m%d_%H%M%S)_${RANDOM}
+run=/root/autodl-tmp/bridgetp/results/qwen3_six_guard40_recompute_auto_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 printf '%s\n' "$revision" > "$run/revision.txt"
-printf 'Six-card 2400s trial with stricter L0/L3 backlog entry; causal short carry gate, proposal CPU prestart, optional current-length assist, unlimited proposals; same seed6/input; no performance claim.\n' > "$run/scope.txt"
+printf 'Six-card 2400s trial, same rules as the 7d2 extreme auto run plus bounded drain recompute on TP1-to-TP2 merges (after 45s drain, <=3 requests, <=65536 context tokens, continued on the new TP2); same seed6/input; no performance claim.\n' > "$run/scope.txt"
 echo "本批目录：$run"
-echo '先Linux CPU检查；通过后只跑同输入2400秒自动场，L0/L3进入更严格，不限转换次数、不自动重试。'
-echo '新启动门按保留侧短流承接能力判断；提议时CPU预启动，关门前需求持续消失可撤回，关门后继续完成。'
+echo '先Linux CPU检查；通过后只跑同输入2400秒自动场，规则同7d2自动场，新增合并排空受限重算；不自动重试。'
+echo '合并关门后排空满45秒、组内只剩≤3条且上下文合计≤65536 token时，中止源端并在新TP2上用已输出token续算；否则照常自然排空。'
 echo '40分钟到达；含CPU/启动/预热/drain/打包，预计50–65分钟，慢机器或积压可能更久。'
 smi=
 pack_result() {
@@ -48,6 +48,7 @@ printf '%s\n' "$task_tmp" > "$run/temporary_directory.txt"
 export TMPDIR="$task_tmp" TEMP="$task_tmp" TMP="$task_tmp"
 "$py" -B -c 'import json,sys,types,unittest; from pathlib import Path; p=types.ModuleType("vllm"); p.__path__=[str(Path.cwd()/"vllm")]; sys.modules["vllm"]=p; s=unittest.defaultTestLoader.loadTestsFromNames(sys.argv[2:]); r=unittest.TextTestRunner(verbosity=2).run(s); ok=r.wasSuccessful() and not r.skipped; Path(sys.argv[1]).write_text(json.dumps(dict(scope="CPU only; no CUDA/NCCL", tests=r.testsRun, passed=ok, failures=[t.id() for t,_ in r.failures], errors=[t.id() for t,_ in r.errors], skipped=[t.id() for t,_ in r.skipped]),indent=2)+"\n"); raise SystemExit(not ok)' \
     "$run/cpu_summary.json" \
+    tests.bridge_tp.test_drain_recompute tests.bridge_tp.test_pressure_ingress \
     tests.bridge_tp.test_six_conversion tests.bridge_tp.test_conversion_channels \
     tests.bridge_tp.test_multi_target tests.bridge_tp.test_pressure_sessions \
     tests.bridge_tp.test_migration_receivers tests.bridge_tp.test_six_card_gate \
@@ -96,7 +97,7 @@ echo '开始2400秒自动场；25:00起10秒短峰应保持，27:00起持续短�
     --cards 6 --static-layout L1AC --phase-shift --phase-scenario mixed_guard_six_v1 \
     --scheduler unified --hold-queue --kv-short-exempt --overload-migrate --migrate-current-length \
     --expanded-context --current-machine --repetitions 1 \
-    --conversion-decider execute --decider-multi --decider-assist --conversion-prestart \
+    --conversion-decider execute --decider-multi --decider-assist --conversion-prestart --conversion-recompute \
     --migration-targets all --decider-max-conversions 0 \
     --model "$model" \
     --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
@@ -110,6 +111,7 @@ cat "$case_dir/auto_check.log"
 printf '%s\n' "$check_status" > "$case_dir/check_exit_code.txt"
 status=$runner_status
 if [ "$status" = 0 ]; then status=$check_status; fi
+echo '重算是否触发、续算停顿和新A接流时间见conversion_decisions.jsonl的RECOMPUTE与pressure_audit的drain_recompute_*。'
 echo '须真实完成长段A合并和持续短段A拆回；短峰及恢复须有效L2C/KEEP，零转换/中止/证据缺失不算覆盖通过；完整输出/ACK/trace/空闲/收尾须通过。'
 pack_result "$status" || exit 1
 exit "$status"

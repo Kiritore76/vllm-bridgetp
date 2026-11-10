@@ -417,12 +417,17 @@ def result_metrics(rows, jobs, origin, lag_budget, natural_eos=False):
         held = (row.get("dispatch_timing") or {}).get("held_s", 0.0)
         started = transport["request_started_unix_s"] - held
         lag = started - origin - job["at_s"]
+        # A drain recompute commits the same seam as a migration; count and
+        # report it apart (no KV moved, its pause is a recompute stall).
+        recomputed = (row.get("recompute") or {}).get("state") == "COMPLETED"
+        stall = row["response"]["handoff_stall_s"]
         metrics.append(
             dict(
                 job_id=row["job_id"],
                 pool=row["initial_pool"],
                 role="background" if "background" in row["job_id"] else "injection",
-                migrated=row["response"]["committed"],
+                migrated=row["response"]["committed"] and not recomputed,
+                recomputed=recomputed,
                 planned_s=job["at_s"],
                 dispatch_lag_s=lag,
                 arrival_valid=-0.01 <= lag <= lag_budget,
@@ -435,7 +440,8 @@ def result_metrics(rows, jobs, origin, lag_budget, natural_eos=False):
                 intervals=len(gaps),
                 slow_intervals=sum(g > 0.1 for g in gaps),
                 slow_fraction=sum(g > 0.1 for g in gaps) / len(gaps) if gaps else 0,
-                handoff_stall_s=row["response"]["handoff_stall_s"],
+                handoff_stall_s=None if recomputed else stall,
+                recompute_stall_s=stall if recomputed else None,
             )
         )
     return metrics

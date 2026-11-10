@@ -3,13 +3,15 @@
 
 from __future__ import annotations
 
+import inspect
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 
 from .online_io import ProxyRecorder, post_streaming_completion
+from .pressure_recompute import close_response
 from .response_proxy import ProxyMode
 from .sampling_contract import freeze_strict_greedy_sampling
 
@@ -58,6 +60,29 @@ class IngressStream:
     executor_submitted_at: float | None = None
     http_thread_started_at: float | None = None
     held_s: float = 0.0
+    # Drain recompute (pressure_recompute): the job, the client's original
+    # request/pool (export keeps them), and the source response to close.
+    recompute: object = None
+    original_payload: dict | None = None
+    initial_pool_id: str | None = None
+    _response: object = field(default=None, repr=False)
+    _abort_requested: bool = field(default=False, repr=False)
+    _abort_lock: object = field(default_factory=threading.Lock, repr=False)
+
+    def bind_response(self, response):
+        with self._abort_lock:
+            self._response = response
+            abort = self._abort_requested
+        if abort:
+            close_response(response)
+
+    def abort_source(self):
+        """Close the source stream; vLLM aborts on client disconnect."""
+        with self._abort_lock:
+            self._abort_requested = True
+            response = self._response
+        if response is not None:
+            close_response(response)
 
 
 class PressureIngress:
@@ -97,6 +122,12 @@ class PressureIngress:
             if post is None
             else post
         )
+        try:
+            self._post_takes_response = (
+                "on_response" in inspect.signature(self.post).parameters
+            )
+        except (TypeError, ValueError):
+            self._post_takes_response = False
         self.streams = {}
         self._open_streams = {}  # what reconcile still has to look at
         self._lock = threading.RLock()
@@ -164,15 +195,36 @@ class PressureIngress:
 
             def consume():
                 value.http_thread_started_at = self.clock()
+                started_unix_s = time.time()
+                options = (
+                    dict(on_response=value.bind_response)
+                    if self._post_takes_response
+                    else {}
+                )
+                result = error = None
                 try:
-                    return self.post(
+                    result = self.post(
                         self.urls[value.pool_id],
                         value.payload,
                         self.timeout_s,
                         recorder.on_source_token,
+                        **options,
                     )
+                except Exception as failure:
+                    # Only a recompute's deliberate disconnect is not an error.
+                    if value.recompute is None:
+                        raise
+                    error = failure
                 finally:
                     self.service.finish(client_id)
+                if value.recompute is None:
+                    return result
+                try:
+                    return value.recompute.finish_source(
+                        result, error, started_unix_s, self.post, self.timeout_s
+                    )
+                finally:
+                    self.service.finish(recorder.target_service_id)
 
             # A transport error can follow acceptance. Retain identity tracking
             # until completion/cleanup; this record reserves no KV capacity.
@@ -273,6 +325,22 @@ class PressureIngress:
                 )
         for record in records:
             self.coordinator.audit(record)
+
+    def rebind(self, value, pool_id, key, payload):
+        """Point a parked stream at its continuation's admission and engine.
+
+        Reconcile then matches the continuation's server request (same client
+        id) against ``payload``; the export keeps the original request/pool.
+        """
+        with self._lock:
+            if value.original_payload is None:
+                value.original_payload = value.payload
+                value.initial_pool_id = value.pool_id
+            value.payload = payload
+            value.pool_id = pool_id
+            value.reservation_key = key
+            value.server_id = None
+            self._open_streams[value.client_id] = value
 
     def for_server_id(self, request_id: str) -> IngressStream:
         with self._lock:
