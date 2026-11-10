@@ -493,5 +493,90 @@ class RecomputeChoiceTests(unittest.TestCase):
         )
 
 
+
+class SmokeCheckTests(unittest.TestCase):
+    """The GPU smoke's checker on synthetic records of both outcomes."""
+
+    def scene(self, root, *, requested):
+        from tools.bridge_tp import drain_recompute_smoke as smoke
+
+        scene = root / "trial" / "scene"
+        (scene / "controller").mkdir(parents=True)
+        plan = dict(state="COMPLETED", bundle_id="A")
+        (scene / "conversion_sequence_result.json").write_text(
+            json.dumps(dict(steps=[dict(plan=plan)]))
+        )
+        events = [
+            dict(kind="TRIGGER", unix_s=110.0),
+            dict(kind="PLAN_STATE", state="DRAINING", unix_s=111.0),
+        ]
+        decisions = [dict(kind="RECOMPUTE", unix_s=120.0, reason="drain younger")]
+        rows = [
+            dict(
+                job_id="s",
+                request=dict(max_tokens=2),
+                response=dict(
+                    emitted=[
+                        dict(index=0, origin="source", unix_s=1.0),
+                        dict(index=1, origin="source", unix_s=2.0),
+                    ]
+                ),
+                source_error=None,
+            )
+        ]
+        if requested:
+            events.append(dict(kind="RECOMPUTE_REQUESTED", unix_s=156.0))
+            decisions.append(
+                dict(kind="RECOMPUTE", unix_s=156.0, reason=None, choice=dict(seq=1))
+            )
+            emitted = [
+                dict(index=i, origin="source" if i < 2 else "target", unix_s=float(i))
+                for i in range(4)
+            ]
+            rows.append(
+                dict(
+                    job_id="l",
+                    request=dict(max_tokens=4),
+                    response=dict(emitted=emitted, handoff_stall_s=30.0),
+                    source_error=None,
+                    source_transport=dict(finish_reason="length"),
+                    recompute=dict(
+                        state="COMPLETED",
+                        source_pool="A-g1",
+                        target_pool="A-g3-tp2",
+                        cutover=2,
+                        requested_at=156.0,
+                        source_ended_at=156.2,
+                        parked_at=157.0,
+                        resumed_at=180.0,
+                    ),
+                )
+            )
+        for name, items in (
+            ("conversion_events.jsonl", events),
+            ("controller/conversion_decisions.jsonl", decisions),
+            ("controller/pressure_audit.jsonl", []),
+        ):
+            (scene / name).write_text("".join(json.dumps(x) + "\n" for x in items))
+        (scene / "controller/layout_status.json").write_text(
+            json.dumps(dict(workload_origin_unix_s=0.0))
+        )
+        (scene / "controller/pressure_request_results.json").write_text(
+            json.dumps(rows)
+        )
+        return smoke, root / "trial"
+
+    def test_exercised_and_missing_coverage_codes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            smoke, trial = self.scene(Path(folder), requested=True)
+            value, code = smoke.check(trial)
+            self.assertEqual(code, 0, value["errors"])
+            self.assertEqual(value["timeline_s"]["recompute_requested"], 156.0)
+            self.assertTrue(value["jobs"][0]["seam"])
+        with tempfile.TemporaryDirectory() as folder:
+            smoke, trial = self.scene(Path(folder), requested=False)
+            self.assertEqual(smoke.check(trial)[1], 2)
+
+
 if __name__ == "__main__":
     unittest.main()
