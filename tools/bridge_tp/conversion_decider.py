@@ -139,6 +139,11 @@ SIX_CARD_RULES = dict(
     # A proposal still waiting to start is withdrawn once its deficit has been
     # gone this long; after the group closed it is never undone.
     gap_withdraw_s=30.0,
+    # Extreme layouts remove one TP class entirely. Require a real backlog,
+    # not just traffic/KV volume, throughout their existing 120s entry hold.
+    extreme_long_held_min=2,
+    extreme_short_held_min=16,
+    extreme_short_wait_s=2.0,
     prepare_long_ratio=0.8,
     l2_max_short=15.0,
     l2_min_long_blocks=12600,
@@ -278,6 +283,7 @@ class ConversionDecider:
         self.block_history = []  # (now, demand blocks)
         self.budget_evidence = six_budget.Evidence()
         self.committed_edge = None
+        self.extreme_observed_at = None
 
     def smooth(self, now, tp1_cap, tpk_cap, waiting):
         r = self.rules
@@ -669,7 +675,7 @@ class ConversionDecider:
             self.prepared = None  # record only: this hold is over
         return record
 
-    def _check_gap(self, edge, s, after, demand):
+    def _check_gap(self, edge, s, after, demand, now=None):
         """(failed, waiting, immediate) of one edge under the gap rules.
 
         Middle moves need a deficit the current layout already shows; the two
@@ -700,6 +706,36 @@ class ConversionDecider:
                 waiting.append("bundle serves a long request")
             return failed, waiting, False
         failed, waiting, _ = self._check_six(edge, s, after)
+        if after in {"L0", "L3"}:
+            stamp = demand.get("sampled_at")
+            if not six_budget.number(stamp) or now is None or not 0 <= now - stamp <= 2:
+                failed.append("extreme-layout backlog evidence is missing or stale")
+            if not all(six_budget.number(s[k]) for k in ("short_rate", "long_blocks")):
+                failed.append("invalid extreme-layout demand")
+            if after == "L0":
+                if s["long_blocks"] != 0:
+                    failed.append("L0 requires all long requests to finish")
+                kind, count_min, wait_min = (
+                    "short",
+                    r["extreme_short_held_min"],
+                    r["extreme_short_wait_s"],
+                )
+            else:
+                kind, count_min, wait_min = (
+                    "long",
+                    r["extreme_long_held_min"],
+                    r["gap_merge_held_long_s"],
+                )
+            count, wait = (
+                demand.get(f"held_{kind}_{suffix}") for suffix in ("count", "wait_s")
+            )
+            if (
+                not six_budget.number(count)
+                or not six_budget.number(wait)
+                or count < count_min
+                or wait < wait_min
+            ):
+                failed.append(f"no substantial held {kind} backlog for {after}")
         return failed, waiting, False
 
     def _gap_demand(self, status, signals):
@@ -719,6 +755,7 @@ class ConversionDecider:
         signals["long_blocks"] += sum(-(-n // BLOCK_TOKENS) for n in held)
         signals["long_arrivals"] += demand.get("held_long_count", 0)
         signals["held_long_wait_s"] = demand.get("held_long_wait_s", 0.0)
+        signals["held_long_count"] = demand.get("held_long_count", 0)
         signals["held_short_wait_s"] = demand.get("held_short_wait_s", 0.0)
         signals["held_short_count"] = demand.get("held_short_count", 0)
         return demand
@@ -731,7 +768,7 @@ class ConversionDecider:
         after = self._six_after(layout, edge)
         if after is None:
             return ["not a neighbouring six-card layout"]
-        return self._check_gap(edge, signals, after, demand)[0]
+        return self._check_gap(edge, signals, after, demand, now)[0]
 
     def observe_gap(self, status, bundles, members, signals, now):
         """Latch one observed deficit; the driver may withdraw before closure."""
@@ -745,6 +782,10 @@ class ConversionDecider:
             and now - self.converted_at < r["cooldown_s"]
         )
         proposal, candidates = None, {}
+        interrupted = self.extreme_observed_at is not None and not (
+            0 <= now - self.extreme_observed_at <= 2
+        )
+        self.extreme_observed_at = now
         if not complete:
             # A partial ACTIVE registry during a conversion is not a layout.
             self.since.clear()
@@ -752,7 +793,11 @@ class ConversionDecider:
         for edge in self.edges.get(layout, ()) if complete else ():
             key = f"{edge[0]}->{edge[1]}"
             after = self._six_after(layout, edge)
-            failed, waiting, immediate = self._check_gap(edge, signals, after, demand)
+            failed, waiting, immediate = self._check_gap(
+                edge, signals, after, demand, now
+            )
+            if after in {"L0", "L3"} and interrupted:
+                self.since.pop(key, None)
             if failed:
                 self.since.pop(key, None)
             else:

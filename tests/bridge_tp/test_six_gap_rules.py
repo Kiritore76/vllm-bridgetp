@@ -210,9 +210,9 @@ class CommitAndSignalTests(unittest.TestCase):
             decider.gap_pending_failed(value, modes, members, 1200, "L1AC", edge),
         )
 
-    def test_extreme_layouts_keep_their_confirmed_conditions(self):
+    def test_extreme_exits_are_not_delayed_by_the_stricter_entries(self):
         proposals, _, _ = run("L1AC", 150, lambda s: dict(short=20))
-        self.assertEqual(proposals, [(120, "B", "TP1")])
+        self.assertEqual(proposals, [])  # rate alone no longer enters L0
         proposals, _, _ = run("L3", 60, lambda s: dict(short=17))
         self.assertEqual(proposals, [(30, "C", "TP1")])
         proposals, _, _ = run("L0", 60, lambda s: dict(short=2))
@@ -238,6 +238,108 @@ class CommitAndSignalTests(unittest.TestCase):
         self.assertIn("worthwhile", record["candidates"]["A->TP2"]["budget"])
         # Four-card rules are untouched.
         self.assertNotIn("gap_split_short", d.ConversionDecider().rules)
+
+
+class ExtremeEntryTests(unittest.TestCase):
+    def test_l3_requires_multiple_long_requests_with_substantial_wait(self):
+        for count, wait in ((0, 0), (1, 300), (2, 44.9)):
+            with self.subTest(count=count, wait=wait):
+                proposals, record, _ = run(
+                    "L2C",
+                    150,
+                    lambda s, count=count, wait=wait: dict(
+                        short=2, **long_demand(count, wait)
+                    ),
+                )
+                self.assertEqual(proposals, [])
+                self.assertIn(
+                    "no substantial held long backlog for L3",
+                    record["candidates"]["C->TP2"]["failed"],
+                )
+
+    def test_l3_still_enters_for_a_sustained_real_long_backlog(self):
+        proposals, _, _ = run(
+            "L2C", 120, lambda s: dict(short=2, **long_demand(2, wait=45))
+        )
+        self.assertEqual(proposals, [(120, "C", "TP2")])
+
+    def test_l0_requires_a_short_backlog_not_just_a_high_short_rate(self):
+        for count, wait in ((0, 0), (15, 10), (16, 1.99)):
+            with self.subTest(count=count, wait=wait):
+                proposals, _, _ = run(
+                    "L1AC",
+                    150,
+                    lambda s, count=count, wait=wait: dict(
+                        short=20, held_short_count=count, held_short_wait_s=wait
+                    ),
+                )
+                self.assertEqual(proposals, [])
+        proposals, _, _ = run(
+            "L1AC",
+            120,
+            lambda s: dict(short=20, held_short_count=16, held_short_wait_s=2),
+        )
+        self.assertEqual(proposals, [(120, "B", "TP1")])
+
+    def test_l0_requires_even_the_last_long_request_to_finish(self):
+        value, modes, members = sample(
+            "L1AC",
+            1000,
+            short=20,
+            blocks=1000,
+            held_short_count=32,
+            held_short_wait_s=10,
+        )
+        decider = d.ConversionDecider(profile="six_card")
+        reasons = decider.gap_pending_failed(
+            value, modes, members, 1000, "L1AC", ("B", "TP1")
+        )
+        self.assertIn("L0 requires all long requests to finish", reasons)
+
+    def test_a_brief_short_backlog_does_not_enter_l0(self):
+        proposals, _, _ = run(
+            "L1AC",
+            150,
+            lambda s: dict(
+                short=20,
+                held_short_count=32 if s < 10 else 0,
+                held_short_wait_s=10 if s < 10 else 0,
+            ),
+        )
+        self.assertEqual(proposals, [])
+
+    def test_extreme_confirmation_restarts_after_the_backlog_clears(self):
+        proposals, _, _ = run(
+            "L2C",
+            181,
+            lambda s: dict(short=2, **long_demand(1 if s == 60 else 2, wait=60)),
+        )
+        self.assertEqual(proposals, [(181, "C", "TP2")])
+
+    def test_observation_gap_cannot_count_toward_the_extreme_hold(self):
+        decider = d.ConversionDecider(profile="six_card", execute=True)
+        proposals = []
+        for t in [*range(61), *range(100, 221)]:
+            value, modes, members = sample("L2C", 1000 + t, **long_demand(2, wait=60))
+            if decider.observe(value, modes, members, 1000 + t)["proposal"]:
+                proposals.append(t)
+        self.assertEqual(proposals, [220])
+
+    def test_stale_or_unknown_backlog_cannot_enter_an_extreme(self):
+        for change in (
+            dict(sampled_at=900),
+            dict(sampled_at=2000),
+            dict(held_long_wait_s=float("nan")),
+        ):
+            decider = d.ConversionDecider(profile="six_card", execute=True)
+            for t in range(121):
+                value, modes, members = sample(
+                    "L2C", 1000 + t, **long_demand(2, wait=60)
+                )
+                value["workload"]["conversion_demand"].update(change)
+                self.assertIsNone(
+                    decider.observe(value, modes, members, 1000 + t)["proposal"]
+                )
 
 
 class WiringTests(unittest.TestCase):
