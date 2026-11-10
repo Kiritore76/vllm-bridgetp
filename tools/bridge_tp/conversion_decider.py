@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Rule-based TP layout conversion decider.
 
-Six-card default (11-10): rolling evidence of joint short/long service need,
-then a current cost-aware payback check before submitting one fixed direction.
-No pre-proposal tilt or demand cancellation after submission. The budget is a
-fixed-output experimental proxy, not calibrated strict goodoutput. The rules
-below describe the four-card policy and explicit six-card legacy compatibility.
+Six-card default (11-10): sustained observed deficits propose one fixed edge.
+While the start check waits, a vanished deficit can withdraw the proposal;
+after admission closes, demand changes cannot undo the conversion. No
+pre-proposal tilt. The old service-budget estimate is recorded only. The
+rules below describe the four-card and explicit legacy compatibility paths.
 
 Does the current mix of requests suit the current layout? Two inputs, the
 short-request rate and the final blocks of the long requests in flight, and
@@ -136,6 +136,9 @@ SIX_CARD_RULES = dict(
     # kept dipping below the line and the split came about 230s late.
     gap_split_short=16.0,
     gap_split_hold_s=30.0,
+    # A proposal still waiting to start is withdrawn once its deficit has been
+    # gone this long; after the group closed it is never undone.
+    gap_withdraw_s=30.0,
     prepare_long_ratio=0.8,
     l2_max_short=15.0,
     l2_min_long_blocks=12600,
@@ -699,11 +702,9 @@ class ConversionDecider:
         failed, waiting, _ = self._check_six(edge, s, after)
         return failed, waiting, False
 
-    def observe_gap(self, status, bundles, members, signals, now):
-        """Propose on an observed, sustained deficit; commit at the proposal."""
-        r = self.rules
-        workload = status.get("workload") or {}
-        demand = workload.get("conversion_demand")
+    def _gap_demand(self, status, signals):
+        """Fold the controller's held requests into the signals; the demand."""
+        demand = (status.get("workload") or {}).get("conversion_demand")
         if status.get("workload_origin_unix_s") is not None and (
             status.get("service_shape") is None or demand is None
         ):
@@ -712,13 +713,6 @@ class ConversionDecider:
                 "six-card decision signals missing: service_shape/conversion_demand"
             )
         demand = demand or {}
-        layout = signals["layout"]
-        complete = set(bundles) == {"A", "B", "C"} and layout in self.edges
-        cooling = (
-            self.execute
-            and self.converted_at is not None
-            and now - self.converted_at < r["cooldown_s"]
-        )
         # Unified runs hold every request in one queue: its long prompts and
         # count are published with the demand, not as held_long_prompt_tokens.
         held = demand.get("held_long_prompt_tokens", ())
@@ -727,6 +721,29 @@ class ConversionDecider:
         signals["held_long_wait_s"] = demand.get("held_long_wait_s", 0.0)
         signals["held_short_wait_s"] = demand.get("held_short_wait_s", 0.0)
         signals["held_short_count"] = demand.get("held_short_count", 0)
+        return demand
+
+    def gap_pending_failed(self, status, bundles, members, now, layout, edge):
+        """Why a proposed, not yet started move no longer has its deficit."""
+        signals = self.signals(status, bundles, members, now)
+        demand = self._gap_demand(status, signals)
+        signals["layout"] = layout
+        after = self._six_after(layout, edge)
+        if after is None:
+            return ["not a neighbouring six-card layout"]
+        return self._check_gap(edge, signals, after, demand)[0]
+
+    def observe_gap(self, status, bundles, members, signals, now):
+        """Latch one observed deficit; the driver may withdraw before closure."""
+        r = self.rules
+        demand = self._gap_demand(status, signals)
+        layout = signals["layout"]
+        complete = set(bundles) == {"A", "B", "C"} and layout in self.edges
+        cooling = (
+            self.execute
+            and self.converted_at is not None
+            and now - self.converted_at < r["cooldown_s"]
+        )
         proposal, candidates = None, {}
         if not complete:
             # A partial ACTIVE registry during a conversion is not a layout.
@@ -1006,8 +1023,18 @@ class ConversionDecider:
             return "L0 suits the load again"
         return None
 
-    def cancelled(self):
-        """A cancelled conversion started nothing, so it needs no cooldown."""
+    def cancelled(self, now=None):
+        """A cancelled conversion started nothing; four-card needs no cooldown.
+
+        The six-card gap policy cools down after a withdrawal or abort as well:
+        without it the next second proposed the same move again (GPU 11-10).
+        """
+        if (
+            now is not None
+            and self.profile == "six_card"
+            and self.rules["decision_budget"] == 2
+        ):
+            self.converted_at = now
         self.since.clear()
         self.prepared = None
         self.committed_edge = None

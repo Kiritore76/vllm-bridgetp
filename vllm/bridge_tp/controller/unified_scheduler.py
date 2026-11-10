@@ -44,8 +44,8 @@ COOLDOWN_S = 15.0
 CONVERSION_FULLNESS_MAX = 0.9
 
 
-def route_gate_ready(snapshot, now, max_age_s=2.0):
-    """Require complete, fresh route evidence before removing serving capacity."""
+def route_evidence_ready(snapshot, now, max_age_s=2.0):
+    """Validate route evidence independently of a fullness threshold."""
     if not snapshot or snapshot.get("kind") != "route":
         return False
     if snapshot.get("complete") is not True:
@@ -61,7 +61,15 @@ def route_gate_ready(snapshot, now, max_age_s=2.0):
         type(v) not in (int, float) or not math.isfinite(v) or v < 0 for v in values
     ):
         return False
-    return values[-1] == max(values[:-1]) and values[-1] < CONVERSION_FULLNESS_MAX
+    return values[-1] == max(values[:-1])
+
+
+def route_gate_ready(snapshot, now, max_age_s=2.0):
+    """Require complete, fresh route evidence before removing serving capacity."""
+    return (
+        route_evidence_ready(snapshot, now, max_age_s)
+        and snapshot["value"] < CONVERSION_FULLNESS_MAX
+    )
 
 
 # Token rate standing in for an instance first seen idle, so its value is zero.
@@ -196,7 +204,8 @@ def rank_admission(rows, pool_sort_ids=None):
     return sorted(
         rows,
         key=lambda r: (
-            r["fullness"]["value"], r["waiting"] or 0,
+            r["fullness"]["value"],
+            r["waiting"] or 0,
             pool_sort_ids.get(r["pool_id"], r["pool_id"]),
         ),
     )

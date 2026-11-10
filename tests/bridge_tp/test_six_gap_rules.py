@@ -179,6 +179,37 @@ class CommitAndSignalTests(unittest.TestCase):
             decider.observe(value, modes, members, 1000)["decision"], "KEEP"
         )
 
+    def test_a_withdrawal_or_abort_cools_down_before_the_next_proposal(self):
+        """GPU 11-10: an aborted merge was proposed again 0.7s later."""
+        proposals, _, decider = run("L2C", 40, lambda s: dict(short=16.5))
+        self.assertEqual(proposals, [(30, "A", "TP1")])
+        decider.cancelled(1040.0)
+        self.assertIsNone(decider.committed_edge)
+        again = []
+        for second in range(41, 260):
+            value, modes, members = sample("L2C", 1000 + second, short=16.5)
+            record = decider.observe(value, modes, members, 1000 + second)
+            if record["proposal"]:
+                again.append(second)
+        self.assertEqual(again, [160])  # 120s cooldown after the withdrawal
+        # Four-card behaviour is unchanged: no cooldown after a cancel.
+        four = d.ConversionDecider()
+        four.cancelled(5.0)
+        self.assertIsNone(four.converted_at)
+
+    def test_pending_check_reports_a_vanished_deficit(self):
+        decider = d.ConversionDecider(profile="six_card", execute=True)
+        edge = ("A", "TP2")
+        value, modes, members = sample("L1AC", 1000, **long_demand(4))
+        self.assertEqual(
+            decider.gap_pending_failed(value, modes, members, 1000, "L1AC", edge), []
+        )
+        value, modes, members = sample("L1AC", 1200)
+        self.assertIn(
+            "long demand within what L1AC holds",
+            decider.gap_pending_failed(value, modes, members, 1200, "L1AC", edge),
+        )
+
     def test_extreme_layouts_keep_their_confirmed_conditions(self):
         proposals, _, _ = run("L1AC", 150, lambda s: dict(short=20))
         self.assertEqual(proposals, [(120, "B", "TP1")])

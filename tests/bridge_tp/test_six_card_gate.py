@@ -279,6 +279,149 @@ class SixValveTests(Base):
         self.assertFalse(self.decisions("VALVE_CONTINUE"))
 
 
+class CarryGateTests(Base):
+    """Gap policy merge: the retained side must carry the short requests."""
+
+    def setUp(self):
+        super().setUp()
+        self.backend.gate_mode = "UNIFIED"
+        self.backend.gate_carry = True
+
+    def publish(self, short, capacity=1.6, full=1.4):
+        # GPU 11-10 at the proposal: retained KV past the hard line, slow ITL.
+        value = status(target_capacity=capacity)
+        retained = value["instances"]["B-g2-tp2"]
+        retained["unified_fullness"] = snapshot(self.now[0], full)
+        retained["tp_degree"] = 2
+        value["workload"] = dict(
+            short_window_s=30,
+            short_window_arrivals=round(short * 30),
+            short_window_long=0,
+            conversion_demand=dict(
+                short_window_s=30,
+                short_count=round(short * 30),
+                sampled_at=self.now[0],
+            ),
+        )
+        self.write(value)
+
+    def test_merge_starts_under_long_pressure_when_shorts_are_carried(self):
+        self.publish(short=1.9)
+        self.assertTrue(self.backend.gate(PLAN))
+        record = self.decisions("GATE")[-1]
+        self.assertEqual(
+            record["carry"], dict(short_rate=1.9, retained_short_capacity=4.0)
+        )
+
+    def test_merge_waits_while_the_retained_side_cannot_carry_the_shorts(self):
+        self.publish(short=4.5, capacity=0.1, full=0.2)
+        self.assertFalse(self.backend.gate(PLAN))
+        self.assertIn("cannot carry", self.decisions("GATE")[-1]["reason"])
+
+    def test_causal_arrivals_are_used_even_when_admissions_are_held(self):
+        self.publish(short=5.0)
+        value = self.backend.status()
+        value["workload"]["short_window_arrivals"] = 10  # few actually dispatched
+        self.write(value)
+        self.assertFalse(self.backend.gate(PLAN))
+        self.assertEqual(self.decisions("GATE")[-1]["carry"]["short_rate"], 5.0)
+
+    def test_invalid_or_stale_arrivals_and_unknown_tp_cannot_open(self):
+        for change in (
+            dict(short_count=float("nan")),
+            dict(short_count=-1),
+            dict(short_window_s=0),
+            dict(short_window_s=float("inf")),
+            dict(sampled_at=self.now[0] - 3),
+            dict(sampled_at=self.now[0] + 1),
+        ):
+            self.publish(short=1.9)
+            value = self.backend.status()
+            value["workload"]["conversion_demand"].update(change)
+            self.write(value)
+            self.assertFalse(self.backend.gate(PLAN))
+        self.publish(short=1.9)
+        value = self.backend.status()
+        del value["instances"]["B-g2-tp2"]["tp_degree"]
+        self.write(value)
+        self.assertFalse(self.backend.gate(PLAN))
+
+    def test_fresh_status_cannot_hide_old_or_incomplete_retained_evidence(self):
+        for change in (
+            dict(sampled_at=self.now[0] - 3),
+            dict(published_at=self.now[0] + 1),
+            dict(complete=False),
+            dict(value=None),
+        ):
+            self.publish(short=1.9)
+            value = self.backend.status()
+            value["instances"]["B-g2-tp2"]["unified_fullness"].update(change)
+            self.write(value)
+            self.assertFalse(self.backend.gate(PLAN))
+
+    def test_missing_arrival_window_or_identity_still_blocks(self):
+        value = status(target_capacity=0.1)
+        value["instances"]["B-g2-tp2"]["unified_fullness"] = snapshot(self.now[0])
+        self.write(value)
+        self.assertFalse(self.backend.gate(PLAN))
+        self.assertIn("cannot carry", self.decisions("GATE")[-1]["reason"])
+        value = status()
+        del value["instances"]["B-g2-tp2"]
+        self.write(value)
+        self.assertFalse(self.backend.gate(PLAN))
+        self.assertIn("mismatch", self.decisions("GATE")[-1]["reason"])
+
+    def test_without_the_gap_policy_the_hard_item_still_blocks(self):
+        self.backend.gate_carry = False
+        self.publish(short=1.9)
+        self.assertFalse(self.backend.gate(PLAN))
+        self.assertIn("hard", self.decisions("GATE")[-1]["reason"])
+
+    def test_split_is_unchanged_by_the_carry_check(self):
+        self.publish(short=17.5, capacity=0.1, full=1.4)
+        split = dict(PLAN, target_bundle_mode="TP1")
+        self.assertTrue(self.backend.gate(split))
+        self.assertIsNone(self.decisions("GATE")[-1]["carry"])
+
+
+class PrestartTests(Base):
+    def test_waiting_prestart_is_idempotent_and_withdrawal_stops_it(self):
+        backend = self.backend
+        backend.prestart_enabled = backend.prestart_at_proposal = True
+        backend.registry = NS(get=lambda ref: NS(lifecycle="ACTIVE"))
+        backend.channel_graph = backend.channel_plan = None
+        backend.gate = lambda plan: False
+        backend.replacement_specs = lambda plan: [
+            ("replacement", 10, dict(instance_id="replacement"), {})
+        ]
+        started, stopped = [], []
+        backend.ops.start = lambda extra: started.append(extra)
+        backend.ops.stop = lambda ids: stopped.extend(ids)
+        backend.write_layout = Mock()
+        for _ in range(3):
+            self.assertFalse(backend.precheck(PLAN))
+        self.assertEqual(len(started), 1)
+        self.assertFalse(pc.Path(started[0]["start_gate"]).exists())
+        backend.write_layout.assert_not_called()  # sources still accept requests
+        backend.restore_admission(PLAN)
+        self.assertEqual(stopped, ["replacement"])
+        self.assertIsNone(backend.prestarted)
+
+    def test_gap_policy_prestarts_at_the_proposal_not_at_the_closure(self):
+        started = []
+        backend = self.backend
+        backend.gate_mode = "UNIFIED"
+        backend.prestart = lambda plan: started.append(plan["plan_id"])
+        backend.registry = NS(get=lambda ref: NS(lifecycle="ACTIVE"))
+        backend.channel_graph = backend.channel_plan = None
+        backend.gate = lambda plan: False  # the start check is still waiting
+        self.assertFalse(backend.precheck(PLAN))
+        self.assertEqual(started, [])  # legacy: only at the closure
+        backend.prestart_at_proposal = True
+        self.assertFalse(backend.precheck(PLAN))
+        self.assertEqual(started, ["manual-A"])
+
+
 class SplitGateTests(Base):
     def setUp(self):
         super().setUp()

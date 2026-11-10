@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 当前任务：六卡2400秒自动往返与10秒短峰抗干扰；不限转换次数。
+# 当前任务：六卡40分钟缺口规则＋新启动门；提议时CPU预启动，转换不限次。
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
@@ -15,12 +15,13 @@ git fetch origin "refs/heads/$branch:refs/remotes/origin/$branch" || exit 1
 revision=$(git rev-parse HEAD)
 [ "$revision" = "$(git rev-parse "origin/$branch")" ] || { echo '请先git pull --ff-only。'; exit 1; }
 mkdir -p /root/autodl-tmp/bridgetp/results || exit 1
-run=/root/autodl-tmp/bridgetp/results/qwen3_six_guard40_auto_$(date +%Y%m%d_%H%M%S)_${RANDOM}
+run=/root/autodl-tmp/bridgetp/results/qwen3_six_guard40_carry_auto_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 printf '%s\n' "$revision" > "$run/revision.txt"
-printf 'Six-card 2400s automatic round trip and isolated 10s short pulse; seed6; current-length migration and optional assist; unlimited proposals; experimental service-budget policy; no performance claim.\n' > "$run/scope.txt"
+printf 'Six-card 2400s gap-policy trial with causal short carry gate, withdrawal before closure, cooldown after abort/withdrawal and CPU prestart at proposal; seed6; optional current-length assist; unlimited proposals; no performance claim.\n' > "$run/scope.txt"
 echo "本批目录：$run"
 echo '先Linux CPU检查；通过后只跑2400秒自动往返/短峰场，不限转换次数，不自动重试。'
+echo '新启动门按保留侧短流承接能力判断；提议时CPU预启动，关门前需求持续消失可撤回，关门后继续完成。'
 echo '40分钟到达；含CPU/启动/预热/drain/打包，预计50–65分钟，慢机器或积压可能更久。'
 smi=
 pack_result() {
@@ -95,7 +96,7 @@ echo '开始2400秒自动场；25:00起10秒短峰应保持，27:00起持续短�
     --cards 6 --static-layout L1AC --phase-shift --phase-scenario mixed_guard_six_v1 \
     --scheduler unified --hold-queue --kv-short-exempt --overload-migrate --migrate-current-length \
     --expanded-context --current-machine --repetitions 1 \
-    --conversion-decider execute --decider-multi --decider-assist \
+    --conversion-decider execute --decider-multi --decider-assist --conversion-prestart \
     --migration-targets all --decider-max-conversions 0 \
     --model "$model" \
     --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \

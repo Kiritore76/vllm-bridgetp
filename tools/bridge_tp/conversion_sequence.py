@@ -763,6 +763,11 @@ class DecidedSequenceDriver(ConversionSequenceDriver):
                 ("B", "TP2"): "PHYSICAL",
             }.get((step["bundle"], step["target_mode"]), "STRICT")
         )
+        gap = (
+            getattr(self.decider, "profile", "four_card") == "six_card"
+            and getattr(self.decider, "rules", {}).get("decision_budget") == 2
+        )
+        self.backend.gate_carry = self.backend.prestart_at_proposal = gap
         # Beginning clears the tilt, but routing keeps it until the bundle closes;
         # the start gate's service check ran before the load the tilt added.
         tilt = self.tilt_before_step
@@ -775,6 +780,13 @@ class DecidedSequenceDriver(ConversionSequenceDriver):
         """Apply legacy demand reconsideration before the policy's commit point."""
         now = time.monotonic()
         state = self.executor.plan["state"]
+        if (
+            getattr(self.decider, "profile", "four_card") == "six_card"
+            and getattr(self.decider, "rules", {}).get("decision_budget") == 2
+        ):
+            if state == "CREATED":
+                self.wait_or_withdraw(now)
+            return
         # The new six-card policy commits at proposal; legacy six-card commits
         # at admission closure. Demand changes cannot undo either commitment.
         # Executor deadlines, physical checks and fault recovery remain active.
@@ -828,6 +840,48 @@ class DecidedSequenceDriver(ConversionSequenceDriver):
         )
         self.executor.plan_cancel()
 
+    def wait_or_withdraw(self, now):
+        """Gap policy, before the group closes: no deadline, but keep checking.
+
+        Waiting at the start check is not a failure, so the plan's deadline
+        starts at the closure. The deficit that proposed the move must still
+        hold: once it has been gone for the rule's hold time the proposal is
+        withdrawn (GPU 11-10: a merge proposed at 1108s passed the gate 170s
+        after its long phase ended and still ran). After closure nothing here
+        can undo the move.
+        """
+        self.executor.plan["deadline"] = time.time() + self.request["deadline_s"]
+        if now - self.cancel_checked < self.decision_interval_s:
+            return
+        if now - self.cancel_checked > 2:
+            self.cancel_since = None
+        self.cancel_checked = now
+        status = self.backend.status()
+        if not self.backend.fresh(status):
+            self.cancel_since = None
+            return
+        from tools.bridge_tp.conversion_decider import registry_layout
+
+        bundles, members = registry_layout(self.backend.registry)
+        layout, edge = self.step_edge
+        failed = self.decider.gap_pending_failed(
+            status, bundles, members, time.time(), layout, edge
+        )
+        if not failed:
+            self.cancel_since = None
+            return
+        if self.cancel_since is None:
+            self.cancel_since = now
+        if now - self.cancel_since < self.decider.rules["gap_withdraw_s"]:
+            return
+        self.backend.ops.event(
+            "DECIDER_WITHDRAW",
+            plan_id=self.executor.plan.get("plan_id"),
+            state="CREATED",
+            reason="; ".join(failed),
+        )
+        self.executor.plan_cancel()
+
     def start_proposal(self, proposal):
         limit = self.sequence_request.get("max_conversions", 4)
         if limit > 0 and self.number >= limit:
@@ -865,7 +919,7 @@ class DecidedSequenceDriver(ConversionSequenceDriver):
             run = getattr(self.backend, "evacuation_run", None)
             if run is not None:
                 self.backend.evacuation_close(run)
-            self.decider.cancelled()
+            self.decider.cancelled(time.time())
         else:
             self.decider.converted(time.time())
         self.prepared_key = None

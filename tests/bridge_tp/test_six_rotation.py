@@ -100,7 +100,10 @@ class RotationTests(unittest.TestCase):
                             current["conversion"]["max_conversions"],
                             getattr(self, "attempts", 8),
                         )
-                        self.assertFalse(current["conversion"]["prestart"])
+                        self.assertEqual(
+                            current["conversion"]["prestart"],
+                            getattr(self, "prestart", False),
+                        )
                         self.assertTrue(current["config"]["dynamic_conversion"])
                     captured.append(current)
                     raise RuntimeError("CPU_STOP_AFTER_REAL_PREFLIGHT")
@@ -143,6 +146,8 @@ class RotationTests(unittest.TestCase):
                         args += ["--migration-targets", "all"]
                     if getattr(self, "unlimited", False):
                         args += ["--decider-max-conversions", "0"]
+                    if getattr(self, "prestart", False):
+                        args += ["--conversion-prestart"]
                 if layout == "L2C":
                     args += ["--migration-targets", "all"]
                 with (
@@ -193,6 +198,9 @@ class RotationTests(unittest.TestCase):
                     )
                     self.assertEqual(contract["max_conversions"], 0)
                     self.assertTrue(contract["assist"])
+                    self.assertEqual(
+                        contract["prestart"], getattr(self, "prestart", False)
+                    )
                     continue
                 if (
                     self.config["recipes"][0]["scenario"]

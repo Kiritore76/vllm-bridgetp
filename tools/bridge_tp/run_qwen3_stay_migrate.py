@@ -1333,6 +1333,7 @@ def main(argv=None):
                     recipe=cfg["recipes"][0],
                     unlimited=args.decider_max_conversions == 0,
                     assist=args.decider_assist,
+                    prestart=args.conversion_prestart,
                 )
             if args.phase_shift and args.phase_scenario == "auto_smoke_six_v1":
                 plan["migration_coverage_required"] = False

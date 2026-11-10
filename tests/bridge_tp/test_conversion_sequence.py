@@ -43,6 +43,7 @@ class Executor:
 class DecidedDriverTests(unittest.TestCase):
     def test_budget_commit_does_not_reconsider_demand_before_or_after_closure(self):
         driver, backend = self.run_driver([], profile="six_card")
+        driver.decider.rules["decision_budget"] = 1  # the retained budget policy
         backend.status = Mock(side_effect=AssertionError("must not re-evaluate"))
         for state in ("CREATED", "DRAINING"):
             driver.executor.plan = dict(state=state)
@@ -50,6 +51,90 @@ class DecidedDriverTests(unittest.TestCase):
             self.assertEqual(driver.executor.plan["state"], state)
         backend.status.assert_not_called()
         self.assertFalse(any(e["kind"] == "DECIDER_CANCEL" for e in self.events))
+
+    def test_gap_policy_withdraws_a_waiting_proposal_once_its_deficit_is_gone(self):
+        """GPU 11-10: a merge ran 170s after the long phase that proposed it."""
+        driver, backend = self.run_driver([], profile="six_card")
+        self.assertEqual(driver.decider.rules["decision_budget"], 2)
+        failed = [[]]
+        driver.decider.gap_pending_failed = lambda *a: list(failed[0])
+        backend.status = lambda: dict(unix_s=0)
+        backend.fresh = lambda status: True
+        backend.registry.instances = {}
+        cancelled = []
+        driver.executor = NS(
+            plan=dict(state="CREATED", deadline=0.0),
+            plan_cancel=lambda: cancelled.append(True),
+        )
+        driver.request = dict(deadline_s=600)
+        driver.step_edge = ("L1AC", ("A", "TP2"))
+        clock = [1000.0]
+
+        def ticks(first, last):
+            for second in range(first, last):
+                clock[0] = 1000.0 + second
+                driver.plan_tick()
+
+        with patch("time.monotonic", lambda: clock[0]):
+            ticks(0, 100)  # deficit present: wait, the deadline keeps moving
+            self.assertFalse(cancelled)
+            self.assertGreater(driver.executor.plan["deadline"], time.time() + 590)
+            failed[0] = ["long demand within what L1AC holds"]
+            ticks(100, 129)  # gone, but not yet for the hold
+            self.assertFalse(cancelled)
+            failed[0] = []
+            ticks(129, 130)  # back: the hold restarts
+            failed[0] = ["long demand within what L1AC holds"]
+            ticks(130, 161)
+        self.assertEqual(cancelled, [True])
+        withdrawn = [e for e in self.events if e["kind"] == "DECIDER_WITHDRAW"]
+        self.assertEqual(len(withdrawn), 1)
+        # After the group closed nothing is reconsidered.
+        backend.status = Mock(side_effect=AssertionError("must not re-evaluate"))
+        for state in ("DRAINING", "FENCED", "PREPARING"):
+            driver.executor.plan = dict(state=state, deadline=1.0)
+            driver.plan_tick()
+            self.assertEqual(driver.executor.plan["deadline"], 1.0)
+
+    def test_stale_or_missing_ticks_cannot_confirm_a_withdrawal(self):
+        for interruption in ("stale", "gap"):
+            with self.subTest(interruption=interruption):
+                driver, backend = self.run_driver([], profile="six_card")
+                driver.decider.gap_pending_failed = lambda *a: ["deficit gone"]
+                backend.registry.instances = {}
+                backend.status = lambda: {}
+                backend.fresh = lambda status: True
+                cancel = Mock()
+                driver.executor = NS(plan=dict(state="CREATED"), plan_cancel=cancel)
+                driver.request = dict(deadline_s=600)
+                driver.step_edge = ("L1AC", ("A", "TP2"))
+                clock = [1000.0]
+                with patch("time.monotonic", lambda clock=clock: clock[0]):
+                    for t in range(20):
+                        clock[0] = 1000.0 + t
+                        driver.plan_tick()
+                    if interruption == "stale":
+                        backend.fresh = lambda status: False
+                        clock[0] = 1020.0
+                        driver.plan_tick()
+                        backend.fresh = lambda status: True
+                        resumed = 1021.0
+                    else:
+                        resumed = 1100.0
+                    for t in range(30):
+                        clock[0] = resumed + t
+                        driver.plan_tick()
+                    cancel.assert_not_called()
+                    clock[0] = resumed + 30
+                    driver.plan_tick()
+                cancel.assert_called_once()
+
+    def test_gap_abort_cools_down_and_enables_proposal_prestart(self):
+        driver, backend = self.run_driver(["ABORTED"], profile="six_card")
+        self.propose(driver, ("A", "TP2"))
+        self.assertIsNotNone(driver.decider.converted_at)
+        self.assertTrue(backend.gate_carry)
+        self.assertTrue(backend.prestart_at_proposal)
 
     def run_driver(self, states, **request):
         self.temp = tempfile.TemporaryDirectory()

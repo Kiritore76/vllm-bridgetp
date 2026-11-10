@@ -23,6 +23,7 @@ The conversion is triggered explicitly; nothing here selects a layout.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import threading
@@ -122,6 +123,11 @@ SAFETY = dict(
     assist_max_attempts=8,
     evacuation_patience_s=30.0,
     decision_interval_s=1.0,
+    # Six-card gap policy start check: short requests one retained instance
+    # carries (11-07 unified sweeps: L0 20/s over six TP1s; L3 12/s over three
+    # TP2s). A merge starts when the retained side carries the short rate.
+    carry_tp1_short=3.3,
+    carry_tp2_short=4.0,
 )
 
 
@@ -194,6 +200,11 @@ class ControllerConversionBackend:
         # exhaustion. NONE: this conversion is the relief, so neither the gate
         # nor the valve holds it back. The decider's driver sets it per edge.
         self.gate_mode = "STRICT"
+        # Six-card gap policy (user 11-10): a merge closes the group once the
+        # retained side can take what the group would still be given, and the
+        # replacements pre-start at the proposal instead of at the closure.
+        self.gate_carry = False
+        self.prestart_at_proposal = False
         self.assist_requires_spare = True
         self.prestarted = None
         self.service_gate_passed = False
@@ -359,12 +370,14 @@ class ControllerConversionBackend:
         return opened
 
     def unified_gate(self, plan):
-        """Six-card gate; tilt and waiting never waive fresh route fullness.
+        """Six-card gate with fresh identities and policy-specific load checks.
 
         Splits (``target_bundle_mode == "TP1"``) skip only the retained route
         fullness (<0.9) item: they still require fresh, matching retained
         identities and hard KV capacity, but are not held behind service
         congestion on the retained side (user 11-09).
+        Gap-policy merges check causal short arrivals against retained short
+        capacity instead of requiring spare KV under long pressure (11-10).
         """
         now = self.clock()
         if self.gate_since is None:
@@ -373,6 +386,7 @@ class ControllerConversionBackend:
         status = self.status()
         retained = {}
         reason = None
+        carried = None
         split = plan.get("target_bundle_mode") == "TP1"
         if not self.fresh(status):
             reason = "status stale"
@@ -386,6 +400,16 @@ class ControllerConversionBackend:
             retained = self.retained(plan, status)
             if not expected or set(retained) != expected:
                 reason = "retained registry/status mismatch"
+            elif self.gate_carry and not split:
+                # Closing the group only moves its NEW requests. Long prompts
+                # that do not fit stay in the controller (admission), so the
+                # retained side must carry the short requests, not have spare
+                # KV: under long pressure it never has (GPU 11-10: 600s of
+                # "retained KV headroom" until the plan timed out).
+                rate, room = self.carry(status, retained)
+                carried = dict(short_rate=rate, retained_short_capacity=room)
+                if rate is None or rate > room:
+                    reason = "retained cannot carry the group's short requests"
             elif not all(
                 self.hard_ok(v, self.safety["valve_capacity"])
                 for v in retained.values()
@@ -407,6 +431,7 @@ class ControllerConversionBackend:
             mode="UNIFIED",
             split=split,
             reason=reason,
+            carry=carried,
             retained={i: v.get("unified_fullness") for i, v in retained.items()},
         )
         if opened:
@@ -419,11 +444,47 @@ class ControllerConversionBackend:
             )
         return opened
 
+    def carry(self, status, retained):
+        """(short arrival rate, short rate the retained instances carry)."""
+        demand = (status.get("workload") or {}).get("conversion_demand") or {}
+        span, count, stamp = (
+            demand.get(key) for key in ("short_window_s", "short_count", "sampled_at")
+        )
+        if (
+            any(
+                type(v) not in (int, float) or not math.isfinite(v)
+                for v in (span, count, stamp)
+            )
+            or span <= 0
+            or count < 0
+            or not 0 <= self.clock() - stamp <= 2
+            or any(v.get("tp_degree") not in (1, 2) for v in retained.values())
+            or not all(
+                load("unified_scheduler").route_evidence_ready(
+                    v.get("unified_fullness"), self.clock()
+                )
+                for v in retained.values()
+            )
+        ):
+            return None, 0.0
+        rate = count / span
+        room = sum(
+            self.safety["carry_tp1_short"]
+            if v.get("tp_degree") == 1
+            else self.safety["carry_tp2_short"]
+            for v in retained.values()
+        )
+        return rate, room
+
     def precheck(self, plan):
         if not all(
             self.registry.get(ref).lifecycle == "ACTIVE" for ref in self.refs(plan)
         ):
             return False
+        if self.prestart_at_proposal:
+            # CPU-side start only: each worker stops before touching CUDA until
+            # the old engines released the GPUs. Dropped if the plan is withdrawn.
+            self.prestart(plan)
         if self.channel_graph is not None:
             if not self.channel_graph.acknowledged():
                 return False
@@ -1004,10 +1065,10 @@ class ControllerConversionBackend:
         return specs
 
     def prestart(self, plan):
-        """Start the replacements behind their start gate while draining.
+        """Start replacements behind their CUDA gate before admission closes.
 
         Process start, imports and worker spawn (about two thirds of a
-        rebuild, S5b GPU 11-01) overlap the drain; each worker waits before
+        rebuild, S5b GPU 11-01) overlap waiting/drain; each worker waits before
         touching CUDA until ``start_replacements`` opens its gate.
         """
         if not self.prestart_enabled or self.prestarted is not None:

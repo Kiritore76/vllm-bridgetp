@@ -39,6 +39,7 @@ class GuardTests(unittest.TestCase):
 
     def test_real_runner_auto_all_assist_unlimited_preflight(self):
         self.automatic = self.assist = self.dynamic_all = self.unlimited = True
+        self.prestart = True  # the 11-10 gap-policy run pre-starts at the proposal
         self.layouts = ("L1AC",)
         self.attempts = 0
         previous.RotationTests.test_real_runner_builds_and_preflights_static_arms_before_gpu(
