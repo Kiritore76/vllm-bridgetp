@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 当前任务：六卡1860秒轻长压/回切自动场（排空时效修复，次数不限）。
+# 当前任务：六卡1860秒同输入静态L1AC对照，保留普通迁移，不转换布局。
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
@@ -15,12 +15,12 @@ git fetch origin "refs/heads/$branch:refs/remotes/origin/$branch" || exit 1
 revision=$(git rev-parse HEAD)
 [ "$revision" = "$(git rev-parse "origin/$branch")" ] || { echo '请先git pull --ff-only。'; exit 1; }
 mkdir -p /root/autodl-tmp/bridgetp/results || exit 1
-run=/root/autodl-tmp/bridgetp/results/qwen3_six_return_auto_$(date +%Y%m%d_%H%M%S)_${RANDOM}
+run=/root/autodl-tmp/bridgetp/results/qwen3_six_return_l1ac_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 printf '%s\n' "$revision" > "$run/revision.txt"
-printf 'Six-card return field; 1860s arrivals, seed6; long rate .04/s; four-minute return; fresh drain proof; current-length assist; unlimited proposals.\n' > "$run/scope.txt"
+printf 'Six-card static L1AC baseline; same registered 1860s return input and seed6; ordinary current-length migration retained; no layout conversion.\n' > "$run/scope.txt"
 echo "本批目录：$run"
-echo '先Linux CPU检查；通过后只跑1860秒轻长压/回切自动场，转换次数不限。'
+echo '先Linux CPU检查；通过后只跑同输入1860秒静态L1AC，保留普通迁移，不转换布局。'
 echo '31分钟到达；含CPU/启动/预热/drain/打包，预计40–55分钟，慢机器或积压可能更久。'
 smi=
 pack_result() {
@@ -28,7 +28,7 @@ pack_result() {
     if [ -n "$smi" ]; then kill "$smi" 2>/dev/null || true; wait "$smi" 2>/dev/null || true; smi=; fi
     printf '%s\n' "$status" > "$run/exit_code.txt"
     local excludes=() edge
-    for edge in auto_from_L1AC; do
+    for edge in static_L1AC; do
         # Never omit unarchived failure data. Keep its raw trial if no inner pack.
         if [ -f "$run/$edge/trial.tar.gz" ] && [ -f "$run/$edge/trial.tar.gz.sha256" ] &&
            (cd "$run/$edge" && sha256sum -c trial.tar.gz.sha256 > /dev/null 2>&1); then
@@ -86,13 +86,12 @@ fi
 nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,pcie.link.gen.current,pcie.link.width.current --format=csv,noheader > "$run/gpu_before.csv" || { pack_result 1; exit 1; }
 nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,pcie.link.gen.current,pcie.link.width.current --format=csv,noheader -lms 1000 > "$run/gpu_samples.csv" &
 smi=$!
-case_dir="$run/auto_from_L1AC"
+case_dir="$run/static_L1AC"
 mkdir "$case_dir" || { pack_result 1; exit 1; }
-echo '开始1860秒轻长压/回切自动场；次数不限，记录全部转换和中止，A合并后拆回才算往返覆盖。'
+echo '开始1860秒静态L1AC对照；与自动组相同输入/服务代码，保留普通迁移。'
 "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
     --cards 6 --static-layout L1AC --phase-shift --phase-scenario mixed_return_six_v1 \
-    --scheduler unified --migration-targets all --hold-queue --kv-short-exempt --overload-migrate --migrate-current-length \
-    --conversion-decider execute --decider-multi --decider-pre-tilt --decider-assist --decider-max-conversions 0 \
+    --scheduler unified --hold-queue --kv-short-exempt --overload-migrate --migrate-current-length \
     --expanded-context --current-machine --repetitions 1 \
     --model "$model" \
     --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
@@ -100,12 +99,12 @@ echo '开始1860秒轻长压/回切自动场；次数不限，记录全部转换
     --output "$case_dir/trial" --expected-revision "$revision" 2>&1 | tee "$case_dir/console.log"
 runner_status=${PIPESTATUS[0]}
 printf '%s\n' "$runner_status" > "$case_dir/runner_exit_code.txt"
-"$py" -B -m tools.bridge_tp.six_rotation assess --arm auto_from_L1AC --scenario mixed_return_six_v1 --directory "$case_dir/trial" > "$case_dir/auto_check.log" 2>&1
+"$py" -B -m tools.bridge_tp.six_rotation assess --arm static_L1AC --scenario mixed_return_six_v1 --directory "$case_dir/trial" > "$case_dir/static_check.log" 2>&1
 check_status=$?
-cat "$case_dir/auto_check.log"
+cat "$case_dir/static_check.log"
 printf '%s\n' "$check_status" > "$case_dir/check_exit_code.txt"
 status=$runner_status
 if [ "$status" = 0 ]; then status=$check_status; fi
-echo '完整输出/ACK/trace/空闲/受管收尾须通过；逐次记录完成/中止与新实例接流；零转换或未完成A合并后拆回记覆盖不足，零辅助如实记未覆盖，不冒称收益。'
+echo '静态L1AC须保持布局不变，完整输出/trace/空闲/受管收尾通过；零普通迁移如实记录，不强制迁移或冒称性能收益。'
 pack_result "$status" || exit 1
 exit "$status"
