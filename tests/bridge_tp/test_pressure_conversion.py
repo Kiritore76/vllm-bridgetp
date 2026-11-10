@@ -72,8 +72,11 @@ class Harness:
         method="DRAIN",
         safety=None,
         prestart=False,
+        coordinate_drain=False,
     ):
         self.root, self.slow = root, set(slow)
+        self.coordinate_drain = coordinate_drain
+        self.inflight_observed = threading.Event()
         self.calls, self.events, self.stopped = [], [], set()
         self.lock = threading.Lock()
         registry, aliases = instance_pool.fixed_pair_registry(
@@ -172,6 +175,26 @@ class Harness:
             root / "conversion_plan.json",
             interval_s=0.02,
         )
+        if coordinate_drain:
+            precheck, drain = self.backend.precheck, self.backend.drain_evidence
+
+            def request_is_pending(plan):
+                status = self.backend.status() or {}
+                instances = status.get("instances", {})
+                pending = any(
+                    instances.get(ref.instance_id, {}).get("streams_pending", 0)
+                    for ref in self.backend.refs(plan)
+                )
+                return bool(pending) and precheck(plan)
+
+            def observe_pending(plan):
+                evidence = drain(plan)
+                if any(row.streams_pending for row in evidence):
+                    self.inflight_observed.set()
+                return evidence
+
+            self.backend.precheck = request_is_pending
+            self.backend.drain_evidence = observe_pending
 
     def event(self, kind, **values):
         self.events.append(dict(kind=kind, unix_s=time.time(), **values))
@@ -258,6 +281,14 @@ class Harness:
         if url in self.stopped_endpoints():
             raise RuntimeError("request routed to a stopped engine")
         sink(0, 42, time.time())
+        if getattr(self, "coordinate_drain", False) and url in self.slow:
+            # A fixed sleep can finish before the first drain observation on a
+            # loaded host. Keep a real stream pending until that evidence was
+            # recorded, then let the ordinary completion/release path run.
+            deadline = time.monotonic() + 10
+            while not self.inflight_observed.wait(0.05):
+                if self.finished.is_set() or time.monotonic() >= deadline:
+                    raise RuntimeError("test did not observe its in-flight stream")
         # In flight across the quiesce: the drain must wait for these.
         time.sleep(1.5 if url in self.slow else 0.25)
         completed = time.time()
@@ -681,7 +712,9 @@ class ConversionTests(unittest.TestCase):
     def test_split_retires_pair_target_and_routes_to_new_tp1(self):
         """L1A -> L0: bundle B TP2(0,1) -> TP1@0 + TP1@1 while serving."""
         with tempfile.TemporaryDirectory() as directory:
-            harness = Harness(Path(directory), "B", "TP1", slow={"target"})
+            harness = Harness(
+                Path(directory), "B", "TP1", slow={"target"}, coordinate_drain=True
+            )
             # Arrivals must outlast the drain (slow target) plus the new
             # instances' inventory join: with 16 (last at 4.5s) the join was
             # sometimes later and nothing could reach them (1 of 24 runs at
