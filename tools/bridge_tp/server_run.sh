@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 当前任务：六卡40分钟自动场：规则同stall场，另加控制器暂存“来得及优先”放行（等满10秒的最优先）；同输入，与stall场对比。
+# 当前任务：六卡40分钟自动场：规则同stall场，另加控制器暂存“来得及优先”放行（等满7秒的最优先）；同输入，与stall场对比。
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
@@ -18,10 +18,10 @@ mkdir -p /root/autodl-tmp/bridgetp/results || exit 1
 run=/root/autodl-tmp/bridgetp/results/qwen3_six_guard40_attainable_auto_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 printf '%s\n' "$revision" > "$run/revision.txt"
-printf 'Six-card 2400s trial: as the stall auto run (recompute, short split-back confirmation, stalled requests uncounted), plus attainable-first release of held requests (held 10s or more first); same seed6/input; no performance claim.\n' > "$run/scope.txt"
+printf 'Six-card 2400s trial: as the stall auto run (recompute, short split-back confirmation, stalled requests uncounted), plus attainable-first release of held requests (held 7s or more first); same seed6/input; no performance claim.\n' > "$run/scope.txt"
 echo "本批目录：$run"
 echo '先Linux CPU检查；通过后只跑同输入2400秒自动场：规则同stall场，另加暂存来得及优先放行；不自动重试。'
-echo '积压时先放还能在TTFT预算内（短2秒/长10秒）出首token的请求，等满10秒的最优先；所有请求照常完成。'
+echo '积压时先放还能在TTFT预算内（短2秒/长10秒）出首token的请求，等满7秒的最优先；所有请求照常完成。'
 echo '40分钟到达；含CPU/启动/预热/drain/打包，预计50–65分钟，慢机器或积压可能更久。'
 smi=
 pack_result() {

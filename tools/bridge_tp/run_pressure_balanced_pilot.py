@@ -133,7 +133,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--hold-starve-s",
         type=float,
-        default=10.0,
+        default=7.0,
         help="attainable order: a request held this long goes first",
     )
     parser.add_argument(
@@ -1753,7 +1753,7 @@ def _run(args, prepared):
                 if getattr(args, "scheduler", "pressure") == "unified"
                 else None,
                 order=getattr(args, "hold_order", "fifo"),
-                starve_s=getattr(args, "hold_starve_s", 10.0),
+                starve_s=getattr(args, "hold_starve_s", 7.0),
             )
             if getattr(args, "hold_unstarted", 0)
             else None,

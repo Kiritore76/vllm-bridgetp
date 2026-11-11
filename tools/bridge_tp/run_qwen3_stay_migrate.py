@@ -451,7 +451,7 @@ def main(argv=None):
         "--hold-attainable",
         action="store_true",
         help="unified hold releases requests that can still meet their "
-        "first-token budget first; held 10s or more go first (user 11-11)",
+        "first-token budget first; held 7s or more go first (user 11-11)",
     )
     parser.add_argument(
         "--overload-migrate",
@@ -1304,7 +1304,7 @@ def main(argv=None):
                     "--hold-order",
                     "attainable",
                     "--hold-starve-s",
-                    "10",
+                    "7",
                 ]
             if args.scheduler == "unified":
                 plan["controller_argv"] += [

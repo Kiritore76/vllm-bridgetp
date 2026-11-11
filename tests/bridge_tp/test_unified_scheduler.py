@@ -442,7 +442,7 @@ class AttainableHoldTests(unittest.TestCase):
     def queue(self, order="attainable"):
         return hold_module.HoldQueue(
             8, 300, 8192, 2.0, lambda pool_id: True,
-            unified_guard_blocks=125, order=order, starve_s=10.0,
+            unified_guard_blocks=125, order=order, starve_s=7.0,
         )
 
     def job(self, name, prompt=512):
@@ -472,18 +472,20 @@ class AttainableHoldTests(unittest.TestCase):
         )
         self.assertEqual(q.waiting(), 0)
 
-    def test_a_request_held_10s_goes_before_attainable_ones(self):
+    def test_a_request_held_7s_goes_before_attainable_ones(self):
         q = self.queue()
         q.add(self.job("old"), 0.0)
-        q.add(self.job("mid"), 5.0)
+        q.add(self.job("old2"), 3.4)  # held 7.1s: starved too
+        q.add(self.job("mid"), 5.0)  # held 5.5s: late, not starved
         q.add(self.job("new"), 10.0)
         self.assertEqual(self.released(q, 10.5), ("old", 10.5))
+        self.assertEqual(self.released(q, 10.5), ("old2", 7.1))
         self.assertEqual(self.released(q, 10.5), ("new", 0.5))
         self.assertEqual(self.released(q, 10.5), ("mid", 5.5))
 
     def test_a_long_prompt_has_the_10s_budget(self):
         q = self.queue()
-        q.add(self.job("short_late"), 0.0)
+        q.add(self.job("short_late"), 0.5)  # 6.5s: late, not yet starved
         q.add(self.job("long", 16384), 1.0)
         # Long waited 6s: 6 + 0.5 + 2.6 <= 10, still attainable.
         self.assertEqual(self.released(q, 7.0)[0], "long")

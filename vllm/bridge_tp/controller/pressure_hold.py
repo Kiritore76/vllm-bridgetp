@@ -17,8 +17,9 @@ Release order (unified hold; user 11-11): ``fifo`` scans arrivals oldest first.
 ``attainable`` serves the requests that can still meet their first-token budget
 before those already past it: under overload FIFO makes every arrival wait the
 whole backlog, so none meets it (six-card split-back: TTFT p50 7s, 0/433). Order:
-(1) waiting at least ``starve_s``, oldest first, so a late request is not passed
-over for long; (2) still attainable, oldest first; (3) the rest, oldest first.
+(1) waiting at least ``starve_s`` (7s; 10s left 6x more requests past 10s
+offline, user 11-11), oldest first, so a late request is not passed over long;
+(2) still attainable, oldest first; (3) the rest, oldest first.
 Every request is still sent; only the order of held ones changes.
 """
 
@@ -50,7 +51,7 @@ class HoldQueue:
         tp1_long_kv=0.0,
         unified_guard_blocks=None,
         order="fifo",
-        starve_s=10.0,
+        starve_s=7.0,
     ):
         if unstarted_limit <= 0 or long_wait_s < 0 or long_tokens <= 0:
             raise ValueError("invalid hold settings")
