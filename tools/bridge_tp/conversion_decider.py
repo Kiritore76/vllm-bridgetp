@@ -142,6 +142,10 @@ SIX_CARD_RULES = dict(
     # 1678s for load from 1620s). This short confirmation only rejects one
     # noisy crossing of the line; entry conditions themselves are unchanged.
     split_confirm_s=5.0,
+    # L1AC -> L0 removes every TP2, so it alone confirms longer (user 11-11):
+    # window plus this needs about a minute of excess short demand, so a
+    # 20-30s short burst no longer enters L0 (was 120s before 11-11).
+    l0_entry_confirm_s=30.0,
     # A proposal still waiting to start is withdrawn once its deficit has been
     # gone this long; after the group closed it is never undone.
     gap_withdraw_s=30.0,
@@ -812,6 +816,8 @@ class ConversionDecider:
             hold_s = (
                 r["gap_merge_hold_s"]
                 if (layout, after) == ("L1AC", "L2C")
+                else r["l0_entry_confirm_s"]
+                if after == "L0"
                 else r["split_confirm_s"]
                 if edge[1] == "TP1"
                 else self._hold_seconds(edge, signals, False)

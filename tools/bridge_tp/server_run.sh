@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 当前任务：六卡40分钟自动场：重算同20261111场，所有拆回方向改为30秒窗口感知+5秒确认（原30/120/30秒持续确认）；同输入。
+# 当前任务：六卡40分钟自动场：重算同20261111场；拆回改为30秒窗口感知+短确认：L2C→L1AC、L3→L2C为5秒，L1AC→L0为30秒（原30/30/120秒）；同输入。
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
@@ -18,9 +18,9 @@ mkdir -p /root/autodl-tmp/bridgetp/results || exit 1
 run=/root/autodl-tmp/bridgetp/results/qwen3_six_guard40_split5_auto_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 printf '%s\n' "$revision" > "$run/revision.txt"
-printf 'Six-card 2400s trial: as the 20261111 recompute auto run, plus every split back (L2C-L1AC, L3-L2C, L1AC-L0) confirmed 5s after the 30s short-rate window instead of 30/120/30s; same seed6/input; no performance claim.\n' > "$run/scope.txt"
+printf 'Six-card 2400s trial: as the 20261111 recompute auto run, plus split backs confirmed after the 30s short-rate window in 5s (L2C-L1AC, L3-L2C) and 30s (L1AC-L0) instead of 30/30/120s; same seed6/input; no performance claim.\n' > "$run/scope.txt"
 echo "本批目录：$run"
-echo '先Linux CPU检查；通过后只跑同输入2400秒自动场：重算同上一场，所有拆回改为30秒窗口+5秒确认；不自动重试。'
+echo '先Linux CPU检查；通过后只跑同输入2400秒自动场：重算同上一场，拆回改为30秒窗口+短确认（拆A/拆C 5秒，进L0 30秒）；不自动重试。'
 echo '回放预期：持续短压下A拆回提议约1653秒（上一场1678秒）；10秒短峰、长压和恢复段不拆。合并规则不变。'
 echo '40分钟到达；含CPU/启动/预热/drain/打包，预计50–65分钟，慢机器或积压可能更久。'
 smi=

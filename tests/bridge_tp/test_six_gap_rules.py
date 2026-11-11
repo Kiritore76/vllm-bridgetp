@@ -111,23 +111,25 @@ class SplitTests(unittest.TestCase):
         )
         self.assertEqual(proposals, [(9, "A", "TP1")])
 
-    def test_every_split_back_uses_the_short_confirmation(self):
+    def test_split_backs_confirm_in_5s_and_l0_entry_in_30s(self):
         rules = d.ConversionDecider(profile="six_card").rules
         self.assertEqual(rules["split_confirm_s"], 5.0)
+        self.assertEqual(rules["l0_entry_confirm_s"], 30.0)
         self.assertNotIn("gap_split_hold_s", rules)
-        for layout, at, edge in (
-            ("L2C", lambda s: dict(short=16.5), "A"),
-            ("L3", lambda s: dict(short=17), "C"),
+        for layout, at, edge, hold in (
+            ("L2C", lambda s: dict(short=16.5), "A", 5.0),
+            ("L3", lambda s: dict(short=17), "C", 5.0),
             (
                 "L1AC",
                 lambda s: dict(short=20, held_short_count=16, held_short_wait_s=2),
                 "B",
+                30.0,
             ),
         ):
             with self.subTest(layout=layout):
-                proposals, record, _ = run(layout, 30, at)
-                self.assertEqual(proposals, [(5, edge, "TP1")])
-                self.assertEqual(record["candidates"][f"{edge}->TP1"]["hold_s"], 5.0)
+                proposals, record, _ = run(layout, 40, at)
+                self.assertEqual(proposals, [(int(hold), edge, "TP1")])
+                self.assertEqual(record["candidates"][f"{edge}->TP1"]["hold_s"], hold)
 
     def test_below_the_line_or_a_ten_second_spike_does_not_split(self):
         proposals, _, _ = run("L2C", 200, lambda s: dict(short=15.9))
@@ -320,7 +322,7 @@ class ExtremeEntryTests(unittest.TestCase):
             120,
             lambda s: dict(short=20, held_short_count=16, held_short_wait_s=2),
         )
-        self.assertEqual(proposals, [(5, "B", "TP1")])
+        self.assertEqual(proposals, [(30, "B", "TP1")])
 
     def test_l0_requires_even_the_last_long_request_to_finish(self):
         value, modes, members = sample(
@@ -338,14 +340,15 @@ class ExtremeEntryTests(unittest.TestCase):
         self.assertIn("L0 requires all long requests to finish", reasons)
 
     def test_a_brief_short_backlog_does_not_enter_l0(self):
-        # Shorter than the 5s confirmation, then gone: no L0 (user 11-11).
+        # A 25s backlog under a sustained window reading: shorter than the
+        # 30s L0 confirmation, then gone, so no L0 (user 11-11).
         proposals, _, _ = run(
             "L1AC",
             150,
             lambda s: dict(
                 short=20,
-                held_short_count=32 if s < 4 else 0,
-                held_short_wait_s=10 if s < 4 else 0,
+                held_short_count=32 if s < 25 else 0,
+                held_short_wait_s=10 if s < 25 else 0,
             ),
         )
         self.assertEqual(proposals, [])
