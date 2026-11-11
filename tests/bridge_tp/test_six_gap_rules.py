@@ -101,16 +101,54 @@ class MergeTests(unittest.TestCase):
 
 class SplitTests(unittest.TestCase):
     def test_short_rate_at_what_l2c_carries_splits_after_the_hold(self):
+        # User 11-11: the 30s rate window is the perception; 5s confirms it.
         proposals, _, _ = run("L2C", 60, lambda s: dict(short=16.5))
-        self.assertEqual(proposals, [(30, "A", "TP1")])
+        self.assertEqual(proposals, [(5, "A", "TP1")])
+
+    def test_one_noisy_dip_restarts_the_split_confirmation(self):
+        proposals, _, _ = run(
+            "L2C", 60, lambda s: dict(short=15.9 if s == 3 else 16.5)
+        )
+        self.assertEqual(proposals, [(9, "A", "TP1")])
+
+    def test_every_split_back_uses_the_short_confirmation(self):
+        rules = d.ConversionDecider(profile="six_card").rules
+        self.assertEqual(rules["split_confirm_s"], 5.0)
+        self.assertNotIn("gap_split_hold_s", rules)
+        for layout, at, edge in (
+            ("L2C", lambda s: dict(short=16.5), "A"),
+            ("L3", lambda s: dict(short=17), "C"),
+            (
+                "L1AC",
+                lambda s: dict(short=20, held_short_count=16, held_short_wait_s=2),
+                "B",
+            ),
+        ):
+            with self.subTest(layout=layout):
+                proposals, record, _ = run(layout, 30, at)
+                self.assertEqual(proposals, [(5, edge, "TP1")])
+                self.assertEqual(record["candidates"][f"{edge}->TP1"]["hold_s"], 5.0)
 
     def test_below_the_line_or_a_ten_second_spike_does_not_split(self):
         proposals, _, _ = run("L2C", 200, lambda s: dict(short=15.9))
         self.assertEqual(proposals, [])
-        proposals, _, _ = run(
-            "L2C", 200, lambda s: dict(short=17.5 if 50 <= s < 60 else 2)
-        )
+        # ``short`` is the 30s window reading: a 10s 17.5/s pulse over 2/s
+        # reads at most (10 * 17.5 + 20 * 2) / 30 = 7.2/s (guard40 1500-1510s).
+        def window(second):
+            seconds = range(second - 29, second + 1)
+            return dict(short=sum(17.5 if 50 <= t < 60 else 2.0 for t in seconds) / 30)
+
+        proposals, _, _ = run("L2C", 200, window)
         self.assertEqual(proposals, [])
+        self.assertLess(max(window(s)["short"] for s in range(200)), 7.2)
+        # The same window still splits a sustained 17.5/s: reading >= 16 after
+        # 28s of it (27.1s exactly), then 5s confirmation.
+        sustained = [
+            sum(17.5 if t >= 50 else 2.0 for t in range(s - 29, s + 1)) / 30
+            for s in range(120)
+        ]
+        proposals, _, _ = run("L2C", 119, lambda s: dict(short=sustained[s]))
+        self.assertEqual(proposals, [(82, "A", "TP1")])
 
     def test_shorts_held_behind_long_requests_are_not_a_short_deficit(self):
         """GPU 11-10 long phase: 63 shorts held 32s at a 2.3/s short rate."""
@@ -157,7 +195,7 @@ class CommitAndSignalTests(unittest.TestCase):
         proposals, record, decider = run(
             "L2C", 90, lambda s: dict(short=16.5 if s <= 30 else 2)
         )
-        self.assertEqual(proposals, [(30, "A", "TP1")])
+        self.assertEqual(proposals, [(5, "A", "TP1")])
         self.assertEqual(record["decision"], "COMMITTED")
         self.assertEqual(decider.committed_edge, ("A", "TP1"))
 
@@ -182,7 +220,7 @@ class CommitAndSignalTests(unittest.TestCase):
     def test_a_withdrawal_or_abort_cools_down_before_the_next_proposal(self):
         """GPU 11-10: an aborted merge was proposed again 0.7s later."""
         proposals, _, decider = run("L2C", 40, lambda s: dict(short=16.5))
-        self.assertEqual(proposals, [(30, "A", "TP1")])
+        self.assertEqual(proposals, [(5, "A", "TP1")])
         decider.cancelled(1040.0)
         self.assertIsNone(decider.committed_edge)
         again = []
@@ -214,7 +252,7 @@ class CommitAndSignalTests(unittest.TestCase):
         proposals, _, _ = run("L1AC", 150, lambda s: dict(short=20))
         self.assertEqual(proposals, [])  # rate alone no longer enters L0
         proposals, _, _ = run("L3", 60, lambda s: dict(short=17))
-        self.assertEqual(proposals, [(30, "C", "TP1")])
+        self.assertEqual(proposals, [(5, "C", "TP1")])
         proposals, _, _ = run("L0", 60, lambda s: dict(short=2))
         self.assertEqual(proposals, [(30, "B", "TP2")])
 
@@ -229,10 +267,13 @@ class CommitAndSignalTests(unittest.TestCase):
                     "gap_merge_hold_s",
                     "gap_merge_held_long_s",
                     "gap_split_short",
-                    "gap_split_hold_s",
+                    "split_confirm_s",
+                    "extreme_exit_hold_s",
+                    "l3_hold_s",
                 )
             ],
-            [2, 20000, 30.0, 45.0, 16.0, 30.0],
+            # Merges keep their holds; only splits back confirm in 5s.
+            [2, 20000, 30.0, 45.0, 16.0, 5.0, 30.0, 120.0],
         )
         _, record, _ = run("L1AC", 5, lambda s: long_demand(4))
         self.assertIn("worthwhile", record["candidates"]["A->TP2"]["budget"])
@@ -279,7 +320,7 @@ class ExtremeEntryTests(unittest.TestCase):
             120,
             lambda s: dict(short=20, held_short_count=16, held_short_wait_s=2),
         )
-        self.assertEqual(proposals, [(120, "B", "TP1")])
+        self.assertEqual(proposals, [(5, "B", "TP1")])
 
     def test_l0_requires_even_the_last_long_request_to_finish(self):
         value, modes, members = sample(
@@ -297,13 +338,14 @@ class ExtremeEntryTests(unittest.TestCase):
         self.assertIn("L0 requires all long requests to finish", reasons)
 
     def test_a_brief_short_backlog_does_not_enter_l0(self):
+        # Shorter than the 5s confirmation, then gone: no L0 (user 11-11).
         proposals, _, _ = run(
             "L1AC",
             150,
             lambda s: dict(
                 short=20,
-                held_short_count=32 if s < 10 else 0,
-                held_short_wait_s=10 if s < 10 else 0,
+                held_short_count=32 if s < 4 else 0,
+                held_short_wait_s=10 if s < 4 else 0,
             ),
         )
         self.assertEqual(proposals, [])

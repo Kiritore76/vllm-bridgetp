@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 当前任务：重算小场——六卡L1AC起步，110秒显式A合并为TP2（自然排空+受限重算+预启动），长突发小负载；确认重算功能后再跑40分钟大场。
+# 当前任务：六卡40分钟自动场：重算同20261111场，所有拆回方向改为30秒窗口感知+5秒确认（原30/120/30秒持续确认）；同输入。
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
@@ -15,21 +15,21 @@ git fetch origin "refs/heads/$branch:refs/remotes/origin/$branch" || exit 1
 revision=$(git rev-parse HEAD)
 [ "$revision" = "$(git rev-parse "origin/$branch")" ] || { echo '请先git pull --ff-only。'; exit 1; }
 mkdir -p /root/autodl-tmp/bridgetp/results || exit 1
-run=/root/autodl-tmp/bridgetp/results/qwen3_six_recompute_smoke_$(date +%Y%m%d_%H%M%S)_${RANDOM}
+run=/root/autodl-tmp/bridgetp/results/qwen3_six_guard40_split5_auto_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 printf '%s\n' "$revision" > "$run/revision.txt"
-printf 'Small six-card drain recompute smoke: L1AC start, explicit A merge to TP2 at 110s (DRAIN, prestart, recompute after 45s drain if <=3 requests and <=65536 context tokens); long-burst workload 150 short + 6 long 16384/8192 at 90-100s; mechanism check only, no performance claim.\n' > "$run/scope.txt"
+printf 'Six-card 2400s trial: as the 20261111 recompute auto run, plus every split back (L2C-L1AC, L3-L2C, L1AC-L0) confirmed 5s after the 30s short-rate window instead of 30/120/30s; same seed6/input; no performance claim.\n' > "$run/scope.txt"
 echo "本批目录：$run"
-echo '先Linux CPU检查；通过后只跑一场小场：L1AC起步，110秒显式把A合并为TP2，开启预启动和受限重算；不自动重试。'
-echo '150条短请求+90–100秒6条长请求（16384/8192）；关门后排空满45秒、A上≤3条且上下文≤65536 token时中止源端并在新TP2续算。'
-echo 'A上长请求超过3条时不会触发重算，会如实记为覆盖缺失（检查码2），不算功能失败。预计含CPU/启动/预热/打包15–30分钟。'
+echo '先Linux CPU检查；通过后只跑同输入2400秒自动场：重算同上一场，所有拆回改为30秒窗口+5秒确认；不自动重试。'
+echo '回放预期：持续短压下A拆回提议约1653秒（上一场1678秒）；10秒短峰、长压和恢复段不拆。合并规则不变。'
+echo '40分钟到达；含CPU/启动/预热/drain/打包，预计50–65分钟，慢机器或积压可能更久。'
 smi=
 pack_result() {
     local status=$1
     if [ -n "$smi" ]; then kill "$smi" 2>/dev/null || true; wait "$smi" 2>/dev/null || true; smi=; fi
     printf '%s\n' "$status" > "$run/exit_code.txt"
     local excludes=() edge
-    for edge in L1AC-L2C_recompute; do
+    for edge in auto_from_L1AC; do
         # Never omit unarchived failure data. Keep its raw trial if no inner pack.
         if [ -f "$run/$edge/trial.tar.gz" ] && [ -f "$run/$edge/trial.tar.gz.sha256" ] &&
            (cd "$run/$edge" && sha256sum -c trial.tar.gz.sha256 > /dev/null 2>&1); then
@@ -90,26 +90,28 @@ fi
 nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,pcie.link.gen.current,pcie.link.width.current --format=csv,noheader > "$run/gpu_before.csv" || { pack_result 1; exit 1; }
 nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,pcie.link.gen.current,pcie.link.width.current --format=csv,noheader -lms 1000 > "$run/gpu_samples.csv" &
 smi=$!
-case_dir="$run/L1AC-L2C_recompute"
+case_dir="$run/auto_from_L1AC"
 mkdir "$case_dir" || { pack_result 1; exit 1; }
-echo '开始小场：110秒A关门；预计约155秒请求重算，新A接流后续算到完整输出。'
+echo '开始2400秒自动场；25:00起10秒短峰应保持，27:00起持续短压应拆回。'
 "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
-    --cards 6 --static-layout L1AC --long-burst-pair \
+    --cards 6 --static-layout L1AC --phase-shift --phase-scenario mixed_guard_six_v1 \
     --scheduler unified --hold-queue --kv-short-exempt --overload-migrate --migrate-current-length \
-    --conversion L1AC-L2C --conversion-trigger-s 110 --conversion-prestart --conversion-recompute \
     --expanded-context --current-machine --repetitions 1 \
+    --conversion-decider execute --decider-multi --decider-assist --conversion-prestart --conversion-recompute \
+    --migration-targets all --decider-max-conversions 0 \
     --model "$model" \
     --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
     --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json" \
     --output "$case_dir/trial" --expected-revision "$revision" 2>&1 | tee "$case_dir/console.log"
 runner_status=${PIPESTATUS[0]}
 printf '%s\n' "$runner_status" > "$case_dir/runner_exit_code.txt"
-"$py" -B -m tools.bridge_tp.drain_recompute_smoke --directory "$case_dir/trial" > "$case_dir/recompute_check.log" 2>&1
+"$py" -B -m tools.bridge_tp.six_rotation assess --arm auto_from_L1AC --scenario mixed_guard_six_v1 --directory "$case_dir/trial" > "$case_dir/auto_check.log" 2>&1
 check_status=$?
-cat "$case_dir/recompute_check.log"
+cat "$case_dir/auto_check.log"
 printf '%s\n' "$check_status" > "$case_dir/check_exit_code.txt"
 status=$runner_status
 if [ "$status" = 0 ]; then status=$check_status; fi
-echo '检查码：0=A合并完成且重算续算完整无缝；2=有效但未触发重算（覆盖缺失）；1=技术失败或证据缺失。时间线只作机制核对，不是性能结论。'
+echo '重算是否触发、续算停顿和新A接流时间见conversion_decisions.jsonl的RECOMPUTE与pressure_audit的drain_recompute_*。'
+echo '须真实完成长段A合并和持续短段A拆回；短峰及恢复须有效L2C/KEEP，零转换/中止/证据缺失不算覆盖通过；完整输出/ACK/trace/空闲/收尾须通过。'
 pack_result "$status" || exit 1
 exit "$status"

@@ -135,7 +135,13 @@ SIX_CARD_RULES = dict(
     # L2C -> L1AC: 16/s is the highest rate L2C passed. At 17 a 17.5/s load
     # kept dipping below the line and the split came about 230s late.
     gap_split_short=16.0,
-    gap_split_hold_s=30.0,
+    # Every split back (L2C->L1AC, L3->L2C, L1AC->L0; user 11-11): the 30s
+    # short-rate window is the perception and already needs most of 30s of
+    # demand (a 10s 17.5/s pulse over 2/s reads 7.2/s), so a second 30s (L0:
+    # 120s) hold only delayed the split by that long (GPU 11-10: proposal
+    # 1678s for load from 1620s). This short confirmation only rejects one
+    # noisy crossing of the line; entry conditions themselves are unchanged.
+    split_confirm_s=5.0,
     # A proposal still waiting to start is withdrawn once its deficit has been
     # gone this long; after the group closed it is never undone.
     gap_withdraw_s=30.0,
@@ -806,8 +812,8 @@ class ConversionDecider:
             hold_s = (
                 r["gap_merge_hold_s"]
                 if (layout, after) == ("L1AC", "L2C")
-                else r["gap_split_hold_s"]
-                if (layout, after) == ("L2C", "L1AC")
+                else r["split_confirm_s"]
+                if edge[1] == "TP1"
                 else self._hold_seconds(edge, signals, False)
             )
             repeated = (
