@@ -436,6 +436,111 @@ class HoldTests(unittest.TestCase):
             )
 
 
+class AttainableHoldTests(unittest.TestCase):
+    """User 11-11: under a backlog, serve arrivals that can still meet TTFT."""
+
+    def queue(self, order="attainable"):
+        return hold_module.HoldQueue(
+            8, 300, 8192, 2.0, lambda pool_id: True,
+            unified_guard_blocks=125, order=order, starve_s=10.0,
+        )
+
+    def job(self, name, prompt=512):
+        return dict(id=name, request=dict(prompt=[1] * prompt))
+
+    def released(self, q, now, free=11000):
+        value = q.next([inst("b", free=free)], now, 10.0)
+        return None if value is None else (value[0]["id"], round(value[0]["held_s"], 3))
+
+    def test_fifo_is_the_default_and_unchanged(self):
+        q = hold_module.HoldQueue(
+            8, 300, 8192, 2.0, lambda pool_id: True, unified_guard_blocks=125
+        )
+        for t in range(6):
+            q.add(self.job(f"s{t}"), float(t))
+        self.assertEqual(self.released(q, 6.0), ("s0", 6.0))
+
+    def test_a_request_that_can_still_meet_its_budget_goes_first(self):
+        q = self.queue()
+        for t in range(6):
+            q.add(self.job(f"s{t}"), float(t))
+        # Waits 6..1s; 512 tokens need 0.5 + 0.08s more, so only s5 (1s) is in time.
+        self.assertEqual(self.released(q, 6.0), ("s5", 1.0))
+        # Then the late ones, oldest first; every request is still served.
+        self.assertEqual(
+            [self.released(q, 6.0)[0] for _ in range(5)], ["s0", "s1", "s2", "s3", "s4"]
+        )
+        self.assertEqual(q.waiting(), 0)
+
+    def test_a_request_held_10s_goes_before_attainable_ones(self):
+        q = self.queue()
+        q.add(self.job("old"), 0.0)
+        q.add(self.job("mid"), 5.0)
+        q.add(self.job("new"), 10.0)
+        self.assertEqual(self.released(q, 10.5), ("old", 10.5))
+        self.assertEqual(self.released(q, 10.5), ("new", 0.5))
+        self.assertEqual(self.released(q, 10.5), ("mid", 5.5))
+
+    def test_a_long_prompt_has_the_10s_budget(self):
+        q = self.queue()
+        q.add(self.job("short_late"), 0.0)
+        q.add(self.job("long", 16384), 1.0)
+        # Long waited 6s: 6 + 0.5 + 2.6 <= 10, still attainable.
+        self.assertEqual(self.released(q, 7.0)[0], "long")
+        q = self.queue()
+        q.add(self.job("short_late"), 0.0)
+        q.add(self.job("long", 16384), 0.5)
+        # 7.5s + 3.1s > 10: late too, so arrival order.
+        self.assertEqual(self.released(q, 8.0)[0], "short_late")
+
+    def test_an_attainable_prompt_without_room_lets_the_next_one_go(self):
+        q = self.queue()
+        q.add(self.job("late"), 0.0)
+        q.add(self.job("long", 16384), 4.0)
+        q.add(self.job("short", 512), 4.5)
+        # 900 free blocks: the long prompt (1024) does not fit anywhere.
+        self.assertEqual(self.released(q, 5.0, free=900)[0], "short")
+        self.assertEqual(self.released(q, 5.0, free=900)[0], "late")
+        self.assertIsNone(self.released(q, 5.0, free=900))
+
+    def test_the_measured_engine_delay_shrinks_what_is_attainable(self):
+        q = self.queue()
+        self.assertEqual(q.engine_delay_s(), 0.5)  # nothing measured yet
+        for i, delay in enumerate((1.2, 1.5, 1.4)):
+            started = types.SimpleNamespace(
+                payload=dict(prompt=[1] * 512),
+                dispatched_at=100.0 + i,
+                recorder=types.SimpleNamespace(
+                    tokens_seen=1,
+                    proxy=types.SimpleNamespace(
+                        emitted=[types.SimpleNamespace(unix_s=100.0 + i + delay)]
+                    ),
+                ),
+                future=types.SimpleNamespace(done=lambda: False),
+            )
+            q.unstarted.setdefault("b", []).append(started)
+        q._refresh()
+        self.assertEqual(q.unstarted["b"], [])
+        self.assertAlmostEqual(q.engine_delay_s(), 1.4)
+        q.add(self.job("late"), 0.0)
+        q.add(self.job("s1"), 4.3)
+        q.add(self.job("s2"), 4.7)
+        # Engine needs 1.4s: s1 (0.7s held) is already out of time, s2 (0.3s) not.
+        self.assertEqual(self.released(q, 5.0)[0], "s2")
+        self.assertEqual(self.released(q, 5.0)[0], "late")
+
+    def test_invalid_order_settings_are_refused(self):
+        with self.assertRaises(ValueError):
+            hold_module.HoldQueue(8, 300, 8192, 2.0, lambda _: True, order="lifo")
+        with self.assertRaises(ValueError):
+            hold_module.HoldQueue(8, 300, 8192, 2.0, lambda _: True, order="attainable")
+        with self.assertRaises(ValueError):
+            self.queue().__class__(
+                8, 300, 8192, 2.0, lambda _: True, unified_guard_blocks=125,
+                order="attainable", starve_s=0,
+            )
+
+
 class Started:
     def __init__(self):
         self.calls = []

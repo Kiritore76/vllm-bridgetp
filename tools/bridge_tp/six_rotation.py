@@ -190,6 +190,9 @@ def configure_plan(
             assist=bool(conversion and conversion.get("assist")),
             prestart=bool(conversion and conversion.get("prestart")),
             recompute=bool(conversion and conversion.get("recompute")),
+            hold_order=argv[argv.index("--hold-order") + 1]
+            if "--hold-order" in argv
+            else "fifo",
             instances=rows,
         ),
     )

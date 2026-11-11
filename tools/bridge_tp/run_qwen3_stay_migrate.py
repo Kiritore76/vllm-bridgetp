@@ -448,6 +448,12 @@ def main(argv=None):
         help="static layout: hold arrivals in the controller while no pool has room",
     )
     parser.add_argument(
+        "--hold-attainable",
+        action="store_true",
+        help="unified hold releases requests that can still meet their "
+        "first-token budget first; held 10s or more go first (user 11-11)",
+    )
+    parser.add_argument(
         "--overload-migrate",
         action="store_true",
         help="static L1A: sustained source overload migrates without a drained queue",
@@ -627,6 +633,10 @@ def main(argv=None):
         parser.error("the conversion decider runs on the phase-shift workload")
     if args.conversion_prestart and not (args.conversion or args.conversion_decider):
         parser.error("--conversion-prestart needs a conversion")
+    if args.hold_attainable and not (
+        args.hold_queue and getattr(args, "scheduler", None) == "unified"
+    ):
+        parser.error("--hold-attainable needs --hold-queue and the unified scheduler")
     if args.conversion_recompute and not (
         args.cards == 6 and (args.conversion or args.conversion_decider)
     ):
@@ -1289,6 +1299,13 @@ def main(argv=None):
                 ]
                 if args.scheduler == "pressure":
                     plan["controller_argv"] += ["--hold-tp1-long-kv", "0.7"]
+            if args.hold_attainable:
+                plan["controller_argv"] += [
+                    "--hold-order",
+                    "attainable",
+                    "--hold-starve-s",
+                    "10",
+                ]
             if args.scheduler == "unified":
                 plan["controller_argv"] += [
                     "--scheduler",

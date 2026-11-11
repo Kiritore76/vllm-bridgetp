@@ -124,6 +124,19 @@ def parse_args(argv=None):
         "of its KV in use; 0 applies neither",
     )
     parser.add_argument(
+        "--hold-order",
+        choices=("fifo", "attainable"),
+        default="fifo",
+        help="unified hold release order: arrival order, or requests that can "
+        "still meet their first-token budget first (pressure_hold)",
+    )
+    parser.add_argument(
+        "--hold-starve-s",
+        type=float,
+        default=10.0,
+        help="attainable order: a request held this long goes first",
+    )
+    parser.add_argument(
         "--hold-long-wait-s",
         type=float,
         default=300.0,
@@ -161,6 +174,10 @@ def parse_args(argv=None):
         parser.error("maximum migrations must be nonnegative")
     if args.hold_unstarted < 0 or args.hold_long_wait_s < 0:
         parser.error("hold settings must be nonnegative")
+    if args.hold_order != "fifo" and args.scheduler != "unified":
+        parser.error("--hold-order attainable needs the unified scheduler")
+    if not args.hold_starve_s > 0:
+        parser.error("--hold-starve-s must be positive")
     if min(args.source_context_limit, args.target_context_limit) <= 0:
         parser.error("positive configured context limits required")
     if any(
@@ -1735,6 +1752,8 @@ def _run(args, prepared):
                 unified_guard_blocks=r.unified.GUARD_BLOCKS
                 if getattr(args, "scheduler", "pressure") == "unified"
                 else None,
+                order=getattr(args, "hold_order", "fifo"),
+                starve_s=getattr(args, "hold_starve_s", 10.0),
             )
             if getattr(args, "hold_unstarted", 0)
             else None,

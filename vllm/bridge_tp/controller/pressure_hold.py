@@ -12,6 +12,14 @@ evidence a small prompt is sent and a long one waits, bounded by ``long_wait_s``
 With ``tp1_long_kv``, a TP1 takes no long prompt while it already serves a request
 past short size or its KV is used this far (user 11-04): two long requests on one
 TP1 preempt each other and stop its queue. Short requests are not affected.
+
+Release order (unified hold; user 11-11): ``fifo`` scans arrivals oldest first.
+``attainable`` serves the requests that can still meet their first-token budget
+before those already past it: under overload FIFO makes every arrival wait the
+whole backlog, so none meets it (six-card split-back: TTFT p50 7s, 0/433). Order:
+(1) waiting at least ``starve_s``, oldest first, so a late request is not passed
+over for long; (2) still attainable, oldest first; (3) the rest, oldest first.
+Every request is still sent; only the order of held ones changes.
 """
 
 import bisect
@@ -41,9 +49,19 @@ class HoldQueue:
         degree=None,
         tp1_long_kv=0.0,
         unified_guard_blocks=None,
+        order="fifo",
+        starve_s=10.0,
     ):
         if unstarted_limit <= 0 or long_wait_s < 0 or long_tokens <= 0:
             raise ValueError("invalid hold settings")
+        if order not in {"fifo", "attainable"} or not starve_s > 0:
+            raise ValueError("invalid hold release order")
+        if order != "fifo" and unified_guard_blocks is None:
+            raise ValueError("the attainable order is for the unified hold")
+        self.order, self.starve_s = order, starve_s
+        # Engine side of TTFT (send to first token) of recent short requests:
+        # under overload the engine queue alone takes seconds (GPU 11-11).
+        self.engine_delays = deque(maxlen=20)
         # Unified (user 11-06): one queue and two rules, the engine queue limit
         # and a prompt that fits after the guard; no long/short distinction.
         self.unified = unified_guard_blocks is not None
@@ -87,9 +105,13 @@ class HoldQueue:
 
     def _refresh(self):
         for pool_id, values in self.unstarted.items():
-            self.unstarted[pool_id] = [
-                v for v in values if not (v.recorder.tokens_seen or v.future.done())
-            ]
+            kept = []
+            for v in values:
+                if v.recorder.tokens_seen and self.order != "fifo":
+                    self._observe_start(v)
+                if not (v.recorder.tokens_seen or v.future.done()):
+                    kept.append(v)
+            self.unstarted[pool_id] = kept
         self.running = [v for v in self.running if not v.future.done()]
 
     def _fresh(self, pool, wall):
@@ -126,6 +148,68 @@ class HoldQueue:
 
     # Arrivals scanned per call; one that fits nowhere does not stop later ones.
     unified_scan = 256
+    # First-token budgets of the strict SLO (short 2s, long 10s). After release
+    # the engine still needs the median send-to-first-token of recent short
+    # requests (at least 0.5s), plus 0.16 ms per extra prompt token (GPU 11-10).
+    # A fixed 0.58s instead kept few more in time than FIFO: offline 11-11,
+    # L2C +160 against +1979 with this online estimate.
+    ttft_budget_s = dict(short=2.0, long=10.0)
+    release_margin_s = 0.5
+    prefill_s_per_token = 1.6e-4
+
+    # The engine delay is measured on short prompts; a longer one adds its
+    # extra prefill on top.
+    short_prompt_tokens = 512
+
+    def _observe_start(self, value):
+        """Record send-to-first-token of a started short request."""
+        if len(value.payload["prompt"]) >= self.long_tokens:
+            return
+        try:
+            first = value.recorder.proxy.emitted[0].unix_s
+        except (AttributeError, IndexError):
+            return
+        delay = first - value.dispatched_at
+        if math.isfinite(delay) and delay >= 0:
+            self.engine_delays.append(delay)
+
+    def engine_delay_s(self):
+        """Median recent engine delay, never below the fixed margin."""
+        if not self.engine_delays:
+            return self.release_margin_s
+        ordered = sorted(self.engine_delays)
+        return max(self.release_margin_s, ordered[len(ordered) // 2])
+
+    def _attainable(self, job, waited, engine_s):
+        prompt = len(job["request"]["prompt"])
+        budget = self.ttft_budget_s["long" if prompt >= self.long_tokens else "short"]
+        extra = max(0, prompt - self.short_prompt_tokens) * self.prefill_s_per_token
+        return waited + engine_s + extra <= budget
+
+    def _scan_order(self, now):
+        """Indexes of held arrivals in the order they are offered a pool."""
+        count = len(self.short)
+        if self.order == "fifo":
+            return range(min(count, self.unified_scan))
+        starved, attainable, late = [], [], []
+        # The queue is in arrival order: starved ones lead, attainable ones are
+        # among the newest (no budget exceeds 10s), the late are in between.
+        newest = max(self.ttft_budget_s.values())
+        index = 0
+        while index < count and now - self.short[index][1] >= self.starve_s:
+            starved.append(index)
+            index += 1
+        first_recent = index
+        while first_recent < count and now - self.short[first_recent][1] > newest:
+            first_recent += 1
+        engine_s = self.engine_delay_s()
+        for i in range(first_recent, count):
+            job, arrived = self.short[i]
+            fits = self._attainable(job, now - arrived, engine_s)
+            (attainable if fits else late).append(i)
+        late = list(range(index, first_recent)) + late
+        late.sort()
+        return (starved + attainable + late)[: self.unified_scan]
 
     def _unified_fits(self, pool, job):
         """Prompt blocks fit after unallocated, sent-but-unstarted and the guard."""
@@ -160,9 +244,8 @@ class HoldQueue:
         least full one (the old hold's bounded wait, user 11-06).
         """
         fresh = [p for p in room if self._fresh(p, wall)]
-        for index, (job, arrived) in enumerate(self.short):
-            if index >= self.unified_scan:
-                break
+        for index in self._scan_order(now):
+            job, arrived = self.short[index]
             if self._never_fits(pools, job):
                 size = len(job["request"]["prompt"])
                 raise ValueError(
