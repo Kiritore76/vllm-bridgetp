@@ -257,7 +257,11 @@ class DrainRecompute:
                 result["requests"].append(stream.client_id)
         self.requests[seq] = dict(
             bundle=control.get("bundle"),
-            known=frozenset(self.tp_of),
+            # Pools serving now. A sleeping engine of the bundle that wakes
+            # later keeps its id and must still count as the new instance.
+            known=frozenset(
+                i for i in self.tp_of if self.co.lifecycle(i) != "SLEEPING"
+            ),
             result=result,
         )
         self.audit(dict(kind="drain_recompute_request", control=control, **result))

@@ -482,7 +482,7 @@ class SequenceBackend(pc.ControllerConversionBackend):
         if not self.fresh(status) or status.get("layout_revision", -1) < self.revision:
             return False
         for instance_id, r in self.registry.instances.items():
-            if r.lifecycle not in {"ACTIVE", "RETIRED"}:
+            if r.lifecycle not in {"ACTIVE", "RETIRED", "SLEEPING"}:
                 return False
             row = status["instances"].get(instance_id)
             if row is None or row["lifecycle"] != r.lifecycle:
@@ -494,7 +494,15 @@ class SequenceBackend(pc.ControllerConversionBackend):
 
 def validate(request):
     """Validate the sequence without creating processes or mutating a registry."""
-    allowed = {"sequence", "base_port", "prestart", "safety", "profile", "recompute"}
+    allowed = {
+        "sequence",
+        "base_port",
+        "prestart",
+        "safety",
+        "profile",
+        "recompute",
+        "engine_reuse",
+    }
     if not set(request) <= allowed or not {"sequence", "base_port"} <= set(request):
         raise ValueError("invalid conversion sequence fields")
     if (
@@ -508,6 +516,10 @@ def validate(request):
         request.get("recompute") and request.get("profile") != "six_card"
     ):
         raise ValueError("drain recompute is a six-card option")
+    if request.get("engine_reuse") not in (None, "sleep") or (
+        request.get("engine_reuse") and request.get("profile") != "six_card"
+    ):
+        raise ValueError("engine reuse is a six-card sleep option")
     if not set(request.get("safety", {})) <= set(pc.SAFETY):
         raise ValueError("invalid sequence safety overrides")
     if request.get("profile", "four_card") not in {"four_card", "six_card"}:

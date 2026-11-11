@@ -3,6 +3,7 @@
 
 import copy
 import json
+import threading
 from pathlib import Path
 
 from tools.bridge_tp import pressure_conversion as pc
@@ -10,6 +11,12 @@ from tools.bridge_tp.conversion_channels import TargetChannelGraph
 from tools.bridge_tp.conversion_sequence import SequenceBackend
 
 ports = pc.load("tcp_ports")
+
+# Engine reuse (user 11-11). A GPU whose engines all sleep keeps their CUDA
+# context and buffers: 525-1214 MiB in the two-GPU probe of 11-11, plus the
+# BridgeTP connector here. More than this means the sleep did not free it.
+SLEEP_RESIDUAL_MIB = 4096
+SLEEP_TIMEOUT_S = 120
 
 PATH = {
     "L0": {"A": 1, "B": 1, "C": 1},
@@ -190,6 +197,14 @@ def configure(plan):
     """Run after canonical identities and serving flags are finalized."""
     if plan.get("scheduler") != "unified" or plan.get("static_cards") != 6:
         raise ValueError("six-card conversion requires six-card unified scheduler")
+    if (plan.get("conversion") or {}).get("engine_reuse") == "sleep":
+        # Engine reuse needs every engine sleep-capable from its first start
+        # (cumem allocator); the dev endpoints stay on the local host.
+        for key in ("source_argv", "target_argv"):
+            if "--enable-sleep-mode" not in plan[key]:
+                plan[key].append("--enable-sleep-mode")
+        for key in ("source_env", "target_env"):
+            plan[key]["VLLM_SERVER_DEV_MODE"] = "1"
     rows = plan["instances"]["instances"]
     state = dict(ports.state(), generation=1000)
     targets = {
@@ -359,6 +374,11 @@ class SixBackend(SequenceBackend):
         super().__init__(*args, **kwargs)
         self.context = dict(profile="six_card")
         self.channel_plan = None
+        # Engine reuse: None, or "sleep" (set by the launcher from the request).
+        self.engine_reuse = None
+        self.sleeping = {}  # instance id -> what its wake needs
+        self.sleep_job = None
+        self.sleep_fallback = set()  # plan ids whose sleep failed
         self.next_instance_generation = (
             max(r.ref.instance_generation for r in self.registry.instances.values()) + 1
         )
@@ -559,6 +579,8 @@ class SixBackend(SequenceBackend):
     def prestart(self, plan):
         if not self.prestart_enabled or self.prestarted is not None:
             return
+        if self.wake_set(plan) is not None:
+            return  # nothing to pre-start: sleeping engines wake instead
         retiring = {r.instance_id for r in self.refs(plan)}
         retained = {n: t for n, t in self.targets.items() if n not in retiring}
         for name, _, extra, _ in self.replacement_specs(plan):
@@ -573,7 +595,182 @@ class SixBackend(SequenceBackend):
                 self.resources["source_links"][name] = extra["source_active"]
         super().prestart(plan)
 
+    # ---------------------------------------------------------- engine reuse
+    def reuse_on(self, plan):
+        return (
+            self.engine_reuse == "sleep" and plan["plan_id"] not in self.sleep_fallback
+        )
+
+    def retire_label(self, plan):
+        return "SLEEPING" if self.reuse_on(plan) else "RETIRED"
+
+    def reclaimed_state(self, plan):
+        return self.retire_label(plan)
+
+    def wake_set(self, plan):
+        """Sleeping engines that are exactly this conversion's target form."""
+        if self.engine_reuse != "sleep":
+            return None
+        tp = int(plan["target_bundle_mode"][2:])
+        gpus = sorted(
+            g for r in self.refs(plan) for g in self.registry.get(r).physical_gpu_ids
+        )
+        names = sorted(
+            n
+            for n, e in self.sleeping.items()
+            if e["bundle"] == plan["bundle_id"] and e["tp"] == tp
+        )
+        found = sorted(g for n in names for g in self.sleeping[n]["gpus"])
+        if not names or found != gpus or len(names) != (1 if tp > 1 else len(gpus)):
+            return None
+        return names
+
+    def stop_owned_engines(self, plan):
+        if not self.reuse_on(plan):
+            return super().stop_owned_engines(plan)
+        ids = [r.instance_id for r in self.refs(plan)]
+        job = dict(plan_id=plan["plan_id"], ids=ids, done=False, error=None)
+        job["started"] = self.clock()
+        self.sleep_job = job
+
+        def run():
+            try:
+                job["seconds"] = self.ops.sleep(
+                    {i: self.registry.instances[i].endpoint for i in ids}
+                )
+            except Exception as error:  # the next poll falls back to a stop
+                job["error"] = repr(error)
+            job["done"] = True
+
+        threading.Thread(target=run, daemon=True).start()
+        self.ops.event("SLEEP_START", plan_id=plan["plan_id"], instances=ids)
+
+    def resources_released(self, plan):
+        job = self.sleep_job
+        if job is None or job["plan_id"] != plan["plan_id"]:
+            return super().resources_released(plan)
+        if not job["done"]:
+            if self.clock() - job["started"] <= SLEEP_TIMEOUT_S:
+                return False
+            job["error"] = "sleep timed out"
+        refs = self.refs(plan)
+        gpus = sorted(g for r in refs for g in self.registry.get(r).physical_gpu_ids)
+        used = None
+        if job["error"] is None:
+            try:
+                used = self.ops.gpu_memory_used(gpus)
+            except Exception as error:
+                job["error"] = repr(error)
+        if job["error"] is None and any(used[g] > SLEEP_RESIDUAL_MIB for g in gpus):
+            job["error"] = "GPU memory not released by sleep"
+        if job["error"] is not None:
+            # Never two awake engines on a GPU: stop the old ones and continue
+            # as a cold conversion (the controller ends them RETIRED).
+            self.ops.event(
+                "SLEEP_FALLBACK",
+                plan_id=plan["plan_id"],
+                reason=job["error"],
+                used_mib=used,
+            )
+            self.sleep_fallback.add(plan["plan_id"])
+            self.sleep_job = None
+            self.write_layout(dict.fromkeys(job["ids"], "RETIRED"))
+            self.ops.stop(job["ids"])
+            return False
+        for ref in refs:
+            row = self.registry.get(ref)
+            self.sleeping[ref.instance_id] = dict(
+                bundle=row.bundle_id,
+                tp=row.tp_degree,
+                gpus=list(row.physical_gpu_ids),
+                endpoint=row.endpoint,
+                context_limit=row.context_limit,
+                inventory_path=self.rows[ref.instance_id]["inventory_path"],
+                target=self.targets.get(ref.instance_id),
+            )
+        self.sleep_job = None
+        self.ops.event(
+            "RESOURCES_RELEASED", plan_id=plan["plan_id"], gpus=gpus, slept=True
+        )
+        self.ops.event(
+            "SLEPT",
+            plan_id=plan["plan_id"],
+            instances=job["ids"],
+            sleep_s=job.get("seconds"),
+            wait_s=round(self.clock() - job["started"], 3),
+            used_mib=used,
+        )
+        return True
+
+    def wake_replacements(self, plan, names):
+        """Wake the sleeping target form; channels open once each is awake."""
+        retiring = {r.instance_id for r in self.refs(plan)}
+        for target in list(self.targets):
+            if target in retiring:
+                self.channel_graph.remove_target(target)
+                del self.targets[target]
+        for name in names:
+            entry = self.sleeping.pop(name)
+            self.registry.transition(self.registry.instances[name].ref, "WAKING")
+            if entry["tp"] == 2:
+                target = entry["target"]
+                # Fresh edges only: connect() gives every source a new generation.
+                target["connector_sources"] = []
+                target["defer_channels_until_model_ready"] = True
+                self.targets[name] = target
+                pc.atomic_json(target["channel_plan"], [])
+                self.channel_graph.add_target(
+                    name,
+                    mechanism_root=target["mechanism_root"],
+                    channel_plan=target["channel_plan"],
+                    wake=True,
+                )
+            self.started[name] = dict(
+                instance_id=name,
+                bundle=entry["bundle"],
+                tp=entry["tp"],
+                gpus=entry["gpus"],
+                endpoint=entry["endpoint"],
+                port=int(entry["endpoint"].rsplit(":", 1)[1]),
+                context_limit=entry["context_limit"],
+                inventory_path=entry["inventory_path"],
+                wake=True,
+                channels_published=entry["tp"] == 2,
+            )
+            self.ops.event("WAKE_START", instance=name, gpus=entry["gpus"])
+        sources = {
+            n: r
+            for n, r in self.rows.items()
+            if n not in retiring
+            and r["tp_degree"] == 1
+            and self.registry.instances[n].lifecycle in {"ACTIVE", "WAKING"}
+        }
+        connect(self.alloc, sources, self.targets)
+        for source, row in sources.items():
+            self.resources["source_links"][source] = row["source_active"]
+            self.channel_graph.source_files[source] = Path(row["targets_file"])
+            waking = self.registry.instances[source].lifecycle == "WAKING"
+            visible = {
+                n: t
+                for n, t in self.targets.items()
+                if not t.get("defer_channels_until_model_ready")
+            }
+            pc.atomic_json(
+                row["targets_file"], [] if waking else source_entries(source, visible)
+            )
+        for target in self.targets.values():
+            pc.atomic_json(
+                target["channel_plan"],
+                []
+                if target.get("defer_channels_until_model_ready")
+                else target["connector_sources"],
+            )
+        self.joined_at = self.clock()
+
     def start_replacements(self, plan):
+        names = self.wake_set(plan)
+        if names is not None:
+            return self.wake_replacements(plan, names)
         retiring = {r.instance_id for r in self.refs(plan)}
         for target in list(self.targets):
             if target in retiring:
@@ -637,15 +834,21 @@ class SixBackend(SequenceBackend):
 
     def retire_channels(self, plan):
         ids = {r.instance_id for r in self.refs(plan)}
-        if any(self.layout.get(i, {}).get("lifecycle") != "RETIRED" for i in ids):
-            self.write_layout(dict.fromkeys(ids, "RETIRED"))
+        label = self.retire_label(plan)
+        if any(self.layout.get(i, {}).get("lifecycle") != label for i in ids):
+            self.write_layout(dict.fromkeys(ids, label))
         status = self.status()
+        # A sleeping group keeps its controller migration group and source
+        # entry (a retired identity can never return); lifecycle gates it.
         if (
             not self.fresh(status)
             or status.get("migration_resource_targets") is None
-            or ids & set(status["migration_resource_targets"])
             or status.get("migration_resource_sources") is None
-            or ids & set(status["migration_resource_sources"])
+            or label == "RETIRED"
+            and (
+                ids & set(status["migration_resource_targets"])
+                or ids & set(status["migration_resource_sources"])
+            )
         ):
             return False
         return pc.ControllerConversionBackend.retire_channels(self, plan)
@@ -654,7 +857,8 @@ class SixBackend(SequenceBackend):
         # Session identities are permanently retired by controller ACK. Once
         # that boundary is published, reviving the old id is not a safe abort.
         if any(
-            self.layout.get(r.instance_id, {}).get("lifecycle") == "RETIRED"
+            self.layout.get(r.instance_id, {}).get("lifecycle")
+            in {"RETIRED", "SLEEPING"}
             for r in self.refs(plan)
         ):
             plan.update(state="RECOVERY_REQUIRED", destruction_started=True)
@@ -686,10 +890,9 @@ class SixBackend(SequenceBackend):
             if target.get("defer_channels_until_model_ready"):
                 pc.atomic_json(target["channel_plan"], target["connector_sources"])
                 for source, row in self.rows.items():
-                    if (
-                        row.get("targets_file")
-                        and self.registry.instances[source].lifecycle == "ACTIVE"
-                    ):
+                    if row.get("targets_file") and self.registry.instances[
+                        source
+                    ].lifecycle in {"ACTIVE", "WAKING"}:
                         pc.atomic_json(
                             row["targets_file"], source_entries(source, self.targets)
                         )
@@ -698,6 +901,19 @@ class SixBackend(SequenceBackend):
                     "CHANNEL_TOPOLOGY_PUBLISHED",
                     instance=name,
                     sources=[c["source"] for c in target["connector_sources"]],
+                )
+        for name, extra in getattr(self, "started", {}).items():
+            # A woken TP1 source reconnects only after its engine is awake.
+            if extra.get("wake") and not extra["channels_published"]:
+                pc.atomic_json(
+                    self.rows[name]["targets_file"],
+                    source_entries(name, self.targets),
+                )
+                extra["channels_published"] = True
+                self.ops.event(
+                    "SOURCE_CHANNELS_PUBLISHED",
+                    instance=name,
+                    targets=sorted(self.targets),
                 )
         missing = []
         for name, target in self.targets.items():
@@ -759,17 +975,23 @@ class SixBackend(SequenceBackend):
     def write_layout(self, changes, **kwargs):
         revision = super().write_layout(changes, **kwargs)
         value = pc.read_json(self.run_dir / "layout_control.json")
+        live = {"ACTIVE", "QUIESCING", "SLEEPING"}
+        asleep = {
+            n: e["target"]
+            for n, e in getattr(self, "sleeping", {}).items()
+            if e.get("target") is not None
+        }
         value["migration_resources"] = dict(
             targets={
                 n: t
-                for n, t in self.targets.items()
-                if self.layout.get(n, {}).get("lifecycle") in {"ACTIVE", "QUIESCING"}
+                for n, t in {**asleep, **self.targets}.items()
+                if self.layout.get(n, {}).get("lifecycle") in live
             },
             source_links={
                 n: r["source_active"]
                 for n, r in self.rows.items()
                 if r.get("source_active")
-                and self.layout.get(n, {}).get("lifecycle") in {"ACTIVE", "QUIESCING"}
+                and self.layout.get(n, {}).get("lifecycle") in live
             },
         )
         pc.atomic_json(self.run_dir / "layout_control.json", value)

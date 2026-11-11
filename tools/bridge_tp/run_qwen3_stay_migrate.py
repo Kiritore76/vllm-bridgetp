@@ -379,6 +379,14 @@ def main(argv=None):
         "new TP2 after a drain delay instead of waiting for them",
     )
     parser.add_argument(
+        "--conversion-engine-reuse",
+        choices=["sleep"],
+        help="six-card conversions put the old engines to sleep (vLLM sleep "
+        "mode level 1) and wake them on the reverse conversion instead of "
+        "stopping and cold-starting engines; the first conversion of each "
+        "group form still cold-starts",
+    )
+    parser.add_argument(
         "--decider-multi",
         action="store_true",
         help="keep converting as the decider proposes, deciding on known lengths",
@@ -631,6 +639,10 @@ def main(argv=None):
         args.cards == 6 and (args.conversion or args.conversion_decider)
     ):
         parser.error("--conversion-recompute needs a six-card conversion")
+    if args.conversion_engine_reuse and not (
+        args.cards == 6 and (args.conversion or args.conversion_decider)
+    ):
+        parser.error("--conversion-engine-reuse needs a six-card conversion")
     if (args.decider_pre_tilt or args.decider_assist) and not args.conversion_decider:
         parser.error("this option needs --conversion-decider")
     if args.decider_evacuate and not args.decider_multi:
@@ -1095,6 +1107,8 @@ def main(argv=None):
             )
             if args.conversion_recompute:
                 spec["conversion"]["recompute"] = True
+            if args.conversion_engine_reuse:
+                spec["conversion"]["engine_reuse"] = args.conversion_engine_reuse
             if args.decider_multi:
                 spec["conversion"].update(
                     multi=True,
@@ -1135,6 +1149,11 @@ def main(argv=None):
                     base_port=8400,
                     prestart=args.conversion_prestart,
                     **({"recompute": True} if args.conversion_recompute else {}),
+                    **(
+                        {"engine_reuse": args.conversion_engine_reuse}
+                        if args.conversion_engine_reuse
+                        else {}
+                    ),
                     sequence=[
                         dict(
                             bundle=edge[2],
@@ -1348,6 +1367,7 @@ def main(argv=None):
                     assist=args.decider_assist,
                     prestart=args.conversion_prestart,
                     recompute=args.conversion_recompute,
+                    engine_reuse=args.conversion_engine_reuse,
                 )
             if args.phase_shift and args.phase_scenario == "auto_smoke_six_v1":
                 plan["migration_coverage_required"] = False

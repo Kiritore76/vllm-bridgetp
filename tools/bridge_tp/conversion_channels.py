@@ -28,12 +28,19 @@ class TargetChannelGraph:
         for target, description in targets.items():
             self.add_target(target, **description)
 
-    def add_target(self, target, *, mechanism_root, channel_plan, tp=2):
+    def add_target(self, target, *, mechanism_root, channel_plan, tp=2, wake=False):
+        """``wake``: a receiver whose engine slept comes back under its id.
+
+        Its old edges were closed before it slept; the new ones carry fresh
+        receiver-scoped generations, so receipts never mix incarnations.
+        """
         if self.closing is not None and not self.closing["done"]:
             raise ValueError("cannot add a receiver during channel retirement")
         root, path = Path(mechanism_root).resolve(), Path(channel_plan).resolve()
-        if target in self.seen:
+        if target in self.targets or (target in self.seen and not wake):
             raise ValueError("target incarnation cannot be reused")
+        if wake and target not in self.seen:
+            raise ValueError("only a known receiver wakes")
         if root != self.root / "migration" / target or not path.is_relative_to(root):
             raise ValueError("target channel plan escaped owned receiver")
         if tp != 2:

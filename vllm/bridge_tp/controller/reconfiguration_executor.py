@@ -247,8 +247,11 @@ class ConversionExecutor:
             elif state == "RECLAIMING":
                 if not self.backend.resources_released(self.plan):
                     return self.plan_status()
+                # Engine reuse: a slept group keeps its ids for a later wake.
+                reclaimed = getattr(self.backend, "reclaimed_state", None)
+                state = "RETIRED" if reclaimed is None else reclaimed(self.plan)
                 for ref in self.refs():
-                    self.registry.transition(ref, "RETIRED")
+                    self.registry.transition(ref, state)
                 self.backend.start_replacements(self.plan)
                 self.plan["state"] = "PREPARING"
             elif state == "PREPARING":

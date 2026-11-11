@@ -934,11 +934,12 @@ class ControllerConversionBackend:
     def retire_channels(self, plan):
         """Retire in the controller, then close their channels on the target."""
         ids = [r.instance_id for r in self.refs(plan)]
-        if any(self.layout.get(i, {}).get("lifecycle") != "RETIRED" for i in ids):
-            self.write_layout(dict.fromkeys(ids, "RETIRED"))
+        label = self.retire_label(plan)
+        if any(self.layout.get(i, {}).get("lifecycle") != label for i in ids):
+            self.write_layout(dict.fromkeys(ids, label))
         states = self.controller_states(ids)
         if states is None or any(
-            s is None or s["lifecycle"] != "RETIRED" for s in states.values()
+            s is None or s["lifecycle"] != label for s in states.values()
         ):
             return False
         if self.channel_graph is not None:
@@ -1007,6 +1008,10 @@ class ControllerConversionBackend:
             teardown_wait_s=self.clock() - closing["closed_at"],
         )
         return True
+
+    def retire_label(self, plan):
+        """Controller lifecycle that ends the old group (SLEEPING on reuse)."""
+        return "RETIRED"
 
     def stop_owned_engines(self, plan):
         self.ops.stop([r.instance_id for r in self.refs(plan)])

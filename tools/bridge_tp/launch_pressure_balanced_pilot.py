@@ -491,10 +491,12 @@ def live_pair(plan):
         side
         for side, pool in (("source", "tp1"), ("target", "tp4"))
         if side not in absent_pair(plan)
-        and status.get(aliases.get(pool), {}).get("lifecycle") != "RETIRED"
+        and status.get(aliases.get(pool), {}).get("lifecycle")
+        not in {"RETIRED", "SLEEPING"}
     ]
     if "target" in absent_pair(plan) and any(
-        row.get("pool_id") == "tp4" and row.get("lifecycle") != "RETIRED"
+        row.get("pool_id") == "tp4"
+        and row.get("lifecycle") not in {"RETIRED", "SLEEPING"}
         for row in status.values()
     ):
         # S5b: the conversion merged the absent pair target; it serves now.
@@ -568,7 +570,7 @@ def decider_request(request):
         <= set(request)
         <= required
         | {"rules", "prestart", "pre_tilt", "assist", "multi"}
-        | {"max_conversions", "evacuate", "profile", "recompute"}
+        | {"max_conversions", "evacuate", "profile", "recompute", "engine_reuse"}
         or request.get("evacuate", False) not in (True, False)
         or request.get("evacuate")
         and not request.get("multi")
@@ -582,6 +584,9 @@ def decider_request(request):
         or request.get("prestart", False) not in (True, False)
         or request.get("recompute", False) not in (True, False)
         or request.get("recompute")
+        and request.get("profile") != "six_card"
+        or request.get("engine_reuse") not in (None, "sleep")
+        or request.get("engine_reuse")
         and request.get("profile") != "six_card"
         or request.get("pre_tilt", False) not in (True, False)
         or request.get("assist", False) not in (True, False)
@@ -1046,6 +1051,10 @@ def start_conversion(spec, scene, plan, common, processes, publish, requests):
         from tools.bridge_tp.run_phase9_cap0_noop import warmup_prompt_shapes
 
         process = owned[extra["instance_id"]]
+        if extra.get("wake"):
+            # Engine reuse: the same process, its weights back from host memory.
+            seconds = engine_sleep_call(extra["endpoint"], "wake")
+            event("WOKEN", instance=extra["instance_id"], wake_s=seconds)
         common.wait_healthy(extra["endpoint"], process, spec["startup_timeout_s"])
         warmup_prompt_shapes(
             extra["endpoint"],
@@ -1078,7 +1087,23 @@ def start_conversion(spec, scene, plan, common, processes, publish, requests):
 
         wait_stager_ready(Path(target["mechanism_dir"]), process)
 
+    def sleep(endpoints):
+        """Level-1 sleep of every engine in parallel; seconds per engine."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        ids = sorted(endpoints)
+        for i in ids:
+            if not common.process_group_alive(owned[i]):
+                raise RuntimeError(f"{i} is not alive")
+        with ThreadPoolExecutor(len(ids)) as pool:
+            seconds = list(
+                pool.map(lambda i: engine_sleep_call(endpoints[i], "sleep"), ids)
+            )
+        return dict(zip(ids, seconds))
+
     ops = SimpleNamespace(
+        sleep=sleep,
+        gpu_memory_used=nvidia_memory_used,
         stop=lambda ids: common.stop_processes([owned[i] for i in ids]),
         start_stager=start_stager,
         start_receiver=start_receiver,
@@ -1119,6 +1144,9 @@ def start_conversion(spec, scene, plan, common, processes, publish, requests):
     )
     # Six-card drain recompute (pressure_recompute) is an explicit run option.
     backend.recompute_enabled = bool(plan["conversion"].get("recompute"))
+    if plan.get("dynamic_conversion"):
+        # Engine reuse (sleep/wake instead of stop/cold start) likewise.
+        backend.engine_reuse = plan["conversion"].get("engine_reuse")
     driver_type = pc.ConversionDriver
     if plan["conversion"].get("multi"):
         from tools.bridge_tp.conversion_sequence import DecidedSequenceDriver
@@ -1131,6 +1159,50 @@ def start_conversion(spec, scene, plan, common, processes, publish, requests):
     driver = driver_type(backend, plan["conversion"], root / "conversion_plan.json")
     driver.start()
     return driver
+
+
+def engine_sleep_call(endpoint, action, timeout_s=120):
+    """vLLM dev endpoints (VLLM_SERVER_DEV_MODE=1): level-1 sleep or wake.
+
+    Returns the seconds until ``/is_sleeping`` reports the new state.
+    """
+    import urllib.request
+
+    def call(method, path):
+        request = urllib.request.Request(endpoint + path, method=method, data=None)
+        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+            return response.read()
+
+    started = time.monotonic()
+    call("POST", "/sleep?level=1" if action == "sleep" else "/wake_up")
+    want = action == "sleep"
+    while json.loads(call("GET", "/is_sleeping"))["is_sleeping"] is not want:
+        if time.monotonic() - started > timeout_s:
+            raise TimeoutError(f"{endpoint} did not {action}")
+        time.sleep(0.05)
+    return round(time.monotonic() - started, 3)
+
+
+def nvidia_memory_used(gpu_ids):
+    """Used MiB per physical GPU index (nvidia-smi)."""
+    import subprocess
+
+    rows = dict(
+        (index.strip(), int(used))
+        for index, used in (
+            line.split(",")
+            for line in subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,memory.used",
+                    "--format=csv,noheader,nounits",
+                ],
+                text=True,
+            ).splitlines()
+            if line.strip()
+        )
+    )
+    return {g: rows[g] for g in gpu_ids}
 
 
 def pc_join(plan):
