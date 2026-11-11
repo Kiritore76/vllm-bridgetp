@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 当前任务：六卡40分钟自动场：拆回短确认同split5场；重算计数不再计入已停住（10秒无输出）的请求；同输入。
+# 当前任务：六卡40分钟同输入静态L1AC对照（基线a6a2ebf18同版），保留普通迁移，不转换布局；替换六卡识别缺失的旧L1AC参考。
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
@@ -15,13 +15,13 @@ git fetch origin "refs/heads/$branch:refs/remotes/origin/$branch" || exit 1
 revision=$(git rev-parse HEAD)
 [ "$revision" = "$(git rev-parse "origin/$branch")" ] || { echo '请先git pull --ff-only。'; exit 1; }
 mkdir -p /root/autodl-tmp/bridgetp/results || exit 1
-run=/root/autodl-tmp/bridgetp/results/qwen3_six_guard40_stall_auto_$(date +%Y%m%d_%H%M%S)_${RANDOM}
+run=/root/autodl-tmp/bridgetp/results/qwen3_six_guard40_static_l1ac_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 printf '%s\n' "$revision" > "$run/revision.txt"
-printf 'Six-card 2400s trial: as the 20261111 recompute auto run, plus split backs confirmed after the 30s short-rate window in 5s (L2C-L1AC, L3-L2C) and 30s (L1AC-L0) instead of 30/30/120s; same seed6/input; no performance claim.\n' > "$run/scope.txt"
+printf 'Six-card static L1AC baseline on the registered guard40 input (2400s, seed6), same service code as the baseline auto runs; ordinary current-length migration retained to the only TP2 (B, default single receiver; the runner allows --migration-targets only for static L2C or dynamic runs); no layout conversion; replaces the old L1AC reference that ran without six-card detection.\n' > "$run/scope.txt"
 echo "本批目录：$run"
-echo '先Linux CPU检查；通过后只跑同输入2400秒自动场：重算同上一场，拆回改为30秒窗口+短确认（拆A/拆C 5秒，进L0 30秒）；不自动重试。'
-echo '回放预期：A合并在排空45秒（约552秒）重算4条（其中2条已停住），上一场为664.8秒；拆回约1653秒。'
+echo '先Linux CPU检查；通过后只跑同输入2400秒静态L1AC一场，保留普通迁移，不转换布局；不自动重试。'
+echo '与旧L1AC参考（44be75dce，未识别六卡、目标满载排除未生效）相比，本场按当前基线识别六卡，迁移目标容量比≥1时排除。'
 echo '40分钟到达；含CPU/启动/预热/drain/打包，预计50–65分钟，慢机器或积压可能更久。'
 smi=
 pack_result() {
@@ -29,7 +29,7 @@ pack_result() {
     if [ -n "$smi" ]; then kill "$smi" 2>/dev/null || true; wait "$smi" 2>/dev/null || true; smi=; fi
     printf '%s\n' "$status" > "$run/exit_code.txt"
     local excludes=() edge
-    for edge in auto_from_L1AC; do
+    for edge in static_L1AC; do
         # Never omit unarchived failure data. Keep its raw trial if no inner pack.
         if [ -f "$run/$edge/trial.tar.gz" ] && [ -f "$run/$edge/trial.tar.gz.sha256" ] &&
            (cd "$run/$edge" && sha256sum -c trial.tar.gz.sha256 > /dev/null 2>&1); then
@@ -90,28 +90,25 @@ fi
 nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,pcie.link.gen.current,pcie.link.width.current --format=csv,noheader > "$run/gpu_before.csv" || { pack_result 1; exit 1; }
 nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,pcie.link.gen.current,pcie.link.width.current --format=csv,noheader -lms 1000 > "$run/gpu_samples.csv" &
 smi=$!
-case_dir="$run/auto_from_L1AC"
+case_dir="$run/static_L1AC"
 mkdir "$case_dir" || { pack_result 1; exit 1; }
-echo '开始2400秒自动场；25:00起10秒短峰应保持，27:00起持续短压应拆回。'
+echo '开始2400秒静态L1AC对照；与基线自动场相同输入/服务代码，保留普通迁移。'
 "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
     --cards 6 --static-layout L1AC --phase-shift --phase-scenario mixed_guard_six_v1 \
     --scheduler unified --hold-queue --kv-short-exempt --overload-migrate --migrate-current-length \
     --expanded-context --current-machine --repetitions 1 \
-    --conversion-decider execute --decider-multi --decider-assist --conversion-prestart --conversion-recompute \
-    --migration-targets all --decider-max-conversions 0 \
     --model "$model" \
     --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
     --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json" \
     --output "$case_dir/trial" --expected-revision "$revision" 2>&1 | tee "$case_dir/console.log"
 runner_status=${PIPESTATUS[0]}
 printf '%s\n' "$runner_status" > "$case_dir/runner_exit_code.txt"
-"$py" -B -m tools.bridge_tp.six_rotation assess --arm auto_from_L1AC --scenario mixed_guard_six_v1 --directory "$case_dir/trial" > "$case_dir/auto_check.log" 2>&1
+"$py" -B -m tools.bridge_tp.six_rotation assess --arm static_L1AC --scenario mixed_guard_six_v1 --directory "$case_dir/trial" > "$case_dir/static_check.log" 2>&1
 check_status=$?
-cat "$case_dir/auto_check.log"
+cat "$case_dir/static_check.log"
 printf '%s\n' "$check_status" > "$case_dir/check_exit_code.txt"
 status=$runner_status
 if [ "$status" = 0 ]; then status=$check_status; fi
-echo '重算是否触发、续算停顿和新A接流时间见conversion_decisions.jsonl的RECOMPUTE与pressure_audit的drain_recompute_*。'
-echo '须真实完成长段A合并和持续短段A拆回；短峰及恢复须有效L2C/KEEP，零转换/中止/证据缺失不算覆盖通过；完整输出/ACK/trace/空闲/收尾须通过。'
+echo '静态L1AC须保持布局不变，完整输出/trace/空闲/受管收尾通过；普通迁移次数如实记录，不强制迁移，不冒称性能收益。'
 pack_result "$status" || exit 1
 exit "$status"
