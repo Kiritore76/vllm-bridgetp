@@ -305,12 +305,14 @@ def cleanup(plan, write):
         active.unlink()
 
 
-def recompute_choice(instances, refs, waited_s, safety):
+def recompute_choice(instances, refs, waited_s, safety, stalled=frozenset()):
     """(reason, None) or (None, choice): which requests a merge recomputes.
 
     Every request still on the group goes, or none: the drain ends with the
     last one. Triggers only on what is observed now (drain time, request
-    count, context so far); it never predicts a remaining length.
+    count, context so far, whose output stopped growing); it never predicts a
+    remaining length. ``stalled`` requests go too but count toward neither
+    the request cap nor the token budget.
     """
     if waited_s < safety["recompute_after_s"]:
         return "drain younger than the recompute delay", None
@@ -321,6 +323,7 @@ def recompute_choice(instances, refs, waited_s, safety):
             request_id=r["request_id"],
             instance=i,
             context_tokens=r["prompt_tokens"] + r["generated"],
+            stalled=r["request_id"] in stalled,
         )
         for i in refs
         for r in instances[i]["requests"]
@@ -329,15 +332,21 @@ def recompute_choice(instances, refs, waited_s, safety):
         return "group already empty", None
     if sum(instances[i].get("streams_pending", 0) for i in refs) != len(rows):
         return "controller streams differ from native inventory", None
-    if len(rows) > safety["recompute_max_requests"]:
+    moving = [r for r in rows if not r["stalled"]]
+    if len(moving) > safety["recompute_max_requests"]:
         return (
-            f"{len(rows)} requests exceed the recompute cap "
+            f"{len(moving)} progressing requests exceed the recompute cap "
             f"{safety['recompute_max_requests']}: natural drain"
         ), None
-    tokens = sum(r["context_tokens"] for r in rows)
+    tokens = sum(r["context_tokens"] for r in moving)
     if tokens > safety["recompute_max_tokens"]:
         return f"{tokens} context tokens exceed the recompute budget", None
-    return None, dict(requests=rows, context_tokens=tokens)
+    return None, dict(
+        requests=rows,
+        context_tokens=sum(r["context_tokens"] for r in rows),
+        counted_tokens=tokens,
+        stalled=sum(r["stalled"] for r in rows),
+    )
 
 
 class SixBackend(SequenceBackend):
@@ -414,14 +423,35 @@ class SixBackend(SequenceBackend):
         clock = self.clock()
         if self.recompute_since is None:
             self.recompute_since = clock
+        # Last time each group request's output grew (observed every tick).
+        progress = getattr(self, "recompute_progress", None)
+        if progress is None:
+            progress = self.recompute_progress = {}
+        seen = {}
+        for i in refs:
+            for row in instances[i]["requests"]:
+                old = progress.get(row["request_id"])
+                grew = old is None or row["generated"] != old[0]
+                seen[row["request_id"]] = (
+                    (row["generated"], clock) if grew else old
+                )
+        progress.clear()
+        progress.update(seen)
+        stalled = frozenset(
+            k
+            for k, (_, since) in progress.items()
+            if clock - since >= self.safety["recompute_stall_s"]
+        )
         result = status.get("assist_result")
-        if self.assist_seq > self.assist_step_start_seq and (
-            result is None or result["seq"] != self.assist_seq
+        waited = clock - self.recompute_since
+        if waited >= self.safety["recompute_after_s"] and (
+            self.assist_seq > self.assist_step_start_seq
+            and (result is None or result["seq"] != self.assist_seq)
         ):
             reason, choice = "an assist START is unanswered", None
         else:
             reason, choice = recompute_choice(
-                instances, refs, clock - self.recompute_since, self.safety
+                instances, refs, waited, self.safety, stalled
             )
         if choice is None:
             if reason != self.last_recompute_reason:

@@ -436,6 +436,54 @@ class RecomputeChoiceTests(unittest.TestCase):
         empty = status_instances([])
         self.assertIn("empty", six.recompute_choice(empty, refs, 60, SAFETY)[0])
 
+    def test_stalled_requests_go_but_count_toward_neither_cap_nor_budget(self):
+        """GPU 11-11: four on A at 45s, two had stood still ~130s."""
+        refs = ["A-g1", "A-g2"]
+        rows = [row("a"), row("b"), row("c", 20000), row("d", 20000)]
+        instances = status_instances(rows)
+        reason, choice = six.recompute_choice(instances, refs, 45, SAFETY)
+        self.assertIn("4 progressing requests exceed", reason)
+        reason, choice = six.recompute_choice(
+            instances, refs, 45, SAFETY, frozenset({"c", "d"})
+        )
+        self.assertIsNone(reason)
+        self.assertEqual([r["request_id"] for r in choice["requests"]], list("abcd"))
+        self.assertEqual(choice["stalled"], 2)
+        self.assertEqual(choice["counted_tokens"], 34000)  # only a and b
+        self.assertEqual(choice["context_tokens"], 34000 + 2 * 21000)
+        # Progressing requests alone still respect the token budget.
+        big = status_instances([row("a", 32000, 2000), row("b", 30000, 2000)])
+        self.assertIn("budget", six.recompute_choice(big, refs, 45, SAFETY)[0])
+
+    def test_step_marks_a_request_stalled_after_10s_without_output(self):
+        instances = status_instances(
+            [row("a"), row("b"), row("c"), row("d")]
+        )
+        backend, clock = self.backend(1000.0, instances)
+        plan = dict(plan_id="p", bundle_id="A")
+        for t in range(0, 46):
+            clock[0] = 1000.0 + t
+            for r in instances["A-g1"]["requests"]:
+                if r["request_id"] in ("a", "b") or t < 30:
+                    r["generated"] = 1000 + t  # c and d stop at 30s
+            backend.recompute_step(plan, clock[0])
+        # At 45s c and d have been still for 15s: two progressing, so go.
+        self.assertEqual(len(backend.layouts), 1)
+        self.assertEqual(backend.layouts[0]["stalled"], 2)
+
+    def test_output_growth_restarts_the_stall_clock(self):
+        instances = status_instances([row(x) for x in "abcd"])
+        backend, clock = self.backend(1000.0, instances)
+        plan = dict(plan_id="p", bundle_id="A")
+        for t in range(0, 60):
+            clock[0] = 1000.0 + t
+            for r in instances["A-g1"]["requests"]:
+                # c and d grow once every 9s: slow, never stalled.
+                if r["request_id"] in ("a", "b") or t % 9 == 0:
+                    r["generated"] = 1000 + t
+            backend.recompute_step(plan, clock[0])
+        self.assertEqual(backend.layouts, [])
+
     def backend(self, now, instances):
         backend = six.SixBackend.__new__(six.SixBackend)
         clock = [now]
@@ -445,6 +493,7 @@ class RecomputeChoiceTests(unittest.TestCase):
         backend.recompute_seq = 0
         backend.recompute_since = None
         backend.last_recompute_reason = None
+        backend.recompute_progress = {}
         backend.assist_seq = backend.assist_step_start_seq = 0
         backend.safety = dict(SAFETY)
         backend.decisions, backend.events, backend.layouts = [], [], []

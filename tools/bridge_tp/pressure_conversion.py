@@ -136,6 +136,12 @@ SAFETY = dict(
     recompute_after_s=45.0,
     recompute_max_requests=3,
     recompute_max_tokens=65536,
+    # A group request whose output has not grown for this long is stalled
+    # (preempted or starved on the closed group; GPU 11-11: two stood still
+    # ~130s and held the cap). It goes with the recompute but counts toward
+    # neither the request cap nor the token budget: preemption already
+    # discarded its KV, so it is prefilled again either way (user 11-11).
+    recompute_stall_s=10.0,
 )
 
 

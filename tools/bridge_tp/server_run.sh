@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 当前任务：六卡40分钟自动场：重算同20261111场；拆回改为30秒窗口感知+短确认：L2C→L1AC、L3→L2C为5秒，L1AC→L0为30秒（原30/30/120秒）；同输入。
+# 当前任务：六卡40分钟自动场：拆回短确认同split5场；重算计数不再计入已停住（10秒无输出）的请求；同输入。
 set -uo pipefail
 repo=/root/autodl-tmp/bridgetp/vllm_bridge
 venv=/root/autodl-tmp/bridgetp/.venv_bridge
@@ -15,13 +15,13 @@ git fetch origin "refs/heads/$branch:refs/remotes/origin/$branch" || exit 1
 revision=$(git rev-parse HEAD)
 [ "$revision" = "$(git rev-parse "origin/$branch")" ] || { echo '请先git pull --ff-only。'; exit 1; }
 mkdir -p /root/autodl-tmp/bridgetp/results || exit 1
-run=/root/autodl-tmp/bridgetp/results/qwen3_six_guard40_split5_auto_$(date +%Y%m%d_%H%M%S)_${RANDOM}
+run=/root/autodl-tmp/bridgetp/results/qwen3_six_guard40_stall_auto_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 printf '%s\n' "$revision" > "$run/revision.txt"
 printf 'Six-card 2400s trial: as the 20261111 recompute auto run, plus split backs confirmed after the 30s short-rate window in 5s (L2C-L1AC, L3-L2C) and 30s (L1AC-L0) instead of 30/30/120s; same seed6/input; no performance claim.\n' > "$run/scope.txt"
 echo "本批目录：$run"
 echo '先Linux CPU检查；通过后只跑同输入2400秒自动场：重算同上一场，拆回改为30秒窗口+短确认（拆A/拆C 5秒，进L0 30秒）；不自动重试。'
-echo '回放预期：持续短压下A拆回提议约1653秒（上一场1678秒）；10秒短峰、长压和恢复段不拆。合并规则不变。'
+echo '回放预期：A合并在排空45秒（约552秒）重算4条（其中2条已停住），上一场为664.8秒；拆回约1653秒。'
 echo '40分钟到达；含CPU/启动/预热/drain/打包，预计50–65分钟，慢机器或积压可能更久。'
 smi=
 pack_result() {

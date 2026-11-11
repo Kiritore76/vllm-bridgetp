@@ -214,6 +214,7 @@ class SequenceBackend(pc.ControllerConversionBackend):
         self.layout_tilt = []
         self.layout_recompute = None
         self.recompute_since = None
+        self.recompute_progress = {}
         self.last_recompute_reason = None
         self._specs = None
 
