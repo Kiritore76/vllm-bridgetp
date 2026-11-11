@@ -1527,13 +1527,20 @@ def _run(args, prepared):
             state = row["lifecycle"]
             if row.get("migration_target") and state == "ACTIVE":
                 layout_state["migration_target"] = pool_id
-            if state == "RETIRED" and pool_id == layout_state["migration_target"]:
+            if (
+                state in {"RETIRED", "SLEEPING", "WAKING"}
+                and pool_id == layout_state["migration_target"]
+            ):
                 layout_state["migration_target"] = None
-            if state not in {"ACTIVE", "QUIESCING", "RETIRED"}:
+            if state not in {"ACTIVE", "QUIESCING", "RETIRED", "SLEEPING", "WAKING"}:
                 raise ValueError("layout control lifecycle " + state)
+            added_asleep = False
             if pool_id not in tp_of:
-                if state != "ACTIVE":
+                # Engine reuse: a standby engine is known (inventory, endpoint,
+                # migration channel) before it first serves.
+                if state not in {"ACTIVE", "SLEEPING"}:
                     raise ValueError("layout control adds instances as ACTIVE")
+                added_asleep = state == "SLEEPING"
                 if (
                     not load("pressure_inventory_process").POOL_ID.fullmatch(pool_id)
                     or row["tp_degree"]
@@ -1581,24 +1588,36 @@ def _run(args, prepared):
                     evacuation_sources.append(
                         (pool_id, Path(row["inventory_path"]), NoPrediction())
                     )
+                if added_asleep:
+                    co.register_sleeping(pool_id)
                 changes.append(dict(pool_id=pool_id, change="ADDED"))
             # The file may skip a step between polls (ACTIVE straight to
             # RETIRED); walk the coordinator's transitions in order.
             # Re-reading a layout is idempotent; a retired id never comes back
-            # (a rebuilt engine gets a new generation in its id).
+            # (a rebuilt engine gets a new generation in its id). A SLEEPING
+            # one does: its engine woke (WAKING is still not routable).
             current = co.lifecycle(pool_id)
             if current == "RETIRED":
                 if state != "RETIRED":
                     raise ValueError("layout control revives retired " + pool_id)
                 continue
-            steps = {"ACTIVE": ["ACTIVE"], "QUIESCING": ["QUIESCING"]}.get(
-                state, ["QUIESCING", "RETIRED"]
-            )
+            if state == "WAKING":
+                state = "SLEEPING"
+            if current == "SLEEPING":
+                steps = {"SLEEPING": [], "ACTIVE": ["ACTIVE"]}.get(state, ["RETIRED"])
+                if state == "QUIESCING":
+                    raise ValueError("a sleeping instance wakes as ACTIVE " + pool_id)
+            elif state == "SLEEPING":
+                steps = ["QUIESCING", "SLEEPING"]
+            else:
+                steps = {"ACTIVE": ["ACTIVE"], "QUIESCING": ["QUIESCING"]}.get(
+                    state, ["QUIESCING", "RETIRED"]
+                )
             # Its inventory is the only completion evidence for admissions
             # still open there, and the coordinator refuses to retire an
             # instance an unsettled migration names (a QUIESCING source may
             # still migrate out): stay QUIESCING until both settle.
-            if state == "RETIRED" and (
+            if state in {"RETIRED", "SLEEPING"} and current != "SLEEPING" and (
                 unsettled_on(co.ledger.live_rows(), pool_id)
                 or any(
                     pool_id in (target, co._session_source.get(session))

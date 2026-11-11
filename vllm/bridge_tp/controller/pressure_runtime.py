@@ -125,16 +125,26 @@ class PressureCoordinator:
     def lifecycle(self, instance_id: str) -> str:
         return self._lifecycle.get(instance_id, "ACTIVE")
 
+    def register_sleeping(self, instance_id: str) -> None:
+        """A standby engine first seen asleep: never routed until it wakes."""
+        with self._lock:
+            if instance_id in self._lifecycle:
+                raise ValueError("a known instance cannot be registered asleep")
+            self._lifecycle[instance_id] = "SLEEPING"
+
     def set_lifecycle(self, instance_id: str, state: str) -> None:
-        """ACTIVE <-> QUIESCING -> RETIRED.
+        """ACTIVE <-> QUIESCING -> RETIRED, and QUIESCING -> SLEEPING -> ACTIVE.
 
         QUIESCING closes new admission and migration INTO the instance; it may
         still migrate its own requests out. RETIRED needs every migration that
-        names it to be settled and drops its trigger state.
+        names it to be settled and drops its trigger state. SLEEPING (engine
+        reuse, user 11-11) has the same entry condition and keeps the instance
+        id: it may serve again as ACTIVE after its engine wakes.
         """
         allowed = {
             "ACTIVE": {"QUIESCING"},
-            "QUIESCING": {"ACTIVE", "RETIRED"},
+            "QUIESCING": {"ACTIVE", "RETIRED", "SLEEPING"},
+            "SLEEPING": {"ACTIVE", "RETIRED"},
             "RETIRED": set(),
         }
         with self._lock:
@@ -143,14 +153,14 @@ class PressureCoordinator:
                 return
             if state not in allowed[current]:
                 raise ValueError("invalid instance lifecycle transition")
-            if state == "RETIRED" and any(
+            if state in {"RETIRED", "SLEEPING"} and any(
                 instance_id in (target, self._session_source.get(session))
                 and self.ledger.entries[session].state == "ACTIVE"
                 for session, (_, target) in self._sessions.items()
             ):
                 raise ValueError("unsettled migration prevents retirement")
             self._lifecycle[instance_id] = state
-            if state == "RETIRED":
+            if state in {"RETIRED", "SLEEPING"}:
                 self.forget_source(instance_id)
         self.audit(
             {

@@ -209,6 +209,50 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(self.r.get(self.t).ref, self.t)
 
 
+class SleepReuseRegistryTests(unittest.TestCase):
+    """Engine reuse (11-11): a SLEEPING instance keeps its id, owns no GPU."""
+
+    def test_sleeping_standby_shares_gpus_and_wakes_only_when_free(self):
+        registry = active_registry()
+        standby = replace(record("s2tp2", 2, ["0", "1"], "A"), lifecycle="SLEEPING")
+        registry.register(standby)
+        with self.assertRaisesRegex(ValueError, "already owned"):
+            registry.register(record("other", 1, ["0"]))
+        with self.assertRaisesRegex(ValueError, "already owned"):
+            registry.transition(standby.ref, "WAKING")
+        for name in ("s1", "s2"):
+            ref = registry.instances[name].ref
+            registry.transition(ref, "QUIESCING")
+            registry.transition(ref, "SLEEPING")
+        registry.transition(standby.ref, "WAKING")
+        registry.transition(standby.ref, "ACTIVE")
+        with self.assertRaisesRegex(ValueError, "already owned"):
+            registry.transition(registry.instances["s1"].ref, "WAKING")
+        registry.transition(standby.ref, "QUIESCING")
+        registry.transition(standby.ref, "SLEEPING")
+        registry.transition(registry.instances["s1"].ref, "WAKING")
+        registry.transition(registry.instances["s1"].ref, "ACTIVE")
+        self.assertEqual(registry.instances["s1"].ref.instance_generation, 1)
+
+    def test_sleep_needs_settled_operations_and_is_not_a_shortcut(self):
+        registry = active_registry()
+        ref = registry.instances["s1"].ref
+        with self.assertRaises(ValueError):
+            registry.transition(ref, "SLEEPING")
+        registry.acquire_dispatch_lease(ref, "q")
+        registry.transition(ref, "QUIESCING")
+        with self.assertRaisesRegex(ValueError, "unsettled"):
+            registry.transition(ref, "SLEEPING")
+        registry.reconcile_dispatch(ref, "q", "TERMINAL")
+        registry.transition(ref, "SLEEPING")
+        with self.assertRaisesRegex(ValueError, "admission closed"):
+            registry.acquire_dispatch_lease(ref, "r")
+        with self.assertRaises(ValueError):
+            registry.transition(registry.instances["s2"].ref, "WAKING")
+        with self.assertRaises(ValueError):
+            registry.transition(ref, "QUIESCING")
+
+
 class PlannerTests(unittest.TestCase):
     def test_delayed_transfer_outside_measured_support_is_unknown(self):
         rows = [replace(r, transfer_supported_delay_s=0) for r in self.requests()]

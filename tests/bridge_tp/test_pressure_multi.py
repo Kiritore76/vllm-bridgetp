@@ -538,6 +538,54 @@ class InstanceLifecycleTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             co.set_lifecycle("b1", "RETIRED")
 
+    def test_sleep_keeps_the_id_and_wakes_back_to_active(self):
+        co, _ = coordinator(config(sustain_s=0))
+        readings = {"a1": pool("a1", decode_ratio=1.5), "b1": pool("b1")}
+        self.started(
+            co, readings, {("a1", "b1"): [candidate("x", owner="a1")]}, "x", "s"
+        )
+        with self.assertRaises(ValueError):
+            co.set_lifecycle("a1", "SLEEPING")
+        co.set_lifecycle("a1", "QUIESCING")
+        with self.assertRaisesRegex(ValueError, "unsettled"):
+            co.set_lifecycle("a1", "SLEEPING")
+        co.finish("s", "x", "CANCELLED", cleanup_confirmed=True, target_id="b1")
+        co.set_lifecycle("a1", "SLEEPING")
+        self.assertNotIn("a1", co._policies)
+        with self.assertRaises(ValueError):
+            co.set_lifecycle("a1", "QUIESCING")
+        with self.assertRaises(p.RoutingError):
+            co.admission_multi(
+                "r", 128, 64, [inst("a1")], TP, 10, "k", allowed_pool_id="a1"
+            )
+        co.set_lifecycle("a1", "ACTIVE")
+        result = co.admission_multi(
+            "r2", 128, 64, [inst("a1")], TP, 10, "k2", allowed_pool_id="a1"
+        )
+        self.assertEqual(result.pool_id, "a1")
+
+    def test_standby_registers_asleep_and_is_never_a_target(self):
+        co, _ = coordinator(config(sustain_s=0))
+        co.register_sleeping("b1")
+        with self.assertRaises(ValueError):
+            co.register_sleeping("b1")
+        co.set_lifecycle("a1", "QUIESCING")
+        with self.assertRaises(ValueError):
+            co.register_sleeping("a1")
+        readings = {
+            "a2": pool("a2", decode_ratio=1.5),
+            "b1": pool("b1"),
+            "b2": pool("b2"),
+        }
+        cands = {
+            ("a2", "b1"): [candidate("x", owner="a2")],
+            ("a2", "b2"): [candidate("x", owner="a2")],
+        }
+        result, _ = self.started(co, readings, cands, "x", "s")
+        self.assertEqual(result[:2], ("a2", "b2"))
+        co.set_lifecycle("b1", "RETIRED")
+        self.assertEqual(co.lifecycle("b1"), "RETIRED")
+
     def test_receipts_must_name_the_bound_target_generation(self):
         co, _ = coordinator(config(sustain_s=0))
         readings = {"a1": pool("a1", decode_ratio=1.5), "b1": pool("b1")}

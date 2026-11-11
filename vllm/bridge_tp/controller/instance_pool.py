@@ -17,6 +17,12 @@ class InstanceRef:
     instance_generation: int
 
 
+# A SLEEPING engine keeps its process and offloaded weights but no GPU
+# working set (vLLM sleep level 1, user 11-11), so another form of its bundle
+# may serve on the same GPUs. Every other non-retired state owns its GPUs.
+AWAKE_STATES = frozenset({"PREPARING", "ACTIVE", "QUIESCING", "WAKING", "FAILED"})
+
+
 @dataclass
 class InstanceRecord:
     ref: InstanceRef
@@ -81,19 +87,29 @@ class Registry:
                 or row.ref.instance_generation <= old.ref.instance_generation
             ):
                 raise ValueError("replacement requires retired older generation")
-            for other in self.instances.values():
-                if other.lifecycle != "RETIRED" and set(
-                    row.physical_gpu_ids
-                ).intersection(other.physical_gpu_ids):
-                    raise ValueError("GPU is already owned")
+            if row.lifecycle in AWAKE_STATES:
+                self._check_gpus_free(row)
             self.instances[row.ref.instance_id] = row
             self.registry_revision += 1
 
+    def _check_gpus_free(self, row):
+        """No other awake instance holds any of ``row``'s GPUs."""
+        for other in self.instances.values():
+            if (
+                other.ref.instance_id != row.ref.instance_id
+                and other.lifecycle in AWAKE_STATES
+                and set(row.physical_gpu_ids).intersection(other.physical_gpu_ids)
+            ):
+                raise ValueError("GPU is already owned")
+
     def transition(self, ref, state):
         allowed = {
-            "PREPARING": {"ACTIVE", "FAILED"},
+            # A standby engine starts, pre-warms its sleep backup and sleeps.
+            "PREPARING": {"ACTIVE", "FAILED", "SLEEPING"},
             "ACTIVE": {"QUIESCING", "FAILED"},
-            "QUIESCING": {"ACTIVE", "RETIRED", "FAILED"},
+            "QUIESCING": {"ACTIVE", "RETIRED", "FAILED", "SLEEPING"},
+            "SLEEPING": {"WAKING", "RETIRED", "FAILED"},
+            "WAKING": {"ACTIVE", "SLEEPING", "FAILED"},
             "FAILED": {"RETIRED"},
             "RETIRED": set(),
         }
@@ -103,7 +119,9 @@ class Registry:
                 return
             if state not in allowed[row.lifecycle]:
                 raise ValueError("invalid lifecycle transition")
-            if state == "RETIRED" and (
+            if row.lifecycle not in AWAKE_STATES and state in AWAKE_STATES:
+                self._check_gpus_free(row)
+            if state in {"RETIRED", "SLEEPING"} and (
                 any(
                     x.ref == ref and x.state != "TERMINAL" for x in self.leases.values()
                 )
