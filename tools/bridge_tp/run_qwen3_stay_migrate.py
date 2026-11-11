@@ -482,6 +482,12 @@ def main(argv=None):
         "under KV pressure; require real commit/release; not a performance trial",
     )
     parser.add_argument(
+        "--six-sleep-smoke",
+        action="store_true",
+        help="engine-reuse smoke: L1AC, explicit A merge/split/merge at "
+        "110/240/440s with sleep/wake and two long bursts; mechanism check only",
+    )
+    parser.add_argument(
         "--conversion-trigger-s",
         type=float,
         default=30,
@@ -529,6 +535,20 @@ def main(argv=None):
         parser.error(
             "six-split-probe needs L2C-L1AC, long-burst-pair, trigger 110, "
             "and natural drain without prestart/decider"
+        )
+    if args.six_sleep_smoke and not (
+        six_conversion
+        and args.conversion == "L1AC-L2C"
+        and args.static_layout == "L1AC"
+        and args.long_burst_pair
+        and args.conversion_trigger_s == 110.0
+        and args.conversion_engine_reuse == "sleep"
+        and not args.conversion_decider
+        and not args.six_split_probe
+    ):
+        parser.error(
+            "six-sleep-smoke needs L1AC-L2C from L1AC, long-burst-pair, trigger "
+            "110 and --conversion-engine-reuse sleep, without decider/split probe"
         )
     if args.conversion in SIX_EDGES and args.cards != 6:
         parser.error("six-card edge requires --cards 6")
@@ -804,6 +824,15 @@ def main(argv=None):
             cfg["horizon_s"] = 1080.0
             cfg["note"] += (
                 "; explicit four-edge mechanism check; no performance comparison"
+            )
+        if args.six_sleep_smoke:
+            from tools.bridge_tp import six_sleep_smoke
+
+            cfg["recipes"] = [six_sleep_smoke.recipe(read(args.inputs))]
+            cfg["horizon_s"] = six_sleep_smoke.HORIZON_S
+            cfg["note"] += (
+                "; engine-reuse smoke: explicit A merge/split/merge, sleep/wake; "
+                "mechanism check, no performance comparison"
             )
         if args.six_split_probe:
             from tools.bridge_tp.six_split_probe import HORIZON_S
@@ -1164,6 +1193,10 @@ def main(argv=None):
                         )
                     ],
                 )
+                if args.six_sleep_smoke:
+                    from tools.bridge_tp import six_sleep_smoke
+
+                    spec["conversion"]["sequence"] = six_sleep_smoke.sequence()
             else:
                 spec["conversion"].update(
                     profile="six_card",
@@ -1228,7 +1261,7 @@ def main(argv=None):
             no_progress_s=90,
             require_stager_process_ready=True,
         )
-        if six_conversion and args.conversion == "L0-L1AC":
+        if six_conversion and (args.conversion == "L0-L1AC" or args.six_sleep_smoke):
             # Do not let the controller deadline mask this conversion's own
             # terminal state plus resource-ACK settlement.
             from tools.bridge_tp.six_conversion import controller_timeout_s
