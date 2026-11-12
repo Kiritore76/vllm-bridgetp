@@ -266,6 +266,28 @@ class DrainRecomputeTests(unittest.TestCase):
         self.assertTrue(sustained.valid_output(row, row["request"], True))
         self.assertTrue(sustained.valid_output(row, row["request"], False))
 
+    def test_idle_release_sample_before_the_stream_end_settles(self):
+        # GPU 11-12: the engine published its empty inventory once, a few ms
+        # before the source stream thread recorded its end, then stayed idle.
+        self.request()
+        job = self.stream.recompute
+        wait_for(lambda: job.state == "SOURCE_ENDED")
+        before = self.inventory("tp1", sampled_at=job.requested_at - 0.01)
+        self.manager.tick(time.time(), [reading("tp1")], {"tp1": before})
+        self.assertEqual(job.state, "SOURCE_ENDED")
+        listed = self.inventory(
+            "tp1", generated=5, sampled_at=job.source_ended_at + 1
+        )
+        self.manager.tick(time.time(), [reading("tp1")], {"tp1": listed})
+        self.assertEqual(job.state, "SOURCE_ENDED")
+        between = (job.requested_at + job.source_ended_at) / 2
+        self.assertLess(between, job.source_ended_at)
+        released = self.inventory("tp1", sampled_at=between)
+        self.manager.tick(time.time(), [reading("tp1")], {"tp1": released})
+        self.assertEqual(job.state, "PARKED")
+        entry = self.co.ledger.entries[self.stream.reservation_key]
+        self.assertEqual(entry.state, "MOVED")
+
     def test_source_that_finished_first_is_not_resubmitted(self):
         stream = self.stream
         # Let the source finish before the disconnect can take effect.

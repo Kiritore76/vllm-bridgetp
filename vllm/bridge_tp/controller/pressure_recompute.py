@@ -288,8 +288,14 @@ class DrainRecompute:
             if self.co.lifecycle(job.source_pool) != "RETIRED":
                 return
         else:
+            # The request was live on the source when its abort was requested,
+            # so any later sample without it proves the engine released it.
+            # Native inventory is event driven: an engine left idle by the
+            # abort publishes once, possibly before the source stream thread
+            # records its end (GPU 11-12: waiting for a sample after
+            # source_ended_at kept a drain open forever).
             prefix = f"cmpl-{job.client_id}-0-"
-            if raw["sampled_at"] <= job.source_ended_at or any(
+            if raw["sampled_at"] <= job.requested_at or any(
                 r["request_id"].startswith(prefix) for r in raw["requests"]
             ):
                 return
