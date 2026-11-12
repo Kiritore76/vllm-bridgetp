@@ -62,6 +62,12 @@ class CliTests(unittest.TestCase):
             300 * 128 + 6 * 8192 + 6 * 4096,
         )
 
+    def test_cli_accepts_standby_mode(self):
+        argv = list(BASE)
+        argv[argv.index("sleep")] = "standby"
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(runner.main(argv), 0)
+
     def test_cli_requires_reuse_trigger_and_layout(self):
         for drop in ("--conversion-engine-reuse", "--long-burst-pair"):
             argv = list(BASE)
@@ -103,7 +109,9 @@ class CliTests(unittest.TestCase):
         self.assertGreater(min(longs[6:]), smoke.SEQUENCE[1][1])
 
 
-def write_scene(root, *, split_woken=TP1, remerge_cold=(), fallback=False, work=True):
+def write_scene(
+    root, *, split_woken=TP1, remerge_cold=(), fallback=False, work=True, standby=False
+):
     scene = root / "trial" / "scene"
     (scene / "controller").mkdir(parents=True)
     origin = 1000.0
@@ -137,10 +145,12 @@ def write_scene(root, *, split_woken=TP1, remerge_cold=(), fallback=False, work=
         events.append(dict(kind="ROUTE_PUBLISHED", plan_id=pid,
                            unix_s=origin + end - 1))
 
-    step("s1", "TP2", 110, 200, TP1, [TP2], [])
+    step("s1", "TP2", 110, 200, TP1, [] if standby else [TP2], [TP2] if standby else [])
     step("s2", "TP1", 240, 300, [TP2], [], list(split_woken))
     step("s3", "TP2", 440, 520, TP1, list(remerge_cold), [] if remerge_cold else [TP2])
     (scene / "conversion_sequence_result.json").write_text(json.dumps(dict(steps=steps)))
+    if standby:
+        (scene / "standby_prewarm.json").write_text(json.dumps(dict(standby={})))
     (scene / "conversion_events.jsonl").write_text(
         "\n".join(json.dumps(e) for e in events) + "\n"
     )
@@ -175,6 +185,20 @@ class CheckTests(unittest.TestCase):
             self.assertEqual(code, 0, value)
             self.assertTrue(value["reuse_exercised"])
             self.assertEqual(value["steps"][1]["woken"], TP1)
+
+    def test_standby_mode_wakes_even_the_first_merge(self):
+        with tempfile.TemporaryDirectory() as folder:
+            value, code = smoke.check(write_scene(Path(folder), standby=True))
+            self.assertEqual(code, 0, value)
+            self.assertEqual(value["mode"], "standby")
+            self.assertEqual(value["steps"][0]["woken"], [TP2])
+        with tempfile.TemporaryDirectory() as folder:
+            # A cold start in standby mode means the standby form was missing.
+            root = write_scene(Path(folder), standby=False)
+            scene = root / "scene"
+            (scene / "standby_prewarm.json").write_text("{}")
+            _, code = smoke.check(root)
+            self.assertEqual(code, 1)
 
     def test_no_work_on_woken_engines_is_coverage_missing(self):
         with tempfile.TemporaryDirectory() as folder:

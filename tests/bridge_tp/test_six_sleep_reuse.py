@@ -18,31 +18,55 @@ from tools.bridge_tp.conversion_channels import TargetChannelGraph
 from tools.bridge_tp.conversion_sequence import validate
 
 
-def reuse_plan(root, layout):
+def reuse_plan(root, layout, mode="sleep"):
     plan = canonical_plan(root, layout)
     plan["controller_argv"] += ["--maximum-migrations", "0"]
     plan["stager_argv"][1] = "tools/bridge_tp/pressure_sessions.py"
-    plan["conversion"] = dict(engine_reuse="sleep")
+    plan["conversion"] = dict(engine_reuse=mode, base_port=8400)
     six.configure(plan)
     return plan
+
+
+def make_root(target):
+    Path(target["mechanism_root"]).mkdir(parents=True, exist_ok=True)
+
+
+def initialize_files(plan):
+    with (
+        patch.object(six, "initialize_target", make_root),
+        patch.object(six, "initialize_links"),
+    ):
+        six.initialize(plan)
+
+
+def connector_sources(argv):
+    config = json.loads(argv[argv.index("--kv-transfer-config") + 1])
+    return config["kv_connector_extra_config"]["bridgetp_gpu_direct_sources"]
 
 
 class Harness:
     """One backend driven through several edges, with fake engines."""
 
-    def __init__(self, test, root, layout, *, fail_sleep=False, residual_mib=900):
+    def __init__(
+        self, test, root, layout, *, fail_sleep=False, residual_mib=900, mode="sleep"
+    ):
         self.test = test
-        self.plan = plan = reuse_plan(root, layout)
+        self.plan = plan = reuse_plan(root, layout, mode)
         self.run = run = plan["run_dir"]
         run.mkdir(parents=True)
         self.calls, self.events = [], []
         self.alive = set(r["instance_id"] for r in plan["instances"]["instances"])
-        self.asleep = set()
+        # The launcher started the standby forms and left them asleep.
+        self.asleep = {e["instance_id"] for e in plan.get("standby_engines", ())}
+        self.alive |= self.asleep
+        if mode == "standby":
+            initialize_files(plan)
+            six.publish_initial_channels(plan)
         self.fail_sleep = fail_sleep
         self.residual_mib = residual_mib
 
         for target in plan["six_targets"].values():
-            Path(target["mechanism_root"]).mkdir(parents=True)
+            Path(target["mechanism_root"]).mkdir(parents=True, exist_ok=True)
             pc.atomic_json(target["channel_plan"], target["connector_sources"])
         for source in plan["source_links"]:
             pc.atomic_json(
@@ -348,6 +372,111 @@ class SleepReuseTests(unittest.TestCase):
             self.assertEqual(len(active_tp1), 2)
             self.assertEqual({c["source"] for c in plan}, active_tp1)
             self.assertFalse(active_tp1 & set(a_tp1))
+
+    def test_standby_forms_are_planned_asleep_with_deferred_channels(self):
+        with tempfile.TemporaryDirectory() as folder:
+            plan = reuse_plan(Path(folder), "L1AC", "standby")
+            standby = {e["instance_id"]: e for e in plan["standby_engines"]}
+            forms = sorted(
+                (e["bundle"], e["tp"], tuple(e["gpus"])) for e in standby.values()
+            )
+            # Each group's other form, on exactly that group's GPUs.
+            self.assertEqual(
+                forms,
+                [
+                    ("A", 2, ("2", "3")),
+                    ("B", 1, ("0",)),
+                    ("B", 1, ("1",)),
+                    ("C", 2, ("4", "5")),
+                ],
+            )
+            self.assertEqual(
+                sorted(e["port"] for e in standby.values()), list(range(8400, 8404))
+            )
+            newest = max(
+                r.ref.instance_generation for r in plan["registry"].instances.values()
+            )
+            for name, e in standby.items():
+                self.assertGreater(int(name.split("-g")[1].split("-")[0]), newest)
+                if e["tp"] == 2:
+                    self.assertIn("--enable-sleep-mode", e["receiver_argv"])
+                    self.assertIn(e["migration_receiver"], plan["migration_targets"])
+                    self.assertEqual(connector_sources(e["receiver_argv"]), [])
+                else:
+                    self.assertTrue(
+                        e["targets_file"].endswith(f"gpu_targets_{name}.json")
+                    )
+            # The awake receivers start without channels until the warm-up.
+            for target in plan["six_targets"].values():
+                self.assertTrue(target["defer_channels_until_model_ready"])
+            for extra in plan["extra_engines"]:
+                if "receiver_argv" in extra:
+                    self.assertEqual(connector_sources(extra["receiver_argv"]), [])
+            run = plan["run_dir"]
+            run.mkdir(parents=True)
+            initialize_files(plan)
+            for target in plan["six_targets"].values():
+                self.assertEqual(pc.read_json(target["channel_plan"]), [])
+            for source in plan["source_links"]:
+                self.assertEqual(pc.read_json(run / f"gpu_targets_{source}.json"), [])
+            six.publish_initial_channels(plan)
+            for target in plan["six_targets"].values():
+                self.assertFalse(target["defer_channels_until_model_ready"])
+                self.assertTrue(target["connector_sources"])
+                self.assertEqual(
+                    pc.read_json(target["channel_plan"]), target["connector_sources"]
+                )
+            for source in plan["source_links"]:
+                self.assertTrue(pc.read_json(run / f"gpu_targets_{source}.json"))
+            for e in standby.values():
+                path = (
+                    e["targets_file"]
+                    if e["tp"] == 1
+                    else e["migration_receiver"]["channel_plan"]
+                )
+                self.assertEqual(pc.read_json(path), [])
+
+    def test_standby_wakes_every_form_without_cold_start(self):
+        with tempfile.TemporaryDirectory() as folder:
+            h = Harness(self, Path(folder), "L1AC", mode="standby")
+            h.backend.engine_reuse = "standby"
+            registry = h.backend.registry
+            standby = {e["instance_id"]: e for e in h.plan["standby_engines"]}
+            for name in standby:
+                self.assertEqual(registry.instances[name].lifecycle, "SLEEPING")
+                self.assertEqual(h.backend.layout[name]["lifecycle"], "SLEEPING")
+            resources = pc.read_json(h.run / "layout_control.json")[
+                "migration_resources"
+            ]
+            for name, e in standby.items():
+                key = "targets" if e["tp"] == 2 else "source_links"
+                self.assertIn(name, resources[key])
+            a_tp2 = [n for n, e in standby.items() if e["bundle"] == "A"]
+            b_tp1 = sorted(n for n, e in standby.items() if e["bundle"] == "B")
+            for edge, woken in (
+                ("L1AC-L2C", a_tp2),
+                ("L2C-L1AC", None),
+                ("L1AC-L0", b_tp1),
+                ("L0-L1AC", None),
+            ):
+                h.calls.clear()
+                h.edge(edge)
+                self.assertFalse(
+                    any(k == "start" for k, _ in h.calls), (edge, h.calls)
+                )
+                if woken is not None:
+                    self.assertEqual(
+                        sorted(n for k, n in h.calls if k == "wake"), woken
+                    )
+                self.assertTrue(any(k == "sleep" for k, _ in h.calls))
+            # Back at L1AC: the original engines serve; the standby ones sleep.
+            for name in standby:
+                self.assertEqual(registry.instances[name].lifecycle, "SLEEPING")
+            for row in h.plan["instances"]["instances"]:
+                self.assertEqual(
+                    registry.instances[row["instance_id"]].lifecycle, "ACTIVE"
+                )
+            self.assertGreaterEqual(h.backend.next_service_port, 8404)
 
     def test_failed_sleep_falls_back_to_stop_and_retirement(self):
         with tempfile.TemporaryDirectory() as folder:

@@ -16,6 +16,10 @@ ports = pc.load("tcp_ports")
 # context and buffers: 525-1214 MiB in the two-GPU probe of 11-11, plus the
 # BridgeTP connector here. More than this means the sleep did not free it.
 SLEEP_RESIDUAL_MIB = 4096
+# "sleep": a form sleeps at its first conversion away (first wake of each
+# form is preceded by one cold start); "standby": every group's other form is
+# started, warmed and put to sleep before the workload (user 11-12).
+REUSE_MODES = ("sleep", "standby")
 SLEEP_TIMEOUT_S = 120
 
 PATH = {
@@ -197,7 +201,8 @@ def configure(plan):
     """Run after canonical identities and serving flags are finalized."""
     if plan.get("scheduler") != "unified" or plan.get("static_cards") != 6:
         raise ValueError("six-card conversion requires six-card unified scheduler")
-    if (plan.get("conversion") or {}).get("engine_reuse") == "sleep":
+    reuse = (plan.get("conversion") or {}).get("engine_reuse")
+    if reuse in ("sleep", "standby"):
         # Engine reuse needs every engine sleep-capable from its first start
         # (cumem allocator); the dev endpoints stay on the local host.
         for key in ("source_argv", "target_argv"):
@@ -214,6 +219,11 @@ def configure(plan):
     }
     sources = {r["instance_id"]: r for r in rows if r["tp_degree"] == 1}
     connect(state, sources, targets)
+    if reuse == "standby":
+        # Awake engines sleep and wake once before the workload; their
+        # channels open only afterwards (publish_initial_channels).
+        for target in targets.values():
+            target["defer_channels_until_model_ready"] = True
     plan.update(
         dynamic_conversion=True,
         receiver_stage=3,
@@ -271,6 +281,13 @@ def configure(plan):
             else:
                 extras[name].update(receiver_argv=argv2, receiver_env=env)
     plan["sequence_context"] = dict(profile="six_card")
+    if reuse == "standby":
+        plan["standby_engines"] = standby_engines(plan, state)
+        plan["migration_targets"] += [
+            e["migration_receiver"]
+            for e in plan["standby_engines"]
+            if "migration_receiver" in e
+        ]
     plan["migration_plan"].update(
         stage="SIX_CARD_DYNAMIC_CONVERSION",
         migration_targets=copy.deepcopy(list(targets.values())),
@@ -288,18 +305,97 @@ def configure(plan):
     )
 
 
+def standby_engines(plan, state):
+    """Each group's other form, cold-started and put to sleep before the
+    awake form starts (engine reuse "standby", user 11-12).
+
+    Same launch contract as a conversion's cold replacement: TP1 sources with
+    their own (empty) target file, TP2 receivers with mechanism root, stager
+    ports and an empty channel plan. Service ports start at the conversion
+    base port; the backend's replacements continue after them.
+    """
+    rows = plan["instances"]["instances"]
+    run = Path(plan["run_dir"])
+    generation = max(
+        r.ref.instance_generation for r in plan["registry"].instances.values()
+    )
+    port = plan["conversion"]["base_port"]
+    tp1_limit, tp2_limit = plan["context_limits"]
+    standby = []
+    for bundle in "ABC":
+        mine = [r for r in rows if r["bundle_id"] == bundle]
+        if not mine:
+            continue
+        gpus = sorted(g for r in mine for g in r["physical_gpu_ids"])
+        tp = 2 if mine[0]["tp_degree"] == 1 else 1
+        for devices in [gpus] if tp == 2 else [[g] for g in gpus]:
+            generation += 1
+            name = f"{bundle}-g{generation}-tp{tp}"
+            extra = dict(
+                instance_id=name,
+                bundle=bundle,
+                tp=tp,
+                gpus=devices,
+                port=port,
+                endpoint=f"http://127.0.0.1:{port}",
+                context_limit=tp1_limit if tp == 1 else tp2_limit,
+                inventory_path=str(run / f"inventory_{name}.jsonl"),
+                standby=True,
+            )
+            port += 1
+            if tp == 1:
+                extra.update(source_fields(name, run, {}))
+            else:
+                target = receiver(state, dict(instance_id=name, endpoint=extra["endpoint"]), run)
+                target["defer_channels_until_model_ready"] = True
+                target["stager_argv"] = stager(plan, target)
+                argv, env = receiver_engine(plan, extra, target)
+                extra.update(migration_receiver=target, receiver_argv=argv, receiver_env=env)
+            standby.append(extra)
+    return standby
+
+
+def publish_initial_channels(plan):
+    """After the awake engines' sleep/wake warm-up: open their channels."""
+    targets = plan["six_targets"]
+    for target in targets.values():
+        target["defer_channels_until_model_ready"] = False
+        pc.atomic_json(target["channel_plan"], target["connector_sources"])
+    for source in plan["source_links"]:
+        pc.atomic_json(
+            Path(plan["run_dir"]) / f"gpu_targets_{source}.json",
+            source_entries(source, targets),
+        )
+
+
 def initialize(plan):
     targets = plan["six_targets"]
     for target in targets.values():
         initialize_target(target)
-        pc.atomic_json(target["channel_plan"], target["connector_sources"])
+        pc.atomic_json(
+            target["channel_plan"],
+            []
+            if target.get("defer_channels_until_model_ready")
+            else target["connector_sources"],
+        )
     sources = plan["source_links"]
     initialize_links(plan["run_dir"], sources, targets)
     for source in sources:
         pc.atomic_json(
             Path(plan["run_dir"]) / f"gpu_targets_{source}.json",
-            source_entries(source, targets),
+            []
+            if any(t.get("defer_channels_until_model_ready") for t in targets.values())
+            else source_entries(source, targets),
         )
+    for extra in plan.get("standby_engines", ()):
+        # Asleep until a conversion wakes it: no channel yet.
+        if extra["tp"] == 2:
+            target = extra["migration_receiver"]
+            initialize_target(target)
+            pc.atomic_json(target["channel_plan"], [])
+        else:
+            initialize_links(plan["run_dir"], {extra["instance_id"]: extra}, targets)
+            pc.atomic_json(extra["targets_file"], [])
     return (
         Path(next(iter(targets.values()))["mechanism_dir"]).resolve()
         if targets
@@ -374,11 +470,14 @@ class SixBackend(SequenceBackend):
         super().__init__(*args, **kwargs)
         self.context = dict(profile="six_card")
         self.channel_plan = None
-        # Engine reuse: None, or "sleep" (set by the launcher from the request).
+        # Engine reuse: None, "sleep" or "standby" (set by the launcher).
         self.engine_reuse = None
         self.sleeping = {}  # instance id -> what its wake needs
         self.sleep_job = None
         self.sleep_fallback = set()  # plan ids whose sleep failed
+        standby = [e["instance_id"] for e in resources.get("standby_engines", ())]
+        for extra in resources.get("standby_engines", ()):
+            self.register_standby(extra)
         self.next_instance_generation = (
             max(r.ref.instance_generation for r in self.registry.instances.values()) + 1
         )
@@ -398,7 +497,51 @@ class SixBackend(SequenceBackend):
             clock=self.clock,
             event=self.ops.event,
         )
-        self.write_layout(dict.fromkeys(self.active(), "ACTIVE"))
+        # A standby receiver has no channel until it wakes under its own id.
+        self.channel_graph.seen.update(n for n in standby if n in self.sleeping)
+        self.write_layout(
+            dict.fromkeys(self.active(), "ACTIVE") | dict.fromkeys(standby, "SLEEPING")
+        )
+
+    def register_standby(self, extra):
+        """A standby form started asleep at launch: SLEEPING under its own id."""
+        name = extra["instance_id"]
+        generation = int(name.split("-g")[1].split("-")[0])
+        identity = next(iter(self.registry.instances.values())).identity
+        self.registry.register(
+            pc.pool.InstanceRecord(
+                pc.pool.InstanceRef(name, generation),
+                extra["tp"],
+                tuple(extra["gpus"]),
+                extra["bundle"],
+                extra["endpoint"],
+                identity,
+                extra["context_limit"],
+                lifecycle="SLEEPING",
+            )
+        )
+        row = dict(
+            instance_id=name,
+            tp_degree=extra["tp"],
+            context_limit=extra["context_limit"],
+            endpoint=extra["endpoint"],
+            inventory_path=extra["inventory_path"],
+        )
+        if extra["tp"] == 1:
+            row.update(
+                {k: extra[k] for k in source_fields(name, self.run_dir, {})}
+            )
+        self.rows[name] = row
+        self.sleeping[name] = dict(
+            bundle=extra["bundle"],
+            tp=extra["tp"],
+            gpus=list(extra["gpus"]),
+            endpoint=extra["endpoint"],
+            context_limit=extra["context_limit"],
+            inventory_path=extra["inventory_path"],
+            target=extra.get("migration_receiver"),
+        )
+        self.next_service_port = max(self.next_service_port, extra["port"] + 1)
 
     def begin_step(self, plan_id, step):
         modes = {r.bundle_id: r.tp_degree for r in self.active().values()}
@@ -598,7 +741,8 @@ class SixBackend(SequenceBackend):
     # ---------------------------------------------------------- engine reuse
     def reuse_on(self, plan):
         return (
-            self.engine_reuse == "sleep" and plan["plan_id"] not in self.sleep_fallback
+            self.engine_reuse in REUSE_MODES
+            and plan["plan_id"] not in self.sleep_fallback
         )
 
     def retire_label(self, plan):
@@ -609,7 +753,7 @@ class SixBackend(SequenceBackend):
 
     def wake_set(self, plan):
         """Sleeping engines that are exactly this conversion's target form."""
-        if self.engine_reuse != "sleep":
+        if self.engine_reuse not in REUSE_MODES:
             return None
         tp = int(plan["target_bundle_mode"][2:])
         gpus = sorted(

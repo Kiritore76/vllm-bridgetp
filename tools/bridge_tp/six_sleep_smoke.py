@@ -7,6 +7,9 @@ engines wake and the A TP2 sleeps. 440 s: A merges again; the sleeping TP2
 wakes. Two long bursts (90-100 s and 420-430 s) put long requests on A before
 each merge, so drain recompute continues them on the new (then woken) TP2.
 
+With ``--conversion-engine-reuse standby`` every group's other form exists
+asleep (pre-warmed) from the start, so the first merge also wakes its TP2.
+
 Exit 0: all three steps completed, both reverse steps woke the same engines
 without any cold start or fallback, and every request delivered its full
 output. Exit 2: valid, but no recompute or migration touched a woken engine
@@ -155,10 +158,23 @@ def check(directory):
         merge, split, remerge = records
         if any(r["fallbacks"] for r in records):
             raise ValueError("a sleep fell back to stop/cold start")
+        # "standby": the A TP2 already exists asleep, so even the first merge
+        # wakes it; "sleep": the first merge cold-starts it.
+        value["mode"] = mode = (
+            "standby" if (scene / "standby_prewarm.json").exists() else "sleep"
+        )
         tp1 = sorted(i for group in merge["slept"] for i in group)
-        if len(tp1) != 2 or len(merge["cold_started"]) != 1:
-            raise ValueError("first merge did not cold-start one TP2 and sleep A")
-        tp2 = merge["cold_started"]
+        if mode == "standby":
+            value["standby_prewarm"] = json.loads(
+                (scene / "standby_prewarm.json").read_text()
+            )
+            if len(tp1) != 2 or merge["cold_started"] or len(merge["woken"]) != 1:
+                raise ValueError("first merge did not wake the standby A TP2")
+            tp2 = merge["woken"]
+        else:
+            if len(tp1) != 2 or len(merge["cold_started"]) != 1:
+                raise ValueError("first merge did not cold-start one TP2 and sleep A")
+            tp2 = merge["cold_started"]
         if split["woken"] != tp1 or split["cold_started"]:
             raise ValueError("split did not wake the same two A TP1 engines")
         if sorted(i for g in split["slept"] for i in g) != tp2:
@@ -167,12 +183,20 @@ def check(directory):
             raise ValueError("re-merge did not wake the sleeping A TP2")
         if sorted(i for g in remerge["slept"] for i in g) != tp1:
             raise ValueError("re-merge did not sleep the A TP1 engines again")
-        if any(
-            value is None or value is False
-            for r in (split, remerge)
-            for value in r["wake_s"].values()
-        ) or set(split["wake_s"]) != set(tp1) or set(remerge["wake_s"]) != set(tp2):
+        woke = (merge, split, remerge) if mode == "standby" else (split, remerge)
+        if (
+            any(v is None or v is False for r in woke for v in r["wake_s"].values())
+            or set(split["wake_s"]) != set(tp1)
+            or set(remerge["wake_s"]) != set(tp2)
+            or mode == "standby"
+            and set(merge["wake_s"]) != set(tp2)
+        ):
             raise ValueError("a wake has no WOKEN receipt")
+        # Pre-warmed engines should never pay the first-sleep pinned allocation.
+        value["slowest_sleep_s"] = max(
+            (v for r in records for d in r["sleep_s"] for v in (d or {}).values()),
+            default=None,
+        )
         acceptance = json.loads(
             unique(root, "conversion_sequence_acceptance.json").read_text()
         )
@@ -189,7 +213,12 @@ def check(directory):
         if value["incomplete_requests"]:
             raise ValueError("a request did not deliver its full output")
         woken_at = {i: split["route_published_s"] for i in tp1}
-        woken_at.update({i: remerge["route_published_s"] for i in tp2})
+        woken_at.update(
+            {
+                i: (merge if mode == "standby" else remerge)["route_published_s"]
+                for i in tp2
+            }
+        )
         recomputed = [
             dict(
                 job_id=r["job_id"],

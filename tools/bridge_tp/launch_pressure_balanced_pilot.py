@@ -585,7 +585,7 @@ def decider_request(request):
         or request.get("recompute", False) not in (True, False)
         or request.get("recompute")
         and request.get("profile") != "six_card"
-        or request.get("engine_reuse") not in (None, "sleep")
+        or request.get("engine_reuse") not in (None, "sleep", "standby")
         or request.get("engine_reuse")
         and request.get("profile") != "six_card"
         or request.get("pre_tilt", False) not in (True, False)
@@ -990,6 +990,10 @@ def start_conversion(spec, scene, plan, common, processes, publish, requests):
             else {}
         ),
         **{e["instance_id"]: by_name[e["instance_id"]] for e in plan["extra_engines"]},
+        **{
+            e["instance_id"]: by_name[e["instance_id"]]
+            for e in plan.get("standby_engines", ())
+        },
     }
     manifest = json.loads(json.dumps(plan["instances"]))
     for row in manifest["instances"]:
@@ -1183,6 +1187,29 @@ def engine_sleep_call(endpoint, action, timeout_s=120):
     return round(time.monotonic() - started, 3)
 
 
+def sleep_cycle(endpoints, actions):
+    """Run ``actions`` (sleep/wake) on every engine in parallel, in order.
+
+    Returns, per endpoint, the seconds of each action.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def run(endpoint):
+        return [
+            dict(action=a, seconds=engine_sleep_call(endpoint, a, timeout_s=300))
+            for a in actions
+        ]
+
+    with ThreadPoolExecutor(len(endpoints)) as pool:
+        return dict(zip(endpoints, pool.map(run, endpoints)))
+
+
+def pc_receipts():
+    from tools.bridge_tp import pressure_conversion as pc
+
+    return pc.preconnect_receipts
+
+
 def nvidia_memory_used(gpu_ids):
     """Used MiB per physical GPU index (nvidia-smi)."""
     import subprocess
@@ -1317,7 +1344,7 @@ def run_scene(
     ).write(mechanism_dir)
     engines = {
         extra["instance_id"]: extra_engine(plan, extra)
-        for extra in plan.get("extra_engines", ())
+        for extra in (*plan.get("extra_engines", ()), *plan.get("standby_engines", ()))
     }
     common.write_json(
         root / "effective_argv.json",
@@ -1371,6 +1398,34 @@ def run_scene(
             common.write_json(Path(path), targets)
         for path, targets in plan.get("runtime_target_files", {}).items():
             common.write_json(Path(path), targets)
+        standby = list(plan.get("standby_engines", ()))
+        if standby:
+            # Engine reuse "standby": each group's other form starts first on
+            # empty GPUs, then sleeps once, wakes, and sleeps again so its
+            # pinned host backup exists before any conversion needs it.
+            announce(
+                scene["name"],
+                "启动备用形态，预热休眠后保持休眠",
+                instances=[e["instance_id"] for e in standby],
+            )
+            started = []
+            for extra in standby:
+                argv, env = engines[extra["instance_id"]]
+                process = common.start_process(
+                    extra["instance_id"], argv, env, root / f"{extra['instance_id']}.log"
+                )
+                processes.append(process)
+                started.append((extra, process))
+            publish_processes()
+            for extra, process in started:
+                common.wait_healthy(extra["endpoint"], process, spec["startup_timeout_s"])
+            prewarm = dict(
+                standby=sleep_cycle(
+                    [e["endpoint"] for e in standby], ("sleep", "wake", "sleep")
+                )
+            )
+            common.write_json(root / "standby_prewarm.json", prewarm)
+        awake = {}  # endpoint -> process, for the standby warm-up below
         target_label = f"TP{plan['config'].get('target_tp_size', 4)}"
         if "target" not in absent:
             announce(scene["name"], f"启动{target_label}服务，等待就绪")
@@ -1381,6 +1436,7 @@ def run_scene(
                 root / "target.log",
             )
             processes.append(target)
+            awake[plan["config"]["target_url"]] = target
             publish_processes()
             common.wait_healthy(
                 plan["config"]["target_url"], target, spec["startup_timeout_s"]
@@ -1392,6 +1448,7 @@ def run_scene(
                 "source TP1", source_argv, source_env, root / "source.log"
             )
             processes.append(source)
+            awake[plan["config"]["source_url"]] = source
             publish_processes()
             common.wait_healthy(
                 plan["config"]["source_url"], source, spec["startup_timeout_s"]
@@ -1439,6 +1496,22 @@ def run_scene(
                 root / f"{extra['instance_id']}_warmup.json",
                 spec["run_timeout_s"],
             )
+        if standby:
+            # The awake forms warm their sleep backup too, then their channels
+            # open (they started with empty channel files).
+            from tools.bridge_tp.migration_receivers import warm_channels
+            from tools.bridge_tp.six_conversion import publish_initial_channels
+
+            awake.update({extra["endpoint"]: process for extra, process in extras})
+            announce(scene["name"], "醒着的形态预热休眠一次，然后发布迁移通道")
+            prewarm["awake"] = sleep_cycle(list(awake), ("sleep", "wake"))
+            for endpoint, process in awake.items():
+                common.wait_healthy(endpoint, process, spec["startup_timeout_s"])
+            publish_initial_channels(plan)
+            prewarm["channels_published_unix_s"] = time.time()
+            warm_channels(plan, pc_receipts(), 180)
+            prewarm["channels_warm_unix_s"] = time.time()
+            common.write_json(root / "standby_prewarm.json", prewarm)
         if before_workload is not None:
             before_workload(plan)
         # S5b: an L2 that will split sources needs the pair target's stager

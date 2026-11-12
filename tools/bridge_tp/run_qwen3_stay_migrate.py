@@ -380,7 +380,7 @@ def main(argv=None):
     )
     parser.add_argument(
         "--conversion-engine-reuse",
-        choices=["sleep"],
+        choices=["sleep", "standby"],
         help="six-card conversions put the old engines to sleep (vLLM sleep "
         "mode level 1) and wake them on the reverse conversion instead of "
         "stopping and cold-starting engines; the first conversion of each "
@@ -542,7 +542,7 @@ def main(argv=None):
         and args.static_layout == "L1AC"
         and args.long_burst_pair
         and args.conversion_trigger_s == 110.0
-        and args.conversion_engine_reuse == "sleep"
+        and args.conversion_engine_reuse in {"sleep", "standby"}
         and not args.conversion_decider
         and not args.six_split_probe
     ):

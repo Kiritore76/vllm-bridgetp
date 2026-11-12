@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 当前任务：六卡引擎休眠复用小场——L1AC起步，显式A合并(110s)→拆回(240s)→再合并(440s)；旧形态休眠，反向转换时唤醒同一批引擎；两段长突发；机制核对，不是性能结论。
+# 当前任务：六卡启动时预建备用形态（standby）小场——启动时每组另一种形态先冷启动并预热休眠，醒着的形态也预热休眠一次；L1AC起步，显式A合并(110s)→拆回(240s)→再合并(440s)全部为唤醒，无冷启动；两段长突发；机制核对，不是性能结论。
 set -uo pipefail
 repo=${REPO:-/root/autodl-tmp/bridgetp/vllm_bridge}
 venv=${VENV:-/root/autodl-tmp/bridgetp/.venv_bridge}
@@ -16,14 +16,15 @@ git fetch origin "refs/heads/$branch:refs/remotes/origin/$branch" || exit 1
 revision=$(git rev-parse HEAD)
 [ "$revision" = "$(git rev-parse "origin/$branch")" ] || { echo '请先git pull --ff-only。'; exit 1; }
 mkdir -p "$results" || exit 1
-run=$results/qwen3_six_sleep_smoke_$(date +%Y%m%d_%H%M%S)_${RANDOM}
+run=$results/qwen3_six_standby_smoke_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 printf '%s\n' "$revision" > "$run/revision.txt"
-printf 'Six-card engine-reuse smoke: L1AC start, explicit A merge (110s), split (240s), merge again (440s) with --conversion-engine-reuse sleep (vLLM sleep mode level 1); the first merge cold-starts the A TP2 and sleeps the A TP1s, the split wakes the same TP1s and sleeps the TP2, the re-merge wakes that TP2. Prestart and drain recompute on. 300 short + two long bursts (6x16384/8192 at 90-100s, 6x16384/4096 at 420-430s). Mechanism check only, no performance claim.\n' > "$run/scope.txt"
+printf 'Six-card engine-reuse smoke with startup standby: --conversion-engine-reuse standby (vLLM sleep mode level 1). Before the workload the other form of each group (A TP2, B 2xTP1, C TP2) is cold-started first on empty GPUs, slept, woken and slept again (pinned backup pre-allocated); the awake L1AC engines then start, sleep and wake once, and only then open their channels. Explicit A merge (110s), split (240s), merge again (440s): every step wakes a sleeping form, no cold start. Prestart and drain recompute on. 300 short + two long bursts (6x16384/8192 at 90-100s, 6x16384/4096 at 420-430s). Mechanism check only, no performance claim.\n' > "$run/scope.txt"
 echo "本批目录：$run"
-echo '先Linux CPU检查；通过后只跑一场：L1AC起步，110秒A合并（冷启动TP2、两个A TP1休眠）→240秒拆回（唤醒同一对TP1、TP2休眠）→440秒再合并（唤醒同一个TP2）。'
+echo '先Linux CPU检查；通过后只跑一场：启动时先建并预热休眠备用形态（A的TP2、B的两个TP1、C的TP2），再启动L1AC醒着的引擎并预热休眠一次，之后才发布迁移通道。'
+echo '110秒A合并（唤醒备用TP2）→240秒拆回（唤醒原来的两个TP1）→440秒再合并（再唤醒同一个TP2），三步都没有冷启动。'
 echo '负载：600秒内每2秒一条短请求；90–100秒6条16384/8192长请求，420–430秒6条16384/4096长请求；合并时开启预启动和受限重算。'
-echo '每个引擎第一次休眠要申请主机pinned内存（两卡实验TP1约13秒）；场景与收尾共约15–30分钟，加上CPU检查、启动和打包。不自动重试。'
+echo '共9个引擎进程，启动比平时多约2–3分钟（备用冷启动约1分钟，两轮预热休眠各约15秒）；主机pinned内存约190GiB。场景与收尾约15–25分钟，加上CPU检查和打包。不自动重试。'
 smi=
 pack_result() {
     local status=$1
@@ -51,6 +52,7 @@ export TMPDIR="$task_tmp" TEMP="$task_tmp" TMP="$task_tmp"
 "$py" -B -c 'import json,sys,types,unittest; from pathlib import Path; p=types.ModuleType("vllm"); p.__path__=[str(Path.cwd()/"vllm")]; sys.modules["vllm"]=p; s=unittest.defaultTestLoader.loadTestsFromNames(sys.argv[2:]); r=unittest.TextTestRunner(verbosity=2).run(s); ok=r.wasSuccessful() and not r.skipped; Path(sys.argv[1]).write_text(json.dumps(dict(scope="CPU only; no CUDA/NCCL", tests=r.testsRun, passed=ok, failures=[t.id() for t,_ in r.failures], errors=[t.id() for t,_ in r.errors], skipped=[t.id() for t,_ in r.skipped]),indent=2)+"\n"); raise SystemExit(not ok)' \
     "$run/cpu_summary.json" \
     tests.bridge_tp.test_six_sleep_reuse tests.bridge_tp.test_six_sleep_smoke \
+    tests.bridge_tp.test_six_standby_launch \
     tests.bridge_tp.test_tp2_reconfiguration tests.bridge_tp.test_pressure_multi \
     tests.bridge_tp.test_drain_recompute tests.bridge_tp.test_pressure_ingress \
     tests.bridge_tp.test_six_conversion tests.bridge_tp.test_conversion_channels \
@@ -102,12 +104,12 @@ nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,pcie.link.gen
 smi=$!
 case_dir="$run/sleep_smoke"
 mkdir "$case_dir" || { pack_result 1; exit 1; }
-echo '开始小场：110/240/440秒三步；事件SLEPT/WOKEN记录每次休眠与唤醒耗时和残留显存。'
+echo '开始小场：启动预热记录在standby_prewarm.json；110/240/440秒三步，事件SLEPT/WOKEN记录每次休眠与唤醒耗时和残留显存。'
 "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
     --cards 6 --static-layout L1AC --long-burst-pair \
     --scheduler unified --hold-queue --kv-short-exempt --overload-migrate --migrate-current-length \
     --conversion L1AC-L2C --conversion-trigger-s 110 --conversion-prestart --conversion-recompute \
-    --conversion-engine-reuse sleep --six-sleep-smoke \
+    --conversion-engine-reuse standby --six-sleep-smoke \
     --expanded-context --current-machine --repetitions 1 \
     --model "$model" \
     --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
@@ -121,6 +123,6 @@ cat "$case_dir/sleep_check.log"
 printf '%s\n' "$check_status" > "$case_dir/check_exit_code.txt"
 status=$runner_status
 if [ "$status" = 0 ]; then status=$check_status; fi
-echo '检查码：0=三步完成，拆回和再合并都唤醒了同一批引擎，没有冷启动和回退，被唤醒的引擎接到了重算或迁移；2=有效，但没有重算或迁移落到被唤醒的引擎上（覆盖缺失）；1=技术失败或证据缺失。耗时只作机制记录，不是性能结论。'
+echo '检查码：0=三步都是唤醒（合并1唤醒备用TP2），没有冷启动和回退，被唤醒的引擎接到了重算或迁移；2=有效，但没有重算或迁移落到被唤醒的引擎上（覆盖缺失）；1=技术失败或证据缺失。耗时只作机制记录，不是性能结论。'
 pack_result "$status" || exit 1
 exit "$status"

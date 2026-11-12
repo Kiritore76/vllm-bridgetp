@@ -516,7 +516,7 @@ def validate(request):
         request.get("recompute") and request.get("profile") != "six_card"
     ):
         raise ValueError("drain recompute is a six-card option")
-    if request.get("engine_reuse") not in (None, "sleep") or (
+    if request.get("engine_reuse") not in (None, "sleep", "standby") or (
         request.get("engine_reuse") and request.get("profile") != "six_card"
     ):
         raise ValueError("engine reuse is a six-card sleep option")
