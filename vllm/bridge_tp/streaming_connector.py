@@ -92,6 +92,26 @@ class _GpuRestoreQuiescence:
 
 
 @dataclass
+class _DirectHistoryJob:
+    """One request's history being copied into KV by the worker hook."""
+
+    request_id: str
+    layout: Any  # direct_history.HistoryLayout
+    ring: Any  # direct_history.ChunkRing
+    destinations: list[torch.Tensor]
+    block_index: torch.Tensor
+    mismatches: torch.Tensor
+    total: int
+    written: int = 0
+    chunks: int = 0
+    hook_calls: int = 0
+    started_unix_s: float = field(default_factory=time.time)
+    final_event: Any = None
+    error: BaseException | None = None
+    done: threading.Event = field(default_factory=threading.Event)
+
+
+@dataclass
 class BridgeTPStreamRequest:
     migration_id: str
     source_request_id: str
@@ -419,6 +439,21 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 "bridgetp_release_persistent_payload_buffer", True
             )
         )
+        # Direct-to-KV history (11-12): receive the sender's chunks into a small
+        # ring and copy them into the admitted request's KV blocks from the
+        # worker's pre-forward hook; no history-sized staging buffer.
+        self.history_direct_to_kv = bool(
+            self._kv_transfer_config.get_from_extra_config(
+                "bridgetp_history_direct_to_kv", False
+            )
+        )
+        self.history_direct_ring_slots = int(
+            self._kv_transfer_config.get_from_extra_config(
+                "bridgetp_history_direct_ring_slots", 16
+            )
+        )
+        if self.history_direct_ring_slots <= 0:
+            raise ValueError("bridgetp_history_direct_ring_slots must be positive")
         if self.persistent_channel:
             # Keep the lexical active-session path.  resolve() would pin the
             # connector to the first symlink target and make later sessions
@@ -495,6 +530,8 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         # temporarily pause the next TP4 model forward while that thread
         # writes the initial history into the live paged-KV tensors.
         self._gpu_restore_quiescence: dict[str, _GpuRestoreQuiescence] = {}
+        self._direct_history_jobs: dict[str, _DirectHistoryJob] = {}
+        self._direct_history_lock = threading.Lock()
         self._gpu_restore_quiescence_lock = threading.Lock()
         self._remote_attention_servers: dict[str, RemoteAttentionRankServer] = {}
         self._completed_recvs: set[str] = set()
@@ -960,6 +997,8 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         # early return for ordinary TP4 background work.  That work is exactly
         # what previously raced the background restore on some ranks.
         self._service_gpu_restore_quiescence()
+        # Direct-to-KV history: this worker thread is the only KV writer.
+        self._service_direct_history()
         # This hook runs outside the compiled/CUDA-graph model body on every
         # model execution.  Arm the dependency here rather than relying only
         # on wait_for_layer_load(): decode CUDA-graph replay does not re-enter
@@ -1912,6 +1951,147 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         gate.error = error
         gate.restore_complete.set()
 
+    # ------------------------------------------------- direct-to-KV history
+    def _begin_direct_history(
+        self,
+        request: BridgeTPStreamRequest,
+        manifest: dict[str, Any],
+        initial_blocks: int,
+        chunk_elements: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Any:
+        """Ring for ``receive_into_ring`` plus the job the worker hook drains.
+
+        Called by the load thread just before the first chunk arrives; the
+        ring is small, so the hook must start copying at once.
+        """
+        from vllm.bridge_tp.direct_history import ChunkRing, HistoryLayout
+
+        layers = list(manifest["layers"])
+        if any(int(row.get("block_axis", manifest["block_axis"])) != 0 for row in layers):
+            raise ValueError("direct-to-KV history requires block axis 0")
+        layout = HistoryLayout([[int(v) for v in row["rank_shape"]] for row in layers])
+        blocks = list(request.target_block_ids[:initial_blocks])
+        if len(blocks) != layout.num_blocks:
+            raise ValueError("target blocks differ from the streamed history")
+        destinations = []
+        for row in layers:
+            name = str(row["layer_name"])
+            if name not in self._registered_kv_caches:
+                raise ValueError(f"Target model is missing KV layer {name}")
+            destinations.append(self._registered_kv_caches[name])
+        with torch.cuda.device(device) if device.type == "cuda" else nullcontext():
+            ring = ChunkRing(
+                self.history_direct_ring_slots,
+                chunk_elements,
+                lambda n: torch.empty(n, dtype=dtype, device=device),
+            )
+            job = _DirectHistoryJob(
+                request_id=request.target_request_id,
+                layout=layout,
+                ring=ring,
+                destinations=destinations,
+                block_index=torch.tensor(blocks, dtype=torch.long, device=device),
+                mismatches=torch.zeros((), dtype=torch.int64, device=device),
+                total=layout.total_elements,
+            )
+        with self._direct_history_lock:
+            if request.target_request_id in self._direct_history_jobs:
+                raise RuntimeError("direct history is already being written")
+            self._direct_history_jobs[request.target_request_id] = job
+        return ring
+
+    def _service_direct_history(self) -> None:
+        """Worker thread, pre-forward: copy finished chunks into KV.
+
+        Runs on the model stream, so the copies are ordered with the model's
+        own KV use (only this thread mutates KV, as since ``378ff1062``). A
+        chunk is taken only after its receive finished: the model stream never
+        waits for the network.
+        """
+        lock = getattr(self, "_direct_history_lock", None)
+        if lock is None:
+            return  # connectors built without direct-to-KV state (tests, old)
+        with lock:
+            jobs = [j for j in self._direct_history_jobs.values() if not j.done.is_set()]
+        from vllm.bridge_tp.direct_history import write_chunk
+
+        for job in jobs:
+            try:
+                cuda = job.block_index.device.type == "cuda"
+                stream = torch.cuda.current_stream(job.block_index.device) if cuda else None
+                job.hook_calls += 1
+                ready = job.ring.take_ready(
+                    (lambda event: event.query()) if cuda else None
+                )
+                for slot, buffer, offset, length, event in ready:
+                    if stream is not None and event is not None:
+                        stream.wait_event(event)
+                    job.written += write_chunk(
+                        job.destinations,
+                        job.block_index,
+                        job.layout,
+                        buffer.narrow(0, 0, length),
+                        offset,
+                        job.mismatches,
+                    )
+                    job.chunks += 1
+                    free_event = None
+                    if stream is not None:
+                        free_event = torch.cuda.Event()
+                        free_event.record(stream)
+                    job.ring.release(slot, free_event)
+                if job.written >= job.total:
+                    if stream is not None:
+                        job.final_event = torch.cuda.Event()
+                        job.final_event.record(stream)
+                    job.done.set()
+            except BaseException as error:
+                job.error = error
+                job.ring.fail(error)
+                job.done.set()
+
+    def _finish_direct_history(self, request_id: str, deadline: float) -> dict[str, Any]:
+        """Load thread: wait for the hook, then check the readback once."""
+        with self._direct_history_lock:
+            job = self._direct_history_jobs.get(request_id)
+        if job is None:
+            raise RuntimeError("direct history job is missing")
+        try:
+            while not job.done.wait(0.01):
+                self._raise_if_shadow_cancelled()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"direct history copy incomplete: {job.written}/{job.total}"
+                    )
+            if job.error is not None:
+                raise RuntimeError("direct history copy failed") from job.error
+            if job.final_event is not None:
+                job.final_event.synchronize()
+            mismatches = int(job.mismatches.item())
+            if mismatches:
+                raise ValueError(
+                    f"direct history readback differs in {mismatches} elements"
+                )
+            return {
+                "exact_readback": True,
+                "num_layers": len(job.destinations),
+                "num_target_blocks": int(job.block_index.numel()),
+                "raw_tensor_bytes": job.total * job.ring.buffers[0].element_size()
+                if job.ring.buffers
+                else None,
+                "direct_to_kv": True,
+                "chunks": job.chunks,
+                "hook_calls": job.hook_calls,
+                "ring_slots": self.history_direct_ring_slots,
+                "copy_s": time.time() - job.started_unix_s,
+            }
+        finally:
+            with self._direct_history_lock:
+                self._direct_history_jobs.pop(request_id, None)
+            job.ring.close()
+
     def _start_live_gpu_load(self, request: BridgeTPStreamRequest) -> None:
         if request.target_request_id in self._load_threads:
             return
@@ -2027,6 +2207,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             direct = None
             if gpu_direct:
                 from vllm.bridge_tp.gpu_direct_history import (
+                    DirectReceiveResult,
                     GpuDirectHistoryReceiver,
                 )
 
@@ -2101,6 +2282,24 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     # live-load exception handler must not receive from it too.
                     receiver = None
                     raise
+                if direct is None and self.history_direct_to_kv:
+                    direct = receiver.receive_into_ring(
+                        migration_id=request.migration_id,
+                        request_id=session_request_id,
+                        rank=tp_rank,
+                        layer_records=list(manifest["layers"]),
+                        make_ring=lambda chunk_elements, dtype: (
+                            self._begin_direct_history(
+                                request,
+                                manifest,
+                                initial_blocks,
+                                chunk_elements,
+                                dtype,
+                                device,
+                            )
+                        ),
+                        slot_timeout_s=self.socket_timeout_s,
+                    )
                 if direct is None:
                     direct = receiver.receive(
                         migration_id=request.migration_id,
@@ -2124,12 +2323,19 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     receiver=receiver,
                     receive_event_ready=(
                         direct.receive_done_event.query()
-                        if direct.receive_done_event is not None
+                        if getattr(direct, "receive_done_event", None) is not None
                         else None
                     ),
                     history_raw_tensor_bytes=direct.raw_tensor_bytes,
                 )
-                history_layers = direct.layers
+                if isinstance(direct, DirectReceiveResult):
+                    # Already in KV (worker hook) once the job finishes.
+                    direct_validation = self._finish_direct_history(
+                        request_id, deadline
+                    )
+                    history_layers = None
+                else:
+                    history_layers = direct.layers
                 history_bytes = b""
                 history_payload_bytes = direct.raw_tensor_bytes
                 history_stage_ms = direct.receive_ms
@@ -2166,45 +2372,52 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                 receiver=receiver,
                 receive_event_ready=(
                     direct.receive_done_event.query()
-                    if direct is not None and direct.receive_done_event is not None
+                    if getattr(direct, "receive_done_event", None) is not None
                     else None
                 ),
             )
-            if restore_stream is not None and direct is not None:
+            if (
+                restore_stream is not None
+                and direct is not None
+                and history_layers is not None
+            ):
                 history_quiescence = self._enter_gpu_restore_quiescence(
                     request_id, restore_stream
                 )
             try:
-                with self._gpu_kv_lock, restore_context:
-                    if restore_stream is not None and direct is not None:
-                        if direct.receive_done_event is None:
-                            raise RuntimeError("GPU history has no receive-done event")
-                        restore_stream.wait_event(direct.receive_done_event)
-                        receive_event_links += 1
+                if history_layers is None:
+                    validation = direct_validation
+                else:
+                    with self._gpu_kv_lock, restore_context:
+                        if restore_stream is not None and direct is not None:
+                            if direct.receive_done_event is None:
+                                raise RuntimeError("GPU history has no receive-done event")
+                            restore_stream.wait_event(direct.receive_done_event)
+                            receive_event_links += 1
 
-                    layer_trace_hook = None
-                    if _gpu_direct_layer_diagnostics_enabled(receiver):
+                        layer_trace_hook = None
+                        if _gpu_direct_layer_diagnostics_enabled(receiver):
 
-                        def layer_trace_hook(operation: str, layer_name: str) -> None:
-                            _write_gpu_direct_rank_diagnostic(
-                                self.manifest_path,
-                                request_id=request_id,
-                                migration_id=request.migration_id,
-                                tp_rank=tp_rank,
-                                phase=f"{operation}_{_safe_name(layer_name)}",
-                                device=device,
-                                receiver=receiver,
-                                layer_name=layer_name,
-                                layer_operation=operation,
-                            )
+                            def layer_trace_hook(operation: str, layer_name: str) -> None:
+                                _write_gpu_direct_rank_diagnostic(
+                                    self.manifest_path,
+                                    request_id=request_id,
+                                    migration_id=request.migration_id,
+                                    tp_rank=tp_rank,
+                                    phase=f"{operation}_{_safe_name(layer_name)}",
+                                    device=device,
+                                    receiver=receiver,
+                                    layer_name=layer_name,
+                                    layer_operation=operation,
+                                )
 
-                    validation = inject_rank_shard(
-                        self._destination_layers(history_layers),
-                        history_layers,
-                        request.target_block_ids[:initial_blocks],
-                        block_axis=int(manifest["block_axis"]),
-                        layer_trace_hook=layer_trace_hook,
-                    )
+                        validation = inject_rank_shard(
+                            self._destination_layers(history_layers),
+                            history_layers,
+                            request.target_block_ids[:initial_blocks],
+                            block_axis=int(manifest["block_axis"]),
+                            layer_trace_hook=layer_trace_hook,
+                        )
             except BaseException as error:
                 self._leave_gpu_restore_quiescence(history_quiescence, error)
                 raise
