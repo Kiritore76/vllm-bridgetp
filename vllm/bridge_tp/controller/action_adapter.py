@@ -286,6 +286,7 @@ class ActionAdapter:
         if not receipt_dir.is_dir():
             return False, set(), "initial GPU-history receipts not created yet"
         buffered: set[int] = set()
+        deferred: set[int] = set()
         for rank in range(self.target_tp_size):
             path = receipt_dir / f"tp_rank_{rank}.json"
             if not path.is_file():
@@ -305,6 +306,22 @@ class ActionAdapter:
                 if receipt.get("exact_readback") is not True:
                     return False, buffered, f"rank {rank} initial GPU readback FAILED"
                 buffered.add(rank)
+            elif (
+                status == "INITIAL_HISTORY_DEFERRED_TO_ADMISSION"
+                and receipt.get("storage") == "TARGET_KV_BLOCKS"
+            ):
+                # Direct-to-KV (11-12): the receiver is bound and receives the
+                # history only into the admitted request's KV blocks, so the
+                # dormant target must be admitted first. Without this the gate
+                # and the receiver waited on each other (directkv run 3).
+                deferred.add(rank)
+        if deferred and buffered:
+            # One rank staged, another deferred: not one consistent path.
+            return (False, buffered,
+                    "initial history receipts mix deferred and buffered ranks")
+        if len(deferred) == self.target_tp_size:
+            return (True, deferred,
+                    "all target ranks bound for direct-to-KV history")
         return (
             len(buffered) == self.target_tp_size,
             buffered,

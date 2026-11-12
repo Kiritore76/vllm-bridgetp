@@ -766,7 +766,24 @@ def maybe_publish_phase8_delta(
     )
     if state.finalizing and num_computed > state.last_computed_token:
         raise RuntimeError("migration anchor advanced after freeze request")
-    if num_computed <= state.last_computed_token:
+    if num_computed < state.last_computed_token:
+        # Preempted after the session started (11-12): its source blocks were
+        # freed and may hold other requests now, so the history being packed
+        # from the session's block ids and any further delta are unsafe.
+        # Refuse the session (the controller cancels it; no more deltas, so
+        # no cutover can commit) instead of waiting or failing the engine.
+        # The refusal stops later delta calls; the controller's cancel runs
+        # the normal source cleanup (STOP_NEW_DELTAS, publishers).
+        from vllm.bridge_tp.kv_stream import _refuse_session
+
+        _refuse_session(
+            state.config,
+            state.role,
+            "source request preempted during migration "
+            f"(computed {num_computed} < sent {state.last_computed_token})",
+        )
+        return
+    if num_computed == state.last_computed_token:
         return
     rolling = (config.run_dir / 'rolling_reservation.json').is_file()
     if rolling:

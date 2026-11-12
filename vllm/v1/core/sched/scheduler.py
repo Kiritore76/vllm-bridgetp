@@ -112,6 +112,10 @@ class Scheduler(SchedulerInterface):
         from vllm.bridge_tp.pressure_inventory import InventoryPublisher
 
         self._bridgetp_pressure_inventory = InventoryPublisher.from_env()
+        # Never preempt the request a live migration is moving out (11-12).
+        from vllm.bridge_tp.preemption_guard import MigrationSourceGuard
+
+        self._bridgetp_preemption_guard = MigrationSourceGuard.from_env()
         self._bridgetp_count_scheduled = (
             self._bridgetp_request_freeze is not None
             or os.environ.get("BRIDGETP_TARGET_OBSERVATION") == "1"
@@ -374,6 +378,8 @@ class Scheduler(SchedulerInterface):
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
         preempted_reqs: list[Request] = []
+        # Resolved at the first preemption of this step only (rare path).
+        bridgetp_protected: list[str | None] = []
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
@@ -517,7 +523,51 @@ class Scheduler(SchedulerInterface):
 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
-                    if self.policy == SchedulingPolicy.PRIORITY:
+                    guard = getattr(self, "_bridgetp_preemption_guard", None)
+                    if guard is not None and not bridgetp_protected:
+                        bridgetp_protected.append(
+                            guard.protected_request_id(
+                                r.request_id for r in self.running
+                            )
+                        )
+                    protected_id = bridgetp_protected[0] if bridgetp_protected else None
+                    if protected_id is not None:
+                        from vllm.bridge_tp.preemption_guard import pick_victim
+
+                        preempted_req = pick_victim(
+                            self.running,
+                            protected_id,
+                            key=(lambda r: (r.priority, r.arrival_time))
+                            if self.policy == SchedulingPolicy.PRIORITY
+                            else None,
+                        )
+                        if preempted_req is None:
+                            # Only the migrating request is left: it waits
+                            # (unscheduled) instead of being preempted.
+                            guard.protected_events += 1
+                            break
+                        if preempted_req.request_id != request.request_id:
+                            guard.protected_events += 1
+                    if protected_id is not None:
+                        # The victim may already be scheduled in this step.
+                        self.running.remove(preempted_req)
+                        if preempted_req in scheduled_running_reqs:
+                            preempted_req_id = preempted_req.request_id
+                            scheduled_running_reqs.remove(preempted_req)
+                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
+                            req_to_new_blocks.pop(preempted_req_id)
+                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
+                                preempted_req_id, None
+                            )
+                            if preempted_encoder_inputs:
+                                num_embeds_to_restore = sum(
+                                    preempted_req.get_num_encoder_embeds(i)
+                                    for i in preempted_encoder_inputs
+                                )
+                                encoder_compute_budget += num_embeds_to_restore
+                            req_index -= 1
+                    elif self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
                             self.running,
                             key=lambda r: (r.priority, r.arrival_time),

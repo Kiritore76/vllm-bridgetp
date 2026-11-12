@@ -70,6 +70,9 @@ class BoundedHistoryTests(unittest.TestCase):
                     migration_id="m",
                 ),
                 _atomic_json_dump=lambda row, path: receipt.append(row),
+                # 11-12: a deferral refused after a timeout (tested separately
+                # in test_source_preemption); within it the guard defers.
+                _start_deferred_too_long=lambda config, role, reason: False,
             )
             exec(
                 compile(

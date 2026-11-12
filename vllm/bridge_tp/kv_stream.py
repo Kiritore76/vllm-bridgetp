@@ -1209,10 +1209,26 @@ def _publish_request(
     num_known = int(request.num_tokens)
     pending = num_known - num_computed
     if pending != 1:
-        raise ValueError(
-            "BridgeTP Phase 6 currently requires exactly one pending known token; "
-            f"observed {pending}"
-        )
+        # Not decoding: the request was preempted and is being recomputed (or
+        # is still prefilling). No session exists yet and no source KV was
+        # read, so wait for a normal decode step instead of failing the
+        # engine (11-12 directkv run 3). Every rank sees the same scheduler
+        # state, so paired ranks stay at one boundary.
+        if _start_deferred_too_long(config, role, "request not decoding"):
+            return
+        if role.leader:
+            _atomic_json_dump(
+                dict(
+                    status="DEFERRED_NOT_DECODING",
+                    migration_id=config.migration_id,
+                    source_request_id=request_id,
+                    pending_known_tokens=pending,
+                    num_computed_tokens=num_computed,
+                    updated_unix_s=time.time(),
+                ),
+                config.run_dir / "source_start_deferred_receipt.json",
+            )
+        return
 
     freeze_request: dict[str, Any] | None = None
     if config.stop_and_copy:
@@ -1291,6 +1307,8 @@ def _publish_request(
         if not allowed:
             # No publisher or wire session has been started. Leave inference
             # running; retry only at the next normal iteration boundary.
+            if _start_deferred_too_long(config, role, "GPU memory for history"):
+                return
             if role.paired:
                 # The other ranks copy this boundary or none: there is no retry.
                 _refuse_session(config, role, "not enough GPU memory for history")
@@ -1708,6 +1726,29 @@ def _publish_source_progress(
 
 
 _refused_sessions: set[str] = set()
+
+
+# First deferral of each session's start (memory or a non-decoding request).
+_start_deferred_since: dict[str, float] = {}
+
+
+def _start_deferred_too_long(config, role: SourceRole, reason: str) -> bool:
+    """Refuse a session whose start stayed deferred beyond the timeout.
+
+    A deferred start keeps the controller's session (and the target's bound
+    receiver) waiting; 11-12 directkv run 3 waited 40 s for history memory on
+    a KV-full TP1. The controller cancels a refused session and may start a
+    fresh one later. Returns True when the session was refused.
+    """
+    timeout = float(os.environ.get("BRIDGETP_SOURCE_START_DEFER_TIMEOUT_S", "10"))
+    now = time.monotonic()
+    first = _start_deferred_since.setdefault(config.migration_id, now)
+    if timeout <= 0 or now - first < timeout:
+        return False
+    _refuse_session(
+        config, role, f"{reason} unavailable for {now - first:.1f} s before start"
+    )
+    return True
 
 
 def _refuse_session(config, role: SourceRole, reason: str) -> None:
