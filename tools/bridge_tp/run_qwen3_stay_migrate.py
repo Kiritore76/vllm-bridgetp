@@ -482,6 +482,13 @@ def main(argv=None):
         "under KV pressure; require real commit/release; not a performance trial",
     )
     parser.add_argument(
+        "--six-sleep-profile",
+        choices=["basic", "stress"],
+        default="basic",
+        help="with --six-sleep-smoke: basic (merge/split/merge) or stress (six "
+        "loaded merge/split rounds, hang reproduction)",
+    )
+    parser.add_argument(
         "--six-sleep-smoke",
         action="store_true",
         help="engine-reuse smoke: L1AC, explicit A merge/split/merge at "
@@ -536,6 +543,8 @@ def main(argv=None):
             "six-split-probe needs L2C-L1AC, long-burst-pair, trigger 110, "
             "and natural drain without prestart/decider"
         )
+    if args.six_sleep_profile != "basic" and not args.six_sleep_smoke:
+        parser.error("--six-sleep-profile needs --six-sleep-smoke")
     if args.six_sleep_smoke and not (
         six_conversion
         and args.conversion == "L1AC-L2C"
@@ -828,8 +837,12 @@ def main(argv=None):
         if args.six_sleep_smoke:
             from tools.bridge_tp import six_sleep_smoke
 
-            cfg["recipes"] = [six_sleep_smoke.recipe(read(args.inputs))]
-            cfg["horizon_s"] = six_sleep_smoke.HORIZON_S
+            cfg["recipes"] = [
+                six_sleep_smoke.recipe(read(args.inputs), args.six_sleep_profile)
+            ]
+            cfg["horizon_s"] = six_sleep_smoke.PROFILES[args.six_sleep_profile][
+                "horizon_s"
+            ]
             cfg["note"] += (
                 "; engine-reuse smoke: explicit A merge/split/merge, sleep/wake; "
                 "mechanism check, no performance comparison"
@@ -1196,7 +1209,9 @@ def main(argv=None):
                 if args.six_sleep_smoke:
                     from tools.bridge_tp import six_sleep_smoke
 
-                    spec["conversion"]["sequence"] = six_sleep_smoke.sequence()
+                    spec["conversion"]["sequence"] = six_sleep_smoke.sequence(
+                        args.six_sleep_profile
+                    )
             else:
                 spec["conversion"].update(
                     profile="six_card",

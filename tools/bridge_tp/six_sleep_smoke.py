@@ -10,6 +10,12 @@ each merge, so drain recompute continues them on the new (then woken) TP2.
 With ``--conversion-engine-reuse standby`` every group's other form exists
 asleep (pre-warmed) from the start, so the first merge also wakes its TP2.
 
+Profile "stress" (GPU 11-12: a woken A TP2 hung about 3 s after it took three
+~20k-token recomputes plus a queue): six A merge/split rounds, a short
+request every second and six 16384/2048 long requests before every merge, so
+each woken TP2 starts serving under load. Hangs are captured by
+``hang_watch.py``.
+
 Exit 0: all three steps completed, both reverse steps woke the same engines
 without any cold start or fallback, and every request delivered its full
 output. Exit 2: valid, but no recompute or migration touched a woken engine
@@ -30,8 +36,30 @@ HORIZON_S = 720.0
 TRIGGER_S = 110.0
 SEQUENCE = (("TP2", 110.0), ("TP1", 240.0), ("TP2", 440.0))
 
+STRESS_PROFILE = "six_sleep_reuse_stress_v1"
+STRESS_ROUNDS = 6
+STRESS_PERIOD_S = 220.0
+STRESS_SPLIT_AFTER_S = 120.0
+STRESS_SEQUENCE = tuple(
+    step
+    for k in range(STRESS_ROUNDS)
+    for step in (
+        ("TP2", TRIGGER_S + STRESS_PERIOD_S * k),
+        ("TP1", TRIGGER_S + STRESS_PERIOD_S * k + STRESS_SPLIT_AFTER_S),
+    )
+)
+STRESS_HORIZON_S = TRIGGER_S + STRESS_PERIOD_S * STRESS_ROUNDS + 60.0
+PROFILES = {
+    "basic": dict(name=PROFILE, horizon_s=HORIZON_S, sequence=SEQUENCE),
+    "stress": dict(
+        name=STRESS_PROFILE, horizon_s=STRESS_HORIZON_S, sequence=STRESS_SEQUENCE
+    ),
+}
 
-def recipe(inputs):
+
+def recipe(inputs, profile="basic"):
+    if profile == "stress":
+        return stress_recipe(inputs)
     jobs = []
 
     def add(at, prompt, cap, role, phase):
@@ -67,7 +95,45 @@ def recipe(inputs):
     )
 
 
-def sequence():
+def stress_recipe(inputs):
+    jobs = []
+
+    def add(at, prompt, cap, role, phase):
+        jobs.append(
+            dict(
+                id=f"{STRESS_PROFILE}-{len(jobs)}",
+                at_s=at,
+                route=None,
+                request=burst.request(inputs, prompt, cap),
+                workload_role=role,
+                workload_phase=phase,
+            )
+        )
+
+    for at in range(0, int(STRESS_HORIZON_S) - 60):
+        add(at, 512, 128, "short_probe", "background")
+    for k, (mode, at) in enumerate(STRESS_SEQUENCE):
+        if mode != "TP2":
+            continue
+        for i in range(6):
+            add(at - 20 + 2 * i, 16384, 2048, "long_input_output", f"burst_{k // 2}")
+    jobs.sort(key=lambda j: (j["at_s"], j["id"]))
+    return dict(
+        name=STRESS_PROFILE,
+        scenario=STRESS_PROFILE,
+        repetition=1,
+        arm_order_offset=0,
+        fixed_output=True,
+        jobs=jobs,
+        input_sha256=matched.digest(jobs),
+        planned_output_tokens=sum(j["request"]["max_tokens"] for j in jobs),
+        routing_scope="unified scheduler, unpinned; six A merge/split rounds with "
+        "engine reuse, loaded at every wake; hang reproduction, no performance "
+        "comparison",
+    )
+
+
+def sequence(profile="basic"):
     return [
         dict(
             bundle="A",
@@ -76,7 +142,7 @@ def sequence():
             deadline_s=900,
             method="DRAIN",
         )
-        for mode, at in SEQUENCE
+        for mode, at in PROFILES[profile]["sequence"]
     ]
 
 
@@ -151,45 +217,50 @@ def check(directory):
         origin = status.get("workload_origin_unix_s") or 0.0
         records = [step_record(s, events, origin) for s in steps]
         value["steps"] = records
-        if [r["target_mode"] for r in records] != [m for m, _ in SEQUENCE] or any(
-            r["state"] != "COMPLETED" for r in records
+        modes = [r["target_mode"] for r in records]
+        if (
+            len(records) not in {len(p["sequence"]) for p in PROFILES.values()}
+            or modes != ["TP2", "TP1"] * (len(records) // 2) + ["TP2"] * (len(records) % 2)
+            or any(r["state"] != "COMPLETED" for r in records)
         ):
-            raise ValueError("the three explicit A steps did not all complete")
-        merge, split, remerge = records
+            raise ValueError("the explicit A merge/split steps did not all complete")
         if any(r["fallbacks"] for r in records):
             raise ValueError("a sleep fell back to stop/cold start")
+        merges, splits = records[0::2], records[1::2]
         # "standby": the A TP2 already exists asleep, so even the first merge
         # wakes it; "sleep": the first merge cold-starts it.
         value["mode"] = mode = (
             "standby" if (scene / "standby_prewarm.json").exists() else "sleep"
         )
-        tp1 = sorted(i for group in merge["slept"] for i in group)
+        first = merges[0]
+        tp1 = sorted(i for group in first["slept"] for i in group)
         if mode == "standby":
             value["standby_prewarm"] = json.loads(
                 (scene / "standby_prewarm.json").read_text()
             )
-            if len(tp1) != 2 or merge["cold_started"] or len(merge["woken"]) != 1:
+            if len(tp1) != 2 or first["cold_started"] or len(first["woken"]) != 1:
                 raise ValueError("first merge did not wake the standby A TP2")
-            tp2 = merge["woken"]
+            tp2 = first["woken"]
         else:
-            if len(tp1) != 2 or len(merge["cold_started"]) != 1:
+            if len(tp1) != 2 or len(first["cold_started"]) != 1:
                 raise ValueError("first merge did not cold-start one TP2 and sleep A")
-            tp2 = merge["cold_started"]
-        if split["woken"] != tp1 or split["cold_started"]:
-            raise ValueError("split did not wake the same two A TP1 engines")
-        if sorted(i for g in split["slept"] for i in g) != tp2:
-            raise ValueError("split did not sleep the A TP2")
-        if remerge["woken"] != tp2 or remerge["cold_started"]:
-            raise ValueError("re-merge did not wake the sleeping A TP2")
-        if sorted(i for g in remerge["slept"] for i in g) != tp1:
-            raise ValueError("re-merge did not sleep the A TP1 engines again")
-        woke = (merge, split, remerge) if mode == "standby" else (split, remerge)
-        if (
-            any(v is None or v is False for r in woke for v in r["wake_s"].values())
-            or set(split["wake_s"]) != set(tp1)
-            or set(remerge["wake_s"]) != set(tp2)
-            or mode == "standby"
-            and set(merge["wake_s"]) != set(tp2)
+            tp2 = first["cold_started"]
+        for index, merge in enumerate(merges):
+            if sorted(i for g in merge["slept"] for i in g) != tp1:
+                raise ValueError(f"merge {index + 1} did not sleep the A TP1 engines")
+            if (index or mode == "standby") and (
+                merge["woken"] != tp2 or merge["cold_started"]
+            ):
+                raise ValueError(f"merge {index + 1} did not wake the sleeping A TP2")
+        for index, split in enumerate(splits):
+            if split["woken"] != tp1 or split["cold_started"]:
+                raise ValueError(f"split {index + 1} did not wake the same A TP1s")
+            if sorted(i for g in split["slept"] for i in g) != tp2:
+                raise ValueError(f"split {index + 1} did not sleep the A TP2")
+        if any(
+            set(r["wake_s"]) != set(r["woken"])
+            or any(v is None or v is False for v in r["wake_s"].values())
+            for r in records
         ):
             raise ValueError("a wake has no WOKEN receipt")
         # Pre-warmed engines should never pay the first-sleep pinned allocation.
@@ -197,6 +268,7 @@ def check(directory):
             (v for r in records for d in r["sleep_s"] for v in (d or {}).values()),
             default=None,
         )
+        value["fence_to_route_s"] = [r["fence_to_route_s"] for r in records]
         acceptance = json.loads(
             unique(root, "conversion_sequence_acceptance.json").read_text()
         )
@@ -212,13 +284,11 @@ def check(directory):
         )
         if value["incomplete_requests"]:
             raise ValueError("a request did not deliver its full output")
-        woken_at = {i: split["route_published_s"] for i in tp1}
-        woken_at.update(
-            {
-                i: (merge if mode == "standby" else remerge)["route_published_s"]
-                for i in tp2
-            }
-        )
+        # First time each engine served after a wake.
+        woken_at = {}
+        for r in records:
+            for name in r["woken"]:
+                woken_at.setdefault(name, r["route_published_s"])
         recomputed = [
             dict(
                 job_id=r["job_id"],
