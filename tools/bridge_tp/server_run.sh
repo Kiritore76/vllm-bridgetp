@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 当前任务：standby加重挂起复现——4轮A合并/拆回；每次合并前2条14336/8192长请求固定到A-g1-tp1（保证在唤醒的TP2上重算），合并前5秒到后70秒每秒14条短请求形成积压；带零依赖挂起诊断；机制与稳定性核对，不是性能结论。
+# 当前任务：guard40自动场（mixed_guard_six_v1）＋standby休眠复用＋零依赖挂起诊断（faulthandler/hang_watch/NCCL_DEBUG=WARN）；含重算结算修复59a245eac（基线stall/split5不含）；其余参数与同版stall场相同；同输入；与stall/split5/静态L1AC对比。
 set -uo pipefail
 repo=${REPO:-/root/autodl-tmp/bridgetp/vllm_bridge}
 venv=${VENV:-/root/autodl-tmp/bridgetp/.venv_bridge}
@@ -14,16 +14,17 @@ source "$venv/bin/activate" || exit 1
 [ "$(git branch --show-current)" = "$branch" ] || { echo "分支不匹配（需要 $branch），停止。"; exit 1; }
 git fetch origin "refs/heads/$branch:refs/remotes/origin/$branch" || exit 1
 revision=$(git rev-parse HEAD)
-[ "$revision" = "$(git rev-parse "origin/$branch")" ] || { echo '请先git pull --ff-only。'; exit 1; }
+[ "$revision" = "$(git rev-parse "origin/$branch")" ] || { echo '本地落后于远端：请先 git merge --ff-only refs/remotes/origin/'"$branch"'。'; exit 1; }
 mkdir -p "$results" || exit 1
-run=$results/qwen3_six_standby_heavy_$(date +%Y%m%d_%H%M%S)_${RANDOM}
+run=$results/qwen3_six_guard40_standby_auto_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 printf '%s\n' "$revision" > "$run/revision.txt"
-printf 'Six-card engine-reuse hang reproduction, heavy (the 11-12 stress run left each woken TP2 nearly idle): --conversion-engine-reuse standby, four explicit A merge/split rounds (merge at 110+400k s, split 280 s later); before every merge two 14336/8192 long requests pinned to the pair source A-g1-tp1, still running at the 45 s drain-recompute check, so both are recomputed on the woken TP2; 14 short requests per second from 5 s before to 70 s after every merge (1 per second otherwise) so a backlog waits for the woken TP2. Same hang diagnostics (faulthandler on SIGUSR1, hang_watch kernel stacks and nvidia-smi, NCCL_DEBUG=WARN). Mechanism and stability check only, no performance claim.\n' > "$run/scope.txt"
+printf 'Six-card 2400s automatic trial (mixed_guard_six_v1, seed6 input 96a46bc7) with --conversion-engine-reuse standby: before the workload the other form of each group is cold-started, slept, woken and slept again, and the awake L1AC engines sleep and wake once before their channels open; every conversion then sleeps the old form and wakes the sleeping one (no cold start). All other options identical to the same-version stall run (a6a2ebf18): unified scheduler, hold queue, decider execute/multi/assist, prestart, drain recompute, split confirm 5s/30s, unlimited conversions. Includes the drain-recompute settle fix 59a245eac (absent from the stall and split5 baselines) and hang diagnostics (faulthandler on SIGUSR1 in every Python process, hang_watch kernel stacks and nvidia-smi, NCCL_DEBUG=WARN); the 11-12 run of this configuration failed at about 870 s when a woken A TP2 hung. Compare with stall, split5 and static L1AC; one run, no repetition statistics.\n' > "$run/scope.txt"
 echo "本批目录：$run"
-echo '先Linux CPU检查；通过后只跑一场standby加重复现：4轮A合并→拆回；每次合并前2条14336/8192长请求固定在A-g1-tp1，合并前后每秒14条短请求，唤醒的TP2一接流就要重算2条长请求并承接积压。'
-echo '合并时刻110/510/910/1310秒，拆回在合并后280秒；共8步，全部是唤醒。挂起时hang_watch会抓各进程线程栈（写进各自日志）、内核栈和nvidia-smi到hang_diag/。'
-echo '共9个引擎进程，启动约3分钟；场景约29分钟（到达1650秒）加排空，总计约40–50分钟，加CPU检查和打包。不自动重试。'
+echo '先Linux CPU检查；通过后只跑一场同输入2400秒自动场：参数与同版stall场相同，只加 --conversion-engine-reuse standby；不自动重试。'
+echo '带挂起诊断：若某引擎60秒不返回，hang_watch抓各进程线程栈（写进各自日志）、内核栈和nvidia-smi到hang_diag/；含重算结算修复（基线stall/split5不含）。'
+echo '启动比stall场多约1分钟（9个引擎，备用形态冷启动加两轮预热休眠），主机pinned内存约214GiB。'
+echo '40分钟到达；含CPU/启动/预热/排空/打包，预计55–70分钟，慢机器或积压可能更久。'
 smi=
 pack_result() {
     local status=$1
@@ -32,7 +33,7 @@ pack_result() {
     free -g > "$run/free_after.txt" 2>&1
     printf '%s\n' "$status" > "$run/exit_code.txt"
     local excludes=() edge
-    for edge in sleep_smoke; do
+    for edge in auto_from_L1AC; do
         # Never omit unarchived failure data. Keep its raw trial if no inner pack.
         if [ -f "$run/$edge/trial.tar.gz" ] && [ -f "$run/$edge/trial.tar.gz.sha256" ] &&
            (cd "$run/$edge" && sha256sum -c trial.tar.gz.sha256 > /dev/null 2>&1); then
@@ -99,36 +100,38 @@ fi
 "$py" -m compileall -q -j 4 "$repo/vllm" "$repo/tools" > "$run/compileall.log" 2>&1 || { tail -n 30 "$run/compileall.log"; pack_result 1; exit 1; }
 free -g > "$run/free_before.txt" 2>&1
 nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,pcie.link.gen.current,pcie.link.width.current --format=csv,noheader > "$run/gpu_before.csv" || { pack_result 1; exit 1; }
-# Residual memory of sleeping engines and host memory over the run.
+# GPU memory (sleep residuals) and host MemAvailable every second.
 ( while true; do
     nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu --format=csv,noheader
     printf 'host %s %s\n' "$(date +%s)" "$(awk '/MemAvailable/ {print $2}' /proc/meminfo)"
     sleep 1
   done ) > "$run/gpu_samples.csv" 2>&1 &
 smi=$!
-case_dir="$run/sleep_smoke"
+case_dir="$run/auto_from_L1AC"
 mkdir "$case_dir" || { pack_result 1; exit 1; }
-"$py" -B tools/bridge_tp/hang_watch.py --root "$run/sleep_smoke" --output "$run/hang_diag" > "$run/hang_watch.log" 2>&1 &
+"$py" -B tools/bridge_tp/hang_watch.py --root "$run/auto_from_L1AC" --output "$run/hang_diag" > "$run/hang_watch.log" 2>&1 &
 watch=$!
-echo '开始加重复现：8步，事件SLEPT/WOKEN记录每次休眠与唤醒；若某引擎60秒不返回，hang_watch抓诊断。'
+echo '开始：启动时预建备用形态并预热休眠（standby_prewarm.json），然后2400秒自动场；25:00起10秒短峰应保持，27:00起持续短压应拆回。'
 "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
-    --cards 6 --static-layout L1AC --long-burst-pair \
+    --cards 6 --static-layout L1AC --phase-shift --phase-scenario mixed_guard_six_v1 \
     --scheduler unified --hold-queue --kv-short-exempt --overload-migrate --migrate-current-length \
-    --conversion L1AC-L2C --conversion-trigger-s 110 --conversion-prestart --conversion-recompute \
-    --conversion-engine-reuse standby --six-sleep-smoke --six-sleep-profile heavy \
     --expanded-context --current-machine --repetitions 1 \
+    --conversion-decider execute --decider-multi --decider-assist --conversion-prestart --conversion-recompute \
+    --conversion-engine-reuse standby \
+    --migration-targets all --decider-max-conversions 0 \
     --model "$model" \
     --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
     --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json" \
     --output "$case_dir/trial" --expected-revision "$revision" 2>&1 | tee "$case_dir/console.log"
 runner_status=${PIPESTATUS[0]}
 printf '%s\n' "$runner_status" > "$case_dir/runner_exit_code.txt"
-"$py" -B -m tools.bridge_tp.six_sleep_smoke --directory "$case_dir/trial" > "$case_dir/sleep_check.log" 2>&1
+"$py" -B -m tools.bridge_tp.six_rotation assess --arm auto_from_L1AC --scenario mixed_guard_six_v1 --directory "$case_dir/trial" > "$case_dir/auto_check.log" 2>&1
 check_status=$?
-cat "$case_dir/sleep_check.log"
+cat "$case_dir/auto_check.log"
 printf '%s\n' "$check_status" > "$case_dir/check_exit_code.txt"
 status=$runner_status
 if [ "$status" = 0 ]; then status=$check_status; fi
-echo '检查码：0=8步全部是唤醒，没有冷启动和回退，被唤醒的引擎接到了重算或迁移；2=有效但覆盖缺失；1=技术失败或证据缺失。若失败，先看hang_diag/与各引擎日志里的Thread栈（Current thread / Thread 0x...）。'
+echo '每次转换的休眠/唤醒耗时与残留显存见conversion_events.jsonl的SLEPT/WOKEN；SLEEP_FALLBACK表示回退为停机。'
+echo '须真实完成长段A合并和持续短段A拆回；短峰及恢复须有效L2C/KEEP，零转换/中止/证据缺失不算覆盖通过；完整输出/ACK/trace/空闲/收尾须通过。'
 pack_result "$status" || exit 1
 exit "$status"
