@@ -631,6 +631,8 @@ class GpuDirectHistoryReceiver:
                 slot, buffer, free_event = ring.acquire(slot_timeout_s)
                 if free_event is not None:
                     self.stream.wait_event(free_event)
+                if buffer.is_cuda:
+                    buffer.record_stream(self.stream)
                 last_event = _recv_tensor(
                     self.nccl, self.comm, buffer.narrow(0, 0, length), self.stream
                 )

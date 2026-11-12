@@ -532,6 +532,9 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         self._gpu_restore_quiescence: dict[str, _GpuRestoreQuiescence] = {}
         self._direct_history_jobs: dict[str, _DirectHistoryJob] = {}
         self._direct_history_lock = threading.Lock()
+        # Direct mode: migrations whose history prebind left for admission
+        # (migration_id -> "DEFERRED" | "DISCARDING").
+        self._deferred_histories: dict[str, str] = {}
         self._gpu_restore_quiescence_lock = threading.Lock()
         self._remote_attention_servers: dict[str, RemoteAttentionRankServer] = {}
         self._completed_recvs: set[str] = set()
@@ -1760,6 +1763,13 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                             source_request_id=str(manifest["source_request_id"]),
                             tp_rank=get_tp_group().rank_in_group,
                         )
+                        if self.history_direct_to_kv:
+                            self._cleanup_cancelled_deferred_history(
+                                manifest=manifest,
+                                migration_id=migration_id,
+                                source_request_id=str(manifest["source_request_id"]),
+                                tp_rank=get_tp_group().rank_in_group,
+                            )
                         time.sleep(0.005)
                         continue
                     self._prebind_receiver_ready.clear()
@@ -1805,41 +1815,73 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                             if receiver is not self._prebound_gpu_receiver:
                                 receiver.close()
                             receiver = self._prebound_gpu_receiver
-                    direct = receiver.receive(
-                        migration_id=migration_id,
-                        request_id=str(manifest["source_request_id"]),
-                        rank=tp_rank,
-                        layer_records=list(manifest["layers"]),
-                        keep_open=(
-                            manifest.get("delta_transport")
-                            == "NCCL_P2P_GPU_DIRECT_PERSISTENT"
-                        ),
-                        synchronize=True,
-                    )
-                    with self._prebound_gpu_history_lock:
-                        self._prebound_gpu_history = (
-                            migration_id,
-                            direct,
+                    if (
+                        self.history_direct_to_kv
+                        and self.persistent_channel
+                        and self.shadow_cutover_output_tokens == 0
+                    ):
+                        # Direct-to-KV: the history is received only into the
+                        # admitted request's KV blocks (live load); nothing is
+                        # staged outside the KV pool before admission. Only
+                        # the looping persistent prebind can later finish a
+                        # session cancelled before admission, so other modes
+                        # keep the staged receive (live then injects it).
+                        with self._direct_history_lock:
+                            self._deferred_histories[migration_id] = "DEFERRED"
+                        deferred_unix_s = time.time()
+                        _atomic_json_dump(
+                            {
+                                "format_version": 1,
+                                "status": "INITIAL_HISTORY_DEFERRED_TO_ADMISSION",
+                                "migration_id": migration_id,
+                                "target_tp_rank": tp_rank,
+                                "exact_readback": None,
+                                "gpu_ready": False,
+                                "storage": "TARGET_KV_BLOCKS",
+                                "completed_unix_s": deferred_unix_s,
+                                "buffered_completed_unix_s": None,
+                                "ready_completed_unix_s": None,
+                            },
+                            self.manifest_path.parent
+                            / "gpu_initial_receipts"
+                            / f"tp_rank_{tp_rank}.json",
                         )
-                    direct = None
-                    buffered_completed_unix_s = time.time()
-                    _atomic_json_dump(
-                        {
-                            "format_version": 1,
-                            "status": "INITIAL_HISTORY_GPU_BUFFERED",
-                            "migration_id": migration_id,
-                            "target_tp_rank": tp_rank,
-                            "exact_readback": None,
-                            "gpu_ready": True,
-                            "storage": "TEMPORARY_GPU_BUFFER",
-                            "completed_unix_s": buffered_completed_unix_s,
-                            "buffered_completed_unix_s": buffered_completed_unix_s,
-                            "ready_completed_unix_s": None,
-                        },
-                        self.manifest_path.parent
-                        / "gpu_initial_receipts"
-                        / f"tp_rank_{tp_rank}.json",
-                    )
+                    else:
+                        direct = receiver.receive(
+                            migration_id=migration_id,
+                            request_id=str(manifest["source_request_id"]),
+                            rank=tp_rank,
+                            layer_records=list(manifest["layers"]),
+                            keep_open=(
+                                manifest.get("delta_transport")
+                                == "NCCL_P2P_GPU_DIRECT_PERSISTENT"
+                            ),
+                            synchronize=True,
+                        )
+                        with self._prebound_gpu_history_lock:
+                            self._prebound_gpu_history = (
+                                migration_id,
+                                direct,
+                            )
+                        direct = None
+                        buffered_completed_unix_s = time.time()
+                        _atomic_json_dump(
+                            {
+                                "format_version": 1,
+                                "status": "INITIAL_HISTORY_GPU_BUFFERED",
+                                "migration_id": migration_id,
+                                "target_tp_rank": tp_rank,
+                                "exact_readback": None,
+                                "gpu_ready": True,
+                                "storage": "TEMPORARY_GPU_BUFFER",
+                                "completed_unix_s": buffered_completed_unix_s,
+                                "buffered_completed_unix_s": buffered_completed_unix_s,
+                                "ready_completed_unix_s": None,
+                            },
+                            self.manifest_path.parent
+                            / "gpu_initial_receipts"
+                            / f"tp_rank_{tp_rank}.json",
+                        )
                     self._prebind_receiver_ready.set()
                     if not (
                         self.persistent_channel
@@ -2002,6 +2044,92 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             self._direct_history_jobs[request.target_request_id] = job
         return ring
 
+    def _claim_deferred_history(self, migration_id: str) -> None:
+        """Live load owns a history prebind deferred; refuse a discarded one."""
+        lock = getattr(self, "_direct_history_lock", None)
+        if lock is None:
+            return
+        with lock:
+            state = self._deferred_histories.get(migration_id)
+            if state == "DISCARDING":
+                raise _ShadowCancelled("deferred history was cancelled before admission")
+            self._deferred_histories.pop(migration_id, None)
+
+    def _cleanup_cancelled_deferred_history(
+        self,
+        *,
+        manifest: dict[str, Any],
+        migration_id: str,
+        source_request_id: str,
+        tp_rank: int,
+    ) -> bool:
+        """Direct mode, cancelled before admission: finish the protocol.
+
+        The sender still sends START_SESSION, the history and deltas up to
+        END_SESSION. Nobody will load them, so receive the history into a
+        self-draining small ring, drain the deltas and return the persistent
+        channel to IDLE, as ``_cleanup_cancelled_prebound_history`` does for
+        a staged history.
+        """
+        from vllm.bridge_tp.direct_history import DiscardRing
+
+        with self._direct_history_lock:
+            if self._deferred_histories.get(migration_id) != "DEFERRED":
+                return False
+        state_path = self.manifest_path.parent.resolve() / "takeover_state.json"
+        if not state_path.is_file() or _load_json(state_path).get("state") != (
+            "CANCELLED"
+        ):
+            return False
+        with self._direct_history_lock:
+            if self._deferred_histories.get(migration_id) != "DEFERRED":
+                return False  # live load claimed it meanwhile
+            self._deferred_histories[migration_id] = "DISCARDING"
+        try:
+            with self._prebound_gpu_receiver_lock:
+                receiver = self._prebound_gpu_receiver
+            if receiver is None:
+                raise RuntimeError("cancelled deferred history has no receiver")
+            device = next(iter(self._registered_kv_caches.values())).device
+            received = receiver.receive_into_ring(
+                migration_id=migration_id,
+                request_id=source_request_id,
+                rank=tp_rank,
+                layer_records=list(manifest["layers"]),
+                make_ring=lambda n, dtype: DiscardRing(
+                    self.history_direct_ring_slots,
+                    n,
+                    lambda m: torch.empty(m, dtype=dtype, device=device),
+                ),
+                slot_timeout_s=self.socket_timeout_s,
+            )
+            del received
+            self._finish_cancelled_receiver(
+                receiver,
+                request_id="NOT_ADMITTED",
+                source_request_id=source_request_id,
+                migration_id=migration_id,
+                tp_rank=tp_rank,
+            )
+            _atomic_json_dump(
+                {
+                    "format_version": 1,
+                    "status": "CANCELLED_DEFERRED_HISTORY_DISCARDED",
+                    "migration_id": migration_id,
+                    "target_tp_rank": tp_rank,
+                    "storage": "NONE",
+                    "completed_unix_s": time.time(),
+                },
+                self.manifest_path.parent
+                / "gpu_cleanup_receipts"
+                / "not_admitted"
+                / f"tp_rank_{tp_rank}.json",
+            )
+            return True
+        finally:
+            with self._direct_history_lock:
+                self._deferred_histories.pop(migration_id, None)
+
     def _service_direct_history(self) -> None:
         """Worker thread, pre-forward: copy finished chunks into KV.
 
@@ -2026,8 +2154,12 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     (lambda event: event.query()) if cuda else None
                 )
                 for slot, buffer, offset, length, event in ready:
-                    if stream is not None and event is not None:
-                        stream.wait_event(event)
+                    if stream is not None:
+                        if event is not None:
+                            stream.wait_event(event)
+                        # Used here and on the receive stream: never recycled
+                        # by the caching allocator while a copy is queued.
+                        buffer.record_stream(stream)
                     job.written += write_chunk(
                         job.destinations,
                         job.block_index,
@@ -2283,6 +2415,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     receiver = None
                     raise
                 if direct is None and self.history_direct_to_kv:
+                    self._claim_deferred_history(request.migration_id)
                     direct = receiver.receive_into_ring(
                         migration_id=request.migration_id,
                         request_id=session_request_id,
@@ -2502,6 +2635,17 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
                     "end_token": current,
                     "exact_readback": exact_readback,
                     "transport": manifest.get("history_transport"),
+                    "history_path": (
+                        "DIRECT_TO_KV"
+                        if validation.get("direct_to_kv")
+                        else "STAGED_INJECT"
+                    ),
+                    "direct_copy": {
+                        k: validation.get(k)
+                        for k in ("chunks", "hook_calls", "ring_slots", "copy_s")
+                    }
+                    if validation.get("direct_to_kv")
+                    else None,
                     "completed_unix_s": resident_completed_unix_s,
                     "buffered_completed_unix_s": buffered_completed_unix_s,
                     "resident_completed_unix_s": resident_completed_unix_s,

@@ -250,3 +250,19 @@ class ChunkRing:
             raise RuntimeError("direct history transfer failed") from self._error
         if self._closed:
             raise RuntimeError("direct history ring is closed")
+
+
+class DiscardRing(ChunkRing):
+    """A ring whose chunks nobody loads (migration cancelled before admission).
+
+    ``publish`` waits for the receive to finish and frees the slot at once,
+    so the receive side drains the sender with a few chunks of memory.
+    """
+
+    def publish(self, slot: int, offset: int, length: int, ready_event: Any) -> None:
+        if not 0 < length <= self.chunk_elements:
+            raise ValueError("received chunk does not fit its slot")
+        if ready_event is not None:
+            ready_event.synchronize()
+        self.discarded = getattr(self, "discarded", 0) + length
+        self.release(slot, None)
