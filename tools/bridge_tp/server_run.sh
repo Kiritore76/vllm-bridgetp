@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 当前任务：standby挂起复现小场——六轮A合并/拆回（每次唤醒都在负载下接流：每秒1条短请求、每次合并前6条16384/2048长请求），开启零依赖挂起诊断（faulthandler线程栈＋hang_watch抓内核栈与nvidia-smi）；机制与稳定性核对，不是性能结论。
+# 当前任务：standby加重挂起复现——4轮A合并/拆回；每次合并前2条14336/8192长请求固定到A-g1-tp1（保证在唤醒的TP2上重算），合并前5秒到后70秒每秒14条短请求形成积压；带零依赖挂起诊断；机制与稳定性核对，不是性能结论。
 set -uo pipefail
 repo=${REPO:-/root/autodl-tmp/bridgetp/vllm_bridge}
 venv=${VENV:-/root/autodl-tmp/bridgetp/.venv_bridge}
@@ -16,14 +16,14 @@ git fetch origin "refs/heads/$branch:refs/remotes/origin/$branch" || exit 1
 revision=$(git rev-parse HEAD)
 [ "$revision" = "$(git rev-parse "origin/$branch")" ] || { echo '请先git pull --ff-only。'; exit 1; }
 mkdir -p "$results" || exit 1
-run=$results/qwen3_six_standby_stress_$(date +%Y%m%d_%H%M%S)_${RANDOM}
+run=$results/qwen3_six_standby_heavy_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 printf '%s\n' "$revision" > "$run/revision.txt"
-printf 'Six-card engine-reuse hang reproduction (GPU 11-12: a woken A TP2 hung about 3s after serving three 20k-token recomputes): --conversion-engine-reuse standby, six explicit A merge/split rounds (merge at 110+220k s, split 120 s later), one short request per second, six 16384/2048 long requests 20-10 s before every merge so each woken TP2 starts under load; prestart and drain recompute on. Hang diagnostics: every Python process registers faulthandler on SIGUSR1 (tools/bridge_tp/stack_dump), hang_watch.py signals them and records kernel stacks and nvidia-smi when an engine log reports no shared-memory broadcast block for 60s; NCCL_DEBUG=WARN. Mechanism and stability check only, no performance claim.\n' > "$run/scope.txt"
+printf 'Six-card engine-reuse hang reproduction, heavy (the 11-12 stress run left each woken TP2 nearly idle): --conversion-engine-reuse standby, four explicit A merge/split rounds (merge at 110+400k s, split 280 s later); before every merge two 14336/8192 long requests pinned to the pair source A-g1-tp1, still running at the 45 s drain-recompute check, so both are recomputed on the woken TP2; 14 short requests per second from 5 s before to 70 s after every merge (1 per second otherwise) so a backlog waits for the woken TP2. Same hang diagnostics (faulthandler on SIGUSR1, hang_watch kernel stacks and nvidia-smi, NCCL_DEBUG=WARN). Mechanism and stability check only, no performance claim.\n' > "$run/scope.txt"
 echo "本批目录：$run"
-echo '先Linux CPU检查；通过后只跑一场standby压力复现：六轮A合并→拆回，每次合并前6条16384/2048长请求，背景每秒1条短请求；每次唤醒后的TP2都要在负载下接流。'
-echo '合并时刻110+220k秒（k=0..5），拆回在合并后120秒；共12步，全部是唤醒。挂起时hang_watch会抓各进程线程栈（写进各自日志）、内核栈和nvidia-smi到hang_diag/。'
-echo '共9个引擎进程，启动约3分钟；场景约25分钟（到达1430秒）加排空，总计约35–45分钟，加CPU检查和打包。不自动重试。'
+echo '先Linux CPU检查；通过后只跑一场standby加重复现：4轮A合并→拆回；每次合并前2条14336/8192长请求固定在A-g1-tp1，合并前后每秒14条短请求，唤醒的TP2一接流就要重算2条长请求并承接积压。'
+echo '合并时刻110/510/910/1310秒，拆回在合并后280秒；共8步，全部是唤醒。挂起时hang_watch会抓各进程线程栈（写进各自日志）、内核栈和nvidia-smi到hang_diag/。'
+echo '共9个引擎进程，启动约3分钟；场景约29分钟（到达1650秒）加排空，总计约40–50分钟，加CPU检查和打包。不自动重试。'
 smi=
 pack_result() {
     local status=$1
@@ -110,12 +110,12 @@ case_dir="$run/sleep_smoke"
 mkdir "$case_dir" || { pack_result 1; exit 1; }
 "$py" -B tools/bridge_tp/hang_watch.py --root "$run/sleep_smoke" --output "$run/hang_diag" > "$run/hang_watch.log" 2>&1 &
 watch=$!
-echo '开始压力复现：12步，事件SLEPT/WOKEN记录每次休眠与唤醒；若某引擎60秒不返回，hang_watch抓诊断。'
+echo '开始加重复现：8步，事件SLEPT/WOKEN记录每次休眠与唤醒；若某引擎60秒不返回，hang_watch抓诊断。'
 "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
     --cards 6 --static-layout L1AC --long-burst-pair \
     --scheduler unified --hold-queue --kv-short-exempt --overload-migrate --migrate-current-length \
     --conversion L1AC-L2C --conversion-trigger-s 110 --conversion-prestart --conversion-recompute \
-    --conversion-engine-reuse standby --six-sleep-smoke --six-sleep-profile stress \
+    --conversion-engine-reuse standby --six-sleep-smoke --six-sleep-profile heavy \
     --expanded-context --current-machine --repetitions 1 \
     --model "$model" \
     --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
@@ -129,6 +129,6 @@ cat "$case_dir/sleep_check.log"
 printf '%s\n' "$check_status" > "$case_dir/check_exit_code.txt"
 status=$runner_status
 if [ "$status" = 0 ]; then status=$check_status; fi
-echo '检查码：0=12步全部是唤醒，没有冷启动和回退，被唤醒的引擎接到了重算或迁移；2=有效但覆盖缺失；1=技术失败或证据缺失。若失败，先看hang_diag/与各引擎日志里的Thread栈（Current thread / Thread 0x...）。'
+echo '检查码：0=8步全部是唤醒，没有冷启动和回退，被唤醒的引擎接到了重算或迁移；2=有效但覆盖缺失；1=技术失败或证据缺失。若失败，先看hang_diag/与各引擎日志里的Thread栈（Current thread / Thread 0x...）。'
 pack_result "$status" || exit 1
 exit "$status"

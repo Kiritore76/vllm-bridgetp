@@ -16,6 +16,13 @@ request every second and six 16384/2048 long requests before every merge, so
 each woken TP2 starts serving under load. Hangs are captured by
 ``hang_watch.py``.
 
+Profile "heavy" (the stress run of 11-12 left each woken TP2 almost idle:
+its long requests had finished before the 45 s recompute check): four rounds,
+two 14336/8192 long requests pinned to the pair source A-g1-tp1 before every
+merge (still running and both resident at the check, so both are recomputed
+on the woken TP2), and 14 short requests per second from 5 s before to 70 s
+after every merge, so a backlog waits for the woken TP2.
+
 Exit 0: all three steps completed, both reverse steps woke the same engines
 without any cold start or fallback, and every request delivered its full
 output. Exit 2: valid, but no recompute or migration touched a woken engine
@@ -49,10 +56,30 @@ STRESS_SEQUENCE = tuple(
     )
 )
 STRESS_HORIZON_S = TRIGGER_S + STRESS_PERIOD_S * STRESS_ROUNDS + 60.0
+HEAVY_PROFILE = "six_sleep_reuse_heavy_v1"
+HEAVY_ROUNDS = 4
+HEAVY_PERIOD_S = 400.0
+HEAVY_SPLIT_AFTER_S = 280.0
+HEAVY_SEQUENCE = tuple(
+    step
+    for k in range(HEAVY_ROUNDS)
+    for step in (
+        ("TP2", TRIGGER_S + HEAVY_PERIOD_S * k),
+        ("TP1", TRIGGER_S + HEAVY_PERIOD_S * k + HEAVY_SPLIT_AFTER_S),
+    )
+)
+HEAVY_HORIZON_S = HEAVY_SEQUENCE[-1][1] + 120.0
+# The pair source keeps its id through every sleep/wake under "standby"; it
+# is the one pool an arrival may be pinned to.
+HEAVY_PINNED_POOL = "A-g1-tp1"
+HEAVY_BURST_RATE = 14  # short requests per second around every merge
 PROFILES = {
     "basic": dict(name=PROFILE, horizon_s=HORIZON_S, sequence=SEQUENCE),
     "stress": dict(
         name=STRESS_PROFILE, horizon_s=STRESS_HORIZON_S, sequence=STRESS_SEQUENCE
+    ),
+    "heavy": dict(
+        name=HEAVY_PROFILE, horizon_s=HEAVY_HORIZON_S, sequence=HEAVY_SEQUENCE
     ),
 }
 
@@ -60,6 +87,8 @@ PROFILES = {
 def recipe(inputs, profile="basic"):
     if profile == "stress":
         return stress_recipe(inputs)
+    if profile == "heavy":
+        return heavy_recipe(inputs)
     jobs = []
 
     def add(at, prompt, cap, role, phase):
@@ -130,6 +159,60 @@ def stress_recipe(inputs):
         routing_scope="unified scheduler, unpinned; six A merge/split rounds with "
         "engine reuse, loaded at every wake; hang reproduction, no performance "
         "comparison",
+    )
+
+
+def heavy_recipe(inputs):
+    jobs = []
+
+    def add(at, prompt, cap, role, phase, route=None):
+        jobs.append(
+            dict(
+                id=f"{HEAVY_PROFILE}-{len(jobs)}",
+                at_s=round(at, 3),
+                route=route,
+                request=burst.request(inputs, prompt, cap),
+                workload_role=role,
+                workload_phase=phase,
+            )
+        )
+
+    merges = [at for mode, at in HEAVY_SEQUENCE if mode == "TP2"]
+    windows = [(m - 5.0, m + 70.0) for m in merges]
+    for second in range(int(HEAVY_HORIZON_S) - 60):
+        burst_window = any(a <= second < b for a, b in windows)
+        rate = HEAVY_BURST_RATE if burst_window else 1
+        for i in range(rate):
+            add(
+                second + i / rate,
+                512,
+                128,
+                "short_probe",
+                "merge_backlog" if burst_window else "background",
+            )
+    for k, merge in enumerate(merges):
+        for at in (merge - 20.0, merge - 18.0):
+            add(
+                at,
+                14336,
+                8192,
+                "long_input_output",
+                f"recompute_{k}",
+                route=HEAVY_PINNED_POOL,
+            )
+    jobs.sort(key=lambda j: (j["at_s"], j["id"]))
+    return dict(
+        name=HEAVY_PROFILE,
+        scenario=HEAVY_PROFILE,
+        repetition=1,
+        arm_order_offset=0,
+        fixed_output=True,
+        jobs=jobs,
+        input_sha256=matched.digest(jobs),
+        planned_output_tokens=sum(j["request"]["max_tokens"] for j in jobs),
+        routing_scope="two long requests per merge pinned to the pair source "
+        "A-g1-tp1, short backlog around each merge; engine reuse hang "
+        "reproduction under load, no performance comparison",
     )
 
 

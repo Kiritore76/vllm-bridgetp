@@ -147,6 +147,53 @@ class StressSceneTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             runner.main(plain + ["--six-sleep-profile", "stress"])
 
+    def test_heavy_profile_pins_recomputable_longs_and_builds_a_backlog(self):
+        from types import SimpleNamespace as NS
+
+        from tools.bridge_tp import run_pressure_balanced_pilot as pilot
+
+        steps = smoke.sequence("heavy")
+        self.assertEqual([s["target_mode"] for s in steps], ["TP2", "TP1"] * 4)
+        jobs = smoke.recipe(
+            dict(requests={"6144": dict(prompt=list(range(200)), max_tokens=1)}),
+            "heavy",
+        )["jobs"]
+        merges = [s["trigger_s"] for s in steps if s["target_mode"] == "TP2"]
+        longs = [j for j in jobs if j["workload_role"] != "short_probe"]
+        self.assertEqual(len(longs), 8)
+        for k, merge in enumerate(merges):
+            mine = [j for j in longs if j["workload_phase"] == f"recompute_{k}"]
+            self.assertEqual(len(mine), 2)
+            # Pinned, still running at the 45 s check, both resident in a TP1.
+            self.assertTrue(all(j["route"] == smoke.HEAVY_PINNED_POOL for j in mine))
+            self.assertTrue(all(merge - 20 <= j["at_s"] < merge for j in mine))
+            self.assertLessEqual(
+                sum(len(j["request"]["prompt"]) + 1500 for j in mine), 37488
+            )
+            window = [
+                j
+                for j in jobs
+                if j["workload_role"] == "short_probe"
+                and merge <= j["at_s"] < merge + 60
+            ]
+            self.assertEqual(len(window), 60 * smoke.HEAVY_BURST_RATE)
+        manifest = dict(
+            legacy_pool_aliases={"tp1": "A-g1-tp1", "tp4": "B-g2-tp2"},
+            runtime_pool_ids={"tp1": "A-g1-tp1", "tp4": "B-g2-tp2"},
+            instances=[],
+        )
+        args = NS(source_context_limit=32768, target_context_limit=32768)
+        pilot.validate_arrivals(jobs, args, NS(dynamic_conversion=True), manifest)
+
+    def test_cli_runs_the_heavy_workload(self):
+        argv = list(BASE)
+        argv[argv.index("sleep")] = "standby"
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(runner.main(argv + ["--six-sleep-profile", "heavy"]), 0)
+        value = json.loads(output.getvalue())
+        self.assertEqual(value["recipes"][0]["scenario"], smoke.HEAVY_PROFILE)
+
     def test_check_accepts_three_steps_and_rejects_partial_rounds(self):
         with tempfile.TemporaryDirectory() as folder:
             value, code = smoke.check(write_scene(Path(folder), standby=True))

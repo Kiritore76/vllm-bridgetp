@@ -483,7 +483,7 @@ def main(argv=None):
     )
     parser.add_argument(
         "--six-sleep-profile",
-        choices=["basic", "stress"],
+        choices=["basic", "stress", "heavy"],
         default="basic",
         help="with --six-sleep-smoke: basic (merge/split/merge) or stress (six "
         "loaded merge/split rounds, hang reproduction)",
