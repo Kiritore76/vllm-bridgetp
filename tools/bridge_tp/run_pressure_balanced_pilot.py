@@ -315,9 +315,12 @@ def preflight(args):
     elif getattr(args, "migration_targets", None):
         raise ValueError("receiver selection requires its owned mechanism root")
     force = getattr(args, "force_migration_target", None)
+    # A dynamic conversion adds receivers at runtime (standby TP2s through the
+    # layout control): the forced id need not be a startup receiver there.
     if force is not None and (
         getattr(args, "migration_targets", None) != "all"
         or force not in migration_receivers(args)
+        and not getattr(controller, "dynamic_conversion", False)
     ):
         raise ValueError("a forced target must be one of all receivers")
     if getattr(args, "migration_target", None) and (
@@ -379,7 +382,19 @@ def validate_arrivals(jobs, args, controller, manifest):
         )
         if name in pair
     }
-    if manifest and manifest.get("diagnostic_arrival_profile") is not None:
+    profile = manifest.get("diagnostic_arrival_profile") if manifest else None
+    if profile is not None and profile.startswith("six_sleep_reuse_migrate"):
+        from tools.bridge_tp.six_sleep_smoke import MIGRATE_PROFILE
+        from tools.bridge_tp.six_sleep_smoke import arrival_limits as sleep_limits
+
+        if not (
+            profile == MIGRATE_PROFILE
+            and getattr(controller, "dynamic_conversion", False)
+            and getattr(args, "scheduler", "pressure") == "unified"
+        ):
+            raise ValueError("diagnostic arrival routes require the migrate profile")
+        route_limits.update(sleep_limits(manifest))
+    elif manifest and manifest.get("diagnostic_arrival_profile") is not None:
         from tools.bridge_tp.six_split_probe import PROFILE, arrival_limits
 
         if not (

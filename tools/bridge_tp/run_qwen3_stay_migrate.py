@@ -515,7 +515,7 @@ def main(argv=None):
     )
     parser.add_argument(
         "--six-sleep-profile",
-        choices=["basic", "stress", "heavy"],
+        choices=["basic", "stress", "heavy", "migrate"],
         default="basic",
         help="with --six-sleep-smoke: basic (merge/split/merge) or stress (six "
         "loaded merge/split rounds, hang reproduction)",
@@ -579,6 +579,10 @@ def main(argv=None):
         parser.error("--history-direct-to-kv needs --expanded-context (chunked sender)")
     if args.history_direct_ring_slots <= 0 or args.gpu_memory_log_s < 0:
         parser.error("ring slots must be positive and the memory log interval >= 0")
+    if args.six_sleep_profile == "migrate" and args.conversion_engine_reuse != "standby":
+        parser.error("the migrate profile forces A's standby TP2: needs standby")
+    if args.six_sleep_profile == "migrate" and not args.history_direct_to_kv:
+        parser.error("the migrate profile checks the direct-to-KV receive path")
     if args.six_sleep_profile != "basic" and not args.six_sleep_smoke:
         parser.error("--six-sleep-profile needs --six-sleep-smoke")
     if args.six_sleep_smoke and not (
@@ -1443,6 +1447,10 @@ def main(argv=None):
                     )
 
                     probe_configure(plan)
+                if args.six_sleep_smoke and args.six_sleep_profile == "migrate":
+                    from tools.bridge_tp.six_sleep_smoke import configure_migrate
+
+                    configure_migrate(plan)
             elif args.migration_targets:
                 from tools.bridge_tp.migration_receivers import configure
 

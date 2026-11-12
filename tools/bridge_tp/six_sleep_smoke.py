@@ -73,8 +73,19 @@ HEAVY_HORIZON_S = HEAVY_SEQUENCE[-1][1] + 120.0
 # is the one pool an arrival may be pinned to.
 HEAVY_PINNED_POOL = "A-g1-tp1"
 HEAVY_BURST_RATE = 14  # short requests per second around every merge
+# Profile "migrate" (11-12: guard40 standby hung at the first migration into a
+# just-woken TP2): heavy, plus two long requests pinned to C-g4-tp1 after
+# every merge closes A, and every migration forced to A's standby TP2. While
+# it sleeps nothing migrates; the moment it wakes it is the only target, so
+# C's pressure migrates into it during its first seconds of service, beside
+# the recomputes and the short backlog (the guard40 situation).
+MIGRATE_PROFILE = "six_sleep_reuse_migrate_v1"
+MIGRATE_SOURCE_POOL = "C-g4-tp1"
 PROFILES = {
     "basic": dict(name=PROFILE, horizon_s=HORIZON_S, sequence=SEQUENCE),
+    "migrate": dict(
+        name=MIGRATE_PROFILE, horizon_s=HEAVY_HORIZON_S, sequence=HEAVY_SEQUENCE
+    ),
     "stress": dict(
         name=STRESS_PROFILE, horizon_s=STRESS_HORIZON_S, sequence=STRESS_SEQUENCE
     ),
@@ -89,6 +100,8 @@ def recipe(inputs, profile="basic"):
         return stress_recipe(inputs)
     if profile == "heavy":
         return heavy_recipe(inputs)
+    if profile == "migrate":
+        return migrate_recipe(inputs)
     jobs = []
 
     def add(at, prompt, cap, role, phase):
@@ -216,6 +229,62 @@ def heavy_recipe(inputs):
     )
 
 
+def migrate_recipe(inputs):
+    base = heavy_recipe(inputs)
+    jobs = [dict(j, id=j["id"].replace(HEAVY_PROFILE, MIGRATE_PROFILE)) for j in base["jobs"]]
+    merges = [at for mode, at in HEAVY_SEQUENCE if mode == "TP2"]
+    for k, merge in enumerate(merges):
+        for at in (merge + 10.0, merge + 12.0):
+            jobs.append(
+                dict(
+                    id=f"{MIGRATE_PROFILE}-c{k}-{int(at)}",
+                    at_s=at,
+                    route=MIGRATE_SOURCE_POOL,
+                    request=burst.request(inputs, 16384, 4096),
+                    workload_role="long_input_output",
+                    workload_phase=f"migrate_{k}",
+                )
+            )
+    jobs.sort(key=lambda j: (j["at_s"], j["id"]))
+    return dict(
+        base,
+        name=MIGRATE_PROFILE,
+        scenario=MIGRATE_PROFILE,
+        jobs=jobs,
+        input_sha256=matched.digest(jobs),
+        planned_output_tokens=sum(j["request"]["max_tokens"] for j in jobs),
+        routing_scope="heavy plus two long requests pinned to C-g4-tp1 after each "
+        "merge; every migration forced to A's standby TP2 (first migration "
+        "into a just-woken TP2); hang/direct-to-KV check, no performance claim",
+    )
+
+
+def arrival_limits(manifest):
+    """Pinnable pools of the migrate profile: the initial TP1 instances."""
+    rows = [r for r in manifest["instances"] if r["tp_degree"] == 1]
+    if MIGRATE_SOURCE_POOL not in {r["instance_id"] for r in rows}:
+        raise ValueError("migrate profile needs the canonical L1AC C-g4-tp1")
+    return {r["instance_id"]: int(r["context_limit"]) for r in rows}
+
+
+def configure_migrate(plan):
+    """After six.configure: pinned C arrivals and A's standby TP2 as target."""
+    arrival_limits(plan["instances"])
+    standby = [
+        e["instance_id"]
+        for e in plan.get("standby_engines", ())
+        if e["bundle"] == "A" and e["tp"] == 2
+    ]
+    if len(standby) != 1:
+        raise ValueError("migrate profile needs engine reuse standby (A TP2 asleep)")
+    plan["instances"]["diagnostic_arrival_profile"] = MIGRATE_PROFILE
+    argv = plan["controller_argv"]
+    if "--force-migration-target" in argv:
+        raise ValueError("migration target already forced")
+    argv += ["--force-migration-target", standby[0]]
+    return standby[0]
+
+
 def sequence(profile="basic"):
     return [
         dict(
@@ -285,6 +354,65 @@ def step_record(step, events, origin):
         woken=sorted(e["instance"] for e in inside if e["kind"] == "WAKE_START"),
         wake_s={e["instance"]: e.get("wake_s") for e in woke},
         fallbacks=[e for e in inside if e["kind"] == "SLEEP_FALLBACK"],
+    )
+
+
+def migration_evidence(scene, tp2, woken_at, origin, rows):
+    """Committed migrations into the woken TP2, their path and handoff."""
+    target = tp2[0]
+    root = scene / "controller" / "migration" / target / "sessions"
+    sessions = []
+    paths = set()
+    for session in sorted(root.glob("*")) if root.exists() else []:
+        state = session / "takeover_state.json"
+        if not state.exists():
+            continue
+        takeover = json.loads(state.read_text())
+        receipts = [
+            json.loads(p.read_text())
+            for p in sorted(session.glob("gpu_initial_receipts/tp_rank_*.json"))
+        ]
+        for receipt in receipts:
+            if receipt.get("history_path"):
+                paths.add(receipt["history_path"])
+        sessions.append(
+            dict(
+                session=session.name,
+                state=takeover.get("state"),
+                history_paths=[r.get("history_path") for r in receipts],
+                direct_copy=[r.get("direct_copy") for r in receipts],
+                updated_s=round(takeover.get("updated_unix_s", origin) - origin, 3),
+            )
+        )
+    handoffs = [
+        r["response"].get("handoff_stall_s")
+        for r in rows
+        if r["response"].get("handoff_stall_s") is not None and not r.get("recompute")
+    ]
+    memory = {}
+    for path in sorted(scene.rglob("gpu_memory_*.jsonl")):
+        samples = [json.loads(x) for x in path.read_text().splitlines() if x.strip()]
+        if samples:
+            memory[path.stem] = dict(
+                samples=len(samples),
+                max_reserved_mib=round(
+                    max(s["max_reserved_bytes"] for s in samples) / 2**20, 1
+                ),
+                min_device_free_mib=round(
+                    min(s["device_free_bytes"] for s in samples) / 2**20, 1
+                ),
+            )
+    return dict(
+        target=target,
+        woken_at_s=woken_at.get(target),
+        sessions=sessions,
+        committed_into_woken_tp2=sum(s["state"] == "COMMITTED" for s in sessions),
+        paths=sorted(paths),
+        handoff_stall_s=dict(
+            n=len(handoffs),
+            max=max(handoffs, default=None),
+        ),
+        gpu_memory=memory,
     )
 
 
@@ -406,6 +534,13 @@ def check(directory):
             and s["t_s"] >= woken_at[s["target"]]
         ]
         value["woken_engine_work"] = touched
+        if any(str(r.get("job_id", "")).startswith(MIGRATE_PROFILE) for r in rows):
+            value["migration"] = migration_evidence(scene, tp2, woken_at, origin, rows)
+            if not value["migration"]["committed_into_woken_tp2"]:
+                raise ValueError("no migration committed into the woken TP2")
+            # The migrate profile runs with --history-direct-to-kv only.
+            if value["migration"]["paths"] != ["DIRECT_TO_KV"]:
+                raise ValueError("a migration did not take the direct-to-KV path")
         value["passed"] = True
         if not touched:
             value["errors"].append(
