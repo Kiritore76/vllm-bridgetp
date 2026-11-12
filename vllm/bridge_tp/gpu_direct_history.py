@@ -172,6 +172,19 @@ class ReceiveResult:
     end_token: int | None = None
 
 
+@dataclass
+class DirectReceiveResult:
+    """History received into ring slots; the TP worker writes it into KV."""
+
+    layout: Any  # direct_history.HistoryLayout
+    ring: Any  # direct_history.ChunkRing (still owned by the KV writer)
+    chunk_elements: int
+    chunks: int
+    raw_tensor_bytes: int
+    receive_ms: float
+    last_receive_event: torch.cuda.Event | None = None
+
+
 class GpuDirectHistoryReceiver:
     """Receive one TP4 rank's historical shard directly into CUDA tensors."""
 
@@ -528,6 +541,159 @@ class GpuDirectHistoryReceiver:
         except Exception:
             self.close()
             raise
+
+    def receive_into_ring(
+        self,
+        *,
+        migration_id: str,
+        request_id: str,
+        rank: int,
+        layer_records: list[dict[str, Any]],
+        make_ring: Callable[[int, torch.dtype], Any],
+        slot_timeout_s: float | None = None,
+    ) -> "DirectReceiveResult | ReceiveResult":
+        """Receive the history chunk by chunk into a ring (direct-to-KV mode).
+
+        Same wire protocol as :meth:`receive` on a persistent channel. Each of
+        the sender's chunks is received into a free ring slot (the receive
+        stream first waits for the worker's ``free_event`` of that slot) and
+        published with its receive-done event; the TP worker copies it into
+        KV (``direct_history.write_chunk``). Nothing history-sized is
+        allocated. A sender that did not chunk its history (no
+        ``history_chunk_elements``) gets the original whole-payload receive:
+        the caller then injects a :class:`ReceiveResult` as before.
+        """
+        from vllm.bridge_tp.direct_history import HistoryLayout
+
+        started = time.perf_counter()
+        self._open(migration_id=migration_id, rank=rank)
+        ring = None
+        try:
+            if not self.persistent_channel:
+                raise ProtocolViolation("direct history requires a persistent channel")
+            if not request_id:
+                raise ProtocolViolation("persistent history requires request_id")
+            self._start_persistent_session(
+                migration_id=migration_id, request_id=request_id
+            )
+            assert self.connection is not None
+            history_message = recv_json(self.connection)
+            if history_message.get("op") != "HISTORY":
+                raise ProtocolViolation("expected HISTORY")
+            envelope = SessionEnvelope.from_wire(history_message)
+            if envelope.payload_type is not PayloadType.HISTORY:
+                raise ProtocolViolation("HISTORY payload type differs")
+            assert self.lifecycle is not None
+            assert self.lifecycle.active_session is not None
+            self.lifecycle.active_session.accept_inbound(envelope)
+            chunk_elements = history_message.get("history_chunk_elements")
+            if chunk_elements is not None and not isinstance(chunk_elements, int):
+                raise ProtocolViolation("history chunk size must be an integer")
+            if not layer_records:
+                raise ValueError("GPU-direct history has no layer records")
+            dtype_names = {
+                str(row["dtype"]).removeprefix("torch.") for row in layer_records
+            }
+            if len(dtype_names) != 1:
+                raise ValueError("GPU-direct packed history requires one dtype")
+            dtype = self._dtype(dtype_names.pop())
+            shapes = [
+                [int(value) for value in row["rank_shape"]] for row in layer_records
+            ]
+            if chunk_elements is None:
+                return self._finish_whole_history(
+                    shapes=shapes,
+                    dtype=dtype,
+                    migration_id=migration_id,
+                    rank=rank,
+                    layer_records=layer_records,
+                    envelope=envelope,
+                    started=started,
+                )
+            layout = HistoryLayout(shapes)
+            total = layout.total_elements
+            if not 0 < chunk_elements <= total:
+                raise ProtocolViolation("invalid GPU-direct history chunk size")
+            if self.comm is None or self.stream is None or self.nccl is None:
+                raise RuntimeError("GPU-direct receiver communicator is missing")
+            ring = make_ring(chunk_elements, dtype)
+            ready: dict[str, Any] = {
+                "status": "READY_TO_RECV",
+                "tensor_id": tensor_id(migration_id, rank, 0),
+                "numel": total,
+            }
+            ready.update(_ack_envelope(envelope).to_wire())
+            send_json(self.connection, ready)
+            chunks = 0
+            last_event = None
+            for offset in range(0, total, chunk_elements):
+                length = min(chunk_elements, total - offset)
+                slot, buffer, free_event = ring.acquire(slot_timeout_s)
+                if free_event is not None:
+                    self.stream.wait_event(free_event)
+                last_event = _recv_tensor(
+                    self.nccl, self.comm, buffer.narrow(0, 0, length), self.stream
+                )
+                ring.publish(slot, offset, length, last_event)
+                chunks += 1
+            for status in ("RECEIVED", "COMPLETE"):
+                send_json(
+                    self.connection,
+                    {"status": status, **_ack_envelope(envelope).to_wire()},
+                )
+            return DirectReceiveResult(
+                layout=layout,
+                ring=ring,
+                chunk_elements=chunk_elements,
+                chunks=chunks,
+                raw_tensor_bytes=total * torch.empty((), dtype=dtype).element_size(),
+                receive_ms=(time.perf_counter() - started) * 1000,
+                last_receive_event=last_event,
+            )
+        except BaseException as error:
+            if ring is not None:
+                ring.fail(error)
+            self.close()
+            raise
+
+    def _finish_whole_history(
+        self,
+        *,
+        shapes: list[list[int]],
+        dtype: torch.dtype,
+        migration_id: str,
+        rank: int,
+        layer_records: list[dict[str, Any]],
+        envelope: SessionEnvelope,
+        started: float,
+    ) -> ReceiveResult:
+        """Fallback of :meth:`receive_into_ring`: the original packed receive."""
+        packed, _, receive_done = self._receive_packed(
+            shapes=shapes,
+            dtype=dtype,
+            tensor_key=tensor_id(migration_id, rank, 0),
+            synchronize=False,
+            envelope=envelope,
+            history_chunk_elements=None,
+        )
+        assert self.connection is not None
+        send_json(
+            self.connection,
+            {"status": "RECEIVED", **_ack_envelope(envelope).to_wire()},
+        )
+        layers = self._unpack(
+            packed, [str(row["layer_name"]) for row in layer_records], shapes
+        )
+        send_json(
+            self.connection,
+            {"status": "COMPLETE", **_ack_envelope(envelope).to_wire()},
+        )
+        return ReceiveResult(
+            layers=layers,
+            raw_tensor_bytes=packed.numel() * packed.element_size(),
+            receive_ms=(time.perf_counter() - started) * 1000,
+            receive_done_event=receive_done,
+        )
 
     def receive_delta(
         self,

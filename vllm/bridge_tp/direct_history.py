@@ -202,15 +202,28 @@ class ChunkRing:
             self._ready.append((slot, offset, length, ready_event))
             self._cond.notify_all()
 
-    def take_ready(self) -> list[tuple[int, Any, int, int, Any]]:
-        """Worker thread, never blocking: every slot received so far."""
+    def take_ready(
+        self, is_complete: Callable[[Any], bool] | None = None
+    ) -> list[tuple[int, Any, int, int, Any]]:
+        """Worker thread, never blocking: slots whose receive has finished.
+
+        A slot is published once its receive is enqueued, not once its data
+        has arrived. The worker must not make its model stream wait for the
+        network (every request on the instance would stall), so it passes
+        ``is_complete`` (``event.query``). Receives finish in order on one
+        stream, so taking stops at the first unfinished slot.
+        """
         with self._cond:
             self._raise_if_failed()
-            items = [
-                (slot, self.buffers[slot], offset, length, event)
-                for slot, offset, length, event in self._ready
-            ]
-            self._ready.clear()
+            items = []
+            while self._ready:
+                slot, offset, length, event = self._ready[0]
+                if is_complete is not None and event is not None and not is_complete(
+                    event
+                ):
+                    break
+                self._ready.popleft()
+                items.append((slot, self.buffers[slot], offset, length, event))
             return items
 
     def release(self, slot: int, free_event: Any) -> None:

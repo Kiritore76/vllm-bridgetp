@@ -194,6 +194,18 @@ class RingTests(unittest.TestCase):
         slot, _, event = ring.acquire(0.1)
         self.assertEqual((slot, event), (a[0], "free-a"))
 
+    def test_worker_takes_only_finished_receives_in_order(self):
+        ring = ChunkRing(3, 4, lambda n: torch.zeros(n))
+        done = {"a": True, "b": False, "c": True}
+        for name, offset in (("a", 0), ("b", 4), ("c", 8)):
+            slot, _, _ = ring.acquire(0.1)
+            ring.publish(slot, offset, 4, name)
+        first = ring.take_ready(lambda event: done[event])
+        self.assertEqual([e for *_, e in first], ["a"])  # stops at unfinished b
+        self.assertEqual(ring.take_ready(lambda event: done[event]), [])
+        done["b"] = True
+        self.assertEqual([e for *_, e in ring.take_ready(done.get)], ["b", "c"])
+
     def test_receiver_waits_for_the_worker_to_free_a_slot(self):
         ring = ChunkRing(1, 4, lambda n: torch.zeros(n))
         slot, _, _ = ring.acquire(0.1)
