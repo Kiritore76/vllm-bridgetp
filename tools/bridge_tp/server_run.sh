@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 当前任务：迁移历史直接写入KV的GPU小场——standby、4轮A合并/拆回（同heavy），每次合并前30/28秒各1条16384/4096长请求固定到C-g4-tp1，所有迁移强制进A的备用TP2：唤醒后的迁移落到刚醒的TP2上（guard40 standby两次挂起的情形）；--history-direct-to-kv、每秒按rank记显存；带零依赖挂起诊断；机制与稳定性核对，不是性能结论。
+# 当前任务：迁移历史直接写入KV的GPU小场——standby、4轮A合并/拆回（同heavy），每次合并后75/77秒各1条16384/4096长请求固定到C-g4-tp1，所有迁移强制进A的备用TP2：唤醒后的迁移落到刚醒的TP2上（guard40 standby两次挂起的情形）；--history-direct-to-kv、每秒按rank记显存；带零依赖挂起诊断；机制与稳定性核对，不是性能结论。
 set -uo pipefail
 repo=${REPO:-/root/autodl-tmp/bridgetp/vllm_bridge}
 venv=${VENV:-/root/autodl-tmp/bridgetp/.venv_bridge}
@@ -19,10 +19,10 @@ mkdir -p "$results" || exit 1
 run=$results/qwen3_six_standby_directkv_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 printf '%s\n' "$revision" > "$run/revision.txt"
-printf 'Six-card direct-to-KV migration receive check (11-12: guard40 standby hung twice at the first migration into a just-woken TP2, whose out-of-KV full-history staging buffer of about 1.5 GB per rank no longer fit beside the sleeping residual). Profile migrate: the heavy run (--conversion-engine-reuse standby, four A merge/split rounds, two 14336/8192 longs pinned to A-g1-tp1 before every merge, 14 shorts per second around every merge) plus two 16384/4096 longs pinned to C-g4-tp1 30 and 28 s before every merge (before the short burst, so both admit), whose growth exceeds one TP1 KV, with every migration forced to the standby A TP2, so C migrates into it after each wake. --history-direct-to-kv: received history goes in bounded ring chunks straight into the admitted request KV blocks (no full-history staging); --gpu-memory-log-s 1 writes per-rank allocated/reserved/peaks/device free next to the inventories. A pinned arrival without room now waits and is retried instead of failing the dispatcher (the first 11-12 run of this scene stopped at 122 s with arrival dispatcher failed). Same hang diagnostics. Mechanism and stability check only, no performance claim.\n' > "$run/scope.txt"
+printf 'Six-card direct-to-KV migration receive check (11-12: guard40 standby hung twice at the first migration into a just-woken TP2, whose out-of-KV full-history staging buffer of about 1.5 GB per rank no longer fit beside the sleeping residual). Profile migrate: the heavy run (--conversion-engine-reuse standby, four A merge/split rounds, two 14336/8192 longs pinned to A-g1-tp1 before every merge, 14 shorts per second around every merge) plus two 16384/4096 longs pinned to C-g4-tp1 75 and 77 s after every merge (after the short burst, so both admit), whose growth fills C-g4 about 66 s later, just before the A TP2 serves at about merge + 147 s, with every migration forced to the standby A TP2, so C migrates into it after each wake. --history-direct-to-kv: received history goes in bounded ring chunks straight into the admitted request KV blocks (no full-history staging); --gpu-memory-log-s 1 writes per-rank allocated/reserved/peaks/device free next to the inventories. A pinned arrival without room now waits and is retried instead of failing the dispatcher (the first 11-12 run of this scene stopped at 122 s with arrival dispatcher failed; in the second, bb322e34e, the C longs pinned 30/28 s before each merge finished before the A TP2 woke, so nothing migrated). Same hang diagnostics. Mechanism and stability check only, no performance claim.\n' > "$run/scope.txt"
 echo "本批目录：$run"
 echo '先Linux CPU检查；通过后只跑一场直写KV小场：standby、4轮A合并→拆回（时刻同heavy：110/510/910/1310秒合并，合并后280秒拆回）。'
-echo '每次合并前30/28秒各1条16384/4096长请求固定到C-g4-tp1（短请求高峰前，两条都能准入；增长后超过一个TP1的KV），所有迁移只能进A的备用TP2：它醒来后接C的迁移、A-g1的2条重算和短请求积压。'
+echo '每次合并后75/77秒各1条16384/4096长请求固定到C-g4-tp1（短请求高峰之后，两条都能准入；约66秒后C-g4的KV占满，正好赶上A的TP2在合并后约147秒醒来），所有迁移只能进A的备用TP2：它醒来后接C的迁移、A-g1的2条重算和短请求积压。'
 echo '修复：固定路由的请求暂时放不下时等待重试，不再让到达分发线程失败（上一场在122秒因此中止）。'
 echo '迁移接收走 --history-direct-to-kv（历史分段直接写进已准入请求的KV块，不再申请整段暂存）；每秒按rank记显存到 gpu_memory_*.jsonl。挂起时hang_watch抓线程栈、内核栈和nvidia-smi到hang_diag/。'
 echo '共9个引擎进程，启动约3分钟；场景约29分钟加排空，总计约40–50分钟，加CPU检查和打包。不自动重试。'
