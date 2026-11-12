@@ -46,7 +46,15 @@ def candidates(own=os.getpid(), proc=Path("/proc")):
             continue
         if b"PY_STACK_DUMP_ON_USR1=1" not in environ:
             continue
-        if not cmdline or b"python" not in os.path.basename(cmdline[0]):
+        # vLLM renames EngineCore and TP workers (setproctitle "VLLM::..."),
+        # so the command line no longer names python: check the executable.
+        try:
+            exe = os.path.basename(os.readlink(entry / "exe"))
+        except OSError:
+            exe = ""
+        if "python" not in exe and (
+            not cmdline or b"python" not in os.path.basename(cmdline[0])
+        ):
             continue
         pool = next(
             (

@@ -57,6 +57,17 @@ class HangWatchTests(unittest.TestCase):
             # Same variable but not Python (the sampling shell): never signalled.
             fake_proc(proc, 102, environ=[b"PY_STACK_DUMP_ON_USR1=1"], cmdline=[b"bash"])
             fake_proc(proc, 103, environ=[b"OTHER=1"], cmdline=[b"python3"])
+            # vLLM's renamed TP worker: no python in the title, python exe.
+            fake_proc(
+                proc,
+                104,
+                environ=[b"PY_STACK_DUMP_ON_USR1=1"],
+                cmdline=[b"VLLM::Worker_TP1"],
+            )
+            try:
+                os.symlink("/venv/bin/python3.12", proc / "104" / "exe")
+            except OSError:
+                pass  # Windows without symlink privilege: covered on Linux
             sent = []
             out = hang_watch.capture(
                 Path(folder) / "out",
@@ -66,9 +77,12 @@ class HangWatchTests(unittest.TestCase):
                 proc=proc,
             )
             usr1 = getattr(signal, "SIGUSR1", None)
-            self.assertEqual(sent, [(101, usr1)] if usr1 is not None else [])
+            expected = [101] + ([104] if (proc / "104" / "exe").is_symlink() else [])
+            self.assertEqual(
+                sorted(sent), [(pid, usr1) for pid in expected] if usr1 is not None else []
+            )
             value = json.loads((out / "processes.json").read_text())
-            self.assertEqual([p["pid"] for p in value["processes"]], [101])
+            self.assertEqual(sorted(p["pid"] for p in value["processes"]), expected)
             self.assertEqual(value["processes"][0]["pool"], "A-g6-tp2")
             self.assertIn("nccl wait", value["processes"][0]["kernel_stack"])
             self.assertTrue((out / "nvidia_smi.txt").exists())
