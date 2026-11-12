@@ -70,6 +70,18 @@ from tools.bridge_tp.six_conversion import PATH as SIX_PATH  # noqa: E402
 START_LAYOUT = {name: name.split("-")[0] for name in CONVERSIONS}
 
 
+def set_connector_extra(argv, **values):
+    """Add BridgeTP connector options to a TP2 serving argv (no-op if none)."""
+    if not values:
+        return
+    if "--kv-transfer-config" not in argv:
+        raise ValueError("TP2 serving argv has no BridgeTP connector")
+    index = argv.index("--kv-transfer-config") + 1
+    connector = json.loads(argv[index])
+    connector.setdefault("kv_connector_extra_config", {}).update(values)
+    argv[index] = json.dumps(connector)
+
+
 def adapt_plan(plan, arm, checkpoint, model):
     adjust_migration_plan(plan)
     configure_predictor(plan, checkpoint, model)
@@ -482,6 +494,26 @@ def main(argv=None):
         "under KV pressure; require real commit/release; not a performance trial",
     )
     parser.add_argument(
+        "--history-direct-to-kv",
+        action="store_true",
+        help="TP2 receivers take each migration's history chunk by chunk "
+        "straight into the admitted request's KV blocks (no history-sized "
+        "staging buffer outside the KV pool); needs --expanded-context, whose "
+        "sender packs 16 MiB chunks",
+    )
+    parser.add_argument(
+        "--history-direct-ring-slots",
+        type=int,
+        default=16,
+        help="receive ring slots per TP2 rank with --history-direct-to-kv",
+    )
+    parser.add_argument(
+        "--gpu-memory-log-s",
+        type=float,
+        default=0.0,
+        help="per-rank CUDA memory samples of every TP2 receiver (0: off)",
+    )
+    parser.add_argument(
         "--six-sleep-profile",
         choices=["basic", "stress", "heavy"],
         default="basic",
@@ -543,6 +575,10 @@ def main(argv=None):
             "six-split-probe needs L2C-L1AC, long-burst-pair, trigger 110, "
             "and natural drain without prestart/decider"
         )
+    if args.history_direct_to_kv and not args.expanded_context:
+        parser.error("--history-direct-to-kv needs --expanded-context (chunked sender)")
+    if args.history_direct_ring_slots <= 0 or args.gpu_memory_log_s < 0:
+        parser.error("ring slots must be positive and the memory log interval >= 0")
     if args.six_sleep_profile != "basic" and not args.six_sleep_smoke:
         parser.error("--six-sleep-profile needs --six-sleep-smoke")
     if args.six_sleep_smoke and not (
@@ -1340,6 +1376,25 @@ def main(argv=None):
             if args.tp2_max_num_seqs != 16:
                 # Every TP2 engine starts from target_argv, extra ones included.
                 set_max_num_seqs(plan["target_argv"], args.tp2_max_num_seqs)
+            # Before six.configure: every TP2 receiver copies target_argv.
+            set_connector_extra(
+                plan["target_argv"],
+                **(
+                    dict(
+                        bridgetp_history_direct_to_kv=True,
+                        bridgetp_history_direct_ring_slots=(
+                            args.history_direct_ring_slots
+                        ),
+                    )
+                    if args.history_direct_to_kv
+                    else {}
+                ),
+                **(
+                    dict(bridgetp_gpu_memory_log_s=args.gpu_memory_log_s)
+                    if args.gpu_memory_log_s
+                    else {}
+                ),
+            )
             plan["tp2_max_num_seqs"] = args.tp2_max_num_seqs
             if args.cards == 6:
                 six.configure(plan)

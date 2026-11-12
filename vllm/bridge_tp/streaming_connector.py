@@ -454,6 +454,13 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         )
         if self.history_direct_ring_slots <= 0:
             raise ValueError("bridgetp_history_direct_ring_slots must be positive")
+        # Per-rank CUDA memory samples (gpu_memory_log.py); 0 disables.
+        self.gpu_memory_log_s = float(
+            self._kv_transfer_config.get_from_extra_config(
+                "bridgetp_gpu_memory_log_s", 0
+            )
+        )
+        self._gpu_memory_log = None
         if self.persistent_channel:
             # Keep the lexical active-session path.  resolve() would pin the
             # connector to the first symlink target and make later sessions
@@ -1002,6 +1009,7 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
         self._service_gpu_restore_quiescence()
         # Direct-to-KV history: this worker thread is the only KV writer.
         self._service_direct_history()
+        self._sample_gpu_memory()
         # This hook runs outside the compiled/CUDA-graph model body on every
         # model execution.  Arm the dependency here rather than relying only
         # on wait_for_layer_load(): decode CUDA-graph replay does not re-enter
@@ -2042,7 +2050,48 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             if request.target_request_id in self._direct_history_jobs:
                 raise RuntimeError("direct history is already being written")
             self._direct_history_jobs[request.target_request_id] = job
+        self._sample_gpu_memory(
+            "direct_history_begin",
+            migration_id=request.migration_id,
+            history_bytes=layout.total_elements * ring.buffers[0].element_size(),
+            ring_bytes=sum(b.numel() * b.element_size() for b in ring.buffers),
+        )
         return ring
+
+    def _sample_gpu_memory(self, event: str | None = None, **extra: Any) -> None:
+        """Worker: periodic (``event`` None) or milestone memory sample."""
+        if getattr(self, "gpu_memory_log_s", 0) <= 0:
+            return
+        try:
+            log = self._gpu_memory_log
+            if log is None:
+                if not self._registered_kv_caches:
+                    return
+                device = next(iter(self._registered_kv_caches.values())).device
+                if device.type != "cuda":
+                    return
+                from vllm.bridge_tp.gpu_memory_log import GpuMemoryLog
+
+                pool = os.environ.get("BRIDGETP_PRESSURE_POOL") or "target"
+                inventory = os.environ.get("BRIDGETP_PRESSURE_INVENTORY_PATH")
+                folder = (
+                    Path(inventory).parent if inventory else self.manifest_path.parent
+                )
+                rank = get_tp_group().rank_in_group
+                log = self._gpu_memory_log = GpuMemoryLog(
+                    folder / f"gpu_memory_{_safe_name(pool)}_tp{rank}.jsonl",
+                    interval_s=self.gpu_memory_log_s,
+                    device=device,
+                    pool=pool,
+                    tp_rank=rank,
+                )
+            if event is None:
+                log.maybe_sample()
+            else:
+                log.sample(event, **extra)
+        except Exception:  # diagnostics must never fail serving
+            logger.exception("BridgeTP GPU memory sample failed")
+            self.gpu_memory_log_s = 0
 
     def _claim_deferred_history(self, migration_id: str) -> None:
         """Live load owns a history prebind deferred; refuse a discarded one."""
@@ -2202,6 +2251,9 @@ class BridgeTPStreamingConnector(KVConnectorBase_V1):
             if job.final_event is not None:
                 job.final_event.synchronize()
             mismatches = int(job.mismatches.item())
+            self._sample_gpu_memory(
+                "direct_history_done", chunks=job.chunks, mismatches=mismatches
+            )
             if mismatches:
                 raise ValueError(
                     f"direct history readback differs in {mismatches} elements"
