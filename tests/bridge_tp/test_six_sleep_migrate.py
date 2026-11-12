@@ -54,7 +54,9 @@ class WorkloadTests(unittest.TestCase):
         merges = [at for mode, at in smoke.HEAVY_SEQUENCE if mode == "TP2"]
         for k, merge in enumerate(merges):
             mine = [j for j in jobs if j["workload_phase"] == f"migrate_{k}"]
-            self.assertEqual(sorted(j["at_s"] for j in mine), [merge + 10, merge + 12])
+            self.assertEqual(sorted(j["at_s"] for j in mine), [merge - 30, merge - 28])
+            # Before the short burst, so C-g4 still has room for both prompts.
+            self.assertTrue(all(j["at_s"] < merge - 5 for j in mine))
             self.assertTrue(all(j["route"] == smoke.MIGRATE_SOURCE_POOL for j in mine))
             # Together beyond one TP1's KV (37,488 tokens): C must migrate.
             self.assertGreater(
@@ -114,7 +116,7 @@ def add_migration(trial, *, state="COMMITTED", path="DIRECT_TO_KV", memory=True)
     rows = json.loads(rows_path.read_text())
     for row in rows:
         row["job_id"] = f"{smoke.MIGRATE_PROFILE}-{row['job_id']}"
-    rows.append(dict(job_id=f"{smoke.MIGRATE_PROFILE}-c0-120",
+    rows.append(dict(job_id=f"{smoke.MIGRATE_PROFILE}-c0-80",
                      request=dict(max_tokens=1),
                      response=dict(emitted=[{}], handoff_stall_s=0.25),
                      source_error=None, recompute=None))

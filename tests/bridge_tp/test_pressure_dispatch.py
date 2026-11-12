@@ -313,6 +313,36 @@ class HoldQueueTests(unittest.TestCase):
         self.assertEqual(sent, ["fixed"])
         self.assertFalse(dispatcher.thread.is_alive())
 
+    def test_a_fixed_route_without_room_waits_in_order_instead_of_failing(self):
+        # 11-12 directkv: AdmissionDeferred on a pinned arrival killed the
+        # dispatcher ("arrival dispatcher failed").
+        attempts, sent = [], []
+        jobs = [
+            dict(hold_job("long"), route="tp1"),
+            dict(hold_job("next", at_s=0.01), route="tp1"),
+        ]
+
+        def submit(job, pools):
+            attempts.append(job["id"])
+            if attempts.count("long") < 3:
+                raise d.AdmissionDeferred({"tp1": {}})
+            sent.append(job["id"])
+            return stream("tp1")
+
+        hold = self.queue(limit=1, active=lambda _: False)
+        hold.poll_s = 0.01
+        dispatcher = d.ScheduledDispatch(
+            jobs, submit, [], time.monotonic(), 5.0, hold=hold
+        )
+        dispatcher.start()
+        dispatcher.thread.join(2)
+        self.assertFalse(dispatcher.thread.is_alive())
+        self.assertEqual(sorted(dispatcher.snapshot()), ["long", "next"])
+        self.assertEqual(sent, ["long", "next"])
+        # "next" is never tried before the earlier pinned arrival went out.
+        self.assertLess(attempts.index("long"), attempts.index("next"))
+        self.assertEqual(attempts.count("next"), 1)
+
 
 class DispatchTests(unittest.TestCase):
     def test_final_capacity_refusal_returns_to_hold_without_losing_arrival(self):

@@ -89,6 +89,11 @@ class ScheduledDispatch:
     def _run_held(self):
         """Arrivals join the hold queue on time and leave when a pool has room."""
         hold, index = self.hold, 0
+        # Fixed-route arrivals skip the hold queue; one that does not fit yet
+        # (AdmissionDeferred) waits here, in arrival order, and is retried on
+        # every poll before the held arrivals (11-12 directkv run: the second
+        # pinned C long request crashed the dispatcher instead of waiting).
+        pinned = []
         while not self.stop.is_set():
             now = time.monotonic()
             if now >= self.deadline:
@@ -100,11 +105,22 @@ class ScheduledDispatch:
                     break
                 index += 1
                 if job.get("route") is not None:
-                    with self.lock:
-                        pools = self.pools
-                    self._send(job, pools)
+                    pinned.append(job)
                 else:
                     hold.add(job, due)
+            if pinned:
+                with self.lock:
+                    pools = self.pools
+                waiting = []
+                for job in pinned:
+                    if waiting:  # keep the arrival order per fixed route
+                        waiting.append(job)
+                        continue
+                    try:
+                        self._send(job, pools)
+                    except AdmissionDeferred:
+                        waiting.append(job)
+                pinned = waiting
             self._publish_held_demand()
             with self.lock:
                 pools = self.pools
@@ -126,7 +142,7 @@ class ScheduledDispatch:
             for job, released_at in deferred:
                 hold.retry(job, released_at)
             self._publish_held_demand()
-            if index == len(self.jobs) and not hold.waiting():
+            if index == len(self.jobs) and not hold.waiting() and not pinned:
                 return
             wait = hold.poll_s
             if index < len(self.jobs):

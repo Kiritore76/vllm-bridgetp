@@ -74,8 +74,8 @@ HEAVY_HORIZON_S = HEAVY_SEQUENCE[-1][1] + 120.0
 HEAVY_PINNED_POOL = "A-g1-tp1"
 HEAVY_BURST_RATE = 14  # short requests per second around every merge
 # Profile "migrate" (11-12: guard40 standby hung at the first migration into a
-# just-woken TP2): heavy, plus two long requests pinned to C-g4-tp1 after
-# every merge closes A, and every migration forced to A's standby TP2. While
+# just-woken TP2): heavy, plus two long requests pinned to C-g4-tp1 before
+# every merge, and every migration forced to A's standby TP2. While
 # it sleeps nothing migrates; the moment it wakes it is the only target, so
 # C's pressure migrates into it during its first seconds of service, beside
 # the recomputes and the short backlog (the guard40 situation).
@@ -234,7 +234,9 @@ def migrate_recipe(inputs):
     jobs = [dict(j, id=j["id"].replace(HEAVY_PROFILE, MIGRATE_PROFILE)) for j in base["jobs"]]
     merges = [at for mode, at in HEAVY_SEQUENCE if mode == "TP2"]
     for k, merge in enumerate(merges):
-        for at in (merge + 10.0, merge + 12.0):
+        # Before the burst (merge - 5 s) C-g4 is nearly empty, so both admit;
+        # their growth then overflows its KV around the time A's TP2 wakes.
+        for at in (merge - 30.0, merge - 28.0):
             jobs.append(
                 dict(
                     id=f"{MIGRATE_PROFILE}-c{k}-{int(at)}",
@@ -253,8 +255,8 @@ def migrate_recipe(inputs):
         jobs=jobs,
         input_sha256=matched.digest(jobs),
         planned_output_tokens=sum(j["request"]["max_tokens"] for j in jobs),
-        routing_scope="heavy plus two long requests pinned to C-g4-tp1 after each "
-        "merge; every migration forced to A's standby TP2 (first migration "
+        routing_scope="heavy plus two long requests pinned to C-g4-tp1 30/28 s "
+        "before each merge; every migration forced to A's standby TP2 (first migration "
         "into a just-woken TP2); hang/direct-to-KV check, no performance claim",
     )
 
