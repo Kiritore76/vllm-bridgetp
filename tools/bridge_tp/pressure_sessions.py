@@ -9,6 +9,16 @@ import sys
 import time
 from pathlib import Path
 
+def _channel_generation(session):
+    """The channel incarnation a session's sender used, or None if unknown."""
+    from tools.bridge_tp.pressure_session import sender_receipt_paths
+
+    try:
+        path = sender_receipt_paths(session.run_dir)[0]
+        return json.loads(Path(path).read_text()).get("channel_generation")
+    except (OSError, ValueError, IndexError, AttributeError):
+        return None
+
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -132,16 +142,21 @@ class PressureSessions:
         if not all(path.is_file() for path in paths):
             return False
         rows = [json.loads(path.read_text()) for path in paths]
+        sender_rows, rest = rows[: len(senders)], rows[len(senders) :]
+        sender = sender_rows[0]
         # Each TP1 source has its own persistent channel (S1-d2): its receipts
-        # count that channel's sessions, not every session of the run.
+        # count that channel's sessions, not every session of the run. Engine
+        # reuse keeps the target's instance id across sleep/wake, but the wake
+        # builds a new channel (new channel_generation, counts restart): count
+        # only this incarnation's sessions (11-12 directkv run 4).
         source = self._channel_key(self.sessions[-1])
+        generation = sender.get("channel_generation")
         channel_sessions = sum(
             self._channel_key(s) == source
+            and (generation is None or _channel_generation(s) == generation)
             for s in self.sessions
             if s.record is not None
         )
-        sender_rows, rest = rows[: len(senders)], rows[len(senders) :]
-        sender = sender_rows[0]
         count = load("tp_geometry").session_target_tp(self.run_dir)
         targets, finalized, stager = rest[:count], rest[count], rest[count + 1]
         if (
@@ -155,6 +170,7 @@ class PressureSessions:
                 row.get("channel_create_count") != 1
                 or row.get("channel_destroy_count") != 0
                 or row.get("channel_session_count") != channel_sessions
+                or row.get("channel_generation") != generation
                 for row in [*sender_rows, *targets]
             )
             or any(
@@ -553,3 +569,4 @@ def follow_stager(argv, run=None):
 
 if __name__ == "__main__":
     follow_stager(sys.argv[1:])
+

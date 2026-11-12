@@ -140,8 +140,16 @@ class RepeatedSessions(unittest.TestCase):
         self.sequence.close()
         self.assertTrue(all(s.adapter.close.called for s in self.sequence.sessions))
 
-    def channel_receipts(self, migration_id, request_id, sessions):
+    def channel_receipts(
+        self, migration_id, request_id, sessions, generation=None, target_generation=None
+    ):
         """Receipts of one source channel that has served ``sessions`` sessions."""
+        tag = {} if generation is None else dict(channel_generation=generation)
+        target_tag = (
+            tag
+            if target_generation is None
+            else dict(channel_generation=target_generation)
+        )
         self.write(
             "gpu_direct_sender.json",
             dict(
@@ -151,6 +159,7 @@ class RepeatedSessions(unittest.TestCase):
                 channel_create_count=1,
                 channel_destroy_count=0,
                 channel_session_count=sessions,
+                **tag,
             ),
         )
         for rank in range(4):
@@ -164,6 +173,7 @@ class RepeatedSessions(unittest.TestCase):
                     channel_create_count=1,
                     channel_destroy_count=0,
                     channel_session_count=sessions,
+                    **target_tag,
                 ),
             )
         self.write("rolling_target_finalized.json", dict(migration_id=migration_id))
@@ -201,6 +211,33 @@ class RepeatedSessions(unittest.TestCase):
         self.assertEqual(self.sequence.migration_id, "run-0004")
         for policy in policies.values():
             self.assertEqual(policy.note_started.call_count, 3)
+
+    def test_a_woken_target_counts_only_its_new_channel(self):
+        """11-12 directkv run 4: engine reuse keeps the target's instance id
+        across sleep/wake, but the wake builds a new channel (new
+        channel_generation) whose session count restarts at 1."""
+        self.co._policies = {"tp1": NS(note_started=Mock())}
+        self.sequence.sessions[0].source_instance = "tp1"
+        with patch("tools.bridge_tp.pressure_sessions.publish_active"):
+            self.assertTrue(self.sequence.rotate())
+            # Same source and target id, after the target slept and woke.
+            self.settle_current("tp1", "source-b")
+            self.channel_receipts("run-0002", "source-b", 2, generation=1009)
+            with self.assertRaisesRegex(ValueError, "receipts disagree"):
+                self.sequence.rotate()  # the old cumulative count is wrong now
+            # Sender and target from different channels never agree.
+            self.channel_receipts(
+                "run-0002", "source-b", 1, generation=1009, target_generation=1005
+            )
+            with self.assertRaisesRegex(ValueError, "receipts disagree"):
+                self.sequence.rotate()
+            self.channel_receipts("run-0002", "source-b", 1, generation=1009)
+            self.assertTrue(self.sequence.rotate())
+            # A second session on that same new channel counts both.
+            self.settle_current("tp1", "source-c")
+            self.channel_receipts("run-0003", "source-c", 2, generation=1009)
+            self.assertTrue(self.sequence.rotate())
+        self.assertEqual(self.sequence.migration_id, "run-0004")
 
     def test_a_request_that_ended_right_after_takeover_still_rotates(self):
         """GPU 11-05: never sampled with output, so no later migration ran."""
