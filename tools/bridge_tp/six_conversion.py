@@ -407,6 +407,16 @@ def cleanup(plan, write):
     from tools.bridge_tp.migration_receivers import cleanup_links
 
     cleanup_links(plan, write)
+    # A standby TP1 that never woke is not in source_links; its entry link
+    # must go too (the evidence archive refuses unresolved symlinks).
+    for extra in plan.get("standby_engines", ()):
+        if extra["tp"] != 1:
+            continue
+        link = Path(extra["source_active"])
+        if link.parent != Path(plan["run_dir"]) / "source_active":
+            raise ValueError("standby source cleanup escaped owned directory")
+        if link.is_symlink():
+            link.unlink()
     active = Path(plan["run_dir"]) / "migration/parked/migration_active"
     if active.is_symlink():
         write(

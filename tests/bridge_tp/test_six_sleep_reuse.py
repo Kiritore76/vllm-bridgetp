@@ -436,6 +436,47 @@ class SleepReuseTests(unittest.TestCase):
                 )
                 self.assertEqual(pc.read_json(path), [])
 
+    def test_standby_cleanup_leaves_no_symlink(self):
+        # GPU 11-12: B's standby TP1 links (never woken) broke the archive.
+        with tempfile.TemporaryDirectory() as probe:
+            try:
+                (Path(probe) / "link").symlink_to(
+                    Path(probe) / "target", target_is_directory=True
+                )
+            except OSError as error:
+                if getattr(error, "winerror", None) == 1314:
+                    self.skipTest("Windows symlink privilege unavailable; Linux required")
+                raise
+        with tempfile.TemporaryDirectory() as folder:
+            plan = reuse_plan(Path(folder), "L1AC", "standby")
+            plan["run_dir"].mkdir(parents=True)
+            six.initialize(plan)
+            for e in plan["standby_engines"]:
+                if e["tp"] == 1:
+                    self.assertTrue(Path(e["source_active"]).is_symlink())
+            six.cleanup(plan, pc.atomic_json)
+            self.assertFalse(any(p.is_symlink() for p in plan["run_dir"].rglob("*")))
+
+    def test_standby_cleanup_removes_unwoken_source_links(self):
+        # Platform-independent: the cleanup selects every standby TP1 link.
+        with tempfile.TemporaryDirectory() as folder:
+            plan = reuse_plan(Path(folder), "L1AC", "standby")
+            removed = []
+            with (
+                patch("tools.bridge_tp.migration_receivers.cleanup_links"),
+                patch.object(Path, "is_symlink", lambda self: True),
+                patch.object(Path, "unlink", lambda self: removed.append(self)),
+                patch.object(Path, "resolve", lambda self: self),
+            ):
+                six.cleanup(plan, lambda *a: None)
+            wanted = {
+                Path(e["source_active"])
+                for e in plan["standby_engines"]
+                if e["tp"] == 1
+            }
+            self.assertEqual(len(wanted), 2)
+            self.assertTrue(wanted <= set(removed))
+
     def test_standby_wakes_every_form_without_cold_start(self):
         with tempfile.TemporaryDirectory() as folder:
             h = Harness(self, Path(folder), "L1AC", mode="standby")
