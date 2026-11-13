@@ -20,9 +20,21 @@ mkdir -p "$out" || exit 1
 samples="$out/cpu_gate_samples.txt"
 : > "$samples"
 
+cgroup_cpu() {
+    # The container's own CPU quota and pressure (cgroup v2), next to the
+    # host-wide /proc view: on a shared host /proc/pressure/cpu also counts
+    # other tenants (11-13: PSI 30% with no busy process in this container).
+    local g=/sys/fs/cgroup
+    local quota=? pressure=?
+    [ -r "$g/cpu.max" ] && quota=$(tr ' ' '/' < "$g/cpu.max")
+    [ -r "$g/cpu.pressure" ] && pressure=$(awk '/^some/ {print $2}' "$g/cpu.pressure")
+    printf 'cgroup_cpu_max=%s cgroup_pressure_some=%s' "$quota" "$pressure"
+}
+
 snapshot() {
     {
-        echo "# $(date '+%F %T') nproc=$(nproc 2>/dev/null || echo ?) loadavg=$(cat /proc/loadavg 2>/dev/null)"
+        # nproc honours OMP_NUM_THREADS (=1 in server_run): count all CPUs.
+        echo "# $(date '+%F %T') cpus_online=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc --all 2>/dev/null || echo ?) nproc_all=$(nproc --all 2>/dev/null || echo ?) $(cgroup_cpu) loadavg=$(cat /proc/loadavg 2>/dev/null)"
         ps aux --sort=-%cpu 2>/dev/null | head -n 40 || ps aux 2>/dev/null | head -n 40
     } > "$out/cpu_gate_processes.txt" 2>&1
 }
@@ -43,8 +55,8 @@ passes=0
 while true; do
     avg10=$(awk '/^some/ {for (i = 1; i <= NF; i++) if ($i ~ /^avg10=/) {sub("avg10=", "", $i); print $i}}' "$psi_file")
     now=$(date +%s)
-    printf '%s psi_some_avg10=%s loadavg=%s procs_running=%s\n' \
-        "$now" "${avg10:-?}" "$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)" "$(running)" >> "$samples"
+    printf '%s psi_some_avg10=%s loadavg=%s procs_running=%s %s\n' \
+        "$now" "${avg10:-?}" "$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)" "$(running)" "$(cgroup_cpu)" >> "$samples"
     if [ -n "$avg10" ] && awk -v v="$avg10" -v m="$max" 'BEGIN {exit !(v < m)}'; then
         passes=$((passes + 1))
     else
@@ -60,6 +72,7 @@ while true; do
         snapshot
         printf 'FAIL psi_some_avg10=%s max=%s waited_s=%s\n' "$avg10" "$max" "$((now - start))" > "$out/cpu_gate.txt"
         echo "CPU空闲检查未通过：等了$((now - start))秒，CPU压力 avg10 仍为 ${avg10}%（阈值 ${max}%）。主机上有实验之外的CPU负载，停止，不启动GPU。"
+        echo '注意：/proc/pressure/cpu是整台物理机的压力；若下面的进程都不忙，负载来自同一物理机上的其他容器。可以稍后重跑，或用 CPU_IDLE_WAIT_S=1800 等更久。'
         echo '占用CPU最多的进程（完整列表见 cpu_gate_processes.txt）：'
         head -n 16 "$out/cpu_gate_processes.txt"
         exit 1
