@@ -25,6 +25,7 @@ echo '先Linux CPU检查；通过后只跑一场同输入2400秒自动场：参�
 echo '本场是11-13直写大场的重跑：上一场没有挂起、7次迁移都走直写，但短峰KEEP覆盖项无法判定（sleep mode下KV块数为2343/11747，预算标定要求2325/11712完全相等）；现已允许多出2%以内的块数，决策规则不变。'
 echo '与上一场guard40 standby的区别：迁移历史分段直接写进目标请求的KV块，不再申请整段暂存（上两场在首个迁移进唤醒TP2时挂起）；另含直写小场验证过的修复：固定路由等待、直写准入门槛、迁移源不被抢占、按通道代次轮换。'
 echo '带挂起诊断：若某引擎60秒不返回，hang_watch抓各进程线程栈、内核栈和nvidia-smi到hang_diag/。9个引擎，启动多约1分钟，主机pinned内存约214GiB。'
+echo 'GPU启动前先做CPU空闲检查：CPU压力（PSI some avg10）须连续两次低于5%，最多等180秒；不通过就停止并打包cpu_gate/（含占用CPU最多的进程）。上一场重跑开始前PSI已有25%，性能因此不可用。'
 echo '40分钟到达；含CPU/启动/预热/排空/打包，预计55–70分钟，慢机器或积压可能更久。'
 smi=
 pack_result() {
@@ -104,6 +105,8 @@ fi
 [ "$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)" = 6 ] || { echo '需要六卡。'; pack_result 1; exit 1; }
 [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] || { echo 'GPU忙，未清理其他进程。'; pack_result 1; exit 1; }
 "$py" -m compileall -q -j 4 "$repo/vllm" "$repo/tools" > "$run/compileall.log" 2>&1 || { tail -n 30 "$run/compileall.log"; pack_result 1; exit 1; }
+# Host CPU must be free of outside work (11-13 rerun: PSI 25% before start).
+bash tools/bridge_tp/cpu_idle_gate.sh "$run/cpu_gate" || { pack_result 1; exit 1; }
 free -g > "$run/free_before.txt" 2>&1
 nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,pcie.link.gen.current,pcie.link.width.current --format=csv,noheader > "$run/gpu_before.csv" || { pack_result 1; exit 1; }
 # GPU memory (sleep residuals) and host MemAvailable every second.
