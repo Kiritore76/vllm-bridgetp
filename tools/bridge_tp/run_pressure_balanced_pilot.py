@@ -1068,6 +1068,11 @@ def _run(args, prepared):
     )
     dispatched, previous = {}, {}
     growth_readers = {pool: health.NativeDecodeGrowth() for pool in tp_of}
+    # Short full GCs (11-13): freeze the setup heap before the workload clock
+    # starts, so the full collection never delays an arrival; later objects
+    # are frozen periodically in the loop.
+    gc_freezer = load("gc_freeze").GcFreezer.from_env(record=audit.write)
+    gc_freezer.start()
     started = time.monotonic()
     origin_unix_s = time.time()
     health_tracker = (
@@ -1782,6 +1787,7 @@ def _run(args, prepared):
                 background_metrics.append(slot["metrics"])
         while time.monotonic() - started < args.max_seconds:
             load("pause_diagnostics").tick()
+            gc_freezer.tick()
             apply_layout_control()
             dispatched = dispatcher.snapshot()
             tracker.update(dispatched, session)
@@ -2643,6 +2649,9 @@ def _run(args, prepared):
         failure = repr(error)
         raise
     finally:
+        if gc_freezer is not None:
+            # In-process callers (tests) get their collector state back.
+            gc_freezer.close()
         dispatch_stop_error = None
         if dispatcher is not None:
             try:

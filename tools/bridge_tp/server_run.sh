@@ -25,7 +25,9 @@ echo '先Linux CPU检查；通过后只跑一场同输入2400秒自动场：参�
 echo '本场是11-13直写大场的重跑：上一场没有挂起、7次迁移都走直写，但短峰KEEP覆盖项无法判定（sleep mode下KV块数为2343/11747，预算标定要求2325/11712完全相等）；现已允许多出2%以内的块数，决策规则不变。'
 echo '与上一场guard40 standby的区别：迁移历史分段直接写进目标请求的KV块，不再申请整段暂存（上两场在首个迁移进唤醒TP2时挂起）；另含直写小场验证过的修复：固定路由等待、直写准入门槛、迁移源不被抢占、按通道代次轮换。'
 echo '带挂起诊断：若某引擎60秒不返回，hang_watch抓各进程线程栈、内核栈和nvidia-smi到hang_diag/。9个引擎，启动多约1分钟，主机pinned内存约214GiB。'
+echo '控制器启动后与每30秒调用gc.freeze()：上几场所有超过0.5秒的准入等待都与控制器的Python完整垃圾回收（0.4–1.1秒）重叠，冻结后完整回收只扫描新对象。'
 echo '引擎库存快照已精简：不再发布逐块列表（读取端从未使用），只保留块数；满载TP2每次快照省约2.9ms（构建与JSON编码），每行由约292KiB降到约5KiB。'
+echo 'CPU检查改为冒烟列表（17个模块，约200项，本地约20秒）：Linux环境依赖和本场关键路径；完整测试在本地开发时按需跑。'
 echo 'GPU启动前先做CPU空闲检查：CPU压力（PSI some avg10）须连续两次低于5%，最多等180秒；不通过就停止并打包cpu_gate/（含占用CPU最多的进程）。上一场重跑开始前PSI已有25%，性能因此不可用。'
 echo '40分钟到达；含CPU/启动/预热/排空/打包，预计55–70分钟，慢机器或积压可能更久。'
 smi=
@@ -58,42 +60,15 @@ printf '%s\n' "$task_tmp" > "$run/temporary_directory.txt"
 export TMPDIR="$task_tmp" TEMP="$task_tmp" TMP="$task_tmp"
 "$py" -B -c 'import json,sys,types,unittest; from pathlib import Path; p=types.ModuleType("vllm"); p.__path__=[str(Path.cwd()/"vllm")]; sys.modules["vllm"]=p; s=unittest.defaultTestLoader.loadTestsFromNames(sys.argv[2:]); r=unittest.TextTestRunner(verbosity=2).run(s); ok=r.wasSuccessful() and not r.skipped; Path(sys.argv[1]).write_text(json.dumps(dict(scope="CPU only; no CUDA/NCCL", tests=r.testsRun, passed=ok, failures=[t.id() for t,_ in r.failures], errors=[t.id() for t,_ in r.errors], skipped=[t.id() for t,_ in r.skipped]),indent=2)+"\n"); raise SystemExit(not ok)' \
     "$run/cpu_summary.json" \
-    tests.bridge_tp.test_six_sleep_reuse tests.bridge_tp.test_six_sleep_smoke \
-    tests.bridge_tp.test_six_standby_launch \
-    tests.bridge_tp.test_hang_diagnostics tests.bridge_tp.test_six_sleep_migrate \
-    tests.bridge_tp.test_direct_history tests.bridge_tp.test_direct_receive \
-    tests.bridge_tp.test_direct_connector tests.bridge_tp.test_direct_prebind \
-    tests.bridge_tp.test_direct_config tests.bridge_tp.test_pressure_dispatch \
+    tests.bridge_tp.test_hang_diagnostics tests.bridge_tp.test_phase9_online_integration \
+    tests.bridge_tp.test_tcp_ports tests.bridge_tp.test_direct_history \
+    tests.bridge_tp.test_direct_receive tests.bridge_tp.test_direct_connector \
+    tests.bridge_tp.test_direct_prebind tests.bridge_tp.test_direct_config \
     tests.bridge_tp.test_direct_admission_gate tests.bridge_tp.test_source_preemption \
-    tests.bridge_tp.test_phase9_online_integration tests.bridge_tp.test_pressure_observation \
-    tests.bridge_tp.test_tp2_reconfiguration tests.bridge_tp.test_pressure_multi \
-    tests.bridge_tp.test_drain_recompute tests.bridge_tp.test_pressure_ingress \
-    tests.bridge_tp.test_six_conversion tests.bridge_tp.test_conversion_channels \
-    tests.bridge_tp.test_multi_target tests.bridge_tp.test_pressure_sessions \
-    tests.bridge_tp.test_migration_receivers tests.bridge_tp.test_six_card_gate \
-    tests.bridge_tp.test_six_card_decider tests.bridge_tp.test_conversion_decider \
-    tests.bridge_tp.test_six_conversion_budget tests.bridge_tp.test_six_gap_rules \
-    tests.bridge_tp.test_conversion_sequence tests.bridge_tp.test_conversion_safety \
-    tests.bridge_tp.test_conversion_planner tests.bridge_tp.test_unified_scheduler \
-    tests.bridge_tp.test_pressure_conversion tests.bridge_tp.test_pressure_sustained \
-    tests.bridge_tp.test_drain_freshness \
-    tests.bridge_tp.test_runtime_instance_ids \
-    tests.bridge_tp.test_migration_plan tests.bridge_tp.test_qwen3_six_card \
-    tests.bridge_tp.test_pressure_launcher \
-    tests.bridge_tp.test_source_channels tests.bridge_tp.test_channel_runtime \
-    tests.bridge_tp.test_tcp_ports tests.bridge_tp.test_gpu_direct_history_lifecycle \
-    tests.bridge_tp.test_six_split_probe \
-    tests.bridge_tp.test_pressure_cancel tests.bridge_tp.test_unified_cancel \
-    tests.bridge_tp.test_six_edge_batch tests.bridge_tp.test_six_single_class \
-    tests.bridge_tp.test_first_target_startup tests.bridge_tp.test_gpu_direct_targets \
-    tests.bridge_tp.test_six_rotation tests.bridge_tp.test_six_simple \
-    tests.bridge_tp.test_six_return \
-    tests.bridge_tp.test_six_guard \
-    tests.bridge_tp.test_pressure_result_export tests.bridge_tp.test_six_auto \
-    tests.bridge_tp.test_six_assist tests.bridge_tp.test_six_auto_smoke \
-    tests.bridge_tp.test_six_current_assist_smoke \
-    tests.bridge_tp.test_pressure_pause_diagnostics \
-    tests.bridge_tp.test_pressure_inventory_process.InventoryProcessTests.test_gc_callback_records_outside_collection_and_restores_callbacks \
+    tests.bridge_tp.test_pressure_sessions tests.bridge_tp.test_six_sleep_reuse \
+    tests.bridge_tp.test_six_standby_launch tests.bridge_tp.test_six_conversion_budget \
+    tests.bridge_tp.test_pressure_observation tests.bridge_tp.test_pressure_dispatch \
+    tests.bridge_tp.test_controller_gc_freeze \
     > "$run/cpu_checks.log" 2>&1
 status=$?
 tail -n 12 "$run/cpu_checks.log"
