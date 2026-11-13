@@ -52,34 +52,48 @@ class GcFreezer:
     def enabled(self) -> bool:
         return self.interval_s > 0
 
-    def _freeze(self, reason: str, generation: int) -> None:
+    def _freeze(self, reason: str, generation: int, count_frozen: bool) -> None:
+        # gc.get_freeze_count() walks the whole permanent generation: about
+        # 6 ms per million objects here and 0.2-0.4 s per periodic freeze on
+        # the server (R5, 1M frozen); only the start/close records count it.
+        young = list(self.gc.get_count())
         started = time.perf_counter()
         collected = self.gc.collect(generation)
-        frozen_before = self.gc.get_freeze_count()
         self.gc.freeze()
+        duration = time.perf_counter() - started
         self.freezes += 1
         self.last = self.clock()
         if self.record is not None:
-            self.record(
-                dict(
-                    kind="controller_gc_freeze",
-                    reason=reason,
-                    collected=collected,
-                    newly_frozen=self.gc.get_freeze_count() - frozen_before,
-                    frozen_total=self.gc.get_freeze_count(),
-                    duration_s=time.perf_counter() - started,
-                    unix_s=time.time(),
-                )
+            row = dict(
+                kind="controller_gc_freeze",
+                reason=reason,
+                collected=collected,
+                young_counts=young,
+                duration_s=duration,
+                unix_s=time.time(),
             )
+            if count_frozen:
+                row["frozen_total"] = self.gc.get_freeze_count()
+            self.record(row)
 
     def start(self) -> None:
-        """After setup, before arrivals: one full collection, then freeze."""
+        """Before the workload clock: one full collection, then freeze."""
         if self.enabled:
-            self._freeze("start", 2)
+            self._freeze("start", 2, count_frozen=True)
 
     def close(self) -> None:
         """Unfreeze when the controller loop ends (in-process callers)."""
         if self.freezes:
+            if self.record is not None:
+                self.record(
+                    dict(
+                        kind="controller_gc_freeze",
+                        reason="close",
+                        freezes=self.freezes,
+                        frozen_total=self.gc.get_freeze_count(),
+                        unix_s=time.time(),
+                    )
+                )
             self.gc.unfreeze()
             self.freezes = 0
             self.last = None
@@ -89,4 +103,4 @@ class GcFreezer:
         if not self.enabled or self.last is None:
             return
         if self.clock() - self.last >= self.interval_s:
-            self._freeze("periodic", 1)
+            self._freeze("periodic", 1, count_frozen=False)

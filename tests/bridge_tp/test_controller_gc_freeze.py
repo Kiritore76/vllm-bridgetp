@@ -31,7 +31,11 @@ class FakeGc:
         self.frozen += 100
 
     def get_freeze_count(self):
+        self.calls.append(("get_freeze_count",))
         return self.frozen
+
+    def get_count(self):
+        return (5, 2, 1)
 
     def unfreeze(self):
         self.calls.append(("unfreeze",))
@@ -54,10 +58,13 @@ class FreezerTests(unittest.TestCase):
         f.tick()  # before start: nothing
         self.assertEqual(self.gc.calls, [])
         f.start()
-        self.assertEqual(self.gc.calls, [("collect", 2), ("freeze",)])
+        self.assertEqual(
+            self.gc.calls, [("collect", 2), ("freeze",), ("get_freeze_count",)]
+        )
         row = self.rows[0]
         self.assertEqual((row["kind"], row["reason"]), ("controller_gc_freeze", "start"))
-        self.assertEqual((row["collected"], row["newly_frozen"], row["frozen_total"]), (3, 100, 100))
+        self.assertEqual((row["collected"], row["frozen_total"]), (3, 100))
+        self.assertEqual(row["young_counts"], [5, 2, 1])
         self.assertGreaterEqual(row["duration_s"], 0)
 
     def test_periodic_freeze_uses_a_young_collection_once_per_interval(self):
@@ -76,13 +83,26 @@ class FreezerTests(unittest.TestCase):
         self.assertEqual([r["reason"] for r in self.rows], ["start", "periodic"])
         self.assertEqual(f.freezes, 2)
 
+    def test_periodic_freezes_never_walk_the_permanent_generation(self):
+        """R5: get_freeze_count() walks every frozen object (0.2-0.4 s per
+        periodic freeze on the server at 1M objects)."""
+        f = self.freezer(30)
+        f.start()
+        self.gc.calls.clear()
+        for second in range(30, 3000, 30):
+            self.now[0] = second
+            f.tick()
+        self.assertNotIn(("get_freeze_count",), self.gc.calls)
+        self.assertTrue(all("frozen_total" not in r for r in self.rows[1:]))
+
     def test_close_unfreezes_only_after_a_freeze(self):
         f = self.freezer(30)
         f.close()
         self.assertEqual(self.gc.calls, [])
         f.start()
         f.close()
-        self.assertEqual(self.gc.calls[-1], ("unfreeze",))
+        self.assertEqual(self.gc.calls[-2:], [("get_freeze_count",), ("unfreeze",)])
+        self.assertEqual(self.rows[-1]["reason"], "close")
         self.now[0] = 100
         f.tick()  # closed: no further freezes
         self.assertEqual(self.gc.calls[-1], ("unfreeze",))
