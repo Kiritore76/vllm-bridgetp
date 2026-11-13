@@ -28,12 +28,20 @@ def inventory_snapshot(scheduler, pool_id: str, now: float) -> dict:
     for request_id, request in list(scheduler.requests.items()):
         groups = manager.get_blocks(request_id).blocks
         supported = len(groups) == 1
-        blocks = {
-            block.block_id: block
-            for group in groups
-            for block in group
-            if not block.is_null
-        }
+        # Counts only (11-13). The per-block list this used to publish was
+        # dropped by every reader (pressure_inventory_process.REQUEST_FIELDS)
+        # yet cost one dict per KV block in the scheduler thread on every
+        # membership change, i.e. nearly every step under short-request load.
+        owned = releasable = None
+        if supported:
+            seen = set()
+            releasable = 0
+            for block in groups[0]:
+                if block.is_null or block.block_id in seen:
+                    continue
+                seen.add(block.block_id)
+                releasable += block.ref_cnt == 1
+            owned = len(seen)
         params = request.sampling_params
         rows.append(
             {
@@ -45,16 +53,8 @@ def inventory_snapshot(scheduler, pool_id: str, now: float) -> dict:
                 "computed_tokens": request.num_computed_tokens,
                 "max_output_tokens": request.max_tokens,
                 "ignore_eos": bool(params.ignore_eos) if params is not None else None,
-                "owned_blocks": len(blocks) if supported else None,
-                "releasable_blocks": sum(
-                    block.ref_cnt == 1 for block in blocks.values()
-                )
-                if supported
-                else None,
-                "blocks": [
-                    {"id": block.block_id, "refs": block.ref_cnt}
-                    for block in blocks.values()
-                ],
+                "owned_blocks": owned,
+                "releasable_blocks": releasable,
                 "block_group_supported": supported,
             }
         )

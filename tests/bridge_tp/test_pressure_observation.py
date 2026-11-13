@@ -72,6 +72,39 @@ class InventoryTests(unittest.TestCase):
             request["prompt_tokens"] + request["generated"],
         )
 
+    def test_counts_match_the_old_per_block_list_without_publishing_it(self):
+        """11-13: the per-block list was unused by every reader; counts stay."""
+        import random
+
+        def old_counts(groups):
+            blocks = {
+                b.block_id: b for group in groups for b in group if not b.is_null
+            }
+            if len(groups) != 1:
+                return None, None
+            return len(blocks), sum(b.ref_cnt == 1 for b in blocks.values())
+
+        rng = random.Random(7)
+        for case in range(200):
+            pool = [
+                NS(block_id=i, ref_cnt=rng.choice((1, 1, 2, 3)), is_null=False)
+                for i in range(1, 40)
+            ] + [NS(block_id=0, ref_cnt=0, is_null=True)]
+            groups = tuple(
+                [rng.choice(pool) for _ in range(rng.randint(0, 30))]  # repeats too
+                for _ in range(rng.choice((1, 1, 1, 2)))
+            )
+            sched = scheduler()
+            sched.kv_cache_manager.get_blocks = lambda rid, g=groups: NS(blocks=g)
+            request = inv.inventory_snapshot(sched, "tp1", 10)["requests"][0]
+            with self.subTest(case=case):
+                self.assertNotIn("blocks", request)
+                self.assertEqual(
+                    (request["owned_blocks"], request["releasable_blocks"]),
+                    old_counts(groups),
+                )
+                self.assertEqual(request["block_group_supported"], len(groups) == 1)
+
     def test_unsupported_groups_keep_release_unknown(self):
         row = inv.inventory_snapshot(scheduler(2), "tp1", 10)
         self.assertIsNone(row["requests"][0]["releasable_blocks"])
