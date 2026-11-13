@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 当前任务：迁移历史直接写入KV的GPU小场——standby、4轮A合并/拆回（同heavy），每次合并后75/77秒各1条16384/4096长请求固定到C-g4-tp1，所有迁移强制进A的备用TP2：唤醒后的迁移落到刚醒的TP2上（guard40 standby两次挂起的情形）；--history-direct-to-kv、每秒按rank记显存；带零依赖挂起诊断；机制与稳定性核对，不是性能结论。
+# 当前任务：guard40自动场（mixed_guard_six_v1）＋standby休眠复用＋迁移历史直写KV（--history-direct-to-kv，每秒按rank记显存）＋挂起诊断；其余参数与guard40 standby场（b0aff5a2a，两次在首个迁移进唤醒TP2时挂起）及同版stall场相同；同输入；与stall/split5/静态L1AC对比。
 set -uo pipefail
 repo=${REPO:-/root/autodl-tmp/bridgetp/vllm_bridge}
 venv=${VENV:-/root/autodl-tmp/bridgetp/.venv_bridge}
@@ -16,18 +16,15 @@ git fetch origin "refs/heads/$branch:refs/remotes/origin/$branch" || exit 1
 revision=$(git rev-parse HEAD)
 [ "$revision" = "$(git rev-parse "origin/$branch")" ] || { echo '本地落后于远端：请先 git merge --ff-only refs/remotes/origin/'"$branch"'。'; exit 1; }
 mkdir -p "$results" || exit 1
-run=$results/qwen3_six_standby_directkv_$(date +%Y%m%d_%H%M%S)_${RANDOM}
+run=$results/qwen3_six_guard40_standby_directkv_auto_$(date +%Y%m%d_%H%M%S)_${RANDOM}
 mkdir "$run" || exit 1
 printf '%s\n' "$revision" > "$run/revision.txt"
-printf 'Six-card direct-to-KV migration receive check (11-12: guard40 standby hung twice at the first migration into a just-woken TP2, whose out-of-KV full-history staging buffer of about 1.5 GB per rank no longer fit beside the sleeping residual). Profile migrate: the heavy run (--conversion-engine-reuse standby, four A merge/split rounds, two 14336/8192 longs pinned to A-g1-tp1 before every merge, 14 shorts per second around every merge) plus two 16384/4096 longs pinned to C-g4-tp1 75 and 77 s after every merge (after the short burst, so both admit), whose growth fills C-g4 about 66 s later, just before the A TP2 serves at about merge + 147 s, with every migration forced to the standby A TP2, so C migrates into it after each wake. --history-direct-to-kv: received history goes in bounded ring chunks straight into the admitted request KV blocks (no full-history staging); --gpu-memory-log-s 1 writes per-rank allocated/reserved/peaks/device free next to the inventories. Fourth run (1c450f28c) committed two direct-to-KV migrations into the woken A TP2 and then stopped at the controller rotation check, which counted channel sessions per target instance id although every wake builds a new channel; it now counts per channel_generation. Third run (0ca873fd0) found two blockers, now fixed: the controller admission gate did not accept the deferred direct-to-KV receipt (target never admitted), and vLLM preempted the migrating source request, which killed the source engine; the scheduler now never preempts the migrating request, a non-decoding request only defers the session start (refused after 10 s like a memory deferral), and a preemption after the start refuses the session. A pinned arrival without room now waits and is retried instead of failing the dispatcher (the first 11-12 run of this scene stopped at 122 s with arrival dispatcher failed; in the second, bb322e34e, the C longs pinned 30/28 s before each merge finished before the A TP2 woke, so nothing migrated). Same hang diagnostics. Mechanism and stability check only, no performance claim.\n' > "$run/scope.txt"
+printf 'Six-card 2400s automatic trial (mixed_guard_six_v1, seed6 input 96a46bc7) with --conversion-engine-reuse standby and --history-direct-to-kv: identical to the 11-12 guard40 standby runs (b0aff5a2a; both hung when the first migration into a just-woken TP2 allocated an out-of-KV full-history staging buffer of about 1.5 GB per rank next to the sleeping residual) except that migrated history is now received in bounded 16-slot ring chunks straight into the admitted request KV blocks (validated 11-13 in qwen3_six_standby_directkv_20261113_000826_3743: four commits into the woken TP2, zero readback mismatches, handoff at most 0.68 s, +44 MiB peak), plus --gpu-memory-log-s 1 per-rank memory logs. Also includes since b0aff5a2a: pinned-arrival wait in the dispatcher, the direct-to-KV admission gate, no preemption of the migrating source request (start deferral refused after 10 s, post-start preemption refuses the session) and channel-generation rotation counting. All other options identical to the same-version stall run (a6a2ebf18): unified scheduler, hold queue, decider execute/multi/assist, prestart, drain recompute, split confirm 5s/30s, unlimited conversions, util 0.88. Compare with stall, split5 and static L1AC; one run, no repetition statistics.\n' > "$run/scope.txt"
 echo "本批目录：$run"
-echo '先Linux CPU检查；通过后只跑一场直写KV小场：standby、4轮A合并→拆回（时刻同heavy：110/510/910/1310秒合并，合并后280秒拆回）。'
-echo '每次合并后75/77秒各1条16384/4096长请求固定到C-g4-tp1（短请求高峰之后，两条都能准入；约66秒后C-g4的KV占满，正好赶上A的TP2在合并后约147秒醒来），所有迁移只能进A的备用TP2：它醒来后接C的迁移、A-g1的2条重算和短请求积压。'
-echo '修复：固定路由的请求暂时放不下时等待重试，不再让到达分发线程失败（上一场在122秒因此中止）。'
-echo '第四场两次直写迁移都提交进了唤醒的A TP2；之后控制器的轮换检查按实例号累计通道会话数，而每次唤醒都会重建通道，现已改为按channel_generation计数。'
-echo '第三场的两个问题已修复：准入门槛认可直写推迟凭证；调度器不再抢占迁移中的源请求，开始前遇到重算就等待（超过10秒拒绝），开始后被抢占则取消迁移，不再让源引擎崩溃。'
-echo '迁移接收走 --history-direct-to-kv（历史分段直接写进已准入请求的KV块，不再申请整段暂存）；每秒按rank记显存到 gpu_memory_*.jsonl。挂起时hang_watch抓线程栈、内核栈和nvidia-smi到hang_diag/。'
-echo '共9个引擎进程，启动约3分钟；场景约29分钟加排空，总计约40–50分钟，加CPU检查和打包。不自动重试。'
+echo '先Linux CPU检查；通过后只跑一场同输入2400秒自动场：参数与guard40 standby场（b0aff5a2a）相同，另加 --history-direct-to-kv --gpu-memory-log-s 1；不自动重试。'
+echo '与上一场guard40 standby的区别：迁移历史分段直接写进目标请求的KV块，不再申请整段暂存（上两场在首个迁移进唤醒TP2时挂起）；另含直写小场验证过的修复：固定路由等待、直写准入门槛、迁移源不被抢占、按通道代次轮换。'
+echo '带挂起诊断：若某引擎60秒不返回，hang_watch抓各进程线程栈、内核栈和nvidia-smi到hang_diag/。9个引擎，启动多约1分钟，主机pinned内存约214GiB。'
+echo '40分钟到达；含CPU/启动/预热/排空/打包，预计55–70分钟，慢机器或积压可能更久。'
 smi=
 pack_result() {
     local status=$1
@@ -36,7 +33,7 @@ pack_result() {
     free -g > "$run/free_after.txt" 2>&1
     printf '%s\n' "$status" > "$run/exit_code.txt"
     local excludes=() edge
-    for edge in sleep_smoke; do
+    for edge in auto_from_L1AC; do
         # Never omit unarchived failure data. Keep its raw trial if no inner pack.
         if [ -f "$run/$edge/trial.tar.gz" ] && [ -f "$run/$edge/trial.tar.gz.sha256" ] &&
            (cd "$run/$edge" && sha256sum -c trial.tar.gz.sha256 > /dev/null 2>&1); then
@@ -108,37 +105,39 @@ fi
 "$py" -m compileall -q -j 4 "$repo/vllm" "$repo/tools" > "$run/compileall.log" 2>&1 || { tail -n 30 "$run/compileall.log"; pack_result 1; exit 1; }
 free -g > "$run/free_before.txt" 2>&1
 nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,pcie.link.gen.current,pcie.link.width.current --format=csv,noheader > "$run/gpu_before.csv" || { pack_result 1; exit 1; }
-# Residual memory of sleeping engines and host memory over the run.
+# GPU memory (sleep residuals) and host MemAvailable every second.
 ( while true; do
     nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu --format=csv,noheader
     printf 'host %s %s\n' "$(date +%s)" "$(awk '/MemAvailable/ {print $2}' /proc/meminfo)"
     sleep 1
   done ) > "$run/gpu_samples.csv" 2>&1 &
 smi=$!
-case_dir="$run/sleep_smoke"
+case_dir="$run/auto_from_L1AC"
 mkdir "$case_dir" || { pack_result 1; exit 1; }
-"$py" -B tools/bridge_tp/hang_watch.py --root "$run/sleep_smoke" --output "$run/hang_diag" > "$run/hang_watch.log" 2>&1 &
+"$py" -B tools/bridge_tp/hang_watch.py --root "$run/auto_from_L1AC" --output "$run/hang_diag" > "$run/hang_watch.log" 2>&1 &
 watch=$!
-echo '开始直写KV小场：8步全是唤醒；迁移凭证gpu_initial_receipts里history_path应为DIRECT_TO_KV。'
+echo '开始：启动时预建备用形态并预热休眠（standby_prewarm.json），然后2400秒自动场；25:00起10秒短峰应保持，27:00起持续短压应拆回。'
 "$py" -B tools/bridge_tp/run_qwen3_stay_migrate.py \
-    --cards 6 --static-layout L1AC --long-burst-pair \
+    --cards 6 --static-layout L1AC --phase-shift --phase-scenario mixed_guard_six_v1 \
     --scheduler unified --hold-queue --kv-short-exempt --overload-migrate --migrate-current-length \
-    --conversion L1AC-L2C --conversion-trigger-s 110 --conversion-prestart --conversion-recompute \
-    --conversion-engine-reuse standby --six-sleep-smoke --six-sleep-profile migrate \
-    --history-direct-to-kv --gpu-memory-log-s 1 \
     --expanded-context --current-machine --repetitions 1 \
+    --conversion-decider execute --decider-multi --decider-assist --conversion-prestart --conversion-recompute \
+    --conversion-engine-reuse standby \
+    --history-direct-to-kv --gpu-memory-log-s 1 \
+    --migration-targets all --decider-max-conversions 0 \
     --model "$model" \
     --checkpoint "$repo/experiments/platforms/qwen3_pressure_observation/artifacts/predictor_distribution.pt" \
     --inputs "$repo/experiments/platforms/qwen3_pressure_observation/inputs.json" \
     --output "$case_dir/trial" --expected-revision "$revision" 2>&1 | tee "$case_dir/console.log"
 runner_status=${PIPESTATUS[0]}
 printf '%s\n' "$runner_status" > "$case_dir/runner_exit_code.txt"
-"$py" -B -m tools.bridge_tp.six_sleep_smoke --directory "$case_dir/trial" > "$case_dir/sleep_check.log" 2>&1
+"$py" -B -m tools.bridge_tp.six_rotation assess --arm auto_from_L1AC --scenario mixed_guard_six_v1 --directory "$case_dir/trial" > "$case_dir/auto_check.log" 2>&1
 check_status=$?
-cat "$case_dir/sleep_check.log"
+cat "$case_dir/auto_check.log"
 printf '%s\n' "$check_status" > "$case_dir/check_exit_code.txt"
 status=$runner_status
 if [ "$status" = 0 ]; then status=$check_status; fi
-echo '检查码：0=8步全部是唤醒、没有冷启动和回退，至少一次迁移提交进刚醒的A TP2，且所有迁移都走DIRECT_TO_KV；2=有效但覆盖缺失；1=技术失败或证据缺失（含没有迁移提交进唤醒的TP2、走了暂存路径）。sleep_smoke_check.json的migration段列出各迁移、handoff停顿和各rank显存峰值。若挂起，先看hang_diag/与各引擎日志里的Thread栈。'
+echo '每次转换的休眠/唤醒耗时与残留显存见conversion_events.jsonl的SLEPT/WOKEN；SLEEP_FALLBACK表示回退为停机。迁移凭证gpu_initial_receipts的history_path应为DIRECT_TO_KV；各rank显存见controller/gpu_memory_*.jsonl。'
+echo '须真实完成长段A合并和持续短段A拆回；短峰及恢复须有效L2C/KEEP，零转换/中止/证据缺失不算覆盖通过；完整输出/ACK/trace/空闲/收尾须通过。'
 pack_result "$status" || exit 1
 exit "$status"
