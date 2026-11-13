@@ -17,6 +17,21 @@ from collections import deque
 # (36.87s split, 50.54s merge), without assuming CPU prestart is enabled.
 SHORT_CAPACITY = {"L0": 20.0, "L1AC": 18.0, "L2C": 16.0, "L3": 12.0}
 BLOCKS = {1: 2325, 2: 11712}
+# vLLM sleep mode (engine reuse, 11-12) allocates through its own memory pool
+# and leaves slightly more KV: TP1 2343 and TP2 11747 blocks at util 0.88
+# (+0.8%/+0.3%). Accept the measured shape up to 2% larger; packing keeps the
+# profile blocks (conservative). Fewer blocks, or more than 2% more, is still
+# an unknown shape.
+BLOCKS_TOLERANCE = 0.02
+
+
+def profile_shape(tp, total_blocks, block_size):
+    """Whether a native KV shape matches the service-budget profile."""
+    return (
+        block_size == 16
+        and type(total_blocks) is int
+        and BLOCKS[tp] <= total_blocks <= BLOCKS[tp] * (1 + BLOCKS_TOLERANCE)
+    )
 REBUILD_S = {"TP1": 40.0, "TP2": 60.0}
 REFERENCE_TPOT_S = 0.035
 ARRIVAL_WINDOW_S = 240.0
@@ -160,15 +175,18 @@ def estimate(status, modes, members, edge, now, signals):
     ):
         return unknown("incomplete or inconsistent active membership")
     requests = {}
+    native_blocks = {}
     for b, ids in members.items():
         for name in ids:
             state = instances.get(name) or {}
             native = state.get("inventory") or {}
-            if (
-                native.get("total_blocks") != BLOCKS[modes[b]]
-                or native.get("block_size") != 16
+            if not profile_shape(
+                modes[b], native.get("total_blocks"), native.get("block_size")
             ):
                 return unknown("native shape differs from service-budget profile")
+            native_blocks[modes[b]] = min(
+                native["total_blocks"], native_blocks.get(modes[b], native["total_blocks"])
+            )
             for q in state.get("requests", ()):
                 if not all(
                     number(q.get(k))
@@ -267,6 +285,8 @@ def estimate(status, modes, members, edge, now, signals):
         short_rate=short_rate,
         long_rate=long_rate,
         horizon_s=HORIZON_S,
+        native_blocks={f"tp{tp}": n for tp, n in sorted(native_blocks.items())},
+        profile_blocks={f"tp{tp}": n for tp, n in sorted(BLOCKS.items())},
         stay_long_slots=stay_slots,
         target_long_slots=target_slots,
         drain_s=drain_s,

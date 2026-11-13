@@ -171,6 +171,43 @@ class BudgetTests(unittest.TestCase):
                 self.assertFalse(result["worthwhile"])
 
 
+    def test_sleep_mode_kv_shape_is_the_profile_shape(self):
+        """11-13 guard40 standby: sleep mode left TP1 2343 / TP2 11747 blocks;
+        an exact match made every budget unsupported for the whole run."""
+        value, modes, members = status(long_rate=0.2)
+        reference = estimate(value, modes, members, ("A", "TP2"))
+        sleep = copy.deepcopy(value)
+        for bundle, ids in members.items():
+            for name in ids:
+                sleep["instances"][name]["inventory"]["total_blocks"] = (
+                    2343 if modes[bundle] == 1 else 11747
+                )
+        result = estimate(sleep, modes, members, ("A", "TP2"))
+        self.assertTrue(result["supported"], result)
+        self.assertEqual(result["native_blocks"], {"tp1": 2343, "tp2": 11747})
+        # Packing keeps the profile blocks: the same estimate as the profile.
+        for key in ("worthwhile", "gain_tokens", "cost_tokens", "stay_long_slots"):
+            self.assertEqual(result[key], reference[key], key)
+        for tp1, tp2, size in (
+            (2324, 11712, 16),  # fewer blocks than measured
+            (2325, int(11712 * 1.03), 16),  # beyond the tolerance
+            (2343, 11747, 32),  # another block size
+        ):
+            with self.subTest(tp1=tp1, tp2=tp2, size=size):
+                other = copy.deepcopy(value)
+                for bundle, ids in members.items():
+                    for name in ids:
+                        other["instances"][name]["inventory"].update(
+                            total_blocks=tp1 if modes[bundle] == 1 else tp2,
+                            block_size=size,
+                        )
+                rejected = estimate(other, modes, members, ("A", "TP2"))
+                self.assertFalse(rejected["supported"])
+                self.assertEqual(
+                    rejected["reason"], "native shape differs from service-budget profile"
+                )
+
+
 class DecisionTests(unittest.TestCase):
     def run_case(self, layout, short, long_rate, edge, blocks=0, seconds=120):
         decider = d.ConversionDecider(
